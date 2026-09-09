@@ -1,19 +1,22 @@
 [package]
-name = "meridian-bus"
+name = "meridian-sidecar"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Topic routing and in-process transport for the Meridian bus"
+description = "The surface a Meridian plugin binds to"
 
 [dependencies]
 meridian-pb.workspace = true
+meridian-bus = { path = "../bus" }
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio-stream.workspace = true
-uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

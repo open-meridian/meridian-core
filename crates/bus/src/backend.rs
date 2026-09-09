@@ -49,6 +49,15 @@ impl Subscription {
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
+
+    /// Consume this subscription as a stream.
+    ///
+    /// Exists so a transport can hand deliveries straight to its client
+    /// without reaching into the channel, which would make the channel type
+    /// part of this crate's public surface.
+    pub fn into_stream(self) -> tokio_stream::wrappers::ReceiverStream<Delivery> {
+        tokio_stream::wrappers::ReceiverStream::new(self.rx)
+    }
 }
 
 impl std::fmt::Debug for Subscription {

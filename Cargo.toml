@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bus"]
+members = ["crates/bus", "crates/sidecar"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +13,10 @@ license = "Apache-2.0"
 [workspace.dependencies]
 meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "efbfe948d489293e354111e632108ffcfa3d1509" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 prost = "0.13"
 thiserror = "2"
 tracing = "0.1"
