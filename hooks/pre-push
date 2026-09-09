@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-RISKY='(^|/)(Dockerfile|docker-compose.*\.ya?ml|Makefile|Cargo\.lock|go\.(mod|sum)|pyproject\.toml|\.github/workflows/)|\.proto$'
+RISKY='(^|/)(Dockerfile|docker-compose.*\.ya?ml|Makefile|Cargo\.lock|pyproject\.toml|poetry\.lock|uv\.lock|requirements.*\.txt|\.github/workflows/)|\.proto$'
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
