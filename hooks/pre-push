@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Pre-push gate. Local green is the completion signal; CI is confirmation.
+#
+# Activate on a fresh clone with:  make install-hooks
+# (sets core.hooksPath=hooks, so this actually fires)
+#
+# Two tiers, promoted automatically. A diff touching build inputs, workflow
+# definitions or the wire schema gets the deep gate, because those are the
+# paths ci-local cannot fully cover by construction.
+#
+# --no-verify bypasses this. It is not recommended and settings.json denies it
+# to agent sessions.
+
+set -euo pipefail
+
+RISKY='(^|/)(Dockerfile|docker-compose.*\.ya?ml|Makefile|Cargo\.lock|go\.(mod|sum)|pyproject\.toml|\.github/workflows/)|\.proto$'
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -n "$upstream" ]; then
+  changed="$(git diff --name-only "$upstream"...HEAD 2>/dev/null || true)"
+else
+  changed="$(git diff --name-only HEAD 2>/dev/null || true)"
+fi
+
+target="ci-local"
+if echo "$changed" | grep -qE "$RISKY"; then
+  target="ci-local-deep"
+  echo "pre-push: diff touches a risky path, promoting to $target"
+fi
+
+echo "pre-push: running make $target"
+if ! make "$target"; then
+  echo
+  echo "pre-push: BLOCKED -- make $target failed."
+  echo "Fix it locally. Pushing red turns CI into a remote debugger."
+  exit 1
+fi
