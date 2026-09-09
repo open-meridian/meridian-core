@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/bus"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+
+# The wire schema is pinned to an exact commit. Bumping it is a deliberate,
+# reviewable change rather than something that drifts in on a rebuild -- a
+# schema change lands in every consumer as one arc or it is not landed.
+[workspace.dependencies]
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "efbfe948d489293e354111e632108ffcfa3d1509" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+prost = "0.13"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+debug = false

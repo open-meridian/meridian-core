@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+#
+# Build and test the Rust workspace.
+#
+# The host is not asked for a Rust toolchain. Everything runs here, at a pinned
+# version, so a contributor needs only Docker and every check is reproducible.
+#
+# Source is copied rather than bind-mounted: mounting a host directory into the
+# VM raced, and cargo intermittently failed to create its own target directory.
+
+ARG RUST_VERSION=1.90
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /w
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+FROM base AS check
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/w/target \
+    cargo build --workspace --locked
+
+FROM base AS test
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/w/target \
+    cargo test --workspace --locked
+
+FROM base AS lint
+RUN rustup component add clippy rustfmt
+RUN cargo fmt --all -- --check
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/w/target \
+    cargo clippy --workspace --locked --all-targets -- -D warnings
