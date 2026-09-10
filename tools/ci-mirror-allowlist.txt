@@ -1,0 +1,12 @@
+# Jobs that CI runs and `make ci-local` cannot.
+#
+# Format: job-id<TAB>reason. A bare job id is rejected; the reason is the point.
+# Every entry here is a hole in "green locally means green in CI", so each one
+# has to be worth the hole.
+#
+# The bar: a job belongs here only when reproducing it locally is impossible
+# rather than merely inconvenient. Needing a credential, a hosted service, or a
+# model is impossible. Being slow is not.
+
+claude-review	Runs the review passes in REVIEW.md against the diff by invoking a model. Not reproducible locally: it needs credentials and produces a judgement, not a verdict. Advisory only -- ci-local is the required status check, this is not.
+claude	The on-demand responder, triggered by an @claude mention on an issue or a review comment. Runs no checks and gates nothing; it exists so a human can ask for work in a thread. Nothing local corresponds to a mention.
