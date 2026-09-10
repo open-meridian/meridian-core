@@ -9,3 +9,4 @@
 # model is impossible. Being slow is not.
 
 claude-review	Runs the review passes in REVIEW.md against the diff by invoking a model. Not reproducible locally: it needs credentials and produces a judgement, not a verdict. Advisory only -- ci-local is the required status check, this is not.
+claude	The on-demand responder, triggered by an @claude mention on an issue or a review comment. Runs no checks and gates nothing; it exists so a human can ask for work in a thread. Nothing local corresponds to a mention.
