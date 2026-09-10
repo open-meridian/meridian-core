@@ -17,6 +17,13 @@ tokio-stream = "0.1"
 tonic = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Signing the assertion a deployment presents on every request. Implementing
+# Ed25519 by hand would be the wrong kind of independence; this is the reference
+# implementation of the standard.
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+base64 = "0.22"
+rand = "0.8"
 prost = "0.13"
 thiserror = "2"
 tracing = "0.1"
