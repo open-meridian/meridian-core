@@ -5,7 +5,7 @@ RUST_VERSION := 1.90
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test lint fmt lock
+        build test lint fmt lock contract-diff
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -16,7 +16,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: ci-mirror-check build test lint
+ci-local: contract-diff ci-mirror-check build test lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -24,6 +24,13 @@ ci-local-deep: ci-local
 
 ci-mirror-check:
 	@$(PY) tools/ci_mirror_check.py --repo-root .
+
+# ADR 005 in meridian-design. Contract-tier changes declare themselves in a
+# commit trailer. Reads what changed on disk, so no tool or session root
+# avoids it -- which is the whole reason it exists alongside the hook.
+contract-diff:
+	@$(PY) tools/check_contract_diff.py --self-test
+	@$(PY) tools/check_contract_diff.py --repo-root .
 
 build:
 	@$(DOCKER) build -f Dockerfile.rust --target check . >/dev/null 2>&1 \
