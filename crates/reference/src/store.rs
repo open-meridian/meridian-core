@@ -52,6 +52,11 @@ impl Identifier {
 /// A replica's copy of an instrument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instrument {
+    /// The canonical identity, and the only thing a position or an order ever
+    /// stores. Never reused: an identifier retired here is not later given to
+    /// something else, so this field answers "which instrument" for all time
+    /// and needs no as-of. Everything dated hangs off it as an attribute,
+    /// tickers included.
     pub instrument_id: String,
     pub identifiers: Vec<Identifier>,
     pub asset_class: String,
@@ -95,17 +100,25 @@ pub trait Store: Send + Sync {
     /// The instrument, if it is held.
     fn by_id(&self, instrument_id: &str) -> Result<Option<Instrument>>;
 
-    /// The instrument an identifier mapped to at `as_of_ns`.
+    /// Every instrument this identifier mapped to at `as_of_ns`.
     ///
     /// Dated, always. Resolving without a moment is how a reused ticker
     /// resolves to whoever holds it now rather than whoever held it then.
-    fn by_identifier(
+    ///
+    /// All of them rather than one of them, because "more than one matched" is
+    /// an answer the caller has to act on. A store that returned the first
+    /// match would be picking, and a pick made here would be invisible to the
+    /// step that is supposed to refuse it.
+    ///
+    /// Ordered by instrument identifier so a repeated query is a repeated
+    /// answer.
+    fn matching(
         &self,
         scheme: &str,
         value: &str,
         source: &str,
         as_of_ns: i64,
-    ) -> Result<Option<Instrument>>;
+    ) -> Result<Vec<Instrument>>;
 
     /// Write, unless what is held is already at or beyond this version.
     ///
@@ -142,16 +155,17 @@ impl Held {
         Applied::Stored
     }
 
-    pub(crate) fn by_identifier(
+    pub(crate) fn matching(
         &self,
         scheme: &str,
         value: &str,
         source: &str,
         as_of_ns: i64,
-    ) -> Option<Instrument> {
-        self.by_id
+    ) -> Vec<Instrument> {
+        let mut found: Vec<Instrument> = self
+            .by_id
             .values()
-            .find(|instrument| {
+            .filter(|instrument| {
                 instrument.identifiers.iter().any(|identifier| {
                     identifier.scheme == scheme
                         && identifier.value == value
@@ -160,5 +174,12 @@ impl Held {
                 })
             })
             .cloned()
+            .collect();
+
+        // A HashMap iterates in whatever order it likes, and an ambiguous
+        // resolution that reports a different pair of candidates each time is
+        // an incident nobody can reproduce.
+        found.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+        found
     }
 }

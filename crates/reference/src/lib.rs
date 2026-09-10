@@ -27,6 +27,7 @@
 
 pub mod apply;
 pub mod assertions;
+pub mod resolve;
 pub mod store;
 
 mod memory;
@@ -34,6 +35,7 @@ mod memory;
 pub use apply::{apply, Outcome};
 pub use assertions::{DeploymentKey, SigningError};
 pub use memory::MemoryStore;
+pub use resolve::{missing_instrument, resolve_identifier, resolve_instrument};
 pub use store::{Applied, Identifier, Instrument, Store, StoreError};
 
 pub type Result<T> = std::result::Result<T, StoreError>;

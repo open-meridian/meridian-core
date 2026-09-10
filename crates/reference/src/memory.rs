@@ -38,14 +38,14 @@ impl Store for MemoryStore {
         Ok(self.read()?.by_id.get(instrument_id).cloned())
     }
 
-    fn by_identifier(
+    fn matching(
         &self,
         scheme: &str,
         value: &str,
         source: &str,
         as_of_ns: i64,
-    ) -> Result<Option<Instrument>> {
-        Ok(self.read()?.by_identifier(scheme, value, source, as_of_ns))
+    ) -> Result<Vec<Instrument>> {
+        Ok(self.read()?.matching(scheme, value, source, as_of_ns))
     }
 
     fn apply(&self, instrument: Instrument) -> Result<Applied> {
@@ -137,24 +137,27 @@ mod tests {
         store.apply(retired).unwrap();
 
         // True at the time.
-        assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 300)
-            .unwrap()
-            .is_some());
+        assert_eq!(
+            store
+                .matching("figi", "BBG000B9XRY4", "", 300)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Not true afterwards. Deleting the mapping instead would make a
         // statement from before the change resolve to whoever holds that
         // identifier now.
         assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 900)
+            .matching("figi", "BBG000B9XRY4", "", 900)
             .unwrap()
-            .is_none());
+            .is_empty());
 
         // And not true before it began either.
         assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 50)
+            .matching("figi", "BBG000B9XRY4", "", 50)
             .unwrap()
-            .is_none());
+            .is_empty());
     }
 
     #[test]
@@ -166,13 +169,16 @@ mod tests {
         store.apply(scoped).unwrap();
 
         assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 300)
+            .matching("figi", "BBG000B9XRY4", "", 300)
             .unwrap()
-            .is_none());
-        assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "snaptrade", 300)
-            .unwrap()
-            .is_some());
+            .is_empty());
+        assert_eq!(
+            store
+                .matching("figi", "BBG000B9XRY4", "snaptrade", 300)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

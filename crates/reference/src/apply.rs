@@ -98,6 +98,39 @@ fn from_wire_identifier(identifier: &PbIdentifier, valid_from_ns: i64) -> Identi
     }
 }
 
+/// The held record as the wire carries it.
+///
+/// The inverse of [`from_wire`], and here beside it on purpose: a pair of
+/// translations that drift apart is how a field silently stops making the round
+/// trip.
+pub(crate) fn to_wire(instrument: &Instrument) -> PbInstrument {
+    PbInstrument {
+        instrument_id: instrument.instrument_id.clone(),
+        identifiers: instrument
+            .identifiers
+            .iter()
+            .map(|identifier| PbIdentifier {
+                scheme: identifier.scheme.clone(),
+                value: identifier.value.clone(),
+                source: identifier.source.clone(),
+            })
+            .collect(),
+        asset_class: instrument.asset_class.clone(),
+        currency: instrument.currency.clone(),
+        exchange_mic: instrument.exchange_mic.clone(),
+        description: instrument.description.clone(),
+        lifecycle_state: lifecycle_value(&instrument.lifecycle_state),
+        version: instrument.version,
+        valid_from_ns: instrument.valid_from_ns,
+        record_time_ns: instrument.record_time_ns,
+    }
+}
+
+fn lifecycle_value(name: &str) -> i32 {
+    meridian_pb::v1::InstrumentLifecycleState::from_str_name(name)
+        .unwrap_or(meridian_pb::v1::InstrumentLifecycleState::Unspecified) as i32
+}
+
 fn lifecycle_name(value: i32) -> String {
     match meridian_pb::v1::InstrumentLifecycleState::try_from(value) {
         Ok(state) => state.as_str_name().to_string(),
@@ -259,14 +292,17 @@ mod tests {
         let store = MemoryStore::new();
         apply(&store, record(4), 1_000).unwrap();
 
+        assert_eq!(
+            store
+                .matching("figi", "BBG000B9XRY4", "", 1_757_376_000_000_000_000 + 1)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 1_757_376_000_000_000_000 + 1)
+            .matching("figi", "BBG000B9XRY4", "", 1_000)
             .unwrap()
-            .is_some());
-        assert!(store
-            .by_identifier("figi", "BBG000B9XRY4", "", 1_000)
-            .unwrap()
-            .is_none());
+            .is_empty());
     }
 
     #[test]
