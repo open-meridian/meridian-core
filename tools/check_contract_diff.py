@@ -141,9 +141,33 @@ def check_commit(root: pathlib.Path, sha: str, repo_name: str) -> list[str]:
         else:
             task = match.group(1)
             task_file = root / "tasks" / f"{task}.md"
+            tasks_root = root / "tasks"
             if repo_name != "meridian-design":
-                task_file = root.parent / "meridian-design" / "tasks" / f"{task}.md"
-            if not task_file.exists():
+                design = root.parent / "meridian-design"
+                task_file = design / "tasks" / f"{task}.md"
+                tasks_root = design / "tasks"
+
+            if not tasks_root.is_dir():
+                # The queue lives in meridian-design, and a sibling repository is
+                # checked out alone in CI. Refusing here would make every
+                # contract-revision commit outside that repo unlandable; passing
+                # silently would let a trailer name anything at all. So it says
+                # which half it checked, in the output, every time.
+                #
+                # The real check still happens where the commit is written: a
+                # developer machine has the whole workspace, and the pre-push
+                # hook runs this gate before the commit ever reaches CI.
+                # design/contract-diff-cross-repo-task-check holds the decision
+                # about making it verifiable here too.
+                print(
+                    f"check-contract-diff: {sha[:9]} names "
+                    f"Contract-Revision: {task}\n"
+                    f"  trailer present and well-formed; the task queue is not in "
+                    f"this checkout,\n"
+                    f"  so whether that task exists was NOT verified here. It was "
+                    f"verified at pre-push."
+                )
+            elif not task_file.exists():
                 problems.append(
                     f"{sha[:9]} {subject}\n"
                     f"    names Contract-Revision: {task}\n"
