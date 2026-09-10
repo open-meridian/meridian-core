@@ -1,0 +1,35 @@
+# CI is confirmation, not the first place a failure is found. The pre-push hook
+# runs the same target locally, so a red run here means the hook was bypassed or
+# the runner differs from a developer's machine -- both worth knowing.
+#
+# The single job is named for the make target it runs. ci-mirror-check enforces
+# that correspondence from inside ci-local, so a job added here without a target
+# fails the build rather than quietly escaping local reproduction.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make ci-local
+        run: make ci-local
+        # build, test and lint each run in Dockerfile.rust at the pinned toolchain.
+        # No Rust is installed on the runner, deliberately: the container is the
+        # only place a version is chosen.
+        env:
+          DOCKER_BUILDKIT: "1"
