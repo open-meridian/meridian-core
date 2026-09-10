@@ -25,11 +25,13 @@
 //! address, its own identifier and a private key, and nothing about the
 //! platform's shape.
 
+pub mod apply;
 pub mod assertions;
 pub mod store;
 
 mod memory;
 
+pub use apply::{apply, Outcome};
 pub use assertions::{DeploymentKey, SigningError};
 pub use memory::MemoryStore;
 pub use store::{Applied, Identifier, Instrument, Store, StoreError};
