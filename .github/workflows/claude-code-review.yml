@@ -1,0 +1,165 @@
+name: Claude Code Review
+
+# Advisory, not required. `ci-local` is the gate that blocks a merge; this job
+# produces a judgement, and a judgement is for a person to weigh.
+#
+# Advisory does not mean it may lie. A job that finishes without reviewing
+# anything used to report success, which is worse than reporting nothing: the
+# tick looks like assurance. The last step below turns "the job finished" into
+# "a review exists on this pull request", which is the only claim worth making.
+#
+# Note for anyone editing this file: the action refuses to run a workflow whose
+# content differs from the default branch, and restores CLAUDE.md and .claude/
+# from the default branch before running, because a pull request must not be
+# able to rewrite the thing reviewing it. So a change to this file, or to the
+# review passes in CLAUDE.md, cannot be observed on the pull request that makes
+# it. Merge it, then open a throwaway pull request to see what it does.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Anything the reviewer posts is judged against this instant. Without a
+      # mark, an older comment from a previous run reads as evidence that this
+      # run said something.
+      - name: Mark the start
+        run: echo "REVIEW_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # No plugin, and no slash command. The plugin's first act is to
+          # launch a background agent to check review eligibility, and the
+          # action's single-shot run ends while still waiting for that agent to
+          # report. The 2026-09-10 log records the final result as the sentence
+          # "I'll wait for the background agent's completion notification",
+          # after which the run exits successfully having reviewed nothing.
+          #
+          # So the review is asked for directly. The passes themselves live in
+          # CLAUDE.md, which this action loads from the default branch, so they
+          # stay in one place and are not duplicated here.
+          prompt: |
+            Review the changes in pull request #${{ github.event.pull_request.number }}
+            of ${{ github.repository }}.
+
+            Follow the Review section of CLAUDE.md exactly: the four passes in
+            order, the severity split between Important and Nit, the cap of five
+            Nits, and the exclusions.
+
+            Do the work yourself. Do not delegate to a background agent and do
+            not wait on one; this run ends when you stop, and anything you have
+            not said by then is lost.
+
+            Read the diff with `gh pr diff`, and read whatever surrounding files
+            you need to judge it.
+
+            Finish by posting exactly one summary comment with
+            `gh pr comment ${{ github.event.pull_request.number }} --body ...`,
+            naming which passes ran and what each found, including when a pass
+            found nothing. Post a comment even when the diff is trivial and even
+            when everything is clean: silence is indistinguishable from a review
+            that never happened, and a gate in this workflow treats it as one.
+
+            Use inline comments for findings tied to specific lines, and keep the
+            summary as the place a reader can see the whole verdict.
+          claude_args: >-
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+
+          # A maintained comment, so a run always leaves a trace even when the
+          # agent concludes there is nothing to report.
+          use_sticky_comment: true
+
+      # The gate. Runs whatever the step above did, including skipping itself.
+      - name: A green check must mean a review happened
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          since="$REVIEW_STARTED_AT"
+
+          # Issue comments carry the summary. A sticky comment is edited rather
+          # than recreated, so updated_at is what moves on a second run.
+          summary=$(gh api "/repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"claude[bot]\")
+                       | select(.updated_at >= \"$since\")] | length")
+
+          # A formal review, if it left one.
+          reviews=$(gh api "/repos/$REPO/pulls/$PR/reviews" --paginate \
+            --jq "[.[] | select(.user.login == \"claude[bot]\")
+                       | select(.submitted_at >= \"$since\")] | length")
+
+          # Inline annotations on specific lines.
+          inline=$(gh api "/repos/$REPO/pulls/$PR/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"claude[bot]\")
+                       | select(.created_at >= \"$since\")] | length")
+
+          total=$(( summary + reviews + inline ))
+          echo "posted since $since: $summary summary, $reviews review(s), $inline inline"
+
+          if [ "$total" -eq 0 ]; then
+            # One cause is structural and expected, so name it rather than
+            # making the reader work through a list. The action refuses to run a
+            # workflow, or trust a CLAUDE.md, that differs from the base branch,
+            # because a pull request must not be able to rewrite the thing
+            # judging it. Any pull request editing either file hits this, always.
+            edits_reviewer=""
+            for f in .github/workflows/claude-code-review.yml CLAUDE.md; do
+              if ! gh api "/repos/$REPO/contents/$f?ref=$BASE" -q '.content' 2>/dev/null \
+                   | base64 -d 2>/dev/null | diff -q - "$f" >/dev/null 2>&1; then
+                edits_reviewer="${edits_reviewer} $f"
+              fi
+            done
+
+            if [ -n "$edits_reviewer" ]; then
+              echo "::error::No review ran, and the reason is structural." >&2
+              echo >&2
+              echo "This pull request changes:$edits_reviewer" >&2
+              echo >&2
+              echo "The action refuses to run a workflow, or trust instructions," >&2
+              echo "that differ from $BASE, so that a pull request cannot rewrite" >&2
+              echo "the thing reviewing it. Every pull request touching those" >&2
+              echo "files lands here. There is no configuration that avoids it." >&2
+              echo >&2
+              echo "So this change needs a human reader instead of a review." >&2
+              echo "After it merges, a small unrelated pull request is the only" >&2
+              echo "way to see what the reviewer now does." >&2
+              exit 1
+            fi
+
+            echo "::error::The reviewer posted nothing, and this diff does not" >&2
+            echo "touch the reviewer's own files, so the usual excuse does not" >&2
+            echo "apply. A green tick with no review is worse than no tick." >&2
+            echo >&2
+            echo "Read the action step above. Known causes:" >&2
+            echo "  1. A tool the reviewer needed was not in allowedTools; the" >&2
+            echo "     denial shows as a rejected tool result." >&2
+            echo "  2. The run ended while waiting on something, in which case" >&2
+            echo "     its last recorded result says so." >&2
+            echo "  3. The run genuinely failed." >&2
+            echo >&2
+            echo "show_full_output: true makes any of those readable." >&2
+            exit 1
+          fi
+
+          echo "A review exists on this pull request."
