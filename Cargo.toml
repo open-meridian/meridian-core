@@ -25,6 +25,16 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 base64 = "0.22"
 rand = "0.8"
 prost = "0.13"
+
+# The client a deployment calls the platform with. rustls rather than the
+# system TLS stack, so the container needs no OpenSSL headers and the build
+# stays a pinned toolchain and nothing else. Redirects are followed by hand, so
+# the built-in policy is switched off where the client is constructed.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset"] }
+
+# A trait with an async method has to be boxed to be usable behind `dyn`, and
+# the transport is behind `dyn` so a test can answer without a network.
+async-trait = "0.1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

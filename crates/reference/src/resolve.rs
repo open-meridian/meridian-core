@@ -152,6 +152,26 @@ pub fn missing_instrument(
     })
 }
 
+/// The global identifiers in a set, strongest first.
+///
+/// Source-scoped ones are dropped rather than ordered last: this is what the
+/// platform is asked, and a brokerage symbol means nothing outside the rail that
+/// issued it, so sending one centrally would make the master's answer depend on
+/// who happened to ask.
+pub(crate) fn global_identifiers_strongest_first(
+    identifiers: &[PbIdentifier],
+) -> Vec<&PbIdentifier> {
+    let mut global: Vec<&PbIdentifier> = identifiers
+        .iter()
+        .filter(|identifier| identifier.source.is_empty())
+        .collect();
+
+    // The same order the local resolve falls through, from the same table.
+    // Two orderings would be two things to keep in step.
+    global.sort_by_key(|identifier| rank(identifier));
+    global
+}
+
 /// Where in the fallback order this identifier sits. Lower is stronger.
 fn rank(identifier: &PbIdentifier) -> usize {
     if !identifier.source.is_empty() {
