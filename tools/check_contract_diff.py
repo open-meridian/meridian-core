@@ -44,6 +44,7 @@ Exit:   0 clean, 1 an undeclared contract-tier change, 2 could not determine a r
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -87,8 +88,17 @@ def git(root: pathlib.Path, *args: str) -> str:
 
 
 def determine_base(root: pathlib.Path, explicit: str | None) -> str | None:
-    if explicit:
-        return explicit
+    """The ref to compare against, or None when there is no honest answer.
+
+    CI checkouts are shallow and detached by default: no upstream, no
+    origin/main, nothing to compare. That is why CONTRACT_DIFF_BASE exists and
+    why None is a failure rather than a pass -- see main().
+    """
+    for candidate in (explicit, os.environ.get("CONTRACT_DIFF_BASE")):
+        if candidate:
+            if not git(root, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"):
+                return None
+            return candidate
     upstream = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
     if upstream:
         return upstream
@@ -226,8 +236,18 @@ def main() -> int:
 
     base = determine_base(root, args.base)
     if base is None:
-        print("check-contract-diff: no upstream and no origin/main, nothing to compare")
-        return 0
+        print(
+            "check-contract-diff FAILED: no base to compare against.\n\n"
+            "Tried, in order: --base, CONTRACT_DIFF_BASE, the branch's upstream,\n"
+            "origin/main, origin/master. None resolved to a commit.\n\n"
+            "This is a failure and not a pass. An earlier version returned 0 here,\n"
+            "and in CI -- a shallow detached checkout with no origin/main -- that\n"
+            "meant the gate reported success having inspected nothing. A gate that\n"
+            "cannot see the range it is meant to police must say so.\n\n"
+            "In CI, set CONTRACT_DIFF_BASE and check out enough history to resolve\n"
+            "it. Locally, set an upstream or fetch origin.",
+            file=sys.stderr)
+        return 2
 
     commits = commits_in_range(root, base)
     if not commits:
