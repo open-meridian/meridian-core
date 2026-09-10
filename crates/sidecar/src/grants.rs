@@ -23,6 +23,10 @@ pub struct Grants {
 }
 
 impl Grants {
+    /// May this plugin publish on `topic`?
+    ///
+    /// Any matching pattern is enough. Grants are additive by
+    /// construction, so there is no deny pattern to check afterwards.
     pub fn may_publish(&self, topic: &str) -> bool {
         self.publish.iter().any(|p| topic::matches(p, topic))
     }
