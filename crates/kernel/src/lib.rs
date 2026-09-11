@@ -10,6 +10,24 @@
 //! the custodian's belief arrives. What to do when the two disagree is a later
 //! slice and nothing here pretends otherwise.
 //!
+//! # How anything else reaches this
+//!
+//! Over the bus, and only over the bus. A consumer knows commands, queries and
+//! events; it does not know there is a database, which one, or what shape it is
+//! in.
+//!
+//! That is what makes the ledger's storage a private decision. The custodian's
+//! side is append-heavy, kept for audit, and tolerant of delay; our own book,
+//! when it exists, is small, transactional, and on the path of every decision.
+//! Those want different storage, and choosing separately is only possible while
+//! nothing outside knows what either one is. A second component linking against
+//! this crate's store would make the schema the interface, and from then on
+//! changing it would be everybody's problem.
+//!
+//! `make check-crate-boundaries` enforces it, because nobody argues against the
+//! rule. What happens is that somebody adds a dependency for convenience and
+//! nothing objects.
+//!
 //! # Three rules that are easy to get quietly wrong
 //!
 //! **A position is replaced, not accumulated.** A holding row states a quantity

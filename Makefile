@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test test-store chart-check lint fmt lock contract-diff up down demo network
+        build test test-store chart-check check-crate-boundaries lint fmt lock contract-diff up down demo network
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -14,6 +14,7 @@ help:
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
+	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make up             bring up Postgres and the replica"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -22,7 +23,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check build test test-store chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries build test test-store chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -30,6 +31,13 @@ ci-local-deep: ci-local
 
 ci-mirror-check:
 	@$(PY) tools/ci_mirror_check.py --repo-root .
+
+# Storage separation without API separation is decorative: two stores fuse into
+# one the moment a second component links against either, because from then on
+# the schema is the interface. Nobody argues against the bus; somebody adds a
+# dependency for convenience and nothing objects. This objects.
+check-crate-boundaries:
+	@$(PY) tools/check_crate_boundaries.py --repo-root .
 
 # ADR 005 in meridian-design. Contract-tier changes declare themselves in a
 # commit trailer. Reads what changed on disk, so no tool or session root

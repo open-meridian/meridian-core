@@ -1,0 +1,12 @@
+# Crates permitted to depend on one that owns a store.
+#
+# Format: crate->dependency<TAB>reason. A bare pair is rejected; the reason is
+# the point.
+#
+# The bar: a composition root. A binary that wires a process together has to
+# construct the store it hands over, and there is nowhere else for that to
+# happen. Everything else reaches a store over the bus, because storage
+# separation without API separation is decorative -- the schema becomes the
+# interface the moment a second component links against it.
+
+meridian-replica->meridian-reference	The composition root for a deployment's replica: it opens the database, builds the platform client and hands both to the crate that uses them. It calls no store method itself.
