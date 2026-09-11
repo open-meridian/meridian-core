@@ -10,10 +10,12 @@
 //! identifiers we could not turn into one, a quantity and a value. Rows are
 //! never deleted and never merged. A statement's rows are what it said.
 //!
-//! A **position** is what an account currently holds of an instrument. It is
-//! derived from the latest statement's rows rather than accumulated across
-//! statements, because a holding row states a quantity as of a date and not a
-//! change. Adding them up would double a position that appeared in two reads.
+//! A **custodial position** is what the custodian says an account holds of an
+//! instrument. It is derived from the latest statement's rows rather than
+//! accumulated across statements, because a holding row states a quantity as of
+//! a date and not a change. Adding them up would double one that appeared in
+//! two reads. It is not our own book, which does not exist yet and will have its
+//! own name when it does.
 
 use crate::amounts::{Money, Overflow, Quantity};
 
@@ -112,9 +114,16 @@ pub struct Identifier {
     pub source: String,
 }
 
-/// What an account currently holds of an instrument.
+/// What the custodian says an account holds of an instrument.
+///
+/// Custodial, and named so deliberately. It is derived from statements and is
+/// the custodian's belief. Our own book, calculated from our own activity, does
+/// not exist yet and is a different number; their disagreement is the entire
+/// subject of reconciliation. A type called `Position` would make every reader
+/// guess which one it had, and would quietly change meaning the day the second
+/// one arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Position {
+pub struct CustodialPosition {
     pub account_id: String,
     pub instrument_id: String,
     pub quantity: Quantity,
@@ -160,12 +169,12 @@ pub enum Settled {
     /// The row resolved and the position changed. Carries what it was, so a
     /// subscriber renders a delta without keeping its own history.
     Changed {
-        position: Position,
+        position: CustodialPosition,
         previous_quantity: Quantity,
     },
 
     /// The row resolved and said exactly what the position already held.
-    Unchanged { position: Position },
+    Unchanged { position: CustodialPosition },
 
     /// The row did not resolve, so no position moved. There is nothing to move
     /// until the deployment knows what it holds.
@@ -195,7 +204,7 @@ impl Counts {
 /// A page of positions, and the rows that could not become one.
 #[derive(Debug, Clone, Default)]
 pub struct Page {
-    pub positions: Vec<Position>,
+    pub positions: Vec<CustodialPosition>,
     pub unresolved: Vec<Holding>,
     pub next_cursor: String,
 }
@@ -226,7 +235,8 @@ pub trait Store: Send + Sync {
     /// What a statement said, in counts. Available before anything publishes it.
     fn counts(&self, statement_id: &str) -> Result<Counts>;
 
-    /// W2.7. Positions, and optionally the rows that could not become one.
+    /// W2.7. Custodial positions, and optionally the rows that could not
+    /// become one.
     fn page(
         &self,
         account_id: &str,
@@ -235,5 +245,9 @@ pub trait Store: Send + Sync {
         cursor: &str,
     ) -> Result<Page>;
 
-    fn position(&self, account_id: &str, instrument_id: &str) -> Result<Option<Position>>;
+    fn custodial_position(
+        &self,
+        account_id: &str,
+        instrument_id: &str,
+    ) -> Result<Option<CustodialPosition>>;
 }

@@ -7,14 +7,15 @@
 //! anything that could object.
 
 use meridian_pb::v1::{
-    Identifier as PbIdentifier, PositionUpdatedEvent, RecordHoldingReply, RecordHoldingRequest,
-    RecordHoldingsStatementReply, RecordHoldingsStatementRequest, StatementRecordedEvent,
+    CustodialPositionUpdatedEvent, Identifier as PbIdentifier, RecordHoldingReply,
+    RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
+    StatementRecordedEvent,
 };
 
 use crate::amounts::{Money, Quantity};
 use crate::ids;
 use crate::store::{
-    Completion, Holding, Identifier, Opened, Position, Result, Settled, Statement, Store,
+    Completion, CustodialPosition, Holding, Identifier, Opened, Result, Settled, Statement, Store,
     StoreError,
 };
 
@@ -75,7 +76,7 @@ pub struct Recorded {
     /// Present only when a position moved. An unresolved row publishes nothing
     /// here, because it updates no position, and neither does a row that says
     /// exactly what the position already held.
-    pub event: Option<PositionUpdatedEvent>,
+    pub event: Option<CustodialPositionUpdatedEvent>,
 
     /// W2.5. Present on the row that completes the statement, and on no other.
     ///
@@ -149,7 +150,7 @@ pub fn record_holding(
             Settled::Changed {
                 position,
                 previous_quantity,
-            } => Some(PositionUpdatedEvent {
+            } => Some(CustodialPositionUpdatedEvent {
                 position: Some(to_wire_position(&position)),
                 statement_id: request.statement_id.clone(),
                 previous_quantity_scaled_1e8: previous_quantity.scaled(),
@@ -176,8 +177,8 @@ pub(crate) fn to_wire_identifier(identifier: &Identifier) -> PbIdentifier {
     }
 }
 
-pub(crate) fn to_wire_position(position: &Position) -> meridian_pb::v1::Position {
-    meridian_pb::v1::Position {
+pub(crate) fn to_wire_position(position: &CustodialPosition) -> meridian_pb::v1::CustodialPosition {
+    meridian_pb::v1::CustodialPosition {
         account_id: position.account_id.clone(),
         instrument_id: position.instrument_id.clone(),
         quantity_scaled_1e8: position.quantity.scaled(),
@@ -394,7 +395,7 @@ mod tests {
         record_holding(&store, &holding_request(&second), NOW + 1).unwrap();
 
         let position = store
-            .position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
             .unwrap()
             .unwrap();
 

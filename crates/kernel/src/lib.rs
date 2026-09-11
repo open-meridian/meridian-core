@@ -55,5 +55,5 @@ pub use positions::list_positions;
 pub use postgres::PostgresStore;
 pub use record::{open_statement, record_holding, Recorded};
 pub use store::{
-    Completion, Counts, Holding, Opened, Position, Settled, Statement, Store, StoreError,
+    Completion, Counts, CustodialPosition, Holding, Opened, Settled, Statement, Store, StoreError,
 };

@@ -5,7 +5,9 @@
 //! answered together, because a view that answers only the first hides its own
 //! gaps, and the gap is the thing an operator needs to see.
 
-use meridian_pb::v1::{ListPositionsReply, ListPositionsRequest, UnresolvedHolding};
+use meridian_pb::v1::{
+    ListCustodialPositionsReply, ListCustodialPositionsRequest, UnresolvedHolding,
+};
 
 use crate::record::{to_wire_identifier, to_wire_position};
 use crate::store::{Holding, Result, Store};
@@ -20,8 +22,8 @@ const DEFAULT_PAGE: usize = 100;
 
 pub fn list_positions(
     store: &dyn Store,
-    request: &ListPositionsRequest,
-) -> Result<ListPositionsReply> {
+    request: &ListCustodialPositionsRequest,
+) -> Result<ListCustodialPositionsReply> {
     let limit = match request.page_size {
         size if size <= 0 => DEFAULT_PAGE,
         size => (size as usize).min(MAX_PAGE),
@@ -34,7 +36,7 @@ pub fn list_positions(
         &request.cursor,
     )?;
 
-    Ok(ListPositionsReply {
+    Ok(ListCustodialPositionsReply {
         positions: page.positions.iter().map(to_wire_position).collect(),
         unresolved: page.unresolved.iter().map(to_wire_unresolved).collect(),
         next_cursor: page.next_cursor,
@@ -125,8 +127,8 @@ mod tests {
         (store, statement_id)
     }
 
-    fn asking(include_unresolved: bool) -> ListPositionsRequest {
-        ListPositionsRequest {
+    fn asking(include_unresolved: bool) -> ListCustodialPositionsRequest {
+        ListCustodialPositionsRequest {
             account_id: "SNAP-ACC-1".into(),
             include_unresolved,
             page_size: 100,

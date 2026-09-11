@@ -9,8 +9,8 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    Completion, Counts, Holding, Opened, Page, Position, Result, Settled, Statement, Store,
-    StoreError,
+    Completion, Counts, CustodialPosition, Holding, Opened, Page, Result, Settled, Statement,
+    Store, StoreError,
 };
 
 #[derive(Debug, Default)]
@@ -65,7 +65,11 @@ impl Store for MemoryStore {
             .page(account_id, include_unresolved, limit, cursor))
     }
 
-    fn position(&self, account_id: &str, instrument_id: &str) -> Result<Option<Position>> {
+    fn custodial_position(
+        &self,
+        account_id: &str,
+        instrument_id: &str,
+    ) -> Result<Option<CustodialPosition>> {
         Ok(self
             .read()?
             .positions
@@ -87,7 +91,7 @@ pub(crate) struct Held {
     pub(crate) by_external: HashMap<(String, String), String>,
 
     pub(crate) holdings: Vec<Holding>,
-    pub(crate) positions: HashMap<(String, String), Position>,
+    pub(crate) positions: HashMap<(String, String), CustodialPosition>,
 
     /// Statements that have already announced themselves, so a row beyond the
     /// count does not announce a second time.
@@ -179,7 +183,7 @@ impl Held {
             .map(|position| position.quantity)
             .unwrap_or(Quantity::ZERO);
 
-        let position = Position {
+        let position = CustodialPosition {
             account_id: holding.account_id.clone(),
             instrument_id,
             quantity: holding.quantity,
@@ -239,7 +243,7 @@ impl Held {
         limit: usize,
         cursor: &str,
     ) -> Page {
-        let mut positions: Vec<Position> = self
+        let mut positions: Vec<CustodialPosition> = self
             .positions
             .values()
             .filter(|position| account_id.is_empty() || position.account_id == account_id)

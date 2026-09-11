@@ -18,8 +18,8 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use crate::amounts::{Money, Quantity};
 use crate::store::{
-    Completion, Counts, Holding, Identifier, Opened, Page, Position, Result, Settled, Statement,
-    Store, StoreError,
+    Completion, Counts, CustodialPosition, Holding, Identifier, Opened, Page, Result, Settled,
+    Statement, Store, StoreError,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -40,6 +40,19 @@ const SCHEMA: &str = include_str!("../migrations/0001_ledger.sql");
 /// this connection. That is the ordinary shape of a deploy: new instances
 /// starting while old ones serve. Found by running the tests in parallel, which
 /// is the same situation with a shorter fuse.
+/// Tables renamed after a release, and therefore under the old name in a
+/// database created before it.
+///
+/// The first entry here is the change the additive mechanism could not absorb,
+/// which is what `kernel/ledger-needs-migrations` is about: this list has no
+/// ordering, no record of what has run, and no way to express a change that is
+/// not a rename or an addition. It is enough for one rename and is not a
+/// migration system.
+///
+/// Guarded the same way and for the same reason: a rename takes an exclusive
+/// lock, so a start with nothing to do must not reach for one.
+const RENAMES: &[(&str, &str)] = &[("position", "custodial_position")];
+
 const ADDITIONS: &[(&str, &str, &str)] = &[
     ("statement", "expected_rows", "integer NOT NULL DEFAULT 0"),
     ("statement", "completed_at_ns", "bigint"),
@@ -71,9 +84,10 @@ impl PostgresStore {
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let created = conn
-            .batch_execute(SCHEMA)
-            .map_err(unavailable)
+        // Renames first: the schema below creates the new name, so running it
+        // before the rename would leave an empty table beside a full one.
+        let created = rename_tables(&mut conn)
+            .and_then(|()| conn.batch_execute(SCHEMA).map_err(unavailable))
             .and_then(|()| add_missing_columns(&mut conn));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
@@ -290,7 +304,7 @@ impl Store for PostgresStore {
             .query(
                 "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
                         last_statement_id, as_of_date, updated_at_ns
-                   FROM position
+                   FROM custodial_position
                   WHERE ($1 = '' OR account_id = $1)
                     AND ($2 = '' OR instrument_id > $2)
                   ORDER BY account_id, instrument_id
@@ -299,9 +313,9 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
 
-        let mut positions: Vec<Position> = rows
+        let mut positions: Vec<CustodialPosition> = rows
             .into_iter()
-            .map(|row| Position {
+            .map(|row| CustodialPosition {
                 account_id: row.get(0),
                 instrument_id: row.get(1),
                 quantity: Quantity::from_scaled(row.get(2)),
@@ -358,18 +372,22 @@ impl Store for PostgresStore {
         })
     }
 
-    fn position(&self, account_id: &str, instrument_id: &str) -> Result<Option<Position>> {
+    fn custodial_position(
+        &self,
+        account_id: &str,
+        instrument_id: &str,
+    ) -> Result<Option<CustodialPosition>> {
         let row = self
             .conn()?
             .query_opt(
                 "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
                         last_statement_id, as_of_date, updated_at_ns
-                   FROM position WHERE account_id = $1 AND instrument_id = $2",
+                   FROM custodial_position WHERE account_id = $1 AND instrument_id = $2",
                 &[&account_id, &instrument_id],
             )
             .map_err(unavailable)?;
 
-        Ok(row.map(|row| Position {
+        Ok(row.map(|row| CustodialPosition {
             account_id: row.get(0),
             instrument_id: row.get(1),
             quantity: Quantity::from_scaled(row.get(2)),
@@ -398,7 +416,7 @@ fn settle(
 ) -> Result<Settled> {
     let fresh = tx
         .execute(
-            "INSERT INTO position (account_id, instrument_id, quantity_scaled, value_scaled,
+            "INSERT INTO custodial_position (account_id, instrument_id, quantity_scaled, value_scaled,
                                    currency, last_statement_id, as_of_date, updated_at_ns)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (account_id, instrument_id) DO NOTHING",
@@ -416,7 +434,7 @@ fn settle(
         .map_err(unavailable)?
         == 1;
 
-    let position = Position {
+    let position = CustodialPosition {
         account_id: holding.account_id.clone(),
         instrument_id: instrument_id.clone(),
         quantity: holding.quantity,
@@ -437,7 +455,7 @@ fn settle(
     let before = tx
         .query_one(
             "SELECT quantity_scaled, value_scaled, currency
-               FROM position WHERE account_id = $1 AND instrument_id = $2
+               FROM custodial_position WHERE account_id = $1 AND instrument_id = $2
                FOR UPDATE",
             &[&holding.account_id, &instrument_id],
         )
@@ -458,7 +476,7 @@ fn settle(
         &instrument_id,
     ];
     tx.execute(
-        "UPDATE position
+        "UPDATE custodial_position
             SET quantity_scaled = $1, value_scaled = $2, currency = $3,
                 last_statement_id = $4, as_of_date = $5, updated_at_ns = $6
           WHERE account_id = $7 AND instrument_id = $8",
@@ -564,6 +582,36 @@ fn from_json(text: String) -> Vec<Identifier> {
         }
     }
     identifiers
+}
+
+/// Apply each rename in [`RENAMES`], and only when the old name is present and
+/// the new one is not.
+///
+/// Both halves of that condition matter. Without the first, a fresh database
+/// tries to rename a table it never had. Without the second, a database that
+/// has both loses whichever it renames onto.
+fn rename_tables(conn: &mut Connection) -> Result<()> {
+    for (from, to) in RENAMES {
+        let old_exists = table_exists(conn, from)?;
+        let new_exists = table_exists(conn, to)?;
+
+        if old_exists && !new_exists {
+            conn.batch_execute(&format!("ALTER TABLE {from} RENAME TO {to}"))
+                .map_err(unavailable)?;
+        }
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_opt(
+            "SELECT 1 FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_name = $1",
+            &[&table],
+        )
+        .map_err(unavailable)?
+        .is_some())
 }
 
 /// Add each column in [`ADDITIONS`] that is not already there, and touch the

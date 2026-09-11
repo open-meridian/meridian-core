@@ -106,7 +106,10 @@ fn a_resolved_row_moves_a_position_and_says_what_it_was() {
         other => panic!("expected a change, got {other:?}"),
     }
 
-    let position = store.position(&account, &instrument).unwrap().unwrap();
+    let position = store
+        .custodial_position(&account, &instrument)
+        .unwrap()
+        .unwrap();
     assert_eq!(position.quantity.scaled(), 1_250_000_000);
     assert_eq!(position.as_of_date, "2026-09-08");
 }
@@ -137,7 +140,10 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
         other => panic!("expected a change, got {other:?}"),
     }
 
-    let held = store.position(&account, &instrument).unwrap().unwrap();
+    let held = store
+        .custodial_position(&account, &instrument)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         held.quantity.scaled(),
         2_000_000_000,
@@ -393,4 +399,48 @@ fn a_statement_promising_no_rows_completes_when_it_opens() {
 
     assert_eq!(opened, Opened::Opened);
     assert_eq!(completion, Completion::JustCompleted);
+}
+
+#[test]
+fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
+    // The first schema change the additive mechanism could not absorb, and the
+    // reason kernel/ledger-needs-migrations exists. A database created before
+    // today has the table under its old name, and creating the new one beside
+    // it would leave a full table and an empty one with nothing to say which is
+    // which.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+
+    let scratch = format!("rename_{}", unique("t").replace('-', "_"));
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {scratch};
+             SET search_path TO {scratch};
+             CREATE TABLE position (
+                account_id text NOT NULL,
+                instrument_id text NOT NULL,
+                quantity_scaled bigint NOT NULL,
+                value_scaled bigint NOT NULL,
+                currency text NOT NULL,
+                last_statement_id text NOT NULL,
+                as_of_date text NOT NULL,
+                updated_at_ns bigint NOT NULL,
+                PRIMARY KEY (account_id, instrument_id));
+             INSERT INTO position VALUES ('ACC', 'INS', 1, 1, 'USD', 'STMT', '2026-09-08', 1);"
+        ))
+        .unwrap();
+
+    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let store = PostgresStore::connect(&scoped, 1).unwrap();
+    store.migrate().expect("the rename did not apply");
+
+    let carried = store.custodial_position("ACC", "INS").unwrap();
+    assert!(
+        carried.is_some(),
+        "the row was left behind under the old table name"
+    );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
+        .unwrap();
 }

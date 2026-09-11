@@ -19,4 +19,5 @@ r2d2_postgres.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+postgres.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

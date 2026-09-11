@@ -22,7 +22,9 @@
 use std::sync::Arc;
 
 use meridian_bus::Bus;
-use meridian_pb::v1::{ListPositionsRequest, RecordHoldingRequest, RecordHoldingsStatementRequest};
+use meridian_pb::v1::{
+    ListCustodialPositionsRequest, RecordHoldingRequest, RecordHoldingsStatementRequest,
+};
 use prost::Message;
 
 use crate::positions::list_positions;
@@ -36,13 +38,13 @@ pub const RECORD_STATEMENT: &str = "platform.kernel.command.record-statement";
 pub const RECORD_HOLDING: &str = "platform.kernel.command.record-holding";
 
 /// W2.6. A position moved.
-pub const POSITION_UPDATED: &str = "platform.kernel.event.position-updated";
+pub const CUSTODIAL_POSITION_UPDATED: &str = "platform.kernel.event.custodial-position-updated";
 
 /// W2.5. A statement has every row it said was coming.
 pub const STATEMENT_RECORDED: &str = "platform.kernel.event.statement-recorded";
 
 /// W2.7. A dashboard asking what is held.
-pub const LIST_POSITIONS: &str = "platform.kernel.query.list-positions";
+pub const LIST_CUSTODIAL_POSITIONS: &str = "platform.kernel.query.list-custodial-positions";
 
 /// Where the time comes from, so a test does not wait for it.
 pub trait Clock: Send + Sync {
@@ -120,8 +122,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         if let Some(event) = recorded.event {
             announcing
                 .publish(
-                    POSITION_UPDATED,
-                    "meridian.v1.PositionUpdatedEvent",
+                    CUSTODIAL_POSITION_UPDATED,
+                    "meridian.v1.CustodialPositionUpdatedEvent",
                     event.encode_to_vec(),
                     correlation,
                     causation,
@@ -149,17 +151,20 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     });
 
     let reading = store;
-    bus.serve(LIST_POSITIONS, move |envelope| {
-        expect(&envelope.payload_type, "meridian.v1.ListPositionsRequest")?;
+    bus.serve(LIST_CUSTODIAL_POSITIONS, move |envelope| {
+        expect(
+            &envelope.payload_type,
+            "meridian.v1.ListCustodialPositionsRequest",
+        )?;
 
-        let request = ListPositionsRequest::decode(&envelope.payload[..])
+        let request = ListCustodialPositionsRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable query: {failed}"))?;
 
         let reply =
             list_positions(reading.as_ref(), &request).map_err(|failed| failed.to_string())?;
 
         Ok((
-            "meridian.v1.ListPositionsReply".to_string(),
+            "meridian.v1.ListCustodialPositionsReply".to_string(),
             reply.encode_to_vec(),
         ))
     });
@@ -184,8 +189,8 @@ mod tests {
 
     use meridian_bus::{MemoryBackend, Subscription};
     use meridian_pb::v1::{
-        Identifier as PbIdentifier, ListPositionsReply, PositionUpdatedEvent, RecordHoldingReply,
-        RecordHoldingsStatementReply, StatementRecordedEvent,
+        CustodialPositionUpdatedEvent, Identifier as PbIdentifier, ListCustodialPositionsReply,
+        RecordHoldingReply, RecordHoldingsStatementReply, StatementRecordedEvent,
     };
 
     use super::*;
@@ -280,7 +285,7 @@ mod tests {
         assert!(reply.resolved);
 
         let position = store
-            .position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
             .unwrap()
             .unwrap();
         assert_eq!(position.quantity.scaled(), 1_250_000_000);
@@ -289,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn a_moved_position_is_announced() {
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(POSITION_UPDATED);
+        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
         let statement_id = open(&bus).await;
 
         record(&bus, row(&statement_id)).await;
@@ -297,9 +302,9 @@ mod tests {
         let delivered = next(&mut announced).await;
         assert_eq!(
             delivered.envelope.payload_type,
-            "meridian.v1.PositionUpdatedEvent"
+            "meridian.v1.CustodialPositionUpdatedEvent"
         );
-        let event = PositionUpdatedEvent::decode(&delivered.envelope.payload[..]).unwrap();
+        let event = CustodialPositionUpdatedEvent::decode(&delivered.envelope.payload[..]).unwrap();
         assert_eq!(event.statement_id, statement_id);
         assert_eq!(event.previous_quantity_scaled_1e8, 0);
     }
@@ -308,7 +313,7 @@ mod tests {
     async fn an_unresolved_row_announces_nothing() {
         // The fixture's postcondition, over the wire this time.
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(POSITION_UPDATED);
+        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
         let statement_id = open(&bus).await;
 
         let mut unresolved = row(&statement_id);
@@ -395,9 +400,9 @@ mod tests {
 
         let (payload_type, payload) = bus
             .call(
-                LIST_POSITIONS,
-                "meridian.v1.ListPositionsRequest",
-                ListPositionsRequest {
+                LIST_CUSTODIAL_POSITIONS,
+                "meridian.v1.ListCustodialPositionsRequest",
+                ListCustodialPositionsRequest {
                     account_id: "SNAP-ACC-1".into(),
                     include_unresolved: true,
                     page_size: 100,
@@ -410,8 +415,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(payload_type, "meridian.v1.ListPositionsReply");
-        let reply = ListPositionsReply::decode(&payload[..]).unwrap();
+        assert_eq!(payload_type, "meridian.v1.ListCustodialPositionsReply");
+        let reply = ListCustodialPositionsReply::decode(&payload[..]).unwrap();
         assert_eq!(reply.positions.len(), 1);
     }
 
@@ -424,8 +429,8 @@ mod tests {
         let failed = bus
             .call(
                 RECORD_HOLDING,
-                "meridian.v1.ListPositionsRequest",
-                ListPositionsRequest::default().encode_to_vec(),
+                "meridian.v1.ListCustodialPositionsRequest",
+                ListCustodialPositionsRequest::default().encode_to_vec(),
                 None,
                 None,
             )

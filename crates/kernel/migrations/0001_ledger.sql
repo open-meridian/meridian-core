@@ -65,7 +65,11 @@ CREATE TABLE IF NOT EXISTS holding (
 CREATE INDEX IF NOT EXISTS holding_by_statement ON holding (statement_id);
 CREATE INDEX IF NOT EXISTS holding_unresolved ON holding (account_id) WHERE instrument_id IS NULL;
 
-CREATE TABLE IF NOT EXISTS position (
+-- What the custodian says an account holds. Named for whose belief it is: our
+-- own book is calculated from our own activity, does not exist yet, and is a
+-- different number whose disagreement with this one is the whole of
+-- reconciliation.
+CREATE TABLE IF NOT EXISTS custodial_position (
     account_id        text   NOT NULL,
     instrument_id     text   NOT NULL,
     quantity_scaled   bigint NOT NULL,
