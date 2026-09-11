@@ -9,7 +9,8 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    Counts, Holding, Opened, Page, Position, Result, Settled, Statement, Store, StoreError,
+    Completion, Counts, Holding, Opened, Page, Position, Result, Settled, Statement, Store,
+    StoreError,
 };
 
 #[derive(Debug, Default)]
@@ -36,7 +37,7 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
-    fn open(&self, statement: Statement) -> Result<(Statement, Opened)> {
+    fn open(&self, statement: Statement) -> Result<(Statement, Opened, Completion)> {
         Ok(self.write()?.open(statement))
     }
 
@@ -44,7 +45,7 @@ impl Store for MemoryStore {
         Ok(self.read()?.statements.get(statement_id).cloned())
     }
 
-    fn record(&self, holding: Holding, now_ns: i64) -> Result<Settled> {
+    fn record(&self, holding: Holding, now_ns: i64) -> Result<(Settled, Completion)> {
         self.write()?.record(holding, now_ns)
     }
 
@@ -87,10 +88,14 @@ pub(crate) struct Held {
 
     pub(crate) holdings: Vec<Holding>,
     pub(crate) positions: HashMap<(String, String), Position>,
+
+    /// Statements that have already announced themselves, so a row beyond the
+    /// count does not announce a second time.
+    pub(crate) completed: std::collections::HashSet<String>,
 }
 
 impl Held {
-    pub(crate) fn open(&mut self, statement: Statement) -> (Statement, Opened) {
+    pub(crate) fn open(&mut self, statement: Statement) -> (Statement, Opened, Completion) {
         let external = (
             statement.source.clone(),
             statement.external_statement_id.clone(),
@@ -98,7 +103,7 @@ impl Held {
 
         if let Some(existing) = self.by_external.get(&external) {
             if let Some(held) = self.statements.get(existing) {
-                return (held.clone(), Opened::AlreadyRecorded);
+                return (held.clone(), Opened::AlreadyRecorded, Completion::Nothing);
             }
         }
 
@@ -107,23 +112,55 @@ impl Held {
         self.statements
             .insert(statement.statement_id.clone(), statement.clone());
 
-        (statement, Opened::Opened)
+        // Nothing is coming, so nothing is outstanding.
+        let completion = if statement.expected_rows == 0
+            && self.completed.insert(statement.statement_id.clone())
+        {
+            Completion::JustCompleted
+        } else {
+            Completion::Nothing
+        };
+
+        (statement, Opened::Opened, completion)
     }
 
-    pub(crate) fn record(&mut self, holding: Holding, now_ns: i64) -> Result<Settled> {
+    pub(crate) fn record(
+        &mut self,
+        holding: Holding,
+        now_ns: i64,
+    ) -> Result<(Settled, Completion)> {
         holding.validate()?;
 
-        if !self.statements.contains_key(&holding.statement_id) {
+        let Some(statement) = self.statements.get(&holding.statement_id).cloned() else {
             return Err(StoreError::UnknownStatement(holding.statement_id.clone()));
-        }
+        };
 
         let settled = match holding.instrument_id.clone() {
             None => Settled::Unresolved,
             Some(instrument_id) => self.settle(&holding, instrument_id, now_ns)?,
         };
 
+        let statement_id = holding.statement_id.clone();
         self.holdings.push(holding);
-        Ok(settled)
+
+        let received = self
+            .holdings
+            .iter()
+            .filter(|held| held.statement_id == statement_id)
+            .count() as u32;
+
+        // Once, at the row that reaches the count. `insert` returning true is
+        // what makes it once: a later row finds it already there.
+        let completion = if received >= statement.expected_rows
+            && statement.expected_rows > 0
+            && self.completed.insert(statement_id)
+        {
+            Completion::JustCompleted
+        } else {
+            Completion::Nothing
+        };
+
+        Ok((settled, completion))
     }
 
     /// A holding row states a quantity as of a date, not a change to one, so

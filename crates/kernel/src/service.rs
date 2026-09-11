@@ -38,7 +38,7 @@ pub const RECORD_HOLDING: &str = "platform.kernel.command.record-holding";
 /// W2.6. A position moved.
 pub const POSITION_UPDATED: &str = "platform.kernel.event.position-updated";
 
-/// W2.5. Nothing publishes this yet. See the crate documentation.
+/// W2.5. A statement has every row it said was coming.
 pub const STATEMENT_RECORDED: &str = "platform.kernel.event.statement-recorded";
 
 /// W2.7. A dashboard asking what is held.
@@ -64,6 +64,7 @@ impl Clock for SystemClock {
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     let statements = store.clone();
     let statement_clock = clock.clone();
+    let opening_bus = bus.clone();
     bus.serve(RECORD_STATEMENT, move |envelope| {
         expect(
             &envelope.payload_type,
@@ -73,12 +74,30 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let request = RecordHoldingsStatementRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable statement: {failed}"))?;
 
-        let reply = open_statement(statements.as_ref(), &request, statement_clock.now_ns())
+        let now_ns = statement_clock.now_ns();
+        let opening = open_statement(statements.as_ref(), &request, now_ns)
             .map_err(|failed| failed.to_string())?;
+
+        // A statement promising no rows is complete at once, so W2.5 can fire
+        // here as well as on a row. An account that holds nothing is a real
+        // answer, and waiting for a row that was never coming would leave it
+        // open forever, which reads as a stuck connector.
+        if let Some(event) = opening.completed {
+            let meta = envelope.meta.as_ref();
+            opening_bus
+                .publish(
+                    STATEMENT_RECORDED,
+                    "meridian.v1.StatementRecordedEvent",
+                    event.encode_to_vec(),
+                    meta.map(|meta| meta.correlation_id.as_str()),
+                    meta.map(|meta| meta.message_id.as_str()),
+                )
+                .map_err(|failed| failed.to_string())?;
+        }
 
         Ok((
             "meridian.v1.RecordHoldingsStatementReply".to_string(),
-            reply.encode_to_vec(),
+            opening.reply.encode_to_vec(),
         ))
     });
 
@@ -94,15 +113,31 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let recorded = record_holding(holdings.as_ref(), &request, holding_clock.now_ns())
             .map_err(|failed| failed.to_string())?;
 
+        let meta = envelope.meta.as_ref();
+        let correlation = meta.map(|meta| meta.correlation_id.as_str());
+        let causation = meta.map(|meta| meta.message_id.as_str());
+
         if let Some(event) = recorded.event {
-            let meta = envelope.meta.as_ref();
             announcing
                 .publish(
                     POSITION_UPDATED,
                     "meridian.v1.PositionUpdatedEvent",
                     event.encode_to_vec(),
-                    meta.map(|meta| meta.correlation_id.as_str()),
-                    meta.map(|meta| meta.message_id.as_str()),
+                    correlation,
+                    causation,
+                )
+                .map_err(|failed| failed.to_string())?;
+        }
+
+        // W2.5, on the row that completed the statement and no other.
+        if let Some(event) = recorded.completed {
+            announcing
+                .publish(
+                    STATEMENT_RECORDED,
+                    "meridian.v1.StatementRecordedEvent",
+                    event.encode_to_vec(),
+                    correlation,
+                    causation,
                 )
                 .map_err(|failed| failed.to_string())?;
         }
@@ -150,7 +185,7 @@ mod tests {
     use meridian_bus::{MemoryBackend, Subscription};
     use meridian_pb::v1::{
         Identifier as PbIdentifier, ListPositionsReply, PositionUpdatedEvent, RecordHoldingReply,
-        RecordHoldingsStatementReply,
+        RecordHoldingsStatementReply, StatementRecordedEvent,
     };
 
     use super::*;
@@ -196,6 +231,7 @@ mod tests {
                     external_statement_id: "st-2026-09-08-SNAP-ACC-1".into(),
                     as_of_date: "2026-09-08".into(),
                     read_at_ns: NOW,
+                    expected_rows: 4,
                 }
                 .encode_to_vec(),
                 None,
@@ -291,6 +327,64 @@ mod tests {
             quiet.is_err(),
             "an unresolved row published a position update"
         );
+    }
+
+    #[tokio::test]
+    async fn a_completed_statement_is_announced_over_the_bus() {
+        let (bus, _) = wired();
+        let mut recorded = bus.subscribe(STATEMENT_RECORDED);
+        let statement_id = open(&bus).await;
+
+        for n in 0..3 {
+            let mut early = row(&statement_id);
+            early.instrument_id = format!("INS-{n}");
+            record(&bus, early).await;
+        }
+
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(100), recorded.recv()).await;
+        assert!(quiet.is_err(), "announced before every row had landed");
+
+        let mut last = row(&statement_id);
+        last.instrument_id = "INS-3".into();
+        record(&bus, last).await;
+
+        let delivered = next(&mut recorded).await;
+        assert_eq!(
+            delivered.envelope.payload_type,
+            "meridian.v1.StatementRecordedEvent"
+        );
+        let event = StatementRecordedEvent::decode(&delivered.envelope.payload[..]).unwrap();
+        assert_eq!(event.statement_id, statement_id);
+        assert_eq!(event.rows_received, 4);
+    }
+
+    #[tokio::test]
+    async fn an_empty_statement_is_announced_when_it_opens() {
+        let (bus, _) = wired();
+        let mut recorded = bus.subscribe(STATEMENT_RECORDED);
+
+        let (_, _payload) = bus
+            .call(
+                RECORD_STATEMENT,
+                "meridian.v1.RecordHoldingsStatementRequest",
+                RecordHoldingsStatementRequest {
+                    source: "snaptrade".into(),
+                    external_statement_id: "st-empty".into(),
+                    as_of_date: "2026-09-08".into(),
+                    read_at_ns: NOW,
+                    expected_rows: 0,
+                }
+                .encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event = StatementRecordedEvent::decode(&next(&mut recorded).await.envelope.payload[..])
+            .unwrap();
+        assert_eq!(event.rows_received, 0);
     }
 
     #[tokio::test]

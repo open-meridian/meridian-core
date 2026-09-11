@@ -16,3 +16,6 @@ target/
 
 # Written by `make demo`: this deployment.
 .demo/
+
+# Written by `make test-store` when it fails.
+.test-store.log

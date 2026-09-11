@@ -80,10 +80,12 @@ mod tests {
                 external_statement_id: "st-2026-09-08-SNAP-ACC-1".into(),
                 as_of_date: "2026-09-08".into(),
                 read_at_ns: NOW,
+                expected_rows: 2,
             },
             NOW,
         )
         .unwrap()
+        .reply
         .statement_id;
 
         record_holding(

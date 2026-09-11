@@ -18,14 +18,32 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use crate::amounts::{Money, Quantity};
 use crate::store::{
-    Counts, Holding, Identifier, Opened, Page, Position, Result, Settled, Statement, Store,
-    StoreError,
+    Completion, Counts, Holding, Identifier, Opened, Page, Position, Result, Settled, Statement,
+    Store, StoreError,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 
 const SCHEMA: &str = include_str!("../migrations/0001_ledger.sql");
+
+/// Columns added after the first release, and therefore absent from a database
+/// created before them. `CREATE TABLE IF NOT EXISTS` adds nothing to a table
+/// that already exists, so without these a database made last week is missing
+/// today's field forever and finds out at query time.
+///
+/// Each is applied only when it is actually missing, and that guard is the
+/// whole point rather than an optimisation. `ALTER TABLE ... ADD COLUMN IF NOT
+/// EXISTS` takes an exclusive lock on the table even when the column is already
+/// there, so a start that has nothing to do still blocks every live
+/// transaction, and deadlocks against one holding a row lock and waiting for
+/// this connection. That is the ordinary shape of a deploy: new instances
+/// starting while old ones serve. Found by running the tests in parallel, which
+/// is the same situation with a shorter fuse.
+const ADDITIONS: &[(&str, &str, &str)] = &[
+    ("statement", "expected_rows", "integer NOT NULL DEFAULT 0"),
+    ("statement", "completed_at_ns", "bigint"),
+];
 
 /// Names the schema lock. Distinct from the replica's, so a deployment running
 /// both does not have one wait on the other.
@@ -53,7 +71,10 @@ impl PostgresStore {
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let created = conn.batch_execute(SCHEMA).map_err(unavailable);
+        let created = conn
+            .batch_execute(SCHEMA)
+            .map_err(unavailable)
+            .and_then(|()| add_missing_columns(&mut conn));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
         created
@@ -65,7 +86,7 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
-    fn open(&self, statement: Statement) -> Result<(Statement, Opened)> {
+    fn open(&self, statement: Statement) -> Result<(Statement, Opened, Completion)> {
         let mut conn = self.conn()?;
 
         // Inserted first and conditionally, so the decision is Postgres' under
@@ -74,8 +95,9 @@ impl Store for PostgresStore {
         let inserted = conn
             .execute(
                 "INSERT INTO statement
-                        (statement_id, source, external_statement_id, as_of_date, read_at_ns)
-                 VALUES ($1, $2, $3, $4, $5)
+                        (statement_id, source, external_statement_id, as_of_date, read_at_ns,
+                         expected_rows)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (source, external_statement_id) DO NOTHING",
                 &[
                     &statement.statement_id,
@@ -83,17 +105,33 @@ impl Store for PostgresStore {
                     &statement.external_statement_id,
                     &statement.as_of_date,
                     &statement.read_at_ns,
+                    &(statement.expected_rows as i32),
                 ],
             )
             .map_err(unavailable)?;
 
         if inserted == 1 {
-            return Ok((statement, Opened::Opened));
+            // Nothing is coming, so nothing is outstanding. Marked here, in the
+            // same statement that decides it, so a redelivery finds it done.
+            let completion = if statement.expected_rows == 0 {
+                conn.execute(
+                    "UPDATE statement SET completed_at_ns = $1
+                      WHERE statement_id = $2 AND completed_at_ns IS NULL",
+                    &[&statement.read_at_ns, &statement.statement_id],
+                )
+                .map_err(unavailable)?;
+                Completion::JustCompleted
+            } else {
+                Completion::Nothing
+            };
+
+            return Ok((statement, Opened::Opened, completion));
         }
 
         let row = conn
             .query_one(
-                "SELECT statement_id, source, external_statement_id, as_of_date, read_at_ns
+                "SELECT statement_id, source, external_statement_id, as_of_date, read_at_ns,
+                        expected_rows
                    FROM statement WHERE source = $1 AND external_statement_id = $2",
                 &[&statement.source, &statement.external_statement_id],
             )
@@ -106,8 +144,10 @@ impl Store for PostgresStore {
                 external_statement_id: row.get(2),
                 as_of_date: row.get(3),
                 read_at_ns: row.get(4),
+                expected_rows: row.get::<_, i32>(5).max(0) as u32,
             },
             Opened::AlreadyRecorded,
+            Completion::Nothing,
         ))
     }
 
@@ -115,7 +155,8 @@ impl Store for PostgresStore {
         let row = self
             .conn()?
             .query_opt(
-                "SELECT statement_id, source, external_statement_id, as_of_date, read_at_ns
+                "SELECT statement_id, source, external_statement_id, as_of_date, read_at_ns,
+                        expected_rows
                    FROM statement WHERE statement_id = $1",
                 &[&statement_id],
             )
@@ -127,23 +168,30 @@ impl Store for PostgresStore {
             external_statement_id: row.get(2),
             as_of_date: row.get(3),
             read_at_ns: row.get(4),
+            expected_rows: row.get::<_, i32>(5).max(0) as u32,
         }))
     }
 
-    fn record(&self, holding: Holding, now_ns: i64) -> Result<Settled> {
+    fn record(&self, holding: Holding, now_ns: i64) -> Result<(Settled, Completion)> {
         holding.validate()?;
 
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
 
-        let as_of: String = tx
+        // Locked for the length of the transaction, so two rows landing at
+        // once cannot both see themselves as the one that completed it.
+        let statement = tx
             .query_opt(
-                "SELECT as_of_date FROM statement WHERE statement_id = $1",
+                "SELECT as_of_date, expected_rows, completed_at_ns
+                   FROM statement WHERE statement_id = $1 FOR UPDATE",
                 &[&holding.statement_id],
             )
             .map_err(unavailable)?
-            .map(|row| row.get(0))
             .ok_or_else(|| StoreError::UnknownStatement(holding.statement_id.clone()))?;
+
+        let as_of: String = statement.get(0);
+        let expected: i32 = statement.get(1);
+        let already_completed: Option<i64> = statement.get(2);
 
         let identifiers = to_json(&holding.unresolved_identifiers);
         tx.execute(
@@ -169,8 +217,28 @@ impl Store for PostgresStore {
             Some(instrument_id) => settle(&mut tx, &holding, instrument_id, &as_of, now_ns)?,
         };
 
+        let received: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM holding WHERE statement_id = $1",
+                &[&holding.statement_id],
+            )
+            .map_err(unavailable)?
+            .get(0);
+
+        let completion =
+            if already_completed.is_none() && expected > 0 && received >= expected as i64 {
+                tx.execute(
+                    "UPDATE statement SET completed_at_ns = $1 WHERE statement_id = $2",
+                    &[&now_ns, &holding.statement_id],
+                )
+                .map_err(unavailable)?;
+                Completion::JustCompleted
+            } else {
+                Completion::Nothing
+            };
+
         tx.commit().map_err(unavailable)?;
-        Ok(settled)
+        Ok((settled, completion))
     }
 
     fn counts(&self, statement_id: &str) -> Result<Counts> {
@@ -496,6 +564,32 @@ fn from_json(text: String) -> Vec<Identifier> {
         }
     }
     identifiers
+}
+
+/// Add each column in [`ADDITIONS`] that is not already there, and touch the
+/// table at all only when one is missing.
+fn add_missing_columns(conn: &mut Connection) -> Result<()> {
+    for (table, column, definition) in ADDITIONS {
+        let present = conn
+            .query_opt(
+                "SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = $1 AND column_name = $2",
+                &[table, column],
+            )
+            .map_err(unavailable)?
+            .is_some();
+
+        if present {
+            continue;
+        }
+
+        conn.batch_execute(&format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"
+        ))
+        .map_err(unavailable)?;
+    }
+    Ok(())
 }
 
 fn unavailable(failed: impl std::error::Error) -> StoreError {

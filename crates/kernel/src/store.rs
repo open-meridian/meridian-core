@@ -56,6 +56,14 @@ pub struct Statement {
     /// When we read it. Different from the above, and conflating the two is how
     /// a stale statement is mistaken for a current one.
     pub read_at_ns: i64,
+
+    /// How many rows will follow. W2.2.
+    ///
+    /// The only thing that marks the end of a statement: rows arrive as
+    /// separate messages and none of them is distinguishable as the last. The
+    /// connector holds the whole list before it publishes any of it, so it
+    /// knows this without reading anything twice.
+    pub expected_rows: u32,
 }
 
 /// One row of one statement.
@@ -132,6 +140,20 @@ pub enum Opened {
     AlreadyRecorded,
 }
 
+/// Whether a statement has everything it said was coming. W2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// Every row has landed, and this row is the one that completed it. Said
+    /// once: a later row does not complete it again, because a subscriber's
+    /// arithmetic should not depend on how many times it heard.
+    JustCompleted,
+
+    /// Not yet, or already announced. Both are silence, and deliberately so.
+    /// A statement whose rows never all arrive publishes nothing rather than
+    /// publishing counts that are wrong.
+    Nothing,
+}
+
 /// What recording a holding did to the position behind it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Settled {
@@ -181,16 +203,25 @@ pub struct Page {
 /// Where the ledger keeps what it has been told.
 pub trait Store: Send + Sync {
     /// Open a statement, or recognise one already held. W2.2.
-    fn open(&self, statement: Statement) -> Result<(Statement, Opened)>;
+    ///
+    /// Carries a completion because zero is a legitimate row count. An account
+    /// that holds nothing today is a real answer and a different one from "we
+    /// did not read the account", so a statement promising no rows is complete
+    /// the moment it opens. Waiting for a row that was never coming would leave
+    /// it open forever, which reads as a stuck connector.
+    fn open(&self, statement: Statement) -> Result<(Statement, Opened, Completion)>;
 
     fn statement(&self, statement_id: &str) -> Result<Option<Statement>>;
 
-    /// Persist a row and settle the position behind it. W2.3 and W2.4.
+    /// Persist a row, settle the position behind it, and say whether the
+    /// statement is now complete. W2.3, W2.4 and the trigger for W2.5.
     ///
     /// One call because they are one transaction: a row recorded without its
     /// position moving, or a position moved without its row, are both states
-    /// nothing else in this crate knows how to repair.
-    fn record(&self, holding: Holding, now_ns: i64) -> Result<Settled>;
+    /// nothing else in this crate knows how to repair. Completion joins them
+    /// for the same reason. Counting rows in one transaction and deciding in
+    /// another is how a statement announces itself twice, or not at all.
+    fn record(&self, holding: Holding, now_ns: i64) -> Result<(Settled, Completion)>;
 
     /// What a statement said, in counts. Available before anything publishes it.
     fn counts(&self, statement_id: &str) -> Result<Counts>;

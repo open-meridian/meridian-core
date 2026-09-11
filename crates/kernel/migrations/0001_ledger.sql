@@ -5,6 +5,15 @@
 -- Applied on start under an advisory lock. `CREATE TABLE IF NOT EXISTS` is not
 -- the concurrency answer it reads as: two connections running it at the same
 -- moment race inside Postgres' own catalogue and one of them fails.
+--
+-- This file is the schema as created. Columns added after a database already
+-- existed live in `postgres.rs` instead, because they have to be guarded: see
+-- ADDITIONS there for why an unguarded ALTER deadlocks against live traffic.
+--
+-- Both together are enough while every change is additive and no more. This
+-- ledger holds statements and positions that cannot be rebuilt from anywhere,
+-- unlike the replica, so the first change that renames or drops a column needs
+-- a real migration history. Queued as kernel/ledger-needs-migrations.
 
 CREATE TABLE IF NOT EXISTS statement (
     statement_id          text PRIMARY KEY,
@@ -12,6 +21,16 @@ CREATE TABLE IF NOT EXISTS statement (
     external_statement_id text   NOT NULL,
     as_of_date            text   NOT NULL,
     read_at_ns            bigint NOT NULL,
+
+    -- How many rows will follow. The only thing that marks the end of a
+    -- statement, so a statement is complete when this many holdings point at
+    -- it and not before.
+    expected_rows         integer NOT NULL DEFAULT 0,
+
+    -- Set once, by the row that completed it. A unique guard rather than a
+    -- flag we check and then set, because checking and setting in two steps is
+    -- how a statement announces itself twice.
+    completed_at_ns       bigint,
 
     -- What makes a redelivery recognisable rather than a duplicate. The rail's
     -- identifiers are its own, so two rails may number theirs alike.

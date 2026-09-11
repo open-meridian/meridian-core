@@ -25,14 +25,19 @@
 //! 1e8 on the wire and in the store, so there is no conversion to get wrong.
 //! [`amounts`] has no constructor from a float and no conversion into one.
 //!
-//! # What is missing, and why it is missing
+//! # How a statement ends
 //!
-//! W2.5 closes a statement and publishes its counts. Nothing in the contract
-//! says when a statement has ended: there is no close command, the open carries
-//! no expected row count, and no message marks the last row. The counts are
-//! computed here and nothing publishes them, because an invented rule gets the
-//! unresolved count wrong and that is the number the workflow says an operator
-//! actually watches. See `sdk-contract/statement-completion`.
+//! It says how many rows will follow, and it is complete when that many have
+//! landed. Nothing else marks the end: rows arrive as separate messages and
+//! none is distinguishable as the last, so before W2.2 carried a count the
+//! kernel was asked to announce the completion of something whose end it could
+//! not observe.
+//!
+//! Two consequences, both deliberate. A statement whose rows never all arrive
+//! is never announced, because counts published early are wrong and wrong
+//! quietly, and the unresolved figure is the one an operator watches. And rows
+//! beyond the count do not announce it again, because a subscriber's arithmetic
+//! should not depend on how many times it heard.
 
 pub mod amounts;
 pub mod ids;
@@ -49,4 +54,6 @@ pub use memory::MemoryStore;
 pub use positions::list_positions;
 pub use postgres::PostgresStore;
 pub use record::{open_statement, record_holding, Recorded};
-pub use store::{Counts, Holding, Opened, Position, Settled, Statement, Store, StoreError};
+pub use store::{
+    Completion, Counts, Holding, Opened, Position, Settled, Statement, Store, StoreError,
+};

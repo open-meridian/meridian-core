@@ -55,9 +55,10 @@ test:
 # differently in development is a store nobody has tested.
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-reference --test postgres -p meridian-kernel --test postgres >/dev/null 2>&1 \
-		|| { echo "test-store FAILED; see it with:" >&2; \
-		     echo "  docker compose run --rm --build tests cargo test --locked -p meridian-reference --test postgres -p meridian-kernel --test postgres" >&2; exit 1; }
+		cargo test --locked -p meridian-reference --test postgres -p meridian-kernel --test postgres \
+		>.test-store.log 2>&1 \
+		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
+		     tail -40 .test-store.log >&2; exit 1; }
 	@echo "test-store OK: both stores pass against Postgres"
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2

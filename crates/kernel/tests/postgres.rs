@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use meridian_kernel::amounts::{Money, Quantity};
-use meridian_kernel::store::{Counts, Holding, Identifier, Opened, Settled, Statement, Store};
+use meridian_kernel::store::{
+    Completion, Counts, Holding, Identifier, Opened, Settled, Statement, Store,
+};
 use meridian_kernel::PostgresStore;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +48,7 @@ fn opened(store: &PostgresStore) -> Statement {
         external_statement_id: unique("st"),
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
+        expected_rows: 1_000,
     };
     store.open(statement).unwrap().0
 }
@@ -73,15 +76,16 @@ fn a_statement_is_opened_once_and_recognised_after_that() {
         external_statement_id: unique("st"),
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
+        expected_rows: 1_000,
     };
 
-    let (first, opened) = store.open(statement.clone()).unwrap();
+    let (first, opened, _) = store.open(statement.clone()).unwrap();
     assert_eq!(opened, Opened::Opened);
 
     // A redelivery mints a new candidate identifier and must not use it.
     let mut again = statement.clone();
     again.statement_id = unique("STMT");
-    let (second, opened) = store.open(again).unwrap();
+    let (second, opened, _) = store.open(again).unwrap();
 
     assert_eq!(opened, Opened::AlreadyRecorded);
     assert_eq!(second.statement_id, first.statement_id);
@@ -95,7 +99,7 @@ fn a_resolved_row_moves_a_position_and_says_what_it_was() {
     let holding = resolved(&statement, &instrument);
     let account = holding.account_id.clone();
 
-    match store.record(holding, NOW).unwrap() {
+    match store.record(holding, NOW).unwrap().0 {
         Settled::Changed {
             previous_quantity, ..
         } => assert_eq!(previous_quantity, Quantity::ZERO),
@@ -122,7 +126,7 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
     grown.account_id = account.clone();
     grown.quantity = Quantity::from_scaled(2_000_000_000);
 
-    match store.record(grown, NOW + 1).unwrap() {
+    match store.record(grown, NOW + 1).unwrap().0 {
         Settled::Changed {
             previous_quantity,
             position,
@@ -156,7 +160,7 @@ fn a_row_saying_what_the_position_already_held_is_not_a_change() {
     same.account_id = account;
 
     assert!(matches!(
-        store.record(same, NOW + 1).unwrap(),
+        store.record(same, NOW + 1).unwrap().0,
         Settled::Unchanged { .. }
     ));
 }
@@ -177,7 +181,7 @@ fn an_unresolved_row_is_kept_and_moves_nothing() {
     let account = unresolved.account_id.clone();
 
     assert!(matches!(
-        store.record(unresolved, NOW).unwrap(),
+        store.record(unresolved, NOW).unwrap().0,
         Settled::Unresolved
     ));
 
@@ -328,4 +332,65 @@ impl FirstIdentifier for Holding {
             .map(|identifier| identifier.value.clone())
             .unwrap_or_default()
     }
+}
+
+#[test]
+fn a_statement_completes_once_and_only_once_under_concurrency() {
+    // Eight rows landing at the same moment against a statement expecting
+    // eight. Exactly one of them is the row that completed it, because two
+    // announcements would make a subscriber's arithmetic depend on timing.
+    let store = Arc::new(store());
+    let statement = Statement {
+        statement_id: unique("STMT"),
+        source: "snaptrade".into(),
+        external_statement_id: unique("st"),
+        as_of_date: "2026-09-08".into(),
+        read_at_ns: NOW,
+        expected_rows: 8,
+    };
+    let statement = store.open(statement).unwrap().0;
+    let account = unique("ACC");
+
+    let mut racing = Vec::new();
+    for n in 0..8 {
+        let store = store.clone();
+        let statement = statement.clone();
+        let account = account.clone();
+        racing.push(std::thread::spawn(move || {
+            let mut row = resolved(&statement, &format!("INS-{n}"));
+            row.account_id = account;
+            store.record(row, NOW + n).unwrap().1
+        }));
+    }
+
+    let completions = racing
+        .into_iter()
+        .filter(|_| true)
+        .map(|thread| thread.join().unwrap())
+        .filter(|completion| *completion == Completion::JustCompleted)
+        .count();
+
+    assert_eq!(
+        completions, 1,
+        "the statement completed {completions} times"
+    );
+    assert_eq!(store.counts(&statement.statement_id).unwrap().received, 8);
+}
+
+#[test]
+fn a_statement_promising_no_rows_completes_when_it_opens() {
+    let store = store();
+    let (_, opened, completion) = store
+        .open(Statement {
+            statement_id: unique("STMT"),
+            source: "snaptrade".into(),
+            external_statement_id: unique("st"),
+            as_of_date: "2026-09-08".into(),
+            read_at_ns: NOW,
+            expected_rows: 0,
+        })
+        .unwrap();
+
+    assert_eq!(opened, Opened::Opened);
+    assert_eq!(completion, Completion::JustCompleted);
 }

@@ -8,12 +8,25 @@
 
 use meridian_pb::v1::{
     Identifier as PbIdentifier, PositionUpdatedEvent, RecordHoldingReply, RecordHoldingRequest,
-    RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
+    RecordHoldingsStatementReply, RecordHoldingsStatementRequest, StatementRecordedEvent,
 };
 
 use crate::amounts::{Money, Quantity};
 use crate::ids;
-use crate::store::{Holding, Identifier, Opened, Position, Result, Settled, Statement, Store};
+use crate::store::{
+    Completion, Holding, Identifier, Opened, Position, Result, Settled, Statement, Store,
+    StoreError,
+};
+
+/// What opening a statement produced.
+#[derive(Debug, Clone)]
+pub struct Opening {
+    pub reply: RecordHoldingsStatementReply,
+
+    /// Present when the statement promised no rows, which completes it at
+    /// once. An account that holds nothing is a real answer.
+    pub completed: Option<StatementRecordedEvent>,
+}
 
 /// W2.2. Open a statement, or recognise one the rail has sent before.
 ///
@@ -24,18 +37,33 @@ pub fn open_statement(
     store: &dyn Store,
     request: &RecordHoldingsStatementRequest,
     now_ns: i64,
-) -> Result<RecordHoldingsStatementReply> {
-    let (statement, opened) = store.open(Statement {
+) -> Result<Opening> {
+    let (statement, opened, completion) = store.open(Statement {
         statement_id: ids::statement(now_ns),
         source: request.source.clone(),
         external_statement_id: request.external_statement_id.clone(),
         as_of_date: request.as_of_date.clone(),
         read_at_ns: request.read_at_ns,
+        expected_rows: request.expected_rows.max(0) as u32,
     })?;
 
-    Ok(RecordHoldingsStatementReply {
-        statement_id: statement.statement_id,
-        already_recorded: matches!(opened, Opened::AlreadyRecorded),
+    Ok(Opening {
+        reply: RecordHoldingsStatementReply {
+            statement_id: statement.statement_id.clone(),
+            already_recorded: matches!(opened, Opened::AlreadyRecorded),
+        },
+        completed: match completion {
+            Completion::Nothing => None,
+            Completion::JustCompleted => Some(StatementRecordedEvent {
+                statement_id: statement.statement_id,
+                source: statement.source,
+                as_of_date: statement.as_of_date,
+                rows_received: 0,
+                rows_resolved: 0,
+                rows_unresolved: 0,
+                recorded_at_ns: now_ns,
+            }),
+        },
     })
 }
 
@@ -48,6 +76,13 @@ pub struct Recorded {
     /// here, because it updates no position, and neither does a row that says
     /// exactly what the position already held.
     pub event: Option<PositionUpdatedEvent>,
+
+    /// W2.5. Present on the row that completes the statement, and on no other.
+    ///
+    /// A statement whose rows never all arrive produces this never, which is
+    /// the intended behaviour: counts published early would be wrong, and wrong
+    /// quietly, and the unresolved figure is the one an operator watches.
+    pub completed: Option<StatementRecordedEvent>,
 }
 
 /// W2.3 and W2.4. Persist a row, and settle the position behind it.
@@ -83,7 +118,27 @@ pub fn record_holding(
     };
 
     let resolved = holding.resolved();
-    let settled = store.record(holding, now_ns)?;
+    let (settled, completion) = store.record(holding, now_ns)?;
+
+    let completed = match completion {
+        Completion::Nothing => None,
+        Completion::JustCompleted => {
+            let statement = store
+                .statement(&request.statement_id)?
+                .ok_or_else(|| StoreError::UnknownStatement(request.statement_id.clone()))?;
+            let counts = store.counts(&request.statement_id)?;
+
+            Some(StatementRecordedEvent {
+                statement_id: statement.statement_id,
+                source: statement.source,
+                as_of_date: statement.as_of_date,
+                rows_received: counts.received as i32,
+                rows_resolved: counts.resolved as i32,
+                rows_unresolved: counts.unresolved as i32,
+                recorded_at_ns: now_ns,
+            })
+        }
+    };
 
     Ok(Recorded {
         reply: RecordHoldingReply {
@@ -101,6 +156,7 @@ pub fn record_holding(
             }),
             Settled::Unchanged { .. } | Settled::Unresolved => None,
         },
+        completed,
     })
 }
 
@@ -148,6 +204,7 @@ mod tests {
             external_statement_id: "st-2026-09-08-SNAP-ACC-1".into(),
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
+            expected_rows: 4,
         }
     }
 
@@ -184,13 +241,16 @@ mod tests {
     fn opened(store: &MemoryStore) -> String {
         open_statement(store, &statement_request(), NOW)
             .unwrap()
+            .reply
             .statement_id
     }
 
     #[test]
     fn opening_a_statement_mints_one_and_says_it_is_new() {
         let store = MemoryStore::new();
-        let reply = open_statement(&store, &statement_request(), NOW).unwrap();
+        let reply = open_statement(&store, &statement_request(), NOW)
+            .unwrap()
+            .reply;
 
         assert!(reply.statement_id.starts_with("STMT-"));
         assert!(!reply.already_recorded);
@@ -201,8 +261,12 @@ mod tests {
         // The fixture's named case. A connector that cannot tell whether its
         // last attempt landed sends it again, and nothing is doubled.
         let store = MemoryStore::new();
-        let first = open_statement(&store, &statement_request(), NOW).unwrap();
-        let again = open_statement(&store, &statement_request(), NOW + 1).unwrap();
+        let first = open_statement(&store, &statement_request(), NOW)
+            .unwrap()
+            .reply;
+        let again = open_statement(&store, &statement_request(), NOW + 1)
+            .unwrap()
+            .reply;
 
         assert_eq!(again.statement_id, first.statement_id);
         assert!(again.already_recorded);
@@ -212,11 +276,13 @@ mod tests {
     fn the_same_external_identifier_from_another_source_is_another_statement() {
         // A rail's identifiers are its own. Two rails may number theirs alike.
         let store = MemoryStore::new();
-        let first = open_statement(&store, &statement_request(), NOW).unwrap();
+        let first = open_statement(&store, &statement_request(), NOW)
+            .unwrap()
+            .reply;
 
         let mut elsewhere = statement_request();
         elsewhere.source = "another-rail".into();
-        let second = open_statement(&store, &elsewhere, NOW).unwrap();
+        let second = open_statement(&store, &elsewhere, NOW).unwrap().reply;
 
         assert_ne!(second.statement_id, first.statement_id);
         assert!(!second.already_recorded);
@@ -323,6 +389,7 @@ mod tests {
         later.as_of_date = "2026-09-09".into();
         let second = open_statement(&store, &later, NOW + 1)
             .unwrap()
+            .reply
             .statement_id;
         record_holding(&store, &holding_request(&second), NOW + 1).unwrap();
 
@@ -348,6 +415,7 @@ mod tests {
         later.external_statement_id = "st-2026-09-09-SNAP-ACC-1".into();
         let second = open_statement(&store, &later, NOW + 1)
             .unwrap()
+            .reply
             .statement_id;
 
         let mut grown = holding_request(&second);
@@ -370,6 +438,7 @@ mod tests {
         again.external_statement_id = "st-2026-09-09-SNAP-ACC-1".into();
         let second = open_statement(&store, &again, NOW + 1)
             .unwrap()
+            .reply
             .statement_id;
         let unchanged = record_holding(&store, &holding_request(&second), NOW + 1).unwrap();
 
@@ -397,6 +466,116 @@ mod tests {
                 .quantity_scaled_1e8,
             -500_000_000
         );
+    }
+
+    #[test]
+    fn a_statement_completes_on_the_row_that_reaches_its_count() {
+        // W2.5. The fixture's statement says four rows follow.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        for n in 0..3 {
+            let mut row = holding_request(&statement_id);
+            row.instrument_id = format!("INS-{n}");
+            let early = record_holding(&store, &row, NOW).unwrap();
+            assert!(early.completed.is_none(), "announced after {} rows", n + 1);
+        }
+
+        let mut last = holding_request(&statement_id);
+        last.instrument_id = String::new();
+        last.unresolved_identifiers = vec![PbIdentifier {
+            scheme: "symbol".into(),
+            value: "ZZTOP".into(),
+            source: "snaptrade".into(),
+        }];
+        let fourth = record_holding(&store, &last, NOW).unwrap();
+
+        let event = fourth.completed.expect("the fourth row completes it");
+        assert_eq!(event.statement_id, statement_id);
+        assert_eq!(event.source, "snaptrade");
+        assert_eq!(event.as_of_date, "2026-09-08");
+        assert_eq!(event.rows_received, 4);
+        assert_eq!(event.rows_resolved, 3);
+        assert_eq!(event.rows_unresolved, 1);
+        assert_eq!(
+            event.rows_resolved + event.rows_unresolved,
+            event.rows_received
+        );
+    }
+
+    #[test]
+    fn a_statement_missing_a_row_is_never_announced() {
+        // Intended rather than a gap. Counts published early are wrong, and
+        // wrong quietly, and the unresolved figure is the one an operator
+        // watches. It stays open, and open is observable.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        for n in 0..3 {
+            let mut row = holding_request(&statement_id);
+            row.instrument_id = format!("INS-{n}");
+            assert!(record_holding(&store, &row, NOW)
+                .unwrap()
+                .completed
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_row_beyond_the_count_does_not_announce_it_again() {
+        // A subscriber's arithmetic should not depend on how many times it
+        // heard.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        for n in 0..4 {
+            let mut row = holding_request(&statement_id);
+            row.instrument_id = format!("INS-{n}");
+            record_holding(&store, &row, NOW).unwrap();
+        }
+
+        let mut extra = holding_request(&statement_id);
+        extra.instrument_id = "INS-surplus".into();
+        let beyond = record_holding(&store, &extra, NOW).unwrap();
+
+        assert!(beyond.completed.is_none());
+        assert!(beyond.reply.resolved, "the row is still recorded");
+        assert_eq!(store.counts(&statement_id).unwrap().received, 5);
+    }
+
+    #[test]
+    fn a_statement_promising_no_rows_is_complete_when_it_opens() {
+        // An account that holds nothing today is a real answer, and a different
+        // one from not having read the account. Waiting for a row that was
+        // never coming would leave it open forever, which reads as a stuck
+        // connector.
+        let store = MemoryStore::new();
+
+        let mut empty = statement_request();
+        empty.expected_rows = 0;
+        let opening = open_statement(&store, &empty, NOW).unwrap();
+
+        let event = opening.completed.expect("nothing is outstanding");
+        assert_eq!(event.rows_received, 0);
+        assert_eq!(event.rows_resolved, 0);
+        assert_eq!(event.rows_unresolved, 0);
+        assert!(!opening.reply.already_recorded);
+    }
+
+    #[test]
+    fn a_redelivered_empty_statement_does_not_announce_twice() {
+        let store = MemoryStore::new();
+        let mut empty = statement_request();
+        empty.expected_rows = 0;
+
+        assert!(open_statement(&store, &empty, NOW)
+            .unwrap()
+            .completed
+            .is_some());
+        let again = open_statement(&store, &empty, NOW + 1).unwrap();
+
+        assert!(again.reply.already_recorded);
+        assert!(again.completed.is_none());
     }
 
     #[test]
