@@ -1,0 +1,82 @@
+# A deployment's runtime, locally.
+#
+# Postgres and the replica. No platform service, and that is not an omission.
+# Describing the platform here would be a second description of it that drifts
+# from the one in meridian-platform, and the replica starting without it is the
+# behaviour under test rather than a degraded mode.
+#
+# The two projects meet on a shared network. Either may create it, so neither
+# has to come up first.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD: meridian
+      POSTGRES_DB: replica
+    ports:
+      # Not 15433: that is the platform's, and two databases on one port is a
+      # confusing afternoon.
+      - "15434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d replica"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [meridian]
+
+  replica:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
+      MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
+      # The platform's one address. A name on the shared network in
+      # development; a public address anywhere else. Nothing else about the
+      # platform is configured, on purpose.
+      MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
+      # Empty until the deployment is registered. `make demo` fills it in.
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
+      MERIDIAN_INSTANCE_ID: ${MERIDIAN_INSTANCE_ID:-reference-1}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - replica-keys:/var/lib/meridian
+    networks: [meridian]
+
+  # The gates that need services. Not a build stage, because a build stage has
+  # no database, and a lightweight substitute for one is exactly what must not
+  # exist.
+  tests:
+    profiles: [tests]
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+      target: base
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
+      MERIDIAN_TEST_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
+      MERIDIAN_TEST_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
+      # Read-only, and the same key the replica generated. The end-to-end test
+      # has to prove itself to the platform exactly as the replica does, so it
+      # signs with the key that was registered rather than one of its own.
+      MERIDIAN_TEST_KEY_PATH: /var/lib/meridian/key.pem
+      CARGO_TARGET_DIR: /tmp/target
+    volumes:
+      - replica-keys:/var/lib/meridian:ro
+    networks: [meridian]
+
+volumes:
+  replica-keys:
+
+networks:
+  meridian:
+    name: meridian
+    external: true

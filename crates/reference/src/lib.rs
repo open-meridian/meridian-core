@@ -28,6 +28,7 @@
 pub mod apply;
 pub mod assertions;
 pub mod platform;
+pub mod postgres;
 pub mod resolve;
 pub mod service;
 pub mod store;
@@ -38,6 +39,7 @@ pub use apply::{apply, Outcome};
 pub use assertions::{DeploymentKey, SigningError};
 pub use memory::MemoryStore;
 pub use platform::{Config, HttpTransport, Platform, PlatformError, Reaction, Transport};
+pub use postgres::PostgresStore;
 pub use resolve::{missing_instrument, resolve_identifier, resolve_instrument};
 pub use service::{Handled, Reactor, SystemClock};
 pub use store::{Applied, Identifier, Instrument, Store, StoreError};

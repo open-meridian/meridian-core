@@ -231,7 +231,7 @@ impl Reactor {
             _ => return Handled::Reacted(reaction, None),
         };
 
-        match self.apply_and_announce(record, &envelope, now_ns) {
+        match self.apply_and_announce(record, &envelope, now_ns).await {
             Ok(applied) => Handled::Reacted(reaction, Some(applied)),
             Err(failed) => Handled::Ignored(failed),
         }
@@ -242,14 +242,23 @@ impl Reactor {
     /// The announcement carries the miss's correlation, so the whole arc -- the
     /// resolution that missed, the pull that answered it, the apply that
     /// followed -- reads as one chain rather than three unrelated events.
-    fn apply_and_announce(
+    async fn apply_and_announce(
         &self,
         record: PbInstrument,
         caused_by: &meridian_bus::Envelope,
         now_ns: i64,
     ) -> Result<Applied, String> {
-        let outcome =
-            apply(self.store.as_ref(), record, now_ns).map_err(|failed| failed.to_string())?;
+        // Off the runtime, because the store is synchronous and a real one
+        // blocks on a socket. Calling it directly from here would block a
+        // worker thread, and with the Postgres driver it does not merely block:
+        // its own runtime refuses to start inside this one, and the process
+        // aborts. Found by running the end-to-end test against a database
+        // rather than a HashMap.
+        let store = self.store.clone();
+        let outcome = tokio::task::spawn_blocking(move || apply(store.as_ref(), record, now_ns))
+            .await
+            .map_err(|failed| format!("the apply task failed: {failed}"))?
+            .map_err(|failed| failed.to_string())?;
 
         let meta = caused_by.meta.as_ref();
         self.bus

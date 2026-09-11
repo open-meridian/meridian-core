@@ -2,21 +2,26 @@ SHELL := /bin/bash
 PY    := python3
 
 RUST_VERSION := 1.90
+COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test lint fmt lock contract-diff
+        build test test-store lint fmt lock contract-diff up down demo network
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
 	@echo "  make build          compile the workspace"
-	@echo "  make test           run the workspace test suite"
+	@echo "  make test           run the unit tests"
+	@echo "  make test-store     run the Postgres store's tests against Postgres"
+	@echo "  make up             bring up Postgres and the replica"
+	@echo "  make down           take them down, keeping nothing"
+	@echo "  make demo           register this deployment and prove the round trip"
 	@echo "  make lint           rustfmt --check and clippy with warnings denied"
 	@echo "  make lock           regenerate Cargo.lock"
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check build test lint
+ci-local: contract-diff ci-mirror-check build test test-store lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -44,6 +49,15 @@ test:
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target test --progress=plain ." >&2; exit 1; }
 	@echo "test OK: workspace tests pass"
 
+# The store's tests need a database. A build stage has none, and a lightweight
+# in-process substitute is exactly what must not exist: a store that behaves
+# differently in development is a store nobody has tested.
+test-store: network
+	@$(COMPOSE) run --rm -T --build tests cargo test --test postgres --locked >/dev/null 2>&1 \
+		|| { echo "test-store FAILED; see it with:" >&2; \
+		     echo "  docker compose run --rm --build tests cargo test --test postgres --locked" >&2; exit 1; }
+	@echo "test-store OK: the Postgres store passes against Postgres"
+
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
 		|| { echo "lint FAILED; see it with:" >&2; \
@@ -65,3 +79,57 @@ lock:
 install-hooks:
 	@git config core.hooksPath hooks
 	@echo "hooks installed: git push now runs 'make ci-local' first"
+
+up: network
+	@$(COMPOSE) up --build
+
+down:
+	@$(COMPOSE) down -v
+
+# The end-to-end check, run rather than described.
+#
+# It reaches into the platform's compose project, which nothing else here does.
+# That is deliberate and confined to this target: core's own compose describes
+# no platform, because a second description of one is a second thing to keep
+# true. A demo is allowed to know about both.
+PLATFORM   ?= ../meridian-platform
+ORGANISATION ?= Demo Capital
+DEPLOYMENT ?= demo-1
+
+demo: network
+	@test -f "$(PLATFORM)/docker-compose.yaml" \
+		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
+	@$(COMPOSE) up -d --build postgres
+	@echo "1/4  making sure this deployment has a key"
+	@mkdir -p .demo
+	@$(COMPOSE) run --rm --no-deps -T replica public-key > .demo/public-key.pem
+	@echo "2/4  registering it on the platform"
+	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
+		run --rm -T site python -m django register_deployment \
+		--settings platform_site.web.settings \
+		--organisation "$(ORGANISATION)" --deployment "$(DEPLOYMENT)" --public-key - \
+		< .demo/public-key.pem > .demo/deployment-id \
+		|| { echo "registration failed; is the platform up? (make up in $(PLATFORM))" >&2; exit 1; }
+	@echo "     deployment $$(cat .demo/deployment-id)"
+	@echo "3/6  resolving, missing, pulling, applying"
+	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
+		$(COMPOSE) run --rm --build -T tests cargo test --test end_to_end --locked
+	@echo "4/6  taking the platform away"
+	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" stop site >/dev/null 2>&1
+	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
+		$(COMPOSE) run --rm -T tests cargo test --test outage --locked \
+		|| { docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1; exit 1; }
+	@echo "5/6  putting it back, and changing nothing else"
+	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1
+	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
+		$(COMPOSE) run --rm -T tests cargo test --test end_to_end --locked
+	@echo "6/6  done"
+
+# The network the platform and a deployment's runtime meet on.
+#
+# Created here rather than by whichever compose project starts first. Compose
+# warns on every command when it attaches to a network another project created,
+# and `external: true` on both sides with no creator means whoever goes first
+# fails. One line, and neither problem exists.
+network:
+	@docker network inspect meridian >/dev/null 2>&1 || docker network create meridian >/dev/null

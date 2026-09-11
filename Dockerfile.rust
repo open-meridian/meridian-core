@@ -24,11 +24,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/w/target \
     cargo build --workspace --locked
 
+# Unit tests only. The Postgres store's tests need a database, and a build
+# stage has no services; `make test-store` runs them through compose. A
+# lightweight in-process substitute is deliberately not offered, so a store that
+# behaves differently in development cannot exist.
 FROM base AS test
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
-    cargo test --workspace --locked
+    cargo test --workspace --locked --lib
 
 FROM base AS lint
 RUN rustup component add clippy rustfmt

@@ -19,6 +19,9 @@ base64.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
+postgres.workspace = true
+r2d2.workspace = true
+r2d2_postgres.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
