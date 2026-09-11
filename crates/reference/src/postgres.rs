@@ -35,6 +35,10 @@ type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 /// Applied on start. See the file for why there is no migration history.
 const SCHEMA: &str = include_str!("../migrations/0001_replica.sql");
 
+/// Names the schema lock. An arbitrary constant, and it only has to be the same
+/// one in every process that creates this schema.
+const SCHEMA_LOCK: i64 = 0x6d65_7269_6469_616e_u64 as i64;
+
 /// The replica, in a database.
 pub struct PostgresStore {
     pool: Pool,
@@ -58,8 +62,29 @@ impl PostgresStore {
     /// Idempotent, and safe to run from every instance on every start: a
     /// replica holds nothing the platform cannot send again, so there is no
     /// history to preserve and nothing to lose to a re-run.
+    ///
+    /// Under an advisory lock, because `IF NOT EXISTS` is not the concurrency
+    /// answer it reads as. Two connections running this at the same moment race
+    /// inside Postgres' own catalogue and one of them fails, which is what
+    /// happens when a compose file starts two replicas, or when a test suite
+    /// runs nine tests in parallel against an empty database. That is how this
+    /// was found.
+    ///
+    /// The lock is released when this returns, by `pg_advisory_unlock` on the
+    /// happy path and by the connection closing on any other.
     pub fn migrate(&self) -> Result<()> {
-        self.conn()?.batch_execute(SCHEMA).map_err(unavailable)
+        let mut conn = self.conn()?;
+
+        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+            .map_err(unavailable)?;
+
+        let created = conn.batch_execute(SCHEMA).map_err(unavailable);
+
+        // Released whether or not the schema went in, so a failure does not
+        // leave every other instance waiting on a lock nobody holds usefully.
+        let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
+
+        created
     }
 
     fn conn(&self) -> Result<Connection> {
@@ -268,6 +293,17 @@ impl Store for PostgresStore {
 /// Not a loss of meaning: nothing above this trait can act differently on a
 /// connection refused than on a syntax error, and a caller given the
 /// distinction would only be tempted to.
-fn unavailable(failed: impl std::fmt::Display) -> StoreError {
-    StoreError::Unavailable(failed.to_string())
+fn unavailable(failed: impl std::error::Error) -> StoreError {
+    // With the cause, because this driver's own message for most failures is
+    // the words "db error" and everything useful is one level down. An error
+    // that says nothing costs an hour the first time somebody reads it.
+    let mut detail = failed.to_string();
+    let mut cause = failed.source();
+    while let Some(next) = cause {
+        detail.push_str(": ");
+        detail.push_str(&next.to_string());
+        cause = next.source();
+    }
+
+    StoreError::Unavailable(detail)
 }
