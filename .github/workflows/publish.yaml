@@ -1,0 +1,64 @@
+# Publishing the replica image.
+#
+# Separate from `ci`, and not a step inside it, because they answer different
+# questions. `ci` says whether the commit is sound and blocks a merge. This
+# takes a commit that already passed and makes it something a customer can pull.
+#
+# It runs after `ci` succeeds on `main`, so nothing is ever published that the
+# gates have not seen. A workflow_run trigger rather than a push trigger is what
+# enforces that ordering; a push trigger would race the gates and sometimes win.
+#
+# The registry is GitHub's, so a customer pulls without asking us for a
+# credential, which is requirement 11 of the hosting spec.
+
+name: publish
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # `completed` includes failed. Publishing an image whose gates went red
+    # would put the tick and the artifact out of step.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged by commit, never only by `latest`. A release names a tag, so a
+      # rollback is a tag somebody can still find.
+      - id: tag
+        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: |
+            ghcr.io/open-meridian/meridian-replica:${{ steps.tag.outputs.sha }}
+            ghcr.io/open-meridian/meridian-replica:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
