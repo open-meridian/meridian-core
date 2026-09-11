@@ -5,7 +5,10 @@ members = ["crates/bus", "crates/sidecar", "crates/reference", "crates/kernel", 
 [workspace.package]
 edition = "2021"
 rust-version = "1.90"
-license = "Apache-2.0"
+# AGPL, because the deployment runtime is the product. A permissive licence on
+# this would let somebody run it as a service without returning anything, and
+# the network clause is the whole reason to choose this family.
+license = "AGPL-3.0-or-later"
 
 # The wire schema is pinned to an exact commit. Bumping it is a deliberate,
 # reviewable change rather than something that drifts in on a rebuild -- a
