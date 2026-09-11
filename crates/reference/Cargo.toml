@@ -8,6 +8,8 @@ description = "The deployment's replica of the security master: resolve, pull, e
 
 [dependencies]
 meridian-pb.workspace = true
+meridian-bus = { path = "../bus" }
+prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

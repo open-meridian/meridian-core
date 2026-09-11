@@ -756,7 +756,7 @@ impl Transport for HttpTransport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -764,29 +764,29 @@ mod tests {
 
     use super::*;
 
-    const ADDRESS: &str = "https://platform.meridian.example";
-    const DEPLOYMENT: &str = "dep-local-1";
-    const AS_OF: i64 = 1_757_289_600_000_000_000;
+    pub(crate) const ADDRESS: &str = "https://platform.meridian.example";
+    pub(crate) const DEPLOYMENT: &str = "dep-local-1";
+    pub(crate) const AS_OF: i64 = 1_757_289_600_000_000_000;
     const NOW: i64 = 1_757_376_000_000_000_000;
 
     /// A transport that answers from a script and remembers what it was asked.
     ///
     /// The last scripted answer repeats, so a test that wants "always fails" or
     /// "always redirects" says it once.
-    struct Fake {
+    pub(crate) struct Fake {
         script: Mutex<VecDeque<Result<Response, TransportFailure>>>,
         seen: Mutex<Vec<Request>>,
     }
 
     impl Fake {
-        fn new(script: Vec<Result<Response, TransportFailure>>) -> Arc<Self> {
+        pub(crate) fn new(script: Vec<Result<Response, TransportFailure>>) -> Arc<Self> {
             Arc::new(Self {
                 script: Mutex::new(script.into()),
                 seen: Mutex::new(Vec::new()),
             })
         }
 
-        fn urls(&self) -> Vec<String> {
+        pub(crate) fn urls(&self) -> Vec<String> {
             self.seen
                 .lock()
                 .unwrap()
@@ -795,7 +795,7 @@ mod tests {
                 .collect()
         }
 
-        fn calls(&self) -> usize {
+        pub(crate) fn calls(&self) -> usize {
             self.seen.lock().unwrap().len()
         }
 
@@ -823,7 +823,7 @@ mod tests {
         }
     }
 
-    fn reply(status: u16, body: &str) -> Response {
+    pub(crate) fn reply(status: u16, body: &str) -> Response {
         Response {
             status,
             location: String::new(),
@@ -839,12 +839,12 @@ mod tests {
         }
     }
 
-    fn failure(detail: &str) -> Result<Response, TransportFailure> {
+    pub(crate) fn failure(detail: &str) -> Result<Response, TransportFailure> {
         Err(TransportFailure(detail.into()))
     }
 
     /// A record in the shape the platform serialises.
-    fn record_json(instrument_id: &str) -> String {
+    pub(crate) fn record_json(instrument_id: &str) -> String {
         serde_json::json!({
             "found": true,
             "instrument": {
@@ -863,7 +863,7 @@ mod tests {
         .to_string()
     }
 
-    fn platform(transport: Arc<Fake>) -> Platform {
+    pub(crate) fn platform(transport: Arc<Fake>) -> Platform {
         Platform::new(
             Config::new(ADDRESS, DEPLOYMENT),
             DeploymentKey::generate(),

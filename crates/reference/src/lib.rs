@@ -29,6 +29,7 @@ pub mod apply;
 pub mod assertions;
 pub mod platform;
 pub mod resolve;
+pub mod service;
 pub mod store;
 
 mod memory;
@@ -36,8 +37,65 @@ mod memory;
 pub use apply::{apply, Outcome};
 pub use assertions::{DeploymentKey, SigningError};
 pub use memory::MemoryStore;
-pub use platform::{Config, HttpTransport, Platform, PlatformError, Reaction};
+pub use platform::{Config, HttpTransport, Platform, PlatformError, Reaction, Transport};
 pub use resolve::{missing_instrument, resolve_identifier, resolve_instrument};
+pub use service::{Handled, Reactor, SystemClock};
 pub use store::{Applied, Identifier, Instrument, Store, StoreError};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+use std::sync::Arc;
+
+use meridian_bus::Bus;
+
+/// The replica, wired up.
+///
+/// The three pieces are independent and each is testable on its own: a store, a
+/// platform client, a bus. This is the one place that says how a running
+/// deployment holds them together, so a process that wants a replica does not
+/// have to know the order.
+pub struct Replica {
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    platform: Arc<Platform>,
+    clock: Arc<dyn service::Clock>,
+}
+
+impl Replica {
+    pub fn new(
+        bus: Arc<Bus>,
+        store: Arc<dyn Store>,
+        platform: Arc<Platform>,
+        clock: Arc<dyn service::Clock>,
+    ) -> Self {
+        Self {
+            bus,
+            store,
+            platform,
+            clock,
+        }
+    }
+
+    /// Subscribe, register the query handlers, and hand back the loop to run.
+    ///
+    /// Not an `async fn`, and that is the point: everything a caller must have
+    /// in place before the first message arrives happens before this returns,
+    /// and only the consuming loop is left to await. Doing the registration
+    /// inside the returned future would leave a window where the replica is
+    /// started and answers nothing, which a caller cannot see and cannot wait
+    /// for.
+    ///
+    /// The subscription is taken first for the same reason. At-most-once
+    /// delivery drops what arrives before a subscriber exists, and it drops it
+    /// silently.
+    ///
+    /// ```ignore
+    /// let running = tokio::spawn(replica.start());
+    /// ```
+    pub fn start(self) -> impl std::future::Future<Output = ()> {
+        let misses = self.bus.subscribe(service::INSTRUMENT_MISSING);
+        service::serve_queries(&self.bus, self.store.clone());
+
+        Reactor::new(self.bus, self.store, self.platform, self.clock).consume(misses)
+    }
+}
