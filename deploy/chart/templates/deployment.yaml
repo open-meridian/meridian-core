@@ -1,0 +1,77 @@
+{{- include "meridian-replica.require" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-replica.fullname" . }}
+  labels:
+    {{- include "meridian-replica.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-replica.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-replica.labels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: replica
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_DEPLOYMENT_ID
+              value: {{ .Values.deployment.id | quote }}
+            - name: MERIDIAN_PLATFORM_ADDRESS
+              value: {{ .Values.platform.address | quote }}
+            - name: MERIDIAN_KEY_PATH
+              value: /etc/meridian/key.pem
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: MERIDIAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.key }}
+          volumeMounts:
+            # Read-only, because the replica only generates a key when it has
+            # none, and in a cluster it always has one: you made it.
+            - name: key
+              mountPath: /etc/meridian
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: key
+          secret:
+            secretName: {{ .Values.key.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.key.key }}
+                path: key.pem
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

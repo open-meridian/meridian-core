@@ -1,0 +1,54 @@
+# Everything a replica needs, and nothing describing the platform's shape.
+#
+# Three values are required and have no defaults worth guessing. The chart
+# refuses to render without them rather than installing something that starts
+# and cannot work.
+
+image:
+  repository: ghcr.io/open-meridian/meridian-replica
+  # Pin a commit tag in anything you care about. `latest` moves under you.
+  tag: latest
+  pullPolicy: IfNotPresent
+
+platform:
+  # The one address. Not a region, not a list, not a failover order: the
+  # platform is allowed to grow and move without this changing.
+  address: https://open-meridian.com
+
+deployment:
+  # Given to you when you register this deployment's public key.
+  id: ""
+
+database:
+  # A secret holding the connection URL, so it is not in your values file and
+  # not in Helm's release history.
+  existingSecret: ""
+  key: url
+
+key:
+  # A secret holding this replica's private key, in PKCS#8 PEM.
+  #
+  # Created by you from a key the replica generated, never by this chart. A
+  # chart-generated key would live in Helm's release secret and in whatever
+  # holds your values, which are two more places for a private key to be than
+  # there should be.
+  existingSecret: ""
+  key: key.pem
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+logLevel: info
+
+nameOverride: ""
+fullnameOverride: ""
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

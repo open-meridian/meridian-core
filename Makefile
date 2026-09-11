@@ -6,13 +6,14 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test test-store lint fmt lock contract-diff up down demo network
+        build test test-store chart-check lint fmt lock contract-diff up down demo network
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
 	@echo "  make build          compile the workspace"
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
+	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make up             bring up Postgres and the replica"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -21,7 +22,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check build test test-store lint
+ci-local: contract-diff ci-mirror-check build test test-store chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -57,6 +58,26 @@ test-store: network
 		|| { echo "test-store FAILED; see it with:" >&2; \
 		     echo "  docker compose run --rm --build tests cargo test --test postgres --locked" >&2; exit 1; }
 	@echo "test-store OK: the Postgres store passes against Postgres"
+
+HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
+CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d
+
+# A chart that renders is half the check. The other half is that it refuses:
+# a replica with no deployment identifier, no key or no database installs
+# happily and then crash-loops, and the operator reads a restart count instead
+# of a sentence.
+chart-check:
+	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: helm lint" >&2; \
+		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
+	@for missing in deployment.id key.existingSecret database.existingSecret; do \
+		if $(HELM) template check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
+			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
+		fi; \
+	done
+	@echo "chart-check OK: the chart renders, and refuses without each of its three required values"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

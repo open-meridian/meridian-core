@@ -1,0 +1,13 @@
+apiVersion: v2
+name: meridian-replica
+description: A deployment's replica of the Meridian security master
+type: application
+
+# The chart's own version, and the application's. They move independently: a
+# fix to a template is not a new replica.
+version: 0.1.0
+appVersion: "0.1.0"
+
+home: https://github.com/open-meridian/meridian-core
+sources:
+  - https://github.com/open-meridian/meridian-core

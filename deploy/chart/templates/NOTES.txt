@@ -1,0 +1,15 @@
+{{ include "meridian-replica.fullname" . }} is installed.
+
+It answers instrument questions from what it holds, and pulls from
+{{ .Values.platform.address }} when it meets something it has not seen.
+
+It does not stop working when that address does. If the platform is unreachable,
+resolution continues from what is already held, and pulling resumes on its own
+when the platform returns. Nothing here needs restarting for that.
+
+Watch it:
+
+  kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+If it refuses to start, the message says which value is wrong. The three that
+matter are the deployment identifier, the key secret and the database secret.
