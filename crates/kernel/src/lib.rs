@@ -37,6 +37,7 @@
 pub mod amounts;
 pub mod ids;
 pub mod positions;
+pub mod postgres;
 pub mod record;
 pub mod service;
 pub mod store;
@@ -46,5 +47,6 @@ mod memory;
 pub use amounts::{Money, Quantity};
 pub use memory::MemoryStore;
 pub use positions::list_positions;
+pub use postgres::PostgresStore;
 pub use record::{open_statement, record_holding, Recorded};
 pub use store::{Counts, Holding, Opened, Position, Settled, Statement, Store, StoreError};
