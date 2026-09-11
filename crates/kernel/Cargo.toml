@@ -1,0 +1,22 @@
+[package]
+name = "meridian-kernel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The deployment ledger: holdings statements, holdings and positions"
+
+[dependencies]
+meridian-pb.workspace = true
+meridian-bus = { path = "../bus" }
+prost.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+postgres.workspace = true
+r2d2.workspace = true
+r2d2_postgres.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

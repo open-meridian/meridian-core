@@ -1015,6 +1015,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-kernel"
+version = "0.1.0"
+dependencies = [
+ "meridian-bus",
+ "meridian-pb",
+ "postgres",
+ "prost",
+ "r2d2",
+ "r2d2_postgres",
+ "rand 0.8.8",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-pb"
 version = "0.1.0"
 source = "git+https://github.com/open-meridian/meridian-schema.git?rev=efbfe948d489293e354111e632108ffcfa3d1509#efbfe948d489293e354111e632108ffcfa3d1509"
@@ -1861,9 +1877,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "socket2"
