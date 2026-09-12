@@ -1,20 +1,20 @@
-{{- include "meridian-replica.require" . -}}
+{{- include "meridian-runtime.require" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "meridian-replica.fullname" . }}
+  name: {{ include "meridian-runtime.fullname" . }}
   labels:
-    {{- include "meridian-replica.labels" . | nindent 4 }}
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "meridian-replica.name" . }}
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        {{- include "meridian-replica.labels" . | nindent 8 }}
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}

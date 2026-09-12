@@ -1,5 +1,5 @@
 apiVersion: v2
-name: meridian-replica
+name: meridian-runtime
 description: A deployment's replica of the Meridian security master
 type: application
 

@@ -63,7 +63,7 @@ jobs:
           target: runtime
           push: true
           tags: |
-            ghcr.io/open-meridian/meridian-replica:${{ steps.tag.outputs.sha }}
-            ghcr.io/open-meridian/meridian-replica:latest
+            ghcr.io/open-meridian/meridian-runtime:${{ steps.tag.outputs.sha }}
+            ghcr.io/open-meridian/meridian-runtime:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

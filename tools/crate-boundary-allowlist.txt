@@ -9,4 +9,4 @@
 # separation without API separation is decorative -- the schema becomes the
 # interface the moment a second component links against it.
 
-meridian-replica->meridian-reference	The composition root for a deployment's replica: it opens the database, builds the platform client and hands both to the crate that uses them. It calls no store method itself.
+meridian-runtime->meridian-reference	The composition root for a deployment's replica: it opens the database, builds the platform client and hands both to the crate that uses them. It calls no store method itself.

@@ -5,7 +5,7 @@
 # and cannot work.
 
 image:
-  repository: ghcr.io/open-meridian/meridian-replica
+  repository: ghcr.io/open-meridian/meridian-runtime
   # Pin a commit tag in anything you care about. `latest` moves under you.
   tag: latest
   pullPolicy: IfNotPresent

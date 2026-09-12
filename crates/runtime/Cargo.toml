@@ -1,10 +1,10 @@
 [package]
-name = "meridian-replica"
+name = "meridian-runtime"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The process that runs a deployment's replica of the security master"
+description = "A deployment's runtime: the process a customer runs"
 
 [dependencies]
 meridian-bus = { path = "../bus" }

@@ -1,4 +1,8 @@
-//! The process that runs a deployment's replica.
+//! A deployment's runtime: the process a customer runs.
+//!
+//! Today it holds the replica of the security master. The kernel and the
+//! dashboard join it, which is why it is not named for the one thing it does
+//! first.
 //!
 //! Configuration is one address, this deployment's identifier, a private key
 //! and a database. Nothing about the platform's shape, because the platform is

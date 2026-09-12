@@ -1,17 +1,17 @@
-{{- define "meridian-replica.name" -}}
+{{- define "meridian-runtime.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "meridian-replica.fullname" -}}
+{{- define "meridian-runtime.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name (include "meridian-replica.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name (include "meridian-runtime.name" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "meridian-replica.labels" -}}
-app.kubernetes.io/name: {{ include "meridian-replica.name" . }}
+{{- define "meridian-runtime.labels" -}}
+app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
@@ -25,7 +25,7 @@ identifier cannot sign; one with no key cannot either; one with no database has
 nowhere to keep what it is told. Installing and then crash-looping would tell
 the operator the same thing far less clearly.
 */}}
-{{- define "meridian-replica.require" -}}
+{{- define "meridian-runtime.require" -}}
 {{- if not .Values.deployment.id -}}
 {{- fail "deployment.id is not set. Register this replica's public key with the platform; the identifier comes back from that." -}}
 {{- end -}}

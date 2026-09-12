@@ -1,4 +1,4 @@
-{{ include "meridian-replica.fullname" . }} is installed.
+{{ include "meridian-runtime.fullname" . }} is installed.
 
 It answers instrument questions from what it holds, and pulls from
 {{ .Values.platform.address }} when it meets something it has not seen.

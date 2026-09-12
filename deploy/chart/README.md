@@ -1,4 +1,4 @@
-# meridian-replica
+# meridian-runtime
 
 A deployment's replica of the Meridian security master, for a Kubernetes
 cluster. On a laptop or at a provider; the chart does not care which.
@@ -16,7 +16,7 @@ the private half.
 ```bash
 mkdir -p keys
 docker run --rm -v "$PWD/keys:/var/lib/meridian" \
-  ghcr.io/open-meridian/meridian-replica public-key
+  ghcr.io/open-meridian/meridian-runtime public-key
 ```
 
 That prints the public half and leaves the private half in `keys/key.pem`.

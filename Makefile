@@ -133,7 +133,7 @@ demo: network
 	@$(COMPOSE) up -d --build postgres
 	@echo "1/4  making sure this deployment has a key"
 	@mkdir -p .demo
-	@$(COMPOSE) run --rm --no-deps -T replica public-key > .demo/public-key.pem
+	@$(COMPOSE) run --rm --no-deps -T runtime public-key > .demo/public-key.pem
 	@echo "2/4  registering it on the platform"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
 		run --rm -T site python -m django register_deployment \

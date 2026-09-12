@@ -17,8 +17,8 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
-    cargo build --release --locked -p meridian-replica \
- && cp target/release/meridian-replica /usr/local/bin/meridian-replica
+    cargo build --release --locked -p meridian-runtime \
+ && cp target/release/meridian-runtime /usr/local/bin/meridian-runtime
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -29,5 +29,5 @@ RUN apt-get update \
 RUN mkdir -p /var/lib/meridian
 VOLUME /var/lib/meridian
 
-COPY --from=build /usr/local/bin/meridian-replica /usr/local/bin/meridian-replica
-ENTRYPOINT ["/usr/local/bin/meridian-replica"]
+COPY --from=build /usr/local/bin/meridian-runtime /usr/local/bin/meridian-runtime
+ENTRYPOINT ["/usr/local/bin/meridian-runtime"]
