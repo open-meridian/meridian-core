@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test test-store chart-check check-crate-boundaries check-test-targets lint fmt lock contract-diff up down demo network
+        build test test-store chart-check check-crate-boundaries check-test-targets interop lint fmt lock contract-diff up down demo network
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -24,7 +24,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets build test test-store chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets build test test-store interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -124,6 +124,37 @@ up: network
 
 down:
 	@$(COMPOSE) down -v
+
+# The Python SDK against this runtime.
+#
+# The sidecar surface is implemented twice, once here and once in the SDK, and
+# decisions/007 says the two must agree. Nothing checked that until this target:
+# each side's tests drove a server written in the same language by the same
+# hand, which shows each is self-consistent and nothing more.
+#
+# A deployment id is supplied because the runtime requires one, and any value
+# does: the platform is not contacted at startup, and this check never reaches
+# it. The role and the grants come from compose and the mounted example table,
+# so what the SDK is held to here is the file a deployment actually ships.
+SDK ?= ../meridian-python
+
+interop: network
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(DOCKER) build -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
+		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build runtime >/dev/null 2>&1 \
+		|| { echo "interop FAILED: the runtime did not start" >&2; exit 1; }
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
+		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
+		status=$$?; \
+		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) down -v >/dev/null 2>&1; \
+		if [ $$status -ne 0 ]; then \
+			echo "interop FAILED. The last 40 lines, and the whole of it in .interop.log:" >&2; \
+			tail -40 .interop.log >&2; exit 1; \
+		fi
+	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface"
 
 # The end-to-end check, run rather than described.
 #

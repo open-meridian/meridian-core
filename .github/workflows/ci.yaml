@@ -28,12 +28,23 @@ jobs:
         with:
           # Full history, so the base commit resolves.
           fetch-depth: 0
+          path: workspace/meridian-core
+
+      # The interop gate drives this runtime's sidecar from the Python SDK,
+      # which is the only check that the two implementations of that surface
+      # agree. Both repositories are public, so this needs no credential and
+      # nothing private is reachable from here.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/meridian-python
+          path: workspace/meridian-python
 
       # The gate needs a range to police. A default checkout is shallow and
       # detached, with no upstream and no origin/main, and the tool now fails
       # rather than passing on that. See the review finding on meridian-core#5,
       # where it reported success having inspected nothing.
       - name: Resolve the contract-diff base
+        working-directory: workspace/meridian-core
         run: |
           case "${{ github.event_name }}" in
             pull_request) base="${{ github.event.pull_request.base.sha }}" ;;
@@ -49,6 +60,7 @@ jobs:
           echo "CONTRACT_DIFF_BASE=$base" >> "$GITHUB_ENV"
 
       - name: make ci-local
+        working-directory: workspace/meridian-core
         run: make ci-local
         # build, test and lint each run in Dockerfile.rust at the pinned toolchain.
         # No Rust is installed on the runner, deliberately: the container is the

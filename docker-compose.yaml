@@ -50,8 +50,8 @@ services:
       # Who the sidecar serves, assigned at launch rather than declared by the
       # plugin. Empty by default: no plugin runs in this compose file yet, and
       # an unconfigured sidecar should refuse rather than admit.
-      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-}
-      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-}
+      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-interop-1}
+      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-custody}
       MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
       RUST_LOG: ${RUST_LOG:-info}
     # No port for the sidecar, deliberately. It binds loopback, so a plugin
@@ -65,6 +65,24 @@ services:
       # the right default for a file that decides access.
       - ./deploy/grants.example.json:/etc/meridian/grants.json:ro
     networks: [meridian]
+
+  # The Python SDK against this runtime, which is the only check that the two
+  # implementations of the sidecar surface agree.
+  #
+  # network_mode puts this container in the runtime's network namespace rather
+  # than beside it on a network. That is not a convenience: the sidecar binds
+  # loopback, because a sidecar reachable from another host is a way around the
+  # boundary it enforces, so a plugin has to share the namespace. In Kubernetes
+  # that is a container in the same pod, and this is the compose equivalent.
+  interop:
+    profiles: [interop]
+    image: meridian-python-interop
+    depends_on:
+      runtime:
+        condition: service_started
+    environment:
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
+    network_mode: "service:runtime"
 
   # The gates that need services. Not a build stage, because a build stage has
   # no database, and a lightweight substitute for one is exactly what must not
