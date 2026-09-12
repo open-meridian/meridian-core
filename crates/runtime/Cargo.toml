@@ -9,6 +9,13 @@ description = "A deployment's runtime: the process a customer runs"
 [dependencies]
 meridian-bus = { path = "../bus" }
 meridian-reference = { path = "../reference" }
+meridian-kernel = { path = "../kernel" }
+meridian-sidecar = { path = "../sidecar" }
+meridian-pb.workspace = true
+tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+prost.workspace = true

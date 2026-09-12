@@ -10,3 +10,4 @@
 # interface the moment a second component links against it.
 
 meridian-runtime->meridian-reference	The composition root for a deployment's replica: it opens the database, builds the platform client and hands both to the crate that uses them. It calls no store method itself.
+meridian-runtime->meridian-kernel	The same composition root, for the ledger: it opens the store and hands it over, and calls no store method itself.

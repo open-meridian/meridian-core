@@ -46,6 +46,18 @@ resources:
 
 logLevel: info
 
+sidecar:
+  # Where plugins dial. They run as their own pods and reach the bus only
+  # through this.
+  port: 9191
+
+grants:
+  # A ConfigMap holding the grant table: which roles this deployment admits and
+  # what each may publish and subscribe to. Absent, nothing registers, which is
+  # the right default for a file that decides access.
+  existingConfigMap: ""
+  key: grants.json
+
 nameOverride: ""
 fullnameOverride: ""
 podAnnotations: {}

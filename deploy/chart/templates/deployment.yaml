@@ -47,15 +47,32 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.key }}
+          ports:
+            - name: sidecar
+              containerPort: {{ .Values.sidecar.port }}
           volumeMounts:
             # Read-only, because the replica only generates a key when it has
             # none, and in a cluster it always has one: you made it.
             - name: key
               mountPath: /etc/meridian
               readOnly: true
+            {{- if .Values.grants.existingConfigMap }}
+            - name: grants
+              mountPath: /etc/meridian/grants.json
+              subPath: grants.json
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        {{- if .Values.grants.existingConfigMap }}
+        - name: grants
+          configMap:
+            name: {{ .Values.grants.existingConfigMap }}
+            items:
+              - key: {{ .Values.grants.key }}
+                path: grants.json
+        {{- end }}
         - name: key
           secret:
             secretName: {{ .Values.key.existingSecret }}

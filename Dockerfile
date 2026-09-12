@@ -29,5 +29,8 @@ RUN apt-get update \
 RUN mkdir -p /var/lib/meridian
 VOLUME /var/lib/meridian
 
+# Where plugins dial.
+EXPOSE 9191
+
 COPY --from=build /usr/local/bin/meridian-runtime /usr/local/bin/meridian-runtime
 ENTRYPOINT ["/usr/local/bin/meridian-runtime"]

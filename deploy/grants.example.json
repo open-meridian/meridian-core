@@ -1,0 +1,30 @@
+{
+  "_note": "A query is a call, and a call is gated by the publish grant, so a role that reads has to be granted the query topic under publish. Denial is by absence: a role named nowhere here gets nothing.",
+  "roles": {
+    "custody": {
+      "publish": [
+        "platform.kernel.command.record-statement",
+        "platform.kernel.command.record-holding",
+        "platform.reference.query.resolve-identifier",
+        "platform.reference.query.resolve-instrument",
+        "platform.reference.event.instrument-missing",
+        "platform.custody.*.event.sync-status"
+      ],
+      "subscribe": [
+        "platform.reference.event.instrument-applied"
+      ]
+    },
+    "dashboard": {
+      "publish": [
+        "platform.kernel.query.list-custodial-positions",
+        "platform.reference.query.resolve-identifier",
+        "platform.reference.query.resolve-instrument"
+      ],
+      "subscribe": [
+        "platform.kernel.event.*",
+        "platform.reference.event.*",
+        "platform.custody.*.event.sync-status"
+      ]
+    }
+  }
+}

@@ -1066,8 +1066,13 @@ name = "meridian-runtime"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
+ "meridian-kernel",
+ "meridian-pb",
  "meridian-reference",
+ "meridian-sidecar",
+ "prost",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
