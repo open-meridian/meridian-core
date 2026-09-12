@@ -18,6 +18,18 @@
 //! When a network backend exists the sidecar can move out, and a plugin will
 //! not notice: it already talks gRPC to an address it is told.
 //!
+//! # One plugin, for now
+//!
+//! One sidecar per plugin is the intended shape, and this is not it. A sidecar
+//! holds one registration and no request after the first says who is calling,
+//! because v1 paired a sidecar with its plugin physically. On a shared port
+//! that pairing is gone, so a second plugin is refused rather than silently
+//! replacing the first and lending it its grants.
+//!
+//! Restoring the intended shape means a sidecar in its own container, which
+//! means a bus it can reach from outside this process:
+//! `sdk-contract/sidecar-needs-a-bus-across-a-process-boundary`.
+//!
 //! # Two stores, which may be one database
 //!
 //! The replica and the ledger take separate connection settings and default to

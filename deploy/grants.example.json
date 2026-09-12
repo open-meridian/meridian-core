@@ -1,5 +1,5 @@
 {
-  "_note": "A query is a call, and a call is gated by the publish grant, so a role that reads has to be granted the query topic under publish. Denial is by absence: a role named nowhere here gets nothing.",
+  "_note": "Two things to know. A query is a call and a call is gated by the publish grant, so a role that only reads still needs its query topics listed under publish. And a plugin's role and each of its tags are looked up in this one table and unioned, so a tag is an entry here like any other; giving a tag the same name as a role merges them silently.",
   "roles": {
     "custody": {
       "publish": [
@@ -24,6 +24,14 @@
         "platform.kernel.event.*",
         "platform.reference.event.*",
         "platform.custody.*.event.sync-status"
+      ]
+    },
+    "positions-reader": {
+      "publish": [
+        "platform.kernel.query.list-custodial-positions"
+      ],
+      "subscribe": [
+        "platform.kernel.event.custodial-position-updated"
       ]
     }
   }

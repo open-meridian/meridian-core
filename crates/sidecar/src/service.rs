@@ -128,6 +128,39 @@ impl SidecarService for Sidecar {
             }));
         }
 
+        // One sidecar serves one plugin, and this is where that stops being a
+        // description and becomes enforcement.
+        //
+        // The registration is a single slot because v1 ran a sidecar container
+        // per plugin, so there was never a second plugin to hold. A runtime
+        // that exposes one shared port breaks that assumption, and the failure
+        // is silent and in the wrong direction: nothing here identifies the
+        // caller on a later request, so every plugin operates under whichever
+        // registration was written last. A read-only role registering before a
+        // connector would inherit the connector's write grants.
+        //
+        // Refusing the second plugin makes that a startup failure an operator
+        // reads instead of an escalation nobody sees. Carrying a caller
+        // identity on every request is the real fix and it changes the
+        // contract, so it goes through a queued task rather than an edit here.
+        if let Some(live) = self.state.read().expect("state lock poisoned").as_ref() {
+            if !live.departed && live.instance_id != req.instance_id {
+                tracing::warn!(
+                    instance = req.instance_id,
+                    held_by = live.instance_id,
+                    "refused: this sidecar already serves another plugin"
+                );
+                return Ok(Response::new(RegisterReply {
+                    admitted: false,
+                    refusal_reason: format!(
+                        "this sidecar already serves `{}`; one sidecar serves one plugin",
+                        live.instance_id
+                    ),
+                    ..Default::default()
+                }));
+            }
+        }
+
         let grants = table.resolve(&req.role, &req.tags);
         if grants.publish.is_empty() && grants.subscribe.is_empty() {
             return Ok(Response::new(RegisterReply {
@@ -353,6 +386,10 @@ mod tests {
             "platform.custody.*.event.sync-status"
           ],
           "subscribe": ["platform.reference.event.instrument-applied"]
+        },
+        "dashboard": {
+          "publish": [],
+          "subscribe": ["platform.kernel.event.*"]
         }
       }
     }"#;
@@ -443,6 +480,81 @@ mod tests {
         assert_eq!(
             reply.subscribe_grants,
             vec!["platform.reference.event.instrument-applied".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_plugin_is_refused_rather_than_taking_over_the_first() {
+        let sc = admitted_sidecar().await;
+
+        // A read-only role arrives at the same sidecar. Nothing on a later
+        // request says who is calling, so admitting this would not give it its
+        // own identity: it would replace the connector's, and every subsequent
+        // call from either plugin would be judged against whichever grants were
+        // written last. Refusal at the door is the only place this is visible.
+        let reply = sc
+            .register(Request::new(RegisterRequest {
+                instance_id: "dashboard-1".into(),
+                role: "dashboard".into(),
+                tags: vec![],
+                schema_version: "v1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!reply.admitted);
+        assert!(
+            reply.refusal_reason.contains("already serves"),
+            "unhelpful refusal: {}",
+            reply.refusal_reason
+        );
+
+        // The first plugin is untouched, rather than left holding a half-
+        // replaced registration.
+        let held = sc.registration().unwrap();
+        assert_eq!(held.instance_id, "custody-snaptrade-1");
+        assert!(held
+            .grants
+            .may_publish("platform.kernel.command.record-holding"));
+    }
+
+    #[tokio::test]
+    async fn the_same_plugin_may_register_again_after_a_restart() {
+        let sc = admitted_sidecar().await;
+
+        // A plugin that restarted reconnects under the identity it already
+        // holds. Refusing that would leave a sidecar permanently occupied by a
+        // plugin that no longer exists.
+        let reply = sc
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.admitted);
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_is_free_again_once_its_plugin_leaves() {
+        let sc = admitted_sidecar().await;
+        sc.leave(Request::new(LeaveRequest::default()))
+            .await
+            .unwrap();
+
+        let reply = sc
+            .register(Request::new(RegisterRequest {
+                instance_id: "dashboard-1".into(),
+                role: "dashboard".into(),
+                tags: vec![],
+                schema_version: "v1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            reply.admitted,
+            "refused after the first plugin left: {}",
+            reply.refusal_reason
         );
     }
 

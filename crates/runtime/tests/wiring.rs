@@ -145,6 +145,11 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 
     // A different plugin, a different role, reading what the first one wrote.
     // One store behind one bus, rather than two of each.
+    //
+    // It needs a second Sidecar because one holds a single registration, so a
+    // shared endpoint admits one plugin. That is the deployment shape today and
+    // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
+    // where it changes, and this line is what should stop being necessary.
     let dashboard = Sidecar::new(bus, "DEP-test", "v1");
     dashboard.load_grants(GrantTable::from_json(GRANTS).unwrap());
     admitted(&dashboard, "dashboard-1", "dashboard").await;
@@ -185,6 +190,17 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     assert!(dashboard.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
     // Read-only means read-only: nothing a dashboard does writes to the ledger.
     assert!(!dashboard.may_publish(meridian_kernel::service::RECORD_HOLDING));
+
+    // A plugin carries a role and any number of tags, and gets the union. A
+    // connector that also reads positions asks for the tag rather than having a
+    // bespoke role minted for the combination.
+    let both = table.resolve("custody", &["positions-reader".to_string()]);
+    assert!(both.may_publish(meridian_kernel::service::RECORD_HOLDING));
+    assert!(both.may_publish(meridian_kernel::service::LIST_CUSTODIAL_POSITIONS));
+    assert!(both.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
+
+    // A tag adds and never subtracts, so the role alone is the smaller set.
+    assert!(!custody.may_publish(meridian_kernel::service::LIST_CUSTODIAL_POSITIONS));
 
     // Denial is by absence, so an unknown role gets nothing rather than
     // everything.
