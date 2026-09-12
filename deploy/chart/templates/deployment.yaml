@@ -42,6 +42,12 @@ spec:
               value: /etc/meridian/key.pem
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ .Values.sidecar.address | quote }}
+            - name: MERIDIAN_PLUGIN_INSTANCE_ID
+              value: {{ .Values.sidecar.plugin.instanceId | quote }}
+            - name: MERIDIAN_PLUGIN_ROLE
+              value: {{ .Values.sidecar.plugin.role | quote }}
+            - name: MERIDIAN_PLUGIN_TAGS
+              value: {{ join "," .Values.sidecar.plugin.tags | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL

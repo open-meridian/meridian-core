@@ -19,7 +19,7 @@ use meridian_pb::v1::{
     RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
     RegisterRequest, ResolveIdentifierReply, ResolveIdentifierRequest,
 };
-use meridian_sidecar::{GrantTable, Sidecar};
+use meridian_sidecar::{GrantTable, Identity, Sidecar};
 use prost::Message;
 use tonic::Request;
 
@@ -43,24 +43,34 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
         Arc::new(meridian_reference::MemoryStore::new()),
     );
 
-    let sidecar = Sidecar::new(bus.clone(), "DEP-test", "v1");
+    let sidecar = Sidecar::new(
+        bus.clone(),
+        "DEP-test",
+        "v1",
+        Identity::new("custody-snaptrade-1", "custody"),
+    );
     sidecar.load_grants(GrantTable::from_json(GRANTS).expect("the shipped grants parse"));
 
     (bus, sidecar)
 }
 
-async fn admitted(sidecar: &Sidecar, instance_id: &str, role: &str) {
+/// A plugin announcing its arrival. It says nothing about who it is: the
+/// sidecar was launched knowing that, and the reply is where the plugin finds
+/// out.
+async fn admitted(sidecar: &Sidecar, expected_role: &str) {
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            instance_id: instance_id.into(),
-            role: role.into(),
-            tags: vec![],
             schema_version: "v1".into(),
         }))
         .await
         .expect("register is served")
         .into_inner();
-    assert!(reply.admitted, "the shipped grants refuse the {role} role");
+    assert!(
+        reply.admitted,
+        "the shipped grants refuse the {expected_role} role: {}",
+        reply.refusal_reason
+    );
+    assert_eq!(reply.role, expected_role);
 }
 
 /// Call a topic the way a plugin does, and fail loudly rather than decoding
@@ -91,7 +101,7 @@ async fn call<T: Message + Default>(
 #[tokio::test]
 async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     let (bus, sidecar) = runtime();
-    admitted(&sidecar, "custody-snaptrade-1", "custody").await;
+    admitted(&sidecar, "custody").await;
 
     // The reference side answers on the same process. Nothing is loaded, so the
     // answer is a miss — which is the honest one, and still proves the handler
@@ -150,9 +160,14 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // shared endpoint admits one plugin. That is the deployment shape today and
     // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
     // where it changes, and this line is what should stop being necessary.
-    let dashboard = Sidecar::new(bus, "DEP-test", "v1");
+    let dashboard = Sidecar::new(
+        bus,
+        "DEP-test",
+        "v1",
+        Identity::new("dashboard-1", "dashboard"),
+    );
     dashboard.load_grants(GrantTable::from_json(GRANTS).unwrap());
-    admitted(&dashboard, "dashboard-1", "dashboard").await;
+    admitted(&dashboard, "dashboard").await;
 
     let listed: ListCustodialPositionsReply = call(
         &dashboard,

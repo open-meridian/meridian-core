@@ -68,7 +68,7 @@ use meridian_kernel::service::SystemClock as LedgerClock;
 use meridian_reference::{
     Config, DeploymentKey, HttpTransport, Platform, PostgresStore, Replica, SystemClock,
 };
-use meridian_sidecar::{GrantTable, Sidecar};
+use meridian_sidecar::{GrantTable, Identity, Sidecar};
 
 /// One attempt against the platform. The retry sequence is longer by design.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -156,7 +156,17 @@ fn run() -> Result<(), String> {
     // cannot find a topic that nothing serves yet.
     meridian_kernel::service::serve(bus.clone(), Arc::new(ledger_store), Arc::new(LedgerClock));
 
-    let sidecar = Sidecar::new(bus.clone(), &deployment_id, "v1");
+    // Who this sidecar serves, from the environment rather than from whatever
+    // registers. A plugin that named its own role would be choosing its own
+    // privileges. Unset means no role, which resolves to no grants, so the
+    // registration is refused and says so.
+    let identity = Identity::new(
+        var("MERIDIAN_PLUGIN_INSTANCE_ID").unwrap_or_default(),
+        var("MERIDIAN_PLUGIN_ROLE").unwrap_or_default(),
+    )
+    .with_tags(tags_from(var("MERIDIAN_PLUGIN_TAGS")));
+
+    let sidecar = Sidecar::new(bus.clone(), &deployment_id, "v1", identity);
     sidecar.load_grants(grants);
 
     let replica = Replica::new(
@@ -222,6 +232,22 @@ fn run() -> Result<(), String> {
         })?;
 
     Ok(())
+}
+
+/// Tags from one comma-separated value, blanks dropped.
+///
+/// Empty and unset are the same thing here: a sidecar with no tags, which is
+/// the ordinary case. v1 read this from the environment too, and a null value
+/// there meant a plugin that registered and then had every publish denied, so
+/// the sidecar logs what it was launched with rather than leaving an operator
+/// to infer it from refusals.
+fn tags_from(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The grant table, or an empty one.

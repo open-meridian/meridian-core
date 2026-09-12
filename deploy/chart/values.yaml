@@ -55,6 +55,17 @@ sidecar:
   # pod. The runtime warns when it is not loopback.
   address: 127.0.0.1:9191
 
+  # Who this sidecar serves. Assigned here, at launch, never declared by the
+  # plugin: a plugin that named its own role would be choosing its own
+  # privileges. Together with the grant table these decide its topic access.
+  #
+  # Left empty, the plugin's registration is refused for having no grants, which
+  # is the right way for an unconfigured deployment to fail.
+  plugin:
+    instanceId: ""
+    role: ""
+    tags: []
+
 grants:
   # A ConfigMap holding the grant table: which roles this deployment admits and
   # what each may publish and subscribe to. Absent, nothing registers, which is

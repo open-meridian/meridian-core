@@ -16,7 +16,7 @@ pub mod grants;
 mod service;
 
 pub use grants::{GrantTable, Grants};
-pub use service::{Registration, Sidecar};
+pub use service::{Identity, Registration, Sidecar};
 
 /// The address a plugin expects its sidecar on.
 ///

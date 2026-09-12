@@ -1,10 +1,10 @@
 //! The operations W4 declares, implemented over the bus.
 //!
-//! One sidecar serves exactly one plugin. That is why no request after
-//! `Register` carries an instance id: there is only one plugin it could be, and
+//! One sidecar serves exactly one plugin. That is why no request carries an
+//! instance id, `Register` included: there is only one plugin it could be, and
 //! a field a caller fills in is a field a caller can get wrong. Identity comes
-//! from the registration, and the registration comes from the process the
-//! sidecar was started for.
+//! from the sidecar's launch configuration, which is to say from whoever
+//! deployed it, and the plugin is told what it is rather than asked.
 
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -32,10 +32,41 @@ pub struct Registration {
     pub departed: bool,
 }
 
+/// Who a sidecar was launched to serve.
+///
+/// Supplied when the sidecar is built, which is to say by whoever deployed it,
+/// and never by the plugin. These three decide the plugin's topic access: a
+/// plugin that named its own role would be choosing its own privileges, and one
+/// that named its own instance could publish as a sibling, because grants are
+/// written with instance wildcards so an instance-scoped topic needs no grant
+/// minted per instance.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub instance_id: String,
+    pub role: String,
+    pub tags: Vec<String>,
+}
+
+impl Identity {
+    pub fn new(instance_id: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            role: role.into(),
+            tags: Vec::new(),
+        }
+    }
+
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+}
+
 pub struct Sidecar {
     bus: Arc<Bus>,
     deployment_id: String,
     schema_version: String,
+    identity: Identity,
 
     /// `None` until access control has loaded.
     ///
@@ -52,11 +83,13 @@ impl Sidecar {
         bus: Arc<Bus>,
         deployment_id: impl Into<String>,
         schema_version: impl Into<String>,
+        identity: Identity,
     ) -> Self {
         Self {
             bus,
             deployment_id: deployment_id.into(),
             schema_version: schema_version.into(),
+            identity,
             grants: Arc::new(RwLock::new(None)),
             state: Arc::new(RwLock::new(None)),
         }
@@ -106,7 +139,7 @@ impl SidecarService for Sidecar {
             Some(t) => t,
             None => {
                 tracing::warn!(
-                    instance = req.instance_id,
+                    instance = self.identity.instance_id,
                     "refused: access control not loaded"
                 );
                 return Ok(Response::new(RegisterReply {
@@ -128,58 +161,39 @@ impl SidecarService for Sidecar {
             }));
         }
 
-        // One sidecar serves one plugin, and this is where that stops being a
-        // description and becomes enforcement.
+        // Grants come from what this sidecar was launched as, never from the
+        // request. The request has nothing in it that could decide them.
         //
-        // The registration is a single slot because v1 ran a sidecar container
-        // per plugin, so there was never a second plugin to hold. A runtime
-        // that exposes one shared port breaks that assumption, and the failure
-        // is silent and in the wrong direction: nothing here identifies the
-        // caller on a later request, so every plugin operates under whichever
-        // registration was written last. A read-only role registering before a
-        // connector would inherit the connector's write grants.
-        //
-        // Refusing the second plugin makes that a startup failure an operator
-        // reads instead of an escalation nobody sees. Carrying a caller
-        // identity on every request is the real fix and it changes the
-        // contract, so it goes through a queued task rather than an edit here.
-        if let Some(live) = self.state.read().expect("state lock poisoned").as_ref() {
-            if !live.departed && live.instance_id != req.instance_id {
-                tracing::warn!(
-                    instance = req.instance_id,
-                    held_by = live.instance_id,
-                    "refused: this sidecar already serves another plugin"
-                );
-                return Ok(Response::new(RegisterReply {
-                    admitted: false,
-                    refusal_reason: format!(
-                        "this sidecar already serves `{}`; one sidecar serves one plugin",
-                        live.instance_id
-                    ),
-                    ..Default::default()
-                }));
-            }
-        }
-
-        let grants = table.resolve(&req.role, &req.tags);
+        // A second caller on this endpoint is therefore no longer an
+        // escalation: it gets the same identity and the same grants, because
+        // there is only one set to get. It is still not separable from the
+        // first, and separating them is what one sidecar per plugin is for.
+        let grants = table.resolve(&self.identity.role, &self.identity.tags);
         if grants.publish.is_empty() && grants.subscribe.is_empty() {
             return Ok(Response::new(RegisterReply {
                 admitted: false,
-                refusal_reason: format!("role `{}` has no grants", req.role),
+                refusal_reason: format!(
+                    "this sidecar was launched as `{}`, which has no grants",
+                    self.identity.role
+                ),
                 ..Default::default()
             }));
         }
 
         *self.state.write().expect("state lock poisoned") = Some(Registration {
-            instance_id: req.instance_id.clone(),
-            role: req.role.clone(),
+            instance_id: self.identity.instance_id.clone(),
+            role: self.identity.role.clone(),
             grants: grants.clone(),
             healthy: true,
             last_heartbeat_ns: now_ns(),
             departed: false,
         });
 
-        tracing::info!(instance = req.instance_id, role = req.role, "admitted");
+        tracing::info!(
+            instance = self.identity.instance_id,
+            role = self.identity.role,
+            "admitted"
+        );
 
         // Grants come back so a plugin can fail at startup rather than at its
         // first refused publish, which moves the failure to where an operator
@@ -190,6 +204,11 @@ impl SidecarService for Sidecar {
             refusal_reason: String::new(),
             publish_grants: grants.publish,
             subscribe_grants: grants.subscribe,
+            // Returned so a plugin can log what it is and stop when that is not
+            // what it expected to be. Learning it is not declaring it.
+            instance_id: self.identity.instance_id.clone(),
+            role: self.identity.role.clone(),
+            tags: self.identity.tags.clone(),
         }))
     }
 
@@ -395,11 +414,16 @@ mod tests {
     }"#;
 
     fn sidecar(load_grants: bool) -> Sidecar {
+        launched_as(load_grants, Identity::new("custody-snaptrade-1", "custody"))
+    }
+
+    /// A sidecar deployed to serve one particular plugin.
+    fn launched_as(load_grants: bool, identity: Identity) -> Sidecar {
         let bus = Arc::new(Bus::single(
             "sidecar-custody-1",
             Arc::new(MemoryBackend::new()),
         ));
-        let sc = Sidecar::new(bus, "dep-local-1", "v1");
+        let sc = Sidecar::new(bus, "dep-local-1", "v1", identity);
         if load_grants {
             sc.load_grants(GrantTable::from_json(GRANTS).unwrap());
         }
@@ -408,9 +432,6 @@ mod tests {
 
     fn register_req() -> RegisterRequest {
         RegisterRequest {
-            instance_id: "custody-snaptrade-1".into(),
-            role: "custody".into(),
-            tags: vec![],
             schema_version: "v1".into(),
         }
     }
@@ -454,13 +475,18 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_role_with_no_grants() {
-        let sc = sidecar(true);
-        let mut req = register_req();
-        req.role = "nonexistent".into();
+        // The refusal names what the sidecar was launched as, because that is
+        // what an operator has to go and change.
+        let sc = launched_as(true, Identity::new("mystery-1", "nonexistent"));
 
-        let reply = sc.register(Request::new(req)).await.unwrap().into_inner();
+        let reply = sc
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(!reply.admitted);
         assert!(reply.refusal_reason.contains("no grants"));
+        assert!(reply.refusal_reason.contains("nonexistent"));
     }
 
     #[tokio::test]
@@ -484,54 +510,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_plugin_is_refused_rather_than_taking_over_the_first() {
-        let sc = admitted_sidecar().await;
+    async fn a_plugin_cannot_ask_to_be_a_role_it_was_not_launched_as() {
+        // The hole this closed: the plugin used to supply role and tags, so a
+        // dashboard could ask to be a connector and be admitted with write
+        // grants. There is now nothing in the request that could ask.
+        let sc = launched_as(true, Identity::new("dashboard-1", "dashboard"));
 
-        // A read-only role arrives at the same sidecar. Nothing on a later
-        // request says who is calling, so admitting this would not give it its
-        // own identity: it would replace the connector's, and every subsequent
-        // call from either plugin would be judged against whichever grants were
-        // written last. Refusal at the door is the only place this is visible.
         let reply = sc
-            .register(Request::new(RegisterRequest {
-                instance_id: "dashboard-1".into(),
-                role: "dashboard".into(),
-                tags: vec![],
-                schema_version: "v1".into(),
-            }))
+            .register(Request::new(register_req()))
             .await
             .unwrap()
             .into_inner();
 
-        assert!(!reply.admitted);
-        assert!(
-            reply.refusal_reason.contains("already serves"),
-            "unhelpful refusal: {}",
-            reply.refusal_reason
-        );
-
-        // The first plugin is untouched, rather than left holding a half-
-        // replaced registration.
-        let held = sc.registration().unwrap();
-        assert_eq!(held.instance_id, "custody-snaptrade-1");
-        assert!(held
+        assert!(reply.admitted);
+        assert_eq!(reply.role, "dashboard");
+        assert_eq!(reply.instance_id, "dashboard-1");
+        assert!(reply.publish_grants.is_empty());
+        assert!(!sc
+            .registration()
+            .unwrap()
             .grants
             .may_publish("platform.kernel.command.record-holding"));
+    }
+
+    #[tokio::test]
+    async fn the_reply_tells_a_plugin_what_it_was_launched_as() {
+        // So a plugin can stop at startup when it is not what it expected to
+        // be, rather than running as something else and finding out by refusal.
+        let sc = launched_as(
+            true,
+            Identity::new("custody-snaptrade-1", "custody")
+                .with_tags(vec!["dashboard".to_string()]),
+        );
+
+        let reply = sc
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(reply.admitted);
+        assert_eq!(reply.instance_id, "custody-snaptrade-1");
+        assert_eq!(reply.role, "custody");
+        assert_eq!(reply.tags, vec!["dashboard".to_string()]);
+        // A tag adds to the role rather than replacing it, and the reply's
+        // grants are the merged set the plugin will actually be held to.
+        assert!(reply
+            .publish_grants
+            .contains(&"platform.kernel.command.record-holding".to_string()));
+        assert!(reply
+            .subscribe_grants
+            .contains(&"platform.kernel.event.*".to_string()));
     }
 
     #[tokio::test]
     async fn the_same_plugin_may_register_again_after_a_restart() {
         let sc = admitted_sidecar().await;
 
-        // A plugin that restarted reconnects under the identity it already
-        // holds. Refusing that would leave a sidecar permanently occupied by a
-        // plugin that no longer exists.
+        // A plugin that restarted reconnects. There is nothing for it to
+        // reassert, so this is idempotent by construction.
         let reply = sc
             .register(Request::new(register_req()))
             .await
             .unwrap()
             .into_inner();
         assert!(reply.admitted);
+        assert_eq!(reply.instance_id, "custody-snaptrade-1");
     }
 
     #[tokio::test]
@@ -542,12 +586,7 @@ mod tests {
             .unwrap();
 
         let reply = sc
-            .register(Request::new(RegisterRequest {
-                instance_id: "dashboard-1".into(),
-                role: "dashboard".into(),
-                tags: vec![],
-                schema_version: "v1".into(),
-            }))
+            .register(Request::new(register_req()))
             .await
             .unwrap()
             .into_inner();

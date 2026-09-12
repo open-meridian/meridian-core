@@ -47,6 +47,12 @@ services:
       # hold different things with different retention and availability needs,
       # so splitting them later is configuration rather than a migration.
       MERIDIAN_LEDGER_DATABASE_URL: ${MERIDIAN_LEDGER_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
+      # Who the sidecar serves, assigned at launch rather than declared by the
+      # plugin. Empty by default: no plugin runs in this compose file yet, and
+      # an unconfigured sidecar should refuse rather than admit.
+      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-}
+      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-}
+      MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
       RUST_LOG: ${RUST_LOG:-info}
     # No port for the sidecar, deliberately. It binds loopback, so a plugin
     # reaches it by sharing this container's network namespace
