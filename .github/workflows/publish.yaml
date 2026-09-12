@@ -130,11 +130,22 @@ jobs:
             -t "$IMAGE:latest" \
             $(printf "$IMAGE@sha256:%s " *)
 
+      # Parsed rather than grepped. The first version of this matched the raw
+      # JSON for `"architecture":"amd64"` and failed against a correct image,
+      # because the output is pretty-printed and the real text has a space after
+      # the colon. An assertion that fails on formatting is an assertion nobody
+      # trusts the third time.
+      #
+      # `unknown` is dropped: buildx adds an attestation manifest per platform
+      # and each carries that architecture.
       - name: Check both architectures are there
+        env:
+          TAG: ${{ steps.tag.outputs.sha }}
         run: |
           set -euo pipefail
-          found=$(docker buildx imagetools inspect "$IMAGE:${{ steps.tag.outputs.sha }}" --raw \
-            | grep -o '"architecture":"[a-z0-9]*"' | sort -u)
-          echo "$found"
-          echo "$found" | grep -q '"architecture":"amd64"'
-          echo "$found" | grep -q '"architecture":"arm64"'
+          found=$(docker buildx imagetools inspect "$IMAGE:$TAG" --raw \
+            | jq -r '.manifests[]?.platform.architecture' \
+            | grep -v '^unknown$' | sort -u)
+          echo "architectures: $(echo $found | tr '\n' ' ')"
+          echo "$found" | grep -qx amd64
+          echo "$found" | grep -qx arm64
