@@ -3,11 +3,14 @@
 //! One sidecar process per plugin, listening on loopback in the plugin's own
 //! network namespace. The plugin reaches this and reaches nothing else: it
 //! never learns the bus address, never holds a broker credential, and never
-//! discovers another plugin. See decisions/004.
+//! discovers another plugin. See decisions/007.
 //!
-//! Six operations, derived from workflow W4: register, publish, subscribe,
-//! call, heartbeat, leave. Typed role-specific operations are generated from
-//! the function matrix and live above this layer, not in it.
+//! The operations W4 declares are register, publish, subscribe, call, heartbeat
+//! and leave. The set is not closed: it grows as workflows demand, and what an
+//! operation has to be is generic, with something for the sidecar to enforce or
+//! stamp by carrying it. Typed role-specific operations are a different thing
+//! and do not belong here; they are generated from the function matrix and live
+//! above this layer.
 
 pub mod grants;
 mod service;

@@ -1,4 +1,4 @@
-//! The six operations, implemented over the bus.
+//! The operations W4 declares, implemented over the bus.
 //!
 //! One sidecar serves exactly one plugin. That is why no request after
 //! `Register` carries an instance id: there is only one plugin it could be, and

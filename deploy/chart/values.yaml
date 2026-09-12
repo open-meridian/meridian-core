@@ -47,9 +47,13 @@ resources:
 logLevel: info
 
 sidecar:
-  # Where plugins dial. They run as their own pods and reach the bus only
-  # through this.
-  port: 9191
+  # Where a plugin dials its sidecar, on loopback. A plugin therefore runs as a
+  # second container in the runtime's pod; a plugin in its own pod cannot reach
+  # this, and is waiting on a bus a sidecar can reach from outside the runtime.
+  #
+  # Changing the host here opens the boundary to anything that can route to the
+  # pod. The runtime warns when it is not loopback.
+  address: 127.0.0.1:9191
 
 grants:
   # A ConfigMap holding the grant table: which roles this deployment admits and

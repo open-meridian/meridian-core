@@ -30,6 +30,9 @@
 //! means a bus it can reach from outside this process:
 //! `sdk-contract/sidecar-needs-a-bus-across-a-process-boundary`.
 //!
+//! Until then a plugin has to share this process's network namespace to reach
+//! the sidecar on loopback, which means a container in the same pod.
+//!
 //! # Two stores, which may be one database
 //!
 //! The replica and the ledger take separate connection settings and default to
@@ -70,8 +73,15 @@ use meridian_sidecar::{GrantTable, Sidecar};
 /// One attempt against the platform. The retry sequence is longer by design.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where plugins dial. v1 used this port and there is no reason to move it.
-const SIDECAR_ADDRESS: &str = "0.0.0.0:9191";
+/// Where a plugin dials its sidecar. Loopback, because meridian_sidecar says
+/// so: a sidecar reachable from another host is a way around the boundary it
+/// exists to enforce.
+///
+/// A plugin therefore has to share this network namespace, which in Kubernetes
+/// means a container in the runtime's pod. That is a narrow deployment, and it
+/// is the honest one until a sidecar can run beside its plugin and reach the
+/// bus from there.
+const SIDECAR_ADDRESS: &str = meridian_sidecar::DEFAULT_BIND;
 
 /// What a plugin may publish and subscribe to, by role.
 ///
@@ -171,6 +181,17 @@ fn run() -> Result<(), String> {
     let listening: std::net::SocketAddr = sidecar_address
         .parse()
         .map_err(|failed| format!("{sidecar_address} is not an address: {failed}"))?;
+
+    // An override off loopback is a deployment decision, and it is the one that
+    // opens the boundary, so it is said out loud rather than inferred later
+    // from a port map.
+    if !listening.ip().is_loopback() {
+        tracing::warn!(
+            %listening,
+            "the sidecar is reachable beyond loopback; anything that can route \
+             here can register as a plugin"
+        );
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -42,16 +42,17 @@ services:
       MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
       # Empty until the deployment is registered. `make demo` fills it in.
       MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
-      MERIDIAN_INSTANCE_ID: ${MERIDIAN_INSTANCE_ID:-reference-1}
+      MERIDIAN_INSTANCE_ID: ${MERIDIAN_INSTANCE_ID:-runtime-1}
       # Separate setting, same database by default. The replica and the ledger
       # hold different things with different retention and availability needs,
       # so splitting them later is configuration rather than a migration.
       MERIDIAN_LEDGER_DATABASE_URL: ${MERIDIAN_LEDGER_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
       RUST_LOG: ${RUST_LOG:-info}
-    ports:
-      # Where plugins dial. They run in their own containers and reach the bus
-      # only through this.
-      - "9191:9191"
+    # No port for the sidecar, deliberately. It binds loopback, so a plugin
+    # reaches it by sharing this container's network namespace
+    # (`network_mode: "service:runtime"`), which is the compose equivalent of a
+    # container in the same pod. Publishing the port instead would put the
+    # boundary on the network, which is the one thing it exists to prevent.
     volumes:
       - runtime-keys:/var/lib/meridian
       # Which roles this deployment admits. Absent, nothing registers, which is

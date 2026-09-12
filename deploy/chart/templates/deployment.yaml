@@ -40,6 +40,8 @@ spec:
               value: {{ .Values.platform.address | quote }}
             - name: MERIDIAN_KEY_PATH
               value: /etc/meridian/key.pem
+            - name: MERIDIAN_SIDECAR_ADDRESS
+              value: {{ .Values.sidecar.address | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL
@@ -47,9 +49,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.key }}
-          ports:
-            - name: sidecar
-              containerPort: {{ .Values.sidecar.port }}
+          # No port. The sidecar binds loopback, so a plugin reaches it by
+          # running as a second container in this pod and sharing the network
+          # namespace. A containerPort would advertise something no pod outside
+          # this one can reach, and a Service in front of it would put the
+          # boundary on the network, which is what it exists to prevent.
           volumeMounts:
             # Read-only, because the replica only generates a key when it has
             # none, and in a cluster it always has one: you made it.
