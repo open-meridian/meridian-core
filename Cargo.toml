@@ -14,7 +14,7 @@ license = "AGPL-3.0-or-later"
 # reviewable change rather than something that drifts in on a rebuild -- a
 # schema change lands in every consumer as one arc or it is not landed.
 [workspace.dependencies]
-meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "68ec81f1b3216440ba9503538d5ee1424d6f0e30" }
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "73b089cf8669b1e05386ba2cd6c5b22cf4e389a2" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.13"

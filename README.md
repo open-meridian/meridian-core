@@ -53,3 +53,14 @@ apply, then take the platform away and watch resolution keep working.
 | `sidecar` | The gRPC surface a plugin binds to |
 | `reference` | The replica: resolve, pull, escalate, apply |
 | `replica` | The process that runs one |
+
+## Licence
+
+AGPL-3.0-or-later. Run it, change it, and if you offer it to others over a
+network, give them what you changed.
+
+That is the deliberate half of a deliberate split. `meridian-schema`, the wire
+contract, and `meridian-python`, the SDK, are Apache-2.0: both exist to be
+implemented and linked against, and copyleft on either would reach into everyone
+who did. This is the runtime, which is the part worth protecting.
+
