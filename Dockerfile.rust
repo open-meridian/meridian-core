@@ -17,6 +17,9 @@ RUN apt-get update \
 WORKDIR /w
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# The runtime's wiring test asserts against the grant table the deployment
+# actually ships, rather than a copy of it that drifts in silence.
+COPY deploy/ deploy/
 
 FROM base AS check
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -24,15 +27,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/w/target \
     cargo build --workspace --locked
 
-# Unit tests only. The Postgres store's tests need a database, and a build
-# stage has no services; `make test-store` runs them through compose. A
-# lightweight in-process substitute is deliberately not offered, so a store that
+# Everything that needs nothing but a toolchain: the unit tests, and the
+# integration tests that stand up their own world in-process.
+#
+# `--lib` alone was the whole of this stage until the runtime's wiring test
+# existed and never ran. An integration test that no target names is not a
+# slower test, it is an absent one, so check-test-targets refuses a tests/ file
+# that no make target reaches.
+#
+# The rest need services a build stage has none of: the two store suites want
+# Postgres (`make test-store`), and end_to_end and outage want a platform to
+# prove themselves against (`make demo`). A lightweight in-process substitute is
+# deliberately not offered for any of them, so a store or a platform client that
 # behaves differently in development cannot exist.
 FROM base AS test
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
-    cargo test --workspace --locked --lib
+    cargo test --workspace --locked --lib --test wiring
 
 FROM base AS lint
 RUN rustup component add clippy rustfmt
