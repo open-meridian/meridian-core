@@ -1,4 +1,4 @@
-# Publishing the replica image.
+# Publishing the runtime image.
 #
 # Separate from `ci`, and not a step inside it, because they answer different
 # questions. `ci` says whether the commit is sound and blocks a merge. This
@@ -8,8 +8,14 @@
 # gates have not seen. A workflow_run trigger rather than a push trigger is what
 # enforces that ordering; a push trigger would race the gates and sometimes win.
 #
-# The registry is GitHub's, so a customer pulls without asking us for a
-# credential, which is requirement 11 of the hosting spec.
+# Two architectures, built natively rather than emulated. This runs in a
+# customer's cluster, and that cluster is as likely to be arm64 as not: Graviton,
+# an Apple laptop, anything ordered in the last three years. An amd64-only image
+# fails at the first command in the README, which is how this was found.
+#
+# Native runners rather than QEMU because the build is Rust. Emulated
+# compilation turns a two-minute job into a twenty-minute one, and a slow
+# publish is a publish people start skipping.
 
 name: publish
 
@@ -28,22 +34,28 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/open-meridian/meridian-runtime
+
 jobs:
-  publish:
-    # `completed` includes failed. Publishing an image whose gates went red
-    # would put the tick and the artifact out of step.
+  build:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      # The cache backend below exports to GitHub's cache service, which the
-      # runner's default docker driver cannot do. Without this the build fails
-      # at the push, having already built everything.
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -52,18 +64,74 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tagged by commit, never only by `latest`. A release names a tag, so a
-      # rollback is a tag somebody can still find.
-      - id: tag
-        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/build-push-action@v6
+      # Pushed by digest, untagged. The tags are applied once, in the merge
+      # below, so a half-finished publish never leaves `latest` pointing at one
+      # architecture.
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           target: runtime
-          push: true
-          tags: |
-            ghcr.io/open-meridian/meridian-runtime:${{ steps.tag.outputs.sha }}
-            ghcr.io/open-meridian/meridian-runtime:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Keep the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          # Through an environment variable: the prefix has to come off in the
+          # shell, and shell expansion cannot happen inside ${{ }}.
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # One manifest list carrying both architectures, tagged by commit and as
+      # latest. A release names a tag, so a rollback has a tag to find.
+      - name: Combine
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ steps.tag.outputs.sha }}" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Check both architectures are there
+        run: |
+          set -euo pipefail
+          found=$(docker buildx imagetools inspect "$IMAGE:${{ steps.tag.outputs.sha }}" --raw \
+            | grep -o '"architecture":"[a-z0-9]*"' | sort -u)
+          echo "$found"
+          echo "$found" | grep -q '"architecture":"amd64"'
+          echo "$found" | grep -q '"architecture":"arm64"'
