@@ -1,0 +1,14 @@
+meridian-core
+Copyright 2026 Societal Lab Inc.
+
+This product includes software developed by Societal Lab Inc.
+
+Licensed under the GNU Affero General Public License, version 3 or later. See
+LICENSE for the terms. In short: run it, change it, and if you offer it to
+others over a network, give them what you changed.
+
+meridian-schema and meridian-python are Apache-2.0. The split is deliberate:
+those two exist to be implemented and linked against, and this one is the
+runtime.
+
+Contributions are accepted under an agreement described in CONTRIBUTING.md.
