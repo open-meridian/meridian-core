@@ -1,16 +1,10 @@
-# Has this contributor agreed to the contribution terms?
+# Has this pull request's author agreed to the contribution terms?
 #
-# Not a bot and not a hosted service, deliberately. Both want a token with write
-# access to this repository, which is a credential to hold and rotate for a
-# check that reads two files. This reads two files.
-#
-# Employees are not asked. Their employment settles who owns what, and making
-# them click through an agreement would be theatre. GitHub already tells us
+# Employees are not asked: employment settles ownership, and GitHub reports
 # which side of that line an author is on.
 #
-# It fails rather than passes while the agreement text is missing. A check that
-# waved contributions through until somebody remembered to finish it would be
-# worth less than no check, because the tick would look like assurance.
+# It fails while CLA.md is missing rather than passing. A tick there would look
+# like assurance.
 
 name: cla
 
@@ -37,37 +31,21 @@ jobs:
 
           case "$ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR)
-              echo "$AUTHOR contributes as $ASSOCIATION; employment settles this."
+              echo "$AUTHOR contributes as $ASSOCIATION."
               exit 0
               ;;
           esac
 
           if [ ! -f CLA.md ]; then
-            echo "::error::CLA.md does not exist yet, so there is nothing for $AUTHOR to have agreed to."
-            echo "Outside contributions cannot be merged until the agreement text is in place."
-            echo "See design/contributor-agreement in meridian-design."
+            echo "::error::CLA.md is not published yet, so outside contributions cannot be merged."
             exit 1
           fi
 
-          if [ ! -f CONTRIBUTORS.md ]; then
-            echo "::error::CONTRIBUTORS.md is missing, so no agreement can be recorded."
-            exit 1
-          fi
-
-          # An exact line, so a login that merely appears inside another login
-          # does not count. "@ada" must not be satisfied by "@adam".
-          if grep -qx -- "- @$AUTHOR" CONTRIBUTORS.md; then
+          # An exact line: "@ada" must not be satisfied by "@adam".
+          if grep -qx -- "- @$AUTHOR" CONTRIBUTORS.md 2>/dev/null; then
             echo "$AUTHOR has agreed."
             exit 0
           fi
 
-          echo "::error::$AUTHOR has not agreed to the contribution terms."
-          echo ""
-          echo "Read CLA.md, then open a separate pull request adding this line"
-          echo "to CONTRIBUTORS.md:"
-          echo ""
-          echo "    - @$AUTHOR"
-          echo ""
-          echo "That pull request is the record of agreement. This one can be"
-          echo "merged once it lands."
+          echo "::error::$AUTHOR has not agreed. Read CLA.md, then open a pull request adding '- @$AUTHOR' to CONTRIBUTORS.md."
           exit 1
