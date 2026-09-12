@@ -83,7 +83,10 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           # Through an environment variable: the prefix has to come off in the
-          # shell, and shell expansion cannot happen inside ${{ }}.
+          # shell, and shell expansion cannot happen inside a GitHub expression.
+          # Nor can a GitHub expression appear in a comment, even an empty one:
+          # they are evaluated anywhere in the file, and an empty one fails the
+          # whole workflow to parse. That is how this comment broke it once.
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - uses: actions/upload-artifact@v4
