@@ -26,12 +26,33 @@ database:
   key: url
 
 key:
-  # A secret holding this replica's private key, in PKCS#8 PEM.
+  # Let the replica make its own key, inside the cluster, in a volume only it
+  # mounts.
   #
-  # Created by you from a key the replica generated, never by this chart. A
-  # chart-generated key would live in Helm's release secret and in whatever
-  # holds your values, which are two more places for a private key to be than
-  # there should be.
+  # This is the way that keeps the claim the product makes: the private half
+  # never leaves the deployment. Generating one on a laptop and putting it in a
+  # secret puts it in a file, a shell history and a backup before it ever
+  # arrives.
+  #
+  # A job runs before the replica and prints the public half to its log:
+  #
+  #   kubectl logs job/<release>-meridian-runtime-key
+  #
+  # Register that with the platform. Until you do, the replica runs and its
+  # calls are refused, which is the honest order: a key cannot be registered
+  # before it exists.
+  #
+  # Never written into Helm's release history: the job writes it to a volume,
+  # and nothing reads it back out.
+  generate: false
+  storage:
+    size: 64Mi
+    # Empty uses the cluster's default. Name one if your default is not
+    # suitable for something this small and this important.
+    className: ""
+
+  # Or supply one yourself, in PKCS#8 PEM, which is what a firm holding keys in
+  # a vault or a cloud KMS will want. Mutually exclusive with generate.
   existingSecret: ""
   key: key.pem
 

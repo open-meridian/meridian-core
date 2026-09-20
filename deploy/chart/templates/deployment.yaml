@@ -39,7 +39,7 @@ spec:
             - name: MERIDIAN_PLATFORM_ADDRESS
               value: {{ .Values.platform.address | quote }}
             - name: MERIDIAN_KEY_PATH
-              value: /etc/meridian/key.pem
+              value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ .Values.sidecar.address | quote }}
             - name: MERIDIAN_PLUGIN_INSTANCE_ID
@@ -71,18 +71,32 @@ spec:
             - name: config
               mountPath: /etc/meridian
               readOnly: true
+            {{- if .Values.key.generate }}
+            # The key the replica made, in a volume only it mounts. Writable,
+            # because the first start is what creates the pair; after that
+            # nothing writes here again.
+            - name: key
+              mountPath: /var/lib/meridian
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        {{- if .Values.key.generate }}
+        - name: key
+          persistentVolumeClaim:
+            claimName: {{ include "meridian-runtime.fullname" . }}-key
+        {{- end }}
         - name: config
           projected:
             defaultMode: 0400
             sources:
+              {{- if .Values.key.existingSecret }}
               - secret:
                   name: {{ .Values.key.existingSecret }}
                   items:
                     - key: {{ .Values.key.key }}
                       path: key.pem
+              {{- end }}
               {{- if .Values.grants.existingConfigMap }}
               - configMap:
                   name: {{ .Values.grants.existingConfigMap }}

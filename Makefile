@@ -104,7 +104,19 @@ chart-check:
 		&& { echo "chart-check FAILED: the chart pins a uid by default" >&2; \
 		     echo "  OpenShift assigns each namespace its own range and refuses a pod asking outside it" >&2; exit 1; } \
 		|| true
-	@echo "chart-check OK: it renders, refuses without its three required values, migrates, and pins no uid"
+	@$(HELM) template check deploy/chart --set deployment.id=DEP-check \
+		--set key.generate=true --set database.existingSecret=d 2>/dev/null \
+		| grep -q "PersistentVolumeClaim" \
+		|| { echo "chart-check FAILED: key.generate renders no volume for the key" >&2; exit 1; }
+	@if $(HELM) template check deploy/chart $(CHART_VALUES) --set key.generate=true >/dev/null 2>&1; then \
+		echo "chart-check FAILED: a supplied key and a generated one are both accepted" >&2; \
+		echo "  they mean opposite things, so accepting both hides which one is in use" >&2; exit 1; \
+	fi
+	@if $(HELM) template check deploy/chart --set deployment.id=DEP-check \
+		--set database.existingSecret=d >/dev/null 2>&1; then \
+		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
+	fi
+	@echo "chart-check OK: both key paths render, neither and both are refused, it migrates, and pins no uid"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

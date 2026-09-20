@@ -29,8 +29,11 @@ the operator the same thing far less clearly.
 {{- if not .Values.deployment.id -}}
 {{- fail "deployment.id is not set. Register this replica's public key with the platform; the identifier comes back from that." -}}
 {{- end -}}
-{{- if not .Values.key.existingSecret -}}
-{{- fail "key.existingSecret is not set. Generate a key with `docker run --rm -v $PWD/keys:/var/lib/meridian <image> public-key`, then create a secret from keys/key.pem." -}}
+{{- if and (not .Values.key.existingSecret) (not .Values.key.generate) -}}
+{{- fail "neither key.existingSecret nor key.generate is set. Set key.generate=true to have the replica make its own key inside the cluster, and read the public half from the key job's log; or create a secret yourself and name it here." -}}
+{{- end -}}
+{{- if and .Values.key.existingSecret .Values.key.generate -}}
+{{- fail "key.existingSecret and key.generate are both set, and they mean opposite things: one supplies a key, the other makes one. Pick." -}}
 {{- end -}}
 {{- if not .Values.database.existingSecret -}}
 {{- fail "database.existingSecret is not set. The replica needs a Postgres URL, in a secret rather than in your values." -}}

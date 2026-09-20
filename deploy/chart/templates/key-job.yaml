@@ -1,0 +1,79 @@
+{{- if .Values.key.generate }}
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  Make this replica's key, inside the cluster, before anything starts.
+
+  `public-key` writes a key pair when the volume has none and prints only the
+  public half. The private half stays in the volume the replica mounts, which
+  is the whole point: a key generated anywhere else has been in a file, a shell
+  history and a backup before it arrives.
+
+  Read the public half from this job's log and register it with the platform.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-key
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-20"
+    # Kept when the release goes. A deleted claim is a key nobody can recover
+    # and a deployment identity that has to be registered again.
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.key.storage.className }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.key.storage.size }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-key
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-10"
+    # Left behind on purpose: its log is where the public half is read from.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: key
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["public-key"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_KEY_PATH
+              value: /var/lib/meridian/key.pem
+          volumeMounts:
+            - name: key
+              mountPath: /var/lib/meridian
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: key
+          persistentVolumeClaim:
+            claimName: {{ include "meridian-runtime.fullname" . }}-key
+{{- end }}
