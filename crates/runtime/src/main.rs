@@ -65,6 +65,7 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_kernel::service::SystemClock as LedgerClock;
+use meridian_reference::platform::ComponentReport;
 use meridian_reference::{
     Config, DeploymentKey, HttpTransport, Platform, PostgresStore, Replica, SystemClock,
 };
@@ -72,6 +73,14 @@ use meridian_sidecar::{GrantTable, Identity, Sidecar};
 
 /// One attempt against the platform. The retry sequence is longer by design.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a component says what it is running.
+///
+/// Often enough that a page is not stale after a deploy, rare enough that a
+/// thousand deployments are not a load. What makes a missed report harmless is
+/// that the page shows when each was last heard from rather than inferring
+/// failure from silence.
+const REPORT_EVERY: Duration = Duration::from_secs(300);
 
 /// Where a plugin dials its sidecar. Loopback, because meridian_sidecar says
 /// so: a sidecar reachable from another host is a way around the boundary it
@@ -129,6 +138,43 @@ fn migrate() -> Result<(), String> {
     Ok(())
 }
 
+/// Tell the platform what is running, now and every interval after.
+///
+/// Both stores are in this process today, so both are reported from here. When
+/// they become separate processes each reports its own, and the platform's
+/// page grows a row without a contract change: that is the shape this is
+/// written for rather than the one it has.
+async fn report_forever(platform: Arc<Platform>, version: String) {
+    let started_at_ns = now_ns();
+    loop {
+        let components = vec![
+            ComponentReport::serving("replica", &version, 0, started_at_ns),
+            ComponentReport::serving(
+                "ledger",
+                &version,
+                meridian_kernel::migrations::latest(),
+                started_at_ns,
+            ),
+        ];
+
+        if let Err(failed) = platform.report_components(&components, now_ns()).await {
+            // Not a warning. A platform that cannot be told what we run changes
+            // nothing about running it, and an unreachable platform is the case
+            // the replica exists to survive.
+            tracing::debug!(%failed, "could not report components");
+        }
+
+        tokio::time::sleep(REPORT_EVERY).await;
+    }
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as i64)
+        .unwrap_or_default()
+}
+
 fn run() -> Result<(), String> {
     // Before the key is touched. A migration job holds database credentials
     // and has no business holding the deployment's private key, and reading it
@@ -177,11 +223,11 @@ fn run() -> Result<(), String> {
     let grants = grants_at(GRANTS_PATH)?;
 
     let transport = HttpTransport::new(REQUEST_TIMEOUT).map_err(|failed| failed.to_string())?;
-    let platform = Platform::new(
+    let platform = Arc::new(Platform::new(
         Config::new(&address, &deployment_id),
         key,
         Arc::new(transport),
-    );
+    ));
 
     let bus = Arc::new(Bus::single(&instance_id, Arc::new(MemoryBackend::new())));
 
@@ -206,7 +252,7 @@ fn run() -> Result<(), String> {
     let replica = Replica::new(
         bus,
         Arc::new(replica_store),
-        Arc::new(platform),
+        Arc::clone(&platform),
         Arc::new(SystemClock),
     );
 
@@ -242,6 +288,17 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            // W5.19. What this deployment is running, told rather than
+            // inferred: a quiet connection and a stopped component look alike
+            // from the platform. Spawned inside the runtime because that is
+            // where a reactor exists, never awaited, and logged at debug when
+            // it fails: a platform that cannot be told what we run changes
+            // nothing about running it.
+            let reporting = Arc::clone(&platform);
+            let version =
+                var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+            tokio::spawn(async move { report_forever(reporting, version).await });
+
             let serving = tonic::transport::Server::builder()
                 .add_service(meridian_sidecar::SidecarServiceServer::new(sidecar))
                 .serve(listening);

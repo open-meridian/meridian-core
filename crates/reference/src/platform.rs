@@ -212,6 +212,46 @@ pub struct Platform {
     reacted: Mutex<HashMap<String, i64>>,
 }
 
+/// One component of this deployment, as it describes itself. W5.19.
+///
+/// The fields are the contract's and nothing more. Adding one that names an
+/// account, an instrument or a person would put a customer's business on a
+/// path that leaves their cluster unprompted, which
+/// `intent/deployment-lifecycle-and-plugin-distribution` rules out.
+#[derive(Clone, Debug)]
+pub struct ComponentReport {
+    pub component: String,
+    pub version: String,
+    pub schema_version: i64,
+    pub health: &'static str,
+    pub detail: String,
+    pub started_at_ns: i64,
+}
+
+impl ComponentReport {
+    pub fn serving(
+        component: &str,
+        version: &str,
+        schema_version: i64,
+        started_at_ns: i64,
+    ) -> Self {
+        Self {
+            component: component.into(),
+            version: version.into(),
+            schema_version,
+            health: "COMPONENT_HEALTH_SERVING",
+            detail: String::new(),
+            started_at_ns,
+        }
+    }
+
+    pub fn degraded(mut self, detail: impl Into<String>) -> Self {
+        self.health = "COMPONENT_HEALTH_DEGRADED";
+        self.detail = detail.into();
+        self
+    }
+}
+
 impl Platform {
     pub fn new(config: Config, key: DeploymentKey, transport: Arc<dyn Transport>) -> Self {
         Self {
@@ -373,6 +413,48 @@ impl Platform {
             return Ok(None);
         }
         reply.instrument.map(into_record).transpose()
+    }
+
+    /// W5.19. What this deployment is running, as its components describe
+    /// themselves.
+    ///
+    /// About the software and never about the business: this carries versions,
+    /// schema versions and health, and there is deliberately no shape here for
+    /// anything a deployment processed or for whom. Content leaves a
+    /// deployment only in a bundle its administrator sends.
+    ///
+    /// A failure is the caller's to shrug at. A platform that cannot be told
+    /// what we run changes nothing about our ability to run it, which is the
+    /// same reasoning that lets the replica serve through an outage.
+    pub async fn report_components(
+        &self,
+        components: &[ComponentReport],
+        now_ns: i64,
+    ) -> Result<(), PlatformError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "deployment_id": self.config.deployment_id,
+            "components": components
+                .iter()
+                .map(|component| serde_json::json!({
+                    "component": component.component,
+                    "version": component.version,
+                    "schema_version": component.schema_version,
+                    "health": component.health,
+                    "detail": component.detail,
+                    "started_at_ns": component.started_at_ns,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+
+        self.call(
+            Method::Post,
+            "/api/v1/reference/deployments/components",
+            Some(body),
+            now_ns,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// One logical request: signed once, retried, and redirected by hand.
@@ -861,6 +943,73 @@ pub(crate) mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_component_report_reaches_the_contracted_path() {
+        let transport = Fake::new(vec![Ok(reply(200, "{\"recorded_at_ns\": 1}"))]);
+        let platform = platform(Arc::clone(&transport));
+
+        platform
+            .report_components(&[ComponentReport::serving("ledger", "1.4.2", 2, NOW)], NOW)
+            .await
+            .expect("the report should have been accepted");
+
+        assert_eq!(
+            transport.urls(),
+            vec![format!("{ADDRESS}/api/v1/reference/deployments/components")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_carries_software_and_nothing_about_the_business() {
+        // The boundary as a test rather than as a comment: every key in the
+        // body is named here, so a field added later has to be added here too,
+        // where somebody has to decide whether it is about software.
+        let transport = Fake::new(vec![Ok(reply(200, "{\"recorded_at_ns\": 1}"))]);
+        let platform = platform(Arc::clone(&transport));
+
+        platform
+            .report_components(
+                &[ComponentReport::serving("ledger", "1.4.2", 2, NOW)
+                    .degraded("the platform is unreachable")],
+                NOW,
+            )
+            .await
+            .unwrap();
+
+        let seen = transport.seen.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(seen[0].body.as_ref().unwrap()).unwrap();
+
+        let mut top: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top.sort();
+        assert_eq!(top, vec!["components", "deployment_id"]);
+
+        let mut fields: Vec<&str> = body["components"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                "component",
+                "detail",
+                "health",
+                "schema_version",
+                "started_at_ns",
+                "version"
+            ]
+        );
+        assert_eq!(body["components"][0]["health"], "COMPONENT_HEALTH_DEGRADED");
     }
 
     pub(crate) fn platform(transport: Arc<Fake>) -> Platform {
