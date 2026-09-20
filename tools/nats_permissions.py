@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Broker permissions, generated from the grant table. Decision 010.
 
+One credential per plugin instance, not per role. Two plugins sharing a role
+would otherwise be able to publish as each other: the grant table writes
+`platform.custody.*.event.sync-status`, and that `*` is the instance segment,
+so a role-wide credential carries the right to speak as every instance of it.
+Substituting the instance identifier is what makes a launch identity mean
+something at the broker rather than only inside the sidecar.
+
 The grant table says what a role may publish and subscribe to. A broker
 enforces the same thing in its own language, and a permission list maintained
 beside the grants it mirrors is two policies that have to agree. v1's recorded
@@ -54,7 +61,53 @@ def subject(pattern: str) -> str:
     return pattern
 
 
-def rendered(grants: dict) -> str:
+def scoped(pattern: str, instance_id: str, role: str) -> str:
+    """The instance's own version of a topic it publishes.
+
+    `platform.<domain>.<instance>.<kind>.<action>` is the shape the registry
+    gives an instance-scoped topic, so a `*` in that position is the instance
+    slot and nothing else. Substituting it is the difference between a
+    credential that may speak for this connector and one that may speak for
+    every connector of its kind.
+
+    Two conditions, and the second was learned by getting it wrong: the domain
+    must be the instance's own. A dashboard subscribes to
+    `platform.custody.*.event.sync-status` to hear every connector, and
+    rewriting that to its own identifier leaves it subscribed to a topic
+    nobody publishes. You may speak only as yourself; you may listen to
+    everyone your grants allow.
+    """
+    segments = pattern.split(".")
+    if len(segments) == 5 and segments[2] == "*" and segments[1] == role:
+        segments[2] = instance_id
+        return ".".join(segments)
+    return pattern
+
+
+def permissions_for(grants: dict, role: str, tags: list[str], instance_id: str) -> tuple[list, list]:
+    """What one instance may publish and subscribe to.
+
+    A role and each of its tags are looked up in the one table and unioned,
+    which is what the grant table's own note says, so a tag is an entry there
+    like any other.
+    """
+    roles = grants.get("roles") or {}
+    publish: set[str] = set()
+    subscribe: set[str] = set()
+
+    for name in [role, *tags]:
+        table = roles.get(name) or {}
+        # Publishing is narrowed to this instance; subscribing is not, because
+        # hearing every instance of another role is what a dashboard is for.
+        publish.update(
+            subject(scoped(topic, instance_id, role)) for topic in table.get("publish") or []
+        )
+        subscribe.update(subject(topic) for topic in table.get("subscribe") or [])
+
+    return sorted(publish), sorted(subscribe)
+
+
+def rendered(grants: dict, instances: dict) -> str:
     roles = grants.get("roles") or {}
     lines = [HEADER, "authorization {", "  users = ["]
 
@@ -66,19 +119,31 @@ def rendered(grants: dict) -> str:
         'permissions: { publish: { allow: [">"] }, subscribe: { allow: [">"] } } }'
     )
 
-    for role in sorted(roles):
-        table = roles[role] or {}
-        publish = sorted({subject(topic) for topic in table.get("publish") or []})
-        subscribe = sorted({subject(topic) for topic in table.get("subscribe") or []})
+    for instance in instances.get("instances") or []:
+        instance_id = instance["instance_id"]
+        role = instance.get("role") or ""
+        tags = instance.get("tags") or []
+
+        if role and role not in roles and not any(tag in roles for tag in tags):
+            raise SystemExit(
+                f"nats-permissions: {instance_id} is launched as `{role}`, which the "
+                "grant table does not define. An instance with no grants has no bus."
+            )
+
+        publish, subscribe = permissions_for(grants, role, tags, instance_id)
 
         # A caller must hear its own answers, and a responder must be able to
-        # reply. Neither widens what the role may ask or say.
+        # reply. Neither widens what the instance may ask or say.
         publish.append(INBOX)
         subscribe.append(INBOX)
 
-        variable = f"$MERIDIAN_NATS_{role.upper().replace('-', '_')}"
+        variable = f"$MERIDIAN_NATS_{instance_id.upper().replace('-', '_')}"
         lines.append(
-            f"    {{ user: {role}, password: {variable}, permissions: {{ "
+            f"    # {instance_id}, launched as {role}"
+            + (f" with {', '.join(tags)}" if tags else "")
+        )
+        lines.append(
+            f"    {{ user: {instance_id}, password: {variable}, permissions: {{ "
             f"publish: {{ allow: {json.dumps(publish)} }}, "
             f"subscribe: {{ allow: {json.dumps(subscribe)} }}, "
             f"allow_responses: true }} }}"
@@ -92,6 +157,7 @@ def rendered(grants: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--grants", default="deploy/grants.example.json")
+    parser.add_argument("--instances", default="deploy/instances.example.json")
     parser.add_argument("--out", default="deploy/nats/permissions.conf")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
@@ -101,7 +167,15 @@ def main() -> int:
         print(f"nats-permissions: no grant table at {grants_path}", file=sys.stderr)
         return 1
 
-    wanted = rendered(json.loads(grants_path.read_text(encoding="utf-8")))
+    instances_path = pathlib.Path(args.instances)
+    if not instances_path.exists():
+        print(f"nats-permissions: no launch configuration at {instances_path}", file=sys.stderr)
+        return 1
+
+    wanted = rendered(
+        json.loads(grants_path.read_text(encoding="utf-8")),
+        json.loads(instances_path.read_text(encoding="utf-8")),
+    )
     out = pathlib.Path(args.out)
 
     if args.check:

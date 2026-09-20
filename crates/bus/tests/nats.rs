@@ -416,3 +416,68 @@ async fn a_caller_with_no_credential_is_refused_the_broker_entirely() {
         "the broker accepted a connection with no credential"
     );
 }
+
+// ── One credential per instance ─────────────────────────────────────────────
+//
+// A role-wide credential carries the right to speak as every instance of that
+// role, because the grant table writes the instance segment as a wildcard. The
+// launch identity decision — a plugin is told who it is and never says so —
+// means nothing at the broker unless the credential says it too.
+
+async fn as_custody_two() -> NatsBackend {
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO")
+        .expect("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO is not set; run `make test-broker`.");
+    NatsBackend::connect(&url)
+        .await
+        .expect("could not reach the test broker as the second instance")
+}
+
+#[tokio::test]
+async fn an_instance_may_publish_under_its_own_identifier() {
+    let custody = as_custody().await;
+    let listening = backend().await;
+
+    let own = "platform.custody.custody-1.event.sync-status";
+    let mut subscription = listening.subscribe(own);
+    settle().await;
+
+    let sent = mark("own-identity");
+    custody.publish(own, envelope(&sent)).unwrap();
+
+    assert!(
+        arrived(&mut subscription, &sent).await,
+        "an instance was refused its own instance-scoped topic"
+    );
+}
+
+#[tokio::test]
+async fn an_instance_cannot_publish_as_another_instance_of_its_role() {
+    // The property per-instance credentials exist for. Both hold the custody
+    // role and identical grants; what differs is who each may claim to be.
+    let custody_one = as_custody().await;
+    let listening = backend().await;
+
+    let somebody_else = "platform.custody.custody-2.event.sync-status";
+    let mut subscription = listening.subscribe(somebody_else);
+    settle().await;
+
+    let sent = mark("impersonation");
+    custody_one.publish(somebody_else, envelope(&sent)).unwrap();
+
+    assert!(
+        !arrived(&mut subscription, &sent).await,
+        "one instance published under another's identifier"
+    );
+
+    // And the instance it tried to impersonate can, which proves the topic
+    // itself is carried and the refusal was about identity.
+    let custody_two = as_custody_two().await;
+    let theirs = mark("their-own");
+    custody_two
+        .publish(somebody_else, envelope(&theirs))
+        .unwrap();
+    assert!(
+        arrived(&mut subscription, &theirs).await,
+        "the instance was refused its own topic"
+    );
+}
