@@ -251,3 +251,36 @@ fn the_replica_can_say_how_much_it_holds() {
 
     assert!(store.count().unwrap() >= 1);
 }
+
+#[test]
+fn a_start_against_a_database_with_no_schema_refuses_and_names_the_fix() {
+    // Found installing the chart for the first time: the serving credential
+    // has no right to create a table, by design, so a start that tried met
+    // `permission denied for schema public` and said nothing about migrating.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let scratch = format!("verify_{}", unique("t").replace('-', "_"));
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
+        .unwrap();
+
+    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let store = PostgresStore::connect(&scoped, 1).unwrap();
+
+    let refused = store
+        .verify()
+        .expect_err("an empty database must not verify");
+    let said = refused.to_string();
+    assert!(said.contains("no schema"), "{said}");
+    assert!(
+        said.contains("migrate"),
+        "the refusal has to name the fix: {said}"
+    );
+
+    store.migrate().expect("could not apply the schema");
+    store.verify().expect("a migrated database must verify");
+
+    admin
+        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
+        .unwrap();
+}

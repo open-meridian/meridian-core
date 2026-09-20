@@ -207,8 +207,13 @@ fn run() -> Result<(), String> {
 
     let replica_store =
         PostgresStore::connect(&replica_url, 8).map_err(|failed| failed.to_string())?;
+
+    // Verified, not created. A deployment that gives the serving credential no
+    // right to alter tables — which the lifecycle intent asks for — would
+    // otherwise meet `permission denied for schema public` at start, with
+    // nothing saying which command fixes it.
     replica_store
-        .migrate()
+        .verify()
         .map_err(|failed| failed.to_string())?;
 
     let ledger_store = meridian_kernel::PostgresStore::connect(&ledger_url, 8)

@@ -72,6 +72,37 @@ impl PostgresStore {
     ///
     /// The lock is released when this returns, by `pg_advisory_unlock` on the
     /// happy path and by the connection closing on any other.
+    /// What a start does instead of migrating: check the schema is there.
+    ///
+    /// The replica creates its schema on start in development, where one
+    /// credential does everything. A deployment that separates them — and the
+    /// lifecycle intent says the credential that migrates is not the one that
+    /// serves — gives the runtime no right to create a table, so a start that
+    /// tried would fail with `permission denied for schema public` and nothing
+    /// saying which command fixes it.
+    ///
+    /// One read, no lock, and a sentence naming the fix.
+    pub fn verify(&self) -> Result<()> {
+        let mut conn = self.conn()?;
+        let present = conn
+            .query_opt(
+                "SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = current_schema() AND table_name = 'instrument'",
+                &[],
+            )
+            .map_err(unavailable)?
+            .is_some();
+
+        if present {
+            return Ok(());
+        }
+        Err(StoreError::Unavailable(
+            "the replica's database has no schema. Run `meridian-runtime migrate` \
+             before starting."
+                .into(),
+        ))
+    }
+
     pub fn migrate(&self) -> Result<()> {
         let mut conn = self.conn()?;
 
