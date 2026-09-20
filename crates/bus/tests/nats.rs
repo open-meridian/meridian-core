@@ -287,3 +287,132 @@ async fn a_local_handler_answers_without_the_broker() {
         .expect("a local handler answers");
     assert_eq!(payload_type, "local");
 }
+
+// ── The broker enforces the grant table ─────────────────────────────────────
+//
+// The sidecar resolves grants locally so a plugin fails at startup. These are
+// about the second check, which is what holds when a sidecar is not ours:
+// a credential carrying the custody role, used to attempt what custody may not
+// do, and refused by the broker rather than by our code.
+
+/// Did this exact message arrive, within a window?
+///
+/// By identity rather than by silence, because these tests share real topic
+/// names — permissions are written against the topics the grant table names,
+/// so they cannot be randomised — and they run concurrently. A subscriber
+/// asserting that nothing at all arrives will eventually see a message another
+/// test legitimately published, and fail for a reason that has nothing to do
+/// with permissions. Found exactly that way.
+async fn arrived(subscription: &mut Subscription, wanted: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(delivery)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        if delivery.envelope.meta.unwrap().message_id == wanted {
+            return true;
+        }
+    }
+    false
+}
+
+/// A message identity nobody else in this run is using.
+fn mark(tag: &str) -> String {
+    format!("{tag}-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+async fn as_custody() -> NatsBackend {
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL_CUSTODY").expect(
+        "MERIDIAN_TEST_BROKER_URL_CUSTODY is not set. These tests need a broker \
+         with the generated permissions; run them with `make test-broker`.",
+    );
+    NatsBackend::connect(&url)
+        .await
+        .expect("could not reach the test broker as custody")
+}
+
+#[tokio::test]
+async fn a_role_may_publish_what_the_grant_table_grants_it() {
+    let custody = as_custody().await;
+    let listening = backend().await;
+
+    // Granted to custody in deploy/grants.example.json.
+    let topic = "platform.reference.event.instrument-missing";
+    let mut subscription = listening.subscribe(topic);
+    settle().await;
+
+    let sent = mark("granted");
+    custody.publish(topic, envelope(&sent)).unwrap();
+
+    assert!(
+        arrived(&mut subscription, &sent).await,
+        "a role was refused a topic its grants allow"
+    );
+}
+
+#[tokio::test]
+async fn the_broker_refuses_a_topic_the_role_does_not_hold() {
+    // custody may record a statement; it may not answer queries about
+    // positions, which is the dashboard's and the positions-reader's. The
+    // publish call itself is accepted by the client, because a broker reports
+    // a permission violation asynchronously; what proves the refusal is that
+    // nothing arrives.
+    let custody = as_custody().await;
+    let listening = backend().await;
+
+    let forbidden = "platform.kernel.event.custodial-position-updated";
+    let mut subscription = listening.subscribe(forbidden);
+    settle().await;
+
+    let sent = mark("ungranted");
+    custody.publish(forbidden, envelope(&sent)).unwrap();
+
+    assert!(
+        !arrived(&mut subscription, &sent).await,
+        "the broker carried a message the role's grants do not allow"
+    );
+}
+
+#[tokio::test]
+async fn the_broker_refuses_a_subscription_the_role_does_not_hold() {
+    // custody subscribes to instrument-applied and nothing else. A sidecar
+    // that asked for more would be told nothing, rather than quietly receiving
+    // another plugin's traffic.
+    let custody = as_custody().await;
+    let publisher = backend().await;
+
+    let forbidden = "platform.kernel.event.custodial-position-updated";
+    let mut refused = custody.subscribe(forbidden);
+    let granted = "platform.reference.event.instrument-applied";
+    let mut allowed = custody.subscribe(granted);
+    settle().await;
+
+    let withheld = mark("not-for-custody");
+    let expected = mark("for-custody");
+    publisher.publish(forbidden, envelope(&withheld)).unwrap();
+    publisher.publish(granted, envelope(&expected)).unwrap();
+
+    assert!(
+        arrived(&mut allowed, &expected).await,
+        "a granted subscription heard nothing"
+    );
+    assert!(
+        !arrived(&mut refused, &withheld).await,
+        "the broker delivered on a subscription the role's grants do not allow"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_with_no_credential_is_refused_the_broker_entirely() {
+    // What a plugin container can reach: the address, and nothing to present.
+    // The seam is the filesystem, and this is the test that tries it rather
+    // than a note asking an operator to arrange it.
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL").unwrap();
+    let anonymous = url
+        .split_once('@')
+        .map(|(_, host)| format!("nats://{host}"))
+        .expect("the test URL should carry a credential");
+
+    let refused = NatsBackend::connect(&anonymous).await;
+    assert!(
+        refused.is_err(),
+        "the broker accepted a connection with no credential"
+    );
+}

@@ -57,13 +57,23 @@ pub struct NatsBackend {
 impl NatsBackend {
     /// Connect, or say why not.
     ///
+    /// The credential is in the URL, because that is where a broker's client
+    /// expects it and inventing a second way to pass one would be a second
+    /// place for it to be wrong. What matters is where the URL comes from: a
+    /// file mounted into this container alone, which the plugin beside it has
+    /// no mount for. Containers in a pod share a network namespace and not a
+    /// filesystem, and that is the whole of the boundary decision 010 rests
+    /// on.
+    ///
     /// Must be called from a Tokio runtime: the handle it captures is what
     /// lets the synchronous half of [`Backend`] reach an async client.
     pub async fn connect(url: &str) -> Result<Self, BusError> {
-        let client = async_nats::connect(url)
+        let (options, address) = credential_in(url);
+        let client = options
+            .connect(&address)
             .await
             .map_err(|failed| BusError::HandlerFailed {
-                topic: url.to_string(),
+                topic: redacted(url),
                 detail: failed.to_string(),
             })?;
 
@@ -95,6 +105,33 @@ impl NatsBackend {
         *entry += 1;
         *entry
     }
+}
+
+/// Split `nats://user:password@host` into what to present and where.
+///
+/// Taken from the URL rather than from a second setting, because that is where
+/// a broker's client expects it and a second way to pass a credential is a
+/// second place for it to be wrong. The client library does not read it from
+/// there itself, which is the kind of thing that fails as an authentication
+/// error naming no user at all.
+fn credential_in(url: &str) -> (async_nats::ConnectOptions, String) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("nats", url));
+
+    let Some((credential, host)) = rest.rsplit_once('@') else {
+        return (async_nats::ConnectOptions::new(), url.to_string());
+    };
+
+    let (user, password) = credential.split_once(':').unwrap_or((credential, ""));
+    (
+        async_nats::ConnectOptions::with_user_and_password(user.to_string(), password.to_string()),
+        format!("{scheme}://{host}"),
+    )
+}
+
+/// The address without its credential, for anything anybody will read.
+fn redacted(url: &str) -> String {
+    let (_, address) = credential_in(url);
+    address
 }
 
 impl Backend for NatsBackend {

@@ -30,7 +30,18 @@ services:
   # what 007 fixed, and durability arrives with the workflow that demands it.
   nats:
     image: nats:2.10-alpine
-    command: ["-DV"]
+    command: ["-c", "/etc/nats/permissions.conf", "-DV"]
+    environment:
+      # Development passwords, and obviously so. A deployment's come from a
+      # secret, one per identity, mounted into that container alone.
+      MERIDIAN_NATS_RUNTIME: runtime-dev-only
+      MERIDIAN_NATS_CUSTODY: custody-dev-only
+      MERIDIAN_NATS_DASHBOARD: dashboard-dev-only
+      MERIDIAN_NATS_POSITIONS_READER: positions-reader-dev-only
+    volumes:
+      # Generated from the grant table, never edited: the grant table is the
+      # policy and this is the broker saying the same thing.
+      - ./deploy/nats/permissions.conf:/etc/nats/permissions.conf:ro
     ports:
       # Not 4222: a developer with another NATS on this machine should not have
       # to stop it to run these tests.
@@ -114,7 +125,10 @@ services:
         condition: service_healthy
     environment:
       MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
-      MERIDIAN_TEST_BROKER_URL: nats://nats:4222
+      MERIDIAN_TEST_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      # A plugin's sidecar, with only what the custody role may do. The tests
+      # that matter most use this one and expect to be refused.
+      MERIDIAN_TEST_BROKER_URL_CUSTODY: nats://custody:custody-dev-only@nats:4222
       MERIDIAN_TEST_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
       MERIDIAN_TEST_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
       # Read-only, and the same key the runtime generated. The end-to-end test

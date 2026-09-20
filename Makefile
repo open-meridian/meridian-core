@@ -1,11 +1,11 @@
 SHELL := /bin/bash
-PY    := python3
+PY     := python3
 
 RUST_VERSION := 1.90
 COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate test-broker help ci-local ci-local-deep install-hooks ci-mirror-check \
+.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets interop lint fmt lock contract-diff up down demo network
 
 help:
@@ -24,7 +24,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets build test test-store test-broker interop chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-nats-permissions build test test-store test-broker interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -84,6 +84,13 @@ CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set d
 # a replica with no deployment identifier, no key or no database installs
 # happily and then crash-loops, and the operator reads a restart count instead
 # of a sentence.
+# The broker's permissions, from the grant table. Decision 010.
+nats-permissions:
+	@$(PY) tools/nats_permissions.py
+
+check-nats-permissions:
+	@$(PY) tools/nats_permissions.py --check
+
 # The bus across a process boundary, against a real broker. Decision 010.
 #
 # Two backends on one broker is the whole point: an in-process test proves
