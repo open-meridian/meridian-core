@@ -67,6 +67,7 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
+            let reporting_bus = Arc::clone(&bus);
 
             let replica = Replica::new(
                 bus,
@@ -79,8 +80,12 @@ fn run() -> Result<(), String> {
             // published into the gap between starting and listening.
             let running = replica.start();
 
+            // W5.19 outward, W5.20 inward: this component holds the key, so
+            // it is the one that can tell the platform anything, and what it
+            // tells it includes what the others have said about themselves.
             let reporting = Arc::clone(&platform);
-            tokio::spawn(async move { report_forever(reporting, "replica", 0).await });
+            let collecting = Arc::clone(&reporting_bus);
+            tokio::spawn(async move { report_forever(reporting, collecting, "replica", 0).await });
 
             tracing::info!(instance_id, "the replica is serving");
 

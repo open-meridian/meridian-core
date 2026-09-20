@@ -18,9 +18,7 @@ use std::sync::Arc;
 
 use meridian_kernel::service::SystemClock;
 use meridian_kernel::PostgresStore;
-use meridian_runtime::{
-    bus_from_env, key_at, now_ns, platform_from_env, report_forever, required, shutdown, var,
-};
+use meridian_runtime::{bus_from_env, now_ns, report_inward_forever, required, shutdown, var};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -71,21 +69,13 @@ fn run() -> Result<(), String> {
             // has not arrived.
             meridian_kernel::service::serve(bus.clone(), Arc::new(store), Arc::new(SystemClock));
 
-            // W5.19, when this process has a key to say it with. The ledger
-            // does not talk to the platform otherwise, and a deployment that
-            // does not mount one here simply goes unreported rather than
-            // failing to start.
-            if let Some(path) = var("MERIDIAN_KEY_PATH") {
-                match key_at(&path).and_then(platform_from_env) {
-                    Ok(platform) => {
-                        let schema = meridian_kernel::migrations::latest();
-                        tokio::spawn(
-                            async move { report_forever(platform, "ledger", schema).await },
-                        );
-                    }
-                    Err(failed) => tracing::warn!(%failed, "not reporting to the platform"),
-                }
-            }
+            // W5.20. Said on the bus, for the replica to carry outward: this
+            // process holds no key, and giving it one so it could report
+            // directly would make it a second thing able to authenticate as
+            // the whole deployment.
+            let reporting = bus.clone();
+            let schema = meridian_kernel::migrations::latest();
+            tokio::spawn(async move { report_inward_forever(reporting, "ledger", schema).await });
 
             tracing::info!(
                 instance_id,

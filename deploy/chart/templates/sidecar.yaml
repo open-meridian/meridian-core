@@ -1,0 +1,91 @@
+{{- range .Values.sidecars }}
+{{- $top := $ }}
+{{/*
+  A plugin's sidecar, one Deployment each. The plugin runs as a second
+  container in this pod, because the sidecar binds loopback: a sidecar
+  reachable across the network is a way around the boundary it enforces.
+
+  One per plugin rather than one shared. A `Sidecar` holds one registration,
+  and a second plugin admitted on a shared one would inherit the first's
+  grants, which was verified rather than assumed.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-sidecar-{{ .instanceId }}
+  labels:
+    meridian.dev/component: sidecar
+    meridian.dev/instance: {{ .instanceId }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
+      app.kubernetes.io/instance: {{ $top.Release.Name }}
+      meridian.dev/instance: {{ .instanceId }}
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" $top | nindent 8 }}
+        meridian.dev/component: sidecar
+        meridian.dev/instance: {{ .instanceId }}
+    spec:
+      {{- with $top.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: sidecar
+          image: "{{ $top.Values.image.repository }}:{{ .imageTag | default $top.Values.image.tag }}"
+          imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+          args: ["meridian-sidecar"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_DEPLOYMENT_ID
+              value: {{ $top.Values.deployment.id | quote }}
+            - name: MERIDIAN_SIDECAR_ADDRESS
+              value: {{ $top.Values.sidecar.address | quote }}
+            - name: MERIDIAN_INSTANCE_ID
+              value: sidecar-{{ .instanceId }}
+            {{/*
+              Assigned here, at launch, never declared by the plugin: a plugin
+              that named its own role would be choosing its own privileges.
+            */}}
+            - name: MERIDIAN_PLUGIN_INSTANCE_ID
+              value: {{ .instanceId | quote }}
+            - name: MERIDIAN_PLUGIN_ROLE
+              value: {{ .role | quote }}
+            - name: MERIDIAN_PLUGIN_TAGS
+              value: {{ join "," (.tags | default list) | quote }}
+            - name: RUST_LOG
+              value: {{ $top.Values.logLevel | quote }}
+            {{/*
+              The credential this instance presents, which the plugin's
+              container has no mount for. Containers in a pod share a network
+              namespace and not a filesystem, and that seam is the boundary.
+            */}}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $top.Values.broker.existingSecret }}
+                  key: {{ .instanceId }}
+          volumeMounts:
+            - name: grants
+              mountPath: /etc/meridian
+              readOnly: true
+          resources:
+            {{- toYaml $top.Values.resources | nindent 12 }}
+      volumes:
+        - name: grants
+          configMap:
+            name: {{ $top.Values.grants.existingConfigMap }}
+            items:
+              - key: {{ $top.Values.grants.key }}
+                path: grants.json
+---
+{{- end }}

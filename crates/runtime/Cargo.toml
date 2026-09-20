@@ -28,6 +28,7 @@ meridian-reference = { path = "../reference" }
 meridian-kernel = { path = "../kernel" }
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
+prost.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing.workspace = true

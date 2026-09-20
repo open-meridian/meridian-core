@@ -83,8 +83,50 @@ migrate:
   existingSecret: ""
   key: ""
 
+  # The ledger's, when its schema lives somewhere else. Empty falls back to the
+  # settings above, and then to the ledger's own serving credential.
+  ledgerSecret: ""
+  ledgerKey: ""
+
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
+
+# Each component is its own Deployment with its own tag, which is what makes
+# "upgrade one without the others" a values change rather than a redesign.
+# Empty means image.tag, so a deployment that moves everything together still
+# names one version.
+replica:
+  image:
+    tag: ""
+
+ledger:
+  replicaCount: 1
+  image:
+    tag: ""
+  # Its own database, or the same one. Two schemas on one server is supported
+  # and two components sharing a table is not, which is a rule the credentials
+  # should enforce rather than the code remember.
+  database:
+    existingSecret: ""
+    key: ""
+
+# The broker the components and sidecars meet on, per decision 010. One secret
+# holding one credential per identity, each mounted into that container alone:
+# a plugin can route to the broker and has nothing to present.
+broker:
+  existingSecret: ""
+  replicaKey: replica
+  ledgerKey: ledger
+
+# A sidecar per plugin, each with the identity it is launched with. The key in
+# the broker secret is the instance identifier, so adding a plugin is adding a
+# credential and an entry here.
+#
+# sidecars:
+#   - instanceId: custody-1
+#     role: custody
+#     tags: []
+sidecars: []
 
 replicaCount: 1
 
@@ -98,9 +140,10 @@ resources:
 logLevel: info
 
 sidecar:
-  # Where a plugin dials its sidecar, on loopback. A plugin therefore runs as a
-  # second container in the runtime's pod; a plugin in its own pod cannot reach
-  # this, and is waiting on a bus a sidecar can reach from outside the runtime.
+  # Where a plugin dials its sidecar, on loopback. A plugin runs as a second
+  # container in its sidecar's pod, which is what sharing a network namespace
+  # means here; a plugin in its own pod cannot reach this, and should not be
+  # able to.
   #
   # Changing the host here opens the boundary to anything that can route to the
   # pod. The runtime warns when it is not loopback.

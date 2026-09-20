@@ -1,0 +1,65 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The ledger. Its own Deployment and its own image tag, which is the whole
+  point of the split: the replica holds what the platform can send again, this
+  holds statements nothing can reconstruct, and tying their versions together
+  made every replica change inherit the ledger's caution.
+
+  No key and no platform address. It does not talk to the platform, so it
+  cannot, and what it runs reaches the platform by way of the replica.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-ledger
+  labels:
+    meridian.dev/component: ledger
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ledger.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: ledger
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: ledger
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ledger
+          image: "{{ .Values.image.repository }}:{{ .Values.ledger.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-ledger"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-ledger
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: MERIDIAN_LEDGER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ledger.database.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.ledger.database.key | default .Values.database.key }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.broker.existingSecret }}
+                  key: {{ .Values.broker.ledgerKey }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

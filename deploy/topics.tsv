@@ -4,6 +4,7 @@
 # permissions. Regenerate from meridian-design with `make component-topics`.
 topic	kind	publisher	subscriber
 platform.custody.*.event.sync-status	event	custody	dashboard
+platform.deployment.event.component-report	event	kernel	reference
 platform.kernel.command.record-holding	command	custody	kernel
 platform.kernel.command.record-statement	command	custody	kernel
 platform.kernel.event.custodial-position-updated	event	kernel	dashboard

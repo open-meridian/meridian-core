@@ -35,11 +35,37 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      containers:
-        - name: migrate
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      {{/*
+        Each component migrates its own schema, in its own container, at the
+        version being released. An init container for the ledger and the
+        replica's in the main one, so both must succeed for the release to
+        proceed and the order is stated rather than raced.
+      */}}
+      initContainers:
+        - name: ledger
+          image: "{{ .Values.image.repository }}:{{ .Values.ledger.image.tag | default .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["migrate"]
+          args: ["meridian-ledger", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_LEDGER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.ledgerSecret | default .Values.migrate.existingSecret | default .Values.ledger.database.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.migrate.ledgerKey | default .Values.migrate.key | default .Values.ledger.database.key | default .Values.database.key }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      containers:
+        - name: replica
+          image: "{{ .Values.image.repository }}:{{ .Values.replica.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-replica", "migrate"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -47,10 +73,10 @@ spec:
               drop: [ALL]
           env:
             {{/*
-              The migrating credential, which is not the serving one: the
-              runtime needs no right to alter a table. Defaults to the same
-              secret so a deployment that has not split them still works, and
-              says so rather than pretending they are separate.
+              The migrating credential, which is not the serving one: a
+              component needs no right to alter a table. Defaults to the
+              serving secret so a deployment that has not separated them still
+              works, and says so rather than pretending they are separate.
             */}}
             - name: MERIDIAN_DATABASE_URL
               valueFrom:

@@ -35,6 +35,9 @@ the operator the same thing far less clearly.
 {{- if and .Values.key.existingSecret .Values.key.generate -}}
 {{- fail "key.existingSecret and key.generate are both set, and they mean opposite things: one supplies a key, the other makes one. Pick." -}}
 {{- end -}}
+{{- if not .Values.broker.existingSecret -}}
+{{- fail "broker.existingSecret is not set. The components meet on a broker, and each presents a credential from that secret; a deployment without one has components that cannot hear each other." -}}
+{{- end -}}
 {{- if not .Values.database.existingSecret -}}
 {{- fail "database.existingSecret is not set. The replica needs a Postgres URL, in a secret rather than in your values." -}}
 {{- end -}}

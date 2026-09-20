@@ -223,3 +223,39 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     assert!(!stranger.may_publish(meridian_kernel::service::RECORD_HOLDING));
     assert!(!stranger.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
 }
+
+// ── W5.20: components say what they run, inward ─────────────────────────────
+
+#[tokio::test]
+async fn a_components_report_reaches_the_one_holding_the_key() {
+    // The ledger holds no key, so what it runs reaches the platform only by
+    // way of the replica. This is that path, without a platform: the ledger
+    // publishes, and what the replica would send carries it.
+    use meridian_runtime::{collect_inward, report_inward_forever, COMPONENT_REPORT_TOPIC};
+
+    let bus = Arc::new(Bus::single("replica-1", Arc::new(MemoryBackend::new())));
+    let heard = collect_inward(Arc::clone(&bus));
+
+    let publishing = Arc::clone(&bus);
+    tokio::spawn(async move { report_inward_forever(publishing, "ledger", 2).await });
+
+    // The first report goes out immediately; the interval is for the ones
+    // after it, which is what makes a restart visible promptly.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(report) = heard.lock().unwrap().get("ledger") {
+            assert_eq!(report.schema_version, 2);
+            assert_eq!(report.health, "COMPONENT_HEALTH_SERVING");
+            assert!(
+                !report.version.is_empty(),
+                "a report with no version says nothing"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "nothing arrived on {COMPONENT_REPORT_TOPIC}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

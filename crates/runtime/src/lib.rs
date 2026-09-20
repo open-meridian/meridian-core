@@ -10,7 +10,8 @@
 //! Each binary is in `src/bin`, and each is small enough to read in one
 //! sitting, which is the point of them being separate.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meridian_bus::{Backend, Bus, MemoryBackend, NatsBackend};
@@ -73,18 +74,124 @@ pub fn platform_from_env(key: DeploymentKey) -> Result<Arc<Platform>, String> {
     )))
 }
 
+/// Where a component says what it is running, inside the deployment. W5.20.
+pub const COMPONENT_REPORT_TOPIC: &str = "platform.deployment.event.component-report";
+
+/// Say what this component is running, on the bus, for the replica to collect.
+///
+/// Inward rather than to the platform, because reporting outward needs the
+/// deployment's key and a component holding one is a second thing able to
+/// authenticate as the whole deployment. That is a large thing to grant for a
+/// version string.
+pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schema: i64) {
+    use prost::Message as _;
+
+    let started_at_ns = now_ns();
+    let version = var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+
+    loop {
+        let report = meridian_pb::v1::ComponentReport {
+            component: component.to_string(),
+            version: version.clone(),
+            schema_version: schema,
+            health: meridian_pb::v1::ComponentHealth::Serving as i32,
+            detail: String::new(),
+            started_at_ns,
+        };
+
+        if let Err(failed) = bus.publish(
+            COMPONENT_REPORT_TOPIC,
+            "meridian.v1.ComponentReport",
+            report.encode_to_vec(),
+            None,
+            None,
+        ) {
+            // Not a warning. A deployment whose components cannot say what
+            // they run still runs them, and the platform shows an age rather
+            // than inferring failure from silence.
+            tracing::debug!(%failed, "could not report inward");
+        }
+
+        tokio::time::sleep(REPORT_EVERY).await;
+    }
+}
+
+/// What every other component has said about itself, newest per component.
+///
+/// A current picture rather than a history, for the reason the platform keeps
+/// one: a history here would be a time series of a customer's estate that
+/// nobody asked for.
+///
+/// Returned rather than kept inside the reporting loop, so what a report ends
+/// up carrying can be tested without a platform to receive it.
+pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentReport>>> {
+    use prost::Message as _;
+
+    let heard: Arc<Mutex<BTreeMap<String, ComponentReport>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let collecting = Arc::clone(&heard);
+    let mut inward = bus.subscribe(COMPONENT_REPORT_TOPIC);
+
+    tokio::spawn(async move {
+        while let Some(delivery) = inward.recv().await {
+            let Ok(report) =
+                meridian_pb::v1::ComponentReport::decode(&delivery.envelope.payload[..])
+            else {
+                tracing::warn!("a component report did not decode");
+                continue;
+            };
+
+            collecting.lock().expect("report lock poisoned").insert(
+                report.component.clone(),
+                ComponentReport {
+                    component: report.component,
+                    version: report.version,
+                    schema_version: report.schema_version,
+                    health: "COMPONENT_HEALTH_SERVING",
+                    detail: report.detail,
+                    started_at_ns: report.started_at_ns,
+                },
+            );
+        }
+    });
+
+    heard
+}
+
 /// Tell the platform what this component is running, now and every interval.
 ///
 /// One component per process now, where the runtime reported two. Failing to
 /// report changes nothing about running, so this is spawned, never awaited,
 /// and logged at debug.
-pub async fn report_forever(platform: Arc<Platform>, component: &'static str, schema: i64) {
+pub async fn report_forever(
+    platform: Arc<Platform>,
+    bus: Arc<Bus>,
+    component: &'static str,
+    schema: i64,
+) {
     let started_at_ns = now_ns();
     let version = var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
 
+    let heard = collect_inward(bus);
+
     loop {
-        let report = ComponentReport::serving(component, &version, schema, started_at_ns);
-        if let Err(failed) = platform.report_components(&[report], now_ns()).await {
+        // This component's own, which never travels: it is the one holding the
+        // key, so it has no reason to tell itself over a broker.
+        let mut reports = vec![ComponentReport::serving(
+            component,
+            &version,
+            schema,
+            started_at_ns,
+        )];
+        reports.extend(
+            heard
+                .lock()
+                .expect("report lock poisoned")
+                .values()
+                .cloned(),
+        );
+
+        if let Err(failed) = platform.report_components(&reports, now_ns()).await {
             tracing::debug!(%failed, "could not report components");
         }
         tokio::time::sleep(REPORT_EVERY).await;

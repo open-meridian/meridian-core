@@ -78,7 +78,7 @@ test-store: network
 	@echo "test-store OK: both stores pass against Postgres"
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
-CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d
+CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d --set broker.existingSecret=b
 
 # A chart that renders is half the check. The other half is that it refuses:
 # a replica with no deployment identifier, no key or no database installs
@@ -134,7 +134,7 @@ chart-check:
 		     echo "  OpenShift assigns each namespace its own range and refuses a pod asking outside it" >&2; exit 1; } \
 		|| true
 	@$(HELM) template check deploy/chart --set deployment.id=DEP-check \
-		--set key.generate=true --set database.existingSecret=d 2>/dev/null \
+		--set key.generate=true --set database.existingSecret=d --set broker.existingSecret=b 2>/dev/null \
 		| grep -q "PersistentVolumeClaim" \
 		|| { echo "chart-check FAILED: key.generate renders no volume for the key" >&2; exit 1; }
 	@if $(HELM) template check deploy/chart $(CHART_VALUES) --set key.generate=true >/dev/null 2>&1; then \
@@ -142,10 +142,24 @@ chart-check:
 		echo "  they mean opposite things, so accepting both hides which one is in use" >&2; exit 1; \
 	fi
 	@if $(HELM) template check deploy/chart --set deployment.id=DEP-check \
-		--set database.existingSecret=d >/dev/null 2>&1; then \
+		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
 		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
 	fi
-	@echo "chart-check OK: both key paths render, neither and both are refused, it migrates, and pins no uid"
+	@for component in ledger replica; do \
+		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+			| grep -q "meridian-$$component\"\]" \
+			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
+	done
+	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| grep -c "^kind: Deployment" | grep -q "^2$$" \
+		|| { echo "chart-check FAILED: the ledger and the replica are not two Deployments" >&2; \
+		     echo "  one workload means neither can be upgraded without the other" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) \
+		--set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' \
+		--set grants.existingConfigMap=g 2>/dev/null \
+		| grep -q "sidecar-custody-1" \
+		|| { echo "chart-check FAILED: a configured plugin gets no sidecar" >&2; exit 1; }
+	@echo "chart-check OK: three components, both key paths, refusals, migrations, and no pinned uid"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

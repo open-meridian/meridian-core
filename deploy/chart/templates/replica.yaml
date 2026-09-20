@@ -2,8 +2,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "meridian-runtime.fullname" . }}
+  name: {{ include "meridian-runtime.fullname" . }}-replica
   labels:
+    meridian.dev/component: replica
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
@@ -11,10 +12,12 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: replica
   template:
     metadata:
       labels:
         {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: replica
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -26,7 +29,8 @@ spec:
       {{- end }}
       containers:
         - name: replica
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.replica.image.tag | default .Values.image.tag }}"
+          args: ["meridian-replica"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -40,14 +44,13 @@ spec:
               value: {{ .Values.platform.address | quote }}
             - name: MERIDIAN_KEY_PATH
               value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
-            - name: MERIDIAN_SIDECAR_ADDRESS
-              value: {{ .Values.sidecar.address | quote }}
-            - name: MERIDIAN_PLUGIN_INSTANCE_ID
-              value: {{ .Values.sidecar.plugin.instanceId | quote }}
-            - name: MERIDIAN_PLUGIN_ROLE
-              value: {{ .Values.sidecar.plugin.role | quote }}
-            - name: MERIDIAN_PLUGIN_TAGS
-              value: {{ join "," .Values.sidecar.plugin.tags | quote }}
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-replica
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.broker.existingSecret }}
+                  key: {{ .Values.broker.replicaKey }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL
@@ -55,11 +58,9 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.key }}
-          # No port. The sidecar binds loopback, so a plugin reaches it by
-          # running as a second container in this pod and sharing the network
-          # namespace. A containerPort would advertise something no pod outside
-          # this one can reach, and a Service in front of it would put the
-          # boundary on the network, which is what it exists to prevent.
+          # No port. Everything this component says goes over the broker, so
+          # nothing outside its pod needs to reach it. A Service in front of it
+          # would be a second way in that nothing asks for.
           volumeMounts:
             # One directory holding both files, because the runtime reads them
             # from fixed paths there. Two volumes cannot do it: mounting the
@@ -96,13 +97,6 @@ spec:
                   items:
                     - key: {{ .Values.key.key }}
                       path: key.pem
-              {{- end }}
-              {{- if .Values.grants.existingConfigMap }}
-              - configMap:
-                  name: {{ .Values.grants.existingConfigMap }}
-                  items:
-                    - key: {{ .Values.grants.key }}
-                      path: grants.json
               {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
