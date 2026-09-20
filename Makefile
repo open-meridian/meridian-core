@@ -5,7 +5,7 @@ RUST_VERSION := 1.90
 COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate help ci-local ci-local-deep install-hooks ci-mirror-check \
+.PHONY: migrate test-broker help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets interop lint fmt lock contract-diff up down demo network
 
 help:
@@ -24,7 +24,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets build test test-store interop chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets build test test-store test-broker interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -84,6 +84,20 @@ CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set d
 # a replica with no deployment identifier, no key or no database installs
 # happily and then crash-loops, and the operator reads a restart count instead
 # of a sentence.
+# The bus across a process boundary, against a real broker. Decision 010.
+#
+# Two backends on one broker is the whole point: an in-process test proves
+# routing, which the memory backend already does, and proves nothing about a
+# message leaving a process.
+test-broker: network
+	@$(COMPOSE) up -d nats >/dev/null
+	@$(COMPOSE) run --rm -T --build tests \
+		cargo test --locked -p meridian-bus --test nats \
+		>.test-broker.log 2>&1 \
+		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
+		     tail -40 .test-broker.log >&2; exit 1; }
+	@echo "test-broker OK: messages cross a process boundary through the broker"
+
 chart-check:
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \

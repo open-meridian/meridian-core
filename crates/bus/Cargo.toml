@@ -7,6 +7,8 @@ license.workspace = true
 description = "Topic routing and in-process transport for the Meridian bus"
 
 [dependencies]
+async-nats.workspace = true
+futures-util.workspace = true
 meridian-pb.workspace = true
 tokio.workspace = true
 prost.workspace = true

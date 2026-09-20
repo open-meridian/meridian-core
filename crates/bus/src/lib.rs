@@ -25,10 +25,12 @@ pub mod topic;
 
 mod backend;
 mod memory;
+mod nats;
 mod router;
 
 pub use backend::{Backend, BusError, Delivery, Subscription};
 pub use memory::MemoryBackend;
+pub use nats::NatsBackend;
 pub use router::{Bus, RouteRule};
 
 /// Envelope and metadata, re-exported so consumers need not depend on the

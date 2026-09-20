@@ -17,6 +17,11 @@ license = "AGPL-3.0-or-later"
 meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "29000cd2061e20014ccb767e359bef93e0b4c5b3" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1"
+
+# The broker the bus runs on, per decision 010. Pinned to a minor version like
+# every other dependency a customer inherits.
+async-nats = "0.38"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tonic = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
