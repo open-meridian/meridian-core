@@ -95,7 +95,16 @@ chart-check:
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
 		fi; \
 	done
-	@echo "chart-check OK: the chart renders, and refuses without each of its three required values"
+	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| grep -q '"migrate"' \
+		|| { echo "chart-check FAILED: the chart renders no migration job" >&2; \
+		     echo "  the runtime verifies the schema and refuses to serve without one" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| grep -q "runAsUser" \
+		&& { echo "chart-check FAILED: the chart pins a uid by default" >&2; \
+		     echo "  OpenShift assigns each namespace its own range and refuses a pod asking outside it" >&2; exit 1; } \
+		|| true
+	@echo "chart-check OK: it renders, refuses without its three required values, migrates, and pins no uid"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

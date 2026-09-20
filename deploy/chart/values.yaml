@@ -35,6 +35,36 @@ key:
   existingSecret: ""
   key: key.pem
 
+# What the pod runs as.
+#
+# Empty by default, and that is the portable answer rather than a lax one. A
+# fixed uid is refused by OpenShift, which assigns each namespace its own
+# range, so a chart that pins one does not install there at all. The image runs
+# as a non-root user already, and a cluster with its own policy applies it here
+# without this chart arguing.
+#
+# Set it if your cluster expects you to:
+#   podSecurityContext:
+#     runAsNonRoot: true
+#     runAsUser: 10001
+#     fsGroup: 10001
+podSecurityContext: {}
+
+# Applying the schema, once per release, before the new version serves.
+#
+# The runtime verifies rather than applies on start, so this is not optional:
+# without it a fresh install starts and refuses to serve, naming the command it
+# needs.
+migrate:
+  # A credential that may alter tables, which the serving one should not be.
+  # Empty means use the database secret above, which is honest about the two
+  # not being separated rather than implying they are.
+  existingSecret: ""
+  key: ""
+
+  # A failed migration should stop the release rather than retry into it.
+  backoffLimit: 0
+
 replicaCount: 1
 
 resources:

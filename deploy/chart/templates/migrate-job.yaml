@@ -1,0 +1,63 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The schema, applied once per release before the new version serves.
+
+  A helm hook rather than an init container: an init container runs per pod, so
+  N replicas starting together race to apply the same migration, and a pod that
+  restarts at 3am migrates a customer's database because it restarted. This
+  runs once, and `helm upgrade --atomic` leaves the running version untouched
+  when it fails.
+
+  An administrator whose delivery tooling does not honour hooks runs the same
+  image with `migrate` themselves; the runtime refuses to serve against a
+  schema it does not recognise, so a missed migration is a refusal with a
+  sentence rather than a wrong answer.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-migrate
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            {{/*
+              The migrating credential, which is not the serving one: the
+              runtime needs no right to alter a table. Defaults to the same
+              secret so a deployment that has not split them still works, and
+              says so rather than pretending they are separate.
+            */}}
+            - name: MERIDIAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.migrate.key | default .Values.database.key }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

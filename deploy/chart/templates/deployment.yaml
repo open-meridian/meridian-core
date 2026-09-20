@@ -20,10 +20,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- with .Values.podSecurityContext }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: replica
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
