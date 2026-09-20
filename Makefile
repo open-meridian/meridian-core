@@ -175,7 +175,8 @@ install-hooks:
 migrate: network
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d postgres >/dev/null
-	@$(COMPOSE) run --rm --build -T runtime migrate
+	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
+	@$(COMPOSE) run --rm -T ledger meridian-ledger migrate
 
 up: migrate
 	@$(COMPOSE) up --build
@@ -203,10 +204,16 @@ interop: network
 		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@$(COMPOSE) run --rm --build -T runtime migrate >/dev/null 2>&1 \
+	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
+	@$(COMPOSE) run --rm -T ledger meridian-ledger migrate >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build runtime >/dev/null 2>&1 \
-		|| { echo "interop FAILED: the runtime did not start" >&2; exit 1; }
+	@# All three components, because the surface under test is the sidecar's
+	@# and the answers come from the other two across a broker. Before the
+	@# split this was one process, and the test could not tell the difference.
+	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
+	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build ledger replica sidecar >/dev/null 2>&1 \
+		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \

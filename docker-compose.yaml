@@ -57,47 +57,73 @@ services:
       retries: 10
     networks: [meridian]
 
-  runtime:
+  # The ledger. Its own process, its own database credential, and no key:
+  # it does not talk to the platform, which is why it cannot.
+  ledger:
     build:
       context: .
       target: runtime
+    command: ["meridian-ledger"]
     depends_on:
       postgres:
         condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_LEDGER_DATABASE_URL: ${MERIDIAN_LEDGER_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: ledger-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
+  # The replica. Holds the deployment's key, because it is the component that
+  # talks to the platform.
+  replica:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-replica"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
     environment:
       MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
-      # The platform's one address. A name on the shared network in
-      # development; a public address anywhere else. Nothing else about the
-      # platform is configured, on purpose.
       MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
-      # Empty until the deployment is registered. `make demo` fills it in.
       MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
-      MERIDIAN_INSTANCE_ID: ${MERIDIAN_INSTANCE_ID:-runtime-1}
-      # Separate setting, same database by default. The replica and the ledger
-      # hold different things with different retention and availability needs,
-      # so splitting them later is configuration rather than a migration.
-      MERIDIAN_LEDGER_DATABASE_URL: ${MERIDIAN_LEDGER_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
-      # Who the sidecar serves, assigned at launch rather than declared by the
-      # plugin. Empty by default: no plugin runs in this compose file yet, and
-      # an unconfigured sidecar should refuse rather than admit.
-      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-interop-1}
-      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-custody}
-      MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
+      MERIDIAN_INSTANCE_ID: replica-1
       RUST_LOG: ${RUST_LOG:-info}
-    # No port for the sidecar, deliberately. It binds loopback, so a plugin
-    # reaches it by sharing this container's network namespace
-    # (`network_mode: "service:runtime"`), which is the compose equivalent of a
-    # container in the same pod. Publishing the port instead would put the
-    # boundary on the network, which is the one thing it exists to prevent.
     volumes:
       - runtime-keys:/var/lib/meridian
-      # Which roles this deployment admits. Absent, nothing registers, which is
-      # the right default for a file that decides access.
+    networks: [meridian]
+
+  # A plugin's sidecar. One per plugin, and the plugin joins this container's
+  # network namespace rather than the other way round, because the sidecar
+  # binds loopback and holds the broker credential.
+  sidecar:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://custody-1:custody-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-1}
+      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-custody}
+      MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
+      MERIDIAN_INSTANCE_ID: sidecar-custody-1
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
       - ./deploy/grants.example.json:/etc/meridian/grants.json:ro
     networks: [meridian]
 
-  # The Python SDK against this runtime, which is the only check that the two
+  # The Python SDK against a sidecar, which is the only check that the two
   # implementations of the sidecar surface agree.
   #
   # network_mode puts this container in the runtime's network namespace rather
@@ -109,11 +135,11 @@ services:
     profiles: [interop]
     image: meridian-python-interop
     depends_on:
-      runtime:
+      sidecar:
         condition: service_started
     environment:
       MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
-    network_mode: "service:runtime"
+    network_mode: "service:sidecar"
 
   # The gates that need services. Not a build stage, because a build stage has
   # no database, and a lightweight substitute for one is exactly what must not

@@ -18,7 +18,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
- && cp target/release/meridian-runtime /usr/local/bin/meridian-runtime
+ && cp target/release/meridian-ledger target/release/meridian-replica \
+       target/release/meridian-sidecar /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -31,5 +32,14 @@ VOLUME /var/lib/meridian
 
 # Where plugins dial.
 
-COPY --from=build /usr/local/bin/meridian-runtime /usr/local/bin/meridian-runtime
-ENTRYPOINT ["/usr/local/bin/meridian-runtime"]
+# One image, three components. They share a build and a base, and differ in
+# which one an orchestrator starts: a deployment upgrades them on their own
+# schedules by moving one Deployment's tag, not by pulling three images that
+# were built from different commits.
+COPY --from=build /usr/local/bin/meridian-ledger /usr/local/bin/meridian-ledger
+COPY --from=build /usr/local/bin/meridian-replica /usr/local/bin/meridian-replica
+COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
+
+# No default: a component is chosen, never inherited. An image that starts
+# something when nobody said which is an image that starts the wrong thing.
+ENTRYPOINT []

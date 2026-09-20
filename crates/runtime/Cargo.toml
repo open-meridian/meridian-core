@@ -4,7 +4,23 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A deployment's runtime: the process a customer runs"
+description = "A deployment's components: the ledger, the replica and a plugin's sidecar"
+
+[lib]
+name = "meridian_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "meridian-ledger"
+path = "src/bin/ledger.rs"
+
+[[bin]]
+name = "meridian-replica"
+path = "src/bin/replica.rs"
+
+[[bin]]
+name = "meridian-sidecar"
+path = "src/bin/sidecar.rs"
 
 [dependencies]
 meridian-bus = { path = "../bus" }
