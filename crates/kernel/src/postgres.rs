@@ -17,6 +17,7 @@ use postgres::{NoTls, Transaction};
 use r2d2_postgres::PostgresConnectionManager;
 
 use crate::amounts::{Money, Quantity};
+use crate::migrations;
 use crate::store::{
     Completion, Counts, CustodialPosition, Holding, Identifier, Opened, Page, Result, Settled,
     Statement, Store, StoreError,
@@ -24,39 +25,6 @@ use crate::store::{
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
-
-const SCHEMA: &str = include_str!("../migrations/0001_ledger.sql");
-
-/// Columns added after the first release, and therefore absent from a database
-/// created before them. `CREATE TABLE IF NOT EXISTS` adds nothing to a table
-/// that already exists, so without these a database made last week is missing
-/// today's field forever and finds out at query time.
-///
-/// Each is applied only when it is actually missing, and that guard is the
-/// whole point rather than an optimisation. `ALTER TABLE ... ADD COLUMN IF NOT
-/// EXISTS` takes an exclusive lock on the table even when the column is already
-/// there, so a start that has nothing to do still blocks every live
-/// transaction, and deadlocks against one holding a row lock and waiting for
-/// this connection. That is the ordinary shape of a deploy: new instances
-/// starting while old ones serve. Found by running the tests in parallel, which
-/// is the same situation with a shorter fuse.
-/// Tables renamed after a release, and therefore under the old name in a
-/// database created before it.
-///
-/// The first entry here is the change the additive mechanism could not absorb,
-/// which is what `kernel/ledger-needs-migrations` is about: this list has no
-/// ordering, no record of what has run, and no way to express a change that is
-/// not a rename or an addition. It is enough for one rename and is not a
-/// migration system.
-///
-/// Guarded the same way and for the same reason: a rename takes an exclusive
-/// lock, so a start with nothing to do must not reach for one.
-const RENAMES: &[(&str, &str)] = &[("position", "custodial_position")];
-
-const ADDITIONS: &[(&str, &str, &str)] = &[
-    ("statement", "expected_rows", "integer NOT NULL DEFAULT 0"),
-    ("statement", "completed_at_ns", "bigint"),
-];
 
 /// Names the schema lock. Distinct from the replica's, so a deployment running
 /// both does not have one wait on the other.
@@ -78,20 +46,38 @@ impl PostgresStore {
         Ok(Self { pool })
     }
 
-    /// Create the schema if it is not there, under a lock.
+    /// Apply every migration not yet recorded, under a lock.
+    ///
+    /// Run once per release by `meridian-runtime migrate`, never by a starting
+    /// process: N replicas starting together would race to apply the same
+    /// migration, and a process that migrates on start changes a customer's
+    /// database because somebody restarted a pod.
     pub fn migrate(&self) -> Result<()> {
         let mut conn = self.conn()?;
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        // Renames first: the schema below creates the new name, so running it
-        // before the rename would leave an empty table beside a full one.
-        let created = rename_tables(&mut conn)
-            .and_then(|()| conn.batch_execute(SCHEMA).map_err(unavailable))
-            .and_then(|()| add_missing_columns(&mut conn));
+        let outcome = apply_migrations(&mut conn);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
-        created
+        outcome
+    }
+
+    /// What a start does instead of migrating: read where the database is and
+    /// refuse to serve unless this binary recognises it.
+    ///
+    /// One read of one table, and no lock, so a start with nothing to do
+    /// blocks nothing. That is not an optimisation: the mechanism this
+    /// replaces took an exclusive lock on every start, which deadlocks against
+    /// live traffic during exactly the rollout it was meant to survive.
+    pub fn verify(&self) -> Result<()> {
+        let mut conn = self.conn()?;
+        let applied = if table_exists(&mut conn, "schema_migration")? {
+            applied_version(&mut conn)?
+        } else {
+            None
+        };
+        migrations::verify(applied)
     }
 
     fn conn(&self) -> Result<Connection> {
@@ -584,23 +570,79 @@ fn from_json(text: String) -> Vec<Identifier> {
     identifiers
 }
 
-/// Apply each rename in [`RENAMES`], and only when the old name is present and
-/// the new one is not.
-///
-/// Both halves of that condition matter. Without the first, a fresh database
-/// tries to rename a table it never had. Without the second, a database that
-/// has both loses whichever it renames onto.
-fn rename_tables(conn: &mut Connection) -> Result<()> {
-    for (from, to) in RENAMES {
-        let old_exists = table_exists(conn, from)?;
-        let new_exists = table_exists(conn, to)?;
+/// The history table, the baseline for a database that predates it, and then
+/// everything outstanding in order.
+fn apply_migrations(conn: &mut Connection) -> Result<()> {
+    conn.batch_execute(migrations::HISTORY)
+        .map_err(unavailable)?;
+    adopt_existing_schema(conn)?;
 
-        if old_exists && !new_exists {
-            conn.batch_execute(&format!("ALTER TABLE {from} RENAME TO {to}"))
-                .map_err(unavailable)?;
+    let applied = applied_version(conn)?;
+    for migration in migrations::MIGRATIONS {
+        if applied.is_some_and(|at| at >= migration.version) {
+            continue;
         }
+
+        // The migration and the row recording it commit together. A failure
+        // part way leaves everything before it applied and recorded, and the
+        // one that failed neither, so running again resumes rather than
+        // repeats.
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(migration.sql).map_err(unavailable)?;
+        migrations::record(&mut tx, migration, now_ns())?;
+        tx.commit().map_err(unavailable)?;
     }
     Ok(())
+}
+
+/// Tables that mean the ledger's schema is already here, whatever record of it
+/// exists. `position` is in the list because a database old enough to carry
+/// that name is exactly the one adoption is for.
+const LEDGER_TABLES: &[&str] = &["statement", "holding", "custodial_position", "position"];
+
+/// A database made before this history existed has the tables and no record of
+/// them. Recording the baseline is right where re-running it would be wrong:
+/// the first migration creates tables that already hold statements, and
+/// creating `custodial_position` fresh beside an old `position` leaves a full
+/// table and an empty one with nothing to say which is which.
+///
+/// Recognised by the tables themselves rather than by a flag, because a flag
+/// would have to have been written by the code that did not have one.
+fn adopt_existing_schema(conn: &mut Connection) -> Result<()> {
+    if applied_version(conn)?.is_some() {
+        return Ok(());
+    }
+
+    let mut present = false;
+    for table in LEDGER_TABLES {
+        if table_exists(conn, table)? {
+            present = true;
+            break;
+        }
+    }
+    if !present {
+        return Ok(());
+    }
+
+    let baseline = &migrations::MIGRATIONS[0];
+    let mut tx = conn.transaction().map_err(unavailable)?;
+    migrations::record(&mut tx, baseline, now_ns())?;
+    tx.commit().map_err(unavailable)?;
+    Ok(())
+}
+
+fn applied_version(conn: &mut Connection) -> Result<Option<i64>> {
+    let row = conn
+        .query_opt("SELECT max(version) FROM schema_migration", &[])
+        .map_err(unavailable)?;
+    Ok(row.and_then(|row| row.get::<_, Option<i64>>(0)))
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as i64)
+        .unwrap_or_default()
 }
 
 fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {
@@ -612,32 +654,6 @@ fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {
         )
         .map_err(unavailable)?
         .is_some())
-}
-
-/// Add each column in [`ADDITIONS`] that is not already there, and touch the
-/// table at all only when one is missing.
-fn add_missing_columns(conn: &mut Connection) -> Result<()> {
-    for (table, column, definition) in ADDITIONS {
-        let present = conn
-            .query_opt(
-                "SELECT 1 FROM information_schema.columns
-                  WHERE table_schema = current_schema()
-                    AND table_name = $1 AND column_name = $2",
-                &[table, column],
-            )
-            .map_err(unavailable)?
-            .is_some();
-
-        if present {
-            continue;
-        }
-
-        conn.batch_execute(&format!(
-            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"
-        ))
-        .map_err(unavailable)?;
-    }
-    Ok(())
 }
 
 fn unavailable(failed: impl std::error::Error) -> StoreError {

@@ -444,3 +444,186 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
         .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
         .unwrap();
 }
+
+// ── The migration history ───────────────────────────────────────────────────
+//
+// Each of these owns a schema of its own, because they are about the state of
+// a database rather than of a row, and the other tests here share one.
+
+fn base_url() -> String {
+    std::env::var("MERIDIAN_TEST_DATABASE_URL").expect(
+        "MERIDIAN_TEST_DATABASE_URL is not set. These tests need a real Postgres; \
+         run them with `make test-store`.",
+    )
+}
+
+/// A schema of this test's own, and a URL whose connections land in it.
+fn own_schema(tag: &str) -> (String, postgres::Client) {
+    let name = unique(tag).replace('-', "_");
+    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls)
+        .expect("could not reach the test database");
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .expect("could not create a schema");
+
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let client = postgres::Client::connect(&url, postgres::NoTls).expect("could not connect");
+    (url, client)
+}
+
+fn applied_versions(client: &mut postgres::Client) -> Vec<i64> {
+    client
+        .query("SELECT version FROM schema_migration ORDER BY version", &[])
+        .expect("could not read the history")
+        .iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect()
+}
+
+#[test]
+fn a_start_against_an_unmigrated_database_refuses_and_says_what_to_run() {
+    let (url, _client) = own_schema("unmigrated");
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+
+    let refused = store
+        .verify()
+        .expect_err("an empty database must not verify");
+    let said = refused.to_string();
+    assert!(said.contains("no schema"), "{said}");
+    assert!(
+        said.contains("migrate"),
+        "the refusal has to name the fix: {said}"
+    );
+}
+
+#[test]
+fn migrating_applies_every_version_and_then_verifies() {
+    let (url, mut client) = own_schema("fresh");
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+
+    store.migrate().expect("could not apply the schema");
+
+    let versions = applied_versions(&mut client);
+    let expected: Vec<i64> = meridian_kernel::migrations::MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .collect();
+    assert_eq!(versions, expected);
+    store.verify().expect("a migrated database must verify");
+}
+
+#[test]
+fn migrating_twice_changes_nothing() {
+    let (url, mut client) = own_schema("twice");
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+
+    store.migrate().expect("could not apply the schema");
+    let first: Vec<(i64, i64)> = client
+        .query("SELECT version, applied_at_ns FROM schema_migration", &[])
+        .expect("could not read the history")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+
+    store.migrate().expect("migrating again must be a no-op");
+
+    let second: Vec<(i64, i64)> = client
+        .query("SELECT version, applied_at_ns FROM schema_migration", &[])
+        .expect("could not read the history")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        first, second,
+        "a second run re-applied or re-recorded something"
+    );
+}
+
+#[test]
+fn a_database_made_before_the_history_is_adopted_with_its_rows_intact() {
+    // The state a real deployment is in: tables created by `CREATE TABLE IF
+    // NOT EXISTS` at start, under the old table name, without the two columns
+    // the guarded list used to add, and holding a statement nothing can
+    // rebuild.
+    let (url, mut client) = own_schema("adopted");
+    client
+        .batch_execute(include_str!("../migrations/0001_ledger.sql"))
+        .expect("could not create the old schema");
+    client
+        .batch_execute(
+            "ALTER TABLE custodial_position RENAME TO position;
+             ALTER TABLE statement DROP COLUMN expected_rows;
+             ALTER TABLE statement DROP COLUMN completed_at_ns;",
+        )
+        .expect("could not put the schema back to how it was");
+    client
+        .execute(
+            "INSERT INTO statement (statement_id, source, external_statement_id, as_of_date, read_at_ns)
+             VALUES ('STM-old', 'snaptrade', 'ext-1', '2026-09-01', 1)",
+            &[],
+        )
+        .expect("could not write a statement");
+
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+    store.migrate().expect("could not adopt and migrate");
+
+    let kept: i64 = client
+        .query_one(
+            "SELECT count(*) FROM statement WHERE statement_id = 'STM-old'",
+            &[],
+        )
+        .expect("could not count")
+        .get(0);
+    assert_eq!(
+        kept, 1,
+        "adoption lost a statement, which nothing can rebuild"
+    );
+
+    let versions = applied_versions(&mut client);
+    assert_eq!(
+        versions.first().copied(),
+        Some(1),
+        "the baseline was not recorded"
+    );
+    assert_eq!(
+        versions.last().copied(),
+        Some(meridian_kernel::migrations::latest()),
+        "the database was not brought up to date"
+    );
+    store.verify().expect("an adopted database must verify");
+
+    let renamed: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_name = 'custodial_position'",
+            &[],
+        )
+        .expect("could not look for the table")
+        .get(0);
+    assert_eq!(renamed, 1, "the rename did not run");
+}
+
+#[test]
+fn a_database_ahead_of_this_binary_is_refused() {
+    // A rollback: the database was migrated by a newer release. Refused rather
+    // than tolerated, because this binary does not know what that release
+    // changed and its queries may already be wrong.
+    let (url, mut client) = own_schema("ahead");
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+    store.migrate().expect("could not apply the schema");
+
+    client
+        .execute(
+            "INSERT INTO schema_migration (version, name, applied_at_ns) VALUES (999, 'later', 1)",
+            &[],
+        )
+        .expect("could not pretend to be ahead");
+
+    let refused = store.verify().expect_err("a newer schema must not verify");
+    let said = refused.to_string();
+    assert!(said.contains("999"), "{said}");
+    assert!(
+        said.contains(&meridian_kernel::migrations::latest().to_string()),
+        "the refusal has to name both versions: {said}"
+    );
+}

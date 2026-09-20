@@ -59,6 +59,7 @@
 
 pub mod amounts;
 pub mod ids;
+pub mod migrations;
 pub mod positions;
 pub mod postgres;
 pub mod record;

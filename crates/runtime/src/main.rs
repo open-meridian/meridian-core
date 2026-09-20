@@ -105,7 +105,38 @@ fn main() {
     }
 }
 
+/// Bring both stores up to the schema this binary expects.
+///
+/// The replica is included because a release should need one command, not a
+/// list. It would survive being recreated, and saying so is not a reason to
+/// leave it out of the step that makes a deployment ready.
+fn migrate() -> Result<(), String> {
+    let replica_url = required("MERIDIAN_DATABASE_URL")?;
+    let ledger_url = var("MERIDIAN_LEDGER_DATABASE_URL").unwrap_or_else(|| replica_url.clone());
+
+    PostgresStore::connect(&replica_url, 1)
+        .and_then(|store| store.migrate())
+        .map_err(|failed| format!("the replica's schema could not be applied: {failed}"))?;
+
+    meridian_kernel::PostgresStore::connect(&ledger_url, 1)
+        .and_then(|store| store.migrate())
+        .map_err(|failed| format!("the ledger's schema could not be applied: {failed}"))?;
+
+    tracing::info!(
+        version = meridian_kernel::migrations::latest(),
+        "schema applied"
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
+    // Before the key is touched. A migration job holds database credentials
+    // and has no business holding the deployment's private key, and reading it
+    // here would create one in whatever volume that job happens to have.
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        return migrate();
+    }
+
     let key_path = var("MERIDIAN_KEY_PATH").unwrap_or_else(|| "/var/lib/meridian/key.pem".into());
     let key = key_at(&key_path)?;
 
@@ -136,9 +167,12 @@ fn run() -> Result<(), String> {
 
     let ledger_store = meridian_kernel::PostgresStore::connect(&ledger_url, 8)
         .map_err(|failed| failed.to_string())?;
-    ledger_store
-        .migrate()
-        .map_err(|failed| failed.to_string())?;
+
+    // Verified, not migrated. The ledger holds statements nothing can rebuild,
+    // so changing its schema is a release's deliberate act rather than
+    // something a starting pod does: `meridian-runtime migrate` applies, this
+    // refuses to serve against a schema it does not recognise.
+    ledger_store.verify().map_err(|failed| failed.to_string())?;
 
     let grants = grants_at(GRANTS_PATH)?;
 

@@ -5,7 +5,7 @@ RUST_VERSION := 1.90
 COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: help ci-local ci-local-deep install-hooks ci-mirror-check \
+.PHONY: migrate help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets interop lint fmt lock contract-diff up down demo network
 
 help:
@@ -119,7 +119,14 @@ install-hooks:
 	@git config core.hooksPath hooks
 	@echo "hooks installed: git push now runs 'make ci-local' first"
 
-up: network
+# Migration before start, because a starting runtime verifies the ledger's
+# schema and refuses to serve against one it does not recognise. One command
+# per release rather than every process racing to apply the same change.
+migrate: network
+	@$(COMPOSE) up -d postgres >/dev/null
+	@$(COMPOSE) run --rm --build -T runtime migrate
+
+up: migrate
 	@$(COMPOSE) up --build
 
 down:
@@ -144,6 +151,9 @@ interop: network
 	@$(DOCKER) build -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+	@$(COMPOSE) up -d postgres >/dev/null 2>&1
+	@$(COMPOSE) run --rm --build -T runtime migrate >/dev/null 2>&1 \
+		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build runtime >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the runtime did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
@@ -170,6 +180,7 @@ demo: network
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
 	@$(COMPOSE) up -d --build postgres
+	@$(COMPOSE) run --rm -T runtime migrate
 	@echo "1/4  making sure this deployment has a key"
 	@mkdir -p .demo
 	@$(COMPOSE) run --rm --no-deps -T runtime public-key > .demo/public-key.pem
