@@ -1,0 +1,15 @@
+{
+  "_note": "Identities that exist only where this repository's tests run. Never in a deployment: the generated permissions.conf is what a chart ships, and this file is merged in only by `make test-broker` and `make up`, into a config that is not committed. The harness is broad because it publishes on scratch topics no component owns, and NATS wildcards match whole tokens, so a prefix like `platform.test-*` is a literal name rather than a pattern. Nothing is weakened by it: every refusal test uses a component's or a plugin's own credential, which is where the enforcement being proved lives.",
+  "users": [
+    {
+      "user": "tests",
+      "password_env": "MERIDIAN_NATS_TESTS",
+      "publish": [
+        ">"
+      ],
+      "subscribe": [
+        ">"
+      ]
+    }
+  ]
+}

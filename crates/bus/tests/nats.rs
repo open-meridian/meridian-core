@@ -481,3 +481,40 @@ async fn an_instance_cannot_publish_as_another_instance_of_its_role() {
         "the instance was refused its own topic"
     );
 }
+
+#[tokio::test]
+async fn the_runtimes_components_may_only_touch_their_own_topics() {
+    // Derived from the registry's publisher and subscriber columns, vendored
+    // here by meridian-design. A component that may publish anything can
+    // publish as a plugin, and the boundary would hold everywhere except at
+    // the thing most able to ignore it.
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+        .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`.");
+    let runtime = NatsBackend::connect(&url)
+        .await
+        .expect("could not reach the test broker as the runtime");
+    let listening = backend().await;
+
+    // The registry says reference publishes this one.
+    let its_own = "platform.reference.event.instrument-applied";
+    let mut allowed = listening.subscribe(its_own);
+
+    // And says custody publishes this one. A component is not a connector.
+    let a_plugins = "platform.reference.event.instrument-missing";
+    let mut refused = listening.subscribe(a_plugins);
+    settle().await;
+
+    let mine = mark("component-own");
+    let theirs = mark("component-as-plugin");
+    runtime.publish(its_own, envelope(&mine)).unwrap();
+    runtime.publish(a_plugins, envelope(&theirs)).unwrap();
+
+    assert!(
+        arrived(&mut allowed, &mine).await,
+        "a component was refused a topic the registry says it publishes"
+    );
+    assert!(
+        !arrived(&mut refused, &theirs).await,
+        "a component published a topic the registry says a plugin publishes"
+    );
+}

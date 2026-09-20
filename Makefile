@@ -97,7 +97,15 @@ check-nats-permissions:
 # routing, which the memory backend already does, and proves nothing about a
 # message leaving a process.
 test-broker: network
+	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d nats >/dev/null
+	@# Restarted rather than left running: a broker holds its permissions from
+	@# start, so a config generated a moment ago is not in force until it does.
+	@# Skipping this meant a permissions change that had not applied, which is a
+	@# gate passing on the wrong configuration.
+	@$(COMPOSE) restart nats >/dev/null
+	@$(COMPOSE) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \
@@ -165,6 +173,7 @@ install-hooks:
 # schema and refuses to serve against one it does not recognise. One command
 # per release rather than every process racing to apply the same change.
 migrate: network
+	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T runtime migrate
 

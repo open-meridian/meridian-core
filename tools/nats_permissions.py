@@ -46,6 +46,10 @@ HEADER = """\
 # responder actually received, which is tighter than any list we could write.
 INBOX = "_INBOX.>"
 
+# Where development identities live. Merged only when asked for, and the result
+# is not what a chart ships.
+DEV_USERS = "deploy/nats/dev-users.json"
+
 
 def subject(pattern: str) -> str:
     """Our pattern in the broker's grammar.
@@ -107,16 +111,57 @@ def permissions_for(grants: dict, role: str, tags: list[str], instance_id: str) 
     return sorted(publish), sorted(subscribe)
 
 
-def rendered(grants: dict, instances: dict) -> str:
+# The components this deployment's runtime hosts. Both stores are in one
+# process today and become two, at which point each gets its own credential
+# with its own half of this: the manifest already says which topics are whose.
+COMPONENTS = ("reference", "kernel")
+
+
+def component_permissions(manifest: str) -> tuple[list[str], list[str]]:
+    """What the runtime's components may publish and subscribe to.
+
+    Derived from the registry's own publisher and subscriber columns, vendored
+    here by meridian-design, rather than granted wholesale. A component that
+    may publish anything can publish as a plugin, and the boundary this whole
+    decision is about would hold everywhere except at the thing most able to
+    ignore it.
+    """
+    publish: set[str] = set()
+    subscribe: set[str] = set()
+
+    for line in manifest.splitlines():
+        if line.startswith("#") or line.startswith("topic\t") or not line.strip():
+            continue
+        topic, _kind, publisher, subscriber = line.split("\t")
+        publishers = {part.strip() for part in publisher.split(",")}
+        subscribers = {part.strip() for part in subscriber.split(",")}
+
+        if publishers & set(COMPONENTS):
+            publish.add(subject(topic))
+        if subscribers & set(COMPONENTS):
+            subscribe.add(subject(topic))
+
+    return sorted(publish), sorted(subscribe)
+
+
+def rendered(grants: dict, instances: dict, manifest: str, extras: dict | None = None) -> str:
     roles = grants.get("roles") or {}
     lines = [HEADER, "authorization {", "  users = ["]
 
-    # The deployment's own components. Broad, and named as the gap it is.
-    lines.append("    # The runtime's components. Broad until a component's")
-    lines.append("    # permissions are derived from the topic registry.")
+    publish, subscribe = component_permissions(manifest)
+
+    # A component answers calls, so it subscribes to the topics it serves and
+    # replies to whoever asked; allow_responses scopes that to inboxes it
+    # actually received, which is tighter than any list.
+    publish.append(INBOX)
+    subscribe.append(INBOX)
+
+    lines.append("    # The runtime's components, from the registry's own columns.")
     lines.append(
-        '    { user: runtime, password: $MERIDIAN_NATS_RUNTIME, '
-        'permissions: { publish: { allow: [">"] }, subscribe: { allow: [">"] } } }'
+        f"    {{ user: runtime, password: $MERIDIAN_NATS_RUNTIME, permissions: {{ "
+        f"publish: {{ allow: {json.dumps(publish)} }}, "
+        f"subscribe: {{ allow: {json.dumps(subscribe)} }}, "
+        f"allow_responses: true }} }}"
     )
 
     for instance in instances.get("instances") or []:
@@ -149,6 +194,17 @@ def rendered(grants: dict, instances: dict) -> str:
             f"allow_responses: true }} }}"
         )
 
+    for extra in (extras or {}).get("users") or []:
+        publish = list(extra.get("publish") or [])
+        subscribe = list(extra.get("subscribe") or [])
+        lines.append(f"    # {extra['user']}: a development identity, from {DEV_USERS}")
+        lines.append(
+            f"    {{ user: {extra['user']}, password: ${extra['password_env']}, permissions: {{ "
+            f"publish: {{ allow: {json.dumps(publish)} }}, "
+            f"subscribe: {{ allow: {json.dumps(subscribe)} }}, "
+            f"allow_responses: true }} }}"
+        )
+
     lines.append("  ]")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -158,6 +214,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--grants", default="deploy/grants.example.json")
     parser.add_argument("--instances", default="deploy/instances.example.json")
+    parser.add_argument("--topics", default="deploy/topics.tsv")
+    parser.add_argument(
+        "--with-dev-users",
+        action="store_true",
+        help="merge deploy/nats/dev-users.json, for running this repository's tests",
+    )
     parser.add_argument("--out", default="deploy/nats/permissions.conf")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
@@ -172,9 +234,24 @@ def main() -> int:
         print(f"nats-permissions: no launch configuration at {instances_path}", file=sys.stderr)
         return 1
 
+    topics_path = pathlib.Path(args.topics)
+    if not topics_path.exists():
+        print(
+            f"nats-permissions: no topic manifest at {topics_path}. It is generated by "
+            "meridian-design's `make component-topics`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    extras = None
+    if args.with_dev_users:
+        extras = json.loads(pathlib.Path(DEV_USERS).read_text(encoding="utf-8"))
+
     wanted = rendered(
         json.loads(grants_path.read_text(encoding="utf-8")),
         json.loads(instances_path.read_text(encoding="utf-8")),
+        topics_path.read_text(encoding="utf-8"),
+        extras,
     )
     out = pathlib.Path(args.out)
 

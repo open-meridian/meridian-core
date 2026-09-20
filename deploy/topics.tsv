@@ -1,0 +1,15 @@
+# Generated from meridian-design's topic registry. Do not edit.
+#
+# Who publishes and who subscribes, which is what decides a component's broker
+# permissions. Regenerate from meridian-design with `make component-topics`.
+topic	kind	publisher	subscriber
+platform.custody.*.event.sync-status	event	custody	dashboard
+platform.kernel.command.record-holding	command	custody	kernel
+platform.kernel.command.record-statement	command	custody	kernel
+platform.kernel.event.custodial-position-updated	event	kernel	dashboard
+platform.kernel.event.statement-recorded	event	kernel	dashboard
+platform.kernel.query.list-custodial-positions	query	dashboard	kernel
+platform.reference.event.instrument-applied	event	reference	kernel,dashboard
+platform.reference.event.instrument-missing	event	custody	reference
+platform.reference.query.resolve-identifier	query	custody	reference
+platform.reference.query.resolve-instrument	query	kernel	reference

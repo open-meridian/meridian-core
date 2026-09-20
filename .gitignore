@@ -20,3 +20,4 @@ target/
 # Written by `make test-store` when it fails.
 .test-store.log
 .interop.log
+deploy/nats/dev.conf
