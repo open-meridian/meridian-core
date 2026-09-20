@@ -23,18 +23,24 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use meridian_pb::v1::Envelope;
 use prost::Message as _;
 use tokio::sync::mpsc;
 
-use crate::backend::{Backend, BusError, Delivery, Subscription};
+use crate::backend::{Answer, Backend, BusError, Delivery, Handler, Subscription};
 use crate::topic;
 
 /// Same bound as the in-memory backend, and for the same reason: a subscriber
 /// that has stopped consuming is noticed rather than hidden behind a backlog.
 const SUBSCRIBER_QUEUE: usize = 1024;
+
+/// Where a refusal travels. Not in the payload, because the payload is the
+/// answer's shape and a refusal is not an answer of that shape.
+const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
 pub struct NatsBackend {
     client: async_nats::Client,
@@ -161,6 +167,149 @@ impl Backend for NatsBackend {
             rx,
             pattern: pattern.to_string(),
         }
+    }
+
+    /// Ask whoever serves this topic, wherever they are.
+    ///
+    /// The broker knows whether anybody is listening, which is what keeps
+    /// "nobody serves this" apart from "nobody answered in time". Those are
+    /// different problems to whoever is holding a pager: one is a deployment
+    /// missing a component, the other is a component that is too slow or gone.
+    fn request<'a>(&'a self, topic: &'a str, envelope: Envelope, timeout: Duration) -> Answer<'a> {
+        let client = self.client.clone();
+        let subject = topic.to_string();
+
+        Box::pin(async move {
+            if !topic::is_publishable(&subject) {
+                return Err(BusError::NotPublishable(subject));
+            }
+
+            let asked = tokio::time::timeout(
+                timeout,
+                client.request(subject.clone(), envelope.encode_to_vec().into()),
+            )
+            .await;
+
+            let message = match asked {
+                Err(_) => {
+                    return Err(BusError::Timeout {
+                        topic: subject,
+                        timeout_ms: timeout.as_millis() as u64,
+                    })
+                }
+                Ok(Err(failed)) => {
+                    return Err(match failed.kind() {
+                        async_nats::RequestErrorKind::NoResponders => BusError::NoHandler(subject),
+                        async_nats::RequestErrorKind::TimedOut => BusError::Timeout {
+                            topic: subject,
+                            timeout_ms: timeout.as_millis() as u64,
+                        },
+                        _ => BusError::HandlerFailed {
+                            topic: subject,
+                            detail: failed.to_string(),
+                        },
+                    })
+                }
+                Ok(Ok(message)) => message,
+            };
+
+            // A handler that refused says so in a header rather than in the
+            // payload: the payload is the answer's shape, and an error is not
+            // an answer of that shape.
+            if let Some(headers) = &message.headers {
+                if let Some(detail) = headers.get(REFUSAL_HEADER) {
+                    return Err(BusError::HandlerFailed {
+                        topic: subject,
+                        detail: detail.to_string(),
+                    });
+                }
+            }
+
+            Envelope::decode(message.payload).map_err(|failed| BusError::HandlerFailed {
+                topic: subject,
+                detail: format!("the answer was not an envelope: {failed}"),
+            })
+        })
+    }
+
+    /// Offer a local handler's answer to callers in other processes.
+    fn serve(&self, topic: &str, handler: Handler) {
+        let client = self.client.clone();
+        let subject = topic.to_string();
+
+        self.handle.spawn(async move {
+            let mut requests = match client.subscribe(subject.clone()).await {
+                Ok(requests) => requests,
+                Err(failed) => {
+                    tracing::error!(topic = subject, %failed, "could not offer a handler");
+                    return;
+                }
+            };
+
+            while let Some(message) = futures_util::StreamExt::next(&mut requests).await {
+                // A publish on a topic somebody also serves: there is nobody
+                // to answer, so there is nothing to do with it here.
+                let Some(reply_to) = message.reply.clone() else {
+                    continue;
+                };
+
+                let asked = match Envelope::decode(message.payload) {
+                    Ok(envelope) => envelope,
+                    Err(failed) => {
+                        tracing::warn!(topic = subject, %failed, "undecodable request");
+                        continue;
+                    }
+                };
+
+                let handler = Arc::clone(&handler);
+                let client = client.clone();
+                let topic = subject.clone();
+
+                // Each request on its own task, so one slow handler does not
+                // hold up the next, and on a blocking pool, because a handler
+                // that blocks would otherwise stall unrelated work.
+                tokio::spawn(async move {
+                    let answered = tokio::task::spawn_blocking(move || handler(asked)).await;
+
+                    let (payload_type, payload, refusal) = match answered {
+                        Ok(Ok((payload_type, payload))) => (payload_type, payload, None),
+                        Ok(Err(detail)) => (String::new(), Vec::new(), Some(detail)),
+                        Err(joined) => (
+                            String::new(),
+                            Vec::new(),
+                            Some(format!("handler panicked: {joined}")),
+                        ),
+                    };
+
+                    let reply = Envelope {
+                        meta: None,
+                        payload_type,
+                        payload,
+                    };
+
+                    let sent = match refusal {
+                        None => client.publish(reply_to, reply.encode_to_vec().into()).await,
+                        Some(detail) => {
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers.insert(REFUSAL_HEADER, detail.as_str());
+                            client
+                                .publish_with_headers(
+                                    reply_to,
+                                    headers,
+                                    reply.encode_to_vec().into(),
+                                )
+                                .await
+                        }
+                    };
+
+                    if let Err(failed) = sent {
+                        // The caller will time out, which is the honest
+                        // outcome: we have no way to tell them from here.
+                        tracing::warn!(topic, %failed, "an answer did not reach the broker");
+                    }
+                });
+            }
+        });
     }
 
     fn dropped(&self) -> u64 {

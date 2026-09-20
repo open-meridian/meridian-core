@@ -18,9 +18,8 @@ pub struct RouteRule {
 }
 
 /// What a request handler returns: the reply's type name and its bytes.
-pub type HandlerReply = std::result::Result<(String, Vec<u8>), String>;
-
-type Handler = Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync>;
+use crate::backend::Handler;
+pub use crate::backend::HandlerReply;
 
 /// The bus.
 ///
@@ -127,17 +126,29 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
+        let handler: Handler = Arc::new(handler);
         self.handlers
             .write()
             .expect("handler lock poisoned")
-            .insert(topic.to_string(), Arc::new(handler));
+            .insert(topic.to_string(), Arc::clone(&handler));
+
+        // And offered to other processes, where the backend has somewhere to
+        // offer it. The in-process backend does nothing here, because the map
+        // above is already the answer.
+        self.backend_for(topic).serve(topic, handler);
     }
 
     /// Ask a question and wait for the answer, bounded in time.
     ///
-    /// Answered in-process. There is no reply topic and no reply address on the
-    /// wire, which is why neither appears in the envelope. Plugins reach this
-    /// through their sidecar and never serve calls themselves.
+    /// Answered here when something in this process serves the topic, and by
+    /// the backend when nothing does. The local path is not an optimisation:
+    /// a deployment that runs everything in one process should not need a
+    /// broker to ask itself a question, and the tests that hold this contract
+    /// run without one.
+    ///
+    /// There is still no reply topic and no reply address in the envelope. How
+    /// an answer finds its way back is the transport's business, which is what
+    /// keeps a plugin from ever addressing one.
     pub async fn call(
         &self,
         topic: &str,
@@ -151,8 +162,7 @@ impl Bus {
             .read()
             .expect("handler lock poisoned")
             .get(topic)
-            .cloned()
-            .ok_or_else(|| BusError::NoHandler(topic.to_string()))?;
+            .cloned();
 
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
@@ -171,6 +181,17 @@ impl Bus {
 
         let timeout = timeout.unwrap_or(self.default_timeout);
         let topic_owned = topic.to_string();
+
+        let Some(handler) = handler else {
+            // Nobody here serves it. Ask whoever does, wherever they are; a
+            // backend with nowhere to ask answers NoHandler, which is what the
+            // caller would have been told a moment ago anyway.
+            let answered = self
+                .backend_for(topic)
+                .request(topic, envelope, timeout)
+                .await?;
+            return Ok((answered.payload_type, answered.payload));
+        };
 
         // The handler runs off the async runtime. A handler that blocks is a
         // handler that would otherwise stall unrelated tasks on the same

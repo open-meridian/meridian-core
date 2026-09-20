@@ -1,5 +1,7 @@
 //! What a bus backend has to provide.
 
+use std::time::Duration;
+
 use meridian_pb::v1::Envelope;
 use tokio::sync::mpsc;
 
@@ -68,6 +70,19 @@ impl std::fmt::Debug for Subscription {
     }
 }
 
+/// What a handler answers a call with: a payload type and bytes, or why not.
+pub type HandlerReply = std::result::Result<(String, Vec<u8>), String>;
+
+/// A registered answer to one topic.
+pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync>;
+
+/// A future a backend returns, boxed so the trait stays object-safe.
+///
+/// Only the call path pays for this. `publish` and `subscribe` stay
+/// synchronous, which is the whole reason this trait is not async.
+pub type Answer<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Envelope, BusError>> + Send + 'a>>;
+
 /// A transport the bus can route onto.
 ///
 /// Deliberately narrow. Everything above this trait -- routing rules,
@@ -82,6 +97,30 @@ pub trait Backend: Send + Sync {
 
     /// Subscribe to a topic pattern. See [`crate::topic`] for the grammar.
     fn subscribe(&self, pattern: &str) -> Subscription;
+
+    /// Ask a question of whoever serves this topic, wherever they are.
+    ///
+    /// Defaulted to "nobody serves this", so a backend that carries only
+    /// publish and subscribe is still a backend, and the router's in-process
+    /// path is unchanged.
+    ///
+    /// The distinction between nobody serving and nobody answering in time is
+    /// the caller's whole diagnosis, so a backend must keep the two apart
+    /// rather than reporting whichever its client reports.
+    fn request<'a>(
+        &'a self,
+        topic: &'a str,
+        _envelope: Envelope,
+        _timeout: Duration,
+    ) -> Answer<'a> {
+        Box::pin(async move { Err(BusError::NoHandler(topic.to_string())) })
+    }
+
+    /// Offer this topic's answer to callers in other processes.
+    ///
+    /// Defaulted to nothing, because an in-process backend has nowhere else to
+    /// offer it to: the router already holds the handler and answers locally.
+    fn serve(&self, _topic: &str, _handler: Handler) {}
 
     /// Messages dropped because a subscriber's queue was full.
     ///

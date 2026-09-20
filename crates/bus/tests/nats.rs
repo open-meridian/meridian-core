@@ -168,3 +168,122 @@ async fn a_pattern_cannot_be_published_to() {
         .expect_err("a pattern is not a topic");
     assert!(refused.to_string().contains("not publishable"), "{refused}");
 }
+
+// ── Request-reply across processes ──────────────────────────────────────────
+//
+// A call was answered only by a handler registered in the caller's own
+// process, so a plugin asking the ledger a question had no path at all once
+// they were separate. These run two buses on one broker, which is the
+// arrangement the split produces.
+
+use std::sync::Arc;
+
+use meridian_bus::{Bus, BusError};
+
+async fn bus(instance: &str) -> Bus {
+    Bus::single(instance, Arc::new(backend().await))
+}
+
+#[tokio::test]
+async fn a_call_is_answered_by_a_handler_in_another_process() {
+    let asking = bus("asking").await;
+    let answering = bus("answering").await;
+    let topic = topic("query.how-many");
+
+    answering.serve(&topic, |envelope| {
+        Ok((
+            "meridian.test.Answer".to_string(),
+            [b"seen: ".to_vec(), envelope.payload].concat(),
+        ))
+    });
+    settle().await;
+
+    let (payload_type, payload) = asking
+        .call(&topic, "meridian.test.Question", b"42".to_vec(), None, None)
+        .await
+        .expect("the call should have been answered");
+
+    assert_eq!(payload_type, "meridian.test.Answer");
+    assert_eq!(payload, b"seen: 42".to_vec());
+}
+
+#[tokio::test]
+async fn nothing_serving_is_distinct_from_nobody_answering() {
+    // The caller's whole diagnosis. One is a deployment missing a component,
+    // the other is a component that is too slow or gone, and a transport that
+    // reported them alike would send somebody to read the wrong logs.
+    let asking = bus("asking-alone").await;
+    let unserved = topic("query.nobody-serves-this");
+
+    let refused = asking
+        .call(&unserved, "meridian.test.Question", vec![], None, None)
+        .await
+        .expect_err("nothing serves this topic");
+    assert!(
+        matches!(refused, BusError::NoHandler(_)),
+        "expected NoHandler, got {refused:?}"
+    );
+
+    let slow_topic = topic("query.slow");
+    let answering = bus("answering-slowly").await;
+    answering.serve(&slow_topic, |_| {
+        std::thread::sleep(Duration::from_millis(800));
+        Ok((String::new(), vec![]))
+    });
+    settle().await;
+
+    let timed_out = asking
+        .call(
+            &slow_topic,
+            "meridian.test.Question",
+            vec![],
+            None,
+            Some(Duration::from_millis(200)),
+        )
+        .await
+        .expect_err("the handler is slower than the timeout");
+    assert!(
+        matches!(timed_out, BusError::Timeout { .. }),
+        "expected Timeout, got {timed_out:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_crosses_with_its_reason() {
+    let asking = bus("asking-refused").await;
+    let answering = bus("answering-refused").await;
+    let topic = topic("query.refused");
+
+    answering.serve(&topic, |_| Err("that instrument is not yours".to_string()));
+    settle().await;
+
+    let refused = asking
+        .call(&topic, "meridian.test.Question", vec![], None, None)
+        .await
+        .expect_err("the handler refused");
+
+    match refused {
+        BusError::HandlerFailed { detail, .. } => {
+            assert!(detail.contains("not yours"), "{detail}")
+        }
+        other => panic!("expected HandlerFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_local_handler_answers_without_the_broker() {
+    // A deployment running everything in one process should not need a broker
+    // to ask itself a question, and the in-process tests hold that contract
+    // without one.
+    let single = bus("single").await;
+    let topic = topic("query.local");
+
+    single.serve(&topic, |_| Ok(("local".to_string(), b"here".to_vec())));
+
+    // No settle: nothing has to reach a broker for this to work.
+    let (payload_type, _) = single
+        .call(&topic, "meridian.test.Question", vec![], None, None)
+        .await
+        .expect("a local handler answers");
+    assert_eq!(payload_type, "local");
+}
