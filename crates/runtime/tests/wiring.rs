@@ -61,6 +61,7 @@ async fn admitted(sidecar: &Sidecar, expected_role: &str) {
     let reply = sidecar
         .register(Request::new(RegisterRequest {
             schema_version: "v1".into(),
+            ..Default::default()
         }))
         .await
         .expect("register is served")
@@ -88,6 +89,7 @@ async fn call<T: Message + Default>(
             payload: body.encode_to_vec(),
             correlation_id: String::new(),
             timeout_ms: 5_000,
+            ..Default::default()
         }))
         .await
         .expect("call is served")

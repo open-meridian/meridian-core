@@ -1,0 +1,11 @@
+[package]
+name = "meridian-access"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Who may reach what: a person's access and a plugin's scope, evaluated from the configuration's records"
+
+[dependencies]
+meridian-domain.workspace = true
+meridian-pb.workspace = true

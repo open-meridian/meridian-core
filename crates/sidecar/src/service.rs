@@ -13,8 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use meridian_bus::{Bus, BusError};
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    CallFailure, CallReply, CallRequest, Delivery, HeartbeatReply, HeartbeatRequest, LeaveReply,
-    LeaveRequest, PublishReply, PublishRequest, RegisterReply, RegisterRequest, SubscribeRequest,
+    AccountScopeDelivery, CallFailure, CallReply, CallRequest, Delivery, HeartbeatReply,
+    HeartbeatRequest, LeaveReply, LeaveRequest, PluginAccessReply, PluginAccessRequest,
+    PublishReply, PublishRequest, RegisterReply, RegisterRequest, SettingsDelivery,
+    SubscribeRequest, WatchAccountScopeRequest, WatchSettingsRequest,
 };
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
@@ -116,6 +118,19 @@ impl Sidecar {
 }
 
 type DeliveryStream = Pin<Box<dyn Stream<Item = Result<Delivery, Status>> + Send>>;
+type SettingsStream = Pin<Box<dyn Stream<Item = Result<SettingsDelivery, Status>> + Send>>;
+type ScopeStream = Pin<Box<dyn Stream<Item = Result<AccountScopeDelivery, Status>> + Send>>;
+
+/// What a v1 sidecar says to the operations contract v2 adds (W4.7, W4.10,
+/// W4.11). A plugin built against v1 never calls them, and one built against
+/// v2 is refused at registration until this sidecar admits v2, so this answer
+/// is reached only by a plugin that skipped registering.
+fn not_until_v2(operation: &str) -> Status {
+    Status::unimplemented(format!(
+        "{operation} is contract v2, and this sidecar admits v1; it arrives with the \
+         dashboard's settings slice (kernel/dashboard-health-settings-and-bundle)"
+    ))
+}
 
 #[tonic::async_trait]
 impl SidecarService for Sidecar {
@@ -354,6 +369,31 @@ impl SidecarService for Sidecar {
         tracing::info!(instance = registration.instance_id, reason, "plugin left");
         Ok(Response::new(LeaveReply {}))
     }
+
+    type WatchSettingsStream = SettingsStream;
+
+    async fn watch_settings(
+        &self,
+        _request: Request<WatchSettingsRequest>,
+    ) -> Result<Response<Self::WatchSettingsStream>, Status> {
+        Err(not_until_v2("WatchSettings"))
+    }
+
+    async fn plugin_access(
+        &self,
+        _request: Request<PluginAccessRequest>,
+    ) -> Result<Response<PluginAccessReply>, Status> {
+        Err(not_until_v2("PluginAccess"))
+    }
+
+    type WatchAccountScopeStream = ScopeStream;
+
+    async fn watch_account_scope(
+        &self,
+        _request: Request<WatchAccountScopeRequest>,
+    ) -> Result<Response<Self::WatchAccountScopeStream>, Status> {
+        Err(not_until_v2("WatchAccountScope"))
+    }
 }
 
 fn failed_call(failure: CallFailure, detail: String) -> CallReply {
@@ -426,6 +466,7 @@ mod tests {
     fn register_req() -> RegisterRequest {
         RegisterRequest {
             schema_version: "v1".into(),
+            ..Default::default()
         }
     }
 
@@ -739,6 +780,7 @@ mod tests {
                 payload: vec![],
                 correlation_id: String::new(),
                 timeout_ms: 1000,
+                ..Default::default()
             }))
             .await
             .unwrap()

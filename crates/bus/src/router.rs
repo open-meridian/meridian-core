@@ -94,17 +94,7 @@ impl Bus {
     ) -> crate::Result<String> {
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
-            meta: Some(MessageMeta {
-                message_id: message_id.clone(),
-                // An empty correlation starts a new causal chain, and this
-                // message is its root.
-                correlation_id: correlation_id.unwrap_or(&message_id).to_string(),
-                causation_id: causation_id.unwrap_or_default().to_string(),
-                publisher_instance_id: self.instance_id.clone(),
-                topic: topic.to_string(),
-                schema_version: "v1".to_string(),
-                published_at_ns: now_ns(),
-            }),
+            meta: Some(self.meta(&message_id, topic, correlation_id, causation_id, "")),
             payload_type: payload_type.to_string(),
             payload,
         };
@@ -157,6 +147,27 @@ impl Bus {
         correlation_id: Option<&str>,
         timeout: Option<Duration>,
     ) -> crate::Result<(String, Vec<u8>)> {
+        self.call_for(topic, payload_type, payload, correlation_id, timeout, "")
+            .await
+    }
+
+    /// [`Bus::call`], on behalf of a person.
+    ///
+    /// For a core component that acts for somebody signed in -- the dashboard,
+    /// asking the conductor to change what a deployment admin changed. The
+    /// person is stamped as `acting_for_subject` so the answering component
+    /// can record who did it. A plugin never reaches this: its sidecar stamps
+    /// the person itself, from an assertion it has verified (decisions/014).
+    /// An empty subject is a call on nobody's behalf.
+    pub async fn call_for(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        payload: Vec<u8>,
+        correlation_id: Option<&str>,
+        timeout: Option<Duration>,
+        acting_for_subject: &str,
+    ) -> crate::Result<(String, Vec<u8>)> {
         let handler = self
             .handlers
             .read()
@@ -166,15 +177,7 @@ impl Bus {
 
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
-            meta: Some(MessageMeta {
-                message_id: message_id.clone(),
-                correlation_id: correlation_id.unwrap_or(&message_id).to_string(),
-                causation_id: String::new(),
-                publisher_instance_id: self.instance_id.clone(),
-                topic: topic.to_string(),
-                schema_version: "v1".to_string(),
-                published_at_ns: now_ns(),
-            }),
+            meta: Some(self.meta(&message_id, topic, correlation_id, None, acting_for_subject)),
             payload_type: payload_type.to_string(),
             payload,
         };
@@ -222,6 +225,32 @@ impl Bus {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Identity, time and the message id, stamped here and never by a caller.
+    fn meta(
+        &self,
+        message_id: &str,
+        topic: &str,
+        correlation_id: Option<&str>,
+        causation_id: Option<&str>,
+        acting_for_subject: &str,
+    ) -> MessageMeta {
+        MessageMeta {
+            message_id: message_id.to_string(),
+            // An empty correlation starts a new causal chain, and this message
+            // is its root.
+            correlation_id: correlation_id.unwrap_or(message_id).to_string(),
+            causation_id: causation_id.unwrap_or_default().to_string(),
+            publisher_instance_id: self.instance_id.clone(),
+            topic: topic.to_string(),
+            schema_version: "v1".to_string(),
+            published_at_ns: now_ns(),
+            acting_for_subject: acting_for_subject.to_string(),
+            // A read's scope is the sidecar's to stamp, for a plugin; a core
+            // component reads as itself.
+            account_scope: Vec::new(),
+        }
     }
 }
 
@@ -451,5 +480,42 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, BusError::NotPublishable(_)));
+    }
+}
+
+#[cfg(test)]
+mod acting_for {
+    use std::sync::Arc;
+
+    use super::Bus;
+    use crate::MemoryBackend;
+
+    /// The subject the answering component sees, when asked with and without one.
+    async fn subject_seen(acting_for: Option<&str>) -> String {
+        let bus = Bus::single("dashboard-1", Arc::new(MemoryBackend::new()));
+        bus.serve("platform.config.command.define-account", |envelope| {
+            let meta = envelope.meta.unwrap_or_default();
+            Ok((String::new(), meta.acting_for_subject.into_bytes()))
+        });
+
+        let topic = "platform.config.command.define-account";
+        let (_, subject) = match acting_for {
+            Some(person) => {
+                bus.call_for(topic, "", Vec::new(), None, None, person)
+                    .await
+            }
+            None => bus.call(topic, "", Vec::new(), None, None).await,
+        }
+        .expect("answered");
+        String::from_utf8(subject).expect("utf-8")
+    }
+
+    #[tokio::test]
+    async fn a_call_for_a_person_carries_them_and_a_plain_call_carries_nobody() {
+        assert_eq!(
+            subject_seen(Some("https://directory.example.org|8812")).await,
+            "https://directory.example.org|8812"
+        );
+        assert_eq!(subject_seen(None).await, "");
     }
 }

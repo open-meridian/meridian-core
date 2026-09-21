@@ -1024,9 +1024,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libredox"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
+checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
 ]
@@ -1088,6 +1088,14 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "meridian-access"
+version = "0.1.0"
+dependencies = [
+ "meridian-domain",
+ "meridian-pb",
+]
 
 [[package]]
 name = "meridian-bus"
@@ -1153,7 +1161,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=263a6ad8ff7d3f923c0022b4698b049d08b3b8f1#263a6ad8ff7d3f923c0022b4698b049d08b3b8f1"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=df16a7a5f5c8bcff649297b12ade76226b7f5200#df16a7a5f5c8bcff649297b12ade76226b7f5200"
 dependencies = [
  "prost",
  "tonic",

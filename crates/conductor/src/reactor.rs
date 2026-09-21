@@ -228,6 +228,7 @@ mod tests {
                     topic: INSTRUMENT_MISSING.into(),
                     schema_version: "v1".into(),
                     published_at_ns: NOW,
+                    ..Default::default()
                 }),
                 payload_type: payload_type.into(),
                 payload,
