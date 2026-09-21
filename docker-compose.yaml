@@ -24,7 +24,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    networks: [meridian]
+    networks:
+      meridian:
+        # "postgres" is ambiguous on the shared network whenever the
+        # platform's own database is up beside this one: both answer to it,
+        # and a lookup returns either. This name is only ever this one, so
+        # every connection in this file uses it.
+        aliases: [core-postgres]
 
   # The bus, per decision 010. Core NATS rather than JetStream: at-most-once is
   # what 007 fixed, and durability arrives with the workflow that demands it.
@@ -70,7 +76,7 @@ services:
       nats:
         condition: service_started
     environment:
-      MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian}
+      MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: street-1
       RUST_LOG: ${RUST_LOG:-info}
@@ -90,7 +96,7 @@ services:
       nats:
         condition: service_started
     environment:
-      MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/meridian
+      MERIDIAN_DATABASE_URL: postgres://meridian:meridian@core-postgres:5432/meridian
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: instrument-1
       RUST_LOG: ${RUST_LOG:-info}
@@ -111,7 +117,7 @@ services:
     environment:
       # The configuration store: what a deployment admin authors. Its tables
       # are prefixed config_, so it can share a schema with the other stores.
-      MERIDIAN_CONFIG_DATABASE_URL: ${MERIDIAN_CONFIG_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian}
+      MERIDIAN_CONFIG_DATABASE_URL: ${MERIDIAN_CONFIG_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
       MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
@@ -142,6 +148,8 @@ services:
       # says nobody can sign in; the e2e target sets it to the bundled Zitadel.
       MERIDIAN_OIDC_ISSUER: ${MERIDIAN_OIDC_ISSUER:-}
       MERIDIAN_OIDC_CLIENT_ID: ${MERIDIAN_OIDC_CLIENT_ID:-}
+      # Zitadel names the client's project in every ID token's audience.
+      MERIDIAN_OIDC_TRUSTED_AUDIENCES: ${MERIDIAN_OIDC_TRUSTED_AUDIENCES:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
@@ -201,7 +209,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@postgres:5432/meridian
+      MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@core-postgres:5432/meridian
       MERIDIAN_TEST_BROKER_URL: nats://tests:tests-dev-only@nats:4222
       # The runtime's own identity, narrowed to what the registry says its
       # components publish and subscribe to.
@@ -223,8 +231,167 @@ services:
       - runtime-keys:/var/lib/meridian:ro
     networks: [meridian]
 
+  # ── make e2e-dashboard ────────────────────────────────────────────────────
+  #
+  # The dashboard's sign-in against a real, self-hosted Zitadel, brokering a
+  # test LDAP directory, with the group hook between them and a stand-in for
+  # the one platform call a claim makes. Everything here is a local test value
+  # for an instance that lives for one run; none of it is a deployment's.
+  # Nothing publishes a host port: every caller is on the network, and the
+  # issuer is the name the dashboard and the tokens both use.
+
+  # The bundled Zitadel, as the chart installs it: its own database and its
+  # own login role inside the deployment's Postgres (spec, requirement 6).
+  # Init creates both with the admin credential; Zitadel then runs as its own
+  # role.
+  zitadel:
+    profiles: [e2e]
+    image: ghcr.io/zitadel/zitadel:v4.17.3
+    # Root, to write the first instance's tokens onto the bootstrap volume.
+    user: "0"
+    command: ["start-from-init", "--masterkeyFromEnv", "--tlsMode", "disabled"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Zitadel's documented example key. A deployment's is created once as a
+      # Secret and never regenerated.
+      ZITADEL_MASTERKEY: MasterkeyNeedsToHave32Characters
+      ZITADEL_LOG_LEVEL: info
+      # The issuer: http://zitadel:8080, the same string inside the network,
+      # in discovery, and in every token.
+      ZITADEL_EXTERNALDOMAIN: zitadel
+      ZITADEL_EXTERNALPORT: 8080
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_TLS_ENABLED: "false"
+      # The default refuses webhook targets on private addresses, which is
+      # where the group hook lives. Narrowed to the metadata range only.
+      ZITADEL_HTTPCLIENT_DENYLIST: "169.254.0.0/16"
+      ZITADEL_DATABASE_POSTGRES_HOST: core-postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel-dev-only
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: meridian
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: meridian
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_EXISTINGDATABASE: meridian
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: E2E
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: zitadel-admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: "Password1!"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      # A machine admin whose token the bootstrap uses, and the login client
+      # whose token drives sign-ins through the session API as Login v2 does.
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: admin-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Admin SA
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /bootstrap/admin.pat
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Login Client
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /bootstrap/login-client.pat
+      # Login v2, so an authorisation request is finished through the v2 API.
+      # The UI itself is not run: the test drives that API as the UI would.
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://zitadel-login:3000/ui/v2/login/
+      ZITADEL_OIDC_DEFAULTLOGINURLV2: http://zitadel-login:3000/ui/v2/login/login?authRequest=
+      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: http://zitadel-login:3000/ui/v2/login/logout?post_logout_redirect=
+    volumes:
+      - e2e-bootstrap:/bootstrap
+    networks: [meridian]
+
+  # A firm's LDAP directory, for Zitadel to broker. memberOf is switched on
+  # and the tree loaded by the make target, because the overlay has to be in
+  # place before the groups are written for it to maintain memberOf.
+  ldap:
+    profiles: [e2e]
+    image: bitnamilegacy/openldap:2.6
+    environment:
+      LDAP_ROOT: dc=example,dc=org
+      LDAP_ADMIN_USERNAME: admin
+      LDAP_ADMIN_PASSWORD: ldap-admin-dev-only
+      LDAP_SKIP_DEFAULT_TREE: "yes"
+    volumes:
+      - ./e2e/dashboard/ldap:/e2e-ldap:ro
+    networks: [meridian]
+
+  # The group hook, with the signing keys Zitadel returned when the bootstrap
+  # made its two targets, and the dashboard's project in Zitadel. Started before
+  # the bootstrap and waiting for it, because Zitadel refuses a target whose
+  # host does not resolve, and the key exists only once the target does.
+  group-hook:
+    profiles: [e2e]
+    build:
+      context: .
+      target: runtime
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        until [ -s /bootstrap/hook-token-signing-key ] && [ -s /bootstrap/project-id ]; do sleep 1; done;
+        MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY="$$(cat /bootstrap/hook-intent-signing-key)"
+        MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY="$$(cat /bootstrap/hook-token-signing-key)"
+        MERIDIAN_GROUP_HOOK_PROJECT_ID="$$(cat /bootstrap/project-id)"
+        exec meridian-group-hook
+    environment:
+      MERIDIAN_GROUP_HOOK_LISTEN: 0.0.0.0:8090
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - e2e-bootstrap:/bootstrap:ro
+    networks: [meridian]
+
+  # Configures Zitadel through its API, idempotently: the dashboard's
+  # project, app and roles, people, the LDAP provider, and the hook's targets
+  # and executions. Writes what the others need onto the bootstrap volume.
+  zitadel-bootstrap:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/e2e/bootstrap.py"]
+    environment:
+      ZITADEL: http://zitadel:8080
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - e2e-bootstrap:/bootstrap
+    networks: [meridian]
+
+  # The one platform call a claim makes, answered: one known code, once.
+  # The real platform does not serve it yet.
+  fake-platform:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/e2e/fake_platform.py"]
+    environment:
+      E2E_CLAIM_CODE: E2E-7KQ2-MX4P
+      E2E_DEPLOYMENT_ID: DEP-e2e
+      E2E_PLATFORM_ADDRESS: http://fake-platform:8000
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+    networks: [meridian]
+
+  # A browser, as far as the dashboard can tell, and Login v2, as far as
+  # Zitadel can: a cookie jar that follows the dashboard's redirects, and the
+  # session API that finishes each sign-in.
+  e2e-runner:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/runner.py"]
+    environment:
+      ZITADEL: http://zitadel:8080
+      DASHBOARD: http://dashboard:8080
+      GROUP_HOOK: http://group-hook:8090
+      FAKE_PLATFORM: http://fake-platform:8000
+      E2E_CLAIM_CODE: E2E-7KQ2-MX4P
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - e2e-bootstrap:/bootstrap:ro
+      - e2e-state:/state
+    networks: [meridian]
+
 volumes:
   runtime-keys:
+  e2e-bootstrap:
+  e2e-state:
 
 networks:
   meridian:

@@ -1,0 +1,4 @@
+dn: cn=ldap-group-b,ou=groups,dc=example,dc=org
+changetype: modify
+delete: member
+member: uid=bob,ou=people,dc=example,dc=org

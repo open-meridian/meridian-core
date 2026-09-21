@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories
+        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -23,6 +23,7 @@ help:
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
+	@echo "  make e2e-dashboard  the dashboard's sign-in and access against a bundled Zitadel and LDAP"
 	@echo "  make lint           rustfmt --check and clippy with warnings denied"
 	@echo "  make lock           regenerate Cargo.lock"
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
@@ -368,6 +369,72 @@ interop: network
 			tail -40 .interop.log >&2; exit 1; \
 		fi
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface"
+
+# The dashboard's sign-in and access, against a real Zitadel.
+#
+# spec/deployment-dashboard-and-access, Verification, for the parts that exist:
+# a Zitadel-native person and an LDAP person brokered by Zitadel sign in; the
+# groups reach the dashboard through the group hook; a claim makes the first
+# deployment admin once; a group removed at the directory is gone at the next
+# sign-in; a Zitadel session reused without the directory is refused on
+# auth_time; the hook refuses what Zitadel did not sign; a restarted Zitadel
+# still signs people in; a callback from another browser is refused.
+#
+# Everything runs on the compose network with no host port, from an empty
+# project, and is taken down with its volumes whatever the outcome. The
+# platform is a stand-in answering the one call a claim makes. Two steps are
+# here rather than in the runner, because they need Docker: changing the
+# directory, and restarting Zitadel.
+E2E := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
+	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
+	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 MERIDIAN_OIDC_ISSUER=http://zitadel:8080 \
+	$(COMPOSE) --profile e2e
+LDAP_ADMIN := -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
+
+e2e-dashboard: network
+	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
+	@$(E2E) down -v >/dev/null 2>&1; started=$$(date +%s); \
+	step() { echo "e2e-dashboard: $$1"; echo "== $$1" >>.e2e-dashboard.log; }; \
+	boot() { $(E2E) run --rm -T --no-deps --entrypoint cat zitadel-bootstrap /bootstrap/$$1 2>>.e2e-dashboard.log; }; \
+	bob() { $(E2E) exec -T ldap ldapsearch -LLL $(LDAP_ADMIN) -b ou=people,dc=example,dc=org '(uid=bob)' memberOf; }; \
+	: >.e2e-dashboard.log; \
+	{ step "building the runtime image" \
+	  && $(E2E) build dashboard conductor group-hook >>.e2e-dashboard.log 2>&1 \
+	  && step "starting Postgres, the broker, Zitadel, LDAP, the group hook and the stand-in platform" \
+	  && $(E2E) up -d postgres nats zitadel ldap group-hook fake-platform >>.e2e-dashboard.log 2>&1 \
+	  && step "loading the directory, with memberOf" \
+	  && $(E2E) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_ADMIN) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+	  && $(E2E) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >>.e2e-dashboard.log 2>&1 \
+	  && $(E2E) exec -T ldap ldapadd $(LDAP_ADMIN) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard.log 2>&1 \
+	  && step "applying the configuration store's schema" \
+	  && $(E2E) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard.log 2>&1 \
+	  && step "configuring Zitadel through its API" \
+	  && $(E2E) run --rm -T zitadel-bootstrap >>.e2e-dashboard.log 2>&1 \
+	  && step "Zitadel's database in the deployment's Postgres: $$($(E2E) exec -T postgres psql -U meridian -d meridian -Atc \
+	     "select datname || ' owned by ' || pg_get_userbyid(datdba) || ', login role ' || (select rolname from pg_roles where rolname = 'zitadel' and rolcanlogin and not rolsuper) from pg_database where datname = 'zitadel'")" \
+	  && client_id=$$(boot client-id) && project_id=$$(boot project-id) \
+	  && step "starting the conductor and the dashboard (client $$client_id)" \
+	  && MERIDIAN_OIDC_CLIENT_ID=$$client_id MERIDIAN_OIDC_TRUSTED_AUDIENCES=$$project_id \
+	     $(E2E) up -d conductor dashboard >>.e2e-dashboard.log 2>&1; } \
+	  || { echo "e2e-dashboard FAILED while setting up. The last 40 lines, and the whole of it in .e2e-dashboard.log:" >&2; \
+	       tail -40 .e2e-dashboard.log >&2; $(E2E) down -v >/dev/null 2>&1; exit 1; }; \
+	step "signing in: A, B, C, D (before), E, F, H"; \
+	$(E2E) run --rm -T e2e-runner main >>.e2e-dashboard.log 2>&1; \
+	step "removing bob from ldap-group-b at the directory"; \
+	{ echo "before:"; bob; $(E2E) exec -T ldap ldapmodify $(LDAP_ADMIN) <e2e/dashboard/ldap/03-remove-bob-from-b.ldif; \
+	  echo "after:"; bob; } >>.e2e-dashboard.log 2>&1; \
+	step "signing in again: D (after)"; \
+	$(E2E) run --rm -T e2e-runner after-removal >>.e2e-dashboard.log 2>&1; \
+	step "restarting Zitadel, and not its database"; \
+	$(E2E) restart zitadel >>.e2e-dashboard.log 2>&1; \
+	step "signing in after the restart: G"; \
+	$(E2E) run --rm -T e2e-runner after-restart >>.e2e-dashboard.log 2>&1; \
+	$(E2E) logs --no-color zitadel group-hook dashboard conductor fake-platform >.e2e-dashboard.services.log 2>&1; \
+	$(E2E) run --rm -T e2e-runner report 2>>.e2e-dashboard.log | tee -a .e2e-dashboard.log; status=$${PIPESTATUS[0]}; \
+	$(E2E) down -v >/dev/null 2>&1; \
+	echo "e2e-dashboard: $$(( $$(date +%s) - started ))s; the run in .e2e-dashboard.log, the services' logs in .e2e-dashboard.services.log"; \
+	if [ $$status -ne 0 ]; then echo "e2e-dashboard FAILED" >&2; exit 1; fi
+	@echo "e2e-dashboard OK: sign-in, groups, claim, freshness and the hook's refusals, against a real Zitadel"
 
 # The end-to-end check, run rather than described.
 #

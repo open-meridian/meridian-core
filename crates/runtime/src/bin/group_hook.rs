@@ -1,8 +1,8 @@
 //! The group hook, as its own process: Zitadel's Actions v2 target for
 //! carrying directory groups into the dashboard's token.
 //!
-//! Runs only where the chart bundles Zitadel. It holds one secret, the
-//! target's signing key, reaches nothing, and is reached only by Zitadel,
+//! Runs only where the chart bundles Zitadel. It holds one kind of
+//! secret, its two targets' signing keys, reaches nothing, and is reached only by Zitadel,
 //! which a NetworkPolicy says. Every call is refused unless Zitadel signed it.
 
 use std::net::SocketAddr;
@@ -31,7 +31,10 @@ fn run() -> Result<(), String> {
         .map_err(|failed| format!("MERIDIAN_GROUP_HOOK_LISTEN is not an address: {failed}"))?;
     let defaults = SamlAttributes::default();
     let hook = Arc::new(Hook {
-        signing_key: required("MERIDIAN_GROUP_HOOK_SIGNING_KEY")?.into_bytes(),
+        // One key per target: Zitadel keys each target on its own, and the
+        // two calls arrive through two targets.
+        intent_signing_key: required("MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY")?.into_bytes(),
+        token_signing_key: required("MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY")?.into_bytes(),
         project_id: required("MERIDIAN_GROUP_HOOK_PROJECT_ID")?,
         saml: SamlAttributes {
             groups: var("MERIDIAN_SAML_GROUPS_ATTRIBUTE").unwrap_or(defaults.groups),

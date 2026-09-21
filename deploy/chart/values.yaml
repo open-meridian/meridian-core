@@ -155,6 +155,10 @@ dashboard:
     existingSecret: ""
     secretKey: client-secret
     groupsClaim: groups
+    # Audiences besides clientId that an ID token may also name, and nothing
+    # else is accepted. Empty for most directories; for Zitadel, the id of the
+    # project the client belongs to, which it adds to every token.
+    trustedAudiences: []
 
 # The broker the components and sidecars meet on, per decision 010. One secret
 # holding one credential per identity, each mounted into that container alone:

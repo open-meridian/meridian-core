@@ -57,6 +57,19 @@ fn field<'a>(fields: &'a Fields, name: &str) -> &'a str {
     fields.get(name).map(|v| v.trim()).unwrap_or_default()
 }
 
+/// One item per line, blanks dropped. For directory groups, because an LDAP
+/// group is a distinguished name, and a distinguished name is full of commas:
+/// split on them, `cn=traders,ou=groups,dc=firm` became three groups, none of
+/// which any sign-in presents.
+fn lines(fields: &Fields, name: &str) -> Vec<String> {
+    field(fields, name)
+        .lines()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// A comma- or line-separated list, blanks dropped.
 fn list(fields: &Fields, name: &str) -> Vec<String> {
     field(fields, name)
@@ -298,7 +311,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&group.user_group_id),
             escape(&group.name),
-            escape(&group.directory_groups.join(", ")),
+            escape(&group.directory_groups.join("; ")),
             escape(&group.logins.join(", "))
         ));
     }
@@ -306,7 +319,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         "</table><form method=\"post\" action=\"/admin/user-groups\">{token}\
          <label>Group to change (empty creates) <input name=\"user_group_id\"></label> \
          <label>Name <input name=\"name\" required></label> \
-         <label>Directory groups <input name=\"directory_groups\"></label> \
+         <label>Directory groups, one per line <textarea name=\"directory_groups\"></textarea></label> \
          <label>Logins <input name=\"logins\"></label> <button>Save user group</button></form>"
     ));
 
@@ -478,7 +491,7 @@ async fn define_user_group(
             user_group: Some(UserGroup {
                 user_group_id: field(&fields, "user_group_id").into(),
                 name: field(&fields, "name").into(),
-                directory_groups: list(&fields, "directory_groups"),
+                directory_groups: lines(&fields, "directory_groups"),
                 logins: list(&fields, "logins"),
             }),
         };

@@ -2,7 +2,7 @@
 //! the bundled Zitadel, which carries none by itself.
 //!
 //! An Actions v2 target in Zitadel, serving two calls, each refused unless
-//! Zitadel signed it with this target's key (spec/deployment-dashboard-and-
+//! Zitadel signed it with the key of the target it came through (spec/deployment-dashboard-and-
 //! access, requirement 7; decisions/015):
 //!
 //! - `POST /intent`, after a brokered sign-in: writes the person's complete
@@ -12,7 +12,7 @@
 //!
 //! It is on the access path: what it writes becomes the directory groups the
 //! dashboard's user groups are matched against. So it verifies every call,
-//! holds nothing but the signing key, and is reviewed as access-control code.
+//! holds nothing but its targets' signing keys, and is reviewed as access-control code.
 
 pub mod groups;
 pub mod signature;
@@ -30,7 +30,13 @@ use serde_json::Value;
 pub use groups::SamlAttributes;
 
 pub struct Hook {
-    pub signing_key: Vec<u8>,
+    /// Zitadel gives every target its own signing key, and each call here
+    /// comes through its own target: `/intent` from the one on the intent
+    /// response, `/token` from the one on the token functions. Each route is
+    /// verified against its own target's key, so a call signed for one is
+    /// not accepted by the other.
+    pub intent_signing_key: Vec<u8>,
+    pub token_signing_key: Vec<u8>,
     /// The dashboard's project in Zitadel, whose roles stand in for groups
     /// for people made in Zitadel itself.
     pub project_id: String,
@@ -53,11 +59,16 @@ pub fn router(hook: Arc<Hook>) -> Router {
 }
 
 /// Verify, then parse. Nothing is read from a body that did not verify.
-fn verified(hook: &Hook, headers: &HeaderMap, body: &Bytes) -> Result<Value, Box<Response>> {
+fn verified(
+    hook: &Hook,
+    key: &[u8],
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Value, Box<Response>> {
     let header = headers
         .get(signature::HEADER)
         .and_then(|value| value.to_str().ok());
-    if let Err(refusal) = signature::verify(header, body, &hook.signing_key, (hook.now_s)()) {
+    if let Err(refusal) = signature::verify(header, body, key, (hook.now_s)()) {
         tracing::warn!("refused a call: {refusal}");
         return Err(Box::new(
             (StatusCode::UNAUTHORIZED, refusal.to_string()).into_response(),
@@ -68,14 +79,14 @@ fn verified(hook: &Hook, headers: &HeaderMap, body: &Bytes) -> Result<Value, Box
 }
 
 async fn intent(State(hook): State<Arc<Hook>>, headers: HeaderMap, body: Bytes) -> Response {
-    match verified(&hook, &headers, &body) {
+    match verified(&hook, &hook.intent_signing_key, &headers, &body) {
         Ok(payload) => Json(groups::on_intent(payload, &hook.saml)).into_response(),
         Err(refused) => *refused,
     }
 }
 
 async fn token(State(hook): State<Arc<Hook>>, headers: HeaderMap, body: Bytes) -> Response {
-    match verified(&hook, &headers, &body) {
+    match verified(&hook, &hook.token_signing_key, &headers, &body) {
         Ok(payload) => Json(groups::on_token(&payload, &hook.project_id)).into_response(),
         Err(refused) => *refused,
     }
@@ -93,7 +104,8 @@ mod tests {
 
     fn hook() -> Router {
         router(Arc::new(Hook {
-            signing_key: b"98KmsU67".to_vec(),
+            intent_signing_key: b"98KmsU67".to_vec(),
+            token_signing_key: b"Qw3rTy12".to_vec(),
             project_id: "P-DASH".into(),
             saml: SamlAttributes::default(),
             now_s: || NOW,
@@ -120,7 +132,7 @@ mod tests {
         let (status, reply) = call(
             "/token",
             body,
-            Some(signature::sign(b"98KmsU67", NOW, body.as_bytes())),
+            Some(signature::sign(b"Qw3rTy12", NOW, body.as_bytes())),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -140,6 +152,31 @@ mod tests {
         assert!(
             !reply.contains("metadata"),
             "a refused call returns no user to write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_signed_for_one_target_is_refused_by_the_other() {
+        let body = r#"{"response":{"idpInformation":{"ldap":{"attributes":{"memberOf":["cn=admins"]}}},"updateUser":{}}}"#;
+        let for_token = signature::sign(b"Qw3rTy12", NOW, body.as_bytes());
+        assert_eq!(
+            call("/intent", body, Some(for_token)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let for_intent = signature::sign(b"98KmsU67", NOW, body.as_bytes());
+        assert_eq!(
+            call("/intent", body, Some(for_intent.clone())).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                "/token",
+                "{}",
+                Some(signature::sign(b"98KmsU67", NOW, b"{}"))
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
         );
     }
 }

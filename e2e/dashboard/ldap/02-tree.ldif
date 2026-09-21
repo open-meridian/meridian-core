@@ -1,0 +1,46 @@
+# The firm's directory: two people, two groups. bob is in both groups and
+# alice in one; ldap-group-b keeps a placeholder member, because groupOfNames
+# needs at least one and bob is removed from it during the run.
+dn: dc=example,dc=org
+objectClass: dcObject
+objectClass: organization
+dc: example
+o: Example
+
+dn: ou=people,dc=example,dc=org
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=example,dc=org
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=alice,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Ldap
+givenName: Alice
+sn: Ldap
+mail: alice@ldap.example.org
+userPassword: alicepass
+
+dn: uid=bob,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Ldap
+givenName: Bob
+sn: Ldap
+mail: bob@ldap.example.org
+userPassword: bobpass
+
+dn: cn=ldap-group-a,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: ldap-group-a
+member: uid=alice,ou=people,dc=example,dc=org
+member: uid=bob,ou=people,dc=example,dc=org
+
+dn: cn=ldap-group-b,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: ldap-group-b
+member: cn=placeholder,dc=example,dc=org
+member: uid=bob,ou=people,dc=example,dc=org

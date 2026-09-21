@@ -50,6 +50,16 @@ fn run() -> Result<(), String> {
         client_secret: var("MERIDIAN_OIDC_CLIENT_SECRET"),
         redirect_url: format!("{}/callback", public_url.trim_end_matches('/')),
         groups_claim: var("MERIDIAN_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into()),
+        // Comma-separated. For the bundled Zitadel, the dashboard's project id.
+        trusted_audiences: var("MERIDIAN_OIDC_TRUSTED_AUDIENCES")
+            .map(|list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
 
     tokio::runtime::Builder::new_multi_thread()

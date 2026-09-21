@@ -610,14 +610,23 @@ pub fn serve(
 
     // Subscribed before this returns, for the reason at-most-once delivery
     // makes unforgiving: what arrives before a subscriber exists is dropped.
+    //
+    // The store is synchronous, and the Postgres one drives its own runtime
+    // underneath, so each write goes to the blocking pool as the handlers'
+    // do. Called on this task instead, the first sign-in panicked the
+    // conductor with "Cannot start a runtime from within a runtime", and the
+    // panic aborted it.
     let mut sign_ins = bus.subscribe(PERSON_SIGNED_IN);
     let keeping = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = sign_ins.recv().await {
             match SignInRecord::decode(&delivery.envelope.payload[..]) {
                 Ok(record) => {
-                    if let Err(failed) = keeping.store.record_sign_in(&record) {
-                        tracing::warn!("a sign-in was not recorded: {failed}");
+                    let store = Arc::clone(&keeping.store);
+                    match tokio::task::spawn_blocking(move || store.record_sign_in(&record)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(failed)) => tracing::warn!("a sign-in was not recorded: {failed}"),
+                        Err(failed) => tracing::warn!("a sign-in was not recorded: {failed}"),
                     }
                 }
                 Err(failed) => tracing::warn!("a sign-in record did not decode: {failed}"),
@@ -639,8 +648,11 @@ pub fn serve(
                 tags: report.tags,
                 last_reported_at_ns: report.reported_at_ns,
             };
-            if let Err(failed) = noting.store.record_plugin(&plugin) {
-                tracing::warn!("a plugin report was not kept: {failed}");
+            let store = Arc::clone(&noting.store);
+            match tokio::task::spawn_blocking(move || store.record_plugin(&plugin)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(failed)) => tracing::warn!("a plugin report was not kept: {failed}"),
+                Err(failed) => tracing::warn!("a plugin report was not kept: {failed}"),
             }
         }
     });

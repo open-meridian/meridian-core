@@ -244,6 +244,19 @@ async fn a_claim_is_redeemed_on_the_signed_in_persons_behalf() {
 }
 
 #[test]
+fn a_directory_group_is_a_whole_line_so_a_distinguished_name_survives() {
+    let fields: Fields = [(
+        "directory_groups".to_string(),
+        "cn=traders,ou=groups,dc=firm,dc=com\r\n\n  ops  \n".to_string(),
+    )]
+    .into();
+    assert_eq!(
+        lines(&fields, "directory_groups"),
+        ["cn=traders,ou=groups,dc=firm,dc=com", "ops"]
+    );
+}
+
+#[test]
 fn entries_are_plugin_tag_and_level_one_per_line() {
     let parsed = parse_entries("oms-1 oms write\n\n snaptrade-1 custody read ").unwrap();
     assert_eq!(parsed.len(), 2);

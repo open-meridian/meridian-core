@@ -74,6 +74,10 @@ spec:
               value: {{ .clientId | quote }}
             - name: MERIDIAN_OIDC_GROUPS_CLAIM
               value: {{ .groupsClaim | default "groups" | quote }}
+            {{- with .trustedAudiences }}
+            - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if .existingSecret }}
             - name: MERIDIAN_OIDC_CLIENT_SECRET
               valueFrom:

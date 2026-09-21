@@ -58,6 +58,11 @@ pub struct OidcConfig {
     /// The claim carrying directory groups. `groups` for Entra ID and for the
     /// bundled Zitadel's group hook.
     pub groups_claim: String,
+    /// Audiences besides the client id that an ID token may also name. Empty
+    /// for most directories. Zitadel always adds the id of the project the
+    /// client belongs to, and a token naming an audience not listed here is
+    /// refused, as OpenID Connect Core 3.1.3.7 says it must be.
+    pub trusted_audiences: Vec<String>,
 }
 
 /// Who the directory says signed in.
@@ -87,6 +92,7 @@ pub struct Oidc {
     provider: Provider,
     http: reqwest::Client,
     groups_claim: String,
+    trusted_audiences: Vec<String>,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
@@ -151,6 +157,7 @@ impl Oidc {
             provider,
             http,
             groups_claim: config.groups_claim.clone(),
+            trusted_audiences: config.trusted_audiences.clone(),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -211,8 +218,13 @@ impl Oidc {
         let id_token = tokens
             .id_token()
             .ok_or("the directory returned no ID token")?;
+        let trusted = self.trusted_audiences.clone();
+        let verifier = self
+            .provider
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(move |audience| trusts(&trusted, audience));
         let claims = id_token
-            .claims(&self.provider.id_token_verifier(), &pending.nonce)
+            .claims(&verifier, &pending.nonce)
             .map_err(|failed| format!("the directory's ID token did not verify: {failed}"))?;
 
         let authenticated_at = claims
@@ -243,6 +255,12 @@ pub fn fresh(authenticated_at_ns: i64, started_at_ns: i64) -> Result<(), String>
         );
     }
     Ok(())
+}
+
+/// Whether an audience other than the client id is one this dashboard was
+/// told to accept. Exact match only: no prefix, no case folding.
+pub fn trusts(trusted: &[String], audience: &str) -> bool {
+    trusted.iter().any(|t| t == audience)
 }
 
 fn raw_payload(compact: &str) -> Result<serde_json::Value, String> {
@@ -306,6 +324,15 @@ mod tests {
             fresh(T0 - 3_600 * SECOND_NS, T0).is_err(),
             "an hour-old session"
         );
+    }
+
+    #[test]
+    fn only_a_listed_audience_is_trusted() {
+        let trusted = vec!["391790364140240901".to_string()];
+        assert!(trusts(&trusted, "391790364140240901"));
+        assert!(!trusts(&trusted, "391790364140240902"));
+        assert!(!trusts(&trusted, "39179036414024090"));
+        assert!(!trusts(&[], "391790364140240901"), "none by default");
     }
 
     #[test]
