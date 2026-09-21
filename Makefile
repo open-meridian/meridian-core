@@ -6,7 +6,8 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
-        build test test-store chart-check check-crate-boundaries check-test-targets interop lint fmt lock contract-diff up down demo network
+        build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
+        interop lint fmt lock contract-diff up down demo network
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -16,6 +17,7 @@ help:
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
+	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make up             bring up Postgres and the replica"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -24,7 +26,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-nats-permissions build test test-store test-broker interop chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions build test test-store test-broker interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -46,6 +48,31 @@ check-crate-boundaries:
 check-test-targets:
 	@$(PY) tools/check_test_targets.py --self-test --repo-root .
 	@$(PY) tools/check_test_targets.py --repo-root .
+
+# A development cluster's database is a database somebody has work in.
+#
+# It ran on an emptyDir for a day, which is the pod's own storage: the first
+# DiskPressure eviction took the schema and both roles with it, and what
+# reported the loss was the platform noticing the deployment had gone quiet.
+# Nothing failed at the moment the mistake was made, which is the shape of
+# defect this repository keeps writing gates for.
+#
+# The key, not the word: the first version of this matched the string, and
+# the sentence explaining why the volume is a claim failed the gate.
+check-local-storage:
+	@for f in deploy/local/*.yaml; do \
+		grep -Eq '^[[:space:]]*emptyDir:' "$$f" \
+			&& { echo "check-local-storage FAILED: $$f puts a volume on an emptyDir" >&2; \
+			     echo "  an emptyDir belongs to the pod; a restart or an eviction empties it" >&2; \
+			     echo "  use a PersistentVolumeClaim, as deploy/local/postgres.yaml does" >&2; exit 1; }; \
+		true; \
+	done
+	@grep -q "kind: PersistentVolumeClaim" deploy/local/postgres.yaml \
+		|| { echo "check-local-storage FAILED: the development database claims no volume" >&2; exit 1; }
+	@grep -q "type: Recreate" deploy/local/postgres.yaml \
+		|| { echo "check-local-storage FAILED: the development database rolls rather than recreates" >&2; \
+		     echo "  a ReadWriteOnce claim is held by the old pod, so a rolling update never finishes" >&2; exit 1; }
+	@echo "check-local-storage OK: the development database outlives its pod"
 
 # ADR 005 in meridian-design. Contract-tier changes declare themselves in a
 # commit trailer. Reads what changed on disk, so no tool or session root

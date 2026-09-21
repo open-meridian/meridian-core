@@ -1,0 +1,99 @@
+# Postgres for a development cluster, and only for a development cluster.
+#
+# The chart ships no database. A deployment brings its own, and
+# `database.existingSecret` is how it says where that one is. This is the local
+# stand-in for it -- the k3s counterpart of the `postgres` service in
+# docker-compose.yaml -- so that bringing a cluster up is a file somebody can
+# read rather than a shell history somebody has to remember.
+#
+#   kubectl create namespace meridian
+#   kubectl -n meridian create secret generic postgres-superuser \
+#     --from-literal=password="$(openssl rand -hex 16)"
+#   kubectl -n meridian apply -f deploy/local/postgres.yaml
+#
+# The volume is a claim rather than an emptyDir, which is what it was until
+# 2026-09-20. An emptyDir belongs to the pod, so a restart, a reschedule or an
+# eviction takes the database with it. That is not hypothetical: DiskPressure
+# on this cluster evicted the pod and took the ledger's schema and both roles,
+# and the first sign of it was the platform saying the deployment had stopped
+# talking. A claim outlives the pod. It does not outlive the node's disk, which
+# for k3s-in-Docker is a Docker volume, so removing that volume still starts
+# you over -- with a claim you lose a database to `docker volume rm`, which is
+# a thing somebody types on purpose.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+  # No storageClassName: the cluster's default provisioner, whatever it is.
+  # k3s answers with local-path, a managed cluster with its own. Naming one
+  # here would make this file work on the cluster it was written against and
+  # fail on the next.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  # Recreate, not the default rolling update. The claim is ReadWriteOnce, so a
+  # rolling update would hold the volume in the old pod while the new one waits
+  # for it, and the rollout would stall until somebody deleted a pod by hand.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: superuser
+            - name: POSTGRES_DB
+              value: meridian
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-superuser
+                  key: password
+            # A subdirectory, because a provisioned volume can arrive with a
+            # lost+found in it and initdb refuses a directory that is not empty.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "superuser", "-d", "meridian"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

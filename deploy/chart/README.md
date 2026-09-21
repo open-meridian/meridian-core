@@ -35,6 +35,12 @@ The chart never creates either. A key it generated would live in Helm's release
 history and in whatever holds your values, which are two more places for a
 private key to be than there should be.
 
+The database is yours in the same way: the chart connects to one and never
+provisions one, because a database a chart owns is a database a `helm uninstall`
+can take with it. If you are bringing up a development cluster and want one to
+point at, `deploy/local/postgres.yaml` is a single Postgres on a claim -- read
+the file before applying it, it says what it is and what it is not for.
+
 ## Installing
 
 ```bash
