@@ -1,6 +1,6 @@
 # meridian-core
 
-The Meridian deployment runtime, in Rust: message bus, sidecar, kernel,
+The Meridian deployment runtime, in Rust: message bus, sidecar, street store,
 reference replica and dashboard. This is what ships to a client and runs in
 their own infrastructure, beside their own database.
 

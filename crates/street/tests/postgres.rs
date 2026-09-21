@@ -1,4 +1,4 @@
-//! The ledger, against Postgres.
+//! The street store, against Postgres.
 //!
 //! Not against a stand-in. Every property worth having here is a property of
 //! the database rather than of the Rust around it: the unique index that makes
@@ -12,11 +12,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_kernel::amounts::{Money, Quantity};
-use meridian_kernel::store::{
+use meridian_street::amounts::{Money, Quantity};
+use meridian_street::store::{
     Completion, Counts, Holding, Identifier, Opened, Settled, Statement, Store,
 };
-use meridian_kernel::PostgresStore;
+use meridian_street::PostgresStore;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -504,7 +504,7 @@ fn migrating_applies_every_version_and_then_verifies() {
     store.migrate().expect("could not apply the schema");
 
     let versions = applied_versions(&mut client);
-    let expected: Vec<i64> = meridian_kernel::migrations::MIGRATIONS
+    let expected: Vec<i64> = meridian_street::migrations::MIGRATIONS
         .iter()
         .map(|m| m.version)
         .collect();
@@ -587,7 +587,7 @@ fn a_database_made_before_the_history_is_adopted_with_its_rows_intact() {
     );
     assert_eq!(
         versions.last().copied(),
-        Some(meridian_kernel::migrations::latest()),
+        Some(meridian_street::migrations::latest()),
         "the database was not brought up to date"
     );
     store.verify().expect("an adopted database must verify");
@@ -623,7 +623,7 @@ fn a_database_ahead_of_this_binary_is_refused() {
     let said = refused.to_string();
     assert!(said.contains("999"), "{said}");
     assert!(
-        said.contains(&meridian_kernel::migrations::latest().to_string()),
+        said.contains(&meridian_street::migrations::latest().to_string()),
         "the refusal has to name both versions: {said}"
     );
 }

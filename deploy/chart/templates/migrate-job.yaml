@@ -37,26 +37,26 @@ spec:
       {{- end }}
       {{/*
         Each component migrates its own schema, in its own container, at the
-        version being released. An init container for the ledger and the
+        version being released. An init container for the street store and the
         replica's in the main one, so both must succeed for the release to
         proceed and the order is stated rather than raced.
       */}}
       initContainers:
-        - name: ledger
-          image: "{{ .Values.image.repository }}:{{ .Values.ledger.image.tag | default .Values.image.tag }}"
+        - name: street
+          image: "{{ .Values.image.repository }}:{{ .Values.street.image.tag | default .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["meridian-ledger", "migrate"]
+          args: ["meridian-street", "migrate"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
           env:
-            - name: MERIDIAN_LEDGER_DATABASE_URL
+            - name: MERIDIAN_STREET_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.migrate.ledgerSecret | default .Values.migrate.existingSecret | default .Values.ledger.database.existingSecret | default .Values.database.existingSecret }}
-                  key: {{ .Values.migrate.ledgerKey | default .Values.migrate.key | default .Values.ledger.database.key | default .Values.database.key }}
+                  name: {{ .Values.migrate.streetSecret | default .Values.migrate.existingSecret | default .Values.street.database.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.migrate.streetKey | default .Values.migrate.key | default .Values.street.database.key | default .Values.database.key }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:

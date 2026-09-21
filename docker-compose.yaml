@@ -57,22 +57,22 @@ services:
       retries: 10
     networks: [meridian]
 
-  # The ledger. Its own process, its own database credential, and no key:
+  # The street store. Its own process, its own database credential, and no key:
   # it does not talk to the platform, which is why it cannot.
-  ledger:
+  street:
     build:
       context: .
       target: runtime
-    command: ["meridian-ledger"]
+    command: ["meridian-street"]
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_started
     environment:
-      MERIDIAN_LEDGER_DATABASE_URL: ${MERIDIAN_LEDGER_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
+      MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
-      MERIDIAN_INSTANCE_ID: ledger-1
+      MERIDIAN_INSTANCE_ID: street-1
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 

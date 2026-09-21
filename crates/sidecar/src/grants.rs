@@ -63,8 +63,8 @@ fn covers(grant: &str, request: &str) -> bool {
         return topic::matches(grant, request);
     }
     match grant.strip_suffix(".**") {
-        // The trailing dot matters: without it `platform.kernel.**` would
-        // appear to cover `platform.kernelish.*`.
+        // The trailing dot matters: without it `platform.street.**` would
+        // appear to cover `platform.streetish.*`.
         Some(prefix) => request.starts_with(&format!("{prefix}.")),
         None => false,
     }
@@ -112,12 +112,12 @@ mod tests {
               "roles": {
                 "custody": {
                   "publish": [
-                    "platform.kernel.command.record-holding",
+                    "platform.street.command.record-holding",
                     "platform.custody.*.event.sync-status"
                   ],
                   "subscribe": ["platform.reference.event.instrument-applied"]
                 },
-                "diagnostics": { "subscribe": ["platform.kernel.**"] }
+                "diagnostics": { "subscribe": ["platform.street.**"] }
               }
             }"#,
         )
@@ -127,13 +127,13 @@ mod tests {
     #[test]
     fn a_granted_topic_may_be_published() {
         let g = table().resolve("custody", &[]);
-        assert!(g.may_publish("platform.kernel.command.record-holding"));
+        assert!(g.may_publish("platform.street.command.record-holding"));
     }
 
     #[test]
     fn an_ungranted_topic_may_not() {
         let g = table().resolve("custody", &[]);
-        assert!(!g.may_publish("platform.kernel.command.record-statement"));
+        assert!(!g.may_publish("platform.street.command.record-statement"));
     }
 
     #[test]
@@ -145,8 +145,8 @@ mod tests {
     #[test]
     fn tags_add_to_the_role() {
         let g = table().resolve("custody", &["diagnostics".to_string()]);
-        assert!(g.may_publish("platform.kernel.command.record-holding"));
-        assert!(g.may_subscribe("platform.kernel.**"));
+        assert!(g.may_publish("platform.street.command.record-holding"));
+        assert!(g.may_subscribe("platform.street.**"));
     }
 
     #[test]
@@ -174,20 +174,20 @@ mod tests {
     #[test]
     fn a_subscription_may_be_narrowed_inside_its_grant() {
         let g = table().resolve("diagnostics", &[]);
-        assert!(g.may_subscribe("platform.kernel.**"));
+        assert!(g.may_subscribe("platform.street.**"));
         // Narrower than the grant, in both concrete and wildcard form.
-        assert!(g.may_subscribe("platform.kernel.event.position-updated"));
-        assert!(g.may_subscribe("platform.kernel.event.*"));
+        assert!(g.may_subscribe("platform.street.event.position-updated"));
+        assert!(g.may_subscribe("platform.street.event.*"));
     }
 
     #[test]
     fn a_wildcard_grant_does_not_leak_into_a_neighbouring_prefix() {
         let table =
-            GrantTable::from_json(r#"{"roles":{"w":{"subscribe":["platform.kernel.**"]}}}"#)
+            GrantTable::from_json(r#"{"roles":{"w":{"subscribe":["platform.street.**"]}}}"#)
                 .unwrap();
         let g = table.resolve("w", &[]);
         // Sharing a string prefix is not sharing a topic prefix.
-        assert!(!g.may_subscribe("platform.kernelish.*"));
+        assert!(!g.may_subscribe("platform.streetish.*"));
         assert!(!g.may_subscribe("platform.reference.**"));
     }
 }

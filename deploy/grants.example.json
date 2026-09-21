@@ -3,8 +3,8 @@
   "roles": {
     "custody": {
       "publish": [
-        "platform.kernel.command.record-statement",
-        "platform.kernel.command.record-holding",
+        "platform.street.command.record-statement",
+        "platform.street.command.record-holding",
         "platform.reference.query.resolve-identifier",
         "platform.reference.query.resolve-instrument",
         "platform.reference.event.instrument-missing",
@@ -16,22 +16,22 @@
     },
     "dashboard": {
       "publish": [
-        "platform.kernel.query.list-custodial-positions",
+        "platform.street.query.list-custodial-positions",
         "platform.reference.query.resolve-identifier",
         "platform.reference.query.resolve-instrument"
       ],
       "subscribe": [
-        "platform.kernel.event.*",
+        "platform.street.event.*",
         "platform.reference.event.*",
         "platform.custody.*.event.sync-status"
       ]
     },
     "positions-reader": {
       "publish": [
-        "platform.kernel.query.list-custodial-positions"
+        "platform.street.query.list-custodial-positions"
       ],
       "subscribe": [
-        "platform.kernel.event.custodial-position-updated"
+        "platform.street.event.custodial-position-updated"
       ]
     }
   }

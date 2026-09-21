@@ -951,7 +951,7 @@ pub(crate) mod tests {
         let platform = platform(Arc::clone(&transport));
 
         platform
-            .report_components(&[ComponentReport::serving("ledger", "1.4.2", 2, NOW)], NOW)
+            .report_components(&[ComponentReport::serving("street", "1.4.2", 2, NOW)], NOW)
             .await
             .expect("the report should have been accepted");
 
@@ -971,7 +971,7 @@ pub(crate) mod tests {
 
         platform
             .report_components(
-                &[ComponentReport::serving("ledger", "1.4.2", 2, NOW)
+                &[ComponentReport::serving("street", "1.4.2", 2, NOW)
                     .degraded("the platform is unreachable")],
                 NOW,
             )

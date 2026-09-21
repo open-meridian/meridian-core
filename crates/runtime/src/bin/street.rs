@@ -1,4 +1,4 @@
-//! The deployment's ledger, as its own process.
+//! The deployment's street store, as its own process.
 //!
 //! Statements, holdings and positions: what a connector read from a custodian,
 //! and the one store in a deployment whose contents nothing can rebuild. It
@@ -9,16 +9,16 @@
 //! replica holds what the platform can send again, so a bad upgrade is fixed
 //! by refetching; this holds a custodian's statement from last month, which
 //! exists in one place. Tying them together made every replica change inherit
-//! the ledger's caution.
+//! the street store's caution.
 //!
-//! `ledger migrate` applies its schema, once per release. Starting verifies
+//! `meridian-street migrate` applies its schema, once per release. Starting verifies
 //! and refuses a schema it does not recognise.
 
 use std::sync::Arc;
 
-use meridian_kernel::service::SystemClock;
-use meridian_kernel::PostgresStore;
 use meridian_runtime::{bus_from_env, now_ns, report_inward_forever, required, shutdown, var};
+use meridian_street::service::SystemClock;
+use meridian_street::PostgresStore;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -34,18 +34,18 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let url = required("MERIDIAN_LEDGER_DATABASE_URL")?;
+    let url = required("MERIDIAN_STREET_DATABASE_URL")?;
 
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         return PostgresStore::connect(&url, 1)
             .and_then(|store| store.migrate())
             .map(|()| {
                 tracing::info!(
-                    version = meridian_kernel::migrations::latest(),
-                    "the ledger's schema is applied"
+                    version = meridian_street::migrations::latest(),
+                    "the street store's schema is applied"
                 )
             })
-            .map_err(|failed| format!("the ledger's schema could not be applied: {failed}"));
+            .map_err(|failed| format!("the street store's schema could not be applied: {failed}"));
     }
 
     let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
@@ -55,7 +55,7 @@ fn run() -> Result<(), String> {
     // customer's database because somebody restarted a pod.
     store.verify().map_err(|failed| failed.to_string())?;
 
-    let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "ledger-1".into());
+    let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "street-1".into());
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -67,20 +67,20 @@ fn run() -> Result<(), String> {
             // Registered before anything can call them. A component that
             // announces itself and then cannot answer is worse than one that
             // has not arrived.
-            meridian_kernel::service::serve(bus.clone(), Arc::new(store), Arc::new(SystemClock));
+            meridian_street::service::serve(bus.clone(), Arc::new(store), Arc::new(SystemClock));
 
             // W5.20. Said on the bus, for the replica to carry outward: this
             // process holds no key, and giving it one so it could report
             // directly would make it a second thing able to authenticate as
             // the whole deployment.
             let reporting = bus.clone();
-            let schema = meridian_kernel::migrations::latest();
-            tokio::spawn(async move { report_inward_forever(reporting, "ledger", schema).await });
+            let schema = meridian_street::migrations::latest();
+            tokio::spawn(async move { report_inward_forever(reporting, "street", schema).await });
 
             tracing::info!(
                 instance_id,
                 started_at_ns = now_ns(),
-                "the ledger is serving"
+                "the street store is serving"
             );
             shutdown().await;
             tracing::info!("stopping");

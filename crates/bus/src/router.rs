@@ -244,9 +244,9 @@ mod tests {
     #[tokio::test]
     async fn publish_stamps_identity_and_time() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.kernel.**");
+        let mut sub = bus.subscribe("platform.street.**");
         bus.publish(
-            "platform.kernel.event.position-updated",
+            "platform.street.event.position-updated",
             "meridian.v1.PositionUpdatedEvent",
             vec![1, 2, 3],
             None,
@@ -256,7 +256,7 @@ mod tests {
 
         let meta = sub.recv().await.unwrap().envelope.meta.unwrap();
         assert_eq!(meta.publisher_instance_id, "core-1");
-        assert_eq!(meta.topic, "platform.kernel.event.position-updated");
+        assert_eq!(meta.topic, "platform.street.event.position-updated");
         assert!(meta.published_at_ns > 0);
         assert!(!meta.message_id.is_empty());
     }
@@ -264,9 +264,9 @@ mod tests {
     #[tokio::test]
     async fn a_message_with_no_correlation_becomes_its_own_root() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.kernel.**");
+        let mut sub = bus.subscribe("platform.street.**");
         bus.publish(
-            "platform.kernel.event.position-updated",
+            "platform.street.event.position-updated",
             "t",
             vec![],
             None,
@@ -282,9 +282,9 @@ mod tests {
     #[tokio::test]
     async fn correlation_and_causation_are_carried_through() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.kernel.**");
+        let mut sub = bus.subscribe("platform.street.**");
         bus.publish(
-            "platform.kernel.event.position-updated",
+            "platform.street.event.position-updated",
             "t",
             vec![],
             Some("corr-1"),

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Nothing reaches another component's store. The bus is the way across.
 
-The kernel holds the ledger and the reference crate holds the replica, each over
+The street crate holds the custodian's records and the reference crate holds
+the replica, each over
 its own database. Both are reachable over the bus: commands, queries, events. A
 consumer knows those and does not know there is a database, let alone which one
 or what shape it is in.
@@ -16,7 +17,7 @@ reads its tables directly.
 Nobody argues against this. What happens instead is that somebody adds a
 dependency for convenience, it works, and nothing objects. This objects.
 
-The rule: a crate may depend on `meridian-kernel` or `meridian-reference` only
+The rule: a crate may depend on `meridian-street` or `meridian-reference` only
 if it is listed in tools/crate-boundary-allowlist.txt with a reason. The
 legitimate reason is being a composition root -- a binary that wires a process
 together and therefore has to construct the store it hands over.
@@ -34,7 +35,7 @@ import sys
 
 # The crates that own a store. Depending on one means holding its types, which
 # means holding its schema.
-OWNS_A_STORE = ("meridian-kernel", "meridian-reference")
+OWNS_A_STORE = ("meridian-street", "meridian-reference")
 
 ALLOWLIST = "tools/crate-boundary-allowlist.txt"
 

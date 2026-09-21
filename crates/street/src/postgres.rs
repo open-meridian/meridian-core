@@ -1,4 +1,4 @@
-//! The ledger in Postgres, behind the same trait the in-memory store answers.
+//! The street store in Postgres, behind the same trait the in-memory store answers.
 //!
 //! Synchronous, for the reason the reference crate's store is: the bus runs
 //! request handlers on a blocking pool already, precisely so a handler may
@@ -595,7 +595,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Tables that mean the ledger's schema is already here, whatever record of it
+/// Tables that mean the street store's schema is already here, whatever record of it
 /// exists. `position` is in the list because a database old enough to carry
 /// that name is exactly the one adoption is for.
 const LEDGER_TABLES: &[&str] = &["statement", "holding", "custodial_position", "position"];

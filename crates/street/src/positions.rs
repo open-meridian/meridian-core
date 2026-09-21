@@ -1,4 +1,4 @@
-//! Reading the ledger. W2.7.
+//! Reading the street store. W2.7.
 //!
 //! One request answers two questions, and that is the design rather than a
 //! convenience. "What do I hold" and "what could I not account for" have to be
@@ -73,7 +73,7 @@ mod tests {
 
     const NOW: i64 = 1_757_376_000_000_000_000;
 
-    fn ledger() -> (MemoryStore, String) {
+    fn street() -> (MemoryStore, String) {
         let store = MemoryStore::new();
         let statement_id = open_statement(
             &store,
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn one_request_answers_what_is_held_and_what_could_not_be_accounted_for() {
-        let (store, _) = ledger();
+        let (store, _) = street();
         let reply = list_positions(&store, &asking(true)).unwrap();
 
         assert_eq!(reply.positions.len(), 1);
@@ -154,7 +154,7 @@ mod tests {
     fn gaps_are_handed_back_only_when_they_were_asked_for() {
         // The reply's postcondition. A reader who did not ask is not handed
         // them silently.
-        let (store, _) = ledger();
+        let (store, _) = street();
         let reply = list_positions(&store, &asking(false)).unwrap();
 
         assert_eq!(reply.positions.len(), 1);
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn another_accounts_holdings_are_not_in_the_answer() {
-        let (store, statement_id) = ledger();
+        let (store, statement_id) = street();
         record_holding(
             &store,
             &RecordHoldingRequest {
@@ -191,7 +191,7 @@ mod tests {
     fn a_page_size_is_a_request_and_not_an_instruction() {
         // Without a ceiling, one caller asking for everything decides how much
         // memory this process uses.
-        let (store, statement_id) = ledger();
+        let (store, statement_id) = street();
         for n in 0..5 {
             record_holding(
                 &store,
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn a_page_carries_a_cursor_when_there_is_more_and_none_when_there_is_not() {
-        let (store, statement_id) = ledger();
+        let (store, statement_id) = street();
         for n in 0..4 {
             record_holding(
                 &store,

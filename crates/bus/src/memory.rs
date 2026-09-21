@@ -141,8 +141,8 @@ mod tests {
     #[tokio::test]
     async fn delivers_to_a_matching_subscriber() {
         let bus = MemoryBackend::new();
-        let mut sub = bus.subscribe("platform.kernel.event.position-updated");
-        bus.publish("platform.kernel.event.position-updated", envelope("x"))
+        let mut sub = bus.subscribe("platform.street.event.position-updated");
+        bus.publish("platform.street.event.position-updated", envelope("x"))
             .unwrap();
 
         let got = sub.recv().await.expect("a delivery");
@@ -153,7 +153,7 @@ mod tests {
     async fn does_not_deliver_to_a_non_matching_subscriber() {
         let bus = MemoryBackend::new();
         let mut other = bus.subscribe("platform.reference.**");
-        bus.publish("platform.kernel.event.position-updated", envelope("x"))
+        bus.publish("platform.street.event.position-updated", envelope("x"))
             .unwrap();
 
         // Nothing queued: try_recv would block forever on recv, so check the
@@ -164,9 +164,9 @@ mod tests {
     #[tokio::test]
     async fn every_matching_subscriber_gets_its_own_copy() {
         let bus = MemoryBackend::new();
-        let mut a = bus.subscribe("platform.kernel.**");
-        let mut b = bus.subscribe("platform.kernel.event.position-updated");
-        bus.publish("platform.kernel.event.position-updated", envelope("x"))
+        let mut a = bus.subscribe("platform.street.**");
+        let mut b = bus.subscribe("platform.street.event.position-updated");
+        bus.publish("platform.street.event.position-updated", envelope("x"))
             .unwrap();
 
         assert!(a.recv().await.is_some());
@@ -177,19 +177,19 @@ mod tests {
     async fn sequence_is_per_topic() {
         let bus = MemoryBackend::new();
         assert_eq!(
-            bus.publish("platform.kernel.event.position-updated", envelope("x"))
+            bus.publish("platform.street.event.position-updated", envelope("x"))
                 .unwrap(),
             1
         );
         assert_eq!(
-            bus.publish("platform.kernel.event.position-updated", envelope("x"))
+            bus.publish("platform.street.event.position-updated", envelope("x"))
                 .unwrap(),
             2
         );
         // A different topic starts its own count rather than continuing a
         // global one.
         assert_eq!(
-            bus.publish("platform.kernel.event.statement-recorded", envelope("x"))
+            bus.publish("platform.street.event.statement-recorded", envelope("x"))
                 .unwrap(),
             1
         );
@@ -207,11 +207,11 @@ mod tests {
     #[tokio::test]
     async fn a_full_subscriber_loses_messages_and_the_loss_is_counted() {
         let bus = MemoryBackend::new();
-        let _sub = bus.subscribe("platform.kernel.**");
+        let _sub = bus.subscribe("platform.street.**");
 
         // Never read from _sub, so the queue fills and then overflows.
         for _ in 0..(SUBSCRIBER_QUEUE + 10) {
-            bus.publish("platform.kernel.event.position-updated", envelope("x"))
+            bus.publish("platform.street.event.position-updated", envelope("x"))
                 .unwrap();
         }
 
@@ -225,11 +225,11 @@ mod tests {
     #[tokio::test]
     async fn a_slow_subscriber_does_not_stall_a_healthy_one() {
         let bus = MemoryBackend::new();
-        let _slow = bus.subscribe("platform.kernel.**");
-        let mut healthy = bus.subscribe("platform.kernel.**");
+        let _slow = bus.subscribe("platform.street.**");
+        let mut healthy = bus.subscribe("platform.street.**");
 
         for _ in 0..(SUBSCRIBER_QUEUE + 5) {
-            bus.publish("platform.kernel.event.position-updated", envelope("x"))
+            bus.publish("platform.street.event.position-updated", envelope("x"))
                 .unwrap();
         }
 
@@ -243,9 +243,9 @@ mod tests {
     async fn dropping_a_subscription_stops_delivery_to_it() {
         let bus = MemoryBackend::new();
         {
-            let _sub = bus.subscribe("platform.kernel.**");
+            let _sub = bus.subscribe("platform.street.**");
         }
-        bus.publish("platform.kernel.event.position-updated", envelope("x"))
+        bus.publish("platform.street.event.position-updated", envelope("x"))
             .unwrap();
         // The closed subscriber is swept, not counted as a drop.
         assert_eq!(bus.dropped(), 0);

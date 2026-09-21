@@ -98,7 +98,7 @@ test:
 # differently in development is a store nobody has tested.
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-reference --test postgres -p meridian-kernel --test postgres \
+		cargo test --locked -p meridian-reference --test postgres -p meridian-street --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
@@ -172,14 +172,14 @@ chart-check:
 		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
 		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
 	fi
-	@for component in ledger replica; do \
+	@for component in street replica; do \
 		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 			| grep -q "meridian-$$component\"\]" \
 			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
 	done
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| grep -c "^kind: Deployment" | grep -q "^2$$" \
-		|| { echo "chart-check FAILED: the ledger and the replica are not two Deployments" >&2; \
+		|| { echo "chart-check FAILED: the street store and the replica are not two Deployments" >&2; \
 		     echo "  one workload means neither can be upgraded without the other" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) \
 		--set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' \
@@ -210,14 +210,14 @@ install-hooks:
 	@git config core.hooksPath hooks
 	@echo "hooks installed: git push now runs 'make ci-local' first"
 
-# Migration before start, because a starting runtime verifies the ledger's
+# Migration before start, because a starting runtime verifies the street store's
 # schema and refuses to serve against one it does not recognise. One command
 # per release rather than every process racing to apply the same change.
 migrate: network
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
-	@$(COMPOSE) run --rm -T ledger meridian-ledger migrate
+	@$(COMPOSE) run --rm -T street meridian-street migrate
 
 up: migrate
 	@$(COMPOSE) up --build
@@ -246,14 +246,14 @@ interop: network
 		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
 	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
-	@$(COMPOSE) run --rm -T ledger meridian-ledger migrate >/dev/null 2>&1 \
+	@$(COMPOSE) run --rm -T street meridian-street migrate >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@# All three components, because the surface under test is the sidecar's
 	@# and the answers come from the other two across a broker. Before the
 	@# split this was one process, and the test could not tell the difference.
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build ledger replica sidecar >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street replica sidecar >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \

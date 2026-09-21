@@ -51,7 +51,7 @@ use crate::store::{Applied, Store};
 /// W3.1. A connector asking what a set of identifiers meant.
 pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
 
-/// W3.6. The kernel asking for a record so a holding can be shown with a name.
+/// W3.6. The street store asking for a record so a holding can be shown with a name.
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 
 /// W3.2. A connector reporting that a resolution missed.

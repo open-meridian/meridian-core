@@ -68,12 +68,12 @@ mod tests {
     #[test]
     fn exact_match() {
         assert!(matches(
-            "platform.kernel.event.position-updated",
-            "platform.kernel.event.position-updated"
+            "platform.street.event.position-updated",
+            "platform.street.event.position-updated"
         ));
         assert!(!matches(
-            "platform.kernel.event.position-updated",
-            "platform.kernel.event.statement-recorded"
+            "platform.street.event.position-updated",
+            "platform.street.event.statement-recorded"
         ));
     }
 
@@ -93,37 +93,37 @@ mod tests {
     #[test]
     fn tail_wildcard_takes_one_or_more() {
         assert!(matches(
-            "platform.kernel.**",
-            "platform.kernel.event.position-updated"
+            "platform.street.**",
+            "platform.street.event.position-updated"
         ));
-        assert!(matches("platform.kernel.**", "platform.kernel.command"));
+        assert!(matches("platform.street.**", "platform.street.command"));
         // Must consume at least one segment.
-        assert!(!matches("platform.kernel.**", "platform.kernel"));
+        assert!(!matches("platform.street.**", "platform.street"));
     }
 
     #[test]
     fn tail_wildcard_only_matches_at_the_tail() {
         // Not supported by design: a mid-pattern ** never matches, rather than
         // matching something surprising.
-        assert!(!matches("platform.**.event", "platform.kernel.event"));
+        assert!(!matches("platform.**.event", "platform.street.event"));
     }
 
     #[test]
     fn wildcard_does_not_cross_into_a_different_domain() {
         assert!(!matches(
-            "platform.kernel.**",
+            "platform.street.**",
             "platform.reference.event.instrument-applied"
         ));
     }
 
     #[test]
     fn publishable_rejects_patterns_and_malformed_topics() {
-        assert!(is_publishable("platform.kernel.command.record-holding"));
+        assert!(is_publishable("platform.street.command.record-holding"));
         assert!(!is_publishable("platform.custody.*.event.sync-status"));
-        assert!(!is_publishable("platform.kernel.**"));
+        assert!(!is_publishable("platform.street.**"));
         assert!(!is_publishable(""));
         assert!(!is_publishable("platform..kernel"));
-        assert!(!is_publishable(".platform.kernel"));
-        assert!(!is_publishable("platform.kernel."));
+        assert!(!is_publishable(".platform.street"));
+        assert!(!is_publishable("platform.street."));
     }
 }

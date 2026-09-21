@@ -399,7 +399,7 @@ mod tests {
       "roles": {
         "custody": {
           "publish": [
-            "platform.kernel.command.record-holding",
+            "platform.street.command.record-holding",
             "platform.reference.event.instrument-missing",
             "platform.reference.query.resolve-identifier",
             "platform.custody.*.event.sync-status"
@@ -408,7 +408,7 @@ mod tests {
         },
         "dashboard": {
           "publish": [],
-          "subscribe": ["platform.kernel.event.*"]
+          "subscribe": ["platform.street.event.*"]
         }
       }
     }"#;
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(reply.deployment_id, "dep-local-1");
         assert!(reply
             .publish_grants
-            .contains(&"platform.kernel.command.record-holding".to_string()));
+            .contains(&"platform.street.command.record-holding".to_string()));
         assert_eq!(
             reply.subscribe_grants,
             vec!["platform.reference.event.instrument-applied".to_string()]
@@ -530,7 +530,7 @@ mod tests {
             .registration()
             .unwrap()
             .grants
-            .may_publish("platform.kernel.command.record-holding"));
+            .may_publish("platform.street.command.record-holding"));
     }
 
     #[tokio::test]
@@ -557,10 +557,10 @@ mod tests {
         // grants are the merged set the plugin will actually be held to.
         assert!(reply
             .publish_grants
-            .contains(&"platform.kernel.command.record-holding".to_string()));
+            .contains(&"platform.street.command.record-holding".to_string()));
         assert!(reply
             .subscribe_grants
-            .contains(&"platform.kernel.event.*".to_string()));
+            .contains(&"platform.street.event.*".to_string()));
     }
 
     #[tokio::test]
@@ -602,7 +602,7 @@ mod tests {
         let sc = sidecar(true);
         let err = sc
             .publish(Request::new(PublishRequest {
-                topic: "platform.kernel.command.record-holding".into(),
+                topic: "platform.street.command.record-holding".into(),
                 ..Default::default()
             }))
             .await
@@ -616,7 +616,7 @@ mod tests {
         let sc = admitted_sidecar().await;
         let reply = sc
             .publish(Request::new(PublishRequest {
-                topic: "platform.kernel.command.record-statement".into(),
+                topic: "platform.street.command.record-statement".into(),
                 payload_type: "meridian.v1.RecordHoldingsStatementRequest".into(),
                 ..Default::default()
             }))
@@ -631,11 +631,11 @@ mod tests {
     #[tokio::test]
     async fn a_granted_publish_reaches_the_bus_stamped_by_the_sidecar() {
         let sc = admitted_sidecar().await;
-        let mut sub = sc.bus.subscribe("platform.kernel.**");
+        let mut sub = sc.bus.subscribe("platform.street.**");
 
         let reply = sc
             .publish(Request::new(PublishRequest {
-                topic: "platform.kernel.command.record-holding".into(),
+                topic: "platform.street.command.record-holding".into(),
                 payload_type: "meridian.v1.RecordHoldingRequest".into(),
                 payload: vec![1, 2, 3],
                 correlation_id: "corr-1".into(),
@@ -678,7 +678,7 @@ mod tests {
         // A boxed stream is not Debug, so unwrap_err is unavailable here.
         match sc
             .subscribe(Request::new(SubscribeRequest {
-                pattern: "platform.kernel.**".into(),
+                pattern: "platform.street.**".into(),
             }))
             .await
         {
@@ -756,7 +756,7 @@ mod tests {
         // Not granted.
         let reply = sc
             .call(Request::new(CallRequest {
-                topic: "platform.kernel.query.list-positions".into(),
+                topic: "platform.street.query.list-positions".into(),
                 timeout_ms: 100,
                 ..Default::default()
             }))
@@ -811,7 +811,7 @@ mod tests {
 
         let err = sc
             .publish(Request::new(PublishRequest {
-                topic: "platform.kernel.command.record-holding".into(),
+                topic: "platform.street.command.record-holding".into(),
                 ..Default::default()
             }))
             .await

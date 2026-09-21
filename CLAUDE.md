@@ -1,8 +1,8 @@
 # meridian-core
 
-The deployment runtime, in Rust. Message bus, sidecar, kernel, reference replica
-and dashboard. This is what ships to a client and what runs locally with
-`docker compose up`.
+The deployment runtime, in Rust. Message bus, sidecar, street store, reference
+replica and dashboard. This is what ships to a client and what runs locally
+with `docker compose up`.
 
 ## Placement
 
@@ -30,6 +30,11 @@ have them yet.
 **No third-party dependencies in the kernel.** Translate external standards at
 the plugin boundary. The kernel defines its own types and stays free to change
 them.
+
+"Kernel" here is the tier, not a component: the deployment's own core as
+against plugins. Decision 012 freed the word by renaming the component that
+held it, because in the v1 vocabulary `meridian_kernel` is the book of record
+and this store holds the custodian's belief instead.
 
 **Plugins are ephemeral.** Anything a plugin holds can vanish at any moment. The
 kernel is the seed on restart.

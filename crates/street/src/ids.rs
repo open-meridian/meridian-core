@@ -1,4 +1,4 @@
-//! Identifiers the kernel mints.
+//! Identifiers the street store mints.
 //!
 //! The same shape the platform mints: a prefix, forty-eight bits of
 //! milliseconds and eighty of randomness, in Crockford's base32. Written here

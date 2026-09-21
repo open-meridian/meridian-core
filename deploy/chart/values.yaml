@@ -83,10 +83,10 @@ migrate:
   existingSecret: ""
   key: ""
 
-  # The ledger's, when its schema lives somewhere else. Empty falls back to the
-  # settings above, and then to the ledger's own serving credential.
-  ledgerSecret: ""
-  ledgerKey: ""
+  # The street store's, when its schema lives somewhere else. Empty falls back to the
+  # settings above, and then to the street store's own serving credential.
+  streetSecret: ""
+  streetKey: ""
 
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
@@ -99,7 +99,7 @@ replica:
   image:
     tag: ""
 
-ledger:
+street:
   replicaCount: 1
   image:
     tag: ""
@@ -116,7 +116,7 @@ ledger:
 broker:
   existingSecret: ""
   replicaKey: replica
-  ledgerKey: ledger
+  streetKey: street
 
 # A sidecar per plugin, each with the identity it is launched with. The key in
 # the broker secret is the instance identifier, so adding a plugin is adding a

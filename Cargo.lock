@@ -1105,7 +1105,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meridian-kernel"
+name = "meridian-street"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
@@ -1156,7 +1156,7 @@ name = "meridian-runtime"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
- "meridian-kernel",
+ "meridian-street",
  "meridian-pb",
  "meridian-reference",
  "meridian-sidecar",

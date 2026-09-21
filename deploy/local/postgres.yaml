@@ -14,7 +14,7 @@
 # The volume is a claim rather than an emptyDir, which is what it was until
 # 2026-09-20. An emptyDir belongs to the pod, so a restart, a reschedule or an
 # eviction takes the database with it. That is not hypothetical: DiskPressure
-# on this cluster evicted the pod and took the ledger's schema and both roles,
+# on this cluster evicted the pod and took the street store's schema and both roles,
 # and the first sign of it was the platform saying the deployment had stopped
 # talking. A claim outlives the pod. It does not outlive the node's disk, which
 # for k3s-in-Docker is a Docker volume, so removing that volume still starts

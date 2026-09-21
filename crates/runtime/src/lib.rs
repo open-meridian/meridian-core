@@ -1,6 +1,6 @@
 //! What every component of a deployment needs, and none should write twice.
 //!
-//! The runtime was one process holding the ledger, the replica and a sidecar.
+//! The runtime was one process holding the street store, the replica and a sidecar.
 //! Decision 010 gave them a bus that crosses a process boundary, and
 //! `design/split-the-runtime-into-services` ruled that they are separate
 //! processes upgraded on their own schedules. This is what they share: the

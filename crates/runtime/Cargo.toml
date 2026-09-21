@@ -4,15 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A deployment's components: the ledger, the replica and a plugin's sidecar"
+description = "A deployment's components: the street store, the replica and a plugin's sidecar"
 
 [lib]
 name = "meridian_runtime"
 path = "src/lib.rs"
 
 [[bin]]
-name = "meridian-ledger"
-path = "src/bin/ledger.rs"
+name = "meridian-street"
+path = "src/bin/street.rs"
 
 [[bin]]
 name = "meridian-replica"
@@ -25,7 +25,7 @@ path = "src/bin/sidecar.rs"
 [dependencies]
 meridian-bus = { path = "../bus" }
 meridian-reference = { path = "../reference" }
-meridian-kernel = { path = "../kernel" }
+meridian-street = { path = "../street" }
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
 prost.workspace = true

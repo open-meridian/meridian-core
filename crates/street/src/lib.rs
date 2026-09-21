@@ -1,14 +1,18 @@
-//! The deployment's ledger: statements, holdings and positions.
+//! The deployment's street store: statements, holdings and positions.
 //!
-//! W2's kernel half. A connector reads a brokerage, opens a statement, and
+//! W2's street half. A connector reads a brokerage, opens a statement, and
 //! publishes one row per account and instrument; this records them, moves the
 //! positions behind them, and answers what is held.
 //!
 //! # The idea the whole workflow rests on
 //!
-//! The kernel holds our belief and the rail holds the custodian's. This is how
-//! the custodian's belief arrives. What to do when the two disagree is a later
-//! slice and nothing here pretends otherwise.
+//! There are two beliefs about what is held, ours and the custodian's. This
+//! store holds the custodian's, which is what `street` says and what `kernel`
+//! used to say the opposite of: in the v1 vocabulary this project adopted,
+//! `meridian_kernel` is the book of record. Decision 012 corrected it. Our own
+//! book is calculated from our own activity, does not exist yet, and will not
+//! be called the same thing when it does. What to do when the two disagree is
+//! a later slice and nothing here pretends otherwise.
 //!
 //! # How anything else reaches this
 //!
@@ -16,7 +20,7 @@
 //! events; it does not know there is a database, which one, or what shape it is
 //! in.
 //!
-//! That is what makes the ledger's storage a private decision. The custodian's
+//! That is what makes this store's storage a private decision. The custodian's
 //! side is append-heavy, kept for audit, and tolerant of delay; our own book,
 //! when it exists, is small, transactional, and on the path of every decision.
 //! Those want different storage, and choosing separately is only possible while
@@ -48,7 +52,7 @@
 //! It says how many rows will follow, and it is complete when that many have
 //! landed. Nothing else marks the end: rows arrive as separate messages and
 //! none is distinguishable as the last, so before W2.2 carried a count the
-//! kernel was asked to announce the completion of something whose end it could
+//! store was asked to announce the completion of something whose end it could
 //! not observe.
 //!
 //! Two consequences, both deliberate. A statement whose rows never all arrive

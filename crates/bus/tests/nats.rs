@@ -172,7 +172,7 @@ async fn a_pattern_cannot_be_published_to() {
 // ── Request-reply across processes ──────────────────────────────────────────
 //
 // A call was answered only by a handler registered in the caller's own
-// process, so a plugin asking the ledger a question had no path at all once
+// process, so a plugin asking the street store a question had no path at all once
 // they were separate. These run two buses on one broker, which is the
 // arrangement the split produces.
 
@@ -357,7 +357,7 @@ async fn the_broker_refuses_a_topic_the_role_does_not_hold() {
     let custody = as_custody().await;
     let listening = backend().await;
 
-    let forbidden = "platform.kernel.event.custodial-position-updated";
+    let forbidden = "platform.street.event.custodial-position-updated";
     let mut subscription = listening.subscribe(forbidden);
     settle().await;
 
@@ -378,7 +378,7 @@ async fn the_broker_refuses_a_subscription_the_role_does_not_hold() {
     let custody = as_custody().await;
     let publisher = backend().await;
 
-    let forbidden = "platform.kernel.event.custodial-position-updated";
+    let forbidden = "platform.street.event.custodial-position-updated";
     let mut refused = custody.subscribe(forbidden);
     let granted = "platform.reference.event.instrument-applied";
     let mut allowed = custody.subscribe(granted);

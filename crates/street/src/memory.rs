@@ -1,4 +1,4 @@
-//! The in-process ledger.
+//! The in-process street.
 //!
 //! What the unit tests run against, and what a single-host demo can run without
 //! a database. Postgres sits behind the same trait; the rules live in `Held`,
@@ -26,13 +26,13 @@ impl MemoryStore {
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Held>> {
         self.held
             .read()
-            .map_err(|_| StoreError::Unavailable("the ledger lock is poisoned".into()))
+            .map_err(|_| StoreError::Unavailable("the street store lock is poisoned".into()))
     }
 
     fn write(&self) -> Result<std::sync::RwLockWriteGuard<'_, Held>> {
         self.held
             .write()
-            .map_err(|_| StoreError::Unavailable("the ledger lock is poisoned".into()))
+            .map_err(|_| StoreError::Unavailable("the street store lock is poisoned".into()))
     }
 }
 
@@ -78,7 +78,7 @@ impl Store for MemoryStore {
     }
 }
 
-/// The ledger's contents, and every rule about them.
+/// The street store's contents, and every rule about them.
 ///
 /// Shared so the Postgres implementation cannot enforce a different set. What
 /// SQL does differently is where the rows live, not what may become one.

@@ -1,10 +1,10 @@
 [package]
-name = "meridian-kernel"
+name = "meridian-street"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The deployment ledger: holdings statements, holdings and positions"
+description = "The deployment's street store: holdings statements, holdings and positions"
 
 [dependencies]
 meridian-pb.workspace = true

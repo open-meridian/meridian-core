@@ -1,4 +1,4 @@
-//! Where the ledger meets the bus.
+//! Where the street store meets the bus.
 //!
 //! Two commands in, one query in, one event out. W2.2 and W2.3 arrive as
 //! commands from a connector, W2.7 as a query from a dashboard, and W2.6 leaves
@@ -32,19 +32,19 @@ use crate::record::{open_statement, record_holding};
 use crate::store::Store;
 
 /// W2.2. A connector opening a statement.
-pub const RECORD_STATEMENT: &str = "platform.kernel.command.record-statement";
+pub const RECORD_STATEMENT: &str = "platform.street.command.record-statement";
 
 /// W2.3. A connector publishing one row.
-pub const RECORD_HOLDING: &str = "platform.kernel.command.record-holding";
+pub const RECORD_HOLDING: &str = "platform.street.command.record-holding";
 
 /// W2.6. A position moved.
-pub const CUSTODIAL_POSITION_UPDATED: &str = "platform.kernel.event.custodial-position-updated";
+pub const CUSTODIAL_POSITION_UPDATED: &str = "platform.street.event.custodial-position-updated";
 
 /// W2.5. A statement has every row it said was coming.
-pub const STATEMENT_RECORDED: &str = "platform.kernel.event.statement-recorded";
+pub const STATEMENT_RECORDED: &str = "platform.street.event.statement-recorded";
 
 /// W2.7. A dashboard asking what is held.
-pub const LIST_CUSTODIAL_POSITIONS: &str = "platform.kernel.query.list-custodial-positions";
+pub const LIST_CUSTODIAL_POSITIONS: &str = "platform.street.query.list-custodial-positions";
 
 /// Where the time comes from, so a test does not wait for it.
 pub trait Clock: Send + Sync {
@@ -62,7 +62,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Register every handler the kernel serves.
+/// Register every handler the street store serves.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     let statements = store.clone();
     let statement_clock = clock.clone();
@@ -209,7 +209,7 @@ mod tests {
     }
 
     fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
-        let bus = Arc::new(Bus::single("kernel-1", Arc::new(MemoryBackend::new())));
+        let bus = Arc::new(Bus::single("street-1", Arc::new(MemoryBackend::new())));
         let store = Arc::new(MemoryStore::new());
         serve(
             bus.clone(),
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_query_answers_from_the_ledger() {
+    async fn the_query_answers_from_the_street() {
         let (bus, _) = wired();
         let statement_id = open(&bus).await;
         record(&bus, row(&statement_id)).await;

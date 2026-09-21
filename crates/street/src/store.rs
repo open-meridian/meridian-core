@@ -1,4 +1,4 @@
-//! What the ledger holds, and what any store of it must provide.
+//! What the street store holds, and what any store of it must provide.
 //!
 //! Three things, and the relationships between them are the whole design.
 //!
@@ -21,7 +21,7 @@ use crate::amounts::{Money, Overflow, Quantity};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("the ledger is unavailable: {0}")]
+    #[error("the street store is unavailable: {0}")]
     Unavailable(String),
 
     #[error("no statement {0}")]
@@ -209,7 +209,7 @@ pub struct Page {
     pub next_cursor: String,
 }
 
-/// Where the ledger keeps what it has been told.
+/// Where the street store keeps what it has been told.
 pub trait Store: Send + Sync {
     /// Open a statement, or recognise one already held. W2.2.
     ///

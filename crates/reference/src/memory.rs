@@ -2,7 +2,7 @@
 //!
 //! Not a placeholder for a first milestone. A deployment watching one brokerage
 //! account holds a handful of instruments, and the replica is rebuilt from the
-//! platform on demand, so durability buys less here than it does in the kernel.
+//! platform on demand, so durability buys less here than it does in the street store.
 //! Postgres arrives behind the same trait when compose does.
 
 use std::sync::RwLock;

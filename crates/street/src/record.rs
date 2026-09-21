@@ -1,9 +1,9 @@
 //! Opening a statement and recording its rows. W2.2, W2.3 and W2.4.
 //!
-//! The wire's shapes translated into the ledger's, and back. A deliberate
+//! The wire's shapes translated into the street store's, and back. A deliberate
 //! translation rather than storing the generated types: the store's shape is
-//! the ledger's business and the wire's is the contract's, and letting one be
-//! the other means a schema change reaches into the ledger without passing
+//! the street store's business and the wire's is the contract's, and letting one be
+//! the other means a schema change reaches into the street store without passing
 //! anything that could object.
 
 use meridian_pb::v1::{

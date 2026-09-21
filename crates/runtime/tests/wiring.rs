@@ -2,7 +2,7 @@
 //!
 //! Every part here is tested in its own crate against its own harness, and none
 //! of that says they were wired together. This is the test that would have
-//! failed for as long as the kernel existed and no process ran it: the ledger
+//! failed for as long as the street store existed and no process ran it: it
 //! compiled, passed 55 tests, and was reachable from nothing.
 //!
 //! So what is under test is the assembly, and it is driven the way a plugin
@@ -33,10 +33,10 @@ const NOW: i64 = 1_757_376_000_000_000_000;
 fn runtime() -> (Arc<Bus>, Sidecar) {
     let bus = Arc::new(Bus::single("runtime-test", Arc::new(MemoryBackend::new())));
 
-    meridian_kernel::service::serve(
+    meridian_street::service::serve(
         bus.clone(),
-        Arc::new(meridian_kernel::MemoryStore::new()),
-        Arc::new(meridian_kernel::service::SystemClock),
+        Arc::new(meridian_street::MemoryStore::new()),
+        Arc::new(meridian_street::service::SystemClock),
     );
     meridian_reference::service::serve_queries(
         &bus,
@@ -120,10 +120,10 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     .await;
     assert!(!resolved.found);
 
-    // The ledger side, on that same bus: open a statement promising one row.
+    // The street store side, on that same bus: open a statement promising one row.
     let opened: RecordHoldingsStatementReply = call(
         &sidecar,
-        meridian_kernel::service::RECORD_STATEMENT,
+        meridian_street::service::RECORD_STATEMENT,
         "meridian.v1.RecordHoldingsStatementRequest",
         RecordHoldingsStatementRequest {
             source: "snaptrade".into(),
@@ -138,7 +138,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 
     let recorded: RecordHoldingReply = call(
         &sidecar,
-        meridian_kernel::service::RECORD_HOLDING,
+        meridian_street::service::RECORD_HOLDING,
         "meridian.v1.RecordHoldingRequest",
         RecordHoldingRequest {
             statement_id: opened.statement_id,
@@ -171,7 +171,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 
     let listed: ListCustodialPositionsReply = call(
         &dashboard,
-        meridian_kernel::service::LIST_CUSTODIAL_POSITIONS,
+        meridian_street::service::LIST_CUSTODIAL_POSITIONS,
         "meridian.v1.ListCustodialPositionsRequest",
         ListCustodialPositionsRequest {
             account_id: "ACC-1".into(),
@@ -193,43 +193,43 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     let table = GrantTable::from_json(GRANTS).expect("the shipped grants parse");
 
     let custody = table.resolve("custody", &[]);
-    assert!(custody.may_publish(meridian_kernel::service::RECORD_STATEMENT));
-    assert!(custody.may_publish(meridian_kernel::service::RECORD_HOLDING));
+    assert!(custody.may_publish(meridian_street::service::RECORD_STATEMENT));
+    assert!(custody.may_publish(meridian_street::service::RECORD_HOLDING));
     assert!(custody.may_publish("platform.custody.custody-snaptrade-1.event.sync-status"));
     // A connector states what it holds; it does not announce that a position
-    // moved. That is the kernel's to say.
-    assert!(!custody.may_publish(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
+    // moved. That is the street store's to say.
+    assert!(!custody.may_publish(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 
     let dashboard = table.resolve("dashboard", &[]);
-    assert!(dashboard.may_publish(meridian_kernel::service::LIST_CUSTODIAL_POSITIONS));
-    assert!(dashboard.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
-    // Read-only means read-only: nothing a dashboard does writes to the ledger.
-    assert!(!dashboard.may_publish(meridian_kernel::service::RECORD_HOLDING));
+    assert!(dashboard.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
+    assert!(dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
+    // Read-only means read-only: nothing a dashboard does writes to the street store.
+    assert!(!dashboard.may_publish(meridian_street::service::RECORD_HOLDING));
 
     // A plugin carries a role and any number of tags, and gets the union. A
     // connector that also reads positions asks for the tag rather than having a
     // bespoke role minted for the combination.
     let both = table.resolve("custody", &["positions-reader".to_string()]);
-    assert!(both.may_publish(meridian_kernel::service::RECORD_HOLDING));
-    assert!(both.may_publish(meridian_kernel::service::LIST_CUSTODIAL_POSITIONS));
-    assert!(both.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
+    assert!(both.may_publish(meridian_street::service::RECORD_HOLDING));
+    assert!(both.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
+    assert!(both.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 
     // A tag adds and never subtracts, so the role alone is the smaller set.
-    assert!(!custody.may_publish(meridian_kernel::service::LIST_CUSTODIAL_POSITIONS));
+    assert!(!custody.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
 
     // Denial is by absence, so an unknown role gets nothing rather than
     // everything.
     let stranger = table.resolve("not-a-role", &[]);
-    assert!(!stranger.may_publish(meridian_kernel::service::RECORD_HOLDING));
-    assert!(!stranger.may_subscribe(meridian_kernel::service::CUSTODIAL_POSITION_UPDATED));
+    assert!(!stranger.may_publish(meridian_street::service::RECORD_HOLDING));
+    assert!(!stranger.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 }
 
 // ── W5.20: components say what they run, inward ─────────────────────────────
 
 #[tokio::test]
 async fn a_components_report_reaches_the_one_holding_the_key() {
-    // The ledger holds no key, so what it runs reaches the platform only by
-    // way of the replica. This is that path, without a platform: the ledger
+    // The street store holds no key, so what it runs reaches the platform only by
+    // way of the replica. This is that path, without a platform: the street store
     // publishes, and what the replica would send carries it.
     use meridian_runtime::{collect_inward, report_inward_forever, COMPONENT_REPORT_TOPIC};
 
@@ -237,13 +237,13 @@ async fn a_components_report_reaches_the_one_holding_the_key() {
     let heard = collect_inward(Arc::clone(&bus));
 
     let publishing = Arc::clone(&bus);
-    tokio::spawn(async move { report_inward_forever(publishing, "ledger", 2).await });
+    tokio::spawn(async move { report_inward_forever(publishing, "street", 2).await });
 
     // The first report goes out immediately; the interval is for the ones
     // after it, which is what makes a restart visible promptly.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(report) = heard.lock().unwrap().get("ledger") {
+        if let Some(report) = heard.lock().unwrap().get("street") {
             assert_eq!(report.schema_version, 2);
             assert_eq!(report.health, "COMPONENT_HEALTH_SERVING");
             assert!(

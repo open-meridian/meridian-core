@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
- && cp target/release/meridian-ledger target/release/meridian-replica \
+ && cp target/release/meridian-street target/release/meridian-replica \
        target/release/meridian-sidecar /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
@@ -36,7 +36,7 @@ VOLUME /var/lib/meridian
 # which one an orchestrator starts: a deployment upgrades them on their own
 # schedules by moving one Deployment's tag, not by pulling three images that
 # were built from different commits.
-COPY --from=build /usr/local/bin/meridian-ledger /usr/local/bin/meridian-ledger
+COPY --from=build /usr/local/bin/meridian-street /usr/local/bin/meridian-street
 COPY --from=build /usr/local/bin/meridian-replica /usr/local/bin/meridian-replica
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
 
