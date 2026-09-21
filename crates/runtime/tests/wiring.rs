@@ -46,7 +46,6 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
     let sidecar = Sidecar::new(
         bus.clone(),
         "DEP-test",
-        "v1",
         Identity::new("custody-snaptrade-1", "custody"),
     );
     sidecar.load_grants(GrantTable::from_json(GRANTS).expect("the shipped grants parse"));
@@ -160,7 +159,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // shared endpoint admits one plugin. That is the deployment shape today and
     // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
     // where it changes, and this line is what should stop being necessary.
-    let dashboard = Sidecar::new(bus, "DEP-test", "v1", Identity::new("dashboard-1", "admin"));
+    let dashboard = Sidecar::new(bus, "DEP-test", Identity::new("dashboard-1", "admin"));
     dashboard.load_grants(GrantTable::from_json(GRANTS).unwrap());
     admitted(&dashboard, "admin").await;
 

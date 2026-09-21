@@ -62,7 +62,7 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
-            let sidecar = Sidecar::new(bus, &deployment_id, "v1", identity);
+            let sidecar = Sidecar::new(bus, &deployment_id, identity);
             sidecar.load_grants(grants);
 
             tracing::info!(instance_id, %listening, "the sidecar is serving");

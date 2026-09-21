@@ -65,7 +65,6 @@ impl Identity {
 pub struct Sidecar {
     bus: Arc<Bus>,
     deployment_id: String,
-    schema_version: String,
     identity: Identity,
 
     /// `None` until access control has loaded.
@@ -79,16 +78,10 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    pub fn new(
-        bus: Arc<Bus>,
-        deployment_id: impl Into<String>,
-        schema_version: impl Into<String>,
-        identity: Identity,
-    ) -> Self {
+    pub fn new(bus: Arc<Bus>, deployment_id: impl Into<String>, identity: Identity) -> Self {
         Self {
             bus,
             deployment_id: deployment_id.into(),
-            schema_version: schema_version.into(),
             identity,
             grants: Arc::new(RwLock::new(None)),
             state: Arc::new(RwLock::new(None)),
@@ -152,11 +145,11 @@ impl SidecarService for Sidecar {
 
         // Refused at the door rather than discovered later in a decode failure,
         // where the symptom would be a corrupt-looking message rather than a
-        // version mismatch.
-        if !req.schema_version.is_empty() && req.schema_version != self.schema_version {
+        // version mismatch. A range, not a match: see `contract`.
+        if let Err(refusal_reason) = crate::contract::admit(&req.schema_version) {
             return Ok(Response::new(RegisterReply {
                 admitted: false,
-                refusal_reason: format!("schema version {} not supported", req.schema_version),
+                refusal_reason,
                 ..Default::default()
             }));
         }
@@ -423,7 +416,7 @@ mod tests {
             "sidecar-custody-1",
             Arc::new(MemoryBackend::new()),
         ));
-        let sc = Sidecar::new(bus, "dep-local-1", "v1", identity);
+        let sc = Sidecar::new(bus, "dep-local-1", identity);
         if load_grants {
             sc.load_grants(GrantTable::from_json(GRANTS).unwrap());
         }
@@ -463,14 +456,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_is_refused_on_a_schema_mismatch() {
+    async fn admission_is_refused_for_a_contract_outside_the_range() {
+        for declared in ["v0", "v2"] {
+            let sc = sidecar(true);
+            let mut req = register_req();
+            req.schema_version = declared.into();
+
+            let reply = sc.register(Request::new(req)).await.unwrap().into_inner();
+            assert!(!reply.admitted, "{declared} was admitted");
+            // Both halves: what was declared, and what would be accepted.
+            assert!(reply.refusal_reason.contains(declared));
+            assert!(reply.refusal_reason.contains("v1 through v1"));
+            assert!(sc.registration().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_declares_no_contract_is_no_longer_admitted() {
+        // It was, until 2026-09-21, which made omitting the version the safest
+        // thing a vendor could do.
         let sc = sidecar(true);
         let mut req = register_req();
-        req.schema_version = "v0".into();
+        req.schema_version = String::new();
 
         let reply = sc.register(Request::new(req)).await.unwrap().into_inner();
         assert!(!reply.admitted);
-        assert!(reply.refusal_reason.contains("v0"));
+        assert!(reply
+            .refusal_reason
+            .contains("declared no contract version"));
     }
 
     #[tokio::test]

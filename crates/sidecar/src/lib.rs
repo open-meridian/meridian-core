@@ -12,9 +12,11 @@
 //! and do not belong here; they are generated from the function matrix and live
 //! above this layer.
 
+pub mod contract;
 pub mod grants;
 mod service;
 
+pub use contract::{admit_within, CONTRACT_CURRENT, CONTRACT_FLOOR};
 pub use grants::{GrantTable, Grants};
 pub use service::{Identity, Registration, Sidecar};
 
