@@ -159,6 +159,11 @@ spec:
               value: {{ printf "%s/callback" (trimSuffix "/" .Values.dashboard.url) | quote }}
             - name: MERIDIAN_GROUP_HOOK_URL
               value: "http://{{ $hook }}:8090"
+            # Zitadel refuses an http redirect address unless the client is in
+            # development mode: on only when the dashboard is served over http,
+            # which is a developer's machine and nowhere else.
+            - name: MERIDIAN_ZITADEL_DEV_MODE
+              value: {{ hasPrefix "http://" .Values.dashboard.url | quote }}
             - name: MERIDIAN_ZITADEL_ROLES
               value: {{ join "," .Values.identity.bundled.roles | quote }}
             {{- if $ldap.enabled }}
