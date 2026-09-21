@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use meridian_bus::{Bus, Delivery};
-use meridian_pb::v1::{MissingInstrumentDetectedEvent, PullInstrumentReply};
+use meridian_domain::v1::{MissingInstrumentDetectedEvent, PullInstrumentReply};
 use prost::Message;
 
 use crate::platform::{Platform, Reaction};
@@ -175,7 +175,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use meridian_bus::{Bus, Delivery, Envelope, MemoryBackend, MessageMeta};
-    use meridian_pb::v1::{Identifier as PbIdentifier, MissReason};
+    use meridian_domain::v1::{Identifier as PbIdentifier, MissReason};
 
     use super::*;
     use crate::platform::tests::{failure, platform as platform_with, record_json, reply, Fake};

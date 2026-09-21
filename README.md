@@ -58,7 +58,13 @@ redirected without anything here changing or restarting.
 | `street` | The street store: statements, holdings, custodial positions |
 | `conductor` | The platform connection, the key, and outward reporting |
 | `symbology` | The identifier fallback order, shared by two components |
+| `domain` | The domain messages, generated from `proto/` by `make codegen` |
 | `runtime` | The four binaries, and what wires each process together |
+
+`proto/` holds the domain messages -- holdings, reference data, accounts -- that
+the runtime carries past its sidecar. A plugin never sees them: its surface is
+the sidecar's, in meridian-schema. They are contract-tier here, so a commit
+changing one names a queued task in a `Contract-Revision:` trailer.
 
 ## Licence
 

@@ -1112,7 +1112,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "meridian-bus",
- "meridian-pb",
+ "meridian-domain",
  "meridian-symbology",
  "prost",
  "rand 0.8.8",
@@ -1125,11 +1125,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-domain"
+version = "0.1.0"
+dependencies = [
+ "prost",
+]
+
+[[package]]
 name = "meridian-instrument"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
- "meridian-pb",
+ "meridian-domain",
  "meridian-symbology",
  "postgres",
  "prost",
@@ -1146,7 +1153,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d#d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=263a6ad8ff7d3f923c0022b4698b049d08b3b8f1#263a6ad8ff7d3f923c0022b4698b049d08b3b8f1"
 dependencies = [
  "prost",
  "tonic",
@@ -1158,6 +1165,7 @@ version = "0.1.0"
 dependencies = [
  "meridian-bus",
  "meridian-conductor",
+ "meridian-domain",
  "meridian-instrument",
  "meridian-pb",
  "meridian-sidecar",
@@ -1190,7 +1198,7 @@ name = "meridian-street"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
- "meridian-pb",
+ "meridian-domain",
  "postgres",
  "prost",
  "r2d2",
@@ -1205,7 +1213,7 @@ dependencies = [
 name = "meridian-symbology"
 version = "0.1.0"
 dependencies = [
- "meridian-pb",
+ "meridian-domain",
 ]
 
 [[package]]

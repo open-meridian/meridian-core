@@ -55,6 +55,9 @@ DERIVATION_BY_REPO = {
     "meridian-design": [r"^workflows/", r"^matrix/", r"^topics/",
                         r"^fixtures/", r"^decisions/"],
     "meridian-schema": [r"^proto/"],
+    # The domain messages, which only the runtime reads past its sidecar.
+    # Task design/domain-protos-move-into-core.
+    "meridian-core": [r"^proto/"],
 }
 
 # Applied in every repository.
@@ -196,9 +199,10 @@ def self_test() -> int:
         ("topics/topics.md", "meridian-design", "derivation"),
         ("fixtures/holdings/x.yaml", "meridian-design", "derivation"),
         ("decisions/001-x.md", "meridian-design", "derivation"),
-        ("proto/meridian/v1/holdings.proto", "meridian-schema", "derivation"),
+        ("proto/meridian/v1/sidecar.proto", "meridian-schema", "derivation"),
+        ("proto/meridian/v1/holdings.proto", "meridian-core", "derivation"),
         # The same path is not derivation-tier in a repo that does not own it.
-        ("proto/meridian/v1/holdings.proto", "meridian-core", None),
+        ("proto/meridian/v1/holdings.proto", "meridian-python", None),
         ("workflows/W1-x.workflow.yaml", "meridian-core", None),
         (".github/workflows/ci.yaml", "meridian-core", "guardrail"),
         (".github/workflows/ci.yaml", "meridian-design", "guardrail"),

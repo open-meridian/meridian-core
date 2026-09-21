@@ -33,6 +33,7 @@ meridian-street = { path = "../street" }
 meridian-conductor = { path = "../conductor" }
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
+meridian-domain.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

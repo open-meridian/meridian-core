@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use meridian_bus::{Bus, Delivery};
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     InstrumentRecord as PbInstrument, PullInstrumentReply, ResolveIdentifierRequest,
     ResolveInstrumentRequest,
 };
@@ -265,7 +265,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use meridian_bus::{Envelope, MemoryBackend, MessageMeta};
-    use meridian_pb::v1::{
+    use meridian_domain::v1::{
         Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentLifecycleState,
         ResolveIdentifierReply, ResolveIdentifierRequest as PbResolveIdentifierRequest,
         ResolveInstrumentReply,

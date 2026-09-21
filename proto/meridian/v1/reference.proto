@@ -1,0 +1,264 @@
+// Instrument identity, symbology mapping, and the escalation path when a
+// resolution misses.
+//
+// Derived from workflows W1 (security master administration) and W3 (instrument
+// resolution and escalation). Every message here traces to a matrix row; see
+// matrix/matrix.tsv.
+//
+// The scope boundary is load-bearing: this is identity, mapping and structure.
+// Prices, yields, ratings, volumes and sector data are client-licensed and live
+// in the deployment. Identity attributes and data values never mix, and no
+// field below invites them to.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The record
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Lifecycle. The transition verbs are the commands; nothing sets this directly.
+enum InstrumentLifecycleState {
+  INSTRUMENT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+
+  // Identity exists, attributes may be incomplete. A holding can reference it,
+  // which is the point: a position may arrive before anyone has decided what
+  // the instrument is.
+  INSTRUMENT_LIFECYCLE_STATE_DEFINE = 1;
+
+  // Fully defined.
+  INSTRUMENT_LIFECYCLE_STATE_ACTIVE = 2;
+
+  // Retired. Existing holdings stay resolvable, because history does not stop
+  // being true when an instrument stops trading.
+  INSTRUMENT_LIFECYCLE_STATE_DECOMMISSIONED = 3;
+}
+
+// One typed identifier for an instrument.
+//
+// `scheme` says what kind of identifier this is: a global scheme ("figi",
+// "isin", "cusip", "sedol") or a source-scoped one ("symbol"). A source-scoped
+// identifier is only meaningful alongside its source, which is why `source` is
+// present and why a bare symbol can never drive a global resolve.
+message Identifier {
+  string scheme = 1;
+  string value = 2;
+
+  // The namespace a source-scoped identifier belongs to, e.g. "snaptrade".
+  // Empty for a global scheme.
+  string source = 3;
+}
+
+// The canonical instrument record.
+//
+// Three time axes, and conflating any two of them produces a resolution bug
+// that only appears when an identifier is reused:
+//
+//   reference time  the as-of a resolution is FOR. A query parameter, never a
+//                   field here.
+//   effective time  valid_from_ns -- when this mapping became true in the world.
+//   record time     record_time_ns -- when the authority knew it.
+//
+// Identifiers get reused: a ticker freed by a delisting is later reassigned to
+// a different instrument. A consumer resolving a historical date must key on
+// effective time, not on when it happened to learn the mapping.
+message InstrumentRecord {
+  // Canonical identifier. "LCL-{uuid}" for a locally minted instrument,
+  // "INS-{uuid}" for one minted by the central authority.
+  string instrument_id = 1;
+
+  // The full identifier set. An amend replaces this authoritatively.
+  repeated Identifier identifiers = 2;
+
+  string asset_class = 3;
+
+  // ISO 4217.
+  string currency = 4;
+
+  // ISO 10383 market identifier code. Empty where there is no listing venue.
+  string exchange_mic = 5;
+
+  string description = 6;
+
+  InstrumentLifecycleState lifecycle_state = 7;
+
+  // Monotonic, assigned by the store, starting at 1. An apply carrying a
+  // version at or below the one held is a no-op, which is what makes replica
+  // application idempotent and overlapping pulls harmless.
+  int64 version = 8;
+
+  // Effective time. When this version's mapping became true.
+  int64 valid_from_ns = 9;
+
+  // Record time. Stamped by the store, never accepted from a caller: knowledge
+  // cannot be back-dated.
+  int64 record_time_ns = 10;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W1 — administration
+// ─────────────────────────────────────────────────────────────────────────────
+
+message DefineInstrumentRequest {
+  repeated Identifier identifiers = 1;
+  string asset_class = 2;
+  string currency = 3;
+  string exchange_mic = 4;
+  string description = 5;
+
+  // When the mapping becomes effective. Zero means now.
+  int64 valid_from_ns = 6;
+}
+
+// Authoritative replace of the identifier set and attributes. Not a delta: an
+// identifier absent here is removed, and its validity window closes as of
+// valid_from_ns. A delta cannot express removal without a second verb, and the
+// second verb is where drift starts.
+message AmendInstrumentRequest {
+  string instrument_id = 1;
+  repeated Identifier identifiers = 2;
+  string asset_class = 3;
+  string currency = 4;
+  string exchange_mic = 5;
+  string description = 6;
+  int64 valid_from_ns = 7;
+}
+
+// The verb is the transition, so the request carries only the subject.
+message DecommissionInstrumentRequest {
+  string instrument_id = 1;
+}
+
+message ReactivateInstrumentRequest {
+  string instrument_id = 1;
+}
+
+message ListInstrumentsRequest {
+  // Zero-value filters mean unfiltered.
+  InstrumentLifecycleState lifecycle_state = 1;
+  string asset_class = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message ListInstrumentsReply {
+  repeated InstrumentRecord instruments = 1;
+  // Empty when the listing is exhausted.
+  string next_cursor = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3 — resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Why a resolution did not produce exactly one instrument.
+enum MissReason {
+  MISS_REASON_UNSPECIFIED = 0;
+
+  // No instrument matched.
+  MISS_REASON_NOT_FOUND = 1;
+
+  // More than one matched. Reported as a miss rather than resolved by picking,
+  // because picking would be wrong about half the time and would be silent.
+  MISS_REASON_AMBIGUOUS = 2;
+}
+
+// Reverse resolution: identifiers to an instrument, as of a date.
+message ResolveIdentifierRequest {
+  // At least one. Matched strongest-first: a global scheme before a
+  // source-scoped symbol.
+  repeated Identifier identifiers = 1;
+
+  // Reference time. The date the mapping is being asked about.
+  int64 as_of_ns = 2;
+
+  // Narrows a symbol match. Empty means unconstrained.
+  string exchange_mic = 3;
+  string currency = 4;
+}
+
+message ResolveIdentifierReply {
+  bool found = 1;
+  string instrument_id = 2;
+  // Set only when found is false.
+  MissReason miss_reason = 3;
+}
+
+// Forward resolution: an instrument identifier to its record.
+message ResolveInstrumentRequest {
+  string instrument_id = 1;
+  int64 as_of_ns = 2;
+}
+
+message ResolveInstrumentReply {
+  bool found = 1;
+  InstrumentRecord instrument = 2;
+}
+
+// A resolution missed. A fact, not a request.
+//
+// The publisher reports what it held and continues. It does not ask for a mint,
+// does not wait for one, and has no authority to perform one. Keeping the
+// authority to create identity on the far side of an event boundary is what
+// stops a misbehaving feed from filling the master with junk.
+message MissingInstrumentDetectedEvent {
+  // The namespace the miss occurred in, e.g. "snaptrade".
+  string source = 1;
+
+  string asset_class = 2;
+
+  // Everything the publisher held at the miss. Enough for a reader to attempt a
+  // pull against a global scheme, or to mint a stub carrying them.
+  repeated Identifier identifiers = 3;
+
+  // Reference time of the missed resolve. The reaction must target the mapping
+  // effective then, not the mapping effective now.
+  int64 as_of_ns = 4;
+
+  string publisher_instance_id = 5;
+  MissReason reason = 6;
+  int64 observed_at_ns = 7;
+}
+
+// Reply to a pull of one instrument from the central authority.
+message PullInstrumentReply {
+  bool found = 1;
+  InstrumentRecord instrument = 2;
+}
+
+// Reply to a pull resolving identifiers against the central authority.
+message PullIdentifierReply {
+  bool found = 1;
+  InstrumentRecord instrument = 2;
+  MissReason miss_reason = 3;
+}
+
+// Ask the central authority to mint an identity for something neither side
+// knows. The identifiers become the stub an administrator completes.
+message EscalateInstrumentRequest {
+  string source = 1;
+  string asset_class = 2;
+  repeated Identifier identifiers = 3;
+  int64 as_of_ns = 4;
+  string requesting_deployment_id = 5;
+}
+
+message EscalateInstrumentReply {
+  InstrumentRecord instrument = 1;
+
+  // False when the authority already held a match and returned it instead of
+  // minting. The caller treats both alike; this is for the operator.
+  bool minted = 2;
+}
+
+// A record reached the local replica, by pull or by mint.
+message InstrumentAppliedEvent {
+  InstrumentRecord instrument = 1;
+
+  // False when the apply was a no-op because the held version was already at or
+  // above this one.
+  bool applied = 2;
+
+  int64 applied_at_ns = 3;
+}

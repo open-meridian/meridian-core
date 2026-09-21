@@ -1,0 +1,239 @@
+// Holdings arriving from an external rail, and the positions they produce.
+//
+// Derived from workflow W2 (holdings ingestion from a brokerage). Every message
+// here traces to a matrix row; see matrix/matrix.tsv.
+//
+// The governing idea: the kernel holds our belief and the rail holds the
+// custodian's belief. These messages carry the custodian's belief inward. What
+// to do when the two disagree is a later slice and deliberately has no
+// vocabulary here yet.
+//
+// Every quantity and monetary amount is an int64 scaled by 1e8. No field below
+// is a float, at any layer, because a rounding error here becomes a position
+// break, and a break costs more to investigate than the discipline costs to
+// keep.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+import "meridian/v1/reference.proto";
+
+// Scale factor for every *_scaled_1e8 field: the value is the real amount
+// multiplied by 100,000,000. A quantity of 1.5 shares is 150000000.
+//
+// Declared as a constant in one place so no implementation has to rediscover
+// it, and named in every field so a reader cannot miss it.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.1 — freshness
+// ─────────────────────────────────────────────────────────────────────────────
+
+// How fresh a connected account's data is, as reported by the rail.
+//
+// Published so an operator can tell stale data from absent data. Those look
+// identical on a holdings screen and mean completely different things.
+message SyncStatusEvent {
+  string source = 1;
+  string account_id = 2;
+
+  // When the rail last successfully synced this account from the institution.
+  int64 last_synced_at_ns = 3;
+
+  // Whether the rail currently considers the connection healthy. A false here
+  // with a recent last_synced_at_ns means the data is good but the connection
+  // has since broken.
+  bool connection_healthy = 4;
+
+  // Rail-supplied text when the connection is unhealthy. Diagnostic only;
+  // nothing branches on it.
+  string status_detail = 5;
+
+  int64 observed_at_ns = 6;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.2 — the statement envelope
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Open one statement: one read of one rail, at one moment.
+//
+// Two dates, and they are not the same thing. `as_of_date` is the date the
+// positions reflect. `read_at_ns` is when the connector fetched them. A
+// statement read this morning may be as of yesterday's close, and conflating
+// the two is how stale data passes for current.
+message RecordHoldingsStatementRequest {
+  // The rail namespace, e.g. "snaptrade".
+  string source = 1;
+
+  // The rail's own identifier for this statement, where it has one. Used to
+  // recognise a redelivery of the same statement.
+  string external_statement_id = 2;
+
+  // ISO 8601 date the positions are as of.
+  string as_of_date = 3;
+
+  int64 read_at_ns = 4;
+
+  // How many holding rows will follow, per W2.2.
+  //
+  // The only thing that marks the end of a statement. Nothing else in the
+  // sequence does: rows arrive as separate messages and none of them is
+  // distinguishable as the last. The kernel closes the statement when this many
+  // have landed, and a statement whose rows never all arrive stays open rather
+  // than publishing counts that are wrong.
+  //
+  // The connector holds the whole list before it publishes any of it, so it
+  // knows this without reading anything twice.
+  int32 expected_rows = 5;
+}
+
+message RecordHoldingsStatementReply {
+  // Kernel-assigned. Every row references it.
+  string statement_id = 1;
+
+  // True when this statement had already been recorded and the existing one is
+  // being returned. Makes redelivery a no-op rather than a duplicate.
+  bool already_recorded = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.3 — the rows
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One holding, for one account, at one instrument.
+//
+// Either `instrument_id` is set, meaning the connector resolved it, or
+// `unresolved_identifiers` is set, meaning it could not. Never both, and never
+// neither. A row that could not be resolved is still recorded, because a
+// dropped holding is invisible and an operator comparing against their
+// brokerage would find a silent discrepancy with nothing to investigate.
+message RecordHoldingRequest {
+  string statement_id = 1;
+  string account_id = 2;
+
+  // Set when resolution succeeded.
+  string instrument_id = 3;
+
+  // Set when it did not: everything the connector held, so an operator can see
+  // exactly what could not be accounted for.
+  repeated Identifier unresolved_identifiers = 4;
+
+  // Signed: negative is a short position.
+  int64 quantity_scaled_1e8 = 5;
+
+  // The rail's valuation of the holding. Recorded as reported, not recomputed:
+  // this is the custodian's belief, and rederiving it would discard the thing
+  // that makes a later comparison meaningful.
+  int64 market_value_scaled_1e8 = 6;
+
+  // ISO 4217 for market_value_scaled_1e8.
+  string currency = 7;
+}
+
+message RecordHoldingReply {
+  string holding_id = 1;
+
+  // True when the row carried an instrument and updated a position. False for
+  // an unresolved row, which updates nothing, because there is no position to
+  // update until the deployment knows what it holds.
+  bool resolved = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.5, W2.6 — what the kernel publishes back
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A statement is complete.
+//
+// The unresolved count is the number an operator actually watches; a statement
+// that is complete and fully resolved is the only quiet outcome.
+message StatementRecordedEvent {
+  string statement_id = 1;
+  string source = 2;
+  string as_of_date = 3;
+  int32 rows_received = 4;
+  int32 rows_resolved = 5;
+  int32 rows_unresolved = 6;
+  int64 recorded_at_ns = 7;
+}
+
+// A custodial position that changed, and the statement that changed it.
+message CustodialPositionUpdatedEvent {
+  CustodialPosition position = 1;
+
+  // The statement that caused this. Lets a reader explain any position by
+  // pointing at what produced it.
+  string statement_id = 2;
+
+  // The previous quantity, so a subscriber can render a delta without holding
+  // its own history.
+  int64 previous_quantity_scaled_1e8 = 3;
+}
+
+// What the custodian says an account holds of an instrument, right now.
+//
+// Custodial, and named so deliberately. This is the custodian's belief, arrived
+// at by reading their statements; it is not what the deployment calculates from
+// its own activity. Those are different numbers whose disagreement is the
+// entire subject of reconciliation, and a message called `Position` would make
+// a consumer guess which one it had.
+//
+// Our own book does not exist yet. When it does it gets its own message and its
+// own name, and no reader of this one silently changes meaning.
+message CustodialPosition {
+  string account_id = 1;
+  string instrument_id = 2;
+  int64 quantity_scaled_1e8 = 3;
+  int64 market_value_scaled_1e8 = 4;
+  string currency = 5;
+
+  // The statement this was last stated by, and when. One not restated recently
+  // is not wrong, but it is worth showing differently.
+  string last_statement_id = 6;
+  string as_of_date = 7;
+  int64 updated_at_ns = 8;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.7 — reading it back
+// ─────────────────────────────────────────────────────────────────────────────
+
+message ListCustodialPositionsRequest {
+  // Empty means every account.
+  string account_id = 1;
+
+  // When true, the reply also carries holdings that never resolved, so one
+  // request answers both "what does the custodian say I hold" and "what could I
+  // not account for".
+  bool include_unresolved = 2;
+
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message ListCustodialPositionsReply {
+  repeated CustodialPosition positions = 1;
+
+  // Populated only when include_unresolved was set.
+  repeated UnresolvedHolding unresolved = 2;
+
+  string next_cursor = 3;
+}
+
+// A holding the deployment received but could not name.
+message UnresolvedHolding {
+  string holding_id = 1;
+  string account_id = 2;
+  repeated Identifier identifiers = 3;
+  int64 quantity_scaled_1e8 = 4;
+  int64 market_value_scaled_1e8 = 5;
+  string currency = 6;
+  string source = 7;
+  string as_of_date = 8;
+
+  // Whether an escalation has already been raised for these identifiers, so the
+  // view can separate "nobody has looked at this" from "this is with the
+  // administrator".
+  bool escalated = 9;
+}

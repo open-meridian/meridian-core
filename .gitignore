@@ -21,3 +21,6 @@ target/
 .test-store.log
 .interop.log
 deploy/nats/dev.conf
+
+# Written and removed by `make check-codegen`.
+.codegen-scratch/

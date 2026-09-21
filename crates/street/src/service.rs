@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use meridian_bus::Bus;
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     ListCustodialPositionsRequest, RecordHoldingRequest, RecordHoldingsStatementRequest,
 };
 use prost::Message;
@@ -188,7 +188,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use meridian_bus::{MemoryBackend, Subscription};
-    use meridian_pb::v1::{
+    use meridian_domain::v1::{
         CustodialPositionUpdatedEvent, Identifier as PbIdentifier, ListCustodialPositionsReply,
         RecordHoldingReply, RecordHoldingsStatementReply, StatementRecordedEvent,
     };

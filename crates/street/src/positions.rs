@@ -5,7 +5,7 @@
 //! answered together, because a view that answers only the first hides its own
 //! gaps, and the gap is the thing an operator needs to see.
 
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     ListCustodialPositionsReply, ListCustodialPositionsRequest, UnresolvedHolding,
 };
 
@@ -63,7 +63,7 @@ fn to_wire_unresolved(holding: &Holding) -> UnresolvedHolding {
 
 #[cfg(test)]
 mod tests {
-    use meridian_pb::v1::{
+    use meridian_domain::v1::{
         Identifier as PbIdentifier, RecordHoldingRequest, RecordHoldingsStatementRequest,
     };
 

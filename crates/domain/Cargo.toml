@@ -1,0 +1,10 @@
+[package]
+name = "meridian-domain"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The domain messages the runtime carries past its sidecar, generated from proto/"
+
+[dependencies]
+prost.workspace = true

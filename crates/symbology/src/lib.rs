@@ -15,7 +15,7 @@
 //! Owns no store and depends on nothing but the wire types, so depending on it
 //! says nothing about who may reach what.
 
-use meridian_pb::v1::Identifier as PbIdentifier;
+use meridian_domain::v1::Identifier as PbIdentifier;
 
 /// Global schemes, strongest first.
 ///

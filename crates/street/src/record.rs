@@ -6,7 +6,7 @@
 //! the other means a schema change reaches into the street store without passing
 //! anything that could object.
 
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     CustodialPositionUpdatedEvent, Identifier as PbIdentifier, RecordHoldingReply,
     RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
     StatementRecordedEvent,
@@ -177,8 +177,10 @@ pub(crate) fn to_wire_identifier(identifier: &Identifier) -> PbIdentifier {
     }
 }
 
-pub(crate) fn to_wire_position(position: &CustodialPosition) -> meridian_pb::v1::CustodialPosition {
-    meridian_pb::v1::CustodialPosition {
+pub(crate) fn to_wire_position(
+    position: &CustodialPosition,
+) -> meridian_domain::v1::CustodialPosition {
+    meridian_domain::v1::CustodialPosition {
         account_id: position.account_id.clone(),
         instrument_id: position.instrument_id.clone(),
         quantity_scaled_1e8: position.quantity.scaled(),

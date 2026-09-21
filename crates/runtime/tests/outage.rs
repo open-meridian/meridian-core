@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform};
-use meridian_instrument::{apply, resolve_identifier, PostgresStore};
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     Identifier as PbIdentifier, InstrumentRecord as PbInstrument, ResolveIdentifierRequest,
 };
+use meridian_instrument::{apply, resolve_identifier, PostgresStore};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {
@@ -47,7 +47,7 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
                 source: String::new(),
             }],
             asset_class: "EQUITY".into(),
-            lifecycle_state: meridian_pb::v1::InstrumentLifecycleState::Active as i32,
+            lifecycle_state: meridian_domain::v1::InstrumentLifecycleState::Active as i32,
             version: 1,
             valid_from_ns: stamp,
             record_time_ns: stamp,

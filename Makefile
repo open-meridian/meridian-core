@@ -7,10 +7,12 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        interop lint fmt lock contract-diff up down demo network
+        interop lint fmt lock contract-diff up down demo network codegen check-codegen
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
+	@echo "  make codegen        regenerate the domain bindings from proto/"
+	@echo "  make check-codegen  fail if crates/domain/src/v1.rs is stale against proto/"
 	@echo "  make build          compile the workspace"
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
@@ -26,7 +28,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions build test test-store test-broker interop chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen build test test-store test-broker interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -80,6 +82,37 @@ check-local-storage:
 contract-diff:
 	@$(PY) tools/check_contract_diff.py --self-test
 	@$(PY) tools/check_contract_diff.py --repo-root .
+
+DOMAIN_RS := crates/domain/src/v1.rs
+SCRATCH   := .codegen-scratch
+
+# Regenerate in place. The only sanctioned way to change $(DOMAIN_RS).
+codegen:
+	@rm -rf $(SCRATCH)
+	@$(DOCKER) build -f Dockerfile.codegen --target export \
+		--output type=local,dest=$(SCRATCH) .
+	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && rm -rf $(SCRATCH)
+	@echo "codegen: wrote $(DOMAIN_RS)"
+
+# Generate into a scratch directory and compare. A vendored file that does not
+# match a fresh generation is a stale checkout or a hand-edit, and both are the
+# same bug: the runtime building against types proto/ does not describe.
+check-codegen:
+	@rm -rf $(SCRATCH)
+	@$(DOCKER) build -f Dockerfile.codegen --target export \
+		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
+		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
+	@if diff -q $(DOMAIN_RS) $(SCRATCH)/v1.rs >/dev/null 2>&1; then \
+		rm -rf $(SCRATCH); \
+		echo "check-codegen OK: $(DOMAIN_RS) matches a fresh generation"; \
+	else \
+		echo "check-codegen FAILED: $(DOMAIN_RS) is stale or hand-edited" >&2; \
+		diff $(DOMAIN_RS) $(SCRATCH)/v1.rs | head -40 >&2; \
+		rm -rf $(SCRATCH); \
+		echo >&2; \
+		echo "Run 'make codegen' and commit the result. Never edit $(DOMAIN_RS) by hand." >&2; \
+		exit 1; \
+	fi
 
 build:
 	@$(DOCKER) build -f Dockerfile.rust --target check . >/dev/null 2>&1 \
@@ -280,14 +313,18 @@ down:
 # does: the platform is not contacted at startup, and this check never reaches
 # it. The role and the grants come from compose and the mounted example table,
 # so what the SDK is held to here is the file a deployment actually ships.
+#
+# The SDK's image is handed this working tree's proto/ as its core-proto build
+# context, in place of the core commit the SDK pins, so the domain messages its
+# tests encode are the ones this runtime was built from.
 SDK ?= ../meridian-python
 
 interop: network
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(DOCKER) build -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm -T street meridian-street migrate >/dev/null 2>&1 \

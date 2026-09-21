@@ -7,7 +7,7 @@ license.workspace = true
 description = "The deployment's end of the link to the platform: the key, the connection, and what it carries"
 
 [dependencies]
-meridian-pb.workspace = true
+meridian-domain.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-symbology = { path = "../symbology" }
 prost.workspace = true

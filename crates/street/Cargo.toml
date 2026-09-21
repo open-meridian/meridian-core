@@ -7,7 +7,7 @@ license.workspace = true
 description = "The deployment's street store: holdings statements, holdings and positions"
 
 [dependencies]
-meridian-pb.workspace = true
+meridian-domain.workspace = true
 meridian-bus = { path = "../bus" }
 prost.workspace = true
 thiserror.workspace = true

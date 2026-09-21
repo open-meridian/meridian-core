@@ -1,0 +1,551 @@
+// Who may act on the platform, and on what.
+//
+// Derived from workflow W5 (platform accounts and access). Every message here
+// traces to a matrix row; see matrix/matrix.tsv.
+//
+// The governing idea: the identity provider proves a person controls an account
+// and answers nothing else. Nothing in this file carries a role, a group or an
+// organisation claim taken from a token, because no authorisation decision is
+// permitted to read one. v1 recorded what that costs when it is not enforced.
+//
+// Two shapes that look similar are deliberately not the same. A membership is
+// always scoped to an organisation. A staff grant never is. Merging them would
+// make the most dangerous privilege in the system a row in the same table as the
+// most ordinary one, distinguished by a blank column.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vocabulary
+// ─────────────────────────────────────────────────────────────────────────────
+
+// What a person may do inside one organisation.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+
+  // Administers the organisation, including its membership. An organisation
+  // always has at least one, and the last one cannot be removed.
+  ROLE_OWNER = 1;
+
+  // Administers deployments and keys, not membership.
+  ROLE_ADMIN = 2;
+
+  // Reads.
+  ROLE_MEMBER = 3;
+}
+
+// What an Open Meridian employee may do across organisations.
+//
+// Deliberately short. Each value here is authority nobody in a customer
+// organisation granted, so the list is the argument for its own size.
+enum StaffCapability {
+  STAFF_CAPABILITY_UNSPECIFIED = 0;
+
+  // Maintain the security master: the five instrument operations of W1.
+  STAFF_CAPABILITY_ADMINISTER_SECURITY_MASTER = 1;
+
+  // Grant the owner role on a customer organisation to a named person, for a
+  // customer who has lost access and cannot restore it themselves. Adds only;
+  // see W5.7 for what it deliberately cannot do.
+  STAFF_CAPABILITY_RESTORE_ORGANISATION_OWNER = 2;
+
+  // Grant and revoke staff capabilities.
+  STAFF_CAPABILITY_ADMINISTER_STAFF = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.2 — organisations
+// ─────────────────────────────────────────────────────────────────────────────
+
+message CreateOrganisationRequest {
+  // Display name. Not an identifier: two organisations may share one, and the
+  // platform never resolves anything by it.
+  string name = 1;
+}
+
+message OrganisationRecord {
+  string organisation_id = 1;
+  string name = 2;
+
+  // Stamped by the store. A caller cannot supply or back-date it.
+  int64 created_at_ns = 3;
+
+  // Whether this organisation may delete a deployment rather than only retire
+  // one. Set by staff, per W5.13, and not by the organisation: a control the
+  // controlled party can switch off is not a control, and a deployment's key
+  // history is partly how anybody answers what its signatures were made with.
+  //
+  // False by default, so an organisation nobody has considered may retire and
+  // not delete.
+  bool may_delete_deployments = 4;
+
+  // W5.17 and W5.18. Closed, not removed: members, deployments and their key
+  // history are kept, because what a deployment signed still has to be
+  // answerable after the organisation that ran it has gone.
+  OrganisationState state = 5;
+
+  // Stamped by the store at W5.17, and cleared by W5.18.
+  int64 closed_at_ns = 6;
+  string closed_by_person_id = 7;
+
+  // The most recent reopening, kept after the organisation is closed again so
+  // the last reason anybody gave for bringing it back is not lost.
+  int64 reopened_at_ns = 8;
+  string reopened_by_person_id = 9;
+  string reopen_reason = 10;
+}
+
+// Whether an organisation is open for business.
+//
+// A state rather than an absence, for the reason DeploymentState is one: the
+// identifier is the subject of records that outlive it.
+enum OrganisationState {
+  ORGANISATION_STATE_UNSPECIFIED = 0;
+  ORGANISATION_STATE_ACTIVE = 1;
+
+  // Absent from every member's view, with no pending invitation left open.
+  // Only staff can see it, and only staff can reopen it.
+  ORGANISATION_STATE_CLOSED = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.3 — membership
+// ─────────────────────────────────────────────────────────────────────────────
+
+message AddMemberRequest {
+  string organisation_id = 1;
+
+  // Must already be a person on the platform, meaning they have signed in at
+  // least once. Membership never conjures an identity from an address.
+  string person_id = 2;
+
+  Role role = 3;
+}
+
+message MembershipRecord {
+  string membership_id = 1;
+  string organisation_id = 2;
+  string person_id = 3;
+  Role role = 4;
+  int64 created_at_ns = 5;
+
+  // Who made this membership exist. A restoration performed by staff and a
+  // grant made by an owner are both memberships, and only this tells them
+  // apart afterwards.
+  string granted_by_person_id = 6;
+}
+
+message RemoveMemberRequest {
+  string organisation_id = 1;
+  string person_id = 2;
+}
+
+message RemoveMemberReply {
+  // False when the person held no membership. Removal is idempotent; asking
+  // twice is not an error.
+  bool removed = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.14, W5.15, W5.16 — inviting somebody to hold staff authority
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// W5.6 grants to a person identifier, which the intended holder cannot see and
+// cannot tell anybody, so reading it out of the database was the procedure.
+// Same shape the organisations had before W5.8, and worse here: what is handed
+// over spans every organisation.
+//
+// Its own messages rather than a variant of the organisation's. One carries a
+// capability and no organisation, the other a role and no organisation-free
+// case; merged they would be told apart by a blank, which is the reasoning that
+// already keeps StaffGrant and Membership apart.
+
+message InviteStaffRequest {
+  // Where it is sent, and the address the accepting identity must carry.
+  string email = 1;
+
+  // Fixed here rather than chosen at acceptance, so an invitation that reaches
+  // the wrong hands cannot ask for a larger capability than was offered.
+  StaffCapability capability = 2;
+}
+
+message StaffInvitationRecord {
+  string invitation_id = 1;
+  string email = 2;
+  StaffCapability capability = 3;
+
+  InvitationState state = 4;
+  InvitationDelivery delivery = 5;
+  string delivery_detail = 6;
+
+  int64 created_at_ns = 7;
+
+  // Shorter-lived than an organisation's. Both are standing capabilities
+  // sitting in a mailbox, and this one is authority over every organisation on
+  // the platform.
+  int64 expires_at_ns = 8;
+
+  string invited_by_person_id = 9;
+}
+
+message AcceptStaffInvitationRequest {
+  // Nothing but the invitation. The address is read from the verified identity
+  // signing in, because an address a caller states about itself decides
+  // nothing.
+  string invitation_id = 1;
+}
+
+message WithdrawStaffInvitationRequest {
+  string invitation_id = 1;
+}
+
+message WithdrawStaffInvitationReply {
+  // False when it was not pending. Idempotent, and asking twice is not an
+  // error.
+  bool withdrawn = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.19 — what a deployment is running
+// ─────────────────────────────────────────────────────────────────────────────
+
+// How a component says it is.
+//
+// Reported by the component rather than inferred centrally: a quiet connection
+// and a stopped component look alike from the platform, and guessing produces
+// a page that reads as fact and is not.
+enum ComponentHealth {
+  COMPONENT_HEALTH_UNSPECIFIED = 0;
+  COMPONENT_HEALTH_SERVING = 1;
+
+  // Running and not doing its whole job: a replica that cannot reach the
+  // platform still answers from what it holds.
+  COMPONENT_HEALTH_DEGRADED = 2;
+
+  // Running and unable to serve. A component that cannot say this is one whose
+  // absence has to be guessed at.
+  COMPONENT_HEALTH_STOPPING = 3;
+}
+
+// One component of a deployment, as it describes itself.
+//
+// About the software and never about the business. What it processed, for
+// whom, and every identifier it touched are absent by design, and no field
+// here may grow to carry them: content leaves a deployment only in a bundle
+// its administrator sends deliberately.
+message ComponentReport {
+  // Stable across restarts and versions, e.g. "ledger", "replica", "sidecar".
+  // What the administrator sees as a row.
+  string component = 1;
+
+  // What is running. An image tag or a commit, whatever the release names
+  // itself; the platform compares it and does not parse it.
+  string version = 2;
+
+  // The schema version this component requires, so a database mid-upgrade is
+  // visible centrally rather than only in a pod's logs. Zero when a component
+  // owns no schema.
+  int64 schema_version = 3;
+
+  ComponentHealth health = 4;
+
+  // One sentence, for a health that needs explaining. Never a stack trace and
+  // never a payload.
+  string detail = 5;
+
+  // When this component last started, so "restarting repeatedly" is visible as
+  // a fact rather than as an inference from a report arriving twice.
+  int64 started_at_ns = 6;
+}
+
+message ReportDeploymentComponentsRequest {
+  // Which deployment, taken from the assertion rather than this field, which
+  // exists so a report is self-describing in a log. The platform reads the
+  // assertion.
+  string deployment_id = 1;
+
+  repeated ComponentReport components = 2;
+}
+
+message ReportDeploymentComponentsReply {
+  // What the platform now believes, so a component can tell a report that
+  // landed from one that was refused without asking again.
+  int64 recorded_at_ns = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.17, W5.18 — closing an organisation, and reopening it
+// ─────────────────────────────────────────────────────────────────────────────
+
+message CloseOrganisationRequest {
+  // Refused while any of the organisation's deployments is in service. Closing
+  // is never how a running environment gets cut off; retiring it is, and it is
+  // done first and on purpose.
+  string organisation_id = 1;
+}
+
+message ReopenOrganisationRequest {
+  string organisation_id = 1;
+
+  // Required. Staff only, under RESTORE_ORGANISATION_OWNER, and not the owner:
+  // an account compromised badly enough to close an organisation should not be
+  // the one that can quietly bring it back.
+  string reason = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.11, W5.12, W5.13 — taking a deployment out of service
+// ─────────────────────────────────────────────────────────────────────────────
+
+message RetireDeploymentRequest {
+  string deployment_id = 1;
+}
+
+message ReturnDeploymentToServiceRequest {
+  // Returning does not restore the keys and cannot: revoking them is what made
+  // the retirement real. The deployment registers new ones. What coming back
+  // preserves is the identifier, which is the subject of every assertion it
+  // signed, and is why this is not delete and register again.
+  string deployment_id = 1;
+}
+
+message DeleteDeploymentRequest {
+  string deployment_id = 1;
+}
+
+message DeleteDeploymentReply {
+  // False when there was nothing to delete. Deleting is idempotent; asking
+  // twice is not an error.
+  bool deleted = 1;
+}
+
+message SetOrganisationDeletionPolicyRequest {
+  string organisation_id = 1;
+
+  // Staff only, per W5.13. Turning this on does not delete anything and does
+  // not delete on the customer's behalf: it decides whether the operation
+  // exists for that organisation, and the customer decides when their own
+  // environment goes.
+  bool may_delete_deployments = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.8, W5.9, W5.10 — joining an organisation
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// W5.3 takes a person identifier, and a person has one only after signing in,
+// so an owner adding a colleague would need an internal identifier for somebody
+// who may not exist yet. These are how somebody arrives in the first place.
+
+// What state an invitation is in. Refusals read better for naming which one.
+enum InvitationState {
+  INVITATION_STATE_UNSPECIFIED = 0;
+  INVITATION_STATE_PENDING = 1;
+  INVITATION_STATE_ACCEPTED = 2;
+  INVITATION_STATE_REVOKED = 3;
+
+  // Reached by time rather than by anybody acting, which is why it is a state
+  // and not an absence: an owner looking at a list needs to see that one ran
+  // out rather than find it silently gone.
+  INVITATION_STATE_EXPIRED = 4;
+}
+
+// Whether the message carrying an invitation actually left.
+//
+// Separate from the invitation's own state, because they answer different
+// questions and conflating them hides the case that matters. An invitation can
+// be perfectly pending and have reached nobody, and to an owner waiting for
+// somebody to arrive that looks exactly like a colleague who has not got round
+// to it. Only one of those is theirs to chase.
+enum InvitationDelivery {
+  INVITATION_DELIVERY_UNSPECIFIED = 0;
+  INVITATION_DELIVERY_SENT = 1;
+
+  // Handed to nothing yet. The invitation exists and the message has not been
+  // attempted, which is a real intermediate state and not an error.
+  INVITATION_DELIVERY_PENDING = 2;
+
+  // Attempted and refused. `delivery_detail` carries what the sender said, for
+  // an owner deciding whether the address was wrong or the service was down.
+  INVITATION_DELIVERY_FAILED = 3;
+}
+
+message InviteMemberRequest {
+  string organisation_id = 1;
+
+  // Where the invitation is sent, and the address the accepting identity has to
+  // carry. Delivery and identity at once, which is what makes a forwarded
+  // invitation useless to whoever received it.
+  string email = 2;
+
+  // Fixed here rather than chosen at acceptance, so an invitation that reaches
+  // the wrong hands cannot be used to ask for a larger role than was offered.
+  Role role = 3;
+}
+
+message InvitationRecord {
+  string invitation_id = 1;
+  string organisation_id = 2;
+  string email = 3;
+  Role role = 4;
+
+  InvitationState state = 5;
+  InvitationDelivery delivery = 6;
+
+  // What the sending service said when it refused. Empty otherwise.
+  string delivery_detail = 7;
+
+  int64 created_at_ns = 8;
+
+  // An invitation is a standing capability sitting in somebody else's mailbox,
+  // so it stops being one on its own rather than only when somebody remembers.
+  int64 expires_at_ns = 9;
+
+  string invited_by_person_id = 10;
+}
+
+message AcceptInvitationRequest {
+  // The invitation being taken up. Nothing else is carried: the address is not
+  // supplied by the caller but read from the verified identity signing in,
+  // because an address a caller states about itself decides nothing.
+  string invitation_id = 1;
+}
+
+message RevokeInvitationRequest {
+  string organisation_id = 1;
+  string invitation_id = 2;
+}
+
+message RevokeInvitationReply {
+  // False when it was not pending: already accepted, already revoked, or run
+  // out. Revoking is idempotent, and asking twice is not an error.
+  bool revoked = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.4, W5.5 — deployments and their keys
+// ─────────────────────────────────────────────────────────────────────────────
+
+message RegisterDeploymentRequest {
+  string organisation_id = 1;
+
+  // Operator-chosen, for telling one deployment from another on a screen.
+  string name = 2;
+}
+
+// Whether a deployment is in service.
+//
+// A state rather than an absence, because an identifier that has signed
+// assertions does not stop having done so. The security master reached the same
+// conclusion for instruments: decommissioned, not removed.
+enum DeploymentState {
+  DEPLOYMENT_STATE_UNSPECIFIED = 0;
+  DEPLOYMENT_STATE_IN_SERVICE = 1;
+
+  // Out of service and holding no keys, because retiring revokes them. A
+  // retired deployment that could still present a key that verified would be a
+  // label on a thing that kept working.
+  DEPLOYMENT_STATE_RETIRED = 2;
+}
+
+message DeploymentRecord {
+  string deployment_id = 1;
+  string organisation_id = 2;
+  string name = 3;
+  int64 created_at_ns = 4;
+
+  // When this deployment last presented a valid assertion. Zero means never.
+  // Recorded so an operator can tell a deployment that is quiet from one that
+  // was never wired up.
+  int64 last_seen_at_ns = 5;
+
+  // Retired and quiet are different things, and this is the difference. Without
+  // it a decommissioned environment reads on a page exactly like one nobody has
+  // started lately.
+  DeploymentState state = 6;
+
+  // Zero while in service.
+  int64 retired_at_ns = 7;
+}
+
+message RegisterDeploymentKeyRequest {
+  string deployment_id = 1;
+
+  // The public half only. The deployment generated the pair and keeps the
+  // private half; the platform never receives it and could not store it if
+  // offered. A dump of this table lets an attacker verify signatures and forge
+  // none.
+  string public_key_pem = 2;
+
+  // Operator-chosen, so a key can be named in a rotation rather than
+  // identified by fingerprint alone.
+  string label = 3;
+}
+
+message DeploymentKeyRecord {
+  string key_id = 1;
+  string deployment_id = 2;
+  string label = 3;
+
+  // Of the public key, so the operator can confirm the deployment holds the
+  // pair they think it does.
+  string fingerprint = 4;
+
+  int64 created_at_ns = 5;
+}
+
+message RevokeDeploymentKeyRequest {
+  string deployment_id = 1;
+  string key_id = 2;
+}
+
+message RevokeDeploymentKeyReply {
+  // Revocation takes effect on the next request. There is no token to expire
+  // and no cache to drain, which is the reason this contract has no token
+  // endpoint at all.
+  bool revoked = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.6, W5.7 — staff authority
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GrantStaffCapabilityRequest {
+  string person_id = 1;
+  StaffCapability capability = 2;
+}
+
+// Note what is absent: an organisation. A grant scoped to one would be a
+// membership, and this is the other kind.
+message StaffGrantRecord {
+  string grant_id = 1;
+  string person_id = 2;
+  StaffCapability capability = 3;
+  int64 created_at_ns = 4;
+  string granted_by_person_id = 5;
+}
+
+message RevokeStaffCapabilityRequest {
+  string grant_id = 1;
+}
+
+message RevokeStaffCapabilityReply {
+  bool revoked = 1;
+}
+
+message RestoreOrganisationOwnerRequest {
+  string organisation_id = 1;
+
+  // Must already be a person on the platform, and must not be the employee
+  // making the request. Both are refusals rather than warnings: the first stops
+  // an owner being conjured from an address, the second removes the
+  // single-actor path to taking control of a customer's account.
+  string person_id = 2;
+
+  // Why, in the employee's own words. Recorded and sent to the organisation's
+  // existing owners, because a restoration nobody hears about is
+  // indistinguishable from a quiet takeover.
+  string reason = 3;
+}

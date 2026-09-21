@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
     MissReason, MissingInstrumentDetectedEvent,
 };
@@ -650,7 +650,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
     }
 
     let lifecycle_state =
-        meridian_pb::v1::InstrumentLifecycleState::from_str_name(&record.lifecycle_state)
+        meridian_domain::v1::InstrumentLifecycleState::from_str_name(&record.lifecycle_state)
             .ok_or_else(|| {
                 PlatformError::Malformed(format!(
                     "{} arrived in lifecycle state {:?}, which the schema does not define",
@@ -1297,7 +1297,7 @@ pub(crate) mod tests {
                 assert_eq!(record.instrument_id, "LCL-01J8");
                 assert_eq!(
                     record.lifecycle_state,
-                    meridian_pb::v1::InstrumentLifecycleState::Define as i32
+                    meridian_domain::v1::InstrumentLifecycleState::Define as i32
                 );
             }
             other => panic!("expected a mint, got {other:?}"),

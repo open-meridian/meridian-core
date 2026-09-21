@@ -7,7 +7,7 @@ license.workspace = true
 description = "The deployment's instrument store: resolve, apply, and answer what an instrument is"
 
 [dependencies]
-meridian-pb.workspace = true
+meridian-domain.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-symbology = { path = "../symbology" }
 prost.workspace = true

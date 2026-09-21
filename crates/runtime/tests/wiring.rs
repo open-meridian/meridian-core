@@ -13,12 +13,13 @@
 use std::sync::Arc;
 
 use meridian_bus::{Bus, MemoryBackend};
-use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{
-    CallRequest, ListCustodialPositionsReply, ListCustodialPositionsRequest, RecordHoldingReply,
+use meridian_domain::v1::{
+    ListCustodialPositionsReply, ListCustodialPositionsRequest, RecordHoldingReply,
     RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
-    RegisterRequest, ResolveIdentifierReply, ResolveIdentifierRequest,
+    ResolveIdentifierReply, ResolveIdentifierRequest,
 };
+use meridian_pb::v1::sidecar_service_server::SidecarService;
+use meridian_pb::v1::{CallRequest, RegisterRequest};
 use meridian_sidecar::{GrantTable, Identity, Sidecar};
 use prost::Message;
 use tonic::Request;

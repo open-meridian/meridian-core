@@ -1,0 +1,14 @@
+[package]
+name = "meridian-codegen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Pinned exactly, and to the same version meridian-schema generates with, so the
+# domain bindings and the plugin-facing ones come from one code generator. The
+# output is vendored and reviewed; a patch bump that reformats it would show up
+# as unexplained churn in a diff.
+[dependencies]
+tonic-build = "=0.13.1"
+
+[workspace]

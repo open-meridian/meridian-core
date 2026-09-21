@@ -18,7 +18,7 @@
 //! current" from "nobody checked". The first is a healthy store confirming
 //! itself; the second is a connection that stopped working.
 
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentRecord as PbInstrument,
 };
 
@@ -127,14 +127,14 @@ pub(crate) fn to_wire(instrument: &Instrument) -> PbInstrument {
 }
 
 fn lifecycle_value(name: &str) -> i32 {
-    meridian_pb::v1::InstrumentLifecycleState::from_str_name(name)
-        .unwrap_or(meridian_pb::v1::InstrumentLifecycleState::Unspecified) as i32
+    meridian_domain::v1::InstrumentLifecycleState::from_str_name(name)
+        .unwrap_or(meridian_domain::v1::InstrumentLifecycleState::Unspecified) as i32
 }
 
 fn lifecycle_name(value: i32) -> String {
-    match meridian_pb::v1::InstrumentLifecycleState::try_from(value) {
+    match meridian_domain::v1::InstrumentLifecycleState::try_from(value) {
         Ok(state) => state.as_str_name().to_string(),
-        Err(_) => meridian_pb::v1::InstrumentLifecycleState::Unspecified
+        Err(_) => meridian_domain::v1::InstrumentLifecycleState::Unspecified
             .as_str_name()
             .to_string(),
     }
@@ -157,7 +157,7 @@ mod tests {
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "Apple Inc. common stock".into(),
-            lifecycle_state: meridian_pb::v1::InstrumentLifecycleState::Active as i32,
+            lifecycle_state: meridian_domain::v1::InstrumentLifecycleState::Active as i32,
             version,
             valid_from_ns: 1_757_376_000_000_000_000,
             record_time_ns: 1_757_376_000_000_000_000,

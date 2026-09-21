@@ -14,12 +14,12 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform, Reaction};
-use meridian_instrument::store::Store;
-use meridian_instrument::{resolve_identifier, PostgresStore};
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent,
     ResolveIdentifierRequest,
 };
+use meridian_instrument::store::Store;
+use meridian_instrument::{resolve_identifier, PostgresStore};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -134,7 +134,7 @@ fn a_miss_the_platform_does_not_know_is_minted_applied_and_resolvable() {
     );
     assert_eq!(
         record.lifecycle_state,
-        meridian_pb::v1::InstrumentLifecycleState::Define as i32,
+        meridian_domain::v1::InstrumentLifecycleState::Define as i32,
         "a stub arrives in DEFINE, awaiting an administrator"
     );
 

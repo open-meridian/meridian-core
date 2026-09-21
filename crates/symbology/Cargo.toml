@@ -7,4 +7,4 @@ license.workspace = true
 description = "The identifier fallback order, in one place because two components must agree on it"
 
 [dependencies]
-meridian-pb.workspace = true
+meridian-domain.workspace = true

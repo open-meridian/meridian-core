@@ -40,7 +40,7 @@
 //! cannot answer for its previous holder. A safe failure, and still a gap.
 //! `design/replica-holds-one-version` owns closing it.
 
-use meridian_pb::v1::{
+use meridian_domain::v1::{
     Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent, ResolveIdentifierReply,
     ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
 };
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(record.description, "Apple Inc. common stock");
         assert_eq!(
             record.lifecycle_state,
-            meridian_pb::v1::InstrumentLifecycleState::Active as i32
+            meridian_domain::v1::InstrumentLifecycleState::Active as i32
         );
     }
 

@@ -111,11 +111,11 @@ pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schem
     let version = var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
 
     loop {
-        let report = meridian_pb::v1::ComponentReport {
+        let report = meridian_domain::v1::ComponentReport {
             component: component.to_string(),
             version: version.clone(),
             schema_version: schema,
-            health: meridian_pb::v1::ComponentHealth::Serving as i32,
+            health: meridian_domain::v1::ComponentHealth::Serving as i32,
             detail: String::new(),
             started_at_ns,
         };
@@ -156,7 +156,7 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
     tokio::spawn(async move {
         while let Some(delivery) = inward.recv().await {
             let Ok(report) =
-                meridian_pb::v1::ComponentReport::decode(&delivery.envelope.payload[..])
+                meridian_domain::v1::ComponentReport::decode(&delivery.envelope.payload[..])
             else {
                 tracing::warn!("a component report did not decode");
                 continue;
