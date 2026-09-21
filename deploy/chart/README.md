@@ -59,3 +59,58 @@ is the whole list, and the omissions are deliberate: no region, no instance
 list, no failover order. The platform is allowed to grow, move and be redirected
 without anything here changing or restarting, which is only true while nothing
 here describes its shape.
+
+## The dashboard, and a bundled Zitadel
+
+The dashboard is off until you set `dashboard.enabled=true` and `dashboard.url`,
+the address your staff reach it at. It signs people in through a directory over
+OpenID Connect: point `dashboard.oidc` at the one your firm already runs.
+
+A firm with no directory, or one whose directory speaks only SAML or LDAP, can
+have the chart run Zitadel beside the deployment instead, with
+`identity.bundled.enabled=true`. It is Zitadel's own chart, vendored under
+`charts/` at 10.0.6, plus a group hook that carries directory groups into the
+dashboard's token and a setup Job that configures Zitadel for the dashboard.
+It needs four things from you:
+
+1. **Its version**, in both `zitadel.image.tag` and `zitadel.login.image.tag`.
+   The chart has no default and never changes it: a Meridian upgrade that needs
+   a newer Zitadel refuses to render and names the version, rather than
+   upgrading it.
+2. **Its public host**, `zitadel.zitadel.configmapConfig.ExternalDomain`. The
+   dashboard's issuer is `https://` that host.
+3. **Its own database and login role**, which you make, and a Secret named
+   `meridian-zitadel-database` with key `dsn` holding a connection string for
+   that role. Zitadel's own init job is off, so it never holds your Postgres
+   superuser.
+4. **Where it may connect**, `identity.bundled.egress.allowCidrs`: its database,
+   and your LDAP directory if any. A NetworkPolicy allows those, the group hook
+   and DNS, and nothing else -- which is what makes it safe that Zitadel's
+   webhook deny list is narrowed so it can reach the hook.
+
+The chart makes Zitadel's master key once, in `meridian-zitadel-masterkey`, and
+never regenerates it; it survives `helm uninstall`. **Back it up apart from the
+database**: without it, the directory credentials and signing keys in Zitadel's
+database cannot be read.
+
+The setup Job runs after every install and upgrade. It alone holds Zitadel's
+admin token, and it may read and update two Secrets -- the dashboard's client,
+and the hook's signing keys -- and nothing else. It is idempotent: a second run
+changes nothing.
+
+### Upgrading Zitadel
+
+Only when you choose to, by changing both tags:
+
+1. Back up Zitadel's database. Its schema step is one-way; going back means
+   restoring this backup.
+2. Set `zitadel.image.tag` and `zitadel.login.image.tag` to the new version,
+   and `helm upgrade`.
+
+Its database, master key, people, groups and directory connections carry over,
+and nothing else restarts. People already signed in to the dashboard stay signed
+in, because sessions live in the dashboard; only new sign-ins wait while
+Zitadel rolls.
+
+Zitadel's chart also uses `alpine/k8s` (to write its admin token into a Secret)
+and `wait4x` (to wait for the database), at the versions its own chart pins.

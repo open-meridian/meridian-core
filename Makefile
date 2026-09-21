@@ -285,7 +285,28 @@ chart-check:
 			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \
 		fi; \
 	done
-	@echo "chart-check OK: four components and the dashboard, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
+	@bundled="--set dashboard.enabled=true --set dashboard.url=https://meridian.example \
+		--set identity.bundled.enabled=true --set zitadel.image.tag=v4.17.3 --set zitadel.login.image.tag=v4.17.3 \
+		--set zitadel.zitadel.configmapConfig.ExternalDomain=id.example --set identity.bundled.egress.allowCidrs={10.0.0.0/8}"; \
+	rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) $$bundled 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render with the bundled Zitadel on" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q "runAsUser" \
+		&& { echo "chart-check FAILED: the bundled Zitadel pins a uid" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '"meridian-group-hook", "setup"' \
+		|| { echo "chart-check FAILED: the bundled Zitadel has no setup Job" >&2; exit 1; }; \
+	role="$$(echo "$$rendered" | awk '/^kind: Role$$/{r=1} r&&/^---/{r=0} r' | grep -A14 'name: check-meridian-runtime-identity-setup' )"; \
+	echo "$$role" | grep -q 'resourceNames: \["check-meridian-runtime-dashboard-oidc", "check-meridian-runtime-group-hook"\]' \
+		|| { echo "chart-check FAILED: the setup Job's Role is not limited to its two Secrets" >&2; exit 1; }; \
+	echo "$$role" | grep -qE 'verbs:.*(create|list|watch|delete|\*)' \
+		&& { echo "chart-check FAILED: the setup Job may do more than read and update its two Secrets" >&2; exit 1; }; \
+	for refused in "zitadel.image.tag=" "zitadel.login.image.tag=v4.17.4" "zitadel.image.tag=v4.15.3" \
+		"zitadel.zitadel.configmapConfig.ExternalDomain=" "dashboard.enabled=false" "identity.bundled.egress.allowCidrs=null" \
+		"identity.bundled.ldap.enabled=true"; do \
+		if $(HELM) template check deploy/chart $(CHART_VALUES) $$bundled --set $$refused >/dev/null 2>&1; then \
+			echo "chart-check FAILED: the bundled Zitadel rendered with $$refused" >&2; exit 1; \
+		fi; \
+	done
+	@echo "chart-check OK: four components, the dashboard and the bundled Zitadel, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

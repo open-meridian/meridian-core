@@ -66,6 +66,25 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.broker.existingSecret }}
                   key: {{ .Values.dashboard.brokerKey | default .Values.dashboard.instanceId }}
+            {{- if .Values.identity.bundled.enabled }}
+            {{- $oidc := printf "%s-dashboard-oidc" (include "meridian-runtime.fullname" .) }}
+            # The bundled Zitadel: its public address is the issuer, and the
+            # client and the audience it adds come from its setup Job.
+            - name: MERIDIAN_OIDC_ISSUER
+              value: {{ printf "https://%s" .Values.zitadel.zitadel.configmapConfig.ExternalDomain | quote }}
+            - name: MERIDIAN_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oidc }}
+                  key: client-id
+            - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oidc }}
+                  key: trusted-audiences
+            - name: MERIDIAN_OIDC_GROUPS_CLAIM
+              value: groups
+            {{- else }}
             {{- with .Values.dashboard.oidc }}
             {{- if .issuer }}
             - name: MERIDIAN_OIDC_ISSUER
@@ -84,6 +103,7 @@ spec:
                 secretKeyRef:
                   name: {{ .existingSecret }}
                   key: {{ .secretKey | default "client-secret" }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- end }}

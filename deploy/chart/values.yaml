@@ -160,6 +160,92 @@ dashboard:
     # project the client belongs to, which it adds to every token.
     trustedAudiences: []
 
+# A bundled Zitadel, for a firm with no directory of its own or one that speaks
+# only SAML or LDAP (spec, rulings 9, 10, 14 to 16). Off by default: most firms
+# point dashboard.oidc at the directory they already run.
+#
+# Turning it on needs, from you:
+#   - zitadel.image.tag and zitadel.login.image.tag: the Zitadel version, the
+#     same in both. Yours to set and yours to change; a Meridian upgrade never
+#     changes it, and refuses to render when it needs a newer one.
+#   - zitadel.zitadel.configmapConfig.ExternalDomain: Zitadel's public host.
+#   - a Secret named meridian-zitadel-database, key `dsn`: a Postgres
+#     connection string for a database and login role you made for Zitadel.
+#     Zitadel never holds your Postgres superuser.
+#   - identity.bundled.egress.allowCidrs: where Zitadel may connect besides the
+#     group hook and DNS -- its database, and the LDAP directory if any.
+identity:
+  bundled:
+    enabled: false
+    # Roles on the dashboard's Zitadel project, standing in for groups for
+    # people you make in Zitadel itself.
+    roles: []
+    # A directory Zitadel brokers over LDAP. Automatic update is always on and
+    # memberOf always mapped: without either, a removed group lingers.
+    ldap:
+      enabled: false
+      name: Directory
+      servers: []            # ldaps://ldap.firm.example:636
+      startTls: false
+      baseDn: ""
+      bindDn: ""
+      # A Secret holding the bind password.
+      bindPasswordSecret: ""
+      bindPasswordKey: password
+      userObjectClass: inetOrgPerson
+      userFilter: uid
+    # SAML attribute names the group hook reads, when SAML is brokered.
+    saml:
+      groupsAttribute: groups
+      usernameAttribute: uid
+      givenNameAttribute: givenName
+      familyNameAttribute: sn
+      emailAttribute: email
+    egress:
+      allowCidrs: []
+
+# The bundled Zitadel's own chart. Only what Meridian needs is set here; any of
+# Zitadel's chart values may be added.
+zitadel:
+  image:
+    tag: ""
+  login:
+    image:
+      tag: ""
+  # Its database and role are yours to make; its init job would need your
+  # Postgres superuser to make them.
+  initJob:
+    enabled: false
+  # No pinned uid, so a platform assigning its own range may run it.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: null
+    fsGroup: null
+  securityContext:
+    runAsUser: null
+  env:
+    - name: ZITADEL_DATABASE_POSTGRES_DSN
+      valueFrom:
+        secretKeyRef:
+          name: meridian-zitadel-database
+          key: dsn
+    # Zitadel refuses webhook targets on private addresses, and the group hook
+    # is on one. Narrowed to link-local only; the NetworkPolicy on Zitadel's
+    # egress is what limits it back to the hook, its database and directory.
+    - name: ZITADEL_HTTPCLIENT_DENYLIST
+      value: "169.254.0.0/16"
+  zitadel:
+    # Made once by this chart and never regenerated: it encrypts the directory
+    # credentials and signing keys in Zitadel's database, which is unreadable
+    # in part without it. Back it up apart from the database.
+    masterkeySecretName: meridian-zitadel-masterkey
+    configmapConfig:
+      ExternalDomain: ""
+      ExternalPort: 443
+      ExternalSecure: true
+      TLS:
+        Enabled: false
+
 # The broker the components and sidecars meet on, per decision 010. One secret
 # holding one credential per identity, each mounted into that container alone:
 # a plugin can route to the broker and has nothing to present.

@@ -1,0 +1,333 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.identity.bundled.enabled }}
+{{/*
+  The bundled Zitadel's part of this chart (spec, rulings 14 to 16). Zitadel
+  itself is its own chart, a dependency; this is what Meridian adds around it:
+  the version check, the master key, the two Secrets the setup Job fills, the
+  Job and the only permissions it holds, the group hook, and the policies
+  saying who may reach what.
+*/}}
+{{- $minimum := "4.17.3" }}
+{{- $z := .Values.zitadel }}
+{{- $tag := $z.image.tag | default "" }}
+{{- if not $tag }}
+{{- fail "zitadel.image.tag is not set. The bundled Zitadel's version is yours to choose and to change; this chart never picks one for you (ruling 16)." }}
+{{- end }}
+{{- if ne $tag ($z.login.image.tag | default "") }}
+{{- fail (printf "zitadel.login.image.tag must equal zitadel.image.tag (%s): Zitadel and its login page are one version" $tag) }}
+{{- end }}
+{{- if not (semverCompare (printf ">=%s" $minimum) (trimPrefix "v" $tag)) }}
+{{- fail (printf "this Meridian release needs Zitadel %s or newer, and zitadel.image.tag is %s. It will not upgrade Zitadel for you: back up Zitadel's database, then set both tags to v%s or newer" $minimum $tag $minimum) }}
+{{- end }}
+{{- $domain := $z.zitadel.configmapConfig.ExternalDomain | default "" }}
+{{- if not $domain }}
+{{- fail "zitadel.zitadel.configmapConfig.ExternalDomain is not set: it is Zitadel's public host, and the dashboard's issuer" }}
+{{- end }}
+{{- if not .Values.dashboard.enabled }}
+{{- fail "identity.bundled.enabled needs dashboard.enabled: the bundled Zitadel exists to sign people in to the dashboard" }}
+{{- end }}
+{{- if not .Values.identity.bundled.egress.allowCidrs }}
+{{- fail "identity.bundled.egress.allowCidrs is empty. List where Zitadel may connect besides the group hook and DNS -- its database, and the LDAP directory if any -- or it can reach neither" }}
+{{- end }}
+{{- $ldap := .Values.identity.bundled.ldap }}
+{{- if and $ldap.enabled (or (not $ldap.servers) (not $ldap.baseDn) (not $ldap.bindDn) (not $ldap.bindPasswordSecret)) }}
+{{- fail "identity.bundled.ldap needs servers, baseDn, bindDn and bindPasswordSecret" }}
+{{- end }}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $zitadel := printf "%s-zitadel" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- $oidc := printf "%s-dashboard-oidc" $full }}
+{{- $hook := printf "%s-group-hook" $full }}
+{{- $masterkey := lookup "v1" "Secret" .Release.Namespace $z.zitadel.masterkeySecretName }}
+---
+# Made once and never regenerated: a new key would leave Zitadel's database
+# unreadable in part. Kept when the release is uninstalled.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $z.zitadel.masterkeySecretName }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  masterkey: {{ if $masterkey }}{{ index $masterkey.data "masterkey" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
+{{- range $name := list $oidc $hook }}
+{{- $existing := lookup "v1" "Secret" $.Release.Namespace $name }}
+---
+# Filled by the setup Job, which may update this and nothing else. Made here
+# because RBAC cannot narrow `create` to a name; rendered with what it
+# already holds, so an upgrade never empties it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+{{- if and $existing $existing.data }}
+data:
+  {{- toYaml $existing.data | nindent 2 }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $full }}-identity-setup
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# The setup Job's only permissions: read and update the two Secrets it fills.
+# Not create, not list, not any other Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $full }}-identity-setup
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $oidc | quote }}, {{ $hook | quote }}]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $full }}-identity-setup
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $full }}-identity-setup
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $full }}-identity-setup
+  apiGroup: rbac.authorization.k8s.io
+---
+# Sets Zitadel up for the dashboard after every install and upgrade,
+# idempotently. It alone holds Zitadel's admin token, for as long as it runs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $full }}-identity-setup
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: identity-setup
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $full }}-identity-setup
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: setup
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-group-hook", "setup"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_ZITADEL_API_URL
+              value: "http://{{ $zitadel }}:8080"
+            - name: MERIDIAN_ZITADEL_HOST
+              value: {{ $domain | quote }}
+            - name: MERIDIAN_ZITADEL_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $z.zitadel.configmapConfig.FirstInstance.Org.Machine.Machine.Username | default "iam-admin" }}-pat
+                  key: pat
+            - name: MERIDIAN_DASHBOARD_REDIRECT_URI
+              value: {{ printf "%s/callback" (trimSuffix "/" .Values.dashboard.url) | quote }}
+            - name: MERIDIAN_GROUP_HOOK_URL
+              value: "http://{{ $hook }}:8090"
+            - name: MERIDIAN_ZITADEL_ROLES
+              value: {{ join "," .Values.identity.bundled.roles | quote }}
+            {{- if $ldap.enabled }}
+            - name: MERIDIAN_LDAP_NAME
+              value: {{ $ldap.name | quote }}
+            - name: MERIDIAN_LDAP_SERVERS
+              value: {{ join "," $ldap.servers | quote }}
+            - name: MERIDIAN_LDAP_START_TLS
+              value: {{ $ldap.startTls | quote }}
+            - name: MERIDIAN_LDAP_BASE_DN
+              value: {{ $ldap.baseDn | quote }}
+            - name: MERIDIAN_LDAP_BIND_DN
+              value: {{ $ldap.bindDn | quote }}
+            - name: MERIDIAN_LDAP_BIND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap.bindPasswordSecret }}
+                  key: {{ $ldap.bindPasswordKey }}
+            - name: MERIDIAN_LDAP_USER_OBJECT_CLASS
+              value: {{ $ldap.userObjectClass | quote }}
+            - name: MERIDIAN_LDAP_USER_FILTER
+              value: {{ $ldap.userFilter | quote }}
+            {{- end }}
+            - name: MERIDIAN_SETUP_OUTPUT
+              value: "secrets:{{ $oidc }},{{ $hook }}"
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+---
+# The group hook: Zitadel's Actions v2 target. Holds its targets' signing
+# keys, reaches nothing, and is reached only by Zitadel.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $hook }}
+  labels:
+    meridian.dev/component: group-hook
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: group-hook
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: group-hook
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      containers:
+        - name: group-hook
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          args: ["meridian-group-hook"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            {{- range $key, $var := dict "intent-signing-key" "MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY" "token-signing-key" "MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY" "project-id" "MERIDIAN_GROUP_HOOK_PROJECT_ID" }}
+            - name: {{ $var }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $hook }}
+                  key: {{ $key }}
+            {{- end }}
+            - name: MERIDIAN_SAML_GROUPS_ATTRIBUTE
+              value: {{ .Values.identity.bundled.saml.groupsAttribute | quote }}
+            - name: MERIDIAN_SAML_USERNAME_ATTRIBUTE
+              value: {{ .Values.identity.bundled.saml.usernameAttribute | quote }}
+            - name: MERIDIAN_SAML_GIVEN_NAME_ATTRIBUTE
+              value: {{ .Values.identity.bundled.saml.givenNameAttribute | quote }}
+            - name: MERIDIAN_SAML_FAMILY_NAME_ATTRIBUTE
+              value: {{ .Values.identity.bundled.saml.familyNameAttribute | quote }}
+            - name: MERIDIAN_SAML_EMAIL_ATTRIBUTE
+              value: {{ .Values.identity.bundled.saml.emailAttribute | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $hook }}
+  labels:
+    meridian.dev/component: group-hook
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: group-hook
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+---
+# The hook is on the access path: what it writes becomes people's groups. So
+# only Zitadel may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $hook }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: group-hook
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: zitadel
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: 8090
+  # Nothing: the hook calls nobody.
+  egress: []
+---
+# Zitadel may call the group hook, DNS, and the addresses you listed -- its
+# database and directory -- and nothing else. This is what bounds the
+# narrowed webhook deny list.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $zitadel }}-egress
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: zitadel
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: group-hook
+      ports:
+        - port: 8090
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        {{- range .Values.identity.bundled.egress.allowCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+{{- end }}
