@@ -22,8 +22,29 @@ use meridian_sidecar::GrantTable;
 /// How long a component waits on the platform before giving up on one attempt.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often a component says what it is running. W5.19.
+/// How often a component tells the platform what it is running. W5.19.
+///
+/// Often enough that a page is not stale after a deploy, rare enough that a
+/// thousand deployments are not a load.
 pub const REPORT_EVERY: Duration = Duration::from_secs(300);
+
+/// How often a component says the same thing on the bus, for the replica to
+/// carry. W5.20.
+///
+/// Much more often, because this one is a few dozen bytes inside a cluster and
+/// because the replica learns what is running only by hearing it. At the
+/// outward interval, a replica that restarted under-reported the deployment
+/// for up to five minutes, and the page said a component had gone when it had
+/// not. Found by restarting one.
+pub const REPORT_INWARD_EVERY: Duration = Duration::from_secs(20);
+
+/// How long after starting a component reports again.
+///
+/// The first report leaves immediately, so a deployment appears as soon as it
+/// is up, and carries only this component: nothing has been heard from the
+/// others yet, and at-most-once delivery means what they said before this
+/// process subscribed is gone. Long enough that they have said it again.
+pub const REPORT_AGAIN_AFTER: Duration = Duration::from_secs(45);
 
 /// Where the grant table is mounted. A file rather than a setting, because it
 /// decides access and a deployment should be able to read what it granted.
@@ -112,7 +133,7 @@ pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schem
             tracing::debug!(%failed, "could not report inward");
         }
 
-        tokio::time::sleep(REPORT_EVERY).await;
+        tokio::time::sleep(REPORT_INWARD_EVERY).await;
     }
 }
 
@@ -174,6 +195,12 @@ pub async fn report_forever(
 
     let heard = collect_inward(bus);
 
+    // Immediately, then once the others have had a chance to say what they
+    // are, then at the ordinary interval. Without the middle one the platform
+    // showed a component as gone for five minutes after the replica restarted,
+    // which is a page saying something untrue rather than something stale.
+    let mut wait = REPORT_AGAIN_AFTER;
+
     loop {
         // This component's own, which never travels: it is the one holding the
         // key, so it has no reason to tell itself over a broker.
@@ -194,7 +221,9 @@ pub async fn report_forever(
         if let Err(failed) = platform.report_components(&reports, now_ns()).await {
             tracing::debug!(%failed, "could not report components");
         }
-        tokio::time::sleep(REPORT_EVERY).await;
+
+        tokio::time::sleep(wait).await;
+        wait = REPORT_EVERY;
     }
 }
 
