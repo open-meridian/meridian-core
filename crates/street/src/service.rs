@@ -259,6 +259,7 @@ mod tests {
             quantity_scaled_1e8: 1_250_000_000,
             market_value_scaled_1e8: 281_250_000_000,
             currency: "USD".into(),
+            external_account_id: String::new(),
         }
     }
 

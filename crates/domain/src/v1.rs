@@ -431,6 +431,136 @@ pub struct RestoreOrganisationOwnerRequest {
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
 }
+/// Published by each sidecar on the deployment's own health topic, beside
+/// component reports, and read by the dashboard in detail and by the conductor,
+/// which carries only a state onward (W5.19).
+///
+/// About the software, like ComponentReport: no account, no person, no payload.
+/// External accounts the plugin could not have recorded go on their own topic
+/// in the config domain (UnlinkedExternalAccountsEvent), because this one may
+/// never carry an account.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginReport {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "4")]
+    pub registered: bool,
+    /// The plugin's own word (W4.5), and why not when not.
+    #[prost(bool, tag = "5")]
+    pub healthy: bool,
+    #[prost(string, tag = "6")]
+    pub health_detail: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub last_heartbeat_at_ns: i64,
+    /// The contract version the plugin registered with.
+    #[prost(string, tag = "8")]
+    pub contract_version: ::prost::alloc::string::String,
+    /// Grants the sidecar refused since it started, and the latest reason. The
+    /// sidecar sees these and the plugin cannot report them about itself.
+    #[prost(int64, tag = "9")]
+    pub refused_grants: i64,
+    #[prost(string, tag = "10")]
+    pub last_refusal_reason: ::prost::alloc::string::String,
+    #[prost(int64, tag = "11")]
+    pub reported_at_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueClaimCodeRequest {
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+}
+/// The code is shown once. The platform keeps only its hash and expiry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueClaimCodeReply {
+    #[prost(string, tag = "1")]
+    pub code: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub expires_at_ns: i64,
+}
+/// From the dashboard to the conductor (W6.2), and from the conductor to the
+/// platform on the assertion it already signs (W5.22). Nothing about the person
+/// redeeming it, at either hop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RedeemClaimCodeRequest {
+    #[prost(string, tag = "1")]
+    pub code: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RedeemClaimCodeReply {
+    #[prost(bool, tag = "1")]
+    pub redeemed: bool,
+    /// Why not: unknown, expired, already used, issued for another deployment,
+    /// or this deployment already has a deployment admin.
+    #[prost(string, tag = "2")]
+    pub refusal_reason: ::prost::alloc::string::String,
+}
+/// Exactly what the deployment admin saw and approved, sent from the dashboard
+/// to the conductor and forwarded unchanged. No secret setting and no log line.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiagnosticBundle {
+    /// Assigned by the dashboard when assembled.
+    #[prost(string, tag = "1")]
+    pub bundle_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub assembled_at_ns: i64,
+    #[prost(message, repeated, tag = "3")]
+    pub items: ::prost::alloc::vec::Vec<BundleItem>,
+    /// Set by the platform on receipt; empty as sent.
+    #[prost(string, tag = "4")]
+    pub deployment_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BundleItem {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// A media type, e.g. application/json.
+    #[prost(string, tag = "2")]
+    pub content_type: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiagnosticBundleReceipt {
+    #[prost(string, tag = "1")]
+    pub bundle_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub received_at_ns: i64,
+    /// 90 days after receipt.
+    #[prost(int64, tag = "3")]
+    pub retain_until_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDiagnosticBundlesRequest {
+    /// Empty lists every deployment's.
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDiagnosticBundlesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub bundles: ::prost::alloc::vec::Vec<DiagnosticBundleSummary>,
+}
+/// Listing reveals no content. Opening one is a recorded read.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiagnosticBundleSummary {
+    #[prost(string, tag = "1")]
+    pub bundle_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub deployment_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub received_at_ns: i64,
+    #[prost(int32, tag = "4")]
+    pub item_count: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadDiagnosticBundleRequest {
+    #[prost(string, tag = "1")]
+    pub bundle_id: ::prost::alloc::string::String,
+}
 /// What a person may do inside one organisation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -484,6 +614,10 @@ pub enum StaffCapability {
     RestoreOrganisationOwner = 2,
     /// Grant and revoke staff capabilities.
     AdministerStaff = 3,
+    /// Read the diagnostic bundles deployments have sent (W5.23). Every read is
+    /// recorded, because a bundle is the one place a deployment's content leaves
+    /// it.
+    ReadDiagnosticBundles = 4,
 }
 impl StaffCapability {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -500,6 +634,7 @@ impl StaffCapability {
                 "STAFF_CAPABILITY_RESTORE_ORGANISATION_OWNER"
             }
             Self::AdministerStaff => "STAFF_CAPABILITY_ADMINISTER_STAFF",
+            Self::ReadDiagnosticBundles => "STAFF_CAPABILITY_READ_DIAGNOSTIC_BUNDLES",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -513,6 +648,9 @@ impl StaffCapability {
                 Some(Self::RestoreOrganisationOwner)
             }
             "STAFF_CAPABILITY_ADMINISTER_STAFF" => Some(Self::AdministerStaff),
+            "STAFF_CAPABILITY_READ_DIAGNOSTIC_BUNDLES" => {
+                Some(Self::ReadDiagnosticBundles)
+            }
             _ => None,
         }
     }
@@ -708,6 +846,335 @@ impl DeploymentState {
             "DEPLOYMENT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
             "DEPLOYMENT_STATE_IN_SERVICE" => Some(Self::InService),
             "DEPLOYMENT_STATE_RETIRED" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+/// Published by the dashboard at each sign-in and kept by the conductor, for
+/// the access table (W4.10) and the per-plugin count. Only people who have
+/// signed in are in it, and it never leaves the deployment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignInRecord {
+    /// Deployment-local: the directory's issuer and subject.
+    #[prost(string, tag = "1")]
+    pub subject: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub display_name: ::prost::alloc::string::String,
+    /// As the directory presented them at this sign-in. Never synchronised.
+    #[prost(string, repeated, tag = "3")]
+    pub directory_groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(int64, tag = "4")]
+    pub signed_in_at_ns: i64,
+}
+/// The dashboard's refresh of everything it evaluates access from, at least
+/// every 30 seconds (decisions/015).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AccessRecordsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccessRecords {
+    #[prost(message, repeated, tag = "1")]
+    pub accounts: ::prost::alloc::vec::Vec<AccountRecord>,
+    #[prost(message, repeated, tag = "2")]
+    pub user_groups: ::prost::alloc::vec::Vec<UserGroup>,
+    #[prost(message, repeated, tag = "3")]
+    pub account_groups: ::prost::alloc::vec::Vec<AccountGroup>,
+    #[prost(message, repeated, tag = "4")]
+    pub access_groups: ::prost::alloc::vec::Vec<AccessGroup>,
+    #[prost(message, repeated, tag = "5")]
+    pub permissions: ::prost::alloc::vec::Vec<Permission>,
+    /// The latest sign-in of each person who has signed in.
+    #[prost(message, repeated, tag = "6")]
+    pub people: ::prost::alloc::vec::Vec<SignInRecord>,
+    /// When the store answered. The dashboard refuses once this is 10 minutes old.
+    #[prost(int64, tag = "7")]
+    pub read_at_ns: i64,
+}
+/// The only thing holdings are recorded against. A plugin never creates one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountRecord {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "AccountState", tag = "3")]
+    pub state: i32,
+    #[prost(int64, tag = "4")]
+    pub created_at_ns: i64,
+}
+/// Creates an account when `account_id` is empty; renames it otherwise.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefineAccountRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CloseAccountRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+}
+/// Links, or with an empty `account_id` unlinks, one external account a plugin
+/// reported. Held as one of that plugin's settings.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkExternalAccountRequest {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub external_account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub account_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalAccountLink {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub external_account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub account_id: ::prost::alloc::string::String,
+}
+/// Published by a sidecar when its plugin brought data for external accounts
+/// with no link, which it refused (W2, W4.8). In the config domain rather than
+/// beside the plugin report, because the deployment domain carries no account.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnlinkedExternalAccountsEvent {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub accounts: ::prost::alloc::vec::Vec<UnlinkedExternalAccount>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnlinkedExternalAccount {
+    #[prost(string, tag = "1")]
+    pub external_account_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub refused_rows: i64,
+    #[prost(int64, tag = "3")]
+    pub first_seen_at_ns: i64,
+    #[prost(int64, tag = "4")]
+    pub last_seen_at_ns: i64,
+}
+/// Who. Permissions name user groups, never directory groups, so moving to a
+/// new directory changes only these members.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UserGroup {
+    #[prost(string, tag = "1")]
+    pub user_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// A person is a member when, at sign-in, they are in one of these.
+    #[prost(string, repeated, tag = "3")]
+    pub directory_groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Or when they are one of these: deployment-local subjects.
+    #[prost(string, repeated, tag = "4")]
+    pub logins: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Creates when `user_group.user_group_id` is empty; replaces it otherwise.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefineUserGroupRequest {
+    #[prost(message, optional, tag = "1")]
+    pub user_group: ::core::option::Option<UserGroup>,
+}
+/// Which accounts. An explicit list: no nesting, no "all accounts", and an
+/// empty group reaches nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountGroup {
+    #[prost(string, tag = "1")]
+    pub account_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefineAccountGroupRequest {
+    #[prost(message, optional, tag = "1")]
+    pub account_group: ::core::option::Option<AccountGroup>,
+}
+/// Which plugin, through which of its tags, at which level. One plugin per
+/// entry, so each plugin's users can be counted on their own.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccessEntry {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub tag: ::prost::alloc::string::String,
+    #[prost(enumeration = "AccessLevel", tag = "3")]
+    pub level: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccessGroup {
+    #[prost(string, tag = "1")]
+    pub access_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub entries: ::prost::alloc::vec::Vec<AccessEntry>,
+    /// True only for deployment admin, which holds the dashboard's own
+    /// capabilities and every account, and cannot be edited or deleted.
+    #[prost(bool, tag = "4")]
+    pub built_in: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefineAccessGroupRequest {
+    #[prost(message, optional, tag = "1")]
+    pub access_group: ::core::option::Option<AccessGroup>,
+}
+/// One user group, one account group, one access group. A permission to the
+/// built-in deployment admin access group names no account group.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Permission {
+    #[prost(string, tag = "1")]
+    pub permission_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub user_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub account_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub access_group_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GrantPermissionRequest {
+    #[prost(string, tag = "1")]
+    pub user_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub account_group_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub access_group_id: ::prost::alloc::string::String,
+}
+/// Refused for the last permission to deployment admin, so a deployment is
+/// never left without an administrator.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawPermissionRequest {
+    #[prost(string, tag = "1")]
+    pub permission_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawPermissionReply {
+    #[prost(bool, tag = "1")]
+    pub withdrawn: bool,
+    #[prost(string, tag = "2")]
+    pub refusal_reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginSettingValue {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetPluginSettingsRequest {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    /// Set or replace these.
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<PluginSettingValue>,
+    /// Remove these.
+    #[prost(string, repeated, tag = "3")]
+    pub cleared: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// What the dashboard may show. A secret's value is never here, only that it
+/// is set.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginSettingsRecord {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<PluginSettingValue>,
+    #[prost(string, repeated, tag = "3")]
+    pub secrets_set: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(int64, tag = "4")]
+    pub updated_at_ns: i64,
+}
+/// Answered for the instance the envelope names, and no other. Secrets travel
+/// only on this reply, never on a broadcast, because the broker narrows
+/// publishing to an instance and not subscribing.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PluginConfigurationRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginConfiguration {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    /// Including secrets' values, for the sidecar to hand to its plugin.
+    #[prost(message, repeated, tag = "2")]
+    pub settings: ::prost::alloc::vec::Vec<PluginSettingValue>,
+    /// For translating external accounts on the way in (W2).
+    #[prost(message, repeated, tag = "3")]
+    pub links: ::prost::alloc::vec::Vec<ExternalAccountLink>,
+    /// The plugin's account scope, derived from permissions (decisions/014).
+    #[prost(string, repeated, tag = "4")]
+    pub read_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub write_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Something in a plugin's configuration changed; its sidecar asks again.
+/// Carries no setting, so every sidecar may hear it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginConfigurationChangedEvent {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub changed_at_ns: i64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AccountState {
+    Unspecified = 0,
+    Open = 1,
+    /// Closed, not deleted: an account is the subject of records that outlive it.
+    Closed = 2,
+}
+impl AccountState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ACCOUNT_STATE_UNSPECIFIED",
+            Self::Open => "ACCOUNT_STATE_OPEN",
+            Self::Closed => "ACCOUNT_STATE_CLOSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ACCOUNT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ACCOUNT_STATE_OPEN" => Some(Self::Open),
+            "ACCOUNT_STATE_CLOSED" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AccessLevel {
+    Unspecified = 0,
+    /// Queries and receiving events.
+    Read = 1,
+    /// Commands, and everything read allows.
+    Write = 2,
+}
+impl AccessLevel {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ACCESS_LEVEL_UNSPECIFIED",
+            Self::Read => "ACCESS_LEVEL_READ",
+            Self::Write => "ACCESS_LEVEL_WRITE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ACCESS_LEVEL_UNSPECIFIED" => Some(Self::Unspecified),
+            "ACCESS_LEVEL_READ" => Some(Self::Read),
+            "ACCESS_LEVEL_WRITE" => Some(Self::Write),
             _ => None,
         }
     }
@@ -1047,6 +1514,8 @@ impl MissReason {
 pub struct SyncStatusEvent {
     #[prost(string, tag = "1")]
     pub source: ::prost::alloc::string::String,
+    /// The account the external account is linked to (W6.4), set by the sidecar.
+    /// Empty when it is not linked.
     #[prost(string, tag = "2")]
     pub account_id: ::prost::alloc::string::String,
     /// When the rail last successfully synced this account from the institution.
@@ -1063,6 +1532,9 @@ pub struct SyncStatusEvent {
     pub status_detail: ::prost::alloc::string::String,
     #[prost(int64, tag = "6")]
     pub observed_at_ns: i64,
+    /// The account as the rail knows it, which the sidecar translates.
+    #[prost(string, tag = "7")]
+    pub external_account_id: ::prost::alloc::string::String,
 }
 /// Open one statement: one read of one rail, at one moment.
 ///
@@ -1138,6 +1610,13 @@ pub struct RecordHoldingRequest {
     /// ISO 4217 for market_value_scaled_1e8.
     #[prost(string, tag = "7")]
     pub currency: ::prost::alloc::string::String,
+    /// The account as the rail knows it. The connector sets this and leaves
+    /// `account_id` empty; the sidecar sets `account_id` from the link in the
+    /// connector's settings (W6.4), and refuses the row, with that reason, when
+    /// there is none. Refused is not dropped: the external account is reported
+    /// unlinked, and the next statement after it is linked records it (W2).
+    #[prost(string, tag = "8")]
+    pub external_account_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordHoldingReply {

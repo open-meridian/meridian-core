@@ -148,6 +148,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
             quantity_scaled_1e8: 1_250_000_000,
             market_value_scaled_1e8: 281_250_000_000,
             currency: "USD".into(),
+            external_account_id: String::new(),
         },
     )
     .await;

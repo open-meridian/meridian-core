@@ -35,6 +35,9 @@ import "meridian/v1/reference.proto";
 // identical on a holdings screen and mean completely different things.
 message SyncStatusEvent {
   string source = 1;
+
+  // The account the external account is linked to (W6.4), set by the sidecar.
+  // Empty when it is not linked.
   string account_id = 2;
 
   // When the rail last successfully synced this account from the institution.
@@ -50,6 +53,9 @@ message SyncStatusEvent {
   string status_detail = 5;
 
   int64 observed_at_ns = 6;
+
+  // The account as the rail knows it, which the sidecar translates.
+  string external_account_id = 7;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +135,13 @@ message RecordHoldingRequest {
 
   // ISO 4217 for market_value_scaled_1e8.
   string currency = 7;
+
+  // The account as the rail knows it. The connector sets this and leaves
+  // `account_id` empty; the sidecar sets `account_id` from the link in the
+  // connector's settings (W6.4), and refuses the row, with that reason, when
+  // there is none. Refused is not dropped: the external account is reported
+  // unlinked, and the next statement after it is linked records it (W2).
+  string external_account_id = 8;
 }
 
 message RecordHoldingReply {

@@ -1,0 +1,268 @@
+// What a deployment admin authors, and what the conductor's configuration
+// store serves from it.
+//
+// Derived from workflows W6 (a person in a deployment) and W4 (plugin
+// lifecycle). Every message here traces to a matrix row; see matrix/matrix.tsv.
+//
+// The governing idea: access is three dimensions joined by a permission -- a
+// user group (who), an account group (which accounts), an access group (which
+// plugin, through which tag, at read or write) -- and a person's access is the
+// union of their user groups' permissions, combined permission by permission.
+// None of it is read from a token, and none of it ever reaches the platform.
+//
+// Everything here lives in the conductor's configuration store. The dashboard
+// writes it by command and reads it by query; a sidecar reads its own plugin's
+// part by query, answered for the instance the envelope names and no other.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.1 — who has signed in
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Published by the dashboard at each sign-in and kept by the conductor, for
+// the access table (W4.10) and the per-plugin count. Only people who have
+// signed in are in it, and it never leaves the deployment.
+message SignInRecord {
+  // Deployment-local: the directory's issuer and subject.
+  string subject = 1;
+  string display_name = 2;
+
+  // As the directory presented them at this sign-in. Never synchronised.
+  repeated string directory_groups = 3;
+
+  int64 signed_in_at_ns = 4;
+}
+
+// The dashboard's refresh of everything it evaluates access from, at least
+// every 30 seconds (decisions/015).
+message AccessRecordsRequest {}
+
+message AccessRecords {
+  repeated AccountRecord accounts = 1;
+  repeated UserGroup user_groups = 2;
+  repeated AccountGroup account_groups = 3;
+  repeated AccessGroup access_groups = 4;
+  repeated Permission permissions = 5;
+
+  // The latest sign-in of each person who has signed in.
+  repeated SignInRecord people = 6;
+
+  // When the store answered. The dashboard refuses once this is 10 minutes old.
+  int64 read_at_ns = 7;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.3 — accounts
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The only thing holdings are recorded against. A plugin never creates one.
+message AccountRecord {
+  string account_id = 1;
+  string name = 2;
+  AccountState state = 3;
+  int64 created_at_ns = 4;
+}
+
+enum AccountState {
+  ACCOUNT_STATE_UNSPECIFIED = 0;
+  ACCOUNT_STATE_OPEN = 1;
+
+  // Closed, not deleted: an account is the subject of records that outlive it.
+  ACCOUNT_STATE_CLOSED = 2;
+}
+
+// Creates an account when `account_id` is empty; renames it otherwise.
+message DefineAccountRequest {
+  string account_id = 1;
+  string name = 2;
+}
+
+message CloseAccountRequest {
+  string account_id = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.4 — linking a plugin's external account
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Links, or with an empty `account_id` unlinks, one external account a plugin
+// reported. Held as one of that plugin's settings.
+message LinkExternalAccountRequest {
+  string plugin_instance_id = 1;
+  string external_account_id = 2;
+  string account_id = 3;
+}
+
+message ExternalAccountLink {
+  string plugin_instance_id = 1;
+  string external_account_id = 2;
+  string account_id = 3;
+}
+
+// Published by a sidecar when its plugin brought data for external accounts
+// with no link, which it refused (W2, W4.8). In the config domain rather than
+// beside the plugin report, because the deployment domain carries no account.
+message UnlinkedExternalAccountsEvent {
+  string plugin_instance_id = 1;
+  repeated UnlinkedExternalAccount accounts = 2;
+}
+
+message UnlinkedExternalAccount {
+  string external_account_id = 1;
+  int64 refused_rows = 2;
+  int64 first_seen_at_ns = 3;
+  int64 last_seen_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.5 to W6.8 — the three dimensions, and the permission joining them
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Who. Permissions name user groups, never directory groups, so moving to a
+// new directory changes only these members.
+message UserGroup {
+  string user_group_id = 1;
+  string name = 2;
+
+  // A person is a member when, at sign-in, they are in one of these.
+  repeated string directory_groups = 3;
+
+  // Or when they are one of these: deployment-local subjects.
+  repeated string logins = 4;
+}
+
+// Creates when `user_group.user_group_id` is empty; replaces it otherwise.
+message DefineUserGroupRequest {
+  UserGroup user_group = 1;
+}
+
+// Which accounts. An explicit list: no nesting, no "all accounts", and an
+// empty group reaches nothing.
+message AccountGroup {
+  string account_group_id = 1;
+  string name = 2;
+  repeated string account_ids = 3;
+}
+
+message DefineAccountGroupRequest {
+  AccountGroup account_group = 1;
+}
+
+// Which plugin, through which of its tags, at which level. One plugin per
+// entry, so each plugin's users can be counted on their own.
+message AccessEntry {
+  string plugin_instance_id = 1;
+  string tag = 2;
+  AccessLevel level = 3;
+}
+
+enum AccessLevel {
+  ACCESS_LEVEL_UNSPECIFIED = 0;
+
+  // Queries and receiving events.
+  ACCESS_LEVEL_READ = 1;
+
+  // Commands, and everything read allows.
+  ACCESS_LEVEL_WRITE = 2;
+}
+
+message AccessGroup {
+  string access_group_id = 1;
+  string name = 2;
+  repeated AccessEntry entries = 3;
+
+  // True only for deployment admin, which holds the dashboard's own
+  // capabilities and every account, and cannot be edited or deleted.
+  bool built_in = 4;
+}
+
+message DefineAccessGroupRequest {
+  AccessGroup access_group = 1;
+}
+
+// One user group, one account group, one access group. A permission to the
+// built-in deployment admin access group names no account group.
+message Permission {
+  string permission_id = 1;
+  string user_group_id = 2;
+  string account_group_id = 3;
+  string access_group_id = 4;
+}
+
+message GrantPermissionRequest {
+  string user_group_id = 1;
+  string account_group_id = 2;
+  string access_group_id = 3;
+}
+
+// Refused for the last permission to deployment admin, so a deployment is
+// never left without an administrator.
+message WithdrawPermissionRequest {
+  string permission_id = 1;
+}
+
+message WithdrawPermissionReply {
+  bool withdrawn = 1;
+  string refusal_reason = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.11 — plugin settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+message PluginSettingValue {
+  string name = 1;
+  string value = 2;
+}
+
+message SetPluginSettingsRequest {
+  string plugin_instance_id = 1;
+
+  // Set or replace these.
+  repeated PluginSettingValue values = 2;
+
+  // Remove these.
+  repeated string cleared = 3;
+}
+
+// What the dashboard may show. A secret's value is never here, only that it
+// is set.
+message PluginSettingsRecord {
+  string plugin_instance_id = 1;
+  repeated PluginSettingValue values = 2;
+  repeated string secrets_set = 3;
+  int64 updated_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W4.7, W4.11 — what a sidecar is told about its own plugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Answered for the instance the envelope names, and no other. Secrets travel
+// only on this reply, never on a broadcast, because the broker narrows
+// publishing to an instance and not subscribing.
+message PluginConfigurationRequest {}
+
+message PluginConfiguration {
+  string plugin_instance_id = 1;
+
+  // Including secrets' values, for the sidecar to hand to its plugin.
+  repeated PluginSettingValue settings = 2;
+
+  // For translating external accounts on the way in (W2).
+  repeated ExternalAccountLink links = 3;
+
+  // The plugin's account scope, derived from permissions (decisions/014).
+  repeated string read_account_ids = 4;
+  repeated string write_account_ids = 5;
+}
+
+// Something in a plugin's configuration changed; its sidecar asks again.
+// Carries no setting, so every sidecar may hear it.
+message PluginConfigurationChangedEvent {
+  string plugin_instance_id = 1;
+  int64 changed_at_ns = 2;
+}

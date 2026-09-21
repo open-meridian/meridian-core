@@ -53,6 +53,11 @@ enum StaffCapability {
 
   // Grant and revoke staff capabilities.
   STAFF_CAPABILITY_ADMINISTER_STAFF = 3;
+
+  // Read the diagnostic bundles deployments have sent (W5.23). Every read is
+  // recorded, because a bundle is the one place a deployment's content leaves
+  // it.
+  STAFF_CAPABILITY_READ_DIAGNOSTIC_BUNDLES = 4;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -548,4 +553,121 @@ message RestoreOrganisationOwnerRequest {
   // existing owners, because a restoration nobody hears about is
   // indistinguishable from a quiet takeover.
   string reason = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W4.8 — what a sidecar says about its plugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Published by each sidecar on the deployment's own health topic, beside
+// component reports, and read by the dashboard in detail and by the conductor,
+// which carries only a state onward (W5.19).
+//
+// About the software, like ComponentReport: no account, no person, no payload.
+// External accounts the plugin could not have recorded go on their own topic
+// in the config domain (UnlinkedExternalAccountsEvent), because this one may
+// never carry an account.
+message PluginReport {
+  string plugin_instance_id = 1;
+  string role = 2;
+  repeated string tags = 3;
+
+  bool registered = 4;
+
+  // The plugin's own word (W4.5), and why not when not.
+  bool healthy = 5;
+  string health_detail = 6;
+  int64 last_heartbeat_at_ns = 7;
+
+  // The contract version the plugin registered with.
+  string contract_version = 8;
+
+  // Grants the sidecar refused since it started, and the latest reason. The
+  // sidecar sees these and the plugin cannot report them about itself.
+  int64 refused_grants = 9;
+  string last_refusal_reason = 10;
+
+  int64 reported_at_ns = 11;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.21, W5.22, W6.2 — the first deployment admin
+// ─────────────────────────────────────────────────────────────────────────────
+
+message IssueClaimCodeRequest {
+  string deployment_id = 1;
+}
+
+// The code is shown once. The platform keeps only its hash and expiry.
+message IssueClaimCodeReply {
+  string code = 1;
+  int64 expires_at_ns = 2;
+}
+
+// From the dashboard to the conductor (W6.2), and from the conductor to the
+// platform on the assertion it already signs (W5.22). Nothing about the person
+// redeeming it, at either hop.
+message RedeemClaimCodeRequest {
+  string code = 1;
+}
+
+message RedeemClaimCodeReply {
+  bool redeemed = 1;
+
+  // Why not: unknown, expired, already used, issued for another deployment,
+  // or this deployment already has a deployment admin.
+  string refusal_reason = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.23, W6.12 — the diagnostic bundle
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Exactly what the deployment admin saw and approved, sent from the dashboard
+// to the conductor and forwarded unchanged. No secret setting and no log line.
+message DiagnosticBundle {
+  // Assigned by the dashboard when assembled.
+  string bundle_id = 1;
+  int64 assembled_at_ns = 2;
+  repeated BundleItem items = 3;
+
+  // Set by the platform on receipt; empty as sent.
+  string deployment_id = 4;
+}
+
+message BundleItem {
+  string name = 1;
+
+  // A media type, e.g. application/json.
+  string content_type = 2;
+  bytes content = 3;
+}
+
+message DiagnosticBundleReceipt {
+  string bundle_id = 1;
+  int64 received_at_ns = 2;
+
+  // 90 days after receipt.
+  int64 retain_until_ns = 3;
+}
+
+message ListDiagnosticBundlesRequest {
+  // Empty lists every deployment's.
+  string deployment_id = 1;
+}
+
+message ListDiagnosticBundlesReply {
+  repeated DiagnosticBundleSummary bundles = 1;
+}
+
+// Listing reveals no content. Opening one is a recorded read.
+message DiagnosticBundleSummary {
+  string bundle_id = 1;
+  string deployment_id = 2;
+  int64 received_at_ns = 3;
+  int32 item_count = 4;
+}
+
+message ReadDiagnosticBundleRequest {
+  string bundle_id = 1;
 }
