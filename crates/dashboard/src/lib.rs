@@ -17,6 +17,7 @@
 
 pub mod clock;
 pub mod html;
+pub mod oidc;
 pub mod records;
 pub mod session;
 pub mod web;

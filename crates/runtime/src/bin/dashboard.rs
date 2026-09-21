@@ -13,10 +13,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock,
 };
-use meridian_runtime::{bus_from_env, now_ns, shutdown, var};
+use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -37,6 +38,19 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| "0.0.0.0:8080".into())
         .parse()
         .map_err(|failed| format!("MERIDIAN_DASHBOARD_LISTEN is not an address: {failed}"))?;
+
+    // Where people reach this dashboard, which is where the directory sends
+    // them back to. HTTPS everywhere but a developer's machine, and cookies
+    // are marked Secure whenever it is.
+    let public_url = required("MERIDIAN_DASHBOARD_URL")?;
+    let secure_cookies = public_url.starts_with("https://");
+    let directory = var("MERIDIAN_OIDC_ISSUER").map(|issuer| OidcConfig {
+        issuer,
+        client_id: var("MERIDIAN_OIDC_CLIENT_ID").unwrap_or_default(),
+        client_secret: var("MERIDIAN_OIDC_CLIENT_SECRET"),
+        redirect_url: format!("{}/callback", public_url.trim_end_matches('/')),
+        groups_claim: var("MERIDIAN_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into()),
+    });
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -65,10 +79,21 @@ fn run() -> Result<(), String> {
                 }
             });
 
+            let oidc = match &directory {
+                Some(config) => Some(Arc::new(discover(config).await?)),
+                None => {
+                    tracing::warn!("no directory is configured (MERIDIAN_OIDC_ISSUER); nobody can sign in");
+                    None
+                }
+            };
+
             let app = router(Arc::new(App {
                 records,
                 sessions,
                 clock,
+                bus,
+                oidc,
+                secure_cookies,
             }));
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
@@ -83,4 +108,25 @@ fn run() -> Result<(), String> {
                 .await
                 .map_err(|failed| failed.to_string())
         })
+}
+
+/// The directory's discovery document, retried for a minute: a bundled
+/// Zitadel may still be starting. Past that, exit with the reason, and let the
+/// cluster restart this rather than serve a sign-in that cannot work.
+async fn discover(config: &OidcConfig) -> Result<Oidc, String> {
+    let mut last = String::new();
+    for _ in 0..12 {
+        match Oidc::discover(config).await {
+            Ok(oidc) => return Ok(oidc),
+            Err(failed) => {
+                tracing::warn!("{failed}; retrying");
+                last = failed;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+    Err(format!(
+        "the directory at {} could not be reached: {last}",
+        config.issuer
+    ))
 }

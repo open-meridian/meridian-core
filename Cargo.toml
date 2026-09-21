@@ -31,6 +31,11 @@ tonic = "0.13"
 # The dashboard's HTTP server. Already in the tree through tonic, which is
 # built on it, so naming it adds no dependency.
 axum = "0.8"
+# OpenID Connect for the dashboard's sign-in: pure Rust, verifying ID tokens
+# itself, over the reqwest client above rather than its own. No SAML: a SAML
+# directory is brokered by the bundled Zitadel (spec, ruling 1).
+openidconnect = { version = "4", default-features = false }
+http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

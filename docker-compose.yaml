@@ -137,6 +137,11 @@ services:
       MERIDIAN_BROKER_URL: nats://dashboard-1:dashboard-1-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: dashboard-1
       MERIDIAN_DASHBOARD_LISTEN: 0.0.0.0:8080
+      MERIDIAN_DASHBOARD_URL: ${MERIDIAN_DASHBOARD_URL:-http://localhost:8088}
+      # A directory to sign in against. Unset here, so the dashboard serves and
+      # says nobody can sign in; the e2e target sets it to the bundled Zitadel.
+      MERIDIAN_OIDC_ISSUER: ${MERIDIAN_OIDC_ISSUER:-}
+      MERIDIAN_OIDC_CLIENT_ID: ${MERIDIAN_OIDC_CLIENT_ID:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
