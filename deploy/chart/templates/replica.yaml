@@ -38,8 +38,6 @@ spec:
             capabilities:
               drop: [ALL]
           env:
-            - name: MERIDIAN_DEPLOYMENT_ID
-              value: {{ .Values.deployment.id | quote }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-replica
             - name: MERIDIAN_BROKER_URL
