@@ -55,8 +55,17 @@ def wait_ready(seconds=180):
             with urllib.request.urlopen(BASE + "/debug/ready", timeout=5) as response:
                 if response.status == 200 and all(
                         os.path.exists(os.path.join(BOOTSTRAP, n)) for n in ("admin.pat", "login-client.pat")):
-                    # Ready also means the instance answers its own host name.
+                    # Ready also means the instance answers its own host name,
+                    # and that its API answers an authenticated call: /debug/ready
+                    # turns green while the gateway in front of the gRPC API is
+                    # still dialling it, and the first call then gets a 503.
                     with urllib.request.urlopen(BASE + "/.well-known/openid-configuration", timeout=5):
+                        pass
+                    token = open(os.path.join(BOOTSTRAP, "admin.pat")).read().strip()
+                    probe = urllib.request.Request(
+                        BASE + "/management/v1/orgs/me",
+                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                    with urllib.request.urlopen(probe, timeout=5):
                         return
         except (urllib.error.URLError, OSError) as failed:
             last = failed

@@ -23,7 +23,7 @@
 //! decides what the person may do.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -48,6 +48,7 @@ pub const PENDING_NS: i64 = 10 * MINUTE_NS;
 /// session could hide in.
 pub const SKEW_NS: i64 = 30 * SECOND_NS;
 
+#[derive(Clone)]
 pub struct OidcConfig {
     pub issuer: String,
     pub client_id: String,
@@ -89,7 +90,10 @@ struct Pending {
 }
 
 pub struct Oidc {
-    provider: Provider,
+    config: OidcConfig,
+    /// Replaced whole by [`Oidc::refresh`], so a sign-in in flight keeps the
+    /// provider it began with.
+    provider: RwLock<Arc<Provider>>,
     http: reqwest::Client,
     groups_claim: String,
     trusted_audiences: Vec<String>,
@@ -134,27 +138,10 @@ impl Oidc {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|failed| failed.to_string())?;
-        let issuer = IssuerUrl::new(config.issuer.clone())
-            .map_err(|failed| format!("the issuer: {failed}"))?;
-        let client = http.clone();
-        let metadata = CoreProviderMetadata::discover_async(issuer, &move |request| {
-            send(client.clone(), request)
-        })
-        .await
-        .map_err(|failed| {
-            format!("the directory's discovery document could not be read: {failed}")
-        })?;
-        let provider = CoreClient::from_provider_metadata(
-            metadata,
-            ClientId::new(config.client_id.clone()),
-            config.client_secret.clone().map(ClientSecret::new),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(config.redirect_url.clone())
-                .map_err(|failed| format!("the redirect URL: {failed}"))?,
-        );
+        let provider = fetch(config, &http).await?;
         Ok(Self {
-            provider,
+            config: config.clone(),
+            provider: RwLock::new(Arc::new(provider)),
             http,
             groups_claim: config.groups_claim.clone(),
             trusted_audiences: config.trusted_audiences.clone(),
@@ -162,12 +149,26 @@ impl Oidc {
         })
     }
 
+    /// Read the discovery document and keys again. A directory rotates the
+    /// keys it signs with, and keys read once at start stop verifying the
+    /// day it does; the binary calls this on a timer, and a sign-in whose
+    /// token does not verify calls it once before refusing.
+    pub async fn refresh(&self) -> Result<(), String> {
+        let provider = fetch(&self.config, &self.http).await?;
+        *self.provider.write().expect("provider lock poisoned") = Arc::new(provider);
+        Ok(())
+    }
+
+    fn current(&self) -> Arc<Provider> {
+        Arc::clone(&self.provider.read().expect("provider lock poisoned"))
+    }
+
     /// Start a sign-in: where to send the browser, and the state that binds
     /// its return to this browser.
     pub fn begin(&self, now_ns: i64) -> (String, String) {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let (url, state, nonce) = self
-            .provider
+            .current()
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
@@ -207,7 +208,7 @@ impl Oidc {
 
         let client = self.http.clone();
         let tokens = self
-            .provider
+            .current()
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .map_err(|failed| failed.to_string())?
             .set_pkce_verifier(pending.verifier)
@@ -218,30 +219,66 @@ impl Oidc {
         let id_token = tokens
             .id_token()
             .ok_or("the directory returned no ID token")?;
-        let trusted = self.trusted_audiences.clone();
-        let verifier = self
-            .provider
-            .id_token_verifier()
-            .set_other_audience_verifier_fn(move |audience| trusts(&trusted, audience));
-        let claims = id_token
-            .claims(&verifier, &pending.nonce)
-            .map_err(|failed| format!("the directory's ID token did not verify: {failed}"))?;
+        let verify = |provider: &Provider| -> Result<(String, String, Option<i64>), String> {
+            let trusted = self.trusted_audiences.clone();
+            let verifier = provider
+                .id_token_verifier()
+                .set_other_audience_verifier_fn(move |audience| trusts(&trusted, audience));
+            let claims = id_token
+                .claims(&verifier, &pending.nonce)
+                .map_err(|failed| format!("the directory's ID token did not verify: {failed}"))?;
+            Ok((
+                claims.issuer().as_str().to_string(),
+                claims.subject().as_str().to_string(),
+                claims.auth_time().and_then(|at| at.timestamp_nanos_opt()),
+            ))
+        };
+        // Once more with fresh keys before refusing: a token signed with a key
+        // the directory rotated in since the last read is not a bad token.
+        let (issuer, subject, authenticated_at) = match verify(&self.current()) {
+            Ok(verified) => verified,
+            Err(first) => {
+                tracing::info!("{first}; reading the directory's keys again");
+                self.refresh().await?;
+                verify(&self.current())?
+            }
+        };
 
-        let authenticated_at = claims
-            .auth_time()
-            .and_then(|at| at.timestamp_nanos_opt())
-            .ok_or("the directory did not say when this person authenticated")?;
+        let authenticated_at =
+            authenticated_at.ok_or("the directory did not say when this person authenticated")?;
         fresh(authenticated_at, pending.started_at_ns)?;
 
         // The token verified above; its payload is read again only for the
         // two claims the core claim set does not name.
         let payload = raw_payload(&id_token.to_string())?;
         Ok(Identity {
-            subject: format!("{}|{}", claims.issuer().as_str(), claims.subject().as_str()),
-            display_name: display_name(&payload, claims.subject().as_str()),
+            subject: format!("{issuer}|{subject}"),
+            display_name: display_name(&payload, &subject),
             groups: groups(&payload, &self.groups_claim),
         })
     }
+}
+
+/// The provider as its discovery document and keys describe it now.
+async fn fetch(config: &OidcConfig, http: &reqwest::Client) -> Result<Provider, String> {
+    let issuer =
+        IssuerUrl::new(config.issuer.clone()).map_err(|failed| format!("the issuer: {failed}"))?;
+    let client = http.clone();
+    let metadata =
+        CoreProviderMetadata::discover_async(issuer, &move |request| send(client.clone(), request))
+            .await
+            .map_err(|failed| {
+                format!("the directory's discovery document could not be read: {failed}")
+            })?;
+    Ok(CoreClient::from_provider_metadata(
+        metadata,
+        ClientId::new(config.client_id.clone()),
+        config.client_secret.clone().map(ClientSecret::new),
+    )
+    .set_redirect_uri(
+        RedirectUrl::new(config.redirect_url.clone())
+            .map_err(|failed| format!("the redirect URL: {failed}"))?,
+    ))
 }
 
 /// Refused when the directory authenticated the person before this sign-in

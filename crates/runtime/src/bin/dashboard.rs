@@ -90,7 +90,24 @@ fn run() -> Result<(), String> {
             });
 
             let oidc = match &directory {
-                Some(config) => Some(Arc::new(discover(config).await?)),
+                Some(config) => {
+                    let oidc = Arc::new(discover(config).await?);
+                    // The directory's keys, read again every 15 minutes, so a
+                    // rotation is picked up without a restart. A sign-in that
+                    // meets a key it does not know also reads them at once.
+                    let refreshing = Arc::clone(&oidc);
+                    tokio::spawn(async move {
+                        let mut every = tokio::time::interval(Duration::from_secs(15 * 60));
+                        every.tick().await;
+                        loop {
+                            every.tick().await;
+                            if let Err(failed) = refreshing.refresh().await {
+                                tracing::warn!("the directory's keys could not be read again: {failed}");
+                            }
+                        }
+                    });
+                    Some(oidc)
+                }
                 None => {
                     tracing::warn!("no directory is configured (MERIDIAN_OIDC_ISSUER); nobody can sign in");
                     None
