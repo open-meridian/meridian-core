@@ -350,7 +350,7 @@ async fn a_role_may_publish_what_the_grant_table_grants_it() {
 #[tokio::test]
 async fn the_broker_refuses_a_topic_the_role_does_not_hold() {
     // custody may record a statement; it may not answer queries about
-    // positions, which is the dashboard's and the positions-reader's. The
+    // positions, which is the admin role's and the reporting role's. The
     // publish call itself is accepted by the client, because a broker reports
     // a permission violation asynchronously; what proves the refusal is that
     // nothing arrives.

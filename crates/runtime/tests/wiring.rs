@@ -160,14 +160,9 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // shared endpoint admits one plugin. That is the deployment shape today and
     // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
     // where it changes, and this line is what should stop being necessary.
-    let dashboard = Sidecar::new(
-        bus,
-        "DEP-test",
-        "v1",
-        Identity::new("dashboard-1", "dashboard"),
-    );
+    let dashboard = Sidecar::new(bus, "DEP-test", "v1", Identity::new("dashboard-1", "admin"));
     dashboard.load_grants(GrantTable::from_json(GRANTS).unwrap());
-    admitted(&dashboard, "dashboard").await;
+    admitted(&dashboard, "admin").await;
 
     let listed: ListCustodialPositionsReply = call(
         &dashboard,
@@ -200,7 +195,7 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     // moved. That is the street store's to say.
     assert!(!custody.may_publish(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 
-    let dashboard = table.resolve("dashboard", &[]);
+    let dashboard = table.resolve("admin", &[]);
     assert!(dashboard.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
     assert!(dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
     // Read-only means read-only: nothing a dashboard does writes to the street store.
@@ -209,7 +204,7 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     // A plugin carries a role and any number of tags, and gets the union. A
     // connector that also reads positions asks for the tag rather than having a
     // bespoke role minted for the combination.
-    let both = table.resolve("custody", &["positions-reader".to_string()]);
+    let both = table.resolve("custody", &["reporting".to_string()]);
     assert!(both.may_publish(meridian_street::service::RECORD_HOLDING));
     assert!(both.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
     assert!(both.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));

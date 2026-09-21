@@ -406,7 +406,7 @@ mod tests {
           ],
           "subscribe": ["platform.reference.event.instrument-applied"]
         },
-        "dashboard": {
+        "admin": {
           "publish": [],
           "subscribe": ["platform.street.event.*"]
         }
@@ -514,7 +514,7 @@ mod tests {
         // The hole this closed: the plugin used to supply role and tags, so a
         // dashboard could ask to be a connector and be admitted with write
         // grants. There is now nothing in the request that could ask.
-        let sc = launched_as(true, Identity::new("dashboard-1", "dashboard"));
+        let sc = launched_as(true, Identity::new("dashboard-1", "admin"));
 
         let reply = sc
             .register(Request::new(register_req()))
@@ -523,7 +523,7 @@ mod tests {
             .into_inner();
 
         assert!(reply.admitted);
-        assert_eq!(reply.role, "dashboard");
+        assert_eq!(reply.role, "admin");
         assert_eq!(reply.instance_id, "dashboard-1");
         assert!(reply.publish_grants.is_empty());
         assert!(!sc
@@ -539,8 +539,7 @@ mod tests {
         // be, rather than running as something else and finding out by refusal.
         let sc = launched_as(
             true,
-            Identity::new("custody-snaptrade-1", "custody")
-                .with_tags(vec!["dashboard".to_string()]),
+            Identity::new("custody-snaptrade-1", "custody").with_tags(vec!["admin".to_string()]),
         );
 
         let reply = sc
@@ -552,7 +551,7 @@ mod tests {
         assert!(reply.admitted);
         assert_eq!(reply.instance_id, "custody-snaptrade-1");
         assert_eq!(reply.role, "custody");
-        assert_eq!(reply.tags, vec!["dashboard".to_string()]);
+        assert_eq!(reply.tags, vec!["admin".to_string()]);
         // A tag adds to the role rather than replacing it, and the reply's
         // grants are the merged set the plugin will actually be held to.
         assert!(reply
