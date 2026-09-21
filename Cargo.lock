@@ -1133,6 +1133,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-config"
+version = "0.1.0"
+dependencies = [
+ "meridian-access",
+ "meridian-bus",
+ "meridian-domain",
+ "meridian-pb",
+ "postgres",
+ "prost",
+ "r2d2",
+ "r2d2_postgres",
+ "rand 0.8.8",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-domain"
 version = "0.1.0"
 dependencies = [

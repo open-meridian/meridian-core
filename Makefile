@@ -132,10 +132,11 @@ test:
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
+			-p meridian-config --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: both stores pass against Postgres"
+	@echo "test-store OK: the instrument, street and configuration stores pass against Postgres"
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d --set broker.existingSecret=b

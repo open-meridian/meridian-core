@@ -1,0 +1,25 @@
+[package]
+name = "meridian-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The conductor's configuration store: accounts, access and plugin settings a deployment admin authors"
+
+[dependencies]
+meridian-access.workspace = true
+meridian-bus = { path = "../bus" }
+meridian-domain.workspace = true
+meridian-pb.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+postgres.workspace = true
+r2d2.workspace = true
+r2d2_postgres.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+postgres.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
