@@ -122,6 +122,26 @@ services:
       - runtime-keys:/var/lib/meridian
     networks: [meridian]
 
+  # The dashboard: the one address staff use. No key and no database of its
+  # own; it reads who may do what from the conductor over the broker, as the
+  # instance dashboard-1 with the admin role's grants.
+  dashboard:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-dashboard"]
+    depends_on:
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_BROKER_URL: nats://dashboard-1:dashboard-1-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: dashboard-1
+      MERIDIAN_DASHBOARD_LISTEN: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
+    networks: [meridian]
+
   # A plugin's sidecar. One per plugin, and the plugin joins this container's
   # network namespace rather than the other way round, because the sidecar
   # binds loopback and holds the broker credential.

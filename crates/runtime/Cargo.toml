@@ -26,12 +26,18 @@ path = "src/bin/sidecar.rs"
 name = "meridian-conductor"
 path = "src/bin/conductor.rs"
 
+[[bin]]
+name = "meridian-dashboard"
+path = "src/bin/dashboard.rs"
+
 [dependencies]
 meridian-bus = { path = "../bus" }
 meridian-instrument = { path = "../instrument" }
 meridian-street = { path = "../street" }
 meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
+meridian-dashboard = { path = "../dashboard" }
+axum.workspace = true
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
 meridian-domain.workspace = true

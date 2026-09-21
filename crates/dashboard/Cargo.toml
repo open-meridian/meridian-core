@@ -1,0 +1,23 @@
+[package]
+name = "meridian-dashboard"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The deployment's one address: sign-in, access, and the pages that administer it"
+
+[dependencies]
+meridian-access.workspace = true
+meridian-bus = { path = "../bus" }
+meridian-domain.workspace = true
+axum.workspace = true
+base64.workspace = true
+prost.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
