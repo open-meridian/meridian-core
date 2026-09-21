@@ -42,3 +42,19 @@ the operator the same thing far less clearly.
 {{- fail "database.existingSecret is not set. The replica needs a Postgres URL, in a secret rather than in your values." -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The bundled Zitadel's issuer, as Zitadel itself states it: its external
+scheme, domain and port, the port left out when it is the scheme's default.
+*/}}
+{{- define "meridian-runtime.zitadelIssuer" -}}
+{{- $c := .Values.zitadel.zitadel.configmapConfig -}}
+{{- $scheme := ternary "https" "http" (ne (toString $c.ExternalSecure) "false") -}}
+{{- $port := int ($c.ExternalPort | default (ternary 443 80 (eq $scheme "https"))) -}}
+{{- if or (and (eq $scheme "https") (eq $port 443)) (and (eq $scheme "http") (eq $port 80)) -}}
+{{- printf "%s://%s" $scheme $c.ExternalDomain -}}
+{{- else -}}
+{{- printf "%s://%s:%d" $scheme $c.ExternalDomain $port -}}
+{{- end -}}
+{{- end -}}
+
