@@ -595,17 +595,17 @@ def scenario_f():
         def sign(key, stamp, payload):
             return f"t={stamp},v1=" + hmac.new(key.encode(), f"{stamp}.".encode() + payload, hashlib.sha256).hexdigest()
 
-        wrong_key = "not-" + token("hook-intent-signing-key")
+        wrong_key = "not-" + token("intent-signing-key")
         for path in ("/intent", "/token"):
             status, reply = send(path, body, None)
             s.check(status == 401 and "metadata" not in reply, f"{path} unsigned: {status} \"{reply}\"")
             status, reply = send(path, body, sign(wrong_key, now, body))
             s.check(status == 401 and "metadata" not in reply, f"{path} signed with the wrong key: {status} \"{reply}\"")
-        status, reply = send("/intent", body, sign(token("hook-token-signing-key"), now, body))
+        status, reply = send("/intent", body, sign(token("token-signing-key"), now, body))
         s.check(status == 401, f"/intent signed with the /token target's key: {status} \"{reply}\"")
-        status, reply = send("/intent", body, sign(token("hook-intent-signing-key"), now - 301, body))
+        status, reply = send("/intent", body, sign(token("intent-signing-key"), now - 301, body))
         s.check(status == 401, f"/intent with its own key but 301s old (a replay): {status} \"{reply}\"")
-        status, reply = send("/intent", body, sign(token("hook-intent-signing-key"), now, body))
+        status, reply = send("/intent", body, sign(token("intent-signing-key"), now, body))
         s.check(status == 200 and "metadata" in reply,
                 f"control: the same body signed with the intent target's key: {status}, a user to write returned")
         after = metadata_groups(bob_id)

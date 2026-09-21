@@ -329,9 +329,9 @@ services:
       - sh
       - -c
       - >-
-        until [ -s /bootstrap/hook-token-signing-key ] && [ -s /bootstrap/project-id ]; do sleep 1; done;
-        MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY="$$(cat /bootstrap/hook-intent-signing-key)"
-        MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY="$$(cat /bootstrap/hook-token-signing-key)"
+        until [ -s /bootstrap/token-signing-key ] && [ -s /bootstrap/project-id ]; do sleep 1; done;
+        MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY="$$(cat /bootstrap/intent-signing-key)"
+        MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY="$$(cat /bootstrap/token-signing-key)"
         MERIDIAN_GROUP_HOOK_PROJECT_ID="$$(cat /bootstrap/project-id)"
         exec meridian-group-hook
     environment:
@@ -341,9 +341,36 @@ services:
       - e2e-bootstrap:/bootstrap:ro
     networks: [meridian]
 
-  # Configures Zitadel through its API, idempotently: the dashboard's
-  # project, app and roles, people, the LDAP provider, and the hook's targets
-  # and executions. Writes what the others need onto the bootstrap volume.
+  # The chart's setup Job, run here with files for output: the dashboard's
+  # project, client and roles, the LDAP provider, and the hook's targets and
+  # executions, through Zitadel's API, idempotently. The same code a
+  # customer's cluster runs, so this run tests it.
+  zitadel-setup:
+    profiles: [e2e]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-group-hook", "setup"]
+    environment:
+      MERIDIAN_ZITADEL_API_URL: http://zitadel:8080
+      MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE: /bootstrap/admin.pat
+      MERIDIAN_DASHBOARD_REDIRECT_URI: http://dashboard:8080/callback
+      MERIDIAN_GROUP_HOOK_URL: http://group-hook:8090
+      MERIDIAN_ZITADEL_ROLES: e2e-staff
+      MERIDIAN_ZITADEL_DEV_MODE: "true"
+      MERIDIAN_LDAP_NAME: Firm LDAP
+      MERIDIAN_LDAP_SERVERS: ldap://ldap:1389
+      MERIDIAN_LDAP_BASE_DN: ou=people,dc=example,dc=org
+      MERIDIAN_LDAP_BIND_DN: cn=admin,dc=example,dc=org
+      MERIDIAN_LDAP_BIND_PASSWORD: ldap-admin-dev-only
+      MERIDIAN_SETUP_OUTPUT: files:/bootstrap
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - e2e-bootstrap:/bootstrap
+    networks: [meridian]
+
+  # What only the test needs, after setup: people made in Zitadel, and the
+  # identifiers the runner looks for.
   zitadel-bootstrap:
     profiles: [e2e]
     image: python:3.12-alpine

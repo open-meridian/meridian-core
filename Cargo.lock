@@ -1502,10 +1502,12 @@ dependencies = [
 name = "meridian-group-hook"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "hex",
  "hmac 0.12.1",
+ "reqwest",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

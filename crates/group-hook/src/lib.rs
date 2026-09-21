@@ -15,6 +15,7 @@
 //! holds nothing but its targets' signing keys, and is reviewed as access-control code.
 
 pub mod groups;
+pub mod setup;
 pub mod signature;
 
 use std::sync::Arc;

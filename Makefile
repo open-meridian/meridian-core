@@ -399,7 +399,7 @@ e2e-dashboard: network
 	bob() { $(E2E) exec -T ldap ldapsearch -LLL $(LDAP_ADMIN) -b ou=people,dc=example,dc=org '(uid=bob)' memberOf; }; \
 	: >.e2e-dashboard.log; \
 	{ step "building the runtime image" \
-	  && $(E2E) build dashboard conductor group-hook >>.e2e-dashboard.log 2>&1 \
+	  && $(E2E) build dashboard conductor group-hook zitadel-setup >>.e2e-dashboard.log 2>&1 \
 	  && step "starting Postgres, the broker, Zitadel, LDAP, the group hook and the stand-in platform" \
 	  && $(E2E) up -d postgres nats zitadel ldap group-hook fake-platform >>.e2e-dashboard.log 2>&1 \
 	  && step "loading the directory, with memberOf" \
@@ -408,7 +408,13 @@ e2e-dashboard: network
 	  && $(E2E) exec -T ldap ldapadd $(LDAP_ADMIN) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard.log 2>&1 \
 	  && step "applying the configuration store's schema" \
 	  && $(E2E) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard.log 2>&1 \
-	  && step "configuring Zitadel through its API" \
+	  && step "setting up Zitadel, as the chart's setup Job does" \
+	  && $(E2E) run --rm -T zitadel-setup >>.e2e-dashboard.log 2>&1 \
+	  && step "setting the same up again, which changes nothing" \
+	  && first=$$(boot client-id)$$(boot intent-signing-key) \
+	  && $(E2E) run --rm -T zitadel-setup >>.e2e-dashboard.log 2>&1 \
+	  && [ "$$first" = "$$(boot client-id)$$(boot intent-signing-key)" ] \
+	  && step "making the test's people" \
 	  && $(E2E) run --rm -T zitadel-bootstrap >>.e2e-dashboard.log 2>&1 \
 	  && step "Zitadel's database in the deployment's Postgres: $$($(E2E) exec -T postgres psql -U meridian -d meridian -Atc \
 	     "select datname || ' owned by ' || pg_get_userbyid(datdba) || ', login role ' || (select rolname from pg_roles where rolname = 'zitadel' and rolcanlogin and not rolsuper) from pg_database where datname = 'zitadel'")" \
