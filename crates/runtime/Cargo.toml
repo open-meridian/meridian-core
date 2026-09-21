@@ -30,6 +30,10 @@ path = "src/bin/conductor.rs"
 name = "meridian-dashboard"
 path = "src/bin/dashboard.rs"
 
+[[bin]]
+name = "meridian-group-hook"
+path = "src/bin/group_hook.rs"
+
 [dependencies]
 meridian-bus = { path = "../bus" }
 meridian-instrument = { path = "../instrument" }
@@ -37,6 +41,7 @@ meridian-street = { path = "../street" }
 meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
 meridian-dashboard = { path = "../dashboard" }
+meridian-group-hook = { path = "../group-hook" }
 axum.workspace = true
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true

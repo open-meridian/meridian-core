@@ -1,0 +1,20 @@
+# What `make advisories` checks, and every exception to it with its reason.
+#
+# Only advisories: licences and bans are other questions. An exception here is
+# a decision, so each one names the advisory, why it does not reach us, and
+# what would change that.
+
+[advisories]
+# Unmaintained crates are reported by their direct dependents' advisories when
+# they matter; failing the build on every one would make the gate noise.
+unmaintained = "workspace"
+ignore = [
+    # The Marvin attack: a timing side channel that can recover an RSA
+    # private key while decrypting or signing with it. `rsa` arrives through
+    # openidconnect, which the dashboard uses only to verify ID-token
+    # signatures with the directory's public keys: the dashboard holds no RSA
+    # private key and never decrypts or signs with one, so the vulnerable path
+    # is not reachable. No fixed release exists. Revisit if the dashboard ever
+    # signs or decrypts with RSA, or when a fixed `rsa` ships.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used by openidconnect only to verify signatures with public keys; no private-key operation is reachable" },
+]

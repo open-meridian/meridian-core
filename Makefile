@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        interop lint fmt lock contract-diff up down demo network codegen check-codegen
+        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -28,7 +28,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen build test test-store test-broker interop chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -113,6 +113,14 @@ check-codegen:
 		echo "Run 'make codegen' and commit the result. Never edit $(DOMAIN_RS) by hand." >&2; \
 		exit 1; \
 	fi
+
+# Published vulnerabilities in anything the workspace links, from RustSec,
+# read fresh each run. Every exception is in deny.toml with its reason.
+advisories:
+	@$(DOCKER) build -f Dockerfile.rust --target advisories . >/dev/null 2>&1 \
+		|| { echo "advisories FAILED: a published vulnerability reaches this workspace. See it with:" >&2; \
+		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; exit 1; }
+	@echo "advisories OK: no published vulnerability reaches the workspace unexplained"
 
 build:
 	@$(DOCKER) build -f Dockerfile.rust --target check . >/dev/null 2>&1 \

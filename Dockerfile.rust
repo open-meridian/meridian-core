@@ -53,3 +53,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
     cargo clippy --workspace --locked --all-targets -- -D warnings
+
+# Published vulnerabilities in anything the workspace links, from the RustSec
+# advisory database, read fresh on every run. A prebuilt cargo-deny at a pinned
+# release rather than `cargo install`, which would compile it every time the
+# cache is cold. deny.toml says what is checked and records every exception
+# with its reason.
+FROM base AS advisories
+ARG CARGO_DENY_VERSION=0.20.2
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) ARCH=x86_64 ;; \
+      arm64) ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /tmp/deny.tgz \
+      "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+ && tar -xzf /tmp/deny.tgz -C /tmp \
+ && mv /tmp/cargo-deny-*/cargo-deny /usr/local/bin/ \
+ && rm -rf /tmp/deny.tgz /tmp/cargo-deny-*
+COPY deny.toml ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo deny --locked check advisories
+
