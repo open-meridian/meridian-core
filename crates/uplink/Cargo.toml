@@ -1,10 +1,10 @@
 [package]
-name = "meridian-reference"
+name = "meridian-uplink"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The deployment's replica of the security master: resolve, pull, escalate, apply"
+description = "The deployment's end of the link to the platform: the key, the connection, and what it carries"
 
 [dependencies]
 meridian-pb.workspace = true
@@ -15,10 +15,11 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
 rand.workspace = true
-postgres.workspace = true
-r2d2.workspace = true
-r2d2_postgres.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]

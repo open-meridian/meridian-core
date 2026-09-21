@@ -114,7 +114,7 @@ def permissions_for(grants: dict, role: str, tags: list[str], instance_id: str) 
 # The components this deployment's runtime hosts. Both stores are in one
 # process today and become two, at which point each gets its own credential
 # with its own half of this: the manifest already says which topics are whose.
-COMPONENTS = ("reference", "street")
+COMPONENTS = ("reference", "street", "uplink")
 
 
 def component_permissions(manifest: str) -> tuple[list[str], list[str]]:

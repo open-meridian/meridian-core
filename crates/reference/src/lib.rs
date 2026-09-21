@@ -8,9 +8,11 @@
 //! # What it does
 //!
 //! Answers instrument questions locally (W3.1, W3.6). Reports a miss as a fact
-//! rather than a request (W3.2). Pulls from the platform when the local answer
-//! is nothing (W3.3), escalates when the platform does not know either (W3.4),
-//! and applies what comes back under a monotonic version (W3.5).
+//! rather than a request (W3.2). Applies under a monotonic version what the
+//! uplink publishes after pulling or escalating (W3.5).
+//!
+//! It does not reach the platform. W3.3 and W3.4 are the uplink's, and so is
+//! the key that would let anything here try: decision 011.
 //!
 //! # What it never does
 //!
@@ -21,13 +23,11 @@
 //! # The constraint it is built under
 //!
 //! The platform may scale, move, be redirected regionally, and go down and come
-//! back, without this crate restarting or being reconfigured. It holds one
-//! address, its own identifier and a private key, and nothing about the
-//! platform's shape.
+//! back, without this crate restarting or being reconfigured. That is easier
+//! than it was: this crate now holds no address, no identifier and no key, and
+//! learns what the platform said only because somebody published it.
 
 pub mod apply;
-pub mod assertions;
-pub mod platform;
 pub mod postgres;
 pub mod resolve;
 pub mod service;
@@ -36,9 +36,7 @@ pub mod store;
 mod memory;
 
 pub use apply::{apply, Outcome};
-pub use assertions::{DeploymentKey, SigningError};
 pub use memory::MemoryStore;
-pub use platform::{Config, HttpTransport, Platform, PlatformError, Reaction, Transport};
 pub use postgres::PostgresStore;
 pub use resolve::{missing_instrument, resolve_identifier, resolve_instrument};
 pub use service::{Handled, Reactor, SystemClock};
@@ -52,30 +50,19 @@ use meridian_bus::Bus;
 
 /// The replica, wired up.
 ///
-/// The three pieces are independent and each is testable on its own: a store, a
-/// platform client, a bus. This is the one place that says how a running
-/// deployment holds them together, so a process that wants a replica does not
-/// have to know the order.
+/// A store and a bus, and nothing else. It held a platform client until
+/// 2026-09-21, which is what put the deployment's private key in the same
+/// process as the instrument tables; decision 011 moved both to the uplink.
+/// What arrives here now arrives on the bus like everything else.
 pub struct Replica {
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
-    platform: Arc<Platform>,
     clock: Arc<dyn service::Clock>,
 }
 
 impl Replica {
-    pub fn new(
-        bus: Arc<Bus>,
-        store: Arc<dyn Store>,
-        platform: Arc<Platform>,
-        clock: Arc<dyn service::Clock>,
-    ) -> Self {
-        Self {
-            bus,
-            store,
-            platform,
-            clock,
-        }
+    pub fn new(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn service::Clock>) -> Self {
+        Self { bus, store, clock }
     }
 
     /// Subscribe, register the query handlers, and hand back the loop to run.
@@ -95,9 +82,9 @@ impl Replica {
     /// let running = tokio::spawn(replica.start());
     /// ```
     pub fn start(self) -> impl std::future::Future<Output = ()> {
-        let misses = self.bus.subscribe(service::INSTRUMENT_MISSING);
+        let pulled = self.bus.subscribe(service::INSTRUMENT_PULLED);
         service::serve_queries(&self.bus, self.store.clone());
 
-        Reactor::new(self.bus, self.store, self.platform, self.clock).consume(misses)
+        Reactor::new(self.bus, self.store, self.clock).consume(pulled)
     }
 }

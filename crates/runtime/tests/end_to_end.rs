@@ -18,9 +18,8 @@ use meridian_pb::v1::{
     ResolveIdentifierRequest,
 };
 use meridian_reference::store::Store;
-use meridian_reference::{
-    resolve_identifier, Config, DeploymentKey, HttpTransport, Platform, PostgresStore, Reaction,
-};
+use meridian_reference::{resolve_identifier, PostgresStore};
+use meridian_uplink::{Config, DeploymentKey, HttpTransport, Platform, Reaction};
 
 fn required(name: &str) -> String {
     std::env::var(name)

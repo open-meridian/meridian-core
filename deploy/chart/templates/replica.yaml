@@ -40,10 +40,6 @@ spec:
           env:
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
-            - name: MERIDIAN_PLATFORM_ADDRESS
-              value: {{ .Values.platform.address | quote }}
-            - name: MERIDIAN_KEY_PATH
-              value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-replica
             - name: MERIDIAN_BROKER_URL
@@ -61,43 +57,12 @@ spec:
           # No port. Everything this component says goes over the broker, so
           # nothing outside its pod needs to reach it. A Service in front of it
           # would be a second way in that nothing asks for.
-          volumeMounts:
-            # One directory holding both files, because the runtime reads them
-            # from fixed paths there. Two volumes cannot do it: mounting the
-            # grants file inside the key's mount is a mount onto a mount, and
-            # the container refuses to start with a message about directories.
-            #
-            # Read-only, because the replica only generates a key when it has
-            # none, and in a cluster it always has one: you made it.
-            - name: config
-              mountPath: /etc/meridian
-              readOnly: true
-            {{- if .Values.key.generate }}
-            # The key the replica made, in a volume only it mounts. Writable,
-            # because the first start is what creates the pair; after that
-            # nothing writes here again.
-            - name: key
-              mountPath: /var/lib/meridian
-            {{- end }}
+          # No volumes. The key and the platform address moved to the uplink
+          # with the connection that used them (decisions/011), and this
+          # component now mounts nothing at all: what it learns, it learns on
+          # the bus.
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      volumes:
-        {{- if .Values.key.generate }}
-        - name: key
-          persistentVolumeClaim:
-            claimName: {{ include "meridian-runtime.fullname" . }}-key
-        {{- end }}
-        - name: config
-          projected:
-            defaultMode: 0400
-            sources:
-              {{- if .Values.key.existingSecret }}
-              - secret:
-                  name: {{ .Values.key.existingSecret }}
-                  items:
-                    - key: {{ .Values.key.key }}
-                      path: key.pem
-              {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

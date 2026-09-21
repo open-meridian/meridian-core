@@ -45,15 +45,10 @@ use meridian_pb::v1::{
     ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
 };
 
+use meridian_symbology::rank;
+
 use crate::apply::to_wire;
 use crate::store::{Instrument, Result, Store};
-
-/// Global schemes, strongest first.
-///
-/// Ordered by how hard the scheme is to confuse: a FIGI names a listing, an
-/// ISIN names an issue, and the national schemes below it are narrower still in
-/// coverage while being no more precise.
-const GLOBAL_PRIORITY: [&str; 4] = ["figi", "isin", "cusip", "sedol"];
 
 /// W3.1 — which instrument this identifier set meant, on that date.
 pub fn resolve_identifier(
@@ -150,40 +145,6 @@ pub fn missing_instrument(
         reason: reply.miss_reason,
         observed_at_ns,
     })
-}
-
-/// The global identifiers in a set, strongest first.
-///
-/// Source-scoped ones are dropped rather than ordered last: this is what the
-/// platform is asked, and a brokerage symbol means nothing outside the rail that
-/// issued it, so sending one centrally would make the master's answer depend on
-/// who happened to ask.
-pub(crate) fn global_identifiers_strongest_first(
-    identifiers: &[PbIdentifier],
-) -> Vec<&PbIdentifier> {
-    let mut global: Vec<&PbIdentifier> = identifiers
-        .iter()
-        .filter(|identifier| identifier.source.is_empty())
-        .collect();
-
-    // The same order the local resolve falls through, from the same table.
-    // Two orderings would be two things to keep in step.
-    global.sort_by_key(|identifier| rank(identifier));
-    global
-}
-
-/// Where in the fallback order this identifier sits. Lower is stronger.
-fn rank(identifier: &PbIdentifier) -> usize {
-    if !identifier.source.is_empty() {
-        // Source-scoped, and therefore weakest whatever it calls itself.
-        return GLOBAL_PRIORITY.len() + 1;
-    }
-
-    GLOBAL_PRIORITY
-        .iter()
-        .position(|scheme| *scheme == identifier.scheme)
-        // A global scheme nobody ranked still outranks a brokerage symbol.
-        .unwrap_or(GLOBAL_PRIORITY.len())
 }
 
 /// Whether the request's venue and currency admit this match.

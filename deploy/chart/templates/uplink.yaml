@@ -1,0 +1,107 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The uplink. The one component holding the deployment's key, and therefore the
+  only one that can reach the platform at all. Decision 011.
+
+  No database, and that is the design rather than an omission: what the platform
+  published can be fetched again, so a control process with a store would be a
+  fourth thing to migrate and the one nobody wrote migrations for.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-uplink
+  labels:
+    meridian.dev/component: uplink
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.uplink.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: uplink
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: uplink
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: uplink
+          image: "{{ .Values.image.repository }}:{{ .Values.uplink.image.tag | default .Values.image.tag }}"
+          args: ["meridian-uplink"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_DEPLOYMENT_ID
+              value: {{ .Values.deployment.id | quote }}
+            - name: MERIDIAN_PLATFORM_ADDRESS
+              value: {{ .Values.platform.address | quote }}
+            - name: MERIDIAN_KEY_PATH
+              value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-uplink
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.broker.existingSecret }}
+                  key: {{ .Values.broker.uplinkKey }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          # No port and no Service. It speaks outward over HTTPS and inward over
+          # the broker; nothing needs to reach it.
+          volumeMounts:
+            - name: config
+              mountPath: /etc/meridian
+              readOnly: true
+            {{- if .Values.key.generate }}
+            # The key this component made, in a volume only it mounts. Writable,
+            # because the first start is what creates the pair; after that
+            # nothing writes here again.
+            - name: key
+              mountPath: /var/lib/meridian
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.key.generate }}
+        - name: key
+          persistentVolumeClaim:
+            claimName: {{ include "meridian-runtime.fullname" . }}-key
+        {{- end }}
+        - name: config
+          projected:
+            defaultMode: 0400
+            sources:
+              {{- if .Values.key.existingSecret }}
+              - secret:
+                  name: {{ .Values.key.existingSecret }}
+                  items:
+                    - key: {{ .Values.key.key }}
+                      path: key.pem
+              {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

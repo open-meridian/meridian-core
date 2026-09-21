@@ -38,13 +38,12 @@ use std::sync::Arc;
 
 use meridian_bus::{Bus, Delivery};
 use meridian_pb::v1::{
-    InstrumentRecord as PbInstrument, MissingInstrumentDetectedEvent, ResolveIdentifierRequest,
+    InstrumentRecord as PbInstrument, PullInstrumentReply, ResolveIdentifierRequest,
     ResolveInstrumentRequest,
 };
 use prost::Message;
 
 use crate::apply::apply;
-use crate::platform::{Platform, Reaction};
 use crate::resolve::{resolve_identifier, resolve_instrument};
 use crate::store::{Applied, Store};
 
@@ -56,6 +55,14 @@ pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrumen
 
 /// W3.2. A connector reporting that a resolution missed.
 pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missing";
+
+/// W3.3 and W3.4. What the uplink got from the platform, for applying.
+///
+/// The replica subscribes rather than fetching. It holds no key and therefore
+/// cannot reach the platform at all, which is the property decision 011 bought:
+/// a defect in instrument storage is no longer a defect in the process holding
+/// the deployment's identity.
+pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
 
 /// W3.5. The replica announcing what it did with a record.
 pub const INSTRUMENT_APPLIED: &str = "platform.reference.event.instrument-applied";
@@ -128,57 +135,38 @@ pub fn serve_queries(bus: &Bus, store: Arc<dyn Store>) {
 /// What one delivery came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Handled {
-    /// Not a miss event, or not a readable one. Nothing was sent anywhere.
+    /// Not a pulled record, or not a readable one. Nothing was written.
     ///
     /// A payload arriving under the wrong type name is refused rather than
     /// decoded: protobuf will happily read one message as another and hand back
-    /// defaults, and defaults here would mean escalating an empty identifier
-    /// set to the platform.
+    /// defaults, and a defaulted record here would be an instrument with no
+    /// identity written into the replica.
     Ignored(String),
 
-    /// The platform answered. What it said, and what the replica did with it.
-    Reacted(Reaction, Option<Applied>),
-
-    /// The platform could not be reached, so nothing happened.
-    ///
-    /// Not an error to anybody upstream. The connector reports the same miss
-    /// again on its next statement, and the throttle entry has already been
-    /// cleared so that report is acted on.
-    PlatformAway(String),
+    /// A record was applied, or was an equal-or-older version and was not.
+    Applied(Applied),
 }
 
-/// Consumes misses and reacts to them. W3.2 in; W3.3, W3.4 and W3.5 out.
+/// Consumes pulled records and applies them. W3.3 and W3.4 in; W3.5 out.
 pub struct Reactor {
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
-    platform: Arc<Platform>,
     clock: Arc<dyn Clock>,
 }
 
 impl Reactor {
-    pub fn new(
-        bus: Arc<Bus>,
-        store: Arc<dyn Store>,
-        platform: Arc<Platform>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            bus,
-            store,
-            platform,
-            clock,
-        }
+    pub fn new(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Self {
+        Self { bus, store, clock }
     }
 
-    /// Consume misses until the bus shuts down.
+    /// Consume pulled records until the bus shuts down.
     ///
-    /// Never returns early on a failure. A platform that is away is the case
-    /// this loop exists to survive, and a loop that exited on one would need a
-    /// person to start it again, which is exactly what the deployment must not
-    /// need.
+    /// Never returns early on a failure. An undecodable delivery is one
+    /// delivery, and a loop that exited on one would need a person to start it
+    /// again, which is exactly what a deployment must not need.
     pub async fn run(self) {
-        let misses = self.bus.subscribe(INSTRUMENT_MISSING);
-        self.consume(misses).await
+        let pulled = self.bus.subscribe(INSTRUMENT_PULLED);
+        self.consume(pulled).await
     }
 
     /// The same loop over a subscription the caller made.
@@ -187,52 +175,41 @@ impl Reactor {
     /// Subscribing inside the task that consumes is a race: at-most-once
     /// delivery drops what arrives before the subscriber exists, and the loss
     /// is silent by design.
-    pub async fn consume(self, mut misses: meridian_bus::Subscription) {
-        while let Some(delivery) = misses.recv().await {
-            let handled = self.react(delivery).await;
-
-            match handled {
+    pub async fn consume(self, mut pulled: meridian_bus::Subscription) {
+        while let Some(delivery) = pulled.recv().await {
+            match self.react(delivery).await {
                 Handled::Ignored(why) => tracing::warn!(why, "ignored a delivery"),
-                Handled::PlatformAway(why) => {
-                    // Expected, not exceptional. Logged so an operator can see
-                    // how long it has been going on, not so somebody acts.
-                    tracing::info!(why, "the platform is away; the miss will be reported again")
-                }
-                Handled::Reacted(reaction, applied) => {
-                    tracing::debug!(?reaction, ?applied, "reacted to a miss")
-                }
+                Handled::Applied(applied) => tracing::debug!(?applied, "applied a pulled record"),
             }
         }
     }
 
-    /// React to one delivery.
+    /// Apply one delivery.
     ///
     /// Public so a test can drive it without a running loop, and so a caller
     /// that wants its own scheduling is not forced through [`Reactor::run`].
     pub async fn react(&self, delivery: Delivery) -> Handled {
         let envelope = delivery.envelope;
-        if envelope.payload_type != "meridian.v1.MissingInstrumentDetectedEvent" {
+        if envelope.payload_type != "meridian.v1.PullInstrumentReply" {
             return Handled::Ignored(format!("payload type {}", envelope.payload_type));
         }
 
-        let event = match MissingInstrumentDetectedEvent::decode(&envelope.payload[..]) {
-            Ok(event) => event,
-            Err(failed) => return Handled::Ignored(format!("undecodable miss: {failed}")),
+        let reply = match PullInstrumentReply::decode(&envelope.payload[..]) {
+            Ok(reply) => reply,
+            Err(failed) => return Handled::Ignored(format!("undecodable record: {failed}")),
+        };
+
+        // `found: false` is not published -- the uplink stays silent when the
+        // platform knew nothing -- so one arriving is a publisher that does not
+        // agree with this one about what the topic means. Refused rather than
+        // treated as a deletion.
+        let Some(record) = reply.instrument.filter(|_| reply.found) else {
+            return Handled::Ignored("a pulled record carrying no instrument".into());
         };
 
         let now_ns = self.clock.now_ns();
-        let reaction = match self.platform.react_to_miss(&event, now_ns).await {
-            Ok(reaction) => reaction,
-            Err(failed) => return Handled::PlatformAway(failed.to_string()),
-        };
-
-        let record = match &reaction {
-            Reaction::Pulled(record) | Reaction::Minted(record) => (**record).clone(),
-            _ => return Handled::Reacted(reaction, None),
-        };
-
         match self.apply_and_announce(record, &envelope, now_ns).await {
-            Ok(applied) => Handled::Reacted(reaction, Some(applied)),
+            Ok(applied) => Handled::Applied(applied),
             Err(failed) => Handled::Ignored(failed),
         }
     }
@@ -289,27 +266,24 @@ mod tests {
 
     use meridian_bus::{Envelope, MemoryBackend, MessageMeta};
     use meridian_pb::v1::{
-        Identifier as PbIdentifier, InstrumentAppliedEvent, MissReason, ResolveIdentifierReply,
+        Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentLifecycleState,
+        ResolveIdentifierReply, ResolveIdentifierRequest as PbResolveIdentifierRequest,
         ResolveInstrumentReply,
     };
 
     use super::*;
-    use crate::platform::tests::{failure, platform as platform_with, record_json, Fake, AS_OF};
     use crate::store::Identifier;
     use crate::{Instrument, MemoryStore};
 
+    /// The fixture's as-of.
+    const AS_OF: i64 = 1_757_289_600_000_000_000;
     const NOW: i64 = 1_757_376_000_000_000_000;
 
-    /// A clock a test moves by hand.
     struct Stopped(AtomicI64);
 
     impl Stopped {
         fn at(now_ns: i64) -> Arc<Self> {
             Arc::new(Self(AtomicI64::new(now_ns)))
-        }
-
-        fn advance(&self, by_ns: i64) {
-            self.0.fetch_add(by_ns, Ordering::SeqCst);
         }
     }
 
@@ -344,19 +318,25 @@ mod tests {
         }
     }
 
-    fn miss_event() -> MissingInstrumentDetectedEvent {
-        MissingInstrumentDetectedEvent {
-            source: "snaptrade".into(),
-            asset_class: "EQUITY".into(),
-            identifiers: vec![PbIdentifier {
-                scheme: "figi".into(),
-                value: "BBG000ZZTOP1".into(),
-                source: String::new(),
-            }],
-            as_of_ns: AS_OF,
-            publisher_instance_id: "custody-snaptrade-1".into(),
-            reason: MissReason::NotFound as i32,
-            observed_at_ns: NOW,
+    /// What the uplink publishes after the platform answered.
+    fn pulled(instrument_id: &str, version: i64) -> PullInstrumentReply {
+        PullInstrumentReply {
+            found: true,
+            instrument: Some(PbInstrument {
+                instrument_id: instrument_id.into(),
+                identifiers: vec![PbIdentifier {
+                    scheme: "figi".into(),
+                    value: "BBG000ZZTOP1".into(),
+                    source: String::new(),
+                }],
+                asset_class: "EQUITY".into(),
+                currency: "USD".into(),
+                exchange_mic: "XNAS".into(),
+                lifecycle_state: InstrumentLifecycleState::Active as i32,
+                version,
+                valid_from_ns: AS_OF - 1,
+                ..Default::default()
+            }),
         }
     }
 
@@ -376,11 +356,11 @@ mod tests {
         Delivery {
             envelope: Envelope {
                 meta: Some(MessageMeta {
-                    message_id: "MSG-MISS".into(),
+                    message_id: "MSG-PULLED".into(),
                     correlation_id: correlation.into(),
                     causation_id: String::new(),
-                    publisher_instance_id: "custody-snaptrade-1".into(),
-                    topic: INSTRUMENT_MISSING.into(),
+                    publisher_instance_id: "uplink-1".into(),
+                    topic: INSTRUMENT_PULLED.into(),
                     schema_version: "v1".into(),
                     published_at_ns: NOW,
                 }),
@@ -391,38 +371,36 @@ mod tests {
         }
     }
 
-    fn reactor(
-        bus: Arc<Bus>,
-        store: Arc<dyn Store>,
-        transport: Arc<Fake>,
-        clock: Arc<Stopped>,
-    ) -> Reactor {
-        Reactor::new(bus, store, Arc::new(platform_with(transport)), clock)
+    fn reactor(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<Stopped>) -> Reactor {
+        Reactor::new(bus, store, clock)
     }
 
     #[tokio::test]
     async fn a_resolve_is_answered_from_the_store() {
-        let bus = bus();
+        // No platform anywhere in this test, and there is no longer one to
+        // stub: the replica cannot reach the platform at all. What used to be
+        // asserted by faking an outage is now structural.
         let store = Arc::new(MemoryStore::new());
         store.apply(held()).unwrap();
-        serve_queries(&bus, store);
 
-        let request = ResolveIdentifierRequest {
-            identifiers: vec![PbIdentifier {
-                scheme: "figi".into(),
-                value: "BBG000B9XRY4".into(),
-                source: String::new(),
-            }],
-            as_of_ns: AS_OF,
-            exchange_mic: String::new(),
-            currency: String::new(),
-        };
+        let bus = bus();
+        serve_queries(&bus, store);
 
         let (payload_type, payload) = bus
             .call(
                 RESOLVE_IDENTIFIER,
                 "meridian.v1.ResolveIdentifierRequest",
-                request.encode_to_vec(),
+                PbResolveIdentifierRequest {
+                    identifiers: vec![PbIdentifier {
+                        scheme: "figi".into(),
+                        value: "BBG000B9XRY4".into(),
+                        source: String::new(),
+                    }],
+                    as_of_ns: AS_OF,
+                    exchange_mic: String::new(),
+                    currency: String::new(),
+                }
+                .encode_to_vec(),
                 None,
                 None,
             )
@@ -437,9 +415,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_forward_resolve_is_answered_from_the_store() {
-        let bus = bus();
         let store = Arc::new(MemoryStore::new());
         store.apply(held()).unwrap();
+
+        let bus = bus();
         serve_queries(&bus, store);
 
         let (_, payload) = bus
@@ -459,248 +438,173 @@ mod tests {
 
         let reply = ResolveInstrumentReply::decode(&payload[..]).unwrap();
         assert!(reply.found);
-        assert_eq!(
-            reply.instrument.unwrap().description,
-            "Apple Inc. common stock"
-        );
+        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-HELD");
+    }
+
+    #[tokio::test]
+    async fn a_pulled_record_is_applied_and_announced() {
+        let store = Arc::new(MemoryStore::new());
+        let bus = bus();
+        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
+
+        let handled = reactor(Arc::clone(&bus), store.clone(), Stopped::at(NOW))
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pulled("INS-ZZTOP", 1).encode_to_vec(),
+                "CORR-1",
+            ))
+            .await;
+
+        assert!(matches!(handled, Handled::Applied(_)), "{handled:?}");
+        assert!(store.by_id("INS-ZZTOP").unwrap().is_some());
+
+        let announced = next(&mut applied).await;
+        let event = InstrumentAppliedEvent::decode(&announced.envelope.payload[..]).unwrap();
+        assert_eq!(event.instrument.unwrap().instrument_id, "INS-ZZTOP");
+    }
+
+    #[tokio::test]
+    async fn the_announcement_is_caused_by_the_record_that_prompted_it() {
+        // The arc reads as one chain across three processes: the resolve that
+        // missed, the pull that answered it, the apply that followed. The
+        // correlation travels; the causation points at the delivery in hand.
+        let store = Arc::new(MemoryStore::new());
+        let bus = bus();
+        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
+
+        reactor(Arc::clone(&bus), store, Stopped::at(NOW))
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pulled("INS-ZZTOP", 1).encode_to_vec(),
+                "CORR-1",
+            ))
+            .await;
+
+        let meta = next(&mut applied).await.envelope.meta.unwrap();
+        assert_eq!(meta.correlation_id, "CORR-1");
+        assert_eq!(meta.causation_id, "MSG-PULLED");
+    }
+
+    #[tokio::test]
+    async fn an_older_version_is_applied_as_a_no_op() {
+        let store = Arc::new(MemoryStore::new());
+        let bus = bus();
+
+        let reactor = reactor(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
+        reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pulled("INS-ZZTOP", 4).encode_to_vec(),
+                "CORR-1",
+            ))
+            .await;
+        reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pulled("INS-ZZTOP", 2).encode_to_vec(),
+                "CORR-2",
+            ))
+            .await;
+
+        assert_eq!(store.by_id("INS-ZZTOP").unwrap().unwrap().version, 4);
     }
 
     #[tokio::test]
     async fn a_payload_under_the_wrong_type_name_is_refused_rather_than_decoded() {
-        // Protobuf will read one message as another and hand back defaults. A
-        // defaulted resolve request is an empty identifier set, which would
-        // answer "not found" to a question nobody asked.
-        let bus = bus();
-        serve_queries(&bus, Arc::new(MemoryStore::new()));
-
-        let failed = bus
-            .call(
-                RESOLVE_IDENTIFIER,
-                "meridian.v1.ResolveInstrumentRequest",
-                ResolveInstrumentRequest::default().encode_to_vec(),
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(
-            failed
-                .to_string()
-                .contains("expected meridian.v1.ResolveIdentifierRequest"),
-            "{failed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_miss_is_pulled_applied_and_announced() {
-        let bus = bus();
+        // protobuf will read one message as another and hand back defaults. A
+        // defaulted record here would be an instrument with no identity,
+        // written into the replica because a type name was wrong.
         let store = Arc::new(MemoryStore::new());
-        let transport = Fake::new(vec![Ok(crate::platform::tests::reply(
-            200,
-            &record_json("INS-PULLED"),
-        ))]);
-        let mut announced = bus.subscribe(INSTRUMENT_APPLIED);
+        let bus = bus();
 
-        let reactor = reactor(bus.clone(), store.clone(), transport, Stopped::at(NOW));
-        let handled = reactor
+        let handled = reactor(bus, store.clone(), Stopped::at(NOW))
             .react(delivery(
-                "meridian.v1.MissingInstrumentDetectedEvent",
-                miss_event().encode_to_vec(),
-                "COR-1",
+                "meridian.v1.InstrumentAppliedEvent",
+                pulled("INS-ZZTOP", 1).encode_to_vec(),
+                "CORR-1",
             ))
             .await;
 
-        assert!(matches!(
-            handled,
-            Handled::Reacted(Reaction::Pulled(_), Some(Applied::Stored))
-        ));
-        assert_eq!(store.version_of("INS-PULLED").unwrap(), Some(4));
-
-        let delivered = next(&mut announced).await;
-        assert_eq!(
-            delivered.envelope.payload_type,
-            "meridian.v1.InstrumentAppliedEvent"
-        );
-        let event = InstrumentAppliedEvent::decode(&delivered.envelope.payload[..]).unwrap();
-        assert!(event.applied);
-        assert_eq!(event.instrument.unwrap().instrument_id, "INS-PULLED");
+        assert!(matches!(handled, Handled::Ignored(_)), "{handled:?}");
+        assert!(store.by_id("INS-ZZTOP").unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn the_announcement_is_caused_by_the_miss_that_prompted_it() {
-        // So the resolution that missed, the pull that answered it and the
-        // apply that followed read as one chain rather than three unrelated
-        // events.
+    async fn an_unreadable_record_is_ignored_rather_than_applied() {
+        let store = Arc::new(MemoryStore::new());
         let bus = bus();
-        let transport = Fake::new(vec![Ok(crate::platform::tests::reply(
-            200,
-            &record_json("INS-PULLED"),
-        ))]);
-        let mut announced = bus.subscribe(INSTRUMENT_APPLIED);
 
-        reactor(
-            bus.clone(),
-            Arc::new(MemoryStore::new()),
-            transport,
-            Stopped::at(NOW),
-        )
-        .react(delivery(
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            miss_event().encode_to_vec(),
-            "COR-1",
-        ))
-        .await;
+        let handled = reactor(bus, store, Stopped::at(NOW))
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                vec![0xff, 0xff, 0xff],
+                "CORR-1",
+            ))
+            .await;
 
-        let meta = next(&mut announced).await.envelope.meta.unwrap();
-        assert_eq!(meta.correlation_id, "COR-1");
-        assert_eq!(meta.causation_id, "MSG-MISS");
+        assert!(matches!(handled, Handled::Ignored(_)), "{handled:?}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_platform_outage_stops_the_reaction_and_nothing_else() {
-        let bus = bus();
+    #[tokio::test]
+    async fn a_reply_carrying_no_instrument_is_refused() {
+        // The uplink stays silent when the platform knew nothing, so one of
+        // these means a publisher that disagrees about what the topic means.
+        // Refused rather than treated as a deletion.
         let store = Arc::new(MemoryStore::new());
-        store.apply(held()).unwrap();
-        serve_queries(&bus, store.clone());
+        let bus = bus();
 
-        let handled = reactor(
-            bus.clone(),
-            store.clone(),
-            Fake::new(vec![failure("connection reset")]),
-            Stopped::at(NOW),
-        )
-        .react(delivery(
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            miss_event().encode_to_vec(),
-            "COR-1",
-        ))
-        .await;
-
-        assert!(matches!(handled, Handled::PlatformAway(_)));
-        assert_eq!(store.count().unwrap(), 1);
-
-        // And the query surface never noticed.
-        let (_, payload) = bus
-            .call(
-                RESOLVE_INSTRUMENT,
-                "meridian.v1.ResolveInstrumentRequest",
-                ResolveInstrumentRequest {
-                    instrument_id: "INS-HELD".into(),
-                    as_of_ns: AS_OF,
+        let handled = reactor(bus, store, Stopped::at(NOW))
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                PullInstrumentReply {
+                    found: false,
+                    instrument: None,
                 }
                 .encode_to_vec(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(ResolveInstrumentReply::decode(&payload[..]).unwrap().found);
+                "CORR-1",
+            ))
+            .await;
+
+        assert!(matches!(handled, Handled::Ignored(_)), "{handled:?}");
     }
 
     #[tokio::test]
-    async fn a_delivery_that_is_not_a_miss_is_ignored() {
-        let handled = reactor(
-            bus(),
-            Arc::new(MemoryStore::new()),
-            Fake::new(vec![]),
-            Stopped::at(NOW),
-        )
-        .react(delivery("meridian.v1.SyncStatusEvent", vec![], "COR-1"))
-        .await;
-
-        match handled {
-            Handled::Ignored(why) => assert!(why.contains("SyncStatusEvent"), "{why}"),
-            other => panic!("expected the delivery to be ignored, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_miss_is_ignored_rather_than_acted_on() {
-        let handled = reactor(
-            bus(),
-            Arc::new(MemoryStore::new()),
-            Fake::new(vec![]),
-            Stopped::at(NOW),
-        )
-        .react(delivery(
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            vec![0xff, 0xff, 0xff],
-            "COR-1",
-        ))
-        .await;
-
-        assert!(matches!(handled, Handled::Ignored(_)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_loop_survives_an_outage_and_resumes_with_nothing_restarted() {
-        // The requirement the deployment is built to: take the platform away,
-        // put it back, and nobody intervenes.
-        let bus = bus();
+    async fn the_loop_consumes_what_the_bus_delivers() {
         let store = Arc::new(MemoryStore::new());
-        let transport = Fake::new(vec![
-            failure("connection reset"),
-            failure("connection reset"),
-            failure("connection reset"),
-            Ok(crate::platform::tests::reply(
-                200,
-                &record_json("INS-PULLED"),
-            )),
-        ]);
-        let clock = Stopped::at(NOW);
-        let reactor = reactor(bus.clone(), store.clone(), transport.clone(), clock.clone());
+        let bus = bus();
+        let pulled_sub = bus.subscribe(INSTRUMENT_PULLED);
+        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
 
-        let miss = delivery(
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            miss_event().encode_to_vec(),
-            "COR-1",
+        tokio::spawn(
+            reactor(Arc::clone(&bus), store.clone(), Stopped::at(NOW)).consume(pulled_sub),
         );
 
-        // Away: three attempts, no record, and the throttle cleared so the next
-        // report is acted on rather than skipped.
-        assert!(matches!(
-            reactor.react(miss.clone()).await,
-            Handled::PlatformAway(_)
-        ));
-        assert_eq!(store.count().unwrap(), 0);
+        bus.publish(
+            INSTRUMENT_PULLED,
+            "meridian.v1.PullInstrumentReply",
+            pulled("INS-ZZTOP", 1).encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
 
-        // Back. Same process, same configuration, no restart.
-        clock.advance(1_000_000_000);
-        assert!(matches!(
-            reactor.react(miss).await,
-            Handled::Reacted(Reaction::Pulled(_), Some(Applied::Stored))
-        ));
-        assert_eq!(store.version_of("INS-PULLED").unwrap(), Some(4));
-        assert_eq!(transport.calls(), 4);
+        let announced = next(&mut applied).await;
+        let event = InstrumentAppliedEvent::decode(&announced.envelope.payload[..]).unwrap();
+        assert_eq!(event.instrument.unwrap().instrument_id, "INS-ZZTOP");
     }
 
     #[tokio::test]
-    async fn a_wired_replica_answers_and_reacts() {
-        // Everything this crate does, through the surface a running deployment
-        // actually uses.
-        let bus = bus();
+    async fn a_wired_replica_answers_and_applies() {
         let store = Arc::new(MemoryStore::new());
         store.apply(held()).unwrap();
-        let transport = Fake::new(vec![Ok(crate::platform::tests::reply(
-            200,
-            &record_json("INS-PULLED"),
-        ))]);
-        let mut announced = bus.subscribe(INSTRUMENT_APPLIED);
 
-        // `start` registers before it returns, so there is no window in which
-        // the replica is running and answers nothing.
-        let running = tokio::spawn(
-            crate::Replica::new(
-                bus.clone(),
-                store.clone(),
-                Arc::new(platform_with(transport)),
-                Stopped::at(NOW),
-            )
-            .start(),
-        );
+        let bus = bus();
+        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
 
-        // It answers from what it holds.
+        let replica = crate::Replica::new(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
+        tokio::spawn(replica.start());
+
+        // The queries it registered.
         let (_, payload) = bus
             .call(
                 RESOLVE_INSTRUMENT,
@@ -717,53 +621,18 @@ mod tests {
             .unwrap();
         assert!(ResolveInstrumentReply::decode(&payload[..]).unwrap().found);
 
-        // And it reacts to what it does not.
+        // And the subscription it took before returning.
         bus.publish(
-            INSTRUMENT_MISSING,
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            miss_event().encode_to_vec(),
+            INSTRUMENT_PULLED,
+            "meridian.v1.PullInstrumentReply",
+            pulled("INS-ZZTOP", 1).encode_to_vec(),
             None,
             None,
         )
         .unwrap();
 
-        next(&mut announced).await;
-        assert_eq!(store.version_of("INS-PULLED").unwrap(), Some(4));
-
-        running.abort();
-    }
-
-    #[tokio::test]
-    async fn the_reaction_loop_consumes_what_the_bus_delivers() {
-        let bus = bus();
-        let store = Arc::new(MemoryStore::new());
-        let transport = Fake::new(vec![Ok(crate::platform::tests::reply(
-            200,
-            &record_json("INS-PULLED"),
-        ))]);
-        let mut announced = bus.subscribe(INSTRUMENT_APPLIED);
-
-        let misses = bus.subscribe(INSTRUMENT_MISSING);
-        let running = tokio::spawn(
-            reactor(bus.clone(), store.clone(), transport, Stopped::at(NOW)).consume(misses),
-        );
-
-        bus.publish(
-            INSTRUMENT_MISSING,
-            "meridian.v1.MissingInstrumentDetectedEvent",
-            miss_event().encode_to_vec(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let delivered = next(&mut announced).await;
-        assert_eq!(
-            delivered.envelope.payload_type,
-            "meridian.v1.InstrumentAppliedEvent"
-        );
-        assert_eq!(store.version_of("INS-PULLED").unwrap(), Some(4));
-
-        running.abort();
+        let announced = next(&mut applied).await;
+        let event = InstrumentAppliedEvent::decode(&announced.envelope.payload[..]).unwrap();
+        assert_eq!(event.instrument.unwrap().instrument_id, "INS-ZZTOP");
     }
 }

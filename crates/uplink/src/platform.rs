@@ -51,7 +51,7 @@ use meridian_pb::v1::{
 use serde::Deserialize;
 
 use crate::assertions::{DeploymentKey, SigningError, MAX_LIFETIME_SECONDS};
-use crate::resolve::global_identifiers_strongest_first;
+use meridian_symbology::global_identifiers_strongest_first;
 
 /// How a request is made. Two verbs is all the contract uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1465,54 +1465,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_replica_keeps_answering_while_the_platform_is_away() {
-        // The requirement the whole crate exists for. A platform outage is an
-        // error on this call and nothing at all downstream.
-        use crate::{apply, resolve_identifier, MemoryStore};
-        use meridian_pb::v1::ResolveIdentifierRequest;
-
-        let store = MemoryStore::new();
-        apply(
-            &store,
-            PbInstrument {
-                instrument_id: "INS-HELD".into(),
-                identifiers: vec![PbIdentifier {
-                    scheme: "figi".into(),
-                    value: "BBG000B9XRY4".into(),
-                    source: String::new(),
-                }],
-                lifecycle_state: meridian_pb::v1::InstrumentLifecycleState::Active as i32,
-                version: 1,
-                valid_from_ns: AS_OF - 1,
-                ..Default::default()
-            },
-            NOW,
-        )
-        .unwrap();
-
+    async fn an_outage_is_an_error_here_and_nothing_downstream() {
+        // The requirement the split exists for, from this side. A platform
+        // outage is an error on this call and nothing at all downstream: the
+        // replica is a separate process holding a separate store, and it never
+        // hears about this.
+        //
+        // The other half of the assertion -- that a resolve still answers --
+        // moved to meridian-reference with the replica on 2026-09-21. It is
+        // structural there rather than tested: that crate has no platform
+        // client to fail, and no key that would let it build one.
         let transport = Fake::new(vec![failure("no route to host")]);
+
         assert!(platform(transport)
             .pull_instrument("INS-OTHER", AS_OF, NOW)
             .await
             .unwrap_err()
             .is_outage());
-
-        let reply = resolve_identifier(
-            &store,
-            &ResolveIdentifierRequest {
-                identifiers: vec![PbIdentifier {
-                    scheme: "figi".into(),
-                    value: "BBG000B9XRY4".into(),
-                    source: String::new(),
-                }],
-                as_of_ns: AS_OF,
-                exchange_mic: String::new(),
-                currency: String::new(),
-            },
-        )
-        .unwrap();
-
-        assert!(reply.found);
-        assert_eq!(reply.instrument_id, "INS-HELD");
     }
 }

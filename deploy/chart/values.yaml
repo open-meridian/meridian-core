@@ -99,6 +99,13 @@ replica:
   image:
     tag: ""
 
+uplink:
+  replicaCount: 1
+  image:
+    # Its own tag, so the component that talks to the platform can be moved
+    # without touching either store. Empty falls back to image.tag.
+    tag: ""
+
 street:
   replicaCount: 1
   image:
@@ -116,6 +123,7 @@ street:
 broker:
   existingSecret: ""
   replicaKey: replica
+  uplinkKey: uplink
   streetKey: street
 
 # A sidecar per plugin, each with the identity it is launched with. The key in

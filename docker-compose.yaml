@@ -76,8 +76,9 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
-  # The replica. Holds the deployment's key, because it is the component that
-  # talks to the platform.
+  # The replica. A store and a bus, and nothing else: no key, no platform
+  # address, no network beyond the broker. Decision 011 moved all three to the
+  # uplink below.
   replica:
     build:
       context: .
@@ -91,10 +92,26 @@ services:
     environment:
       MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: replica-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
+  # The uplink. The key, the platform connection, and nothing else: no database,
+  # because what the platform published can be fetched again.
+  uplink:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-uplink"]
+    depends_on:
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
       MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
       MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
-      MERIDIAN_INSTANCE_ID: replica-1
+      MERIDIAN_INSTANCE_ID: uplink-1
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - runtime-keys:/var/lib/meridian

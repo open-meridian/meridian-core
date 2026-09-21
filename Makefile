@@ -172,21 +172,32 @@ chart-check:
 		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
 		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
 	fi
-	@for component in street replica; do \
+	@for component in street replica uplink; do \
 		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 			| grep -q "meridian-$$component\"\]" \
 			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
 	done
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
-		| grep -c "^kind: Deployment" | grep -q "^2$$" \
-		|| { echo "chart-check FAILED: the street store and the replica are not two Deployments" >&2; \
-		     echo "  one workload means neither can be upgraded without the other" >&2; exit 1; }
+		| grep -c "^kind: Deployment" | grep -q "^3$$" \
+		|| { echo "chart-check FAILED: the street store, the replica and the uplink are not three Deployments" >&2; \
+		     echo "  one workload means none can be upgraded without the others" >&2; exit 1; }
+	@# decisions/011. The key authenticates as the whole deployment, so exactly
+	@# one component may mount it. A second holder is a second thing that can
+	@# speak for the customer, and the last one appeared by accident.
+	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| awk '/^kind: Deployment/{c=""} /meridian.dev\/component:/{c=$$2} /key.pem/{print c}' \
+		| sort -u | grep -qx "uplink" \
+		|| { echo "chart-check FAILED: the key is mounted by something that is not the uplink" >&2; exit 1; }
+	@test "$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| awk '/^kind: Deployment/{c=""} /meridian.dev\/component:/{c=$$2} /key.pem/{print c}' \
+		| sort -u | wc -l | tr -d ' ')" = "1" \
+		|| { echo "chart-check FAILED: more than one component mounts the deployment key" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) \
 		--set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' \
 		--set grants.existingConfigMap=g 2>/dev/null \
 		| grep -q "sidecar-custody-1" \
 		|| { echo "chart-check FAILED: a configured plugin gets no sidecar" >&2; exit 1; }
-	@echo "chart-check OK: three components, both key paths, refusals, migrations, and no pinned uid"
+	@echo "chart-check OK: four components, the key on the uplink alone, both key paths, refusals, migrations, and no pinned uid"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
@@ -253,7 +264,7 @@ interop: network
 	@# split this was one process, and the test could not tell the difference.
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street replica sidecar >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street replica uplink sidecar >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
@@ -282,7 +293,7 @@ demo: network
 	@$(COMPOSE) run --rm -T runtime migrate
 	@echo "1/4  making sure this deployment has a key"
 	@mkdir -p .demo
-	@$(COMPOSE) run --rm --no-deps -T runtime public-key > .demo/public-key.pem
+	@$(COMPOSE) run --rm --no-deps -T uplink meridian-uplink public-key > .demo/public-key.pem
 	@echo "2/4  registering it on the platform"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
 		run --rm -T site python -m django register_deployment \
