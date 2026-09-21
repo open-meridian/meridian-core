@@ -38,9 +38,9 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
         Arc::new(meridian_street::MemoryStore::new()),
         Arc::new(meridian_street::service::SystemClock),
     );
-    meridian_reference::service::serve_queries(
+    meridian_instrument::service::serve_queries(
         &bus,
-        Arc::new(meridian_reference::MemoryStore::new()),
+        Arc::new(meridian_instrument::MemoryStore::new()),
     );
 
     let sidecar = Sidecar::new(
@@ -108,7 +108,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // is registered rather than absent.
     let resolved: ResolveIdentifierReply = call(
         &sidecar,
-        meridian_reference::service::RESOLVE_IDENTIFIER,
+        meridian_instrument::service::RESOLVE_IDENTIFIER,
         "meridian.v1.ResolveIdentifierRequest",
         ResolveIdentifierRequest {
             identifiers: vec![],
@@ -224,11 +224,11 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
 #[tokio::test]
 async fn a_components_report_reaches_the_one_holding_the_key() {
     // The street store holds no key, so what it runs reaches the platform only by
-    // way of the replica. This is that path, without a platform: the street store
-    // publishes, and what the replica would send carries it.
+    // way of the instrument store. This is that path, without a platform: the street store
+    // publishes, and what the instrument store would send carries it.
     use meridian_runtime::{collect_inward, report_inward_forever, COMPONENT_REPORT_TOPIC};
 
-    let bus = Arc::new(Bus::single("replica-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single("instrument-1", Arc::new(MemoryBackend::new())));
     let heard = collect_inward(Arc::clone(&bus));
 
     let publishing = Arc::clone(&bus);

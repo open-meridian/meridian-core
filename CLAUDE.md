@@ -1,7 +1,7 @@
 # meridian-core
 
-The deployment runtime, in Rust. Message bus, sidecar, street store, reference
-replica and dashboard. This is what ships to a client and what runs locally
+The deployment runtime, in Rust. Message bus, sidecar, street store, instrument
+store, conductor and dashboard. This is what ships to a client and what runs locally
 with `docker compose up`.
 
 ## Placement

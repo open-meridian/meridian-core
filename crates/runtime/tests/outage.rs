@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform};
+use meridian_instrument::{apply, resolve_identifier, PostgresStore};
 use meridian_pb::v1::{
     Identifier as PbIdentifier, InstrumentRecord as PbInstrument, ResolveIdentifierRequest,
 };
-use meridian_reference::{apply, resolve_identifier, PostgresStore};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {
@@ -29,7 +29,7 @@ fn now_ns() -> i64 {
 }
 
 #[test]
-fn the_replica_keeps_answering_while_the_platform_is_away() {
+fn the_store_keeps_answering_while_the_platform_is_away() {
     let store = PostgresStore::connect(&required("MERIDIAN_TEST_DATABASE_URL"), 4).unwrap();
     store.migrate().unwrap();
 
@@ -96,7 +96,7 @@ fn the_replica_keeps_answering_while_the_platform_is_away() {
 
     assert!(
         reply.found,
-        "the replica stopped answering for what it holds"
+        "the instrument store stopped answering for what it holds"
     );
     assert_eq!(reply.instrument_id, instrument_id);
 }

@@ -1,6 +1,6 @@
 //! What every component of a deployment needs, and none should write twice.
 //!
-//! The runtime was one process holding the street store, the replica and a sidecar.
+//! The runtime was one process holding the street store, the instrument store and a sidecar.
 //! Decision 010 gave them a bus that crosses a process boundary, and
 //! `design/split-the-runtime-into-services` ruled that they are separate
 //! processes upgraded on their own schedules. This is what they share: the
@@ -28,12 +28,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// thousand deployments are not a load.
 pub const REPORT_EVERY: Duration = Duration::from_secs(300);
 
-/// How often a component says the same thing on the bus, for the replica to
+/// How often a component says the same thing on the bus, for the instrument store to
 /// carry. W5.20.
 ///
 /// Much more often, because this one is a few dozen bytes inside a cluster and
-/// because the replica learns what is running only by hearing it. At the
-/// outward interval, a replica that restarted under-reported the deployment
+/// because the instrument store learns what is running only by hearing it. At the
+/// outward interval, a reporter that restarted under-reported the deployment
 /// for up to five minutes, and the page said a component had gone when it had
 /// not. Found by restarting one.
 pub const REPORT_INWARD_EVERY: Duration = Duration::from_secs(20);
@@ -98,7 +98,7 @@ pub fn platform_from_env(key: DeploymentKey) -> Result<Arc<Platform>, String> {
 /// Where a component says what it is running, inside the deployment. W5.20.
 pub const COMPONENT_REPORT_TOPIC: &str = "platform.deployment.event.component-report";
 
-/// Say what this component is running, on the bus, for the replica to collect.
+/// Say what this component is running, on the bus, for the instrument store to collect.
 ///
 /// Inward rather than to the platform, because reporting outward needs the
 /// deployment's key and a component holding one is a second thing able to
@@ -197,7 +197,7 @@ pub async fn report_forever(
 
     // Immediately, then once the others have had a chance to say what they
     // are, then at the ordinary interval. Without the middle one the platform
-    // showed a component as gone for five minutes after the replica restarted,
+    // showed a component as gone for five minutes after the instrument store restarted,
     // which is a page saying something untrue rather than something stale.
     let mut wait = REPORT_AGAIN_AFTER;
 

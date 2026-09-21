@@ -1,7 +1,8 @@
-//! The deployment's replica of the security master.
+//! The deployment's instrument store.
 //!
-//! A replica rather than a cache, and the difference is what happens when the
-//! platform is unreachable. A cache with an expiry stops answering; a replica
+//! For identity it is a replica rather than a cache, and the difference is what
+//! happens when the platform is unreachable. A cache with an expiry stops
+//! answering; a replica
 //! keeps answering from what it holds, which is what the deployment needs in
 //! order to stay useful through somebody else's outage.
 //!
@@ -48,19 +49,19 @@ use std::sync::Arc;
 
 use meridian_bus::Bus;
 
-/// The replica, wired up.
+/// The instrument store, wired up.
 ///
 /// A store and a bus, and nothing else. It held a platform client until
 /// 2026-09-21, which is what put the deployment's private key in the same
 /// process as the instrument tables; decision 011 moved both to the conductor.
 /// What arrives here now arrives on the bus like everything else.
-pub struct Replica {
+pub struct InstrumentService {
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
     clock: Arc<dyn service::Clock>,
 }
 
-impl Replica {
+impl InstrumentService {
     pub fn new(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn service::Clock>) -> Self {
         Self { bus, store, clock }
     }
@@ -70,7 +71,7 @@ impl Replica {
     /// Not an `async fn`, and that is the point: everything a caller must have
     /// in place before the first message arrives happens before this returns,
     /// and only the consuming loop is left to await. Doing the registration
-    /// inside the returned future would leave a window where the replica is
+    /// inside the returned future would leave a window where the instrument store is
     /// started and answers nothing, which a caller cannot see and cannot wait
     /// for.
     ///
@@ -79,7 +80,7 @@ impl Replica {
     /// silently.
     ///
     /// ```ignore
-    /// let running = tokio::spawn(replica.start());
+    /// let running = tokio::spawn(service.start());
     /// ```
     pub fn start(self) -> impl std::future::Future<Output = ()> {
         let pulled = self.bus.subscribe(service::INSTRUMENT_PULLED);

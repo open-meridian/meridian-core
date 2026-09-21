@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# The replica image.
+# The instrument store image.
 #
 # Separate from Dockerfile.rust, which is the gate runner. This one produces the
 # thing that runs; that one produces answers about it.
@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
- && cp target/release/meridian-street target/release/meridian-replica \
+ && cp target/release/meridian-street target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
@@ -37,7 +37,7 @@ VOLUME /var/lib/meridian
 # schedules by moving one Deployment's tag, not by pulling three images that
 # were built from different commits.
 COPY --from=build /usr/local/bin/meridian-street /usr/local/bin/meridian-street
-COPY --from=build /usr/local/bin/meridian-replica /usr/local/bin/meridian-replica
+COPY --from=build /usr/local/bin/meridian-instrument /usr/local/bin/meridian-instrument
 COPY --from=build /usr/local/bin/meridian-conductor /usr/local/bin/meridian-conductor
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
 

@@ -1,4 +1,4 @@
-//! Answering instrument questions from what the replica holds.
+//! Answering instrument questions from what the instrument store holds.
 //!
 //! Three steps live here. W3.1 turns a set of identifiers into one instrument
 //! or into a miss. W3.6 turns an instrument identifier into its record, so a
@@ -31,7 +31,7 @@
 //! symbol what the FIGIs said was ambiguous would answer a question nobody
 //! asked, using the evidence the caller trusted least.
 //!
-//! # What the replica cannot answer yet
+//! # What the instrument store cannot answer yet
 //!
 //! It holds one version per instrument, so an identifier dropped by a later
 //! version is simply gone from it, and resolving as of a date when that mapping
@@ -98,7 +98,7 @@ pub fn resolve_identifier(
 ///
 /// `as_of_ns` does not select which instrument. Identity is never reused, so
 /// the key answers that on its own. It selects which version's attributes were
-/// true then, and the replica holds one version, so the answer here is the
+/// true then, and the instrument store holds one version, so the answer here is the
 /// version held whatever the as-of. Stale attributes on a stable identity, and
 /// the same gap `design/replica-holds-one-version` covers.
 pub fn resolve_instrument(
@@ -138,7 +138,7 @@ pub fn missing_instrument(
         asset_class: asset_class.to_string(),
 
         // Everything held, not just what was tried. A reader with access to the
-        // platform may be able to pull on a scheme this replica could not.
+        // platform may be able to pull on a scheme this store could not.
         identifiers: request.identifiers.clone(),
         as_of_ns: request.as_of_ns,
         publisher_instance_id: publisher_instance_id.to_string(),
@@ -493,7 +493,7 @@ mod tests {
         // statement from before the reassignment must not resolve to whoever
         // holds the ticker now.
         //
-        // The replica keeps one version, so the earlier mapping is simply gone
+        // The instrument store keeps one version, so the earlier mapping is simply gone
         // and the honest answer is a miss. Recorded, with the alternatives, in
         // design/replica-holds-one-version.
         let store = MemoryStore::new();
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn forward_resolution_needs_no_as_of_to_know_which_instrument() {
         // Identity is never reused, so the key answers that by itself. The
-        // as-of selects which version's attributes were true, and the replica
+        // as-of selects which version's attributes were true, and the instrument store
         // holds one.
         let store = MemoryStore::new();
         store
@@ -607,7 +607,7 @@ mod tests {
     fn a_miss_carries_everything_the_publisher_held() {
         // The fixture's event. Both identifiers travel, not just the one that
         // was tried: a reader with platform access may be able to pull on a
-        // scheme this replica could not.
+        // scheme this store could not.
         let request = ResolveIdentifierRequest {
             identifiers: vec![
                 asked("symbol", "ZZTOP", "snaptrade"),

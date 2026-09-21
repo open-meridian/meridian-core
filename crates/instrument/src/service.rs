@@ -1,4 +1,4 @@
-//! Where the replica meets the bus.
+//! Where the instrument store meets the bus.
 //!
 //! Two questions answered from what is held, and one event reacted to. That is
 //! the whole surface: W3.1 and W3.6 are calls, W3.2 arrives as an event, and
@@ -31,7 +31,7 @@
 //!
 //! A pulled record and a minted one both go through [`apply`], version-gated,
 //! and are announced the same way. The authority to create identity stays on
-//! the platform, and the authority to decide what the replica holds stays in
+//! the platform, and the authority to decide what the instrument store holds stays in
 //! the version number.
 
 use std::sync::Arc;
@@ -58,13 +58,13 @@ pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missin
 
 /// W3.3 and W3.4. What the conductor got from the platform, for applying.
 ///
-/// The replica subscribes rather than fetching. It holds no key and therefore
+/// The instrument store subscribes rather than fetching. It holds no key and therefore
 /// cannot reach the platform at all, which is the property decision 011 bought:
 /// a defect in instrument storage is no longer a defect in the process holding
 /// the deployment's identity.
 pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
 
-/// W3.5. The replica announcing what it did with a record.
+/// W3.5. The instrument store announcing what it did with a record.
 pub const INSTRUMENT_APPLIED: &str = "platform.reference.event.instrument-applied";
 
 /// Where the time comes from.
@@ -140,7 +140,7 @@ pub enum Handled {
     /// A payload arriving under the wrong type name is refused rather than
     /// decoded: protobuf will happily read one message as another and hand back
     /// defaults, and a defaulted record here would be an instrument with no
-    /// identity written into the replica.
+    /// identity written into the instrument store.
     Ignored(String),
 
     /// A record was applied, or was an equal-or-older version and was not.
@@ -378,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn a_resolve_is_answered_from_the_store() {
         // No platform anywhere in this test, and there is no longer one to
-        // stub: the replica cannot reach the platform at all. What used to be
+        // stub: the instrument store cannot reach the platform at all. What used to be
         // asserted by faking an outage is now structural.
         let store = Arc::new(MemoryStore::new());
         store.apply(held()).unwrap();
@@ -513,7 +513,7 @@ mod tests {
     async fn a_payload_under_the_wrong_type_name_is_refused_rather_than_decoded() {
         // protobuf will read one message as another and hand back defaults. A
         // defaulted record here would be an instrument with no identity,
-        // written into the replica because a type name was wrong.
+        // written into the instrument store because a type name was wrong.
         let store = Arc::new(MemoryStore::new());
         let bus = bus();
 
@@ -594,15 +594,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wired_replica_answers_and_applies() {
+    async fn a_wired_store_answers_and_applies() {
         let store = Arc::new(MemoryStore::new());
         store.apply(held()).unwrap();
 
         let bus = bus();
         let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
 
-        let replica = crate::Replica::new(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
-        tokio::spawn(replica.start());
+        let service =
+            crate::InstrumentService::new(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
+        tokio::spawn(service.start());
 
         // The queries it registered.
         let (_, payload) = bus

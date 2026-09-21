@@ -1,10 +1,10 @@
 {{- if .Values.key.generate }}
 {{- include "meridian-runtime.require" . -}}
 {{/*
-  Make this replica's key, inside the cluster, before anything starts.
+  Make this deployment's key, inside the cluster, before anything starts.
 
   `public-key` writes a key pair when the volume has none and prints only the
-  public half. The private half stays in the volume the replica mounts, which
+  public half. The private half stays in the volume the instrument store mounts, which
   is the whole point: a key generated anywhere else has been in a file, a shell
   history and a backup before it arrives.
 

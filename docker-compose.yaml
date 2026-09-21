@@ -14,13 +14,13 @@ services:
     environment:
       POSTGRES_USER: meridian
       POSTGRES_PASSWORD: meridian
-      POSTGRES_DB: replica
+      POSTGRES_DB: meridian
     ports:
       # Not 15433: that is the platform's, and two databases on one port is a
       # confusing afternoon.
       - "15434:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U meridian -d replica"]
+      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -70,29 +70,29 @@ services:
       nats:
         condition: service_started
     environment:
-      MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/replica}
+      MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: street-1
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
-  # The replica. A store and a bus, and nothing else: no key, no platform
+  # The instrument store. A store and a bus, and nothing else: no key, no platform
   # address, no network beyond the broker. Decision 011 moved all three to the
   # conductor below.
-  replica:
+  instrument:
     build:
       context: .
       target: runtime
-    command: ["meridian-replica"]
+    command: ["meridian-instrument"]
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_started
     environment:
-      MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
+      MERIDIAN_DATABASE_URL: postgres://meridian:meridian@postgres:5432/meridian
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
-      MERIDIAN_INSTANCE_ID: replica-1
+      MERIDIAN_INSTANCE_ID: instrument-1
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
@@ -171,7 +171,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@postgres:5432/replica
+      MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@postgres:5432/meridian
       MERIDIAN_TEST_BROKER_URL: nats://tests:tests-dev-only@nats:4222
       # The runtime's own identity, narrowed to what the registry says its
       # components publish and subscribe to.

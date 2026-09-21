@@ -5,10 +5,10 @@
 //! talks to the bus and to its database, and to nothing else — in particular
 //! not to the platform, which is why this process holds no deployment key.
 //!
-//! Separate from the replica because they have opposite properties. The
-//! replica holds what the platform can send again, so a bad upgrade is fixed
+//! Separate from the instrument store because they have opposite properties. The
+//! instrument store holds what the platform can send again, so a bad upgrade is fixed
 //! by refetching; this holds a custodian's statement from last month, which
-//! exists in one place. Tying them together made every replica change inherit
+//! exists in one place. Tying them together made every instrument-store change inherit
 //! the street store's caution.
 //!
 //! `meridian-street migrate` applies its schema, once per release. Starting verifies
@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
             // has not arrived.
             meridian_street::service::serve(bus.clone(), Arc::new(store), Arc::new(SystemClock));
 
-            // W5.20. Said on the bus, for the replica to carry outward: this
+            // W5.20. Said on the bus, for the instrument store to carry outward: this
             // process holds no key, and giving it one so it could report
             // directly would make it a second thing able to authenticate as
             // the whole deployment.

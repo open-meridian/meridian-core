@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bus", "crates/sidecar", "crates/reference", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime"]
+members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime"]
 
 [workspace.package]
 edition = "2021"
@@ -44,7 +44,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 # the transport is behind `dyn` so a test can answer without a network.
 async-trait = "0.1"
 
-# The replica's store. A synchronous driver on purpose: the bus already runs
+# The instrument store. A synchronous driver on purpose: the bus already runs
 # request handlers on a blocking pool, so a store that blocks is the shape that
 # fits, and an async trait here would be boxed futures at every call site.
 postgres = "0.19"

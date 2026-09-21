@@ -1,10 +1,10 @@
-//! The replica against a running platform and a real database.
+//! The instrument store against a running platform and a real database.
 //!
 //! Everything the crate claims about pulling, minting and applying is a claim
 //! until it has been made against the platform rather than against a scripted
 //! transport. This is that run.
 //!
-//! It signs with the key the replica generated and an operator registered, so a
+//! It signs with the key the instrument store generated and an operator registered, so a
 //! failure to authenticate fails here rather than being mocked away. Run by
 //! `make demo`, which brings up the database, registers the deployment and sets
 //! the three variables below.
@@ -14,12 +14,12 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform, Reaction};
+use meridian_instrument::store::Store;
+use meridian_instrument::{resolve_identifier, PostgresStore};
 use meridian_pb::v1::{
     Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent,
     ResolveIdentifierRequest,
 };
-use meridian_reference::store::Store;
-use meridian_reference::{resolve_identifier, PostgresStore};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -48,7 +48,7 @@ fn runtime() -> Runtime {
 
 fn platform() -> Platform {
     let pem = std::fs::read_to_string(required("MERIDIAN_TEST_KEY_PATH"))
-        .expect("could not read the deployment key the replica generated");
+        .expect("could not read the deployment key the instrument store generated");
 
     Platform::new(
         Config::new(
@@ -65,7 +65,7 @@ fn platform() -> Platform {
 
 fn store() -> PostgresStore {
     let store = PostgresStore::connect(&required("MERIDIAN_TEST_DATABASE_URL"), 4)
-        .expect("could not reach the replica's database");
+        .expect("could not reach the instrument store's database");
     store.migrate().expect("could not create the schema");
     store
 }
@@ -139,7 +139,7 @@ fn a_miss_the_platform_does_not_know_is_minted_applied_and_resolvable() {
     );
 
     // W3.5, through the same path a locally defined instrument takes.
-    let applied = meridian_reference::apply(&store, record.clone(), now_ns()).unwrap();
+    let applied = meridian_instrument::apply(&store, record.clone(), now_ns()).unwrap();
     assert!(applied.changed());
 
     // And now the resolution that missed would not.
@@ -156,7 +156,7 @@ fn a_miss_the_platform_does_not_know_is_minted_applied_and_resolvable() {
 
     assert!(
         reply.found,
-        "the replica still cannot resolve what it applied"
+        "the instrument store still cannot resolve what it applied"
     );
     assert_eq!(reply.instrument_id, record.instrument_id);
     assert_eq!(
@@ -191,10 +191,10 @@ fn applying_the_same_record_twice_changes_nothing() {
         other => panic!("expected a mint, got {other:?}"),
     };
 
-    assert!(meridian_reference::apply(&store, record.clone(), now_ns())
+    assert!(meridian_instrument::apply(&store, record.clone(), now_ns())
         .unwrap()
         .changed());
-    assert!(!meridian_reference::apply(&store, record, now_ns())
+    assert!(!meridian_instrument::apply(&store, record, now_ns())
         .unwrap()
         .changed());
 }

@@ -124,7 +124,7 @@ pub enum PlatformError {
 
 impl PlatformError {
     /// Whether this is the platform being away rather than the platform
-    /// answering. The caller keeps serving from the replica either way; the
+    /// answering. The caller keeps serving from the instrument store either way; the
     /// difference is what it is worth logging as.
     pub fn is_outage(&self) -> bool {
         matches!(self, PlatformError::Unreachable { .. })
@@ -425,7 +425,7 @@ impl Platform {
     ///
     /// A failure is the caller's to shrug at. A platform that cannot be told
     /// what we run changes nothing about our ability to run it, which is the
-    /// same reasoning that lets the replica serve through an outage.
+    /// same reasoning that lets the instrument store serve through an outage.
     pub async fn report_components(
         &self,
         components: &[ComponentReport],
@@ -783,7 +783,7 @@ impl HttpTransport {
             .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .user_agent(concat!("meridian-reference/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("meridian-instrument/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
 
@@ -1468,11 +1468,11 @@ pub(crate) mod tests {
     async fn an_outage_is_an_error_here_and_nothing_downstream() {
         // The requirement the split exists for, from this side. A platform
         // outage is an error on this call and nothing at all downstream: the
-        // replica is a separate process holding a separate store, and it never
+        // instrument store is a separate process holding a separate store, and it never
         // hears about this.
         //
         // The other half of the assertion -- that a resolve still answers --
-        // moved to meridian-reference with the replica on 2026-09-21. It is
+        // moved to meridian-instrument with the instrument store on 2026-09-21. It is
         // structural there rather than tested: that crate has no platform
         // client to fail, and no key that would let it build one.
         let transport = Fake::new(vec![failure("no route to host")]);

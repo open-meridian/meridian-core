@@ -2,22 +2,22 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "meridian-runtime.fullname" . }}-replica
+  name: {{ include "meridian-runtime.fullname" . }}-instrument
   labels:
-    meridian.dev/component: replica
+    meridian.dev/component: instrument
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.instrument.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      meridian.dev/component: replica
+      meridian.dev/component: instrument
   template:
     metadata:
       labels:
         {{- include "meridian-runtime.labels" . | nindent 8 }}
-        meridian.dev/component: replica
+        meridian.dev/component: instrument
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -28,9 +28,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: replica
-          image: "{{ .Values.image.repository }}:{{ .Values.replica.image.tag | default .Values.image.tag }}"
-          args: ["meridian-replica"]
+        - name: instrument
+          image: "{{ .Values.image.repository }}:{{ .Values.instrument.image.tag | default .Values.image.tag }}"
+          args: ["meridian-instrument"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -39,12 +39,12 @@ spec:
               drop: [ALL]
           env:
             - name: MERIDIAN_INSTANCE_ID
-              value: {{ include "meridian-runtime.fullname" . }}-replica
+              value: {{ include "meridian-runtime.fullname" . }}-instrument
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.broker.existingSecret }}
-                  key: {{ .Values.broker.replicaKey }}
+                  key: {{ .Values.broker.instrumentKey }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL

@@ -1,4 +1,4 @@
-# Everything a replica needs, and nothing describing the platform's shape.
+# Everything a deployment needs, and nothing describing the platform's shape.
 #
 # Three values are required and have no defaults worth guessing. The chart
 # refuses to render without them rather than installing something that starts
@@ -26,7 +26,7 @@ database:
   key: url
 
 key:
-  # Let the replica make its own key, inside the cluster, in a volume only it
+  # Let the instrument store make its own key, inside the cluster, in a volume only it
   # mounts.
   #
   # This is the way that keeps the claim the product makes: the private half
@@ -34,11 +34,11 @@ key:
   # secret puts it in a file, a shell history and a backup before it ever
   # arrives.
   #
-  # A job runs before the replica and prints the public half to its log:
+  # A job runs before the instrument store and prints the public half to its log:
   #
   #   kubectl logs job/<release>-meridian-runtime-key
   #
-  # Register that with the platform. Until you do, the replica runs and its
+  # Register that with the platform. Until you do, the instrument store runs and its
   # calls are refused, which is the honest order: a key cannot be registered
   # before it exists.
   #
@@ -95,7 +95,8 @@ migrate:
 # "upgrade one without the others" a values change rather than a redesign.
 # Empty means image.tag, so a deployment that moves everything together still
 # names one version.
-replica:
+instrument:
+  replicaCount: 1
   image:
     tag: ""
 
@@ -122,7 +123,7 @@ street:
 # a plugin can route to the broker and has nothing to present.
 broker:
   existingSecret: ""
-  replicaKey: replica
+  instrumentKey: instrument
   conductorKey: conductor
   streetKey: street
 
@@ -136,7 +137,6 @@ broker:
 #     tags: []
 sidecars: []
 
-replicaCount: 1
 
 resources:
   requests:

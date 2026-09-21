@@ -14,8 +14,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_reference::store::{Applied, Identifier, Instrument, Store};
-use meridian_reference::PostgresStore;
+use meridian_instrument::store::{Applied, Identifier, Instrument, Store};
+use meridian_instrument::PostgresStore;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -239,7 +239,7 @@ fn an_instrument_nobody_applied_is_absent_rather_than_an_error() {
 }
 
 #[test]
-fn the_replica_can_say_how_much_it_holds() {
+fn the_store_can_say_how_much_it_holds() {
     let store = store();
     store
         .apply(instrument(

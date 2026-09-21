@@ -13,7 +13,7 @@ pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missin
 
 /// W3.3, and W3.4's outcome on the same topic. What the platform gave us.
 ///
-/// One topic for both because the replica applies a pulled record and a minted
+/// One topic for both because the instrument store applies a pulled record and a minted
 /// one by the same version-gated path and has no reason to tell them apart.
 /// Two topics would be two things to keep in step for no reader's benefit.
 pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
@@ -51,7 +51,7 @@ pub enum Carried {
     Ignored(String),
 
     /// The platform answered, and this is what it said. `true` when a record
-    /// was published for the replica to apply.
+    /// was published for the instrument store to apply.
     Answered(Reaction, bool),
 
     /// The platform could not be reached, so nothing happened.
@@ -135,7 +135,7 @@ impl Conductor {
         let record = match &reaction {
             Reaction::Pulled(record) | Reaction::Minted(record) => (**record).clone(),
             // Throttled, ambiguous or declined. Silence rather than an event
-            // saying nothing happened: the replica has nothing to do with any
+            // saying nothing happened: the instrument store has nothing to do with any
             // of those, and a topic nobody acts on is a topic that drifts.
             _ => return Carried::Answered(reaction, false),
         };
@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_record_the_platform_knew_is_published_for_the_replica() {
+    async fn a_record_the_platform_knew_is_published_for_the_store() {
         let bus = bus();
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
@@ -312,7 +312,7 @@ mod tests {
 
         assert!(matches!(carried, Carried::PlatformAway(_)), "{carried:?}");
 
-        // Nothing published: the replica must not see an empty record and take
+        // Nothing published: the instrument store must not see an empty record and take
         // it for an answer.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), pulled.recv())
@@ -325,7 +325,7 @@ mod tests {
     async fn a_second_miss_inside_the_window_publishes_nothing() {
         // The throttle moved here with the platform connection. A burst of
         // misses is not a burst of pulls, and it is not a burst of events for
-        // the replica to apply either.
+        // the instrument store to apply either.
         let bus = bus();
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);

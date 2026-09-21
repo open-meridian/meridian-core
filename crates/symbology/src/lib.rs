@@ -1,12 +1,12 @@
 //! Which identifier to believe first.
 //!
-//! One table, deliberately in a crate of its own. The replica falls through
+//! One table, deliberately in a crate of its own. The instrument store falls through
 //! this order when resolving locally; the conductor tries global identifiers in
 //! this order when asking the platform. Two orderings would be two things to
 //! keep in step, and the day they disagreed a deployment would resolve one way
 //! and the master another, with nothing failing to say so.
 //!
-//! It lived in the replica until 2026-09-21, which was fine while the platform
+//! It lived in the instrument store until 2026-09-21, which was fine while the platform
 //! client lived there too. Decision 011 moved the client out, and the choice
 //! was this crate or a copy. A copy of a priority table is the kind of drift
 //! nothing detects, because both halves keep compiling and only the answers

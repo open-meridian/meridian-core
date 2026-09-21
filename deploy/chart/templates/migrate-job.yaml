@@ -38,7 +38,7 @@ spec:
       {{/*
         Each component migrates its own schema, in its own container, at the
         version being released. An init container for the street store and the
-        replica's in the main one, so both must succeed for the release to
+        instrument store's in the main one, so both must succeed for the release to
         proceed and the order is stated rather than raced.
       */}}
       initContainers:
@@ -62,10 +62,10 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       containers:
-        - name: replica
-          image: "{{ .Values.image.repository }}:{{ .Values.replica.image.tag | default .Values.image.tag }}"
+        - name: instrument
+          image: "{{ .Values.image.repository }}:{{ .Values.instrument.image.tag | default .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["meridian-replica", "migrate"]
+          args: ["meridian-instrument", "migrate"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -1,4 +1,4 @@
-//! The replica in Postgres, behind the same trait the in-memory store answers.
+//! The instrument store in Postgres, behind the same trait the in-memory store answers.
 //!
 //! The trait was written for this. Nothing above it changes, which is the test
 //! of whether the seam was in the right place.
@@ -33,13 +33,13 @@ type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 
 /// Applied on start. See the file for why there is no migration history.
-const SCHEMA: &str = include_str!("../migrations/0001_replica.sql");
+const SCHEMA: &str = include_str!("../migrations/0001_instrument.sql");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
 const SCHEMA_LOCK: i64 = 0x6d65_7269_6469_616e_u64 as i64;
 
-/// The replica, in a database.
+/// The instrument store, in a database.
 pub struct PostgresStore {
     pool: Pool,
 }
@@ -60,7 +60,7 @@ impl PostgresStore {
     /// Create the schema if it is not there.
     ///
     /// Idempotent, and safe to run from every instance on every start: a
-    /// replica holds nothing the platform cannot send again, so there is no
+    /// instrument store holds nothing the platform cannot send again, so there is no
     /// history to preserve and nothing to lose to a re-run.
     ///
     /// Under an advisory lock, because `IF NOT EXISTS` is not the concurrency
@@ -74,7 +74,7 @@ impl PostgresStore {
     /// happy path and by the connection closing on any other.
     /// What a start does instead of migrating: check the schema is there.
     ///
-    /// The replica creates its schema on start in development, where one
+    /// The instrument store creates its schema on start in development, where one
     /// credential does everything. A deployment that separates them — and the
     /// lifecycle intent says the credential that migrates is not the one that
     /// serves — gives the runtime no right to create a table, so a start that
@@ -97,7 +97,7 @@ impl PostgresStore {
             return Ok(());
         }
         Err(StoreError::Unavailable(
-            "the replica's database has no schema. Run `meridian-runtime migrate` \
+            "the instrument store's database has no schema. Run `meridian-instrument migrate` \
              before starting."
                 .into(),
         ))
@@ -319,7 +319,7 @@ impl Store for PostgresStore {
     }
 }
 
-/// Every database failure is the replica being unavailable.
+/// Every database failure is the instrument store being unavailable.
 ///
 /// Not a loss of meaning: nothing above this trait can act differently on a
 /// connection refused than on a syntax error, and a caller given the

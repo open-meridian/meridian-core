@@ -1,4 +1,4 @@
-//! Writing a record into the replica, gated on its version.
+//! Writing a record into the instrument store, gated on its version.
 //!
 //! Everything inbound lands here: a record pulled because a resolve missed, one
 //! returned by an escalation, one redelivered because a retry could not tell
@@ -7,15 +7,15 @@
 //!
 //! W3.5 puts it plainly: a pulled record is indistinguishable from a locally
 //! defined one afterwards. That is what makes the resume cursor trustworthy —
-//! the highest version held describes everything the replica knows, however it
+//! the highest version held describes everything the instrument store knows, however it
 //! arrived.
 //!
 //! # An unapplied record is still an event
 //!
 //! An apply that changes nothing still announces itself, with `applied` false.
-//! Suppressing it would make the event stream depend on what the replica
+//! Suppressing it would make the event stream depend on what the instrument store
 //! happened to be holding, so a subscriber could not tell "we checked and it was
-//! current" from "nobody checked". The first is a healthy replica confirming
+//! current" from "nobody checked". The first is a healthy store confirming
 //! itself; the second is a connection that stopped working.
 
 use meridian_pb::v1::{
@@ -32,7 +32,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// Whether the replica changed. False for a redelivery or a late arrival.
+    /// Whether the instrument store changed. False for a redelivery or a late arrival.
     pub fn changed(&self) -> bool {
         matches!(self.applied, Applied::Stored)
     }
@@ -55,10 +55,10 @@ pub fn apply(store: &dyn Store, record: PbInstrument, now_ns: i64) -> Result<Out
     })
 }
 
-/// The wire record as the replica holds it.
+/// The wire record as the instrument store holds it.
 ///
 /// A deliberate translation rather than storing the generated type directly.
-/// The store's shape is the replica's business and the wire's shape is the
+/// The store's shape is the store's business and the wire's shape is the
 /// contract's, and letting one be the other means a schema change reaches into
 /// the store without passing anything that could object.
 fn from_wire(record: &PbInstrument) -> Instrument {
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn an_unapplied_record_is_still_announced() {
         // So a subscriber can tell "we checked and it was current" from "nobody
-        // checked". The first is a healthy replica; the second is a connection
+        // checked". The first is a healthy store; the second is a connection
         // that stopped working.
         let store = MemoryStore::new();
         apply(&store, record(4), 1_000).unwrap();
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn a_lifecycle_state_arrives_as_a_name_rather_than_a_number() {
-        // A replica read by a person or a dashboard should not require a lookup
+        // A store read by a person or a dashboard should not require a lookup
         // table to say what state something is in.
         let store = MemoryStore::new();
         apply(&store, record(4), 1_000).unwrap();
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn an_unknown_lifecycle_state_does_not_panic() {
-        // A replica older than the platform will meet a state it has never
+        // A store older than the platform will meet a state it has never
         // heard of. Refusing to hold the record would be worse than holding it
         // with a state nobody recognises.
         let store = MemoryStore::new();
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn a_pulled_record_is_indistinguishable_from_any_other_afterwards() {
         // The fixture's postcondition, and what makes the resume cursor
-        // trustworthy: the highest version held describes everything the replica
+        // trustworthy: the highest version held describes everything the instrument store
         // knows, however it arrived.
         let store = MemoryStore::new();
         apply(&store, record(4), 1_000).unwrap();

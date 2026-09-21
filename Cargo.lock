@@ -1125,16 +1125,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meridian-pb"
-version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d#d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d"
-dependencies = [
- "prost",
- "tonic",
-]
-
-[[package]]
-name = "meridian-reference"
+name = "meridian-instrument"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
@@ -1153,13 +1144,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-pb"
+version = "0.1.0"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d#d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d"
+dependencies = [
+ "prost",
+ "tonic",
+]
+
+[[package]]
 name = "meridian-runtime"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
  "meridian-conductor",
+ "meridian-instrument",
  "meridian-pb",
- "meridian-reference",
  "meridian-sidecar",
  "meridian-street",
  "prost",

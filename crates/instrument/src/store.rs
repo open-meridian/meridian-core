@@ -1,4 +1,4 @@
-//! What the replica holds, and what any store of it must provide.
+//! What the instrument store holds, and what any store of it must provide.
 //!
 //! The same shape the bus uses: a trait with one in-process implementation, and
 //! Postgres behind it when compose arrives. Writing against the trait first is
@@ -49,7 +49,7 @@ impl Identifier {
     }
 }
 
-/// A replica's copy of an instrument.
+/// The store's copy of an instrument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instrument {
     /// The canonical identity, and the only thing a position or an order ever
@@ -75,7 +75,7 @@ pub struct Instrument {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("the replica is unavailable: {0}")]
+    #[error("the instrument store is unavailable: {0}")]
     Unavailable(String),
 }
 
@@ -84,7 +84,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// What an applied record did, so a caller knows whether to announce it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
-    /// Written. The replica now holds this version.
+    /// Written. The instrument store now holds this version.
     Stored,
 
     /// Ignored: an equal or older version than the one held.
@@ -95,7 +95,7 @@ pub enum Applied {
     AlreadyCurrent,
 }
 
-/// Where a replica keeps what it has been told.
+/// Where the instrument store keeps what it has been told.
 pub trait Store: Send + Sync {
     /// The instrument, if it is held.
     fn by_id(&self, instrument_id: &str) -> Result<Option<Instrument>>;

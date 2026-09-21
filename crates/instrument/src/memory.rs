@@ -1,7 +1,7 @@
 //! The in-process store.
 //!
 //! Not a placeholder for a first milestone. A deployment watching one brokerage
-//! account holds a handful of instruments, and the replica is rebuilt from the
+//! account holds a handful of instruments, and the instrument store is rebuilt from the
 //! platform on demand, so durability buys less here than it does in the street store.
 //! Postgres arrives behind the same trait when compose does.
 
@@ -9,7 +9,7 @@ use std::sync::RwLock;
 
 use crate::store::{Applied, Held, Instrument, Result, Store, StoreError};
 
-/// A replica held in memory.
+/// The instrument store, held in memory.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     held: RwLock<Held>,
@@ -23,13 +23,13 @@ impl MemoryStore {
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Held>> {
         self.held
             .read()
-            .map_err(|_| StoreError::Unavailable("the replica lock is poisoned".into()))
+            .map_err(|_| StoreError::Unavailable("the instrument store lock is poisoned".into()))
     }
 
     fn write(&self) -> Result<std::sync::RwLockWriteGuard<'_, Held>> {
         self.held
             .write()
-            .map_err(|_| StoreError::Unavailable("the replica lock is poisoned".into()))
+            .map_err(|_| StoreError::Unavailable("the instrument store lock is poisoned".into()))
     }
 }
 

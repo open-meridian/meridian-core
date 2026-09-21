@@ -26,7 +26,7 @@ use crate::store::{
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 
-/// Names the schema lock. Distinct from the replica's, so a deployment running
+/// Names the schema lock. Distinct from the instrument store's, so a deployment running
 /// both does not have one wait on the other.
 const SCHEMA_LOCK: i64 = 0x6b65_726e_656c_0001_u64 as i64;
 

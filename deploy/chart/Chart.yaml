@@ -1,10 +1,10 @@
 apiVersion: v2
 name: meridian-runtime
-description: A deployment's replica of the Meridian security master
+description: A Meridian deployment -- its instrument store, street store, conductor and plugin sidecars
 type: application
 
 # The chart's own version, and the application's. They move independently: a
-# fix to a template is not a new replica.
+# fix to a template is not a new runtime.
 version: 0.1.0
 appVersion: "0.1.0"
 

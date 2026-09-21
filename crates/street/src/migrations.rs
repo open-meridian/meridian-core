@@ -1,7 +1,7 @@
 //! The street store's migration history: what exists, what has run, and what a
 //! binary will run against.
 //!
-//! The replica creates its schema on start and that is right for it: it holds
+//! The instrument store creates its schema on start and that is right for it: it holds
 //! what the platform can send again, so a fresh schema loses nothing. The
 //! street store holds statements and positions nothing can reconstruct, and
 //! `CREATE TABLE IF NOT EXISTS` adds no column to a table that already exists,

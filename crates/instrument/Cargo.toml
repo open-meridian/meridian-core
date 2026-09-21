@@ -1,10 +1,10 @@
 [package]
-name = "meridian-reference"
+name = "meridian-instrument"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The deployment's replica of the security master: resolve, pull, escalate, apply"
+description = "The deployment's instrument store: resolve, apply, and answer what an instrument is"
 
 [dependencies]
 meridian-pb.workspace = true

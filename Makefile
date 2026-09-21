@@ -18,7 +18,7 @@ help:
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
-	@echo "  make up             bring up Postgres and the replica"
+	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
 	@echo "  make lint           rustfmt --check and clippy with warnings denied"
@@ -98,7 +98,7 @@ test:
 # differently in development is a store nobody has tested.
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-reference --test postgres -p meridian-street --test postgres \
+		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
@@ -108,7 +108,7 @@ HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d --set broker.existingSecret=b
 
 # A chart that renders is half the check. The other half is that it refuses:
-# a replica with no deployment identifier, no key or no database installs
+# a component with no deployment identifier, no key or no database installs
 # happily and then crash-loops, and the operator reads a restart count instead
 # of a sentence.
 # The broker's permissions, from the grant table. Decision 010.
@@ -172,14 +172,14 @@ chart-check:
 		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
 		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
 	fi
-	@for component in street replica conductor; do \
+	@for component in street instrument conductor; do \
 		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 			| grep -q "meridian-$$component\"\]" \
 			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
 	done
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| grep -c "^kind: Deployment" | grep -q "^3$$" \
-		|| { echo "chart-check FAILED: the street store, the replica and the conductor are not three Deployments" >&2; \
+		|| { echo "chart-check FAILED: the street store, the instrument store and the conductor are not three Deployments" >&2; \
 		     echo "  one workload means none can be upgraded without the others" >&2; exit 1; }
 	@# decisions/011. The key authenticates as the whole deployment, so exactly
 	@# one component may mount it. A second holder is a second thing that can
@@ -227,7 +227,7 @@ install-hooks:
 migrate: network
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d postgres >/dev/null
-	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
+	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm -T street meridian-street migrate
 
 up: migrate
@@ -256,7 +256,7 @@ interop: network
 		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@$(COMPOSE) run --rm --build -T replica meridian-replica migrate
+	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm -T street meridian-street migrate >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@# All three components, because the surface under test is the sidecar's
@@ -264,7 +264,7 @@ interop: network
 	@# split this was one process, and the test could not tell the difference.
 	@$(PY) tools/nats_permissions.py --with-dev-users --out deploy/nats/dev.conf >/dev/null
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street replica conductor sidecar >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street instrument conductor sidecar >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
