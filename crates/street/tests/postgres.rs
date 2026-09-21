@@ -404,7 +404,7 @@ fn a_statement_promising_no_rows_completes_when_it_opens() {
 #[test]
 fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
     // The first schema change the additive mechanism could not absorb, and the
-    // reason kernel/ledger-needs-migrations exists. A database created before
+    // reason kernel/ledger-needs-migrations existed. A database created before
     // today has the table under its old name, and creating the new one beside
     // it would leave a full table and an empty one with nothing to say which is
     // which.
@@ -547,7 +547,7 @@ fn a_database_made_before_the_history_is_adopted_with_its_rows_intact() {
     // rebuild.
     let (url, mut client) = own_schema("adopted");
     client
-        .batch_execute(include_str!("../migrations/0001_ledger.sql"))
+        .batch_execute(include_str!("../migrations/0001_street.sql"))
         .expect("could not create the old schema");
     client
         .batch_execute(

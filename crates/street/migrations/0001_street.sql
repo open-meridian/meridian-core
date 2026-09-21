@@ -1,20 +1,21 @@
--- The ledger's schema.
+-- The street store's schema, as first created.
 --
 -- Three tables, and the constraints are the design rather than decoration.
 --
--- Applied on start under an advisory lock. `CREATE TABLE IF NOT EXISTS` is not
--- the concurrency answer it reads as: two connections running it at the same
--- moment race inside Postgres' own catalogue and one of them fails.
+-- Migration 1 of the history in `migrations.rs`. It is applied by
+-- `meridian-street migrate`, once per release; starting only verifies. It was
+-- once applied on start under an advisory lock, which is why it is written
+-- with `IF NOT EXISTS` throughout -- harmless now, and what lets a database
+-- created before the history existed be adopted at this version rather than
+-- re-run.
 --
--- This file is the schema as created. Columns added after a database already
--- existed live in `postgres.rs` instead, because they have to be guarded: see
--- ADDITIONS there for why an unguarded ALTER deadlocks against live traffic.
+-- Columns added after a database already existed live in `postgres.rs`
+-- instead, because they have to be guarded: see ADDITIONS there for why an
+-- unguarded ALTER deadlocks against live traffic.
 --
--- Both together are enough while every change is additive and no more. This
--- ledger holds statements and positions that cannot be rebuilt from anywhere,
--- unlike the replica, so the first change that renames or drops a column needs
--- a real migration history. Queued as kernel/ledger-needs-migrations.
-
+-- Renamed from 0001_ledger.sql on 2026-09-20 with decision 012, together with
+-- the name recorded in `schema_migration`. `migrations.rs` says why that was
+-- allowed once and is not allowed again.
 CREATE TABLE IF NOT EXISTS statement (
     statement_id          text PRIMARY KEY,
     source                text   NOT NULL,

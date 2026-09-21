@@ -37,17 +37,21 @@ pub struct Migration {
 /// In order, and never reordered or edited after release: the record of what
 /// ran names a version, and editing one makes that record a lie.
 ///
-/// Which is why migration 1 is still called `ledger` and its file is still
-/// `0001_ledger.sql`, after decision 012 renamed the component to `street`.
-/// Every database that has run it holds that name in `schema_migration`, so
-/// changing it here would not rename anything -- it would make this table
-/// disagree with every deployment, which is the one thing the record exists
-/// to prevent. The name of a migration is history, not documentation.
+/// Migration 1 was renamed from `ledger` to `street` on 2026-09-20, which
+/// breaks that rule on purpose and exactly once. The rule protects databases
+/// that have already run a migration: their `schema_migration` holds the old
+/// name and nothing here can reach in and change it. On 2026-09-20 one
+/// database had run it, ours, and rebuilding it cost a `DROP SCHEMA` and a
+/// `migrate`. Ruled by the product owner: cheaper to correct the name than to
+/// carry a wrong one into every deployment that follows.
+///
+/// From here the rule holds without the exception, because the next database
+/// to run this is one we cannot reach.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        name: "ledger",
-        sql: include_str!("../migrations/0001_ledger.sql"),
+        name: "street",
+        sql: include_str!("../migrations/0001_street.sql"),
     },
     Migration {
         version: 2,
