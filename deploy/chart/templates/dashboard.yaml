@@ -1,0 +1,120 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.dashboard.enabled }}
+{{- if not .Values.dashboard.url }}
+{{- fail "dashboard.url is required: it is where people reach the dashboard, and where the directory sends them back to after signing in" }}
+{{- end }}
+{{- if gt (int .Values.dashboard.replicaCount) 1 }}
+{{- fail "dashboard.replicaCount must be 1: sessions live in the dashboard's memory, and a second replica would sign people out at random" }}
+{{- end }}
+{{/*
+  The dashboard: the one address a firm's staff use. It signs people in
+  through the firm's directory, holds no deployment key and no database, and
+  reads who may do what from the conductor over the broker, as the instance
+  dashboard.instanceId with the admin role's grants.
+  spec/deployment-dashboard-and-access.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-dashboard
+  labels:
+    meridian.dev/component: dashboard
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: dashboard
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dashboard
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          args: ["meridian-dashboard"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ .Values.dashboard.instanceId | quote }}
+            - name: MERIDIAN_DASHBOARD_LISTEN
+              value: "0.0.0.0:8080"
+            - name: MERIDIAN_DASHBOARD_URL
+              value: {{ .Values.dashboard.url | quote }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.broker.existingSecret }}
+                  key: {{ .Values.dashboard.brokerKey | default .Values.dashboard.instanceId }}
+            {{- with .Values.dashboard.oidc }}
+            {{- if .issuer }}
+            - name: MERIDIAN_OIDC_ISSUER
+              value: {{ .issuer | quote }}
+            - name: MERIDIAN_OIDC_CLIENT_ID
+              value: {{ .clientId | quote }}
+            - name: MERIDIAN_OIDC_GROUPS_CLAIM
+              value: {{ .groupsClaim | default "groups" | quote }}
+            {{- if .existingSecret }}
+            - name: MERIDIAN_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ .secretKey | default "client-secret" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          # Ready only while the records are fresh: a dashboard that cannot read
+          # who may do what is taken out rather than sending people to a
+          # refusal. Alive is only that it answers at all, so a stale one is
+          # not restarted into the same outage.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-dashboard
+  labels:
+    meridian.dev/component: dashboard
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: dashboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

@@ -274,7 +274,17 @@ chart-check:
 		--set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' --set grants.existingConfigMap=g \
 		--show-only templates/sidecar.yaml 2>/dev/null | grep -q "^        - name: plugin$$" \
 		&& { echo "chart-check FAILED: a sidecar with no plugin rendered a plugin container" >&2; exit 1; } || true
-	@echo "chart-check OK: four components, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url=https://meridian.example 2>/dev/null \
+		| grep -q '"meridian-dashboard"' \
+		|| { echo "chart-check FAILED: the dashboard does not render when enabled" >&2; exit 1; }
+	@for refused in "dashboard.url=" "dashboard.replicaCount=2"; do \
+		if $(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+			--set dashboard.url=https://meridian.example --set $$refused >/dev/null 2>&1; then \
+			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \
+		fi; \
+	done
+	@echo "chart-check OK: four components and the dashboard, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
