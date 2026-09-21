@@ -1,7 +1,7 @@
 //! Which identifier to believe first.
 //!
 //! One table, deliberately in a crate of its own. The replica falls through
-//! this order when resolving locally; the uplink tries global identifiers in
+//! this order when resolving locally; the conductor tries global identifiers in
 //! this order when asking the platform. Two orderings would be two things to
 //! keep in step, and the day they disagreed a deployment would resolve one way
 //! and the master another, with nothing failing to say so.

@@ -1,15 +1,15 @@
 //! The deployment's replica of the security master, as its own process.
 //!
-//! Answers instrument questions locally and applies what the uplink publishes
+//! Answers instrument questions locally and applies what the conductor publishes
 //! after pulling or escalating. It holds no key and reaches no network: the
-//! platform connection and the deployment's identity are the uplink's, per
+//! platform connection and the deployment's identity are the conductor's, per
 //! decision 011.
 //!
 //! A replica rather than a cache: it keeps answering from what it holds when
 //! the platform is unreachable, which is what lets a deployment stay useful
 //! through somebody else's outage.
 //!
-//! `replica migrate` applies its schema. `public-key` moved to the uplink with
+//! `replica migrate` applies its schema. `public-key` moved to the conductor with
 //! the key it prints the public half of.
 
 use std::sync::Arc;
@@ -61,7 +61,7 @@ fn run() -> Result<(), String> {
             // published into the gap between starting and listening.
             let running = replica.start();
 
-            // W5.20. Said on the bus for the uplink to carry outward. This
+            // W5.20. Said on the bus for the conductor to carry outward. This
             // process holds no key, and giving it one so it could report
             // directly would put the deployment's identity back in a store.
             tokio::spawn(async move { report_inward_forever(reporting_bus, "replica", 0).await });

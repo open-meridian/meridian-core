@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-replica \
-       target/release/meridian-uplink target/release/meridian-sidecar /usr/local/bin/
+       target/release/meridian-conductor target/release/meridian-sidecar /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -38,7 +38,7 @@ VOLUME /var/lib/meridian
 # were built from different commits.
 COPY --from=build /usr/local/bin/meridian-street /usr/local/bin/meridian-street
 COPY --from=build /usr/local/bin/meridian-replica /usr/local/bin/meridian-replica
-COPY --from=build /usr/local/bin/meridian-uplink /usr/local/bin/meridian-uplink
+COPY --from=build /usr/local/bin/meridian-conductor /usr/local/bin/meridian-conductor
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
 
 # No default: a component is chosen, never inherited. An image that starts

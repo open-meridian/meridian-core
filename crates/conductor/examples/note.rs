@@ -9,7 +9,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use meridian_uplink::DeploymentKey;
+use meridian_conductor::DeploymentKey;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

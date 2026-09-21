@@ -7,11 +7,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform};
 use meridian_pb::v1::{
     Identifier as PbIdentifier, InstrumentRecord as PbInstrument, ResolveIdentifierRequest,
 };
 use meridian_reference::{apply, resolve_identifier, PostgresStore};
-use meridian_uplink::{Config, DeploymentKey, HttpTransport, Platform};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {

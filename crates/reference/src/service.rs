@@ -56,7 +56,7 @@ pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrumen
 /// W3.2. A connector reporting that a resolution missed.
 pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missing";
 
-/// W3.3 and W3.4. What the uplink got from the platform, for applying.
+/// W3.3 and W3.4. What the conductor got from the platform, for applying.
 ///
 /// The replica subscribes rather than fetching. It holds no key and therefore
 /// cannot reach the platform at all, which is the property decision 011 bought:
@@ -199,7 +199,7 @@ impl Reactor {
             Err(failed) => return Handled::Ignored(format!("undecodable record: {failed}")),
         };
 
-        // `found: false` is not published -- the uplink stays silent when the
+        // `found: false` is not published -- the conductor stays silent when the
         // platform knew nothing -- so one arriving is a publisher that does not
         // agree with this one about what the topic means. Refused rather than
         // treated as a deletion.
@@ -318,7 +318,7 @@ mod tests {
         }
     }
 
-    /// What the uplink publishes after the platform answered.
+    /// What the conductor publishes after the platform answered.
     fn pulled(instrument_id: &str, version: i64) -> PullInstrumentReply {
         PullInstrumentReply {
             found: true,
@@ -359,7 +359,7 @@ mod tests {
                     message_id: "MSG-PULLED".into(),
                     correlation_id: correlation.into(),
                     causation_id: String::new(),
-                    publisher_instance_id: "uplink-1".into(),
+                    publisher_instance_id: "conductor-1".into(),
                     topic: INSTRUMENT_PULLED.into(),
                     schema_version: "v1".into(),
                     published_at_ns: NOW,
@@ -547,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reply_carrying_no_instrument_is_refused() {
-        // The uplink stays silent when the platform knew nothing, so one of
+        // The conductor stays silent when the platform knew nothing, so one of
         // these means a publisher that disagrees about what the topic means.
         // Refused rather than treated as a deletion.
         let store = Arc::new(MemoryStore::new());

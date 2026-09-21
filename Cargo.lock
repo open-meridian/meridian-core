@@ -1105,6 +1105,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-conductor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "meridian-bus",
+ "meridian-pb",
+ "meridian-symbology",
+ "prost",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-pb"
 version = "0.1.0"
 source = "git+https://github.com/open-meridian/meridian-schema.git?rev=d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d#d7521f0c8e57d4d9b27b60c55b18efa2732f9b1d"
@@ -1137,11 +1157,11 @@ name = "meridian-runtime"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
+ "meridian-conductor",
  "meridian-pb",
  "meridian-reference",
  "meridian-sidecar",
  "meridian-street",
- "meridian-uplink",
  "prost",
  "tokio",
  "tonic",
@@ -1186,26 +1206,6 @@ name = "meridian-symbology"
 version = "0.1.0"
 dependencies = [
  "meridian-pb",
-]
-
-[[package]]
-name = "meridian-uplink"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "ed25519-dalek",
- "meridian-bus",
- "meridian-pb",
- "meridian-symbology",
- "prost",
- "rand 0.8.8",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
 ]
 
 [[package]]

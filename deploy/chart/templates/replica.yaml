@@ -57,7 +57,7 @@ spec:
           # No port. Everything this component says goes over the broker, so
           # nothing outside its pod needs to reach it. A Service in front of it
           # would be a second way in that nothing asks for.
-          # No volumes. The key and the platform address moved to the uplink
+          # No volumes. The key and the platform address moved to the conductor
           # with the connection that used them (decisions/011), and this
           # component now mounts nothing at all: what it learns, it learns on
           # the bus.

@@ -8,16 +8,16 @@
 //! process that accumulates a store becomes a fourth thing to migrate and the
 //! one nobody wrote migrations for.
 //!
-//! `uplink public-key` prints the public half of the deployment's key,
+//! `conductor public-key` prints the public half of the deployment's key,
 //! generating one if there is none. That moved here with the key: the process
 //! that holds a private half is the process that can speak for its public one.
 
 use std::sync::Arc;
 
+use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
 use meridian_runtime::{
     bus_from_env, key_at, now_ns, platform_from_env, report_forever, shutdown, var,
 };
-use meridian_uplink::{SystemClock, Uplink, INSTRUMENT_MISSING};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -44,7 +44,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "uplink-1".into());
+    let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
     let platform = platform_from_env(key)?;
 
     tokio::runtime::Builder::new_multi_thread()
@@ -60,21 +60,23 @@ fn run() -> Result<(), String> {
             let misses = bus.subscribe(INSTRUMENT_MISSING);
 
             let carrying = Arc::clone(&bus);
-            let uplink = Uplink::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
-            let running = tokio::spawn(uplink.consume(misses));
+            let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
+            let running = tokio::spawn(conductor.consume(misses));
 
             // W5.19 outward, W5.20 inward: this component holds the key, so it
             // is the one that can tell the platform anything, and what it tells
             // it includes what the others have said about themselves.
             let reporting = Arc::clone(&platform);
             let collecting = Arc::clone(&bus);
-            tokio::spawn(async move { report_forever(reporting, collecting, "uplink", 0).await });
+            tokio::spawn(
+                async move { report_forever(reporting, collecting, "conductor", 0).await },
+            );
 
             tracing::info!(
                 instance_id,
                 platform = platform.address(),
                 started_at_ns = now_ns(),
-                "the uplink is connected"
+                "the conductor is connected"
             );
 
             tokio::select! {

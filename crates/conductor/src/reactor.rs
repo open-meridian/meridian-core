@@ -63,13 +63,13 @@ pub enum Carried {
 }
 
 /// Consumes misses, asks the platform, and publishes what it gets.
-pub struct Uplink {
+pub struct Conductor {
     bus: Arc<Bus>,
     platform: Arc<Platform>,
     clock: Arc<dyn Clock>,
 }
 
-impl Uplink {
+impl Conductor {
     pub fn new(bus: Arc<Bus>, platform: Arc<Platform>, clock: Arc<dyn Clock>) -> Self {
         Self {
             bus,
@@ -114,7 +114,7 @@ impl Uplink {
     /// React to one delivery.
     ///
     /// Public so a test can drive it without a running loop, and so a caller
-    /// that wants its own scheduling is not forced through [`Uplink::run`].
+    /// that wants its own scheduling is not forced through [`Conductor::run`].
     pub async fn carry(&self, delivery: Delivery) -> Carried {
         let envelope = delivery.envelope;
         if envelope.payload_type != "meridian.v1.MissingInstrumentDetectedEvent" {
@@ -198,7 +198,7 @@ mod tests {
     }
 
     fn bus() -> Arc<Bus> {
-        Arc::new(Bus::single("uplink-1", Arc::new(MemoryBackend::new())))
+        Arc::new(Bus::single("conductor-1", Arc::new(MemoryBackend::new())))
     }
 
     fn miss_event() -> MissingInstrumentDetectedEvent {
@@ -236,8 +236,8 @@ mod tests {
         }
     }
 
-    fn uplink(bus: Arc<Bus>, transport: Arc<Fake>) -> Uplink {
-        Uplink::new(bus, Arc::new(platform_with(transport)), Stopped::at(NOW))
+    fn conductor(bus: Arc<Bus>, transport: Arc<Fake>) -> Conductor {
+        Conductor::new(bus, Arc::new(platform_with(transport)), Stopped::at(NOW))
     }
 
     /// What arrived on the pulled topic, or a failure rather than a hang.
@@ -254,7 +254,7 @@ mod tests {
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
 
-        let carried = uplink(Arc::clone(&bus), transport)
+        let carried = conductor(Arc::clone(&bus), transport)
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 miss_event().encode_to_vec(),
@@ -285,7 +285,7 @@ mod tests {
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
 
-        uplink(Arc::clone(&bus), transport)
+        conductor(Arc::clone(&bus), transport)
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 miss_event().encode_to_vec(),
@@ -303,7 +303,7 @@ mod tests {
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![failure("no route to host")]);
 
-        let carried = uplink(Arc::clone(&bus), transport)
+        let carried = conductor(Arc::clone(&bus), transport)
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 miss_event().encode_to_vec(),
@@ -329,9 +329,9 @@ mod tests {
         let bus = bus();
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
-        let uplink = uplink(Arc::clone(&bus), transport);
+        let conductor = conductor(Arc::clone(&bus), transport);
 
-        uplink
+        conductor
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 miss_event().encode_to_vec(),
@@ -339,7 +339,7 @@ mod tests {
             .await;
         next(&mut pulled).await;
 
-        let again = uplink
+        let again = conductor
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 miss_event().encode_to_vec(),
@@ -366,7 +366,7 @@ mod tests {
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
         let calls = Arc::clone(&transport);
 
-        let carried = uplink(bus, transport)
+        let carried = conductor(bus, transport)
             .carry(delivery(
                 "meridian.v1.InstrumentAppliedEvent",
                 miss_event().encode_to_vec(),
@@ -383,7 +383,7 @@ mod tests {
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
         let calls = Arc::clone(&transport);
 
-        let carried = uplink(bus, transport)
+        let carried = conductor(bus, transport)
             .carry(delivery(
                 "meridian.v1.MissingInstrumentDetectedEvent",
                 vec![0xff, 0xff, 0xff],
@@ -401,7 +401,7 @@ mod tests {
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
 
-        tokio::spawn(uplink(Arc::clone(&bus), transport).consume(misses));
+        tokio::spawn(conductor(Arc::clone(&bus), transport).consume(misses));
 
         bus.publish(
             INSTRUMENT_MISSING,

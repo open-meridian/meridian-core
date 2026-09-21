@@ -1,7 +1,23 @@
-//! The deployment's end of the link to the platform.
+//! The conductor: the one component that coordinates a deployment.
 //!
-//! One process holds the deployment's private key, makes the outbound
-//! connection, and carries what comes back onto the bus. Decision 011.
+//! An orchestra's parts play independently and one role turns them into a
+//! single performance. That is this: the street store and the replica answer
+//! the bus without asking anyone, and this component holds the deployment's
+//! identity, speaks for the whole of it outward, and brings back what the
+//! others cannot fetch for themselves. Decision 011.
+//!
+//! The name carries an invariant worth knowing before anybody scales this:
+//! there is one conductor. Redundancy here means a standby, not a second one.
+//! Two would pull the same record twice, escalate the same miss twice, and
+//! defeat the throttle that exists so a burst of misses is not a burst of
+//! mints.
+//!
+//! # What it does
+//!
+//! Holds the deployment's private key, which is what lets it speak for the
+//! deployment at all. Carries a miss to the platform and the answer back onto
+//! the bus (W3.3, W3.4). Collects what every component says about itself and
+//! reports it as one picture (W5.19, W5.20).
 //!
 //! # Why this is not the replica
 //!
@@ -44,4 +60,4 @@ pub use assertions::{DeploymentKey, SigningError};
 pub use platform::{
     ComponentReport, Config, HttpTransport, Platform, PlatformError, Reaction, Transport,
 };
-pub use reactor::{Carried, Clock, SystemClock, Uplink, INSTRUMENT_MISSING, INSTRUMENT_PULLED};
+pub use reactor::{Carried, Clock, Conductor, SystemClock, INSTRUMENT_MISSING, INSTRUMENT_PULLED};

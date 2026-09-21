@@ -9,9 +9,9 @@
 //!
 //! Answers instrument questions locally (W3.1, W3.6). Reports a miss as a fact
 //! rather than a request (W3.2). Applies under a monotonic version what the
-//! uplink publishes after pulling or escalating (W3.5).
+//! conductor publishes after pulling or escalating (W3.5).
 //!
-//! It does not reach the platform. W3.3 and W3.4 are the uplink's, and so is
+//! It does not reach the platform. W3.3 and W3.4 are the conductor's, and so is
 //! the key that would let anything here try: decision 011.
 //!
 //! # What it never does
@@ -52,7 +52,7 @@ use meridian_bus::Bus;
 ///
 /// A store and a bus, and nothing else. It held a platform client until
 /// 2026-09-21, which is what put the deployment's private key in the same
-/// process as the instrument tables; decision 011 moved both to the uplink.
+/// process as the instrument tables; decision 011 moved both to the conductor.
 /// What arrives here now arrives on the bus like everything else.
 pub struct Replica {
     bus: Arc<Bus>,

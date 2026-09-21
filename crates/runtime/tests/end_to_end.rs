@@ -13,13 +13,13 @@ use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
+use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform, Reaction};
 use meridian_pb::v1::{
     Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent,
     ResolveIdentifierRequest,
 };
 use meridian_reference::store::Store;
 use meridian_reference::{resolve_identifier, PostgresStore};
-use meridian_uplink::{Config, DeploymentKey, HttpTransport, Platform, Reaction};
 
 fn required(name: &str) -> String {
     std::env::var(name)

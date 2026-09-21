@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meridian_bus::{Backend, Bus, MemoryBackend, NatsBackend};
+use meridian_conductor::platform::ComponentReport;
+use meridian_conductor::{DeploymentKey, Platform};
 use meridian_sidecar::GrantTable;
-use meridian_uplink::platform::ComponentReport;
-use meridian_uplink::{DeploymentKey, Platform};
 
 /// How long a component waits on the platform before giving up on one attempt.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -82,7 +82,7 @@ pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
 
 /// The platform client, for a component that talks to the platform.
 pub fn platform_from_env(key: DeploymentKey) -> Result<Arc<Platform>, String> {
-    use meridian_uplink::{Config, HttpTransport};
+    use meridian_conductor::{Config, HttpTransport};
 
     let address = required("MERIDIAN_PLATFORM_ADDRESS")?;
     let deployment_id = required("MERIDIAN_DEPLOYMENT_ID")?;

@@ -1,6 +1,6 @@
 {{- include "meridian-runtime.require" . -}}
 {{/*
-  The uplink. The one component holding the deployment's key, and therefore the
+  The conductor. The one component holding the deployment's key, and therefore the
   only one that can reach the platform at all. Decision 011.
 
   No database, and that is the design rather than an omission: what the platform
@@ -10,22 +10,22 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "meridian-runtime.fullname" . }}-uplink
+  name: {{ include "meridian-runtime.fullname" . }}-conductor
   labels:
-    meridian.dev/component: uplink
+    meridian.dev/component: conductor
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.uplink.replicaCount }}
+  replicas: {{ .Values.conductor.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      meridian.dev/component: uplink
+      meridian.dev/component: conductor
   template:
     metadata:
       labels:
         {{- include "meridian-runtime.labels" . | nindent 8 }}
-        meridian.dev/component: uplink
+        meridian.dev/component: conductor
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -36,9 +36,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: uplink
-          image: "{{ .Values.image.repository }}:{{ .Values.uplink.image.tag | default .Values.image.tag }}"
-          args: ["meridian-uplink"]
+        - name: conductor
+          image: "{{ .Values.image.repository }}:{{ .Values.conductor.image.tag | default .Values.image.tag }}"
+          args: ["meridian-conductor"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -53,12 +53,12 @@ spec:
             - name: MERIDIAN_KEY_PATH
               value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
-              value: {{ include "meridian-runtime.fullname" . }}-uplink
+              value: {{ include "meridian-runtime.fullname" . }}-conductor
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.broker.existingSecret }}
-                  key: {{ .Values.broker.uplinkKey }}
+                  key: {{ .Values.broker.conductorKey }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           # No port and no Service. It speaks outward over HTTPS and inward over
