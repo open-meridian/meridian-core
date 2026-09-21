@@ -53,6 +53,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-in", get(sign_in))
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
+        .merge(crate::admin::routes())
         .with_state(app)
 }
 
@@ -114,7 +115,15 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         escape(&session.display_name)
     );
     if access.deployment_admin {
-        body.push_str("<p>You are a deployment admin.</p>");
+        body.push_str(
+            "<p>You are a deployment admin: <a href=\"/admin\">administer this deployment</a>.</p>",
+        );
+    } else if !records
+        .permissions
+        .iter()
+        .any(|p| p.access_group_id == meridian_access::DEPLOYMENT_ADMIN)
+    {
+        body.push_str("<p>Nobody administers this deployment yet. <a href=\"/claim\">Claim it</a> with a code from open-meridian.com.</p>");
     }
     if access.plugins.is_empty() {
         body.push_str("<p>You hold no access to any plugin.</p>");

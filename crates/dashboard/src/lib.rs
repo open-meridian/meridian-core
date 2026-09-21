@@ -15,6 +15,7 @@
 //! than configuration, because a bound somebody can widen in a values file is
 //! not a bound.
 
+pub mod admin;
 pub mod clock;
 pub mod html;
 pub mod oidc;
