@@ -340,6 +340,47 @@ pub async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// The platform, as the configuration store needs it (W5.22, W5.23), over the
+/// conductor's own client and key.
+///
+/// The configuration store calls it from a bus handler, which runs on a
+/// blocking thread, so this blocks on the runtime it was made on rather than
+/// making the store async for two calls.
+pub struct PlatformUpstream {
+    platform: Arc<Platform>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl PlatformUpstream {
+    /// Call inside the runtime the handlers will block on.
+    pub fn new(platform: Arc<Platform>) -> Self {
+        Self {
+            platform,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl meridian_config::Upstream for PlatformUpstream {
+    fn honour_claim_code(
+        &self,
+        code: &str,
+    ) -> Result<meridian_domain::v1::RedeemClaimCodeReply, String> {
+        self.runtime
+            .block_on(self.platform.honour_claim_code(code, now_ns()))
+            .map_err(|failed| format!("the platform could not be asked: {failed}"))
+    }
+
+    fn submit_diagnostic_bundle(
+        &self,
+        bundle: &meridian_domain::v1::DiagnosticBundle,
+    ) -> Result<meridian_domain::v1::DiagnosticBundleReceipt, String> {
+        self.runtime
+            .block_on(self.platform.submit_diagnostic_bundle(bundle, now_ns()))
+            .map_err(|failed| format!("the platform could not be sent the bundle: {failed}"))
+    }
+}
+
 pub fn var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

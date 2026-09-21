@@ -187,10 +187,12 @@ chart-check:
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
 		fi; \
 	done
-	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
-		| grep -q '"migrate"' \
-		|| { echo "chart-check FAILED: the chart renders no migration job" >&2; \
-		     echo "  the runtime verifies the schema and refuses to serve without one" >&2; exit 1; }
+	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	for store in meridian-conductor meridian-street meridian-instrument; do \
+		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
+			|| { echo "chart-check FAILED: the chart renders no migration for $$store" >&2; \
+			     echo "  each store verifies its schema and refuses to serve without one" >&2; exit 1; }; \
+	done
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| grep -q "runAsUser" \
 		&& { echo "chart-check FAILED: the chart pins a uid by default" >&2; \
@@ -296,6 +298,7 @@ migrate: network
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm -T street meridian-street migrate
+	@$(COMPOSE) run --rm --build -T conductor meridian-conductor migrate
 
 up: migrate
 	@$(COMPOSE) up --build
@@ -328,7 +331,8 @@ interop: network
 		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
-	@$(COMPOSE) run --rm -T street meridian-street migrate >/dev/null 2>&1 \
+	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
+	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@# All three components, because the surface under test is the sidecar's
 	@# and the answers come from the other two across a broker. Before the
@@ -360,8 +364,7 @@ DEPLOYMENT ?= demo-1
 demo: network
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
-	@$(COMPOSE) up -d --build postgres
-	@$(COMPOSE) run --rm -T runtime migrate
+	@$(MAKE) --no-print-directory migrate
 	@echo "1/4  making sure this deployment has a key"
 	@mkdir -p .demo
 	@$(COMPOSE) run --rm --no-deps -T conductor meridian-conductor public-key > .demo/public-key.pem

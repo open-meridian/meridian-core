@@ -3,9 +3,10 @@
   The conductor. The one component holding the deployment's key, and therefore the
   only one that can reach the platform at all. Decision 011.
 
-  No database, and that is the design rather than an omission: what the platform
-  published can be fetched again, so a control process with a store would be a
-  fourth thing to migrate and the one nobody wrote migrations for.
+  It holds the configuration store -- what a deployment admin authors -- which
+  it did not until 2026-09-21. The objection to a control process with a store
+  was that nobody would write its migrations; this one has a history from its
+  first commit, applied by the migrate job, and a start only verifies it.
 */}}
 apiVersion: apps/v1
 kind: Deployment
@@ -54,6 +55,11 @@ spec:
               value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
+            - name: MERIDIAN_CONFIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.conductor.database.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.conductor.database.key | default .Values.database.key }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:

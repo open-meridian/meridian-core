@@ -88,6 +88,10 @@ migrate:
   streetSecret: ""
   streetKey: ""
 
+  # The configuration store's, likewise.
+  configSecret: ""
+  configKey: ""
+
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
 
@@ -106,6 +110,12 @@ conductor:
     # Its own tag, so the component that talks to the platform can be moved
     # without touching either store. Empty falls back to image.tag.
     tag: ""
+  # The configuration store's database, or the same one as the others: its
+  # tables are prefixed config_, so sharing a schema is supported. Empty falls
+  # back to the database secret above.
+  database:
+    existingSecret: ""
+    key: ""
 
 street:
   replicaCount: 1

@@ -11,3 +11,4 @@
 
 meridian-runtime->meridian-instrument	The composition root for the instrument store: it opens the database and hands it to the crate that uses it. It calls no store method itself.
 meridian-runtime->meridian-street	The same composition root, for the street store: it opens the store and hands it over, and calls no store method itself.
+meridian-runtime->meridian-config	The composition root for the configuration store: the conductor's binary opens the database and hands it to the service that uses it, joined to the platform through an Upstream. It calls no store method itself.

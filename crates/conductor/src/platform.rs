@@ -45,8 +45,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meridian_domain::v1::{
-    EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
-    MissReason, MissingInstrumentDetectedEvent,
+    DiagnosticBundle, DiagnosticBundleReceipt, EscalateInstrumentRequest,
+    Identifier as PbIdentifier, InstrumentRecord as PbInstrument, MissReason,
+    MissingInstrumentDetectedEvent, RedeemClaimCodeReply,
 };
 use serde::Deserialize;
 
@@ -457,6 +458,77 @@ impl Platform {
         .map(|_| ())
     }
 
+    /// W5.22. Present a claim code a deployment admin is redeeming.
+    ///
+    /// The body is the code and nothing else. The note this call is signed
+    /// with already says which deployment is asking, and nothing here says who
+    /// is redeeming: the platform learns that a code was used, never by whom.
+    pub async fn honour_claim_code(
+        &self,
+        code: &str,
+        now_ns: i64,
+    ) -> Result<RedeemClaimCodeReply, PlatformError> {
+        let body = serde_json::to_vec(&serde_json::json!({ "code": code }))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .call(
+                Method::Post,
+                "/api/v1/reference/deployments/claim-codes/redeem",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let reply: WireRedemption = read_json(&response)?;
+        Ok(RedeemClaimCodeReply {
+            redeemed: reply.redeemed,
+            refusal_reason: reply.refusal_reason.unwrap_or_default(),
+        })
+    }
+
+    /// W5.23. Send a diagnostic bundle, exactly as its deployment admin
+    /// approved it.
+    ///
+    /// Nothing is added: not who sent it, and not the deployment's identity,
+    /// which the signed note already carries and the platform records itself.
+    /// Content is base64, as proto's JSON form writes bytes.
+    pub async fn submit_diagnostic_bundle(
+        &self,
+        bundle: &DiagnosticBundle,
+        now_ns: i64,
+    ) -> Result<DiagnosticBundleReceipt, PlatformError> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "bundle_id": bundle.bundle_id,
+            "assembled_at_ns": bundle.assembled_at_ns,
+            "items": bundle
+                .items
+                .iter()
+                .map(|item| serde_json::json!({
+                    "name": item.name,
+                    "content_type": item.content_type,
+                    "content": STANDARD.encode(&item.content),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .call(
+                Method::Post,
+                "/api/v1/reference/deployments/diagnostic-bundles",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let receipt: WireReceipt = read_json(&response)?;
+        Ok(DiagnosticBundleReceipt {
+            bundle_id: receipt.bundle_id,
+            received_at_ns: receipt.received_at_ns,
+            retain_until_ns: receipt.retain_until_ns,
+        })
+    }
+
     /// One logical request: signed once, retried, and redirected by hand.
     async fn call(
         &self,
@@ -623,6 +695,29 @@ fn found_or_nothing(response: Response) -> Result<Option<PbInstrument>, Platform
         return Ok(None);
     }
     reply.instrument.map(into_record).transpose()
+}
+
+#[derive(Deserialize)]
+struct WireRedemption {
+    redeemed: bool,
+    refusal_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireReceipt {
+    bundle_id: String,
+    received_at_ns: i64,
+    retain_until_ns: i64,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(response: &Response) -> Result<T, PlatformError> {
+    if !(200..300).contains(&response.status) {
+        return Err(PlatformError::Refused {
+            status: response.status,
+        });
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))
 }
 
 fn read(response: &Response) -> Result<WireReply, PlatformError> {
@@ -844,6 +939,8 @@ pub(crate) mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine as _;
 
+    use meridian_domain::v1::BundleItem;
+
     use super::*;
 
     pub(crate) const ADDRESS: &str = "https://platform.meridian.example";
@@ -943,6 +1040,80 @@ pub(crate) mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_claim_code_is_presented_with_nothing_about_the_person() {
+        let transport = Fake::new(vec![Ok(reply(200, "{\"redeemed\": true}"))]);
+        let platform = platform(Arc::clone(&transport));
+
+        let answered = platform
+            .honour_claim_code("7KQ2-MX4P-9RTD", NOW)
+            .await
+            .unwrap();
+        assert!(answered.redeemed);
+        assert_eq!(
+            transport.urls(),
+            vec![format!(
+                "{ADDRESS}/api/v1/reference/deployments/claim-codes/redeem"
+            )]
+        );
+        let seen = transport.seen.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(seen[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"code": "7KQ2-MX4P-9RTD"}));
+    }
+
+    #[tokio::test]
+    async fn a_refused_claim_says_why() {
+        let transport = Fake::new(vec![Ok(reply(
+            200,
+            "{\"redeemed\": false, \"refusal_reason\": \"already used\"}",
+        ))]);
+        let answered = platform(transport)
+            .honour_claim_code("7KQ2-MX4P-9RTD", NOW)
+            .await
+            .unwrap();
+        assert!(!answered.redeemed);
+        assert_eq!(answered.refusal_reason, "already used");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_is_sent_as_approved_with_nothing_added() {
+        let transport = Fake::new(vec![Ok(reply(
+            200,
+            "{\"bundle_id\": \"DB-1\", \"received_at_ns\": 5, \"retain_until_ns\": 6}",
+        ))]);
+        let platform = platform(Arc::clone(&transport));
+        let bundle = DiagnosticBundle {
+            bundle_id: "DB-1".into(),
+            assembled_at_ns: 3,
+            items: vec![BundleItem {
+                name: "component-reports.json".into(),
+                content_type: "application/json".into(),
+                content: b"[]".to_vec(),
+            }],
+            deployment_id: String::new(),
+        };
+
+        let receipt = platform
+            .submit_diagnostic_bundle(&bundle, NOW)
+            .await
+            .unwrap();
+        assert_eq!(receipt.retain_until_ns, 6);
+
+        let seen = transport.seen.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(seen[0].body.as_ref().unwrap()).unwrap();
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["assembled_at_ns", "bundle_id", "items"]);
+        assert_eq!(body["items"][0]["content"], "W10=");
     }
 
     #[tokio::test]

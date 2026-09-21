@@ -106,7 +106,12 @@ services:
     depends_on:
       nats:
         condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
+      # The configuration store: what a deployment admin authors. Its tables
+      # are prefixed config_, so it can share a schema with the other stores.
+      MERIDIAN_CONFIG_DATABASE_URL: ${MERIDIAN_CONFIG_DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
       MERIDIAN_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}

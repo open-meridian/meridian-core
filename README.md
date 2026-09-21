@@ -19,8 +19,10 @@ Four processes and a broker, each its own image tag and upgraded on its own:
 - **street store** -- what custodians say is held: statements, holdings,
   custodial positions. The one store whose contents nothing can rebuild.
 - **conductor** -- the only component holding the deployment's key, and so the
-  only one that reaches the platform. There is one conductor; redundancy means a
-  standby, not a second one.
+  only one that reaches the platform. It also holds the configuration store:
+  accounts, who may reach what, and plugin settings, as a deployment admin
+  authors them. There is one conductor; redundancy means a standby, not a
+  second one.
 - **sidecar** -- one per plugin, bound to loopback, holding that plugin's broker
   credential and enforcing its grants.
 
@@ -57,6 +59,8 @@ redirected without anything here changing or restarting.
 | `instrument` | The instrument store: resolve and apply |
 | `street` | The street store: statements, holdings, custodial positions |
 | `conductor` | The platform connection, the key, and outward reporting |
+| `config` | The configuration store: accounts, access, settings |
+| `access` | Evaluating who may reach what, shared by the conductor and the dashboard |
 | `symbology` | The identifier fallback order, shared by two components |
 | `domain` | The domain messages, generated from `proto/` by `make codegen` |
 | `runtime` | The four binaries, and what wires each process together |

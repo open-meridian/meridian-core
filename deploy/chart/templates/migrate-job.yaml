@@ -37,11 +37,31 @@ spec:
       {{- end }}
       {{/*
         Each component migrates its own schema, in its own container, at the
-        version being released. An init container for the street store and the
-        instrument store's in the main one, so both must succeed for the release to
-        proceed and the order is stated rather than raced.
+        version being released. Init containers for the configuration store and
+        the street store, and the instrument store's in the main one, so all
+        three must succeed for the release to proceed and the order is stated
+        rather than raced. The conductor's migration needs a database and no key.
       */}}
       initContainers:
+        - name: conductor
+          image: "{{ .Values.image.repository }}:{{ .Values.conductor.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-conductor", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_CONFIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.configSecret | default .Values.migrate.existingSecret | default .Values.conductor.database.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.migrate.configKey | default .Values.migrate.key | default .Values.conductor.database.key | default .Values.database.key }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
         - name: street
           image: "{{ .Values.image.repository }}:{{ .Values.street.image.tag | default .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}

@@ -4,9 +4,13 @@
 //! and the answer back onto the bus, and reports what the deployment is running.
 //! Decision 011.
 //!
-//! No database. What the platform published can be fetched again, and a control
-//! process that accumulates a store becomes a fourth thing to migrate and the
-//! one nobody wrote migrations for.
+//! It holds the configuration store: what a deployment admin authors, which
+//! nothing else can rebuild. It held no database until 2026-09-21, on the
+//! argument that a control process accumulating a store becomes the one nobody
+//! writes migrations for. Configuration was ruled to live here, as it did in
+//! v1, so the store came with its migration history, and
+//! `meridian-conductor migrate` applies it once per release. Starting verifies
+//! and refuses a schema it does not recognise.
 //!
 //! `conductor public-key` prints the public half of the deployment's key,
 //! generating one if there is none. That moved here with the key: the process
@@ -15,8 +19,10 @@
 use std::sync::Arc;
 
 use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
+use meridian_config::PostgresStore;
 use meridian_runtime::{
-    bus_from_env, key_at, now_ns, platform_from_env, report_forever, shutdown, var,
+    bus_from_env, key_at, now_ns, platform_from_env, report_forever, required, shutdown, var,
+    PlatformUpstream,
 };
 
 fn main() {
@@ -33,16 +39,42 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let command = std::env::args().nth(1);
+
+    // Before the key, because migrating needs a database and nothing else: a
+    // migration job holds no key and should not need one.
+    if command.as_deref() == Some("migrate") {
+        let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
+        return PostgresStore::connect(&url, 1)
+            .and_then(|store| store.migrate())
+            .map(|()| {
+                tracing::info!(
+                    version = meridian_config::migrations::latest(),
+                    "the configuration store's schema is applied"
+                )
+            })
+            .map_err(|failed| {
+                format!("the configuration store's schema could not be applied: {failed}")
+            });
+    }
+
     let key_path = var("MERIDIAN_KEY_PATH").unwrap_or_else(|| "/var/lib/meridian/key.pem".into());
     let key = key_at(&key_path)?;
 
-    if std::env::args().nth(1).as_deref() == Some("public-key") {
+    // And before the database, because printing the public half needs the key
+    // and nothing else.
+    if command.as_deref() == Some("public-key") {
         println!(
             "{}",
             key.public_key_pem().map_err(|failed| failed.to_string())?
         );
         return Ok(());
     }
+
+    let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
+    let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
+    // Verified, never applied, for the reason every store gives.
+    store.verify().map_err(|failed| failed.to_string())?;
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
     let platform = platform_from_env(key)?;
@@ -59,6 +91,15 @@ fn run() -> Result<(), String> {
             // exists is dropped, and dropped silently.
             let misses = bus.subscribe(INSTRUMENT_MISSING);
 
+            // The config domain: registered and subscribed before the loop
+            // starts, so nothing the dashboard or a sidecar asks is missed.
+            meridian_config::serve(
+                Arc::clone(&bus),
+                Arc::new(store),
+                Arc::new(meridian_config::SystemClock),
+                Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
+            );
+
             let carrying = Arc::clone(&bus);
             let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
             let running = tokio::spawn(conductor.consume(misses));
@@ -68,9 +109,10 @@ fn run() -> Result<(), String> {
             // it includes what the others have said about themselves.
             let reporting = Arc::clone(&platform);
             let collecting = Arc::clone(&bus);
-            tokio::spawn(
-                async move { report_forever(reporting, collecting, "conductor", 0).await },
-            );
+            let schema = meridian_config::migrations::latest();
+            tokio::spawn(async move {
+                report_forever(reporting, collecting, "conductor", schema).await
+            });
 
             tracing::info!(
                 instance_id,
