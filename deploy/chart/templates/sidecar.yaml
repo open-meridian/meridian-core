@@ -1,5 +1,13 @@
 {{- range .Values.sidecars }}
 {{- $top := $ }}
+{{- with .plugin }}
+{{- if and .existingSecret (eq .existingSecret $top.Values.broker.existingSecret) }}
+{{- fail "a plugin's existingSecret is the broker secret: envFrom would give the plugin every component's broker credential, which the sidecar holds so that the plugin does not" }}
+{{- end }}
+{{- if and .existingSecret $top.Values.key.existingSecret (eq .existingSecret $top.Values.key.existingSecret) }}
+{{- fail "a plugin's existingSecret is the deployment's key secret: the conductor is the only component that may hold the key" }}
+{{- end }}
+{{- end }}
 {{/*
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -35,6 +43,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .plugin }}{{- with .imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}{{- end }}
       containers:
         - name: sidecar
           image: "{{ $top.Values.image.repository }}:{{ .imageTag | default $top.Values.image.tag }}"
@@ -80,6 +92,62 @@ spec:
               readOnly: true
           resources:
             {{- toYaml $top.Values.resources | nindent 12 }}
+        {{- with .plugin }}
+        {{- /*
+          The plugin. It joins this pod rather than running as a workload of
+          its own, because the sidecar binds loopback: sharing the network
+          namespace is what lets the plugin dial it, and nothing outside the
+          pod can.
+
+          It is given the sidecar's address and nothing else of the sidecar's.
+          No broker credential and no grants mount -- that seam is the boundary.
+          And not its role or tags: a plugin that named its own role would be
+          choosing its own privileges (decision 007), so it learns them from
+          the sidecar's reply to registration instead.
+
+          A sidecar with no plugin still renders, alone, as it did before this
+          existed.
+        */}}
+        - name: plugin
+          image: {{ required "sidecars[].plugin.image is required when a plugin is given" .image | quote }}
+          imagePullPolicy: {{ .pullPolicy | default "IfNotPresent" }}
+          {{- with .args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_SIDECAR_ADDRESS
+              value: {{ $top.Values.sidecar.address | quote }}
+            {{- range $name, $value := .env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with .existingSecret }}
+          {{- /*
+            The vendor's credentials, as environment variables from a Secret
+            the administrator created. Never rendered here: the chart creates
+            no secret, for the same reason it creates no key.
+          */}}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
+          volumeMounts:
+            {{- /*
+              The root filesystem is read-only, as the sidecar's is; a
+              scratch directory is the one writable place, because most
+              runtimes need one somewhere.
+            */}}
+            - name: plugin-tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
+        {{- end }}
       volumes:
         - name: grants
           configMap:
@@ -87,5 +155,9 @@ spec:
             items:
               - key: {{ $top.Values.grants.key }}
                 path: grants.json
+        {{- if .plugin }}
+        - name: plugin-tmp
+          emptyDir: {}
+        {{- end }}
 ---
 {{- end }}

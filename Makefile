@@ -106,6 +106,8 @@ test-store: network
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d --set broker.existingSecret=b
+PLUGIN_VALUES := --set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' --set grants.existingConfigMap=g \
+	--set 'sidecars[0].plugin.image=example/plugin:1' --set 'sidecars[0].plugin.existingSecret=vendor'
 
 # A chart that renders is half the check. The other half is that it refuses:
 # a component with no deployment identifier, no key or no database installs
@@ -197,7 +199,38 @@ chart-check:
 		--set grants.existingConfigMap=g 2>/dev/null \
 		| grep -q "sidecar-custody-1" \
 		|| { echo "chart-check FAILED: a configured plugin gets no sidecar" >&2; exit 1; }
-	@echo "chart-check OK: four components, the key on the conductor alone, both key paths, refusals, migrations, and no pinned uid"
+	@# A plugin joins its sidecar's pod, and the seam between the two
+	@# containers is the boundary: the plugin gets the sidecar's address and
+	@# nothing that would let it speak on the bus as itself. Each check reads
+	@# only the plugin container's block, so a credential correctly held by the
+	@# sidecar beside it cannot satisfy or fail it.
+	@$(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+		| grep -q "^        - name: plugin$$" \
+		|| { echo "chart-check FAILED: a sidecar given a plugin renders no plugin container" >&2; exit 1; }
+	@for forbidden in MERIDIAN_BROKER_URL MERIDIAN_PLUGIN_ROLE MERIDIAN_PLUGIN_TAGS "name: grants"; do \
+		if $(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+			| awk '/^        - name: plugin$$/{p=1;next} p&&/^        - name: /{p=0} p&&/^      [a-z]/{p=0} p' \
+			| grep -q "$$forbidden"; then \
+			echo "chart-check FAILED: the plugin container is given $$forbidden" >&2; \
+			echo "  the sidecar holds that so the plugin does not; containers share a network, not a filesystem" >&2; exit 1; \
+		fi; \
+	done
+	@$(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+		| awk '/^        - name: plugin$$/{p=1;next} p&&/^        - name: /{p=0} p&&/^      [a-z]/{p=0} p' \
+		| grep -q "MERIDIAN_SIDECAR_ADDRESS" \
+		|| { echo "chart-check FAILED: the plugin container is not told where its sidecar is" >&2; exit 1; }
+	@for secret in b k; do \
+		if $(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) \
+			--set "sidecars[0].plugin.existingSecret=$$secret" >/dev/null 2>&1; then \
+			echo "chart-check FAILED: a plugin was allowed to read secret $$secret" >&2; \
+			echo "  the broker's and the key's secrets must never reach a plugin through envFrom" >&2; exit 1; \
+		fi; \
+	done
+	@$(HELM) template check deploy/chart $(CHART_VALUES) \
+		--set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' --set grants.existingConfigMap=g \
+		--show-only templates/sidecar.yaml 2>/dev/null | grep -q "^        - name: plugin$$" \
+		&& { echo "chart-check FAILED: a sidecar with no plugin rendered a plugin container" >&2; exit 1; } || true
+	@echo "chart-check OK: four components, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

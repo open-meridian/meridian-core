@@ -135,6 +135,17 @@ broker:
 #   - instanceId: custody-1
 #     role: custody
 #     tags: []
+#     # The plugin, as a second container in this sidecar's pod. Optional: a
+#     # sidecar with no plugin runs alone. Adding or removing an entry here is
+#     # one Deployment created or deleted, and nothing else restarts.
+#     plugin:
+#       image: ghcr.io/open-meridian/meridian-snaptrade:<commit>
+#       pullPolicy: IfNotPresent
+#       imagePullSecret: ""        # for a private registry
+#       args: []
+#       env: {}                    # non-secret configuration, name: value
+#       existingSecret: ""         # the vendor's credentials, made by you
+#       resources: {}              # defaults to the runtime's own
 sidecars: []
 
 
