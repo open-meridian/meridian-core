@@ -249,6 +249,35 @@ impl Postgres {
             }
         };
 
+        // Requirement 13 asks for read and write as well, and the cluster
+        // trial showed why: a serving role that may not even use the schema
+        // is one every component reports as an empty database. What it may do
+        // to tables the migration has not made yet cannot be tested here; the
+        // migration grants that, and this is what can be checked now.
+        let usable: bool = match client
+            .query_one(
+                "select has_schema_privilege(current_user, 'public', 'USAGE')",
+                &[],
+            )
+            .and_then(|row| row.try_get(0))
+        {
+            Ok(usable) => usable,
+            Err(failed) => {
+                return vec![format!(
+                    "{} could not be checked: {}",
+                    login.role,
+                    detail(&failed)
+                )]
+            }
+        };
+        if !usable {
+            return vec![format!(
+                "{} may not use schema public, so it could read nothing: \
+                 grant USAGE on schema public to it",
+                login.role
+            )];
+        }
+
         match (may_create, allowed) {
             // The finding worth having: a serving role that may create tables
             // is one that can migrate a customer's database by restarting.

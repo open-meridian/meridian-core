@@ -69,6 +69,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.migrate.configSecret | default .Values.migrate.existingSecret | default .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.migrate.configKey | default .Values.conductor.database.key | default (include "meridian-runtime.migrateKey" $) }}
+            # What the components themselves connect as. The tables belong to
+            # the role that makes them, so the migration grants this one the
+            # right to read and write them; without that a deployment finishes
+            # its wizard and every component reports an empty schema.
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.conductor.database.key | default .Values.database.key }}
+                  optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:
@@ -88,6 +98,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.migrate.streetSecret | default .Values.migrate.existingSecret | default .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.migrate.streetKey | default .Values.street.database.key | default (include "meridian-runtime.migrateKey" $) }}
+            # What the components themselves connect as. The tables belong to
+            # the role that makes them, so the migration grants this one the
+            # right to read and write them; without that a deployment finishes
+            # its wizard and every component reports an empty schema.
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.street.database.key | default .Values.database.key }}
+                  optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:
@@ -114,6 +134,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.migrate.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ include "meridian-runtime.migrateKey" $ }}
+            # What the components themselves connect as. The tables belong to
+            # the role that makes them, so the migration grants this one the
+            # right to read and write them; without that a deployment finishes
+            # its wizard and every component reports an empty schema.
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.database.key | default .Values.database.key }}
+                  optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:

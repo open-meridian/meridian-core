@@ -391,3 +391,93 @@ pub fn var(name: &str) -> Option<String> {
 pub fn required(name: &str) -> Result<String, String> {
     var(name).ok_or_else(|| format!("{name} is not set"))
 }
+
+/// Let the serving role read and write what the migration just made.
+///
+/// The two roles are the point of having two: the migrating one may create a
+/// table and the serving one may not (spec/installation-and-first-run,
+/// requirement 13). What follows from that, and what nothing did until a
+/// cluster trial on 2026-09-22 found it, is that the tables belong to the
+/// migrating role and the serving role can read none of them. Every component
+/// then reports that the database has no schema, which is true from where it
+/// is standing and is not what is wrong.
+///
+/// So the migration grants what it owns: the tables and sequences it just
+/// made, and default privileges so the next release's are readable without
+/// another grant.
+///
+/// What it cannot grant is `USAGE` on the schema, unless it happens to own
+/// that too: Postgres lets only an owner pass on a privilege, and warns
+/// rather than failing when somebody else tries. The schema belongs to
+/// whoever made the database, so usage on it is theirs to grant, and the
+/// wizard's database check refuses an answer whose serving role does not have
+/// it and names the statement that fixes it.
+///
+/// Idempotent, and a no-op when both roles are the same, which is what an
+/// administrator who supplied one connection has.
+pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), String> {
+    let serving: postgres::Config = serving_url
+        .parse()
+        .map_err(|failed| format!("the serving database URL is unreadable: {failed}"))?;
+    let migrating: postgres::Config = migrating_url
+        .parse()
+        .map_err(|failed| format!("the migrating database URL is unreadable: {failed}"))?;
+
+    let (Some(role), Some(migrator)) = (serving.get_user(), migrating.get_user()) else {
+        return Err("a database URL names no role".into());
+    };
+    if role == migrator {
+        return Ok(());
+    }
+
+    // Quoted as an identifier, and refused if it is not one. A role name
+    // arrives from a wizard somebody typed into, and this is the one place a
+    // name becomes SQL.
+    if !role
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("{role} is not a role name this can grant to"));
+    }
+    let role = format!("\"{role}\"");
+
+    let mut client = migrating
+        .connect(postgres::NoTls)
+        .map_err(|failed| format!("the migrating role could not connect: {failed}"))?;
+
+    // The schema the migration just wrote into, rather than `public` by name:
+    // a deployment whose URL sets a search_path keeps its tables there, and
+    // granting on the wrong schema grants nothing and says it worked.
+    let schema: String = client
+        // Cast, because `current_schema()` is a `name` and this wants text.
+        .query_one("select current_schema()::text", &[])
+        .and_then(|row| row.try_get(0))
+        .map_err(|failed| format!("the migrating role's schema could not be read: {failed}"))?;
+    let schema = format!("\"{schema}\"");
+
+    for statement in [
+        format!("grant usage on schema {schema} to {role}"),
+        format!("grant select, insert, update, delete on all tables in schema {schema} to {role}"),
+        format!("grant usage, select on all sequences in schema {schema} to {role}"),
+        format!(
+            "alter default privileges in schema {schema} \
+             grant select, insert, update, delete on tables to {role}"
+        ),
+        format!("alter default privileges in schema {schema} grant usage, select on sequences to {role}"),
+    ] {
+        client.batch_execute(&statement).map_err(|failed| {
+            // The crate's own word for every failure is "db error", and what
+            // an operator needs is underneath it.
+            let mut said = failed.to_string();
+            let mut source = std::error::Error::source(&failed);
+            while let Some(cause) = source {
+                said = format!("{said}: {cause}");
+                source = cause.source();
+            }
+            format!("{statement}: {said}")
+        })?;
+    }
+
+    tracing::info!(%role, %schema, "the serving role may read and write what was migrated");
+    Ok(())
+}

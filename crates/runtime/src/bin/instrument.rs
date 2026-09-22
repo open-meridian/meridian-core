@@ -36,12 +36,13 @@ fn run() -> Result<(), String> {
     // Before the key is touched: a migration job holds database credentials and
     // has no business holding the deployment's private key.
     if std::env::args().nth(1).as_deref() == Some("migrate") {
-        return PostgresStore::connect(&url, 1)
+        PostgresStore::connect(&url, 1)
             .and_then(|store| store.migrate())
             .map(|()| tracing::info!("the instrument store's schema is applied"))
             .map_err(|failed| {
                 format!("the instrument store's schema could not be applied: {failed}")
-            });
+            })?;
+        return grant_if_serving(&url);
     }
 
     let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
@@ -83,4 +84,16 @@ fn run() -> Result<(), String> {
                 }
             }
         })
+}
+
+/// Grant to the serving role, when this deployment has one.
+///
+/// A deployment configured by its wizard holds two logins; one an
+/// administrator supplied by hand may hold a single connection, and then this
+/// does nothing.
+fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
+    match var("MERIDIAN_SERVING_DATABASE_URL") {
+        Some(serving) => meridian_runtime::grant_serving(migrating_url, &serving),
+        None => Ok(()),
+    }
 }

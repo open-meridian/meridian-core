@@ -50,7 +50,7 @@ fn run() -> Result<(), String> {
     // migration job holds no key and should not need one.
     if command.as_deref() == Some("migrate") {
         let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
-        return PostgresStore::connect(&url, 1)
+        PostgresStore::connect(&url, 1)
             .and_then(|store| store.migrate())
             .map(|()| {
                 tracing::info!(
@@ -60,7 +60,8 @@ fn run() -> Result<(), String> {
             })
             .map_err(|failed| {
                 format!("the configuration store's schema could not be applied: {failed}")
-            });
+            })?;
+        return grant_if_serving(&url);
     }
 
     let key_path = var("MERIDIAN_KEY_PATH").unwrap_or_else(|| "/var/lib/meridian/key.pem".into());
@@ -243,5 +244,17 @@ async fn enrol(
             );
             state(false, String::new(), failed.to_string())
         }
+    }
+}
+
+/// Grant to the serving role, when this deployment has one.
+///
+/// A deployment configured by its wizard holds two logins; one an
+/// administrator supplied by hand may hold a single connection, and then this
+/// does nothing.
+fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
+    match var("MERIDIAN_SERVING_DATABASE_URL") {
+        Some(serving) => meridian_runtime::grant_serving(migrating_url, &serving),
+        None => Ok(()),
     }
 }
