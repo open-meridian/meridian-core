@@ -339,7 +339,15 @@ zitadel:
 # holding one credential per identity, each mounted into that container alone:
 # a plugin can route to the broker and has nothing to present.
 broker:
+  # A broker this deployment already has, holding a credential per component
+  # under the keys below. Empty means this chart brings one, makes the
+  # credentials once and keeps them, and generates its permissions from the
+  # grant table at start -- which is what leaves an install with no Secret for
+  # anybody to write by hand.
   existingSecret: ""
+
+  # The bundled broker's own image. Its version is yours, as Zitadel's is.
+  image: nats:2.10-alpine
   instrumentKey: instrument
   conductorKey: conductor
   streetKey: street

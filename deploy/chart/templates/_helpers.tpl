@@ -35,9 +35,7 @@ the operator the same thing far less clearly.
 {{- if and .Values.key.existingSecret .Values.key.generate -}}
 {{- fail "key.existingSecret and key.generate are both set, and they mean opposite things: one supplies a key, the other makes one. Pick." -}}
 {{- end -}}
-{{- if not .Values.broker.existingSecret -}}
-{{- fail "broker.existingSecret is not set. The components meet on a broker, and each presents a credential from that secret; a deployment without one has components that cannot hear each other." -}}
-{{- end -}}
+
 {{- end -}}
 
 {{/*
@@ -66,6 +64,32 @@ learns the database (spec/installation-and-first-run, requirement 6).
 {{- .Values.database.key -}}
 {{- else -}}
 migrate-url
+{{- end -}}
+{{- end -}}
+
+{{- define "meridian-runtime.brokerSecret" -}}
+{{- /*
+  Where a component reads its own broker credential.
+
+  An administrator's own broker is named in values; otherwise this chart
+  brings one and holds the credentials it made, which is what leaves an
+  install with no Secret for anybody to write by hand.
+*/ -}}
+{{- .Values.broker.existingSecret | default (printf "%s-broker" (include "meridian-runtime.fullname" .)) -}}
+{{- end -}}
+
+{{- define "meridian-runtime.runtimeBrokerKey" -}}
+{{- /*
+  Which key in the broker Secret the stores and the conductor read.
+
+  They share one credential, because the registry gives them one set of
+  topics: the generator writes it as `runtime`. An administrator naming their
+  own Secret keeps naming their own keys.
+*/ -}}
+{{- if .Values.broker.existingSecret -}}
+{{- .key -}}
+{{- else -}}
+runtime
 {{- end -}}
 {{- end -}}
 

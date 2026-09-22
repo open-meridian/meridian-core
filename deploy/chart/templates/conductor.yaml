@@ -82,8 +82,8 @@ spec:
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.broker.existingSecret }}
-                  key: {{ .Values.broker.conductorKey }}
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
+                  key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.conductorKey) }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           # No port and no Service. It speaks outward over HTTPS and inward over

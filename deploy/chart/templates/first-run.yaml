@@ -119,7 +119,7 @@ spec:
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.broker.existingSecret }}
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ .Values.firstRun.brokerKey }}
             # Every name it may touch, from the chart, because the Role names
             # the same ones.

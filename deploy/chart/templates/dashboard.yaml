@@ -64,7 +64,7 @@ spec:
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.broker.existingSecret }}
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ .Values.dashboard.brokerKey | default .Values.dashboard.instanceId }}
             {{- if .Values.identity.bundled.enabled }}
             {{- $oidc := printf "%s-dashboard-oidc" (include "meridian-runtime.fullname" .) }}

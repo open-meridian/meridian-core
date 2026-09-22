@@ -1,0 +1,257 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if not .Values.broker.existingSecret }}
+{{/*
+  The broker this deployment's components meet on, brought by the chart.
+
+  Every other hand-written Secret went when the wizard arrived; this was the
+  last one, and it was the hardest, because a broker is not only a password:
+  it is a server, its permissions, and one credential per component and plugin
+  instance (spec/installation-and-first-run, and decisions/010).
+
+  So the chart makes the passwords, once, and keeps them; and the broker
+  generates its own permissions at start, from the grant table this deployment
+  was given and the instances it was configured with, using the same binary
+  the repository generates the committed file with. A chart that computed the
+  same thing in templates would be the second policy the generator exists to
+  avoid.
+
+  An administrator who runs their own broker names it in broker.existingSecret
+  and none of this renders.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-broker" $full }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $held := dict }}
+{{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
+{{/*
+  One credential per instance, never per role: two plugins sharing a role
+  could otherwise publish as each other. The list is the components, the
+  dashboard where it runs, first run where it runs, and every sidecar.
+*/}}
+{{- $users := list "runtime" }}
+{{- if .Values.dashboard.enabled }}
+{{- $users = append $users (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) }}
+{{- $users = append $users .Values.firstRun.brokerKey }}
+{{- end }}
+{{- range .Values.sidecars }}
+{{- $users = append $users (.plugin).instanceId }}
+{{- end }}
+{{/*
+  Decided once, here, and used by both Secrets below: generating in each would
+  give the broker one password and its components another, and a deployment
+  whose components cannot connect to their own bus.
+*/}}
+{{- $passwords := dict }}
+{{- range $user := $users }}
+{{- if $user }}
+{{- $_ := set $passwords $user (index $held (printf "%s-password" $user) | default (randAlphaNum 32 | b64enc)) }}
+{{- end }}
+{{- end }}
+---
+# Made once and kept: a regenerated password is a deployment that cannot hear
+# itself until every component restarts. Each entry is a whole connection
+# string, because that is what a component reads.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+{{- $service := printf "%s.%s.svc.cluster.local:4222" $name .Release.Namespace }}
+{{- range $user, $password := $passwords }}
+  {{ $user }}-password: {{ $password }}
+  {{ $user }}: {{ printf "nats://%s:%s@%s" $user (b64dec $password) $service | b64enc }}
+{{- end }}
+---
+# What the broker reads its passwords from. The generated configuration names
+# the variables and never holds a password, so it is a file nobody has to
+# protect.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-passwords
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+{{- range $user, $password := $passwords }}
+  {{ printf "MERIDIAN_NATS_%s" (upper (replace "-" "_" $user)) }}: {{ $password }}
+{{- end }}
+---
+# Which instances this deployment launched, for the generator to make a
+# credential for. The grant table decides what each may do; this says who
+# exists.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-instances
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  instances.json: |
+    {
+      "instances": [
+        {{- $entries := list }}
+        {{- if .Values.dashboard.enabled }}
+        {{- $entries = append $entries (dict "instance_id" (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) "role" "admin" "tags" list) }}
+        {{- end }}
+        {{- range .Values.sidecars }}
+        {{- $entries = append $entries (dict "instance_id" (.plugin).instanceId "role" (.plugin).role "tags" ((.plugin).tags | default list)) }}
+        {{- end }}
+        {{- range $i, $entry := $entries }}{{ if $i }},{{ end }}
+        {{ toJson $entry }}
+        {{- end }}
+      ]
+    }
+---
+# The registry's publisher and subscriber columns, vendored from
+# meridian-design and shipped with this chart, because the generator reads
+# them and a cluster cannot.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-topics
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  topics.tsv: |
+{{ .Files.Get "files/topics.tsv" | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: broker
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: broker
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: broker
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # The permissions, from the grant table and the registry, by the same
+        # binary this repository generates its committed copy with. Written to
+        # a volume that lives and dies with the pod: nothing stores a policy
+        # that can be recomputed.
+        - name: permissions
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - meridian-broker-config
+            - --topics
+            - /etc/meridian/registry/topics.tsv
+            - --grants
+            - /etc/meridian/grants/{{ .Values.grants.key }}
+            - --instances
+            - /etc/meridian/instances/instances.json
+            - --out
+            - /etc/nats/nats.conf
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+            {{- if .Values.grants.existingConfigMap }}
+            - name: grants
+              mountPath: /etc/meridian/grants
+              readOnly: true
+            {{- end }}
+            - name: instances
+              mountPath: /etc/meridian/instances
+              readOnly: true
+            - name: topics
+              mountPath: /etc/meridian/registry
+              readOnly: true
+      containers:
+        - name: broker
+          image: {{ .Values.broker.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-c", "/etc/nats/nats.conf"]
+          envFrom:
+            - secretRef:
+                name: {{ $name }}-passwords
+          ports:
+            - name: client
+              containerPort: 4222
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          emptyDir: {}
+        {{- if .Values.grants.existingConfigMap }}
+        - name: grants
+          configMap:
+            name: {{ .Values.grants.existingConfigMap }}
+        {{- end }}
+        - name: instances
+          configMap:
+            name: {{ $name }}-instances
+        - name: topics
+          configMap:
+            name: {{ $name }}-topics
+---
+# Reached by this deployment's own components and by nothing else. A broker a
+# plugin could reach directly is a bus with its enforcement bypassed
+# (decisions/009, decisions/010).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: broker
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: 4222
+{{- end }}

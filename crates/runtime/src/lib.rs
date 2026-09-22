@@ -10,6 +10,8 @@
 //! Each binary is in `src/bin`, and each is small enough to read in one
 //! sitting, which is the point of them being separate.
 
+pub mod broker;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -43,8 +43,8 @@ spec:
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.broker.existingSecret }}
-                  key: {{ .Values.broker.instrumentKey }}
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
+                  key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.instrumentKey) }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL

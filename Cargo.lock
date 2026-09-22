@@ -1698,6 +1698,7 @@ dependencies = [
  "meridian-street",
  "postgres",
  "prost",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",

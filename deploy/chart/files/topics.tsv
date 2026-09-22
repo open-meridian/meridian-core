@@ -1,0 +1,39 @@
+# Generated from meridian-design's topic registry. Do not edit.
+#
+# Who publishes and who subscribes, which is what decides a component's broker
+# permissions. Regenerate from meridian-design with `make component-topics`.
+topic	kind	publisher	subscriber
+platform.config.command.apply-first-run-configuration	command	admin	first-run
+platform.config.command.close-account	command	admin	conductor
+platform.config.command.define-access-group	command	admin	conductor
+platform.config.command.define-account	command	admin	conductor
+platform.config.command.define-account-group	command	admin	conductor
+platform.config.command.define-user-group	command	admin	conductor
+platform.config.command.grant-permission	command	admin	conductor
+platform.config.command.link-external-account	command	admin	conductor
+platform.config.command.redeem-claim-code	command	admin	conductor
+platform.config.command.send-diagnostic-bundle	command	admin	conductor
+platform.config.command.set-plugin-settings	command	admin	conductor
+platform.config.command.withdraw-permission	command	admin	conductor
+platform.config.event.person-signed-in	event	admin	conductor
+platform.config.event.plugin-configuration-changed	event	conductor	sidecar
+platform.config.event.unlinked-external-accounts	event	sidecar	admin
+platform.config.query.access-records	query	admin	conductor
+platform.config.query.check-first-run-answer	query	admin	first-run
+platform.config.query.enrolment	query	admin	conductor
+platform.config.query.first-run-sealing-key	query	admin	first-run
+platform.config.query.plugin-access	query	sidecar	conductor
+platform.config.query.plugin-configuration	query	sidecar	conductor
+platform.custody.*.event.sync-status	event	custody	admin
+platform.deployment.event.component-report	event	street	conductor
+platform.deployment.event.plugin-report	event	sidecar	admin,conductor
+platform.reference.event.instrument-applied	event	instrument	street,admin
+platform.reference.event.instrument-missing	event	custody	instrument
+platform.reference.event.instrument-pulled	event	conductor	instrument
+platform.reference.query.resolve-identifier	query	custody	instrument
+platform.reference.query.resolve-instrument	query	street	instrument
+platform.street.command.record-holding	command	custody	street
+platform.street.command.record-statement	command	custody	street
+platform.street.event.custodial-position-updated	event	street	admin
+platform.street.event.statement-recorded	event	street	admin
+platform.street.query.list-custodial-positions	query	admin	street
