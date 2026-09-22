@@ -75,6 +75,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
                     RedeemClaimCodeReply {
                         redeemed: true,
                         refusal_reason: String::new(),
+                        ..Default::default()
                     }
                     .encode_to_vec(),
                 ));

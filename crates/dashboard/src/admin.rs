@@ -25,10 +25,10 @@ use meridian_access::{person_access, DEPLOYMENT_ADMIN};
 use meridian_bus::BusError;
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, AccountState,
-    CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
-    DefineUserGroupRequest, GrantPermissionRequest, LinkExternalAccountRequest,
-    RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup, WithdrawPermissionReply,
-    WithdrawPermissionRequest,
+    ClaimCodePurpose, CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest,
+    DefineAccountRequest, DefineUserGroupRequest, GrantPermissionRequest,
+    LinkExternalAccountRequest, RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup,
+    WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use prost::Message;
 
@@ -229,6 +229,7 @@ async fn claim(
     }
     let request = RedeemClaimCodeRequest {
         code: field(&fields, "code").to_string(),
+        purpose: ClaimCodePurpose::FirstAdmin as i32,
     };
     let reply: Result<RedeemClaimCodeReply, String> = command(
         &app,

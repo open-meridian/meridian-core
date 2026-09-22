@@ -506,6 +506,7 @@ pub fn serve(
             let refused = |reason: &str| RedeemClaimCodeReply {
                 redeemed: false,
                 refusal_reason: reason.to_string(),
+                ..Default::default()
             };
             if redeemer.is_empty() {
                 return Ok(refused("a claim code is redeemed by somebody signed in"));

@@ -1,0 +1,228 @@
+// A deployment's first run: what the wizard sends the first-run Job to test,
+// and the configuration it applies.
+//
+// Derived from workflow W7 (installing a deployment and its first run). Every
+// message here traces to a matrix row; see matrix/matrix.tsv.
+//
+// The governing idea: the dashboard asks and the first-run Job acts, and
+// nothing keeps the Job's rights once first run ends (decisions/016). Every
+// credential crosses the bus sealed to the Job's in-memory key, so the broker
+// and every other participant see only ciphertext. None of this reaches the
+// platform.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W7.4 — the key credentials are sealed to
+// ─────────────────────────────────────────────────────────────────────────────
+
+message FirstRunSealingKeyRequest {}
+
+// Made in memory when the Job starts, and never stored. A Job that restarts
+// has a new one, and a credential sealed to the old one is refused, so the
+// dashboard asks again and seals again.
+message FirstRunSealingKey {
+  // HPKE (RFC 9180): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+  // ChaCha20-Poly1305. The raw 32-byte X25519 public key.
+  bytes public_key = 1;
+
+  // Names this key, so a sealed credential says which one it was sealed to.
+  string key_id = 2;
+}
+
+// One credential, sealed to the Job's key. Only the Job can open it.
+message SealedCredential {
+  string key_id = 1;
+
+  // HPKE's encapsulated key and the sealed value. The associated data is the
+  // name of the field the credential fills, so one cannot be moved into
+  // another's place.
+  bytes encapsulated_key = 2;
+  bytes ciphertext = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W7.4, W7.5 — the answers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A Postgres server, and one role on it.
+message DatabaseLogin {
+  string host = 1;
+  uint32 port = 2;
+  string database = 3;
+  string role = 4;
+  SealedCredential password = 5;
+
+  // As libpq names it; `verify-full` unless the administrator chose otherwise.
+  string ssl_mode = 6;
+}
+
+// The runtime's database. The migrating role may create a table and the
+// serving role may not; both may read and write. The test checks exactly
+// that. The two may name the same server and database.
+message RuntimeDatabaseAnswer {
+  DatabaseLogin serving = 1;
+  DatabaseLogin migrating = 2;
+}
+
+// The firm's LDAP directory, brokered by the bundled Zitadel. The chart's
+// identity.bundled.ldap settings, answered in the wizard instead.
+message LdapDirectoryAnswer {
+  string name = 1;
+  repeated string servers = 2;
+  bool start_tls = 3;
+  string base_dn = 4;
+  string bind_dn = 5;
+  SealedCredential bind_password = 6;
+  string user_object_class = 7;
+  string user_filter = 8;
+}
+
+// The firm's SAML directory, brokered by the bundled Zitadel. Zitadel maps no
+// profile attributes from SAML, so the group hook takes these names (spec
+// `deployment-dashboard-and-access`).
+message SamlDirectoryAnswer {
+  // One of the two.
+  string metadata_url = 1;
+  bytes metadata_xml = 2;
+
+  string groups_attribute = 3;
+  string username_attribute = 4;
+  string given_name_attribute = 5;
+  string family_name_attribute = 6;
+  string email_attribute = 7;
+}
+
+// The first administrator's account in the bundled Zitadel, for a firm with no
+// directory of its own.
+message LocalAccountAnswer {
+  string login_name = 1;
+  string email = 2;
+  string given_name = 3;
+  string family_name = 4;
+  SealedCredential initial_password = 5;
+}
+
+// The firm's own OIDC provider, which leaves the bundled Zitadel at zero
+// replicas. The chart's dashboard.oidc settings, answered in the wizard.
+message OidcProviderAnswer {
+  string issuer = 1;
+  string client_id = 2;
+  SealedCredential client_secret = 3;
+  string groups_claim = 4;
+  repeated string trusted_audiences = 5;
+}
+
+// Where the bundled Zitadel's own data lives. Its database and role are the
+// administrator's (spec `deployment-dashboard-and-access` ruling 16).
+message ZitadelDatabaseAnswer {
+  oneof route {
+    // A database and role the firm's database administrator made, from
+    // statements the wizard showed them.
+    DatabaseLogin existing = 1;
+
+    // Created once, in W7.5, with a privileged connection that is then
+    // forgotten: never stored, never handed to Zitadel. A test does not
+    // create anything.
+    CreateZitadelDatabase create = 2;
+  }
+}
+
+message CreateZitadelDatabase {
+  DatabaseLogin privileged = 1;
+
+  // What to create, and the login Zitadel will hold. Never the superuser.
+  string database = 2;
+  string role = 3;
+  SealedCredential role_password = 4;
+}
+
+// The bundled Zitadel, whichever way it is used.
+message BundledZitadelAnswer {
+  // Offered as the version the chart was tested against, and confirmed by the
+  // administrator: never chosen for them.
+  string version = 1;
+
+  ZitadelDatabaseAnswer database = 2;
+
+  // The ranges Zitadel may reach: its directory's, suggested by the wizard and
+  // confirmed. Patched into Zitadel's egress NetworkPolicy.
+  repeated string egress_cidrs = 3;
+
+  // The project roles Zitadel issues, which are the firm's own names.
+  repeated string roles = 4;
+
+  // How people sign in through it. For a firm with no directory, the first
+  // administrator's local account.
+  oneof directory {
+    LocalAccountAnswer local_account = 5;
+    LdapDirectoryAnswer ldap = 6;
+    SamlDirectoryAnswer saml = 7;
+  }
+}
+
+message LoginBackendAnswer {
+  oneof backend {
+    BundledZitadelAnswer bundled = 1;
+    OidcProviderAnswer oidc = 2;
+  }
+}
+
+// The addresses a browser uses. In a cloud, from the listing's load balancer
+// and DNS name; locally, `localhost` names the CLI port-forwards.
+message AddressesAnswer {
+  string dashboard_url = 1;
+
+  // Only with the bundled Zitadel: its external domain, port and scheme, as
+  // one URL.
+  string zitadel_url = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W7.4 — testing an answer
+// ─────────────────────────────────────────────────────────────────────────────
+
+message FirstRunCheckRequest {
+  oneof answer {
+    RuntimeDatabaseAnswer runtime_database = 1;
+    LoginBackendAnswer login_backend = 2;
+    AddressesAnswer addresses = 3;
+  }
+}
+
+// A pass, or what failed. Each finding names the check and the fix, and never
+// repeats a credential.
+message FirstRunCheckReply {
+  bool passed = 1;
+  repeated string findings = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W7.5 — applying the configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Every answer at once, each already tested. The Job tests them again before
+// writing anything, because a test and an apply are separate moments.
+message FirstRunConfiguration {
+  RuntimeDatabaseAnswer runtime_database = 1;
+  LoginBackendAnswer login_backend = 2;
+  AddressesAnswer addresses = 3;
+}
+
+// What the Job did, step by step. Applying the same configuration again
+// completes a partial one.
+message FirstRunApplied {
+  bool applied = 1;
+
+  // Each step taken, in order: Secrets, the NetworkPolicy, scaling, restarts.
+  repeated string steps = 2;
+
+  // Why it stopped, when it did.
+  string refusal_reason = 3;
+
+  // Whether the Job has deleted its own binding. Only after every step
+  // succeeded; until then the dashboard shows that the rights are still held.
+  bool rights_released = 4;
+}

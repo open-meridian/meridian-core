@@ -482,6 +482,7 @@ impl Platform {
         Ok(RedeemClaimCodeReply {
             redeemed: reply.redeemed,
             refusal_reason: reply.refusal_reason.unwrap_or_default(),
+            ..Default::default()
         })
     }
 

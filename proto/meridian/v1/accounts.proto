@@ -501,6 +501,32 @@ message DeploymentKeyRecord {
   int64 created_at_ns = 5;
 }
 
+// W5.4 — an enrolment code, issued when a deployment is registered and again
+// for one that has not enrolled. It is what an install carries in place of a
+// key (W7.1).
+message IssueEnrolmentCodeRequest {
+  string deployment_id = 1;
+}
+
+// The code is shown once. The platform keeps only its hash and expiry.
+message IssueEnrolmentCodeReply {
+  string code = 1;
+  int64 expires_at_ns = 2;
+}
+
+// W5.24 — the deployment registers the key it generated, with the code
+// standing in for the signed-in person W5.5 needs. The request is signed by the
+// key it enrols, which proves the sender holds the private half; it is the one
+// deployment request not signed by a key already registered. Answered with the
+// DeploymentKeyRecord W5.5 would return, whose fingerprint the wizard shows.
+message EnrolDeploymentKeyRequest {
+  string deployment_id = 1;
+  string enrolment_code = 2;
+
+  // The public half only, as in RegisterDeploymentKeyRequest.
+  string public_key_pem = 3;
+}
+
 message RevokeDeploymentKeyRequest {
   string deployment_id = 1;
   string key_id = 2;
@@ -591,11 +617,26 @@ message PluginReport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// W5.21, W5.22, W6.2 — the first deployment admin
+// W5.21, W5.22, W6.2, W7.3 — claim codes: the first-run wizard and the first
+// deployment admin
 // ─────────────────────────────────────────────────────────────────────────────
+
+// What a claim code is for. A code redeemed for the other purpose is refused.
+enum ClaimCodePurpose {
+  // Read as first admin: what every claim code was before first run existed.
+  CLAIM_CODE_PURPOSE_UNSPECIFIED = 0;
+
+  // Makes the deployment's first deployment admin (W6.2).
+  CLAIM_CODE_PURPOSE_FIRST_ADMIN = 1;
+
+  // Opens the deployment's first-run wizard (W7.3). Honouring one also issues
+  // the first administrator's code, in the same act.
+  CLAIM_CODE_PURPOSE_FIRST_RUN = 2;
+}
 
 message IssueClaimCodeRequest {
   string deployment_id = 1;
+  ClaimCodePurpose purpose = 2;
 }
 
 // The code is shown once. The platform keeps only its hash and expiry.
@@ -609,14 +650,22 @@ message IssueClaimCodeReply {
 // redeeming it, at either hop.
 message RedeemClaimCodeRequest {
   string code = 1;
+  ClaimCodePurpose purpose = 2;
 }
 
 message RedeemClaimCodeReply {
   bool redeemed = 1;
 
-  // Why not: unknown, expired, already used, issued for another deployment,
-  // or this deployment already has a deployment admin.
+  // Why not: unknown, expired, already used, issued for another deployment or
+  // another purpose, or this deployment already has a deployment admin.
   string refusal_reason = 2;
+
+  // Only when a first-run code is redeemed: the first administrator's code,
+  // issued in the same act and returned this once. The wizard shows it when
+  // the configuration is applied (W7.5), and it is redeemed at the first
+  // directory sign-in (W7.7). The platform keeps only its hash.
+  string first_admin_code = 3;
+  int64 first_admin_code_expires_at_ns = 4;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

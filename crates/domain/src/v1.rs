@@ -368,6 +368,37 @@ pub struct DeploymentKeyRecord {
     #[prost(int64, tag = "5")]
     pub created_at_ns: i64,
 }
+/// W5.4 — an enrolment code, issued when a deployment is registered and again
+/// for one that has not enrolled. It is what an install carries in place of a
+/// key (W7.1).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueEnrolmentCodeRequest {
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+}
+/// The code is shown once. The platform keeps only its hash and expiry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueEnrolmentCodeReply {
+    #[prost(string, tag = "1")]
+    pub code: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub expires_at_ns: i64,
+}
+/// W5.24 — the deployment registers the key it generated, with the code
+/// standing in for the signed-in person W5.5 needs. The request is signed by the
+/// key it enrols, which proves the sender holds the private half; it is the one
+/// deployment request not signed by a key already registered. Answered with the
+/// DeploymentKeyRecord W5.5 would return, whose fingerprint the wizard shows.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnrolDeploymentKeyRequest {
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub enrolment_code: ::prost::alloc::string::String,
+    /// The public half only, as in RegisterDeploymentKeyRequest.
+    #[prost(string, tag = "3")]
+    pub public_key_pem: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RevokeDeploymentKeyRequest {
     #[prost(string, tag = "1")]
@@ -472,6 +503,8 @@ pub struct PluginReport {
 pub struct IssueClaimCodeRequest {
     #[prost(string, tag = "1")]
     pub deployment_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "ClaimCodePurpose", tag = "2")]
+    pub purpose: i32,
 }
 /// The code is shown once. The platform keeps only its hash and expiry.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -488,15 +521,25 @@ pub struct IssueClaimCodeReply {
 pub struct RedeemClaimCodeRequest {
     #[prost(string, tag = "1")]
     pub code: ::prost::alloc::string::String,
+    #[prost(enumeration = "ClaimCodePurpose", tag = "2")]
+    pub purpose: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RedeemClaimCodeReply {
     #[prost(bool, tag = "1")]
     pub redeemed: bool,
-    /// Why not: unknown, expired, already used, issued for another deployment,
-    /// or this deployment already has a deployment admin.
+    /// Why not: unknown, expired, already used, issued for another deployment or
+    /// another purpose, or this deployment already has a deployment admin.
     #[prost(string, tag = "2")]
     pub refusal_reason: ::prost::alloc::string::String,
+    /// Only when a first-run code is redeemed: the first administrator's code,
+    /// issued in the same act and returned this once. The wizard shows it when
+    /// the configuration is applied (W7.5), and it is redeemed at the first
+    /// directory sign-in (W7.7). The platform keeps only its hash.
+    #[prost(string, tag = "3")]
+    pub first_admin_code: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub first_admin_code_expires_at_ns: i64,
 }
 /// Exactly what the deployment admin saw and approved, sent from the dashboard
 /// to the conductor and forwarded unchanged. No secret setting and no log line.
@@ -850,6 +893,40 @@ impl DeploymentState {
         }
     }
 }
+/// What a claim code is for. A code redeemed for the other purpose is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ClaimCodePurpose {
+    /// Read as first admin: what every claim code was before first run existed.
+    Unspecified = 0,
+    /// Makes the deployment's first deployment admin (W6.2).
+    FirstAdmin = 1,
+    /// Opens the deployment's first-run wizard (W7.3). Honouring one also issues
+    /// the first administrator's code, in the same act.
+    FirstRun = 2,
+}
+impl ClaimCodePurpose {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CLAIM_CODE_PURPOSE_UNSPECIFIED",
+            Self::FirstAdmin => "CLAIM_CODE_PURPOSE_FIRST_ADMIN",
+            Self::FirstRun => "CLAIM_CODE_PURPOSE_FIRST_RUN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CLAIM_CODE_PURPOSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CLAIM_CODE_PURPOSE_FIRST_ADMIN" => Some(Self::FirstAdmin),
+            "CLAIM_CODE_PURPOSE_FIRST_RUN" => Some(Self::FirstRun),
+            _ => None,
+        }
+    }
+}
 /// Published by the dashboard at each sign-in and kept by the conductor, for
 /// the access table (W4.10) and the per-plugin count. Only people who have
 /// signed in are in it, and it never leaves the deployment.
@@ -1178,6 +1255,282 @@ impl AccessLevel {
             _ => None,
         }
     }
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct FirstRunSealingKeyRequest {}
+/// Made in memory when the Job starts, and never stored. A Job that restarts
+/// has a new one, and a credential sealed to the old one is refused, so the
+/// dashboard asks again and seals again.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstRunSealingKey {
+    /// HPKE (RFC 9180): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+    /// ChaCha20-Poly1305. The raw 32-byte X25519 public key.
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key: ::prost::alloc::vec::Vec<u8>,
+    /// Names this key, so a sealed credential says which one it was sealed to.
+    #[prost(string, tag = "2")]
+    pub key_id: ::prost::alloc::string::String,
+}
+/// One credential, sealed to the Job's key. Only the Job can open it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SealedCredential {
+    #[prost(string, tag = "1")]
+    pub key_id: ::prost::alloc::string::String,
+    /// HPKE's encapsulated key and the sealed value. The associated data is the
+    /// name of the field the credential fills, so one cannot be moved into
+    /// another's place.
+    #[prost(bytes = "vec", tag = "2")]
+    pub encapsulated_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub ciphertext: ::prost::alloc::vec::Vec<u8>,
+}
+/// A Postgres server, and one role on it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DatabaseLogin {
+    #[prost(string, tag = "1")]
+    pub host: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
+    #[prost(string, tag = "3")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub password: ::core::option::Option<SealedCredential>,
+    /// As libpq names it; `verify-full` unless the administrator chose otherwise.
+    #[prost(string, tag = "6")]
+    pub ssl_mode: ::prost::alloc::string::String,
+}
+/// The runtime's database. The migrating role may create a table and the
+/// serving role may not; both may read and write. The test checks exactly
+/// that. The two may name the same server and database.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeDatabaseAnswer {
+    #[prost(message, optional, tag = "1")]
+    pub serving: ::core::option::Option<DatabaseLogin>,
+    #[prost(message, optional, tag = "2")]
+    pub migrating: ::core::option::Option<DatabaseLogin>,
+}
+/// The firm's LDAP directory, brokered by the bundled Zitadel. The chart's
+/// identity.bundled.ldap settings, answered in the wizard instead.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LdapDirectoryAnswer {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub servers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "3")]
+    pub start_tls: bool,
+    #[prost(string, tag = "4")]
+    pub base_dn: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub bind_dn: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub bind_password: ::core::option::Option<SealedCredential>,
+    #[prost(string, tag = "7")]
+    pub user_object_class: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub user_filter: ::prost::alloc::string::String,
+}
+/// The firm's SAML directory, brokered by the bundled Zitadel. Zitadel maps no
+/// profile attributes from SAML, so the group hook takes these names (spec
+/// `deployment-dashboard-and-access`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SamlDirectoryAnswer {
+    /// One of the two.
+    #[prost(string, tag = "1")]
+    pub metadata_url: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub metadata_xml: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "3")]
+    pub groups_attribute: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub username_attribute: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub given_name_attribute: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub family_name_attribute: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub email_attribute: ::prost::alloc::string::String,
+}
+/// The first administrator's account in the bundled Zitadel, for a firm with no
+/// directory of its own.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LocalAccountAnswer {
+    #[prost(string, tag = "1")]
+    pub login_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub email: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub given_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub family_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub initial_password: ::core::option::Option<SealedCredential>,
+}
+/// The firm's own OIDC provider, which leaves the bundled Zitadel at zero
+/// replicas. The chart's dashboard.oidc settings, answered in the wizard.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OidcProviderAnswer {
+    #[prost(string, tag = "1")]
+    pub issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub client_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub client_secret: ::core::option::Option<SealedCredential>,
+    #[prost(string, tag = "4")]
+    pub groups_claim: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub trusted_audiences: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Where the bundled Zitadel's own data lives. Its database and role are the
+/// administrator's (spec `deployment-dashboard-and-access` ruling 16).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ZitadelDatabaseAnswer {
+    #[prost(oneof = "zitadel_database_answer::Route", tags = "1, 2")]
+    pub route: ::core::option::Option<zitadel_database_answer::Route>,
+}
+/// Nested message and enum types in `ZitadelDatabaseAnswer`.
+pub mod zitadel_database_answer {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Route {
+        /// A database and role the firm's database administrator made, from
+        /// statements the wizard showed them.
+        #[prost(message, tag = "1")]
+        Existing(super::DatabaseLogin),
+        /// Created once, in W7.5, with a privileged connection that is then
+        /// forgotten: never stored, never handed to Zitadel. A test does not
+        /// create anything.
+        #[prost(message, tag = "2")]
+        Create(super::CreateZitadelDatabase),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateZitadelDatabase {
+    #[prost(message, optional, tag = "1")]
+    pub privileged: ::core::option::Option<DatabaseLogin>,
+    /// What to create, and the login Zitadel will hold. Never the superuser.
+    #[prost(string, tag = "2")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub role_password: ::core::option::Option<SealedCredential>,
+}
+/// The bundled Zitadel, whichever way it is used.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BundledZitadelAnswer {
+    /// Offered as the version the chart was tested against, and confirmed by the
+    /// administrator: never chosen for them.
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub database: ::core::option::Option<ZitadelDatabaseAnswer>,
+    /// The ranges Zitadel may reach: its directory's, suggested by the wizard and
+    /// confirmed. Patched into Zitadel's egress NetworkPolicy.
+    #[prost(string, repeated, tag = "3")]
+    pub egress_cidrs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The project roles Zitadel issues, which are the firm's own names.
+    #[prost(string, repeated, tag = "4")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// How people sign in through it. For a firm with no directory, the first
+    /// administrator's local account.
+    #[prost(oneof = "bundled_zitadel_answer::Directory", tags = "5, 6, 7")]
+    pub directory: ::core::option::Option<bundled_zitadel_answer::Directory>,
+}
+/// Nested message and enum types in `BundledZitadelAnswer`.
+pub mod bundled_zitadel_answer {
+    /// How people sign in through it. For a firm with no directory, the first
+    /// administrator's local account.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Directory {
+        #[prost(message, tag = "5")]
+        LocalAccount(super::LocalAccountAnswer),
+        #[prost(message, tag = "6")]
+        Ldap(super::LdapDirectoryAnswer),
+        #[prost(message, tag = "7")]
+        Saml(super::SamlDirectoryAnswer),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoginBackendAnswer {
+    #[prost(oneof = "login_backend_answer::Backend", tags = "1, 2")]
+    pub backend: ::core::option::Option<login_backend_answer::Backend>,
+}
+/// Nested message and enum types in `LoginBackendAnswer`.
+pub mod login_backend_answer {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Backend {
+        #[prost(message, tag = "1")]
+        Bundled(super::BundledZitadelAnswer),
+        #[prost(message, tag = "2")]
+        Oidc(super::OidcProviderAnswer),
+    }
+}
+/// The addresses a browser uses. In a cloud, from the listing's load balancer
+/// and DNS name; locally, `localhost` names the CLI port-forwards.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddressesAnswer {
+    #[prost(string, tag = "1")]
+    pub dashboard_url: ::prost::alloc::string::String,
+    /// Only with the bundled Zitadel: its external domain, port and scheme, as
+    /// one URL.
+    #[prost(string, tag = "2")]
+    pub zitadel_url: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstRunCheckRequest {
+    #[prost(oneof = "first_run_check_request::Answer", tags = "1, 2, 3")]
+    pub answer: ::core::option::Option<first_run_check_request::Answer>,
+}
+/// Nested message and enum types in `FirstRunCheckRequest`.
+pub mod first_run_check_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Answer {
+        #[prost(message, tag = "1")]
+        RuntimeDatabase(super::RuntimeDatabaseAnswer),
+        #[prost(message, tag = "2")]
+        LoginBackend(super::LoginBackendAnswer),
+        #[prost(message, tag = "3")]
+        Addresses(super::AddressesAnswer),
+    }
+}
+/// A pass, or what failed. Each finding names the check and the fix, and never
+/// repeats a credential.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstRunCheckReply {
+    #[prost(bool, tag = "1")]
+    pub passed: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub findings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Every answer at once, each already tested. The Job tests them again before
+/// writing anything, because a test and an apply are separate moments.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstRunConfiguration {
+    #[prost(message, optional, tag = "1")]
+    pub runtime_database: ::core::option::Option<RuntimeDatabaseAnswer>,
+    #[prost(message, optional, tag = "2")]
+    pub login_backend: ::core::option::Option<LoginBackendAnswer>,
+    #[prost(message, optional, tag = "3")]
+    pub addresses: ::core::option::Option<AddressesAnswer>,
+}
+/// What the Job did, step by step. Applying the same configuration again
+/// completes a partial one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FirstRunApplied {
+    #[prost(bool, tag = "1")]
+    pub applied: bool,
+    /// Each step taken, in order: Secrets, the NetworkPolicy, scaling, restarts.
+    #[prost(string, repeated, tag = "2")]
+    pub steps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why it stopped, when it did.
+    #[prost(string, tag = "3")]
+    pub refusal_reason: ::prost::alloc::string::String,
+    /// Whether the Job has deleted its own binding. Only after every step
+    /// succeeded; until then the dashboard shows that the rights are still held.
+    #[prost(bool, tag = "4")]
+    pub rights_released: bool,
 }
 /// One typed identifier for an instrument.
 ///

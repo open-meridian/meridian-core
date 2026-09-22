@@ -3,6 +3,7 @@
 # Who publishes and who subscribes, which is what decides a component's broker
 # permissions. Regenerate from meridian-design with `make component-topics`.
 topic	kind	publisher	subscriber
+platform.config.command.apply-first-run-configuration	command	admin	first-run
 platform.config.command.close-account	command	admin	conductor
 platform.config.command.define-access-group	command	admin	conductor
 platform.config.command.define-account	command	admin	conductor
@@ -18,6 +19,8 @@ platform.config.event.person-signed-in	event	admin	conductor
 platform.config.event.plugin-configuration-changed	event	conductor	sidecar
 platform.config.event.unlinked-external-accounts	event	sidecar	admin
 platform.config.query.access-records	query	admin	conductor
+platform.config.query.check-first-run-answer	query	admin	first-run
+platform.config.query.first-run-sealing-key	query	admin	first-run
 platform.config.query.plugin-access	query	sidecar	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor
 platform.custody.*.event.sync-status	event	custody	admin

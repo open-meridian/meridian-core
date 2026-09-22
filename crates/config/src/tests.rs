@@ -47,6 +47,7 @@ impl Upstream for FakePlatform {
             } else {
                 "expired".into()
             },
+            ..Default::default()
         })
     }
 
@@ -222,6 +223,7 @@ async fn redeem(h: &Harness, as_whom: &str) -> RedeemClaimCodeReply {
             "meridian.v1.RedeemClaimCodeRequest",
             RedeemClaimCodeRequest {
                 code: "7KQ2-MX4P-9RTD".into(),
+                ..Default::default()
             }
             .encode_to_vec(),
             None,

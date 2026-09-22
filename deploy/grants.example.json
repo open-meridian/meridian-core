@@ -31,7 +31,10 @@
         "platform.config.command.grant-permission",
         "platform.config.command.withdraw-permission",
         "platform.config.command.set-plugin-settings",
-        "platform.config.command.send-diagnostic-bundle"
+        "platform.config.command.send-diagnostic-bundle",
+        "platform.config.query.first-run-sealing-key",
+        "platform.config.query.check-first-run-answer",
+        "platform.config.command.apply-first-run-configuration"
       ],
       "subscribe": [
         "platform.street.event.*",
