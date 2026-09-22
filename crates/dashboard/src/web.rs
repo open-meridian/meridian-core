@@ -35,6 +35,12 @@ pub const SIGN_IN_COOKIE: &str = "meridian_signin";
 pub const PERSON_SIGNED_IN: &str = "platform.config.event.person-signed-in";
 
 pub struct App {
+    /// Whether this deployment has been configured yet. False is the wizard;
+    /// true is a directory and everything else. Read from whether a directory
+    /// is configured at all, so ending first run is the configuration landing
+    /// rather than a flag somebody could flip back.
+    pub first_run: bool,
+    pub wizard: Arc<crate::first_run::WizardSession>,
     pub records: Arc<RecordsCache>,
     pub sessions: Arc<Sessions>,
     pub clock: Arc<dyn Clock>,
@@ -54,6 +60,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
         .merge(crate::admin::routes())
+        .merge(crate::first_run::routes())
         .with_state(app)
 }
 
@@ -66,7 +73,7 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     }
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(COOKIE)
         .iter()
@@ -77,7 +84,13 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
-fn set_cookie(app: &App, name: &str, value: &str, path: &str, max_age_s: i64) -> HeaderValue {
+pub(crate) fn set_cookie(
+    app: &App,
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age_s: i64,
+) -> HeaderValue {
     let secure = if app.secure_cookies { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
         "{name}={value}; Path={path}; Max-Age={max_age_s}; HttpOnly; SameSite=Lax{secure}"

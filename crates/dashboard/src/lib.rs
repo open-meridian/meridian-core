@@ -17,6 +17,7 @@
 
 pub mod admin;
 pub mod clock;
+pub mod first_run;
 pub mod html;
 pub mod oidc;
 pub mod records;
@@ -24,6 +25,7 @@ pub mod session;
 pub mod web;
 
 pub use clock::{Clock, SystemClock};
+pub use first_run::WizardSession;
 pub use records::{refresh, refresh_forever, RecordsCache, Stale};
 pub use session::{Session, Sessions};
 pub use web::{router, App};

@@ -20,6 +20,7 @@ platform.config.event.plugin-configuration-changed	event	conductor	sidecar
 platform.config.event.unlinked-external-accounts	event	sidecar	admin
 platform.config.query.access-records	query	admin	conductor
 platform.config.query.check-first-run-answer	query	admin	first-run
+platform.config.query.enrolment	query	admin	conductor
 platform.config.query.first-run-sealing-key	query	admin	first-run
 platform.config.query.plugin-access	query	sidecar	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor

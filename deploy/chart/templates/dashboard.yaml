@@ -72,16 +72,24 @@ spec:
             # client and the audience it adds come from its setup Job.
             - name: MERIDIAN_OIDC_ISSUER
               value: {{ include "meridian-runtime.zitadelIssuer" . | quote }}
+            # Optional, and that is what makes first run possible: the client
+            # exists only once the setup Job has made one, which cannot happen
+            # before somebody has configured Zitadel's database in the wizard.
+            # Without these the dashboard starts and serves that wizard; a
+            # required key would leave it unable to start at all
+            # (spec/installation-and-first-run, requirement 6).
             - name: MERIDIAN_OIDC_CLIENT_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ $oidc }}
                   key: client-id
+                  optional: true
             - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
               valueFrom:
                 secretKeyRef:
                   name: {{ $oidc }}
                   key: trusted-audiences
+                  optional: true
             - name: MERIDIAN_OIDC_GROUPS_CLAIM
               value: groups
             {{- else }}

@@ -15,6 +15,31 @@ syntax = "proto3";
 package meridian.v1;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// W7.2 — whether this deployment's key is registered
+// ─────────────────────────────────────────────────────────────────────────────
+
+message EnrolmentStateRequest {}
+
+// What the wizard shows before anything is redeemed, and the only thing it
+// shows: the conductor holds the key and is what enrols, so it is what knows.
+message EnrolmentState {
+  string deployment_id = 1;
+
+  bool enrolled = 2;
+
+  // Of the public half, as the platform states it beside the deployment. An
+  // administrator comparing the two is how a code somebody else spent is
+  // noticed: the fingerprint on the platform is then one they have never
+  // seen here.
+  string fingerprint = 3;
+
+  // Why not, when it is not: no code was given, the code expired, or it had
+  // been spent. What the administrator does about each differs, so the
+  // reason is carried rather than a bare false.
+  string refusal_reason = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W7.4 — the key credentials are sealed to
 // ─────────────────────────────────────────────────────────────────────────────
 

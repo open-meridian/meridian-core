@@ -23,6 +23,8 @@ fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> 
         cache.store(records, read_at);
     }
     Arc::new(App {
+        first_run: false,
+        wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions: Arc::new(Sessions::default()),
         clock: Arc::new(At(now)),

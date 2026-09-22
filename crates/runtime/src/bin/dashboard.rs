@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
-    refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock,
+    refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
 use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
 
@@ -44,23 +44,29 @@ fn run() -> Result<(), String> {
     // are marked Secure whenever it is.
     let public_url = required("MERIDIAN_DASHBOARD_URL")?;
     let secure_cookies = public_url.starts_with("https://");
-    let directory = var("MERIDIAN_OIDC_ISSUER").map(|issuer| OidcConfig {
-        issuer,
-        client_id: var("MERIDIAN_OIDC_CLIENT_ID").unwrap_or_default(),
-        client_secret: var("MERIDIAN_OIDC_CLIENT_SECRET"),
-        redirect_url: format!("{}/callback", public_url.trim_end_matches('/')),
-        groups_claim: var("MERIDIAN_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into()),
-        // Comma-separated. For the bundled Zitadel, the dashboard's project id.
-        trusted_audiences: var("MERIDIAN_OIDC_TRUSTED_AUDIENCES")
-            .map(|list| {
-                list.split(',')
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    });
+    // Both, because the chart knows the bundled Zitadel's issuer from the
+    // moment it renders and the client exists only once setup has made one.
+    // An issuer with no client is a deployment part-way through first run, and
+    // it signs nobody in.
+    let directory = var("MERIDIAN_OIDC_ISSUER")
+        .zip(var("MERIDIAN_OIDC_CLIENT_ID"))
+        .map(|(issuer, client_id)| OidcConfig {
+            issuer,
+            client_id,
+            client_secret: var("MERIDIAN_OIDC_CLIENT_SECRET"),
+            redirect_url: format!("{}/callback", public_url.trim_end_matches('/')),
+            groups_claim: var("MERIDIAN_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into()),
+            // Comma-separated. For the bundled Zitadel, the dashboard's project id.
+            trusted_audiences: var("MERIDIAN_OIDC_TRUSTED_AUDIENCES")
+                .map(|list| {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -109,12 +115,24 @@ fn run() -> Result<(), String> {
                     Some(oidc)
                 }
                 None => {
-                    tracing::warn!("no directory is configured (MERIDIAN_OIDC_ISSUER); nobody can sign in");
+                    // Not an error, and the ordinary state of a deployment
+                    // nobody has set up yet: no directory means the wizard,
+                    // which is where a directory is configured (W7).
+                    tracing::info!(
+                        "no directory is configured: this deployment serves its first-run wizard"
+                    );
                     None
                 }
             };
 
+            // First run is the absence of a directory rather than a flag, so
+            // ending it is the configuration landing and nothing anybody can
+            // switch back from inside the dashboard (requirement 18).
+            let first_run = oidc.is_none();
+
             let app = router(Arc::new(App {
+                first_run,
+                wizard: Arc::new(WizardSession::default()),
                 records,
                 sessions,
                 clock,

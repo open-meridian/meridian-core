@@ -96,6 +96,8 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
     let session = sessions.start(ADA, "Ada", vec![], T0);
     let form_token = sessions.find(&session, T0).unwrap().form_token;
     let app = Arc::new(App {
+        first_run: false,
+        wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions,
         clock: Arc::new(At(T0)),

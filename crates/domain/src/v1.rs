@@ -1257,6 +1257,28 @@ impl AccessLevel {
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct EnrolmentStateRequest {}
+/// What the wizard shows before anything is redeemed, and the only thing it
+/// shows: the conductor holds the key and is what enrols, so it is what knows.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnrolmentState {
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub enrolled: bool,
+    /// Of the public half, as the platform states it beside the deployment. An
+    /// administrator comparing the two is how a code somebody else spent is
+    /// noticed: the fingerprint on the platform is then one they have never
+    /// seen here.
+    #[prost(string, tag = "3")]
+    pub fingerprint: ::prost::alloc::string::String,
+    /// Why not, when it is not: no code was given, the code expired, or it had
+    /// been spent. What the administrator does about each differs, so the
+    /// reason is carried rather than a bare false.
+    #[prost(string, tag = "4")]
+    pub refusal_reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct FirstRunSealingKeyRequest {}
 /// Made in memory when the Job starts, and never stored. A Job that restarts
 /// has a new one, and a credential sealed to the old one is refused, so the

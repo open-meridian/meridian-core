@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
 use meridian_config::PostgresStore;
+use meridian_domain::v1::EnrolmentState;
 use meridian_runtime::{
     bus_from_env, key_at, now_ns, platform_from_env, report_forever, required, shutdown, var,
     PlatformUpstream,
@@ -37,6 +38,10 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// W7.2, the wizard's first question. In the config domain, which is where
+/// everything the dashboard asks the conductor lives.
+const ENROLMENT_STATE: &str = "platform.config.query.enrolment";
 
 fn run() -> Result<(), String> {
     let command = std::env::args().nth(1);
@@ -91,9 +96,14 @@ fn run() -> Result<(), String> {
             // whose code has expired or been spent keeps running and says so,
             // because the wizard is where somebody enters a new one and the
             // wizard is served by a component that has to be up.
-            enrol(&platform, &public_key_pem, &key_path).await;
+            let enrolment = enrol(&platform, &public_key_pem, &key_path).await;
 
             let bus = bus_from_env(&instance_id).await?;
+
+            // W7.2. The wizard's first page, and everything it shows until a
+            // claim code is redeemed. The conductor holds the key and is what
+            // enrols, so it is what knows.
+            serve_enrolment_state(&bus, enrolment);
 
             // Subscribed before the loop starts, for the reason at-most-once
             // delivery makes unforgiving: what arrives before a subscriber
@@ -143,20 +153,51 @@ fn run() -> Result<(), String> {
         })
 }
 
+/// Answer what the wizard shows before anything is redeemed.
+fn serve_enrolment_state(bus: &Arc<meridian_bus::Bus>, state: meridian_domain::v1::EnrolmentState) {
+    use prost::Message;
+
+    bus.serve(ENROLMENT_STATE, move |envelope| {
+        if envelope.payload_type != "meridian.v1.EnrolmentStateRequest" {
+            return Err(format!(
+                "{ENROLMENT_STATE} expects meridian.v1.EnrolmentStateRequest, and this is {}",
+                envelope.payload_type
+            ));
+        }
+        Ok((
+            "meridian.v1.EnrolmentState".to_string(),
+            state.encode_to_vec(),
+        ))
+    });
+}
+
 /// Register the deployment's own key, once, with a code the install carried.
 ///
 /// The marker beside the key is what makes it once: it is written where the
 /// key lives, so a deployment that keeps its key keeps the knowledge that the
 /// key is registered, and one that lost its volume enrols again with a new
 /// code exactly as a new deployment would.
-async fn enrol(platform: &Arc<meridian_conductor::Platform>, public_key_pem: &str, key_path: &str) {
-    let Some(code) = var("MERIDIAN_ENROLMENT_CODE") else {
-        return;
+async fn enrol(
+    platform: &Arc<meridian_conductor::Platform>,
+    public_key_pem: &str,
+    key_path: &str,
+) -> EnrolmentState {
+    let deployment_id = var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default();
+    let state = |enrolled: bool, fingerprint: String, refusal_reason: String| EnrolmentState {
+        deployment_id: deployment_id.clone(),
+        enrolled,
+        fingerprint,
+        refusal_reason,
     };
+
     let marker = std::path::Path::new(key_path).with_extension("enrolled");
-    if marker.exists() {
-        return;
+    if let Ok(fingerprint) = std::fs::read_to_string(&marker) {
+        return state(true, fingerprint.trim().to_string(), String::new());
     }
+
+    let Some(code) = var("MERIDIAN_ENROLMENT_CODE") else {
+        return state(false, String::new(), "no enrolment code".into());
+    };
 
     match platform.enrol_key(&code, public_key_pem, now_ns()).await {
         Ok(enrolled) => {
@@ -169,18 +210,22 @@ async fn enrol(platform: &Arc<meridian_conductor::Platform>, public_key_pem: &st
                 fingerprint = enrolled.fingerprint,
                 "this deployment enrolled its key"
             );
-            if let Err(failed) = std::fs::write(&marker, enrolled.fingerprint) {
+            if let Err(failed) = std::fs::write(&marker, &enrolled.fingerprint) {
                 tracing::warn!(
                     %failed,
                     "the key is enrolled and the marker could not be written; \
                      the next start will try to enrol again and be refused"
                 );
             }
+            state(true, enrolled.fingerprint, String::new())
         }
-        Err(failed) => tracing::error!(
-            %failed,
-            "this deployment could not enrol its key. Issue another enrolment \
-             code on the platform and give it to the deployment"
-        ),
+        Err(failed) => {
+            tracing::error!(
+                %failed,
+                "this deployment could not enrol its key. Issue another enrolment \
+                 code on the platform and give it to the deployment"
+            );
+            state(false, String::new(), failed.to_string())
+        }
     }
 }
