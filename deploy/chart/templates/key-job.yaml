@@ -58,7 +58,12 @@ spec:
         - name: key
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["public-key"]
+          # The binary first: the image has no entrypoint, so every container
+          # here names the one it runs. This said `public-key` alone and could
+          # never have started; the path is only reached with key.generate,
+          # which no install had used until first run made it the default way
+          # a deployment gets a key.
+          args: ["meridian-conductor", "public-key"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

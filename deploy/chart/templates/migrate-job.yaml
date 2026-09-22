@@ -2,11 +2,23 @@
 {{/*
   The schema, applied once per release before the new version serves.
 
-  A helm hook rather than an init container: an init container runs per pod, so
-  N replicas starting together race to apply the same migration, and a pod that
-  restarts at 3am migrates a customer's database because it restarted. This
-  runs once, and `helm upgrade --atomic` leaves the running version untouched
-  when it fails.
+  One Job per release revision, rather than an init container and rather than a
+  hook. An init container runs per pod, so N replicas starting together race to
+  apply the same migration, and a pod that restarts at 3am migrates a
+  customer's database because it restarted.
+
+  A hook was the first answer and cannot stay one. A pre-install hook has to
+  succeed before any ordinary resource exists, and on a fresh install the
+  database is not configured yet: the wizard writes it, and the wizard is
+  served by the dashboard, which a hook would be waiting in front of
+  (spec/installation-and-first-run, requirement 6). So this waits instead. A
+  container whose Secret has no key yet does not start and starts when it
+  appears, which is the whole of the waiting.
+
+  What the hook gave up is ordering: the components come up while this runs.
+  They verify the schema rather than applying it and refuse to serve one they
+  do not recognise, so the window is a readiness failure that clears, never a
+  wrong answer.
 
   An administrator whose delivery tooling does not honour hooks runs the same
   image with `migrate` themselves; the runtime refuses to serve against a
@@ -16,15 +28,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "meridian-runtime.fullname" . }}-migrate
+  name: {{ include "meridian-runtime.fullname" . }}-migrate-{{ .Release.Revision }}
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
-  annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
+  # No deadline: this may wait for a database the wizard has not configured
+  # yet, and a deadline would count that wait as failure.
+  ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
@@ -56,7 +67,7 @@ spec:
             - name: MERIDIAN_CONFIG_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.migrate.configSecret | default .Values.migrate.existingSecret | default .Values.conductor.database.existingSecret | default .Values.database.existingSecret }}
+                  name: {{ .Values.migrate.configSecret | default .Values.migrate.existingSecret | default .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.migrate.configKey | default .Values.migrate.key | default .Values.conductor.database.key | default .Values.database.key }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
@@ -75,7 +86,7 @@ spec:
             - name: MERIDIAN_STREET_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.migrate.streetSecret | default .Values.migrate.existingSecret | default .Values.street.database.existingSecret | default .Values.database.existingSecret }}
+                  name: {{ .Values.migrate.streetSecret | default .Values.migrate.existingSecret | default .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.migrate.streetKey | default .Values.migrate.key | default .Values.street.database.key | default .Values.database.key }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
@@ -101,7 +112,7 @@ spec:
             - name: MERIDIAN_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.migrate.existingSecret | default .Values.database.existingSecret }}
+                  name: {{ .Values.migrate.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.migrate.key | default .Values.database.key }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

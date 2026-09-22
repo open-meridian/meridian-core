@@ -191,11 +191,17 @@ chart-check:
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
-	@for missing in deployment.id key.existingSecret database.existingSecret; do \
+	@for missing in deployment.id key.existingSecret; do \
 		if $(HELM) template check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
 		fi; \
 	done
+	@unset="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set database.existingSecret= 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render without a database secret, which is how a fresh install starts" >&2; exit 1; }; \
+	echo "$$unset" | grep -q "name: check-meridian-runtime-database" \
+		|| { echo "chart-check FAILED: without a database secret the chart makes none for the wizard to fill" >&2; exit 1; }; \
+	echo "$$unset" | awk '/name: check-meridian-runtime-database$$/{f=1} f&&/^data:/{print "has data"} /^---/{f=0}' | grep -q . \
+		&& { echo "chart-check FAILED: the database secret the chart makes is not empty" >&2; exit 1; }; true
 	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
 	for store in meridian-conductor meridian-street meridian-instrument; do \
 		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
@@ -313,7 +319,10 @@ chart-check:
 			echo "chart-check FAILED: the bundled Zitadel rendered with $$refused" >&2; exit 1; \
 		fi; \
 	done
-	@echo "chart-check OK: four components, the dashboard and the bundled Zitadel, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
+	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
+		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
+	echo "chart-check OK: four components, the dashboard and the bundled Zitadel, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

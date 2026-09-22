@@ -58,7 +58,7 @@ spec:
             - name: MERIDIAN_CONFIG_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.conductor.database.existingSecret | default .Values.database.existingSecret }}
+                  name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.conductor.database.key | default .Values.database.key }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:

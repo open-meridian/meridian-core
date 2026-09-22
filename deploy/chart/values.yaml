@@ -22,6 +22,11 @@ deployment:
 database:
   # A secret holding the connection URL, so it is not in your values file and
   # not in Helm's release history.
+  #
+  # Empty means this chart makes one, named after the release and left empty
+  # for the first-run wizard to fill. Components wait for it rather than
+  # failing, so an install before anybody has configured a database is a
+  # deployment waiting at its wizard rather than a failed release.
   existingSecret: ""
   key: url
 
@@ -203,6 +208,12 @@ identity:
       emailAttribute: email
     egress:
       allowCidrs: []
+    # The Secret holding Zitadel's own Postgres URL, under the key `dsn`. Made
+    # by this chart and left empty for the first-run wizard to fill, because a
+    # fresh install has no database for Zitadel yet. Its database and role are
+    # still yours to make (ruling 16); what the wizard fills in is how to reach
+    # them. It must match what zitadel.env names below.
+    databaseSecretName: meridian-zitadel-database
 
 # The bundled Zitadel's own chart. Only what Meridian needs is set here; any of
 # Zitadel's chart values may be added.
@@ -216,9 +227,21 @@ zitadel:
   # part its own role can: Zitadel's schema inside the database it owns. The
   # rest of init -- the database, the role, their grants -- would need your
   # Postgres superuser.
+  # Zitadel's own init and setup run as Helm hooks, and a hook has to succeed
+  # before any ordinary resource exists. On a fresh install its database is not
+  # configured until somebody has been through the first-run wizard, which the
+  # dashboard serves, so a hook would be waiting in front of the thing that
+  # unblocks it. Both are turned off here and run instead as our own Job, which
+  # waits (templates/identity.yaml).
+  #
+  # The setup job has no enabled flag, so it is annotated as a test hook: it
+  # renders, and nothing but `helm test` would ever run it.
   initJob:
-    enabled: true
-    command: zitadel
+    enabled: false
+  setupJob:
+    annotations:
+      helm.sh/hook: test
+      helm.sh/hook-delete-policy: before-hook-creation
   # Zitadel's own security context is kept: its image names its user rather
   # than numbering it, so Kubernetes can only verify it is non-root through the
   # uid its chart pins. On OpenShift, which assigns each namespace its own

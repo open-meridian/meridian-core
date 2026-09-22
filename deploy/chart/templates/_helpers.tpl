@@ -38,9 +38,18 @@ the operator the same thing far less clearly.
 {{- if not .Values.broker.existingSecret -}}
 {{- fail "broker.existingSecret is not set. The components meet on a broker, and each presents a credential from that secret; a deployment without one has components that cannot hear each other." -}}
 {{- end -}}
-{{- if not .Values.database.existingSecret -}}
-{{- fail "database.existingSecret is not set. The replica needs a Postgres URL, in a secret rather than in your values." -}}
 {{- end -}}
+
+{{/*
+The Secret holding the runtime's Postgres URL.
+
+A name the administrator gives, or one this chart makes and leaves empty for
+the first-run wizard to fill. It was once required, which a fresh install
+cannot satisfy: nobody has been through the wizard yet, and the wizard is what
+learns the database (spec/installation-and-first-run, requirement 6).
+*/}}
+{{- define "meridian-runtime.databaseSecret" -}}
+{{- .Values.database.existingSecret | default (printf "%s-database" (include "meridian-runtime.fullname" .)) -}}
 {{- end -}}
 
 {{/*

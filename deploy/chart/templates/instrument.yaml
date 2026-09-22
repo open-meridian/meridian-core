@@ -50,7 +50,7 @@ spec:
             - name: MERIDIAN_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.database.existingSecret }}
+                  name: {{ (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.database.key }}
           # No port. Everything this component says goes over the broker, so
           # nothing outside its pod needs to reach it. A Service in front of it

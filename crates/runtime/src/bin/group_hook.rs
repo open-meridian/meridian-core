@@ -75,7 +75,14 @@ fn secret(name: &str) -> Result<String, String> {
         return Ok(value.trim().to_string());
     }
     let file = required(&format!("{name}_FILE"))?;
-    for _ in 0..90 {
+    // Three minutes is enough for a deployment whose directory already exists.
+    // First run is not that: the token appears only once somebody has been
+    // through the wizard, so the chart gives this an hour there.
+    let seconds: u64 = var("MERIDIAN_SETUP_WAIT_SECONDS")
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(180);
+    for _ in 0..(seconds / 2).max(1) {
         if let Ok(value) = std::fs::read_to_string(&file) {
             if !value.trim().is_empty() {
                 return Ok(value.trim().to_string());
@@ -83,7 +90,7 @@ fn secret(name: &str) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    Err(format!("{file} did not appear within three minutes"))
+    Err(format!("{file} did not appear within {seconds} seconds"))
 }
 
 fn list(name: &str) -> Vec<String> {
