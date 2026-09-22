@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
-    AccessRecordsRequest, AccountRecord, AccountState, CloseAccountRequest,
+    AccessRecordsRequest, AccountRecord, AccountState, ClaimCodePurpose, CloseAccountRequest,
     DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
     GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
@@ -80,8 +80,12 @@ impl Clock for SystemClock {
 ///
 /// Called from a bus handler, which runs on a blocking thread, so these block.
 pub trait Upstream: Send + Sync {
-    /// W5.22. Carries the code and nothing about the person.
-    fn honour_claim_code(&self, code: &str) -> Result<RedeemClaimCodeReply, String>;
+    /// W5.22. Carries the code and its purpose, and nothing about the person.
+    ///
+    /// The purpose travels because the platform checks it: a code for the
+    /// first administrator is not a code for the wizard, and swapping one for
+    /// the other is refused there rather than here.
+    fn honour_claim_code(&self, code: &str, purpose: i32) -> Result<RedeemClaimCodeReply, String>;
 
     /// W5.23. Exactly what the deployment admin approved.
     fn submit_diagnostic_bundle(
@@ -508,8 +512,19 @@ pub fn serve(
                 refusal_reason: reason.to_string(),
                 ..Default::default()
             };
-            if redeemer.is_empty() {
+            // A first-run code is the exception, and the only one: it opens
+            // the wizard before any directory exists, so nobody can be signed
+            // in to redeem it and the deployment has no records to put anybody
+            // in. It makes no administrator here; the code it brings back does
+            // that later, at a real sign-in (W7.3, W7.7).
+            let first_run = request.purpose == ClaimCodePurpose::FirstRun as i32;
+            if redeemer.is_empty() && !first_run {
                 return Ok(refused("a claim code is redeemed by somebody signed in"));
+            }
+            if first_run {
+                return cx
+                    .upstream
+                    .honour_claim_code(&request.code, request.purpose);
             }
             let has_admin = |snapshot: &Snapshot| {
                 snapshot
@@ -524,7 +539,9 @@ pub fn serve(
                 return Ok(refused("this deployment already has a deployment admin"));
             }
 
-            let answered = cx.upstream.honour_claim_code(&request.code)?;
+            let answered = cx
+                .upstream
+                .honour_claim_code(&request.code, request.purpose)?;
             if !answered.redeemed {
                 return Ok(answered);
             }

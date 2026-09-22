@@ -68,11 +68,17 @@ spec:
               value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
+            # Optional, and that is what lets first run happen at all: the
+            # database is what the wizard configures, and the wizard needs the
+            # conductor up to enrol this deployment and to relay its claim
+            # code. Without it the conductor keeps its configuration in memory
+            # and says so (spec/installation-and-first-run, requirement 6).
             - name: MERIDIAN_CONFIG_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.conductor.database.key | default .Values.database.key }}
+                  optional: true
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:

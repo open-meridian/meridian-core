@@ -180,9 +180,15 @@ impl Cluster for ApiServer {
             .map(|cidr| serde_json::json!({"ipBlock": {"cidr": cidr}}))
             .collect();
 
+        // As the release's own field manager, because the chart owns this
+        // policy and renders these ranges back from the cluster on its next
+        // upgrade. Patching as anyone else leaves the field owned by a
+        // manager Helm does not know, and the next upgrade fails on the
+        // conflict rather than on anything being wrong -- found on a cluster
+        // on 2026-09-22.
         self.patch(
             &format!(
-                "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{name}",
+                "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{name}?fieldManager=helm",
                 self.namespace
             ),
             "application/merge-patch+json",

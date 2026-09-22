@@ -473,8 +473,26 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+    {{- /*
+      The ranges Zitadel may reach, which first run is allowed to patch
+      because the administrator confirms them in the wizard. So this renders
+      what the policy already holds, exactly as the Secrets beside it do: a
+      chart that rendered its values here would fight the Job for the field,
+      and on a cluster on 2026-09-22 it did -- the next upgrade failed with a
+      field-ownership conflict rather than a wrong answer.
+    */}}
+    {{- $policy := lookup "networking.k8s.io/v1" "NetworkPolicy" .Release.Namespace (printf "%s-egress" $zitadel) }}
+    {{- $written := dig "spec" "egress" (list) ($policy | default dict) }}
+    {{- $configured := list }}
+    {{- range $written }}
+    {{- range .to }}
+    {{- if .ipBlock }}
+    {{- $configured = append $configured .ipBlock.cidr }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
     - to:
-        {{- range .Values.identity.bundled.egress.allowCidrs }}
+        {{- range (default .Values.identity.bundled.egress.allowCidrs $configured) }}
         - ipBlock:
             cidr: {{ . }}
         {{- end }}

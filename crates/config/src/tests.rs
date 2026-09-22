@@ -37,7 +37,7 @@ struct FakePlatform {
 }
 
 impl Upstream for FakePlatform {
-    fn honour_claim_code(&self, code: &str) -> Result<RedeemClaimCodeReply, String> {
+    fn honour_claim_code(&self, code: &str, _purpose: i32) -> Result<RedeemClaimCodeReply, String> {
         self.codes.lock().unwrap().push(code.to_string());
         let redeemed = *self.redeem.lock().unwrap();
         Ok(RedeemClaimCodeReply {

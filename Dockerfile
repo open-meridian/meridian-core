@@ -20,7 +20,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar \
-       target/release/meridian-dashboard target/release/meridian-group-hook /usr/local/bin/
+       target/release/meridian-dashboard target/release/meridian-group-hook \
+       target/release/meridian-first-run /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -43,6 +44,7 @@ COPY --from=build /usr/local/bin/meridian-conductor /usr/local/bin/meridian-cond
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
 COPY --from=build /usr/local/bin/meridian-dashboard /usr/local/bin/meridian-dashboard
 COPY --from=build /usr/local/bin/meridian-group-hook /usr/local/bin/meridian-group-hook
+COPY --from=build /usr/local/bin/meridian-first-run /usr/local/bin/meridian-first-run
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.

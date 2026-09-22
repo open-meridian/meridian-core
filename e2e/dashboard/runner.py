@@ -422,8 +422,8 @@ def scenario_b():
         s.check([a.get("redeemed") for a in seen] == [False, True],
                 "the platform was asked twice (wrong code, then the right one) and never a third time: "
                 "the conductor refused the repeat before spending a call")
-        s.check(all(a.get("body_keys") == ["code"] for a in seen),
-                "the platform was sent the code and nothing about who redeemed it")
+        s.check(all(a.get("body_keys") == ["code", "purpose"] for a in seen),
+                "the platform was sent the code and its purpose, and nothing about who redeemed it")
 
 
 def admin_rows(page, section):

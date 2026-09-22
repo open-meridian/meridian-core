@@ -180,7 +180,27 @@ fn list(name: &str) -> Vec<String> {
 struct Postgres;
 
 impl DatabaseProbe for Postgres {
+    /// On a thread of its own, because the synchronous Postgres client builds
+    /// an async runtime inside itself and doing that on a thread already
+    /// driving one panics. Found by applying a configuration on a cluster:
+    /// the check passed, the apply re-checked, and the Job took the panic.
     fn check(&self, login: &DatabaseLogin, password: &[u8], may_create: bool) -> Vec<String> {
+        std::thread::scope(|threads| {
+            threads
+                .spawn(|| self.connect_and_check(login, password, may_create))
+                .join()
+                .unwrap_or_else(|_| vec![format!("{} could not be checked", login.role)])
+        })
+    }
+}
+
+impl Postgres {
+    fn connect_and_check(
+        &self,
+        login: &DatabaseLogin,
+        password: &[u8],
+        may_create: bool,
+    ) -> Vec<String> {
         let mut config = postgres::Config::new();
         config
             .host(&login.host)
@@ -198,9 +218,17 @@ impl DatabaseProbe for Postgres {
             Ok(client) => client,
             Err(failed) => {
                 return vec![format!(
-                    "{}@{}:{}/{} could not be reached: {failed}",
-                    login.role, login.host, login.port, login.database
-                )]
+                    "{}@{}:{}/{} could not be reached: {}",
+                    login.role,
+                    login.host,
+                    login.port,
+                    login.database,
+                    // The crate's own Display is "db error" and the sentence
+                    // an administrator needs is in its source. A finding that
+                    // does not say what is wrong is a finding they cannot act
+                    // on.
+                    detail(&failed)
+                )];
             }
         };
 
@@ -212,7 +240,13 @@ impl DatabaseProbe for Postgres {
             .and_then(|row| row.try_get(0))
         {
             Ok(allowed) => allowed,
-            Err(failed) => return vec![format!("{} could not be checked: {failed}", login.role)],
+            Err(failed) => {
+                return vec![format!(
+                    "{} could not be checked: {}",
+                    login.role,
+                    detail(&failed)
+                )]
+            }
         };
 
         match (may_create, allowed) {
@@ -229,4 +263,15 @@ impl DatabaseProbe for Postgres {
             _ => Vec::new(),
         }
     }
+}
+
+/// What actually went wrong, rather than the wrapper's word for it.
+fn detail(failed: &postgres::Error) -> String {
+    let mut said = failed.to_string();
+    let mut source = std::error::Error::source(failed);
+    while let Some(cause) = source {
+        said = format!("{said}: {cause}");
+        source = cause.source();
+    }
+    said
 }

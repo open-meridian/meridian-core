@@ -76,10 +76,26 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
-    let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
-    // Verified, never applied, for the reason every store gives.
-    store.verify().map_err(|failed| failed.to_string())?;
+    // No database is first run, not a misconfiguration: the wizard is where a
+    // deployment's database is chosen, and the wizard cannot run without this
+    // component, which enrols the deployment and relays its claim code. What
+    // the conductor holds in the meantime is nothing anybody has authored
+    // yet, so memory is the honest place for it.
+    let store: Arc<dyn meridian_config::Store> = match var("MERIDIAN_CONFIG_DATABASE_URL") {
+        Some(url) => {
+            let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
+            // Verified, never applied, for the reason every store gives.
+            store.verify().map_err(|failed| failed.to_string())?;
+            Arc::new(store)
+        }
+        None => {
+            tracing::info!(
+                "no database is configured: the configuration store is in memory \
+                 until first run applies one"
+            );
+            Arc::new(meridian_config::MemoryStore::default())
+        }
+    };
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
@@ -114,7 +130,7 @@ fn run() -> Result<(), String> {
             // starts, so nothing the dashboard or a sidecar asks is missed.
             meridian_config::serve(
                 Arc::clone(&bus),
-                Arc::new(store),
+                Arc::clone(&store),
                 Arc::new(meridian_config::SystemClock),
                 Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
             );

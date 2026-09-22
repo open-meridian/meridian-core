@@ -68,7 +68,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.migrate.configSecret | default .Values.migrate.existingSecret | default .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
-                  key: {{ .Values.migrate.configKey | default .Values.migrate.key | default .Values.conductor.database.key | default .Values.database.key }}
+                  key: {{ .Values.migrate.configKey | default .Values.conductor.database.key | default (include "meridian-runtime.migrateKey" $) }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:
@@ -87,7 +87,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.migrate.streetSecret | default .Values.migrate.existingSecret | default .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
-                  key: {{ .Values.migrate.streetKey | default .Values.migrate.key | default .Values.street.database.key | default .Values.database.key }}
+                  key: {{ .Values.migrate.streetKey | default .Values.street.database.key | default (include "meridian-runtime.migrateKey" $) }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:
@@ -113,7 +113,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.migrate.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
-                  key: {{ .Values.migrate.key | default .Values.database.key }}
+                  key: {{ include "meridian-runtime.migrateKey" $ }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:

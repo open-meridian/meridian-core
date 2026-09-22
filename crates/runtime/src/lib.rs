@@ -365,9 +365,10 @@ impl meridian_config::Upstream for PlatformUpstream {
     fn honour_claim_code(
         &self,
         code: &str,
+        purpose: i32,
     ) -> Result<meridian_domain::v1::RedeemClaimCodeReply, String> {
         self.runtime
-            .block_on(self.platform.honour_claim_code(code, now_ns()))
+            .block_on(self.platform.honour_claim_code(code, purpose, now_ns()))
             .map_err(|failed| format!("the platform could not be asked: {failed}"))
     }
 

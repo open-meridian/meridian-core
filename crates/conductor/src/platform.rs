@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meridian_domain::v1::{
-    DiagnosticBundle, DiagnosticBundleReceipt, EscalateInstrumentRequest,
+    ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt, EscalateInstrumentRequest,
     Identifier as PbIdentifier, InstrumentRecord as PbInstrument, MissReason,
     MissingInstrumentDetectedEvent, RedeemClaimCodeReply,
 };
@@ -504,10 +504,16 @@ impl Platform {
     pub async fn honour_claim_code(
         &self,
         code: &str,
+        purpose: i32,
         now_ns: i64,
     ) -> Result<RedeemClaimCodeReply, PlatformError> {
-        let body = serde_json::to_vec(&serde_json::json!({ "code": code }))
-            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "code": code,
+            "purpose": ClaimCodePurpose::try_from(purpose)
+                .unwrap_or(ClaimCodePurpose::Unspecified)
+                .as_str_name(),
+        }))
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
         let response = self
             .call(
                 Method::Post,
@@ -520,7 +526,11 @@ impl Platform {
         Ok(RedeemClaimCodeReply {
             redeemed: reply.redeemed,
             refusal_reason: reply.refusal_reason.unwrap_or_default(),
-            ..Default::default()
+            // Only a first-run redemption brings one back, and only once.
+            first_admin_code: reply.first_admin_code.unwrap_or_default(),
+            first_admin_code_expires_at_ns: reply
+                .first_admin_code_expires_at_ns
+                .unwrap_or_default(),
         })
     }
 
@@ -755,6 +765,8 @@ struct WireEnrolment {
 struct WireRedemption {
     redeemed: bool,
     refusal_reason: Option<String>,
+    first_admin_code: Option<String>,
+    first_admin_code_expires_at_ns: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1138,7 +1150,7 @@ pub(crate) mod tests {
         let platform = platform(Arc::clone(&transport));
 
         let answered = platform
-            .honour_claim_code("7KQ2-MX4P-9RTD", NOW)
+            .honour_claim_code("7KQ2-MX4P-9RTD", ClaimCodePurpose::FirstAdmin as i32, NOW)
             .await
             .unwrap();
         assert!(answered.redeemed);
@@ -1151,7 +1163,8 @@ pub(crate) mod tests {
         let seen = transport.seen.lock().unwrap();
         let body: serde_json::Value =
             serde_json::from_slice(seen[0].body.as_ref().unwrap()).unwrap();
-        assert_eq!(body, serde_json::json!({"code": "7KQ2-MX4P-9RTD"}));
+        assert_eq!(body["code"], "7KQ2-MX4P-9RTD");
+        assert_eq!(body["purpose"], "CLAIM_CODE_PURPOSE_FIRST_ADMIN");
     }
 
     #[tokio::test]
@@ -1161,7 +1174,7 @@ pub(crate) mod tests {
             "{\"redeemed\": false, \"refusal_reason\": \"already used\"}",
         ))]);
         let answered = platform(transport)
-            .honour_claim_code("7KQ2-MX4P-9RTD", NOW)
+            .honour_claim_code("7KQ2-MX4P-9RTD", ClaimCodePurpose::FirstAdmin as i32, NOW)
             .await
             .unwrap();
         assert!(!answered.redeemed);

@@ -48,6 +48,27 @@ the first-run wizard to fill. It was once required, which a fresh install
 cannot satisfy: nobody has been through the wizard yet, and the wizard is what
 learns the database (spec/installation-and-first-run, requirement 6).
 */}}
+{{- define "meridian-runtime.migrateKey" -}}
+{{- /*
+  Which key in the database Secret migrates with.
+
+  A deployment configured by its wizard holds both logins in one Secret: `url`
+  is the serving role, which may not create a table, and `migrate-url` is the
+  one that may. Reading `url` here migrates as the role that cannot, which is
+  a permission error three layers down from the thing that chose it -- found
+  on a cluster on 2026-09-22, as "permission denied for schema public".
+
+  An administrator who named their own Secret keeps naming their own keys.
+*/ -}}
+{{- if .Values.migrate.key -}}
+{{- .Values.migrate.key -}}
+{{- else if .Values.database.existingSecret -}}
+{{- .Values.database.key -}}
+{{- else -}}
+migrate-url
+{{- end -}}
+{{- end -}}
+
 {{- define "meridian-runtime.databaseSecret" -}}
 {{- .Values.database.existingSecret | default (printf "%s-database" (include "meridian-runtime.fullname" .)) -}}
 {{- end -}}
