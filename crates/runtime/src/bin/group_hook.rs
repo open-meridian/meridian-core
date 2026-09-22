@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
 /// for: Zitadel writes its admin token only once its own setup has run.
 fn secret(name: &str) -> Result<String, String> {
     if let Some(value) = var(name) {
-        return Ok(value);
+        return Ok(value.trim().to_string());
     }
     let file = required(&format!("{name}_FILE"))?;
     for _ in 0..90 {

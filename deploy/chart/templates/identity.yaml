@@ -41,6 +41,10 @@
 ---
 # Made once and never regenerated: a new key would leave Zitadel's database
 # unreadable in part. Kept when the release is uninstalled.
+#
+# A hook ahead of Zitadel's own (its init and setup run at weights 1 and 2),
+# because they read it before any ordinary resource exists. On an upgrade it
+# is recreated with the key it already held, read back through lookup.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -49,6 +53,9 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
   annotations:
     helm.sh/resource-policy: keep
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
 type: Opaque
 data:
   masterkey: {{ if $masterkey }}{{ index $masterkey.data "masterkey" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
@@ -109,20 +116,23 @@ roleRef:
   name: {{ $full }}-identity-setup
   apiGroup: rbac.authorization.k8s.io
 ---
-# Sets Zitadel up for the dashboard after every install and upgrade,
+# Sets Zitadel up for the dashboard on every install and upgrade,
 # idempotently. It alone holds Zitadel's admin token, for as long as it runs.
+#
+# Not a post-install hook: Helm runs those only once everything is ready, and
+# the dashboard and the group hook cannot be ready until this has written
+# their Secrets. So it runs beside the rollout, waits for Zitadel, and the two
+# start as soon as their Secrets fill. Named for the revision because a Job's
+# template cannot change in place; each is removed an hour after it ends.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ $full }}-identity-setup
+  name: {{ $full }}-identity-setup-{{ .Release.Revision }}
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
-  annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "5"
-    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
@@ -150,11 +160,11 @@ spec:
               value: "http://{{ $zitadel }}:8080"
             - name: MERIDIAN_ZITADEL_HOST
               value: {{ $domain | quote }}
-            - name: MERIDIAN_ZITADEL_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $z.zitadel.configmapConfig.FirstInstance.Org.Machine.Machine.Username | default "iam-admin" }}-pat
-                  key: pat
+            # A file rather than an env reference: Zitadel writes the token
+            # with a trailing newline, and the file is read and trimmed once
+            # it appears rather than failing the pod while it does not.
+            - name: MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE
+              value: /var/run/zitadel/pat
             - name: MERIDIAN_DASHBOARD_REDIRECT_URI
               value: {{ printf "%s/callback" (trimSuffix "/" .Values.dashboard.url) | quote }}
             - name: MERIDIAN_GROUP_HOOK_URL
@@ -191,8 +201,17 @@ spec:
               value: "secrets:{{ $oidc }},{{ $hook }}"
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+          volumeMounts:
+            - name: admin-pat
+              mountPath: /var/run/zitadel
+              readOnly: true
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: admin-pat
+          secret:
+            secretName: {{ $z.zitadel.configmapConfig.FirstInstance.Org.Machine.Machine.Username | default "iam-admin" }}-pat
+            optional: true
 ---
 # The group hook: Zitadel's Actions v2 target. Holds its targets' signing
 # keys, reaches nothing, and is reached only by Zitadel.
@@ -297,14 +316,17 @@ spec:
             matchLabels:
               app.kubernetes.io/name: zitadel
               app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: start
       ports:
         - port: 8090
   # Nothing: the hook calls nobody.
   egress: []
 ---
-# Zitadel may call the group hook, DNS, and the addresses you listed -- its
-# database and directory -- and nothing else. This is what bounds the
-# narrowed webhook deny list.
+# Zitadel's server may call the group hook, DNS, and the addresses you listed
+# -- its database and directory -- and nothing else. This is what bounds the
+# narrowed webhook deny list. Only the server (component "start"): Zitadel's
+# own init and setup jobs carry the same name, and its setup writes a Secret
+# through the Kubernetes API, which this would cut off.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -316,6 +338,7 @@ spec:
     matchLabels:
       app.kubernetes.io/name: zitadel
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: start
   policyTypes: [Egress]
   egress:
     - to:

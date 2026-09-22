@@ -81,8 +81,8 @@ It needs four things from you:
    dashboard's issuer is `https://` that host.
 3. **Its own database and login role**, which you make, and a Secret named
    `meridian-zitadel-database` with key `dsn` holding a connection string for
-   that role. Zitadel's own init job is off, so it never holds your Postgres
-   superuser.
+   that role. Zitadel's init job makes only its schema, as that role, so it
+   never holds your Postgres superuser.
 4. **Where it may connect**, `identity.bundled.egress.allowCidrs`: its database,
    and your LDAP directory if any. A NetworkPolicy allows those, the group hook
    and DNS, and nothing else -- which is what makes it safe that Zitadel's
@@ -111,6 +111,12 @@ Its database, master key, people, groups and directory connections carry over,
 and nothing else restarts. People already signed in to the dashboard stay signed
 in, because sessions live in the dashboard; only new sign-ins wait while
 Zitadel rolls.
+
+Zitadel runs with its own chart's security context, which pins uid 1000: its
+image names its user rather than numbering it, so that is how Kubernetes knows
+it is not root. On OpenShift, set `runAsUser` and `fsGroup` to null under
+`zitadel.podSecurityContext` and `zitadel.securityContext`; the platform assigns
+the uid instead. Meridian's own templates pin none.
 
 Zitadel's chart also uses `alpine/k8s` (to write its admin token into a Secret)
 and `wait4x` (to wait for the database), at the versions its own chart pins.

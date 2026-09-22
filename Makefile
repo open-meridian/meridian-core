@@ -290,10 +290,17 @@ chart-check:
 		--set zitadel.zitadel.configmapConfig.ExternalDomain=id.example --set identity.bundled.egress.allowCidrs={10.0.0.0/8}"; \
 	rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) $$bundled 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render with the bundled Zitadel on" >&2; exit 1; }; \
-	echo "$$rendered" | grep -q "runAsUser" \
-		&& { echo "chart-check FAILED: the bundled Zitadel pins a uid" >&2; exit 1; }; \
+	echo "$$rendered" | awk '/^# Source: meridian-runtime\/templates\//{own=1;next} /^# Source: /{own=0} own' | grep -q "runAsUser" \
+		&& { echo "chart-check FAILED: a Meridian template pins a uid with the bundled Zitadel on" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '"meridian-group-hook", "setup"' \
 		|| { echo "chart-check FAILED: the bundled Zitadel has no setup Job" >&2; exit 1; }; \
+	job="$$(echo "$$rendered" | awk '/^---/{if(f)print d; d=""; f=0} {d=d $$0 "\n"} /"meridian-group-hook", "setup"/{f=1} END{if(f)print d}')"; \
+	echo "$$job" | grep -q 'helm.sh/hook' \
+		&& { echo "chart-check FAILED: the setup Job is a hook, and a hook waits on the pods that wait on it" >&2; exit 1; }; \
+	echo "$$job" | grep -q 'MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE' \
+		|| { echo "chart-check FAILED: the setup Job does not read Zitadel's admin token from its file" >&2; exit 1; }; \
+	echo "$$rendered" | grep -A12 'name: check-zitadel-egress' | grep -q 'app.kubernetes.io/component: start' \
+		|| { echo "chart-check FAILED: the Zitadel egress policy reaches past the server to Zitadel's own jobs" >&2; exit 1; }; \
 	role="$$(echo "$$rendered" | awk '/^kind: Role$$/{r=1} r&&/^---/{r=0} r' | grep -A14 'name: check-meridian-runtime-identity-setup' )"; \
 	echo "$$role" | grep -q 'resourceNames: \["check-meridian-runtime-dashboard-oidc", "check-meridian-runtime-group-hook"\]' \
 		|| { echo "chart-check FAILED: the setup Job's Role is not limited to its two Secrets" >&2; exit 1; }; \

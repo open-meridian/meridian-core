@@ -212,17 +212,25 @@ zitadel:
   login:
     image:
       tag: ""
-  # Its database and role are yours to make; its init job would need your
-  # Postgres superuser to make them.
+  # Its database and role are yours to make, so its init job does only the
+  # part its own role can: Zitadel's schema inside the database it owns. The
+  # rest of init -- the database, the role, their grants -- would need your
+  # Postgres superuser.
   initJob:
-    enabled: false
-  # No pinned uid, so a platform assigning its own range may run it.
-  podSecurityContext:
-    runAsNonRoot: true
-    runAsUser: null
-    fsGroup: null
-  securityContext:
-    runAsUser: null
+    enabled: true
+    command: zitadel
+  # Zitadel's own security context is kept: its image names its user rather
+  # than numbering it, so Kubernetes can only verify it is non-root through the
+  # uid its chart pins. On OpenShift, which assigns each namespace its own
+  # range and refuses a pinned uid, set runAsUser and fsGroup to null here and
+  # in securityContext, and the platform's numeric uid does the same job.
+  # Zitadel's chart names its kubectl image after the cluster's Kubernetes
+  # version, and not every version has an image (alpine/k8s:1.28.8 does not).
+  # Pinned to one that exists.
+  tools:
+    kubectl:
+      image:
+        tag: "1.31.0"
   env:
     - name: ZITADEL_DATABASE_POSTGRES_DSN
       valueFrom:
