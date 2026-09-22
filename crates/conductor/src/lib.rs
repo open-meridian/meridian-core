@@ -58,6 +58,6 @@ mod reactor;
 
 pub use assertions::{DeploymentKey, SigningError};
 pub use platform::{
-    ComponentReport, Config, HttpTransport, Platform, PlatformError, Reaction, Transport,
+    ComponentReport, Config, Enrolment, HttpTransport, Platform, PlatformError, Reaction, Transport,
 };
 pub use reactor::{Carried, Clock, Conductor, SystemClock, INSTRUMENT_MISSING, INSTRUMENT_PULLED};

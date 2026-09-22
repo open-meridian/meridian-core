@@ -49,6 +49,10 @@ serde_json = "1"
 # implementation of the standard.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 base64 = "0.22"
+# Signs the bundled Zitadel's system-user credential. ring rather than the
+# `rsa` crate: RUSTSEC-2023-0071 is a timing side channel in that crate's
+# private-key operations, and this workspace does none.
+ring = "0.17"
 rand = "0.8"
 prost = "0.13"
 

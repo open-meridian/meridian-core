@@ -103,6 +103,28 @@ fn list(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// What setup presents to Zitadel: a JWT the system API user signs for itself.
+///
+/// The key is the chart's, held in a Secret and mounted here; Zitadel holds
+/// the public half in its own configuration. Nothing about it is one-shot,
+/// which is the point: Zitadel's first-instance token is minted once and a
+/// deployment that loses it cannot administer its own directory.
+fn bearer() -> Result<String, String> {
+    use meridian_group_hook::system_user;
+
+    let user = required("MERIDIAN_ZITADEL_SYSTEM_USER")?;
+    let key = secret("MERIDIAN_ZITADEL_SYSTEM_USER_KEY")?;
+    // The issuer Zitadel states, which is what it checks the audience
+    // against; not the address this dials it on.
+    let audience = required("MERIDIAN_ZITADEL_ISSUER")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|failed| format!("the clock is before the epoch: {failed}"))?
+        .as_secs();
+
+    system_user::bearer(&user, &key, &audience, now)
+}
+
 fn setup() -> Result<(), String> {
     use meridian_group_hook::setup::{self, Config, Files, Ldap, Secrets, Sink};
 
@@ -123,7 +145,7 @@ fn setup() -> Result<(), String> {
     let config = Config {
         api_url: required("MERIDIAN_ZITADEL_API_URL")?,
         host: var("MERIDIAN_ZITADEL_HOST"),
-        admin_token: secret("MERIDIAN_ZITADEL_ADMIN_TOKEN")?,
+        bearer: bearer()?,
         redirect_uri: required("MERIDIAN_DASHBOARD_REDIRECT_URI")?,
         hook_url: required("MERIDIAN_GROUP_HOOK_URL")?,
         roles: list("MERIDIAN_ZITADEL_ROLES"),

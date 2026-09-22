@@ -77,6 +77,7 @@ fn run() -> Result<(), String> {
     store.verify().map_err(|failed| failed.to_string())?;
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
+    let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
     let platform = platform_from_env(key)?;
 
     tokio::runtime::Builder::new_multi_thread()
@@ -84,6 +85,14 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            // W5.24, before anything asks the platform for anything: a fresh
+            // deployment has generated a key nothing has registered, and an
+            // enrolment code is what registers it. Never fatal. A deployment
+            // whose code has expired or been spent keeps running and says so,
+            // because the wizard is where somebody enters a new one and the
+            // wizard is served by a component that has to be up.
+            enrol(&platform, &public_key_pem, &key_path).await;
+
             let bus = bus_from_env(&instance_id).await?;
 
             // Subscribed before the loop starts, for the reason at-most-once
@@ -132,4 +141,46 @@ fn run() -> Result<(), String> {
                 }
             }
         })
+}
+
+/// Register the deployment's own key, once, with a code the install carried.
+///
+/// The marker beside the key is what makes it once: it is written where the
+/// key lives, so a deployment that keeps its key keeps the knowledge that the
+/// key is registered, and one that lost its volume enrols again with a new
+/// code exactly as a new deployment would.
+async fn enrol(platform: &Arc<meridian_conductor::Platform>, public_key_pem: &str, key_path: &str) {
+    let Some(code) = var("MERIDIAN_ENROLMENT_CODE") else {
+        return;
+    };
+    let marker = std::path::Path::new(key_path).with_extension("enrolled");
+    if marker.exists() {
+        return;
+    }
+
+    match platform.enrol_key(&code, public_key_pem, now_ns()).await {
+        Ok(enrolled) => {
+            // The fingerprint, so an administrator comparing it with the
+            // platform's own page can see that this deployment's key is the
+            // one registered, and not somebody else's spent from the same
+            // code.
+            tracing::info!(
+                key_id = enrolled.key_id,
+                fingerprint = enrolled.fingerprint,
+                "this deployment enrolled its key"
+            );
+            if let Err(failed) = std::fs::write(&marker, enrolled.fingerprint) {
+                tracing::warn!(
+                    %failed,
+                    "the key is enrolled and the marker could not be written; \
+                     the next start will try to enrol again and be refused"
+                );
+            }
+        }
+        Err(failed) => tracing::error!(
+            %failed,
+            "this deployment could not enrol its key. Issue another enrolment \
+             code on the platform and give it to the deployment"
+        ),
+    }
 }

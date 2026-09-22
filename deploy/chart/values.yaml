@@ -16,8 +16,22 @@ platform:
   address: https://open-meridian.com
 
 deployment:
-  # Given to you when you register this deployment's public key.
+  # Given to you when you register this deployment on the platform.
   id: ""
+
+  # The one-time code an install carries in place of a key (W5.24). The
+  # conductor generates this deployment's key, registers the public half with
+  # this code, and spends it; nobody handles either half, and nothing copies a
+  # key out of a log into a form.
+  #
+  # Single use and a day long. After it is spent this value does nothing, and a
+  # deployment that never spent one is given another on the platform.
+  #
+  # A marketplace listing asks for it in its form, so it arrives as a value
+  # here. Where that is not wanted, name a secret holding it instead.
+  enrolmentCode: ""
+  enrolmentCodeSecret: ""
+  enrolmentCodeKey: code
 
 database:
   # A secret holding the connection URL, so it is not in your values file and
@@ -214,6 +228,13 @@ identity:
     # still yours to make (ruling 16); what the wizard fills in is how to reach
     # them. It must match what zitadel.env names below.
     databaseSecretName: meridian-zitadel-database
+    # The key pair this chart makes for the system API user Zitadel trusts.
+    # Setup signs a short-lived credential with the private half whenever it
+    # runs, so nothing here is minted once and lost forever: Zitadel's own
+    # first-instance token is, which is why setup does not use it. Zitadel
+    # reads the public half through the mount in zitadel.extraVolumes below,
+    # so the two names have to agree.
+    systemUserSecretName: meridian-identity-system-user
 
 # The bundled Zitadel's own chart. Only what Meridian needs is set here; any of
 # Zitadel's chart values may be added.
@@ -265,12 +286,39 @@ zitadel:
     # egress is what limits it back to the hook, its database and directory.
     - name: ZITADEL_HTTPCLIENT_DENYLIST
       value: "169.254.0.0/16"
+  # Where Zitadel reads the system API user's certificate from. Its name is
+  # identity.bundled.systemUserSecretName above.
+  extraVolumes:
+    - name: system-user
+      secret:
+        secretName: meridian-identity-system-user
+  extraVolumeMounts:
+    - name: system-user
+      mountPath: /system-user
+      readOnly: true
   zitadel:
     # Made once by this chart and never regenerated: it encrypts the directory
     # credentials and signing keys in Zitadel's database, which is unreadable
     # in part without it. Back it up apart from the database.
     masterkeySecretName: meridian-zitadel-masterkey
     configmapConfig:
+      # The one credential that administers this Zitadel. A system API user
+      # rather than the first instance's token, which Zitadel mints once and
+      # never again: losing it would leave the directory unadministrable with
+      # an empty database as the only way back.
+      #
+      # System membership, because this Zitadel serves exactly one deployment
+      # and exists to be configured by it. The roles are what setup needs to
+      # make the project, its application and the directory connection, and
+      # SYSTEM_OWNER is deliberately not among them.
+      SystemAPIUsers:
+        - meridian-setup:
+            Path: /system-user/tls.crt
+            Memberships:
+              - MemberType: System
+                Roles:
+                  - IAM_OWNER
+                  - ORG_OWNER
       ExternalDomain: ""
       ExternalPort: 443
       ExternalSecure: true

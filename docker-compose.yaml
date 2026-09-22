@@ -249,7 +249,9 @@ services:
     image: ghcr.io/zitadel/zitadel:v4.17.3
     # Root, to write the first instance's tokens onto the bootstrap volume.
     user: "0"
-    command: ["start-from-init", "--masterkeyFromEnv", "--tlsMode", "disabled"]
+    command:
+      ["start-from-init", "--masterkeyFromEnv", "--tlsMode", "disabled",
+       "--config", "/zitadel-config/config.yaml"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -299,6 +301,9 @@ services:
       ZITADEL_OIDC_DEFAULTLOGOUTURLV2: http://zitadel-login:3000/ui/v2/login/logout?post_logout_redirect=
     volumes:
       - e2e-bootstrap:/bootstrap
+      # The system API user setup signs its credential for, as the chart
+      # configures in a cluster.
+      - ./e2e/zitadel:/zitadel-config:ro
     networks: [meridian]
 
   # A firm's LDAP directory, for Zitadel to broker. memberOf is switched on
@@ -353,7 +358,11 @@ services:
     command: ["meridian-group-hook", "setup"]
     environment:
       MERIDIAN_ZITADEL_API_URL: http://zitadel:8080
-      MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE: /bootstrap/admin.pat
+      MERIDIAN_ZITADEL_SYSTEM_USER: meridian-setup
+      MERIDIAN_ZITADEL_SYSTEM_USER_KEY_FILE: /zitadel-config/system-user.key
+      # What Zitadel checks the credential's audience against: the issuer it
+      # states, which here is its own name on this network.
+      MERIDIAN_ZITADEL_ISSUER: http://zitadel:8080
       MERIDIAN_DASHBOARD_REDIRECT_URI: http://dashboard:8080/callback
       MERIDIAN_GROUP_HOOK_URL: http://group-hook:8090
       MERIDIAN_ZITADEL_ROLES: e2e-staff
@@ -367,6 +376,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - e2e-bootstrap:/bootstrap
+      - ./e2e/zitadel:/zitadel-config:ro
     networks: [meridian]
 
   # What only the test needs, after setup: people made in Zitadel, and the

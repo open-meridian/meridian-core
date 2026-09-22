@@ -51,6 +51,19 @@ spec:
               value: {{ .Values.deployment.id | quote }}
             - name: MERIDIAN_PLATFORM_ADDRESS
               value: {{ .Values.platform.address | quote }}
+            {{- if or .Values.deployment.enrolmentCode .Values.deployment.enrolmentCodeSecret }}
+            # W5.24. Spent once, on the key this conductor generated, and then
+            # worthless: nobody handles a key and nothing copies one.
+            - name: MERIDIAN_ENROLMENT_CODE
+              {{- if .Values.deployment.enrolmentCodeSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.deployment.enrolmentCodeSecret }}
+                  key: {{ .Values.deployment.enrolmentCodeKey }}
+              {{- else }}
+              value: {{ .Values.deployment.enrolmentCode | quote }}
+              {{- end }}
+            {{- end }}
             - name: MERIDIAN_KEY_PATH
               value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID

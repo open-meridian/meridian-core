@@ -458,6 +458,44 @@ impl Platform {
         .map(|_| ())
     }
 
+    /// W5.24. Register the key this deployment generated, with a code.
+    ///
+    /// The one call here that no registered key vouches for, because the
+    /// deployment has none yet: it is signed by the key it enrols, which
+    /// proves the sender holds the private half, and the code proves they are
+    /// entitled to register it. The platform checks both together.
+    ///
+    /// Nobody handles either half of the key. That is the whole reason this
+    /// exists: the alternative was an operator copying a public key out of a
+    /// pod's log into a form on another machine.
+    pub async fn enrol_key(
+        &self,
+        code: &str,
+        public_key_pem: &str,
+        now_ns: i64,
+    ) -> Result<Enrolment, PlatformError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "deployment_id": self.config.deployment_id,
+            "enrolment_code": code,
+            "public_key_pem": public_key_pem,
+        }))
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+
+        let response = self
+            .call(
+                Method::Post,
+                "/api/v1/reference/deployments/keys/enrol",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let record: WireEnrolment = read_json(&response)?;
+        Ok(Enrolment {
+            key_id: record.key_id,
+            fingerprint: record.fingerprint,
+        })
+    }
+
     /// W5.22. Present a claim code a deployment admin is redeeming.
     ///
     /// The body is the code and nothing else. The note this call is signed
@@ -696,6 +734,21 @@ fn found_or_nothing(response: Response) -> Result<Option<PbInstrument>, Platform
         return Ok(None);
     }
     reply.instrument.map(into_record).transpose()
+}
+
+/// What the platform says it registered, which the wizard shows so an
+/// administrator can compare it with the fingerprint on the platform's own
+/// page. A code spent by somebody else leaves one they do not recognise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrolment {
+    pub key_id: String,
+    pub fingerprint: String,
+}
+
+#[derive(Deserialize)]
+struct WireEnrolment {
+    key_id: String,
+    fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -1041,6 +1094,42 @@ pub(crate) mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_key_is_enrolled_with_the_code_that_carried_the_install() {
+        let transport = Fake::new(vec![Ok(reply(
+            201,
+            "{\"key_id\": \"KEY-1\", \"fingerprint\": \"SHA256:abc\"}",
+        ))]);
+        let platform = platform(Arc::clone(&transport));
+
+        let enrolled = platform
+            .enrol_key(
+                "ENR-4H7D-QW2M-8XPC",
+                "-----BEGIN PUBLIC KEY-----\nA\n-----END PUBLIC KEY-----\n",
+                NOW,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(enrolled.fingerprint, "SHA256:abc");
+        assert_eq!(
+            transport.urls(),
+            vec![format!("{ADDRESS}/api/v1/reference/deployments/keys/enrol")]
+        );
+        let seen = transport.seen.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(seen[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["enrolment_code"], "ENR-4H7D-QW2M-8XPC");
+        assert!(body["public_key_pem"]
+            .as_str()
+            .unwrap()
+            .contains("PUBLIC KEY"));
+        // Signed like every other call, and by the key it enrols: the platform
+        // verifies the note against the key in this body and against nothing
+        // it already holds, because it holds none yet.
+        assert!(!seen[0].assertion.is_empty());
     }
 
     #[tokio::test]

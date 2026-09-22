@@ -37,7 +37,7 @@
 {{- $zitadel := printf "%s-zitadel" .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- $oidc := printf "%s-dashboard-oidc" $full }}
 {{- $hook := printf "%s-group-hook" $full }}
-{{- $adminpat := printf "%s-identity-admin-pat" $full }}
+{{- $system := .Values.identity.bundled.systemUserSecretName }}
 {{- $masterkey := lookup "v1" "Secret" .Release.Namespace $z.zitadel.masterkeySecretName }}
 ---
 # Made once and never regenerated: a new key would leave Zitadel's database
@@ -60,13 +60,12 @@ metadata:
 type: Opaque
 data:
   masterkey: {{ if $masterkey }}{{ index $masterkey.data "masterkey" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
-{{- range $name := list $oidc $hook $adminpat }}
+{{- range $name := list $oidc $hook }}
 {{- $existing := lookup "v1" "Secret" $.Release.Namespace $name }}
 ---
-# Filled by a Job that may update this and nothing else: the setup Job writes
-# the first two, the bootstrap Job writes the admin token. Made here because
-# RBAC cannot narrow `create` to a name; rendered with what it already holds,
-# so an upgrade never empties it.
+# Filled by the setup Job, which may update these and nothing else. Made here
+# because RBAC cannot narrow `create` to a name; rendered with what it already
+# holds, so an upgrade never empties it.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -93,44 +92,11 @@ data:
 # off in values and this waits instead. A container whose Secret has no key
 # yet does not start, and starts when the key appears.
 #
-# Faithful to what its chart does, and no more: `init` creates the schema in
-# the database the administrator made, `setup` creates the first instance, and
-# the token that instance mints is copied into a Secret. Ordering comes from
-# init being an init container, which Kubernetes runs to completion first.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ $full }}-identity-bootstrap
-  labels:
-    {{- include "meridian-runtime.labels" . | nindent 4 }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ $full }}-identity-bootstrap
-  labels:
-    {{- include "meridian-runtime.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: [{{ $adminpat | quote }}]
-    verbs: ["get", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ $full }}-identity-bootstrap
-  labels:
-    {{- include "meridian-runtime.labels" . | nindent 4 }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ $full }}-identity-bootstrap
-    namespace: {{ .Release.Namespace }}
-roleRef:
-  kind: Role
-  name: {{ $full }}-identity-bootstrap
-  apiGroup: rbac.authorization.k8s.io
----
+# `init` creates the schema in the database the administrator made, and
+# `setup` creates the first instance. Both are init containers, so the order
+# is Kubernetes' rather than a retry loop's, and the Job holds no permissions
+# at all: what setup needs to administer Zitadel afterwards is the system
+# user's key, which the chart made and Zitadel already trusts.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -147,7 +113,6 @@ spec:
         meridian.dev/component: identity-bootstrap
     spec:
       restartPolicy: OnFailure
-      serviceAccountName: {{ $full }}-identity-bootstrap
       # No security context of ours: this runs Zitadel's own image, which has
       # its own user, and forcing runAsNonRoot with no uid stopped it starting
       # once already. An OpenShift override belongs in Zitadel's values, where
@@ -166,6 +131,7 @@ spec:
             - name: config
               mountPath: /config
               readOnly: true
+      containers:
         - name: setup
           image: "{{ $z.image.repository }}:{{ $tag }}"
           imagePullPolicy: {{ $z.image.pullPolicy | default "IfNotPresent" }}
@@ -182,67 +148,45 @@ spec:
                 secretKeyRef:
                   name: {{ $z.zitadel.masterkeySecretName }}
                   key: masterkey
-            # Where the first instance's token is written, for the writer
-            # beside this to copy. An emptyDir: it never reaches a volume that
-            # outlives the pod.
-            - name: ZITADEL_FIRSTINSTANCE_PATPATH
-              value: /machinekey/pat
-            - name: ZITADEL_FIRSTINSTANCE_MACHINEKEYPATH
-              value: /machinekey/sa.json
             {{- toYaml $z.env | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /config
               readOnly: true
-            - name: machinekey
-              mountPath: /machinekey
-      containers:
-        # Copies the token into the Secret the setup Job reads. Zitadel's own
-        # two steps are init containers, so Kubernetes has already run them to
-        # completion before this starts: no polling, and no right to read pods,
-        # which is what the first trial of this needed and did not have.
-        #
-        # On every run after the first there is no token to copy, because the
-        # instance already exists: the Secret keeps what it holds and this
-        # exits.
-        - name: admin-token
-          image: {{ printf "%s:%s" ($z.tools.kubectl.image.repository | default "docker.io/alpine/k8s") $z.tools.kubectl.image.tag }}
-          imagePullPolicy: {{ $z.tools.kubectl.image.pullPolicy | default "IfNotPresent" }}
-          command:
-            - sh
-            - -c
-            - |
-              # Zitadel mints this once, when it creates the first instance,
-              # and never again. If it is lost the instance cannot be
-              # administered and the only way back is an empty database. So
-              # this retries, and the container restarts in place on failure
-              # with the file still in the pod's own volume.
-              attempt=0
-              while [ -f /machinekey/pat ] && [ $attempt -lt 30 ]; do
-                kubectl --namespace={{ .Release.Namespace }} patch secret {{ $adminpat }} \
-                  --type=json \
-                  -p="[{\"op\": \"replace\", \"path\": \"/data\", \"value\": {\"pat\": \"$(base64 < /machinekey/pat | tr -d '\n')\"}}]" && {
-                  echo 'wrote the admin token'
-                  exit 0
-                }
-                attempt=$((attempt + 1))
-                echo "could not write the admin token, attempt $attempt"
-                sleep 5
-              done
-              if [ -f /machinekey/pat ]; then
-                echo 'gave up writing the admin token'
-                exit 1
-              fi
-              echo 'no token this time: the instance already exists'
-          volumeMounts:
-            - name: machinekey
-              mountPath: /machinekey
       volumes:
         - name: config
           configMap:
             name: {{ $zitadel }}-config-yaml
-        - name: machinekey
-          emptyDir: {}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $system }}
+{{- $pair := genSelfSignedCert "meridian-setup" nil nil 3650 }}
+---
+# The system API user's key pair, made once by this chart.
+#
+# Zitadel's first instance mints an administrator token exactly once, and a
+# deployment that loses it cannot administer its own directory: the only way
+# back is an empty database, which the first trial of the bootstrap Job proved
+# by losing one. A system API user has no such moment. Zitadel holds the public
+# half in its configuration, setup signs a short-lived JWT with the private
+# half whenever it runs, and losing a token means signing another.
+#
+# Wrapped in a self-signed certificate rather than a bare public key, which is
+# what Zitadel recommends for exactly this: a Secret holds both halves and the
+# certificate is what gets mounted.
+#
+# Kept when the release goes, and rendered with what it already holds, because
+# regenerating the pair would leave Zitadel trusting a key nothing has.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $system }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ if $existing }}{{ index $existing.data "tls.crt" }}{{ else }}{{ $pair.Cert | b64enc }}{{ end }}
+  tls.key: {{ if $existing }}{{ index $existing.data "tls.key" }}{{ else }}{{ $pair.Key | b64enc }}{{ end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -327,12 +271,18 @@ spec:
             # A file rather than an env reference: Zitadel writes the token
             # with a trailing newline, and the file is read and trimmed once
             # it appears rather than failing the pod while it does not.
-            - name: MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE
-              value: /var/run/zitadel/pat
+            - name: MERIDIAN_ZITADEL_SYSTEM_USER
+              value: meridian-setup
+            - name: MERIDIAN_ZITADEL_SYSTEM_USER_KEY_FILE
+              value: /var/run/zitadel/tls.key
+            # What Zitadel checks the credential's audience against: the
+            # issuer it states, never the address this dials.
+            - name: MERIDIAN_ZITADEL_ISSUER
+              value: {{ include "meridian-runtime.zitadelIssuer" . | quote }}
             # First run can sit at the wizard for as long as the administrator
-            # takes, and the token does not exist until they have configured
-            # Zitadel's database. So this waits for an hour rather than the
-            # three minutes an already-configured deployment needs.
+            # takes, and Zitadel's database is configured there. So this waits
+            # an hour for the key rather than the three minutes an already
+            # configured deployment needs.
             - name: MERIDIAN_SETUP_WAIT_SECONDS
               value: "3600"
             - name: MERIDIAN_DASHBOARD_REDIRECT_URI
@@ -372,15 +322,15 @@ spec:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           volumeMounts:
-            - name: admin-pat
+            - name: system-user
               mountPath: /var/run/zitadel
               readOnly: true
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
-        - name: admin-pat
+        - name: system-user
           secret:
-            secretName: {{ $adminpat }}
+            secretName: {{ $system }}
             optional: true
 ---
 # The group hook: Zitadel's Actions v2 target. Holds its targets' signing

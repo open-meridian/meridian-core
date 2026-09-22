@@ -44,7 +44,11 @@ pub struct Config {
     /// The instance's external domain, sent as the Host Zitadel routes by
     /// when `api_url` is not the public address.
     pub host: Option<String>,
-    pub admin_token: String,
+    /// What setup presents on every call: a JWT the system API user signs for
+    /// itself (`system_user`). Zitadel's first-instance token is minted once
+    /// and never again, so a deployment that lost it could not be administered
+    /// at all; this can always be signed afresh.
+    pub bearer: String,
     /// The dashboard's `/callback`.
     pub redirect_uri: String,
     /// Where Zitadel reaches the group hook.
@@ -93,6 +97,12 @@ pub trait Sink: Send + Sync {
 }
 
 struct Zitadel {
+    /// The organisation every management call is made against.
+    ///
+    /// A system API user belongs to no organisation, so Zitadel cannot infer
+    /// one and answers "organisation not found" until it is told. It is
+    /// resolved once, from the instance's default, and sent on every call.
+    org_id: std::sync::Mutex<Option<String>>,
     http: reqwest::Client,
     config: Config,
 }
@@ -124,8 +134,11 @@ impl Zitadel {
                 method,
                 format!("{}{path}", self.config.api_url.trim_end_matches('/')),
             )
-            .bearer_auth(&self.config.admin_token)
+            .bearer_auth(&self.config.bearer)
             .header("Accept", "application/json");
+        if let Some(org) = self.org_id.lock().ok().and_then(|held| held.clone()) {
+            request = request.header("x-zitadel-orgid", org);
+        }
         if let Some(host) = &self.config.host {
             request = request.header("Host", host);
         }
@@ -175,16 +188,30 @@ fn first_id(found: &Value, list: &str, id: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Wait until Zitadel answers an authenticated call: its readiness endpoint
-/// turns green before the gateway in front of its API can reach it.
+/// Wait until Zitadel answers an authenticated call, and learn which
+/// organisation to work in.
+///
+/// Its readiness endpoint turns green before the gateway in front of its API
+/// can reach it, so this asks something that needs both the API and the
+/// credential. The instance's default organisation is that question and its
+/// answer at once: a system API user is in no organisation, and every
+/// management call after this names the one it found.
 async fn ready(z: &Zitadel) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..90 {
         match z
-            .call(reqwest::Method::GET, "/management/v1/orgs/me", None)
+            .call(reqwest::Method::GET, "/admin/v1/orgs/default", None)
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(found) => {
+                let id = found["org"]["id"]
+                    .as_str()
+                    .ok_or("Zitadel named no default organisation")?;
+                if let Ok(mut held) = z.org_id.lock() {
+                    *held = Some(id.to_string());
+                }
+                return Ok(());
+            }
             Err(failed) => last = failed.to_string(),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -201,6 +228,7 @@ pub async fn run(
     hook_secret: &str,
 ) -> Result<Outcome, String> {
     let z = Zitadel {
+        org_id: std::sync::Mutex::new(None),
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))

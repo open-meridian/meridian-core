@@ -17,6 +17,7 @@
 pub mod groups;
 pub mod setup;
 pub mod signature;
+pub mod system_user;
 
 use std::sync::Arc;
 

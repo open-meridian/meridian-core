@@ -303,8 +303,8 @@ chart-check:
 	job="$$(echo "$$rendered" | awk '/^---/{if(f)print d; d=""; f=0} {d=d $$0 "\n"} /"meridian-group-hook", "setup"/{f=1} END{if(f)print d}')"; \
 	echo "$$job" | grep -q 'helm.sh/hook' \
 		&& { echo "chart-check FAILED: the setup Job is a hook, and a hook waits on the pods that wait on it" >&2; exit 1; }; \
-	echo "$$job" | grep -q 'MERIDIAN_ZITADEL_ADMIN_TOKEN_FILE' \
-		|| { echo "chart-check FAILED: the setup Job does not read Zitadel's admin token from its file" >&2; exit 1; }; \
+	echo "$$job" | grep -q 'MERIDIAN_ZITADEL_SYSTEM_USER_KEY_FILE' \
+		|| { echo "chart-check FAILED: the setup Job does not sign its own credential. Zitadel's first-instance token is minted once and a deployment that loses it cannot administer its directory" >&2; exit 1; }; \
 	echo "$$rendered" | grep -A12 'name: check-zitadel-egress' | grep -q 'app.kubernetes.io/component: start' \
 		|| { echo "chart-check FAILED: the Zitadel egress policy reaches past the server to Zitadel's own jobs" >&2; exit 1; }; \
 	role="$$(echo "$$rendered" | awk '/^kind: Role$$/{r=1} r&&/^---/{r=0} r' | grep -A14 'name: check-meridian-runtime-identity-setup' )"; \
