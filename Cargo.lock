@@ -1598,6 +1598,7 @@ dependencies = [
  "meridian-access",
  "meridian-bus",
  "meridian-domain",
+ "meridian-first-run",
  "openidconnect",
  "prost",
  "rand 0.8.8",

@@ -7,7 +7,15 @@ use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::AccessRecords;
 use tower::ServiceExt;
 
+use meridian_first_run::SealingKey;
+
 use super::*;
+
+thread_local! {
+    /// What the fake Job opened, for the test that cares that it could.
+    static OPENED: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
 use crate::clock::Clock;
 use crate::records::RecordsCache;
 use crate::session::Sessions;
@@ -42,6 +50,61 @@ fn app(first_run: bool, state: EnrolmentState, redemption: RedeemClaimCodeReply)
             redemption.encode_to_vec(),
         ))
     });
+
+    let job = SealingKey::new("frk-1");
+    let public_key = job.public_key();
+    bus.serve(SEALING_KEY, move |_| {
+        Ok((
+            "meridian.v1.FirstRunSealingKey".to_string(),
+            meridian_domain::v1::FirstRunSealingKey {
+                public_key: public_key.clone(),
+                key_id: "frk-1".to_string(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let checking = Arc::new(job);
+    let opened = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let seen = Arc::clone(&opened);
+    let job = Arc::clone(&checking);
+    bus.serve(CHECK_ANSWER, move |envelope| {
+        let request =
+            meridian_domain::v1::FirstRunCheckRequest::decode(&envelope.payload[..]).unwrap();
+        // What the Job can read is what the wizard sealed, and nothing else
+        // on the bus can.
+        if let Some(meridian_domain::v1::first_run_check_request::Answer::RuntimeDatabase(db)) =
+            &request.answer
+        {
+            let sealed = db.serving.as_ref().unwrap().password.as_ref().unwrap();
+            // The payload itself never carries the password in clear.
+            assert!(!envelope.payload.windows(7).any(|w| w == b"hunter2"));
+            let plain = job
+                .open(sealed, "runtime_database.serving.password")
+                .unwrap();
+            *seen.lock().unwrap() = plain;
+        }
+        Ok((
+            "meridian.v1.FirstRunCheckReply".to_string(),
+            meridian_domain::v1::FirstRunCheckReply {
+                passed: true,
+                findings: vec![],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(APPLY, move |_| {
+        Ok((
+            "meridian.v1.FirstRunApplied".to_string(),
+            meridian_domain::v1::FirstRunApplied {
+                applied: true,
+                steps: vec!["secrets".into(), "restart".into()],
+                refusal_reason: String::new(),
+                rights_released: true,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    OPENED.with(|held| *held.borrow_mut() = Some(opened));
 
     let records = Arc::new(RecordsCache::default());
     records.store(AccessRecords::default(), T0);
@@ -214,7 +277,10 @@ async fn a_redeemed_code_starts_one_session_and_holds_the_first_administrators_c
         Some(cookie.split(';').next().unwrap()),
     )
     .await;
-    assert!(body.contains("The code was accepted"), "{body}");
+    assert!(
+        body.contains("/first-run/apply"),
+        "the wizard itself: {body}"
+    );
 }
 
 #[tokio::test]
@@ -249,4 +315,91 @@ fn a_session_does_not_outlive_its_bound() {
         wizard.of(Some(&key), T0 + ABSOLUTE_NS + 1).is_none(),
         "a wizard left open is the exposure a session left open is (decisions/015)"
     );
+}
+
+async fn post(app: Arc<App>, path: &str, cookie: &str, body: &str) -> (StatusCode, String) {
+    let request = Request::post(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(COOKIE, cookie)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    read(app, request).await
+}
+
+async fn redeemed(app: &Arc<App>) -> String {
+    let (_, _, cookie) = claim_with(Arc::clone(app), "FR-9C2L-7TXB-K4QM").await;
+    cookie
+        .expect("a session")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn wizard_app() -> Arc<App> {
+    app(
+        true,
+        enrolled(),
+        RedeemClaimCodeReply {
+            redeemed: true,
+            first_admin_code: "7KQ2-MX4P-9RTD".into(),
+            ..Default::default()
+        },
+    )
+}
+
+const ANSWERS: &str = "db_host=db.firm.internal&db_port=5432&db_name=meridian\
+&db_serving_role=meridian_app&db_serving_password=hunter2\
+&db_migrating_role=meridian_migrate&db_migrating_password=hunter2\
+&backend=bundled&zitadel_version=v4.17.3&zitadel_egress=10.20.0.0/16\
+&directory=local&admin_login=ada&admin_password=hunter2\
+&dashboard_url=https://meridian.firm.example";
+
+#[tokio::test]
+async fn a_credential_reaches_the_job_sealed_and_nothing_else_can_read_it() {
+    let app = wizard_app();
+    let cookie = redeemed(&app).await;
+
+    let (status, body) = post(Arc::clone(&app), "/first-run/check", &cookie, ANSWERS).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("passes"), "{body}");
+    // The Job opened it; the assertion inside the fake Job is that the bus
+    // payload never carried it in clear.
+    let opened = OPENED.with(|held| held.borrow().clone()).unwrap();
+    let opened = opened.lock().unwrap().clone();
+    assert_eq!(opened, b"hunter2");
+}
+
+#[tokio::test]
+async fn applying_shows_the_first_administrators_code_once_and_ends_the_wizard() {
+    let app = wizard_app();
+    let cookie = redeemed(&app).await;
+
+    let (status, body) = post(Arc::clone(&app), "/first-run/apply", &cookie, ANSWERS).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("7KQ2-MX4P-9RTD"), "{body}");
+    assert!(body.contains("shown once"), "{body}");
+
+    // And the session is over: the same cookie now sees the closed page,
+    // because what makes first run end is the configuration landing.
+    let (_, again) = get(app, "/first-run", Some(&cookie)).await;
+    assert!(again.contains("first-run/claim"), "{again}");
+}
+
+#[tokio::test]
+async fn the_wizard_refuses_anybody_without_a_session() {
+    let app = wizard_app();
+
+    let (status, body) = post(
+        Arc::clone(&app),
+        "/first-run/apply",
+        "meridian_first_run=not-a-session",
+        ANSWERS,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("first-run/claim"), "the closed page: {body}");
 }

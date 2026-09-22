@@ -10,6 +10,7 @@ description = "The deployment's one address: sign-in, access, and the pages that
 meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-domain.workspace = true
+meridian-first-run = { path = "../first-run" }
 axum.workspace = true
 http.workspace = true
 openidconnect.workspace = true

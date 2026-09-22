@@ -161,6 +161,33 @@ impl FirstRun {
         let mut steps: Vec<String> = Vec::new();
         let mut applied = FirstRunApplied::default();
 
+        // Tested again here, because a test and an apply are separate moments
+        // and what was true at the first may not be at the second: a password
+        // rotated between them, a role's rights changed. Writing a
+        // configuration that no longer works would leave a deployment with a
+        // database it cannot reach and no wizard to fix it in.
+        for answer in [
+            configuration
+                .runtime_database
+                .clone()
+                .map(Answer::RuntimeDatabase),
+            configuration
+                .login_backend
+                .clone()
+                .map(Answer::LoginBackend),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let checked = self.check(&FirstRunCheckRequest {
+                answer: Some(answer),
+            });
+            if !checked.passed {
+                applied.refusal_reason = checked.findings.join("; ");
+                return applied;
+            }
+        }
+
         if let Err(refusal) = self.write_database(configuration).await {
             applied.steps = steps;
             applied.refusal_reason = refusal;
