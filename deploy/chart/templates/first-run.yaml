@@ -1,0 +1,146 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.dashboard.enabled }}
+{{/*
+  The only thing in this deployment that may change the cluster, and only
+  until somebody has configured it (decisions/016).
+
+  The wizard asks; this acts. It is a Job rather than a component, its Role
+  names every resource it may touch, it may create none of them, and when the
+  configuration is applied it deletes its own RoleBinding and exits. A
+  deployment that is already configured starts it, finds its work done, gives
+  the rights up and exits, so installing the same release twice leaves nothing
+  holding them.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-first-run" $full }}
+{{- $database := include "meridian-runtime.databaseSecret" . }}
+{{- $zitadelDatabase := .Values.identity.bundled.databaseSecretName }}
+{{- $oidc := printf "%s-dashboard-oidc" $full }}
+{{- $ldap := .Values.identity.bundled.ldap.bindPasswordSecret | default (printf "%s-ldap-bind" $full) }}
+{{- $egress := printf "%s-zitadel-egress" .Release.Name }}
+{{- $restart := list (printf "%s-conductor" $full) (printf "%s-dashboard" $full) }}
+{{- $bundled := list (printf "%s-zitadel" .Release.Name) (printf "%s-zitadel-login" .Release.Name) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# Every resource by name, and `create` on none of them. The Secrets are made
+# empty by the chart precisely so that this can be true: RBAC cannot narrow
+# `create` to a name, so a Job allowed to create Secrets could create any.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $database | quote }}, {{ $zitadelDatabase | quote }}, {{ $oidc | quote }}, {{ $ldap | quote }}]
+    verbs: ["get", "update", "patch"]
+  # The one security resource it may change: the ranges the bundled Zitadel
+  # may reach, which the administrator confirms in the wizard. It could widen
+  # that egress to what they entered, which is the point of asking them. It
+  # cannot touch any other policy.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: [{{ $egress | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ range $i, $d := (concat $restart $bundled) }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: [{{ range $i, $d := $bundled }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
+    verbs: ["get", "patch"]
+  # Deleting exactly one binding: its own. This is what makes "gives up its
+  # rights" a thing that happens rather than a thing that was meant.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    resourceNames: [{{ $name | quote }}]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-{{ .Release.Revision }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: first-run
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $name }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: first-run
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-first-run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: first-run
+            # Its own broker credential, not the runtime's: what the wizard
+            # seals reaches this Job and nothing else (ruling 5).
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.broker.existingSecret }}
+                  key: {{ .Values.firstRun.brokerKey }}
+            # Every name it may touch, from the chart, because the Role names
+            # the same ones.
+            - name: MERIDIAN_FIRST_RUN_DATABASE_SECRET
+              value: {{ $database | quote }}
+            - name: MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET
+              value: {{ $zitadelDatabase | quote }}
+            - name: MERIDIAN_FIRST_RUN_OIDC_SECRET
+              value: {{ $oidc | quote }}
+            - name: MERIDIAN_FIRST_RUN_LDAP_SECRET
+              value: {{ $ldap | quote }}
+            - name: MERIDIAN_FIRST_RUN_EGRESS_POLICY
+              value: {{ $egress | quote }}
+            - name: MERIDIAN_FIRST_RUN_BINDING
+              value: {{ $name | quote }}
+            - name: MERIDIAN_FIRST_RUN_RESTART
+              value: {{ join "," $restart | quote }}
+            - name: MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY
+              value: {{ join "," $bundled | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- end }}

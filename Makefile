@@ -326,6 +326,15 @@ chart-check:
 		--set identity.bundled.egress.allowCidrs={10.0.0.0/8} 2>/dev/null \
 		| awk '/name: MERIDIAN_OIDC_CLIENT_ID/{f=1} f&&/optional: true/{print "optional"; exit}' | grep -q optional \
 		|| { echo "chart-check FAILED: the dashboard cannot start without a client id, and the wizard that makes one is what it would be serving" >&2; exit 1; }
+	@role="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url=https://meridian.example 2>/dev/null \
+		| awk '/^kind: Role$$/{r=1} r; /^---/{r=0}' | grep -A30 'name: check-meridian-runtime-first-run')"; \
+	echo "$$role" | grep -qE 'verbs:.*(create|\*)' \
+		&& { echo "chart-check FAILED: first run may create a resource. RBAC cannot narrow create to a name, so a Job that may create Secrets may create any" >&2; exit 1; }; \
+	echo "$$role" | grep -q 'resources: \["rolebindings"\]' \
+		|| { echo "chart-check FAILED: first run cannot delete its own binding, so it never gives up its rights" >&2; exit 1; }; \
+	echo "$$role" | grep -c 'resourceNames:' | grep -qv '^0$$' \
+		|| { echo "chart-check FAILED: a first-run rule names no resource" >&2; exit 1; }; true
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \

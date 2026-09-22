@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/group-hook"]
+members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run", "crates/group-hook"]
 
 [workspace.package]
 edition = "2021"
@@ -53,6 +53,10 @@ base64 = "0.22"
 # `rsa` crate: RUSTSEC-2023-0071 is a timing side channel in that crate's
 # private-key operations, and this workspace does none.
 ring = "0.17"
+# Seals a credential to the first-run Job, so the broker and everything else
+# on the bus see ciphertext (spec/installation-and-first-run, ruling 4).
+# RFC 9180, and a pure-Rust implementation.
+hpke = { version = "0.12", default-features = false, features = ["x25519", "alloc"] }
 rand = "0.8"
 prost = "0.13"
 

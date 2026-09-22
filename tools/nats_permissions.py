@@ -116,6 +116,31 @@ def permissions_for(grants: dict, role: str, tags: list[str], instance_id: str) 
 # with its own half of this: the manifest already says which topics are whose.
 COMPONENTS = ("instrument", "street", "conductor")
 
+# Components that hold a credential of their own rather than the runtime's.
+#
+# First run holds the only right in a deployment to change the cluster, and the
+# wizard seals every credential it sends to it. Sharing the runtime credential
+# would let any component receive those messages, and would give this Job every
+# other component's rights (spec/installation-and-first-run, ruling 5).
+OWN_CREDENTIAL = ("first-run",)
+
+
+def permissions_from_manifest(manifest: str, components: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """The registry's own columns, for one set of components."""
+    publish: set[str] = set()
+    subscribe: set[str] = set()
+
+    for line in manifest.splitlines():
+        if line.startswith("#") or line.startswith("topic\t") or not line.strip():
+            continue
+        topic, _kind, publisher, subscriber = line.split("\t")
+        if {part.strip() for part in publisher.split(",")} & set(components):
+            publish.add(subject(topic))
+        if {part.strip() for part in subscriber.split(",")} & set(components):
+            subscribe.add(subject(topic))
+
+    return sorted(publish), sorted(subscribe)
+
 
 def component_permissions(manifest: str) -> tuple[list[str], list[str]]:
     """What the runtime's components may publish and subscribe to.
@@ -155,6 +180,24 @@ def rendered(grants: dict, instances: dict, manifest: str, extras: dict | None =
     # actually received, which is tighter than any list.
     publish.append(INBOX)
     subscribe.append(INBOX)
+
+    for component in OWN_CREDENTIAL:
+        own_publish, own_subscribe = permissions_from_manifest(manifest, (component,))
+        if not own_publish and not own_subscribe:
+            continue
+        own_publish.append(INBOX)
+        own_subscribe.append(INBOX)
+        variable = f"$MERIDIAN_NATS_{component.upper().replace('-', '_')}"
+        lines.append(
+            f"    # {component}, its own credential rather than the runtime's: "
+            "what the wizard seals reaches it and nothing else."
+        )
+        lines.append(
+            f"    {{ user: {component}, password: {variable}, permissions: {{ "
+            f"publish: {{ allow: {json.dumps(own_publish)} }}, "
+            f"subscribe: {{ allow: {json.dumps(own_subscribe)} }}, "
+            f"allow_responses: true }} }}"
+        )
 
     lines.append("    # The runtime's components, from the registry's own columns.")
     lines.append(

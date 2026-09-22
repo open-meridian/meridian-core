@@ -47,6 +47,7 @@ services:
       MERIDIAN_NATS_CUSTODY_1: custody-1-dev-only
       MERIDIAN_NATS_CUSTODY_2: custody-2-dev-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-dev-only
+      MERIDIAN_NATS_FIRST_RUN: first-run-dev-only
       MERIDIAN_NATS_TESTS: tests-dev-only
     volumes:
       # Generated from the grant table, never edited: the grant table is the

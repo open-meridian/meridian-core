@@ -193,6 +193,16 @@ dashboard:
 #     Zitadel never holds your Postgres superuser.
 #   - identity.bundled.egress.allowCidrs: where Zitadel may connect besides the
 #     group hook and DNS -- its database, and the LDAP directory if any.
+# The Job that turns the wizard's answers into this deployment's
+# configuration, and the only thing here that may change the cluster. It runs
+# with the dashboard, gives up its rights when the configuration is applied,
+# and exits; a deployment already configured finds its work done and exits.
+firstRun:
+  # Its own key in the broker secret, never the runtime's: what the wizard
+  # seals is sealed to this Job, and a shared credential would let any
+  # component receive it.
+  brokerKey: first-run
+
 identity:
   bundled:
     enabled: false
