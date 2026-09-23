@@ -65,21 +65,16 @@ pub const WIZARD_COOKIE: &str = "meridian_first_run";
 pub struct Wizard {
     pub token: String,
     pub started_at_ns: i64,
-    /// Issued with the first-run code in the same act on the platform
-    /// (ruling 3). Held here until the configuration is applied, shown once
-    /// then, and never stored anywhere else.
-    pub first_admin_code: String,
 }
 
 #[derive(Default)]
 pub struct WizardSession(Mutex<Option<Wizard>>);
 
 impl WizardSession {
-    pub fn start(&self, first_admin_code: String, now_ns: i64) -> String {
+    pub fn start(&self, now_ns: i64) -> String {
         let wizard = Wizard {
             token: token(),
             started_at_ns: now_ns,
-            first_admin_code,
         };
         let key = wizard.token.clone();
         if let Ok(mut held) = self.0.lock() {
@@ -245,7 +240,12 @@ async fn claim(
         return Html(closed_page(&enrolment, &reason)).into_response();
     }
 
-    let key = app.wizard.start(reply.first_admin_code, app.clock.now_ns());
+    // The reply still carries a first administrator's code, and this ignores
+    // it: who administers a deployment is now named in the wizard and written
+    // when the configuration is applied (ruling 3, amended). The code remains
+    // the way a deployment left with no administrator is recovered, issued on
+    // the platform when somebody asks for one.
+    let key = app.wizard.start(app.clock.now_ns());
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -433,10 +433,13 @@ async fn apply(
         return Html(open_page(&fields, &findings, "")).into_response();
     }
 
-    // Shown this once and never again: the platform keeps only its hash, and
-    // this dashboard is about to restart into directory sign-in.
     app.wizard.end();
-    Html(applied_page(&wizard.first_admin_code, &applied.steps)).into_response()
+    let _ = wizard;
+    Html(applied_page(
+        &configuration.administrator.clone().unwrap_or_default(),
+        &applied.steps,
+    ))
+    .into_response()
 }
 
 fn live(app: &Arc<App>, headers: &HeaderMap) -> Option<Wizard> {
@@ -499,21 +502,45 @@ async fn ask(
 }
 
 /// What the wizard shows once everything is applied.
-fn applied_page(first_admin_code: &str, steps: &[String]) -> String {
+///
+/// It used to show a code to redeem. Nobody redeems anything now: applying
+/// recorded who administers this deployment, and the conductor writes the
+/// permission when it restarts onto the store it was just given (W7.6).
+fn applied_page(administrator: &AdministratorAnswer, steps: &[String]) -> String {
+    let who = match &administrator.named {
+        Some(Named::DirectoryGroup(group)) => format!(
+            "<p>Everybody in <strong>{}</strong> administers this deployment. \
+             Sign in through the directory you configured; there is nothing to \
+             redeem.</p>\
+             <p>Adding an administrator later is a change in your directory \
+             rather than here.</p>",
+            escape(group)
+        ),
+        Some(Named::LocalAccountLogin(login)) => format!(
+            "<p><strong>{}</strong> administers this deployment. Sign in with \
+             the account and password you just gave; there is nothing to \
+             redeem.</p>",
+            escape(login)
+        ),
+        // Refused before anything was written, so this page is not reached
+        // with nobody named. Said rather than left blank, because a page that
+        // shows nothing here is a deployment somebody cannot get into.
+        None => "<p class=\"refusal\">Nobody was named to administer this \
+                 deployment. Issue a claim code on the platform and redeem it \
+                 at the first sign-in.</p>"
+            .to_string(),
+    };
+
     page(
         "This deployment is configured",
         &format!(
             "<h1>This deployment is configured</h1>\
              <p>{}</p>\
-             <h2>Your first administrator's code</h2>\
-             <p><code>{}</code></p>\
-             <p>Copy it now: it is shown once, and the platform keeps only its \
-             hash. Sign in through the directory you configured and redeem it \
-             there; that makes you this deployment's first administrator.</p>\
+             <h2>Signing in</h2>\
+             {who}\
              <p>The components are restarting into what you configured. This \
              page will not come back.</p>",
-            escape(&steps.join(", ")),
-            escape(first_admin_code)
+            escape(&steps.join(", "))
         ),
     )
 }
@@ -788,11 +815,12 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
              somebody later is a change in your directory rather than here. \
              With no directory, the account above is the administrator and \
              this is left empty.</p>\
-             <p>A group is checked against LDAP and the bundled directory. \
-             Against your own OpenID Connect provider it cannot be checked: \
-             a provider states a person's groups inside their own token, and \
-             listing a directory's groups is a separate interface for every \
-             vendor. Spell it carefully there.</p>\
+             <p><strong>The group is not checked.</strong> A directory \
+             states a person's groups when they sign in; it is not asked to \
+             list them, and the bundled directory has no database until this \
+             page is applied. Spell it carefully: a group that does not exist \
+             is a deployment nobody can administer, and getting back in then \
+             means a claim code from the platform.</p>\
              {}\
              <h2>Addresses</h2>\
              <p>Where a browser reaches this deployment. The directory sends \

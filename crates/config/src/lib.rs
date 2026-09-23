@@ -34,7 +34,10 @@ mod memory;
 pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use postgres::PostgresStore;
-pub use service::{configuration, deployment_admin, serve, Clock, SystemClock, Upstream};
+pub use service::{
+    configuration, deployment_admin, install_named_administrator, serve, Clock, SystemClock,
+    Upstream,
+};
 pub use store::{KnownPlugin, Snapshot, Store, StoreError, Withdrawal};
 
 #[cfg(test)]

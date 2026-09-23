@@ -407,6 +407,28 @@ impl FirstRun {
             addresses.dashboard_url.clone().into_bytes(),
         )]);
 
+        // W7.5 records who administers this deployment; W7.6 writes the
+        // permission. Here rather than in a Secret of its own because this is
+        // already the one the wizard fills with things the components read,
+        // and the Job may write no Secret the chart has not named.
+        if let Some(administrator) = &configuration.administrator {
+            match &administrator.named {
+                Some(Named::DirectoryGroup(group)) if !group.trim().is_empty() => {
+                    values.insert(
+                        "administrator-directory-group".to_string(),
+                        group.trim().as_bytes().to_vec(),
+                    );
+                }
+                Some(Named::LocalAccountLogin(login)) if !login.trim().is_empty() => {
+                    values.insert(
+                        "administrator-login".to_string(),
+                        login.trim().as_bytes().to_vec(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         if !addresses.zitadel_url.trim().is_empty() {
             let (domain, port, secure) = split_zitadel_url(&addresses.zitadel_url)?;
             values.extend([
@@ -499,13 +521,13 @@ fn encode(value: &str) -> String {
 
 /// W7.4. Whether anybody will be able to administer this deployment.
 ///
-/// Shape only, as the checks beside it are. Asking a directory whether a group
-/// exists is not done here and is not pretended: against LDAP and the bundled
-/// Zitadel it can be asked and should be, which is
-/// `kernel/first-run-names-the-administrator`; against a firm's own OIDC
-/// provider it cannot be at all, because a provider asserts a person's groups
-/// inside their own token and listing a directory's groups is a separate API
-/// per vendor (spec/installation-and-first-run, requirement 13).
+/// Shape only, and that is the whole of what can be checked here. Asking a
+/// directory whether a group exists is not done for any backend, and the
+/// wizard says so on the page rather than implying otherwise: nothing in the
+/// deployment speaks LDAP, the bundled Zitadel has no database until this
+/// very configuration is applied, and a firm's own provider asserts a
+/// person's groups inside their own token rather than listing a directory's
+/// (spec/installation-and-first-run, requirement 13).
 ///
 /// What is caught here is the case worth catching without a directory: nobody
 /// named. That produces a configured deployment with no administrator, which

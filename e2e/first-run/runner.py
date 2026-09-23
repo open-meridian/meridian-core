@@ -171,21 +171,20 @@ def main():
 
     print("F: applied", flush=True)
     status, page = browser.post(f"{DASHBOARD}/first-run/apply", ANSWERS)
-    if FIRST_ADMIN_CODE not in page:
-        # This failed intermittently on 2026-09-23 and was written up here as
-        # something seen once and not reproduced. It was not a flake: the
-        # dashboard waited the bus default of five seconds for a Job that
-        # writes Secrets, patches a policy, scales and restarts, so when the
-        # Job took longer the deployment was configured and the wizard said it
-        # had not been -- losing the code, of which the platform keeps only a
-        # hash. Fixed by giving applying its own bound, and pinned by
-        # `applying_waits_for_a_job_slower_than_a_question_from_memory`.
-        #
-        # The diagnostic stays. If this ever fails again, what the platform was
-        # asked and answered says which side lost the code.
+    # W7.6 and decisions/017: nobody redeems anything. Applying recorded who
+    # administers this deployment, and the conductor writes the permission
+    # when it restarts onto the store it was just given.
+    if "administers this deployment" not in page:
+        # What the platform was asked and answered says which side lost what,
+        # so it is printed here rather than guessed at from a bare failure.
         s.note(f"redemptions: {[c for c in json_at(f'{PLATFORM}/e2e/calls')['calls'] if c['path'].endswith('/redeem')]}")
         s.note(f"page: {re.sub(r'<[^>]*>', ' ', page)[:300]}")
-    s.check(FIRST_ADMIN_CODE in page, "the first administrator's code is shown once")
+    s.check("administers this deployment" in page,
+            "the applied page names who administers it")
+    s.check(ANSWERS["admin_login"] in page,
+            "and names the account the wizard created, with nothing to redeem")
+    s.check(FIRST_ADMIN_CODE not in page,
+            "no code is shown: there is nothing left to claim")
 
     state = json_at(f"{KUBE}/e2e/state")
     s.note(f"secrets: {sorted(state['secrets'])}")

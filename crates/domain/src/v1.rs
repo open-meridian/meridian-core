@@ -1535,12 +1535,12 @@ pub mod administrator_answer {
         /// A directory group whose members hold deployment admin. Onboarding then
         /// stays a change in the firm's directory rather than in Meridian.
         ///
-        /// Tested where the directory can be asked, which is LDAP and the bundled
-        /// Zitadel. Against a firm's own OIDC provider it cannot be: a provider
-        /// asserts a person's groups inside their own token, and listing a
-        /// directory's groups is a separate API per vendor with its own
-        /// registration and credentials. Taken unverified there, and a claim code
-        /// recovers a deployment left with nobody who can administer it.
+        /// Not checked against the directory, for any backend, and the wizard says
+        /// so rather than implying otherwise: nothing in the deployment speaks
+        /// LDAP, the bundled Zitadel has no database until this configuration is
+        /// applied, and a provider asserts a person's groups inside their own
+        /// token rather than listing a directory's. A misspelled group is a
+        /// deployment nobody can administer, recovered with a claim code.
         #[prost(string, tag = "1")]
         DirectoryGroup(::prost::alloc::string::String),
         /// The local account the bundled route already creates, by its login.

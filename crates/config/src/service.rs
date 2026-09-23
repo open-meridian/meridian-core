@@ -182,6 +182,55 @@ impl Context {
     }
 }
 
+/// W7.6. Write the administrator the wizard named, once.
+///
+/// Called by the conductor when it first has a store. Applying the
+/// configuration recorded who administers this deployment; writing the
+/// permission had to wait, because access records live in this store and this
+/// store's database is one of the things the wizard was configuring
+/// (decisions/017).
+///
+/// Idempotent by the same mechanism a claim code uses: the write is refused
+/// when a deployment admin already exists, so a restart, a second apply or a
+/// claim code redeemed in between all leave one administrator rather than
+/// two arguments about who it is.
+pub fn install_named_administrator(
+    store: &dyn Store,
+    clock: &dyn Clock,
+    directory_group: &str,
+    login: &str,
+) -> Result<bool, String> {
+    let directory_group = directory_group.trim();
+    let login = login.trim();
+    if directory_group.is_empty() && login.is_empty() {
+        return Ok(false);
+    }
+
+    let now = clock.now_ns();
+    let group = UserGroup {
+        user_group_id: ids::user_group(now),
+        name: "Deployment admins".into(),
+        directory_groups: match directory_group.is_empty() {
+            true => Vec::new(),
+            false => vec![directory_group.to_string()],
+        },
+        logins: match login.is_empty() {
+            true => Vec::new(),
+            false => vec![login.to_string()],
+        },
+    };
+    let permission = Permission {
+        permission_id: ids::permission(now),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+
+    store
+        .install_first_admin(&group, &permission)
+        .map_err(|failed| failed.to_string())
+}
+
 fn subject(envelope: &Envelope) -> String {
     envelope
         .meta

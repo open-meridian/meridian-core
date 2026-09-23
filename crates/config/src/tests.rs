@@ -626,3 +626,90 @@ async fn a_bundle_is_forwarded_exactly_as_approved() {
         std::slice::from_ref(&bundle)
     );
 }
+
+// ── W7.6: the administrator the wizard named ────────────────────────────────
+
+#[test]
+fn the_administrator_the_wizard_named_gets_the_permission() {
+    let store = MemoryStore::new();
+
+    let written = install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap();
+
+    assert!(written);
+    let records = store.snapshot().unwrap().records;
+    let group = records
+        .user_groups
+        .iter()
+        .find(|g| g.directory_groups == vec!["meridian-admins".to_string()])
+        .expect("a user group naming the directory group");
+    assert!(
+        records.permissions.iter().any(|p| {
+            p.user_group_id == group.user_group_id && p.access_group_id == DEPLOYMENT_ADMIN
+        }),
+        "an ordinary permission, audited by reading the same table as every other grant"
+    );
+}
+
+#[test]
+fn a_local_account_is_named_by_its_login_instead() {
+    let store = MemoryStore::new();
+
+    assert!(install_named_administrator(&store, &FixedClock, "", "ada").unwrap());
+
+    let records = store.snapshot().unwrap().records;
+    assert_eq!(
+        records
+            .user_groups
+            .iter()
+            .find(|g| !g.logins.is_empty())
+            .map(|g| g.logins.clone()),
+        Some(vec!["ada".to_string()])
+    );
+}
+
+#[test]
+fn it_is_written_once_however_often_the_conductor_restarts() {
+    // The conductor calls this every start, because it cannot know which one
+    // is the first after the wizard. Writing twice would leave a deployment
+    // with two groups arguing about who administers it.
+    let store = MemoryStore::new();
+
+    assert!(install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
+    assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
+
+    let records = store.snapshot().unwrap().records;
+    assert_eq!(records.permissions.len(), 1);
+}
+
+#[test]
+fn an_administrator_who_arrived_another_way_is_left_alone() {
+    // A claim code redeemed before the conductor restarted, say. The store
+    // refuses the write when a deployment admin exists, which is what makes
+    // this safe to call unconditionally.
+    let store = MemoryStore::new();
+    let group = UserGroup {
+        user_group_id: "ug-existing".into(),
+        name: "Deployment admins".into(),
+        directory_groups: Vec::new(),
+        logins: vec![ADA.into()],
+    };
+    let permission = Permission {
+        permission_id: "perm-existing".into(),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+    store.install_first_admin(&group, &permission).unwrap();
+
+    assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
+    assert_eq!(store.snapshot().unwrap().records.permissions.len(), 1);
+}
+
+#[test]
+fn naming_nobody_writes_nothing() {
+    let store = MemoryStore::new();
+
+    assert!(!install_named_administrator(&store, &FixedClock, "  ", "").unwrap());
+
+    assert!(store.snapshot().unwrap().records.permissions.is_empty());
+}

@@ -350,7 +350,7 @@ async fn a_refused_code_says_why_and_starts_nothing() {
 }
 
 #[tokio::test]
-async fn a_redeemed_code_starts_one_session_and_holds_the_first_administrators_code() {
+async fn a_redeemed_code_starts_one_session_bound_to_that_browser() {
     let app = app(
         true,
         enrolled(),
@@ -375,8 +375,11 @@ async fn a_redeemed_code_starts_one_session_and_holds_the_first_administrators_c
             T0,
         )
         .expect("the session is this browser's");
-    // Held for W7.5 and shown once there, never written anywhere else.
-    assert_eq!(held.first_admin_code, "7KQ2-MX4P-9RTD");
+    // The session holds the wizard and nothing else. It used to carry a first
+    // administrator's code to show at W7.5; the wizard names the
+    // administrator now, and the permission is written when the conductor
+    // restarts (decisions/017).
+    assert_eq!(held.started_at_ns, T0);
 
     let (_, body) = get(
         Arc::clone(&app),
@@ -415,7 +418,7 @@ async fn another_browser_is_not_the_session() {
 #[test]
 fn a_session_does_not_outlive_its_bound() {
     let wizard = WizardSession::default();
-    let key = wizard.start("7KQ2-MX4P-9RTD".into(), T0);
+    let key = wizard.start(T0);
 
     assert!(wizard.of(Some(&key), T0 + ABSOLUTE_NS).is_some());
     assert!(
@@ -474,8 +477,8 @@ async fn applying_waits_for_a_job_slower_than_a_question_from_memory() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("7KQ2-MX4P-9RTD"),
-        "a Job slower than the default still shows the code: {body}"
+        body.contains("administers this deployment"),
+        "a Job slower than the default still finishes the wizard: {body}"
     );
 }
 
@@ -515,15 +518,18 @@ async fn a_credential_reaches_the_job_sealed_and_nothing_else_can_read_it() {
 }
 
 #[tokio::test]
-async fn applying_shows_the_first_administrators_code_once_and_ends_the_wizard() {
+async fn applying_names_the_administrator_and_ends_the_wizard() {
     let app = wizard_app();
     let cookie = redeemed(&app).await;
 
     let (status, body) = post(Arc::clone(&app), "/first-run/apply", &cookie, ANSWERS).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("7KQ2-MX4P-9RTD"), "{body}");
-    assert!(body.contains("shown once"), "{body}");
+    // Nobody redeems anything: applying recorded who administers this
+    // deployment, and the conductor writes the permission when it restarts
+    // onto the store it was just given (W7.6, decisions/017).
+    assert!(body.contains("administers this deployment"), "{body}");
+    assert!(!body.contains("7KQ2-MX4P-9RTD"), "no code to copy: {body}");
 
     // And the session is over: the same cookie now sees the closed page,
     // because what makes first run end is the configuration landing.

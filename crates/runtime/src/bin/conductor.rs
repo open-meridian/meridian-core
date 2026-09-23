@@ -99,6 +99,8 @@ fn run() -> Result<(), String> {
         }
     };
 
+    install_named_administrator(store.as_ref());
+
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
     let platform = platform_from_env(key)?;
@@ -356,6 +358,44 @@ async fn enrol_with_code(
             );
             state(false, String::new(), failed.to_string())
         }
+    }
+}
+
+/// W7.6. Write the permission for whoever the wizard named, once.
+///
+/// Applying the configuration recorded them; the permission had to wait,
+/// because access records live in this store and this store's database was
+/// one of the things being configured. The Job writes the Secret and restarts
+/// this component, so by the time this runs there is somewhere to write to
+/// (decisions/017).
+///
+/// Never fatal. A deployment that cannot write this is a deployment somebody
+/// recovers with a claim code, and refusing to start would take away the
+/// dashboard they would redeem it in.
+fn install_named_administrator(store: &dyn meridian_config::Store) {
+    let group = var("MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP").unwrap_or_default();
+    let login = var("MERIDIAN_ADMINISTRATOR_LOGIN").unwrap_or_default();
+
+    match meridian_config::install_named_administrator(
+        store,
+        &meridian_config::SystemClock,
+        &group,
+        &login,
+    ) {
+        // Every start after the first, and every deployment whose
+        // administrator arrived another way. The write refuses itself when one
+        // exists, which is what makes this safe to call unconditionally.
+        Ok(false) => {}
+        Ok(true) => tracing::info!(
+            directory_group = group,
+            login = login,
+            "the administrator the wizard named holds deployment admin"
+        ),
+        Err(failed) => tracing::error!(
+            %failed,
+            "the administrator the wizard named could not be written. \
+             Issue a claim code on the platform and redeem it at first sign-in"
+        ),
     }
 }
 

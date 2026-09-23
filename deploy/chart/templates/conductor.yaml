@@ -64,6 +64,29 @@ spec:
               value: {{ .Values.deployment.enrolmentCode | quote }}
               {{- end }}
             {{- end }}
+            {{- if .Values.dashboard.enabled }}
+            # W7.6. Who the wizard said administers this deployment, written
+            # by first run into the same Secret it writes the addresses to.
+            # Optional, because it does not exist until somebody has been
+            # through the wizard, and a conductor that would not start without
+            # it would be a conductor the wizard could not run without.
+            #
+            # The permission is written here rather than by the Job because
+            # access records live in this component's store, and that store's
+            # database is one of the things the wizard was configuring.
+            - name: MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  key: administrator-directory-group
+                  optional: true
+            - name: MERIDIAN_ADMINISTRATOR_LOGIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  key: administrator-login
+                  optional: true
+            {{- end }}
             - name: MERIDIAN_KEY_PATH
               value: {{ if include "meridian-runtime.generatedKey" . }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
