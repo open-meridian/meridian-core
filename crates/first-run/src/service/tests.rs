@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use meridian_domain::v1::{
     BundledZitadelAnswer, CreateZitadelDatabase, LdapDirectoryAnswer, OidcProviderAnswer,
@@ -18,9 +18,14 @@ fn administrator(group: &str) -> AdministratorAnswer {
 use crate::sealing::seal;
 
 /// Remembers what it was asked to do, and answers yes.
+///
+/// The record is behind an `Arc` so a test can keep a handle on it after the
+/// stand-in has been boxed into the run. It was write-only until 2026-09-23,
+/// which is part of why the firm's-own-directory route went unexamined: the
+/// tests could see that applying succeeded and not what it wrote.
 #[derive(Default)]
 struct Remembering {
-    done: Mutex<Vec<String>>,
+    done: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -524,4 +529,93 @@ fn a_bundled_directory_this_chart_did_not_render_is_refused() {
         "{:?}",
         reply.findings
     );
+}
+
+/// What the run wrote, as `secret <name> <comma-joined keys>` and so on.
+fn watched() -> (Remembering, Arc<Mutex<Vec<String>>>) {
+    let cluster = Remembering::default();
+    let done = cluster.done.clone();
+    (cluster, done)
+}
+
+fn firms_own_directory(groups_claim: &str) -> LoginBackendAnswer {
+    LoginBackendAnswer {
+        backend: Some(Backend::Oidc(OidcProviderAnswer {
+            issuer: "https://directory.firm.example/".into(),
+            client_id: "meridian".into(),
+            groups_claim: groups_claim.into(),
+            ..Default::default()
+        })),
+    }
+}
+
+#[tokio::test]
+async fn the_firms_own_issuer_reaches_the_secret_the_dashboard_reads() {
+    // The chart reads one issuer, out of the addresses Secret. On the bundled
+    // route that is Zitadel's address; on this route it is the firm's, and it
+    // was written only into the dashboard's OIDC Secret, which the chart reads
+    // the client id out of and not the issuer.
+    //
+    // So a deployment installed with the bundle rendered -- which is what
+    // keeps the choice open until the wizard -- and then pointed at the firm's
+    // directory came up with no issuer, and nobody could sign in.
+    let (cluster, done) = watched();
+    let run = first_run(Box::new(cluster), vec![]);
+    let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
+        runtime_database: Some(database(&run)),
+        login_backend: Some(firms_own_directory("")),
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+            // Empty, because this deployment is not using the bundled Zitadel.
+            zitadel_url: String::new(),
+        }),
+    };
+
+    let applied = run.apply(&configuration).await;
+
+    assert!(applied.applied, "{}", applied.refusal_reason);
+    let wrote = done.lock().unwrap().clone();
+    let addresses = wrote
+        .iter()
+        .find(|line| line.starts_with("secret m-addresses "))
+        .expect("the addresses secret was written");
+    assert!(
+        addresses.contains("issuer"),
+        "the dashboard reads its issuer from here: {addresses}"
+    );
+}
+
+#[tokio::test]
+async fn the_groups_claim_is_written_only_when_the_wizard_was_told_one() {
+    // Absent means the dashboard's own default, `groups`, which is what Entra
+    // ID, Okta and Zitadel use. Writing an empty one would override that
+    // default with nothing, and a claim of "" matches no claim at all: every
+    // token would present no groups, the administrators' group would never
+    // match, and nobody would hold deployment admin.
+    for (given, expected) in [("roles", true), ("", false)] {
+        let (cluster, done) = watched();
+        let run = first_run(Box::new(cluster), vec![]);
+        let configuration = FirstRunConfiguration {
+            administrator: Some(administrator("meridian-admins")),
+            runtime_database: Some(database(&run)),
+            login_backend: Some(firms_own_directory(given)),
+            addresses: None,
+        };
+
+        let applied = run.apply(&configuration).await;
+
+        assert!(applied.applied, "{}", applied.refusal_reason);
+        let wrote = done.lock().unwrap().clone();
+        let oidc = wrote
+            .iter()
+            .find(|line| line.starts_with("secret m-dashboard-oidc "))
+            .expect("the dashboard's OIDC secret was written")
+            .clone();
+        assert_eq!(
+            oidc.contains("groups-claim"),
+            expected,
+            "given {given:?}: {oidc}"
+        );
+    }
 }

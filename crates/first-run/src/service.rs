@@ -619,6 +619,16 @@ impl FirstRun {
                         self.key.open(sealed, "oidc.client_secret")?,
                     );
                 }
+                // Absent means the dashboard's own default, `groups`, which is
+                // what Entra ID, Okta and Zitadel use. Written only when the
+                // wizard was told something else, so a firm whose provider
+                // names the claim differently can say so.
+                if !oidc.groups_claim.trim().is_empty() {
+                    values.insert(
+                        "groups-claim".to_string(),
+                        oidc.groups_claim.trim().as_bytes().to_vec(),
+                    );
+                }
                 self.cluster
                     .put_secret(&self.names.dashboard_oidc_secret, &values)
                     .await
@@ -809,6 +819,30 @@ impl FirstRun {
                 ("zitadel-external-port".to_string(), port.into_bytes()),
                 ("zitadel-external-secure".to_string(), secure.into_bytes()),
             ]);
+        }
+
+        // Whoever signs people in, whichever route was chosen. The dashboard
+        // reads one issuer, from this Secret: on the bundled route it is
+        // Zitadel's own address, written just above from the address the
+        // wizard gave it. On the firm's own directory it is theirs, and until
+        // 2026-09-23 it was written only into the dashboard's OIDC Secret,
+        // which the chart reads the client id out of and not the issuer. A
+        // deployment installed with the bundle rendered and then pointed at
+        // the firm's directory therefore came up with no issuer at all, and
+        // nobody could sign in. That is the combination somebody installing
+        // from the runbook hits, because rendering the bundle is what keeps
+        // the choice open until the wizard.
+        if let Some(Backend::Oidc(oidc)) = configuration
+            .login_backend
+            .as_ref()
+            .and_then(|backend| backend.backend.as_ref())
+        {
+            if !oidc.issuer.trim().is_empty() {
+                values.insert(
+                    "issuer".to_string(),
+                    oidc.issuer.trim().trim_end_matches('/').as_bytes().to_vec(),
+                );
+            }
         }
 
         self.cluster

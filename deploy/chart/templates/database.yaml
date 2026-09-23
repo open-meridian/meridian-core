@@ -98,7 +98,16 @@ spec:
   # Zero until the wizard says otherwise. Every other component in this chart
   # waits at a Secret key; this one waits at a replica count, because what it
   # waits for is a choice rather than a credential.
-  replicas: 0
+  #
+  # And zero only on the way in. The wizard's Job scales this to one when
+  # somebody chooses it, so a later `helm upgrade` that rendered zero again
+  # would stop the database underneath a running deployment -- the chart
+  # undoing a choice it asked somebody to make. Reading the live count keeps
+  # it. `lookup` answers nothing when there is no cluster to ask, which is
+  # every `helm template` and every dry run, and zero is the right answer
+  # there because that is what a fresh install gets.
+  {{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
+  replicas: {{ dig "spec" "replicas" 0 (default (dict) $live) }}
   serviceName: {{ $name }}
   selector:
     matchLabels:

@@ -836,7 +836,7 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
              </select></label>\
              {}{}{}{}\
              {}{}{}{}\
-             {}{}{}\
+             {}{}{}{}\
              <h2>Administrators</h2>\
              <p>Who runs this deployment once it is set up. With a directory, \
              name a group: its members hold deployment admin, and adding \
@@ -901,6 +901,7 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             text("oidc_issuer", "Issuer", "https://directory.firm.example"),
             text("oidc_client_id", "Client id", ""),
             secret("oidc_client_secret", "Client secret"),
+            text("oidc_groups_claim", "Groups claim", "groups"),
             text(
                 "admin_group",
                 "Administrators' directory group",

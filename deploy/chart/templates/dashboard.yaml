@@ -117,8 +117,16 @@ spec:
                   name: {{ $oidc }}
                   key: trusted-audiences
                   optional: true
+            # `groups` unless the wizard was told otherwise: right for Entra
+            # ID, Okta and Zitadel, and wrong for a provider that puts them
+            # under another name. It was hardcoded here until 2026-09-23, so
+            # the answer the wizard collected reached nothing.
             - name: MERIDIAN_OIDC_GROUPS_CLAIM
-              value: groups
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oidc }}
+                  key: groups-claim
+                  optional: true
             {{- else }}
             {{- with .Values.dashboard.oidc }}
             {{- if .issuer }}
