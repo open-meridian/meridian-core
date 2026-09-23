@@ -50,7 +50,10 @@ spec:
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
             - name: MERIDIAN_PLATFORM_ADDRESS
-              value: {{ .Values.platform.address | quote }}
+              # Resolved here rather than defaulted in the conductor, so the
+              # rendered manifest says where this deployment talks and an
+              # operator can read it without reading a log.
+              value: {{ .Values.platform.address | default "https://open-meridian.com" | quote }}
             {{- if or .Values.deployment.enrolmentCode .Values.deployment.enrolmentCodeSecret }}
             # W5.24. Spent once, on the key this conductor generated, and then
             # worthless: nobody handles a key and nothing copies one.

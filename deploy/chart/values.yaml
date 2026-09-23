@@ -11,9 +11,17 @@ image:
   pullPolicy: IfNotPresent
 
 platform:
-  # The one address. Not a region, not a list, not a failover order: the
-  # platform is allowed to grow and move without this changing.
-  address: https://open-meridian.com
+  # Where the platform is. Empty is the platform, which is what every
+  # deployment wants and what nobody should have to write down.
+  #
+  # Set it only to reach a different one -- a staging platform while somebody
+  # is testing a change to the platform itself. It is an override in the same
+  # way the deployment identifier and the enrolment code are values: something
+  # an install carries when it has to, and leaves alone when it does not.
+  #
+  # The one address either way. Not a region, not a list, not a failover
+  # order: the platform is allowed to grow and move without this changing.
+  address: ""
 
 deployment:
   # Given to you when you register this deployment on the platform.

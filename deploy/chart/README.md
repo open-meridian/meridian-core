@@ -24,12 +24,18 @@ create:
   rights up afterwards. It tests both database roles before it writes anything
   and names the statement that fixes what it finds.
 
-The database itself is still yours to run: the chart connects to one and never
-provisions one, because a database a chart owns is a database a
-`helm uninstall` can take with it. If you are bringing up a development cluster
-and want one to point at, `deploy/local/postgres.yaml` is a single Postgres on
-a claim -- read the file before applying it, it says what it is and what it is
-not for.
+The wizard asks about the database once, for the whole deployment, and takes
+one of two answers:
+
+- **A database you already run** -- your own Postgres, one in Docker, a
+  managed one from your cloud. It needs two roles: the migrating role may
+  create a table and the serving role must not. Both are tested before
+  anything is written. This is what anything you depend on should use.
+- **One started inside this cluster.** Nothing is asked of you: the chart
+  ships a Postgres at zero replicas, and choosing this starts it and makes
+  the databases, the roles and the grants. For trying the product and for
+  development. It keeps its data if Meridian is removed and installed again,
+  it loses everything if the cluster is deleted, and nobody backs it up.
 
 ## Installing
 
@@ -38,6 +44,11 @@ helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
   --set deployment.id=DEP-... \
   --set deployment.enrolmentCode=ENROL-...
 ```
+
+You do not tell it where the platform is. `platform.address` is empty by
+default and the chart resolves it, so nothing ordinary carries that address
+around. Set it only to reach a different one -- a staging platform, while
+somebody is testing a change to the platform itself.
 
 Every published chart pins the image built from the same commit, so a chart and
 the runtime it runs are one build. Installing from a checkout instead
@@ -89,11 +100,14 @@ It needs four things from you:
    upgrading it.
 2. **Its public host**, `zitadel.zitadel.configmapConfig.ExternalDomain`. The
    dashboard's issuer is `https://` that host.
-3. **Its own database and login role**, which you make. The connection string
-   goes into `meridian-zitadel-database` under `dsn`, and on a fresh install
-   the wizard asks for it and writes it there, so it is not a secret you create
-   by hand either. Zitadel's init job makes only its schema, as that role, so
-   it never holds your Postgres superuser.
+3. **Its own database and login role.** On the route where this deployment
+   starts its own Postgres, these are made for you on that same server --
+   still a database of its own, because Zitadel's schema step is one-way and
+   putting its tables beside the ones holding positions would make a Zitadel
+   upgrade one-way there too. On the route where you point at a database you
+   run, you make them, and the wizard asks for the connection and writes it
+   into `meridian-zitadel-database` under `dsn`. Zitadel's init job makes only
+   its schema, as that role, so it never holds your Postgres superuser.
 4. **Where it may connect**, `identity.bundled.egress.allowCidrs`: its database,
    and your LDAP directory if any. A NetworkPolicy allows those, the group hook
    and DNS, and nothing else -- which is what makes it safe that Zitadel's
