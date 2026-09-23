@@ -259,11 +259,38 @@ That is the install finished.
 | The wizard asks for an enrolment code, not a first-run code | The conductor could not enrol — usually a code already spent or expired | Issue a fresh enrolment code and enter it on that page. Nothing needs reinstalling |
 | The fingerprints differ | Somebody else spent your enrolment code | Revoke that key on the platform, issue a new code, re-enrol. Do not continue |
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there. Codes are refused while it is retired |
-| "already enrolled" when issuing an enrolment code | It holds a key already | You are reinstalling. Register the new key signed in, through the deployment's keys |
+| "already enrolled" when issuing an enrolment code | It holds a key already | If the cluster still has it, register the new key signed in through the deployment's keys. If you deleted the namespace, see **Starting over** below |
+| "this deployment is retired" | It was taken out of service on the platform | Return it to service there |
 | The wizard refuses the bundled directory | The chart did not render it | Add the four `identity.bundled` and `zitadel` values from step 3, `helm upgrade`, and apply again. Your answers are not kept, so have them to hand |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
 | `street`, `instrument` or `migrate` still in error **after** applying | They may not have retried yet | Give them two minutes. If they persist, read the message: a key named there that is still missing means the apply did not write the database Secret |
 | Zitadel never reaches `1/1` | It cannot reach its database | Check `identity.bundled.egress.allowCidrs` covers your cluster's pod and service ranges |
+
+## Starting over
+
+If you delete the namespace to begin again — reasonable while you are learning
+the shape of this — **the deployment's private key goes with it.** It lived
+only in that cluster, which is the point of it: nobody ever handled it, and
+there is no copy anywhere to restore.
+
+The platform still holds the public half, so that deployment now refuses a new
+enrolment code. That refusal is deliberate rather than an oversight: a code
+that still worked after a deployment had enrolled would be a second way to
+register a key for a live deployment, which is the thing worth stealing.
+
+Two ways on, and the first is usually what you want:
+
+1. **Revoke the key, then issue a fresh enrolment code.** On the deployment's
+   page the key is listed with its fingerprint and a Revoke button. Once it
+   holds no key, `Issue enrolment code` works again and you start from step 2
+   with the same identifier. Keeping the identifier matters: it is the subject
+   of every assertion that deployment ever signed.
+2. **Register a new deployment**, and start from step 1. Simplest if you are
+   only experimenting and do not care about the old identifier. Retire the old
+   one so it stops appearing in the list.
+
+Deleting the namespace also removes the database if this deployment brought
+one, along with everything in it. Nothing warns you and nothing backs it up.
 
 ## What to back up
 
