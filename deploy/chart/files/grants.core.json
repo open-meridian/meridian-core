@@ -1,0 +1,36 @@
+{
+  "roles": {
+    "admin": {
+      "publish": [
+        "platform.street.query.list-custodial-positions",
+        "platform.reference.query.resolve-identifier",
+        "platform.reference.query.resolve-instrument",
+        "platform.config.event.person-signed-in",
+        "platform.config.query.access-records",
+        "platform.config.command.redeem-claim-code",
+        "platform.config.command.define-account",
+        "platform.config.command.close-account",
+        "platform.config.command.link-external-account",
+        "platform.config.command.define-user-group",
+        "platform.config.command.define-account-group",
+        "platform.config.command.define-access-group",
+        "platform.config.command.grant-permission",
+        "platform.config.command.withdraw-permission",
+        "platform.config.command.set-plugin-settings",
+        "platform.config.command.send-diagnostic-bundle",
+        "platform.config.query.enrolment",
+        "platform.config.query.first-run-sealing-key",
+        "platform.config.query.check-first-run-answer",
+        "platform.config.command.apply-first-run-configuration"
+      ],
+      "subscribe": [
+        "platform.street.event.*",
+        "platform.reference.event.*",
+        "platform.custody.*.event.sync-status",
+        "platform.deployment.event.plugin-report",
+        "platform.config.event.unlinked-external-accounts"
+      ]
+    }
+  },
+  "_note": "The roles core itself launches, shipped with the chart: the dashboard is a component of the deployment rather than a plugin somebody chose, and a deployment with no plugins still has one. A deployment's own grant table adds the roles its plugins are launched as, and wins where both name a role."
+}

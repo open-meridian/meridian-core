@@ -122,6 +122,8 @@ metadata:
 data:
   topics.tsv: |
 {{ .Files.Get "files/topics.tsv" | indent 4 }}
+  grants.core.json: |
+{{ .Files.Get "files/grants.core.json" | indent 4 }}
 ---
 apiVersion: v1
 kind: Service
@@ -174,8 +176,10 @@ spec:
             - meridian-broker-config
             - --topics
             - /etc/meridian/registry/topics.tsv
+            - --core-grants
+            - /etc/meridian/registry/grants.core.json
             - --grants
-            - /etc/meridian/grants/{{ .Values.grants.key }}
+            - {{ if .Values.grants.existingConfigMap }}/etc/meridian/grants/{{ .Values.grants.key }}{{ else }}/etc/meridian/registry/none.json{{ end }}
             - --instances
             - /etc/meridian/instances/instances.json
             - --out

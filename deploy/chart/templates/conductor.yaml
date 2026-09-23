@@ -65,7 +65,7 @@ spec:
               {{- end }}
             {{- end }}
             - name: MERIDIAN_KEY_PATH
-              value: {{ if .Values.key.generate }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
+              value: {{ if include "meridian-runtime.generatedKey" . }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
             # Optional, and that is what lets first run happen at all: the
@@ -92,7 +92,7 @@ spec:
             - name: config
               mountPath: /etc/meridian
               readOnly: true
-            {{- if .Values.key.generate }}
+            {{- if include "meridian-runtime.generatedKey" . }}
             # The key this component made, in a volume only it mounts. Writable,
             # because the first start is what creates the pair; after that
             # nothing writes here again.
@@ -102,7 +102,7 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
-        {{- if .Values.key.generate }}
+        {{- if include "meridian-runtime.generatedKey" . }}
         - name: key
           persistentVolumeClaim:
             claimName: {{ include "meridian-runtime.fullname" . }}-key

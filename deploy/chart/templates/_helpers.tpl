@@ -30,10 +30,7 @@ the operator the same thing far less clearly.
 {{- fail "deployment.id is not set. Register this replica's public key with the platform; the identifier comes back from that." -}}
 {{- end -}}
 {{- if and (not .Values.key.existingSecret) (not .Values.key.generate) -}}
-{{- fail "neither key.existingSecret nor key.generate is set. Set key.generate=true to have the replica make its own key inside the cluster, and read the public half from the key job's log; or create a secret yourself and name it here." -}}
-{{- end -}}
-{{- if and .Values.key.existingSecret .Values.key.generate -}}
-{{- fail "key.existingSecret and key.generate are both set, and they mean opposite things: one supplies a key, the other makes one. Pick." -}}
+{{- fail "key.generate is off and key.existingSecret names nothing, so this deployment has no way to get a key. Leave key.generate on to have the conductor make its own inside the cluster, or name a secret holding one." -}}
 {{- end -}}
 
 {{- end -}}
@@ -64,6 +61,21 @@ learns the database (spec/installation-and-first-run, requirement 6).
 {{- .Values.database.key -}}
 {{- else -}}
 migrate-url
+{{- end -}}
+{{- end -}}
+
+{{- define "meridian-runtime.generatedKey" -}}
+{{- /*
+  Whether this deployment makes its own key.
+
+  Generating is the default, because it is how an install gets a key with
+  nobody handling one. A named secret wins: an administrator who has a key
+  already is not asking for a second, and the two are not a contradiction to
+  refuse but a preference to honour.
+*/ -}}
+{{- if .Values.key.existingSecret -}}
+{{- else -}}
+{{- .Values.key.generate -}}
 {{- end -}}
 {{- end -}}
 

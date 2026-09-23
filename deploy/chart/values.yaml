@@ -63,7 +63,11 @@ key:
   #
   # Never written into Helm's release history: the job writes it to a volume,
   # and nothing reads it back out.
-  generate: false
+  # On by default, because it is how a deployment gets a key without anybody
+  # handling one: the conductor makes its own and enrols the public half with
+  # the code the install carried (W5.24). An administrator with a key already
+  # names it in existingSecret instead, and then this must be off.
+  generate: true
   storage:
     size: 64Mi
     # Empty uses the cluster's default. Name one if your default is not

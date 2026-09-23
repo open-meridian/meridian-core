@@ -148,7 +148,7 @@ test-store: network
 	@echo "test-store OK: the three stores pass against Postgres, and the migration grants the serving role what it made"
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
-CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set database.existingSecret=d --set broker.existingSecret=b
+CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set key.generate=false --set database.existingSecret=d --set broker.existingSecret=b
 PLUGIN_VALUES := --set 'sidecars[0].instanceId=custody-1' --set 'sidecars[0].role=custody' --set grants.existingConfigMap=g \
 	--set 'sidecars[0].plugin.image=example/plugin:1' --set 'sidecars[0].plugin.existingSecret=vendor'
 
@@ -209,7 +209,9 @@ chart-check:
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
-	@for missing in deployment.id key.existingSecret; do \
+	@$(HELM) template check deploy/chart --set deployment.id=D --set key.generate=false >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: a deployment with no key and no way to make one rendered anyway" >&2; exit 1; }; true
+	@for missing in deployment.id; do \
 		if $(HELM) template check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
 		fi; \
@@ -235,13 +237,14 @@ chart-check:
 		--set key.generate=true --set database.existingSecret=d --set broker.existingSecret=b 2>/dev/null \
 		| grep -q "PersistentVolumeClaim" \
 		|| { echo "chart-check FAILED: key.generate renders no volume for the key" >&2; exit 1; }
-	@if $(HELM) template check deploy/chart $(CHART_VALUES) --set key.generate=true >/dev/null 2>&1; then \
-		echo "chart-check FAILED: a supplied key and a generated one are both accepted" >&2; \
-		echo "  they mean opposite things, so accepting both hides which one is in use" >&2; exit 1; \
+	@if $(HELM) template check deploy/chart $(CHART_VALUES) --set key.generate=true 2>/dev/null | grep -q "PersistentVolumeClaim"; then \
+		echo "chart-check FAILED: a deployment that was given a key made a second one anyway" >&2; \
+		echo "  generating is the default, and a named secret is what an administrator chose" >&2; exit 1; \
 	fi
-	@if $(HELM) template check deploy/chart --set deployment.id=DEP-check \
+	@if ! $(HELM) template check deploy/chart --set deployment.id=DEP-check \
 		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
-		echo "chart-check FAILED: the chart rendered with neither a key nor key.generate" >&2; exit 1; \
+		echo "chart-check FAILED: an install that named only its deployment did not render" >&2; \
+		echo "  a first install supplies what the platform gave it and nothing else" >&2; exit 1; \
 	fi
 	@for component in street instrument conductor; do \
 		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \

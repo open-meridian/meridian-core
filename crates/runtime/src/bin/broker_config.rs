@@ -30,6 +30,7 @@ fn run() -> Result<(), String> {
     let mut grants = "deploy/grants.example.json".to_string();
     let mut instances = "deploy/instances.example.json".to_string();
     let mut topics = "deploy/topics.tsv".to_string();
+    let mut core_grants = String::new();
     let mut out = String::new();
     let mut dev_users = String::new();
 
@@ -47,6 +48,10 @@ fn run() -> Result<(), String> {
             // Development identities, merged only when asked for. What they
             // produce is not what a chart ships.
             "--dev-users" => dev_users = value()?,
+            // The roles core launches itself, which ship with the chart: a
+            // deployment with no plugins still runs a dashboard, and its role
+            // is not one an administrator should have to write down.
+            "--core-grants" => core_grants = value()?,
             other => return Err(format!("{other} is not an argument this takes")),
         }
     }
@@ -60,11 +65,27 @@ fn run() -> Result<(), String> {
     // A deployment with no grant table admits no plugin, which is the right
     // default for a file that decides access: the broker still serves the
     // components, and a plugin that connects is refused every topic.
-    let grants: serde_json::Value = match std::fs::read_to_string(&grants) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|failed| format!("the grant table is not JSON: {failed}"))?,
-        Err(_) => serde_json::json!({"roles": {}}),
+    let read_grants = |path: &str| -> Result<serde_json::Value, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|failed| format!("{path} is not JSON: {failed}")),
+            // A deployment with no grant table admits no plugin, which is the
+            // right default for a file that decides access.
+            Err(_) => Ok(serde_json::json!({"roles": {}})),
+        }
     };
+    let mut grants = read_grants(&grants)?;
+    if !core_grants.is_empty() {
+        let core = read_grants(&core_grants)?;
+        let roles = grants["roles"].as_object().cloned().unwrap_or_default();
+        let mut merged = core["roles"].as_object().cloned().unwrap_or_default();
+        // The deployment's own table wins: a role named in both is the
+        // administrator's to decide.
+        for (name, table) in roles {
+            merged.insert(name, table);
+        }
+        grants = serde_json::json!({ "roles": merged });
+    }
     let instances: serde_json::Value = match std::fs::read_to_string(&instances) {
         Ok(text) => serde_json::from_str(&text)
             .map_err(|failed| format!("the instance list is not JSON: {failed}"))?,
