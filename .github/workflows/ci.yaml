@@ -67,3 +67,17 @@ jobs:
         # only place a version is chosen.
         env:
           DOCKER_BUILDKIT: "1"
+
+      # What the services said, kept only when something failed. The e2e
+      # targets write these beside the checkout and the runner names them on
+      # failure, which is no help at all once the runner is gone: a red run on
+      # 2026-09-23 had to be diagnosed from the assertion output alone because
+      # the one file explaining it was discarded with the machine.
+      - name: Keep what the e2e services said
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: workspace/meridian-core/.e2e-*.log
+          if-no-files-found: ignore
+          retention-days: 14

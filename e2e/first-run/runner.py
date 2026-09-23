@@ -204,10 +204,25 @@ def main():
         # What the platform was asked and answered says which side lost what,
         # so it is printed here rather than guessed at from a bare failure.
         s.note(f"redemptions: {[c for c in json_at(f'{PLATFORM}/e2e/calls')['calls'] if c['path'].endswith('/redeem')]}")
+        # The status and the size, because the page alone cannot tell a refusal
+        # from an empty body: this failed in CI on 2026-09-23 with the stripped
+        # page printing as blank, and which of those it was decided where to
+        # look. Without them the note says only that something went wrong.
+        s.note(f"apply answered {status}, body {len(page)} bytes")
+        # Every refusal path in `apply` re-renders this form with the reason as
+        # a list item, so this is where it says why it stopped. The note printed
+        # the head of the page instead until 2026-09-23, which is the title and
+        # the stylesheet: a red run had to be diagnosed without ever seeing the
+        # refusal it was reporting.
+        s.note(f"findings: {re.findall(r'<li>([^<]*)</li>', page)}")
         s.note(f"page: {re.sub(r'<[^>]*>', ' ', page)[:300]}")
     s.check("administers this deployment" in page,
             "the applied page names who administers it")
-    s.check(ANSWERS["admin_login"] in page,
+    # Against the text rather than the markup. The form carries this login in
+    # an input's `value`, so a raw match passed on the very page that means
+    # applying was refused -- it agreed with the check above it that the apply
+    # had failed, and still said ok.
+    s.check(ANSWERS["admin_login"] in re.sub(r"<[^>]*>", " ", page),
             "and names the account the wizard created, with nothing to redeem")
     s.check(FIRST_ADMIN_CODE not in page,
             "no code is shown: there is nothing left to claim")
