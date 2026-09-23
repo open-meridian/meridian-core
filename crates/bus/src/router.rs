@@ -55,6 +55,17 @@ impl Bus {
         self
     }
 
+    /// How long a question waits when its asker states no bound of its own.
+    ///
+    /// Five seconds by default, which suits a question answered from memory
+    /// and suits nothing else. A caller with slower work to wait on passes
+    /// its own bound to `call`; this exists so that a test can shorten the
+    /// default and prove the caller's bound is the one being used.
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = timeout;
+        self
+    }
+
     fn backend_for(&self, topic: &str) -> &Arc<dyn Backend> {
         for rule in &self.rules {
             if topic::matches(&rule.pattern, topic) {

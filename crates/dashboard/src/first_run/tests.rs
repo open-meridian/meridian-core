@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::header::{COOKIE, LOCATION, SET_COOKIE};
@@ -33,7 +34,31 @@ impl Clock for At {
 
 /// A conductor that answers the two things the wizard asks it.
 fn app(first_run: bool, state: EnrolmentState, redemption: RedeemClaimCodeReply) -> Arc<App> {
-    let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
+    // A Job that answers at once, on a bus with its ordinary default.
+    app_with(
+        first_run,
+        state,
+        redemption,
+        Duration::ZERO,
+        DEFAULT_TIMEOUT,
+    )
+}
+
+/// The bus's own default, restated here so a test can be shorter than it and
+/// mean something by that.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn app_with(
+    first_run: bool,
+    state: EnrolmentState,
+    redemption: RedeemClaimCodeReply,
+    applying: Duration,
+    default_timeout: Duration,
+) -> Arc<App> {
+    let bus = Arc::new(
+        Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))
+            .with_default_timeout(default_timeout),
+    );
     bus.serve(ENROLMENT_STATE, move |_| {
         Ok((
             "meridian.v1.EnrolmentState".to_string(),
@@ -106,6 +131,9 @@ fn app(first_run: bool, state: EnrolmentState, redemption: RedeemClaimCodeReply)
         ))
     });
     bus.serve(APPLY, move |_| {
+        // A Job in a cluster writes Secrets, patches a policy, scales and
+        // restarts before it answers. Here that is a sleep.
+        std::thread::sleep(applying);
         Ok((
             "meridian.v1.FirstRunApplied".to_string(),
             meridian_domain::v1::FirstRunApplied {
@@ -413,6 +441,42 @@ async fn redeemed(app: &Arc<App>) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+#[tokio::test]
+async fn applying_waits_for_a_job_slower_than_a_question_from_memory() {
+    // The bug this pins reached the end-to-end test as an intermittent
+    // failure and was recorded there as a flake for a day. The dashboard
+    // asked the Job to apply and waited the bus default of five seconds.
+    // Applying writes three Secrets, patches a NetworkPolicy, scales the
+    // bundled directory, restarts two Deployments and deletes a RoleBinding;
+    // when that took longer, the Job finished the work and the dashboard
+    // stopped listening. The deployment was configured, the wizard said the
+    // Job had not answered, and the first administrator's code was never
+    // shown -- and the platform keeps only its hash, so it was gone.
+    //
+    // The bus here gives up in 20ms unless a caller states its own bound, and
+    // the Job takes 150ms. Only the caller's bound makes this pass.
+    let app = app_with(
+        true,
+        enrolled(),
+        RedeemClaimCodeReply {
+            redeemed: true,
+            first_admin_code: "7KQ2-MX4P-9RTD".into(),
+            ..Default::default()
+        },
+        Duration::from_millis(150),
+        Duration::from_millis(20),
+    );
+    let cookie = redeemed(&app).await;
+
+    let (status, body) = post(app, "/first-run/apply", &cookie, ANSWERS).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("7KQ2-MX4P-9RTD"),
+        "a Job slower than the default still shows the code: {body}"
+    );
 }
 
 fn wizard_app() -> Arc<App> {

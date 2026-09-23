@@ -172,10 +172,17 @@ def main():
     print("F: applied", flush=True)
     status, page = browser.post(f"{DASHBOARD}/first-run/apply", ANSWERS)
     if FIRST_ADMIN_CODE not in page:
-        # Seen once on 2026-09-23 and not reproduced: the page came back
-        # without the code the platform had returned. What the platform was
-        # asked and answered says which side lost it, so it is printed here
-        # rather than left to be guessed at from a bare failure.
+        # This failed intermittently on 2026-09-23 and was written up here as
+        # something seen once and not reproduced. It was not a flake: the
+        # dashboard waited the bus default of five seconds for a Job that
+        # writes Secrets, patches a policy, scales and restarts, so when the
+        # Job took longer the deployment was configured and the wizard said it
+        # had not been -- losing the code, of which the platform keeps only a
+        # hash. Fixed by giving applying its own bound, and pinned by
+        # `applying_waits_for_a_job_slower_than_a_question_from_memory`.
+        #
+        # The diagnostic stays. If this ever fails again, what the platform was
+        # asked and answered says which side lost the code.
         s.note(f"redemptions: {[c for c in json_at(f'{PLATFORM}/e2e/calls')['calls'] if c['path'].endswith('/redeem')]}")
         s.note(f"page: {re.sub(r'<[^>]*>', ' ', page)[:300]}")
     s.check(FIRST_ADMIN_CODE in page, "the first administrator's code is shown once")

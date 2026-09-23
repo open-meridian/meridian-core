@@ -42,6 +42,7 @@ use meridian_domain::v1::{
 };
 use prost::Message;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::html::{escape, page};
 use crate::session::{token, ABSOLUTE_NS};
@@ -367,6 +368,7 @@ async fn check(
         CHECK_ANSWER,
         "meridian.v1.FirstRunCheckRequest",
         request.encode_to_vec(),
+        TESTING,
     )
     .await
     {
@@ -409,6 +411,7 @@ async fn apply(
         APPLY,
         "meridian.v1.FirstRunConfiguration",
         configuration.encode_to_vec(),
+        APPLYING,
     )
     .await
     {
@@ -455,17 +458,44 @@ async fn closed(app: &Arc<App>, refusal: &str) -> Response {
 }
 
 /// One request to the first-run Job.
+/// How long the Job is given, per question, and why it is not the bus default.
+///
+/// The default is five seconds, which is right for a question a component
+/// answers from memory and wrong for every question on this page. Applying
+/// writes three Secrets, patches a NetworkPolicy, scales the bundled
+/// directory, restarts two Deployments and deletes a RoleBinding: half a
+/// dozen round trips to a cluster's API server. Testing opens a database
+/// connection, and sometimes an LDAP one, over a network somebody has just
+/// described for the first time.
+///
+/// Getting this wrong is not a slow page. The Job finishes the work and the
+/// dashboard stops listening, so the deployment is configured, the wizard
+/// says the Job did not answer, and the first administrator's code -- of
+/// which the platform keeps only a hash -- is never shown. That happened,
+/// intermittently, and was recorded in the end-to-end test as a flake for a
+/// day before it was read properly.
+const APPLYING: Duration = Duration::from_secs(120);
+const TESTING: Duration = Duration::from_secs(60);
+
 async fn ask(
     app: &Arc<App>,
     topic: &str,
     payload_type: &str,
     payload: Vec<u8>,
+    patience: Duration,
 ) -> Result<Vec<u8>, String> {
     app.bus
-        .call(topic, payload_type, payload, None, None)
+        .call(topic, payload_type, payload, None, Some(patience))
         .await
         .map(|(_, payload)| payload)
-        .map_err(|failed| format!("the first-run job did not answer: {failed}"))
+        .map_err(|failed| {
+            format!(
+                "the first-run job did not answer within {}s: {failed}. \
+                 It may have finished anyway -- every step it takes is \
+                 idempotent, so applying again completes whatever it did not.",
+                patience.as_secs()
+            )
+        })
 }
 
 /// What the wizard shows once everything is applied.
@@ -536,6 +566,8 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
         SEALING_KEY,
         "meridian.v1.FirstRunSealingKeyRequest",
         FirstRunSealingKeyRequest {}.encode_to_vec(),
+        // Answered from memory: the Job made this key when it started.
+        TESTING,
     )
     .await?;
     let key = FirstRunSealingKey::decode(&key[..])
