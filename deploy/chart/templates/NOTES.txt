@@ -7,9 +7,21 @@ It does not stop working when that address does. If the platform is unreachable,
 resolution continues from what is already held, and pulling resumes on its own
 when the platform returns. Nothing here needs restarting for that.
 
-Watch it:
+{{ if .Values.dashboard.enabled }}Set it up. It has no database and no directory yet, and the components that
+need them are waiting rather than failing. Everything they wait for is
+answered in the wizard:
 
-  kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} -f
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "meridian-runtime.fullname" . }}-dashboard 8443:80
 
-If it refuses to start, the message says which value is wrong. The three that
-matter are the deployment identifier, the key secret and the database secret.
+then open http://127.0.0.1:8443/first-run. It asks for a first-run code,
+which a deployment administrator issues on the platform. A forward rather
+than an address of its own: a deployment that has not been set up should not
+be reachable from anywhere but here.
+
+{{ end }}Watch it:
+
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+A component showing CreateContainerConfigError before first run is waiting
+for a Secret key the wizard writes, not failing. If the release itself
+refuses to render, the message names the value that is wrong.
