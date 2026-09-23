@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
-        e2e-first-run-brought e2e-cluster e2e-cluster-external \
+        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -31,7 +31,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -172,6 +172,13 @@ E2E_FIRST_RUN = $(COMPOSE) --profile first-run
 E2E_DB_ROUTE ?= external
 E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brought and made itself,)
 
+# And which directory signs people in. `bundled` is the Zitadel this chart
+# runs; `oidc` is the firm's own, with the bundle rendered and switched off,
+# which is the combination somebody keeping the choice open until the wizard
+# ends up in.
+E2E_BACKEND ?= bundled
+E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through the firm's own directory,)
+
 e2e-first-run: network
 	@rm -f .e2e-first-run.log
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
@@ -204,12 +211,20 @@ e2e-first-run: network
 		echo "  the roles are real: brought_app may not create tables, brought_migrate may, and zitadel has its own database"; \
 	fi
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1
-	@echo "e2e-first-run OK: an install given nothing, made to serve$(E2E_ROUTE_SAID)"
+	@echo "e2e-first-run OK: an install given nothing, made to serve$(E2E_ROUTE_SAID)$(E2E_BACKEND_SAID)"
 
 # The same run, taking the other route. Its own target rather than a loop, so
 # a failure says which route failed without anybody reading a log.
 e2e-first-run-brought:
 	@$(MAKE) --no-print-directory e2e-first-run E2E_DB_ROUTE=brought
+
+# And the same run again, through the firm's own directory rather than the
+# bundled one. Its own target for the same reason, and it exists at all
+# because three defects sat in that route undisturbed until 2026-09-23: the
+# issuer written where the chart does not read it, the groups claim collected
+# and dropped, and the bundle left on. Every other test here chose the bundle.
+e2e-first-run-oidc:
+	@$(MAKE) --no-print-directory e2e-first-run E2E_BACKEND=oidc
 
 # Path 1 of the five: a real cluster, a real platform, and nobody in it.
 #
