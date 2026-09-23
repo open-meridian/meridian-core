@@ -36,6 +36,12 @@ const SEALING_KEY: &str = "platform.config.query.first-run-sealing-key";
 const CHECK: &str = "platform.config.query.check-first-run-answer";
 const APPLY: &str = "platform.config.command.apply-first-run-configuration";
 
+/// How long to wait for the answer to reach the broker before giving up and
+/// exiting anyway. Generous, because the work is already done by this point
+/// and the only thing left is a write; bounded, because a Job that does not
+/// exit is a first run that does not finish.
+const ANSWER_ON_THE_WIRE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -123,27 +129,37 @@ fn run() -> Result<(), String> {
             // Applying is the one thing here that changes anything, and the
             // one thing that ends this Job: it replies, then stops serving.
             let (done, mut finished) = tokio::sync::mpsc::channel::<FirstRunApplied>(1);
+            // Signalled when the answer is on the wire, which is not the same
+            // moment as the handler returning: the handler composes the reply
+            // and the bus sends it afterwards. Exiting on the first lost the
+            // reply often enough to be seen under load, and the wizard then
+            // reported a timeout for a first run that had entirely succeeded.
+            let delivered = Arc::new(tokio::sync::Notify::new());
             let applying = Arc::clone(&first_run);
-            bus.serve(APPLY, move |envelope| {
-                expect(&envelope.payload_type, "meridian.v1.FirstRunConfiguration")?;
-                let configuration = FirstRunConfiguration::decode(&envelope.payload[..])
-                    .map_err(|failed| format!("undecodable configuration: {failed}"))?;
+            bus.serve_delivered(
+                APPLY,
+                move |envelope| {
+                    expect(&envelope.payload_type, "meridian.v1.FirstRunConfiguration")?;
+                    let configuration = FirstRunConfiguration::decode(&envelope.payload[..])
+                        .map_err(|failed| format!("undecodable configuration: {failed}"))?;
 
-                let applying = Arc::clone(&applying);
-                let done = done.clone();
-                let applied = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async move { applying.apply(&configuration).await })
-                });
+                    let applying = Arc::clone(&applying);
+                    let done = done.clone();
+                    let applied = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(async move { applying.apply(&configuration).await })
+                    });
 
-                if applied.applied {
-                    let _ = done.try_send(applied.clone());
-                }
-                Ok((
-                    "meridian.v1.FirstRunApplied".to_string(),
-                    applied.encode_to_vec(),
-                ))
-            });
+                    if applied.applied {
+                        let _ = done.try_send(applied.clone());
+                    }
+                    Ok((
+                        "meridian.v1.FirstRunApplied".to_string(),
+                        applied.encode_to_vec(),
+                    ))
+                },
+                Arc::clone(&delivered),
+            );
 
             tracing::info!(instance_id, "first run is waiting for its wizard");
 
@@ -151,6 +167,20 @@ fn run() -> Result<(), String> {
                 applied = finished.recv() => {
                     if let Some(applied) = applied {
                         tracing::info!(steps = ?applied.steps, "the configuration is applied");
+                    }
+                    // Bounded, because a Job that never exits is a first run
+                    // that never finishes. Reaching the bound means the answer
+                    // did not make it, and the wizard is about to say so, so
+                    // it is worth one line saying the work was done anyway.
+                    if tokio::time::timeout(ANSWER_ON_THE_WIRE, delivered.notified())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "the answer was not confirmed sent within {}s; the wizard will \
+                             report a timeout for work that is already applied",
+                            ANSWER_ON_THE_WIRE.as_secs()
+                        );
                     }
                 }
                 () = shutdown() => tracing::info!("stopping before the configuration was applied"),

@@ -30,6 +30,7 @@ use std::time::Duration;
 use meridian_pb::v1::Envelope;
 use prost::Message as _;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::backend::{Answer, Backend, BusError, Delivery, Handler, Subscription};
 use crate::topic;
@@ -271,6 +272,21 @@ impl Backend for NatsBackend {
 
     /// Offer a local handler's answer to callers in other processes.
     fn serve(&self, topic: &str, handler: Handler) {
+        self.offer(topic, handler, None);
+    }
+
+    /// The same, signalling once each answer is on the wire.
+    fn serve_delivered(&self, topic: &str, handler: Handler, delivered: Arc<Notify>) {
+        self.offer(topic, handler, Some(delivered));
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl NatsBackend {
+    fn offer(&self, topic: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
         let client = self.client.clone();
         let subject = topic.to_string();
 
@@ -301,6 +317,7 @@ impl Backend for NatsBackend {
                 let handler = Arc::clone(&handler);
                 let client = client.clone();
                 let topic = subject.clone();
+                let delivered = delivered.clone();
 
                 // Each request on its own task, so one slow handler does not
                 // hold up the next, and on a blocking pool, because a handler
@@ -343,13 +360,28 @@ impl Backend for NatsBackend {
                         // The caller will time out, which is the honest
                         // outcome: we have no way to tell them from here.
                         tracing::warn!(topic, %failed, "an answer did not reach the broker");
+                        return;
+                    }
+
+                    // Queued is not sent. `publish` returns once the answer is
+                    // in this client's write buffer, and a process that exits
+                    // promptly afterwards takes the buffer with it. A
+                    // long-lived component never notices, because the client
+                    // drains in the background; a one-shot Job that replies
+                    // and stops does, and its caller then waits out the whole
+                    // timeout for an answer that was never written. Seen under
+                    // load on 2026-09-23, reported to the operator as a first
+                    // run that failed after it had entirely succeeded.
+                    if let Err(failed) = client.flush().await {
+                        tracing::warn!(topic, %failed, "an answer was not flushed to the broker");
+                        return;
+                    }
+
+                    if let Some(delivered) = delivered {
+                        delivered.notify_one();
                     }
                 });
             }
         });
-    }
-
-    fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
     }
 }

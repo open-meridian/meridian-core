@@ -518,3 +518,43 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
         "a component published a topic the registry says a plugin publishes"
     );
 }
+
+#[tokio::test]
+async fn an_answer_is_announced_only_once_it_has_reached_the_broker() {
+    // For a component that replies and then stops. Returning from a handler
+    // says the answer was composed, not that it was sent: `publish` puts it in
+    // this client's write buffer and a process that exits promptly takes the
+    // buffer with it. A first run did exactly that on 2026-09-23 -- every
+    // Secret written, its own rights given up, and the wizard told the job had
+    // not answered in 120 seconds.
+    //
+    // So the signal has to come from after the send, not from the handler.
+    let serving = backend().await;
+    let asking = backend().await;
+    let subject = topic("delivered");
+
+    let delivered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let handler: meridian_bus::Handler =
+        std::sync::Arc::new(|_| Ok(("meridian.v1.Answer".to_string(), b"answered".to_vec())));
+    serving.serve_delivered(&subject, handler, std::sync::Arc::clone(&delivered));
+    settle().await;
+
+    // Nothing has been asked, so nothing can have been delivered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), delivered.notified())
+            .await
+            .is_err(),
+        "an answer was announced before anybody asked for one"
+    );
+
+    let answer = asking
+        .request(&subject, envelope("ask"), Duration::from_secs(5))
+        .await
+        .expect("the handler answered");
+    assert_eq!(answer.payload, b"answered");
+
+    // And now it has, because the caller above holds it.
+    tokio::time::timeout(Duration::from_secs(5), delivered.notified())
+        .await
+        .expect("the answer reached the broker but was never announced");
+}

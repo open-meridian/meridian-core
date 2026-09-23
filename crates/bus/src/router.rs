@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use meridian_pb::v1::{Envelope, MessageMeta};
+use tokio::sync::Notify;
 
 use crate::backend::{Backend, BusError, Subscription};
 use crate::topic;
@@ -137,6 +138,27 @@ impl Bus {
         // offer it. The in-process backend does nothing here, because the map
         // above is already the answer.
         self.backend_for(topic).serve(topic, handler);
+    }
+
+    /// Register a handler, and signal once each answer has been delivered.
+    ///
+    /// For the one component that replies and then stops: first run applies a
+    /// configuration, answers the wizard and ends. Exiting when the handler
+    /// returns lost the answer often enough to be seen once under load, and
+    /// the wizard then reported a timeout for work that had completed --
+    /// every Secret written and the Job's own rights given up.
+    pub fn serve_delivered<F>(&self, topic: &str, handler: F, delivered: Arc<Notify>)
+    where
+        F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
+    {
+        let handler: Handler = Arc::new(handler);
+        self.handlers
+            .write()
+            .expect("handler lock poisoned")
+            .insert(topic.to_string(), Arc::clone(&handler));
+
+        self.backend_for(topic)
+            .serve_delivered(topic, handler, delivered);
     }
 
     /// Ask a question and wait for the answer, bounded in time.

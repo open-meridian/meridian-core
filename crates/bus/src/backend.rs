@@ -1,9 +1,10 @@
 //! What a bus backend has to provide.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_pb::v1::Envelope;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -121,6 +122,21 @@ pub trait Backend: Send + Sync {
     /// Defaulted to nothing, because an in-process backend has nowhere else to
     /// offer it to: the router already holds the handler and answers locally.
     fn serve(&self, _topic: &str, _handler: Handler) {}
+
+    /// The same, and signal once an answer has actually reached the broker.
+    ///
+    /// For a component that replies and then stops. Returning from a handler
+    /// says the answer was composed, not that it was sent, and a process that
+    /// exits on the strength of the first takes the answer with it.
+    ///
+    /// Defaulted to permitting immediately, because a backend with no wire
+    /// cannot hold an answer in flight: the router answered from its own map
+    /// before this was ever reached, so there is nothing left to wait for and
+    /// a caller that waited would wait forever.
+    fn serve_delivered(&self, topic: &str, handler: Handler, delivered: Arc<Notify>) {
+        self.serve(topic, handler);
+        delivered.notify_one();
+    }
 
     /// Messages dropped because a subscriber's queue was full.
     ///
