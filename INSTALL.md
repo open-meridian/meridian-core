@@ -57,9 +57,15 @@ do not have to get the grants exactly right here.
 
 **How people sign in.** Either the firm's own OpenID Connect provider, or a
 Zitadel the chart runs beside the deployment for firms that have no directory
-or whose directory speaks only LDAP or SAML. **This one is decided at install
-time**, in step 3, because choosing the bundled directory in the wizard when
-the chart did not render one fails late, at the step that writes.
+or whose directory speaks only LDAP or SAML.
+
+You can keep this choice open until the wizard, and the easiest thing is to
+do so: install with the bundled Zitadel rendered, in step 3, and then answer
+either way. Choosing the firm's own provider leaves the bundle switched off
+and costs nothing. What you cannot do is the reverse — install without it and
+then choose it, which the wizard refuses, because Helm either rendered those
+resources or it did not. The price of keeping the choice open is naming a
+Zitadel version you might never use.
 
 ## 1. Register the deployment
 
@@ -95,18 +101,11 @@ Make a namespace and install. Substitute your identifier and your code:
 kubectl create namespace meridian
 ```
 
-With the firm's own OpenID Connect provider:
-
-```bash
-helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
-  --namespace meridian \
-  --set deployment.id=DEP-XXXX-XXXX \
-  --set deployment.enrolmentCode=ENR-XXXX-XXXX-XXXX
-```
-
-With a Zitadel beside the deployment, add four more. The chart has no default
+**Unless you are certain you will use the firm's own provider**, install with
+the bundled Zitadel rendered and decide in the wizard. The chart has no default
 Zitadel version and never picks one, so that an upgrade needing a newer Zitadel
-refuses and names it rather than upgrading it underneath you:
+refuses and names it rather than moving it underneath you — which is why you
+name one here even if you end up not using it:
 
 ```bash
 helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
@@ -126,6 +125,9 @@ uses. On a managed cluster, use that cluster's ranges — your provider's consol
 calls them the pod and service CIDRs — and add your directory's range if it is
 elsewhere. The chart refuses to render without this rather than installing
 something that can reach nothing.
+
+If you are certain the firm's own provider is what you will use, leave all four
+off and install with the first three values alone.
 
 You do not tell it where the platform is. Leave `platform.address` alone unless
 somebody has asked you to test against a staging platform.
@@ -237,7 +239,7 @@ That is the install finished.
 | The fingerprints differ | Somebody else spent your enrolment code | Revoke that key on the platform, issue a new code, re-enrol. Do not continue |
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there. Codes are refused while it is retired |
 | "already enrolled" when issuing an enrolment code | It holds a key already | You are reinstalling. Register the new key signed in, through the deployment's keys |
-| Apply fails at the step that writes Zitadel's Secrets | The wizard's backend and the install disagree | The chart renders those only when `identity.bundled.enabled=true`. Set it, `helm upgrade`, and apply again |
+| The wizard refuses the bundled directory | The chart did not render it | Add the four `identity.bundled` and `zitadel` values from step 3, `helm upgrade`, and apply again. Your answers are not kept, so have them to hand |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
 | Zitadel never reaches `1/1` | It cannot reach its database | Check `identity.bundled.egress.allowCidrs` covers your cluster's pod and service ranges |
 
