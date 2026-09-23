@@ -6,6 +6,10 @@ cluster. On a laptop or at a provider; the chart does not care which.
 If you do not have a cluster, use the compose file in the repository root
 instead. It runs the same image.
 
+This is reference, organised by topic. To install one for the first time,
+follow [INSTALL.md](../../INSTALL.md) instead: same ground, in the order you
+do it.
+
 ## Before installing
 
 Two things, both from the platform: **this deployment's identifier** and a

@@ -31,7 +31,9 @@ commit, and carries all four binaries.
 
 ## Bringing one up
 
-On a cluster, use the chart: [deploy/chart/README.md](deploy/chart/README.md).
+On a cluster, follow [INSTALL.md](INSTALL.md), which walks the whole path
+from registering the deployment to signing in. [deploy/chart/README.md](deploy/chart/README.md)
+is the reference for what each value does.
 Locally, `docker compose up` runs every component with a database and a broker
 alongside, and `make demo` proves the round trip against a platform -- resolve,
 miss, pull, apply, then take the platform away and watch resolution keep
