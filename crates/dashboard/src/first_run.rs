@@ -34,11 +34,11 @@ use meridian_domain::v1::login_backend_answer::Backend;
 use meridian_domain::v1::zitadel_database_answer::Route;
 use meridian_domain::v1::{
     administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BundledZitadelAnswer,
-    ClaimCodePurpose, DatabaseLogin, EnrolmentState, EnrolmentStateRequest, FirstRunApplied,
-    FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration, FirstRunSealingKey,
-    FirstRunSealingKeyRequest, LdapDirectoryAnswer, LocalAccountAnswer, LoginBackendAnswer,
-    OidcProviderAnswer, RedeemClaimCodeReply, RedeemClaimCodeRequest, RuntimeDatabaseAnswer,
-    SealedCredential, ZitadelDatabaseAnswer,
+    ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState, EnrolmentStateRequest,
+    FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration,
+    FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer, LocalAccountAnswer,
+    LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply, RedeemClaimCodeRequest,
+    RuntimeDatabaseAnswer, SealedCredential, ZitadelDatabaseAnswer,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -49,6 +49,7 @@ use crate::web::{cookie, set_cookie, App};
 
 pub const ENROLMENT_STATE: &str = "platform.config.query.enrolment";
 pub const REDEEM_CLAIM_CODE: &str = "platform.config.command.redeem-claim-code";
+pub const ENROL_WITH_CODE: &str = "platform.config.command.enrol-with-code";
 pub const SEALING_KEY: &str = "platform.config.query.first-run-sealing-key";
 pub const CHECK_ANSWER: &str = "platform.config.query.check-first-run-answer";
 pub const APPLY: &str = "platform.config.command.apply-first-run-configuration";
@@ -114,6 +115,7 @@ impl WizardSession {
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/first-run", get(first_page))
+        .route("/first-run/enrol", post(enrol))
         .route("/first-run/claim", post(claim))
         .route("/first-run/check", post(check))
         .route("/first-run/apply", post(apply))
@@ -134,6 +136,60 @@ async fn first_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     match held {
         None => Html(closed_page(&enrolment, "")).into_response(),
         Some(_) => Html(open_page(&Fields::new(), &[], "")).into_response(),
+    }
+}
+
+/// W7.2. Hand the conductor an enrolment code somebody entered.
+///
+/// The one first-run endpoint that answers before a claim code is redeemed,
+/// and it must be: a deployment that never enrolled cannot redeem a claim
+/// code at all, because redemption is a signed call and it has no key to sign
+/// with. Requirement 9 promised this page would take a new code; until this
+/// existed it told the reader to supply one and offered nowhere to put it.
+async fn enrol(
+    State(app): State<Arc<App>>,
+    Form(fields): Form<HashMap<String, String>>,
+) -> Response {
+    if !app.first_run {
+        return not_here();
+    }
+
+    let code = fields.get("code").map(String::as_str).unwrap_or_default();
+    let request = EnrolWithCodeRequest {
+        code: code.trim().to_string(),
+    };
+
+    let answered = app
+        .bus
+        .call(
+            ENROL_WITH_CODE,
+            "meridian.v1.EnrolWithCodeRequest",
+            request.encode_to_vec(),
+            None,
+            None,
+        )
+        .await;
+
+    match answered {
+        Ok((_, payload)) => {
+            let state = EnrolmentState::decode(&payload[..]).unwrap_or_default();
+            let refusal = match state.enrolled {
+                true => String::new(),
+                false => format!("That enrolment code was refused: {}.", state.refusal_reason),
+            };
+            Html(closed_page(&state, &refusal)).into_response()
+        }
+        // The conductor is what holds the key and what enrols. Unreachable is
+        // not a refused code, and saying so is the difference between issuing
+        // another code and waiting a moment.
+        Err(failed) => {
+            let enrolment = enrolment_state(&app).await;
+            Html(closed_page(
+                &enrolment,
+                &format!("The deployment could not be asked to enrol: {failed}"),
+            ))
+            .into_response()
+        }
     }
 }
 
@@ -239,14 +295,25 @@ fn enrolment_summary(state: &EnrolmentState) -> String {
         format!(
             "<p>This deployment is <strong>{}</strong>, and its key is \
              <strong>not registered</strong>: {}.</p>\
-             <p>Issue another enrolment code on the platform and give it to \
-             this deployment. Nothing needs reinstalling.</p>",
+             <p>Issue another enrolment code on the platform and enter it \
+             here. Nothing needs reinstalling.</p>\
+             <form method=\"post\" action=\"/first-run/enrol\">\
+             <label for=\"enrolment-code\">Enrolment code</label>\
+             <input id=\"enrolment-code\" name=\"code\" autocomplete=\"off\" required>\
+             <button type=\"submit\">Enrol</button>\
+             </form>\
+             <details><summary>Or register this deployment's key by hand</summary>\
+             <p>On the platform, register the deployment and add this key to \
+             it. It is the public half; the private half was made in this \
+             cluster and has never left it.</p>\
+             <pre>{}</pre></details>",
             escape(&state.deployment_id),
             escape(if state.refusal_reason.is_empty() {
                 "no reason given"
             } else {
                 &state.refusal_reason
-            })
+            }),
+            escape(&state.public_key_pem)
         )
     }
 }

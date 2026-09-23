@@ -16,11 +16,11 @@
 //! generating one if there is none. That moved here with the key: the process
 //! that holds a private half is the process that can speak for its public one.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
 use meridian_config::PostgresStore;
-use meridian_domain::v1::EnrolmentState;
+use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
     bus_from_env, key_at, now_ns, platform_from_env, report_forever, required, shutdown, var,
     PlatformUpstream,
@@ -42,6 +42,7 @@ fn main() {
 /// W7.2, the wizard's first question. In the config domain, which is where
 /// everything the dashboard asks the conductor lives.
 const ENROLMENT_STATE: &str = "platform.config.query.enrolment";
+const ENROL_WITH_CODE: &str = "platform.config.command.enrol-with-code";
 
 fn run() -> Result<(), String> {
     let command = std::env::args().nth(1);
@@ -113,14 +114,23 @@ fn run() -> Result<(), String> {
             // whose code has expired or been spent keeps running and says so,
             // because the wizard is where somebody enters a new one and the
             // wizard is served by a component that has to be up.
-            let enrolment = enrol(&platform, &public_key_pem, &key_path).await;
+            let enrolment = Arc::new(Mutex::new(
+                enrol(&platform, &public_key_pem, &key_path).await,
+            ));
 
             let bus = bus_from_env(&instance_id).await?;
 
             // W7.2. The wizard's first page, and everything it shows until a
             // claim code is redeemed. The conductor holds the key and is what
             // enrols, so it is what knows.
-            serve_enrolment_state(&bus, enrolment);
+            serve_enrolment_state(&bus, Arc::clone(&enrolment));
+            serve_enrol_with_code(
+                &bus,
+                Arc::clone(&enrolment),
+                Arc::clone(&platform),
+                public_key_pem.clone(),
+                key_path.clone(),
+            );
 
             // Subscribed before the loop starts, for the reason at-most-once
             // delivery makes unforgiving: what arrives before a subscriber
@@ -171,7 +181,12 @@ fn run() -> Result<(), String> {
 }
 
 /// Answer what the wizard shows before anything is redeemed.
-fn serve_enrolment_state(bus: &Arc<meridian_bus::Bus>, state: meridian_domain::v1::EnrolmentState) {
+///
+/// Shared rather than moved in, because enrolment is no longer only something
+/// that happened at start: a code entered in the wizard changes this, and a
+/// page that still showed the old answer would be telling somebody their
+/// repair had failed.
+fn serve_enrolment_state(bus: &Arc<meridian_bus::Bus>, state: Arc<Mutex<EnrolmentState>>) {
     use prost::Message;
 
     bus.serve(ENROLMENT_STATE, move |envelope| {
@@ -181,9 +196,66 @@ fn serve_enrolment_state(bus: &Arc<meridian_bus::Bus>, state: meridian_domain::v
                 envelope.payload_type
             ));
         }
+        let held = state.lock().expect("enrolment lock poisoned").clone();
         Ok((
             "meridian.v1.EnrolmentState".to_string(),
-            state.encode_to_vec(),
+            held.encode_to_vec(),
+        ))
+    });
+}
+
+/// W7.2. Enrol with a code somebody entered in the wizard.
+///
+/// Requirement 9's other half: the wizard said "issue another code and give it
+/// to this deployment" and had nowhere to put one, so the only way out of a
+/// spent or mistyped code was a `helm upgrade`.
+///
+/// Unauthenticated, and it can be nothing else: a deployment with no key
+/// cannot sign, so nothing it might present could be checked. The code is the
+/// credential, which is what it was made to be.
+fn serve_enrol_with_code(
+    bus: &Arc<meridian_bus::Bus>,
+    state: Arc<Mutex<EnrolmentState>>,
+    platform: Arc<meridian_conductor::Platform>,
+    public_key_pem: String,
+    key_path: String,
+) {
+    use prost::Message;
+
+    // Taken here rather than inside the handler: handlers run on a blocking
+    // thread, where there is no runtime to find.
+    let runtime = tokio::runtime::Handle::current();
+
+    bus.serve(ENROL_WITH_CODE, move |envelope| {
+        if envelope.payload_type != "meridian.v1.EnrolWithCodeRequest" {
+            return Err(format!(
+                "{ENROL_WITH_CODE} expects meridian.v1.EnrolWithCodeRequest, and this is {}",
+                envelope.payload_type
+            ));
+        }
+        let request = EnrolWithCodeRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("that is not an EnrolWithCodeRequest: {failed}"))?;
+
+        let code = request.code.trim().to_string();
+        if code.is_empty() {
+            let mut held = state.lock().expect("enrolment lock poisoned").clone();
+            held.refusal_reason = "no code was entered".into();
+            return Ok((
+                "meridian.v1.EnrolmentState".to_string(),
+                held.encode_to_vec(),
+            ));
+        }
+
+        let answered = runtime.block_on(enrol_with_code(
+            &platform,
+            &public_key_pem,
+            &key_path,
+            &code,
+        ));
+        *state.lock().expect("enrolment lock poisoned") = answered.clone();
+        Ok((
+            "meridian.v1.EnrolmentState".to_string(),
+            answered.encode_to_vec(),
         ))
     });
 }
@@ -199,24 +271,64 @@ async fn enrol(
     public_key_pem: &str,
     key_path: &str,
 ) -> EnrolmentState {
-    let deployment_id = var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default();
-    let state = |enrolled: bool, fingerprint: String, refusal_reason: String| EnrolmentState {
-        deployment_id: deployment_id.clone(),
-        enrolled,
-        fingerprint,
-        refusal_reason,
+    let held = |enrolled, fingerprint: String, refusal_reason: String| {
+        enrolment_state(public_key_pem, enrolled, fingerprint, refusal_reason)
     };
 
     let marker = std::path::Path::new(key_path).with_extension("enrolled");
     if let Ok(fingerprint) = std::fs::read_to_string(&marker) {
-        return state(true, fingerprint.trim().to_string(), String::new());
+        return held(true, fingerprint.trim().to_string(), String::new());
     }
 
     let Some(code) = var("MERIDIAN_ENROLMENT_CODE") else {
-        return state(false, String::new(), "no enrolment code".into());
+        return held(false, String::new(), "no enrolment code".into());
     };
 
-    match platform.enrol_key(&code, public_key_pem, now_ns()).await {
+    enrol_with_code(platform, public_key_pem, key_path, &code).await
+}
+
+/// What the wizard is shown, built in one place so a retry and a start cannot
+/// describe the same deployment differently.
+fn enrolment_state(
+    public_key_pem: &str,
+    enrolled: bool,
+    fingerprint: String,
+    refusal_reason: String,
+) -> EnrolmentState {
+    EnrolmentState {
+        deployment_id: var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default(),
+        enrolled,
+        fingerprint,
+        refusal_reason,
+        public_key_pem: public_key_pem.to_string(),
+    }
+}
+
+/// W7.2. Enrol with a code, from the install or from the wizard.
+///
+/// Requirement 9: a code that expired or was already spent leaves a deployment
+/// running and unenrolled, and a new one entered in the wizard fixes it with
+/// nothing reinstalled. Both routes arrive here, so the marker is written and
+/// the refusal is worded once.
+async fn enrol_with_code(
+    platform: &Arc<meridian_conductor::Platform>,
+    public_key_pem: &str,
+    key_path: &str,
+    code: &str,
+) -> EnrolmentState {
+    let state = |enrolled, fingerprint: String, refusal_reason: String| {
+        enrolment_state(public_key_pem, enrolled, fingerprint, refusal_reason)
+    };
+    let marker = std::path::Path::new(key_path).with_extension("enrolled");
+
+    // A deployment that already holds a registered key does not enrol again,
+    // and the platform refuses it anyway. Saying so here is the difference
+    // between an answer and a round trip that ends in "already used".
+    if let Ok(fingerprint) = std::fs::read_to_string(&marker) {
+        return state(true, fingerprint.trim().to_string(), String::new());
+    }
+
+    match platform.enrol_key(code, public_key_pem, now_ns()).await {
         Ok(enrolled) => {
             // The fingerprint, so an administrator comparing it with the
             // platform's own page can see that this deployment's key is the

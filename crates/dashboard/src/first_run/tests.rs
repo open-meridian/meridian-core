@@ -40,6 +40,19 @@ fn app(first_run: bool, state: EnrolmentState, redemption: RedeemClaimCodeReply)
             state.encode_to_vec(),
         ))
     });
+    // W7.2. A deployment that never enrolled cannot redeem a claim code at
+    // all, so this is the one first-run endpoint that answers before one is.
+    bus.serve(ENROL_WITH_CODE, move |envelope| {
+        let asked = EnrolWithCodeRequest::decode(&envelope.payload[..]).unwrap();
+        let answered = match asked.code.as_str() {
+            "ENR-GOOD" => enrolled(),
+            other => unenrolled(&format!("no such enrolment code: {other}")),
+        };
+        Ok((
+            "meridian.v1.EnrolmentState".to_string(),
+            answered.encode_to_vec(),
+        ))
+    });
     bus.serve(REDEEM_CLAIM_CODE, move |envelope| {
         let asked = RedeemClaimCodeRequest::decode(&envelope.payload[..]).unwrap();
         // The purpose is the point: a code for the first administrator is not
@@ -126,8 +139,13 @@ fn enrolled() -> EnrolmentState {
         enrolled: true,
         fingerprint: FINGERPRINT.into(),
         refusal_reason: String::new(),
+        public_key_pem: PUBLIC_KEY.into(),
     }
 }
+
+/// The public half, as the wizard shows it for the route that registers a key
+/// by hand. A public key, so nothing here is a credential.
+const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA\n-----END PUBLIC KEY-----";
 
 async fn get(app: Arc<App>, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
     let mut request = Request::get(path);
@@ -210,14 +228,8 @@ async fn before_a_code_is_redeemed_the_wizard_shows_its_one_page() {
 
 #[tokio::test]
 async fn a_deployment_that_has_not_enrolled_says_why_and_what_to_do() {
-    let state = EnrolmentState {
-        deployment_id: "DEP-7".into(),
-        enrolled: false,
-        fingerprint: String::new(),
-        refusal_reason: "expired".into(),
-    };
     let (_, body) = get(
-        app(true, state, RedeemClaimCodeReply::default()),
+        app(true, unenrolled("expired"), RedeemClaimCodeReply::default()),
         "/first-run",
         None,
     )
@@ -226,6 +238,73 @@ async fn a_deployment_that_has_not_enrolled_says_why_and_what_to_do() {
     assert!(body.contains("not registered"), "{body}");
     assert!(body.contains("expired"), "{body}");
     assert!(body.contains("Nothing needs reinstalling"), "{body}");
+
+    // Requirement 9 promised a new code fixes this with nothing reinstalled,
+    // and for a while the page said so above a form that took a different
+    // kind of code entirely.
+    assert!(
+        body.contains("/first-run/enrol"),
+        "somewhere to put one: {body}"
+    );
+
+    // And the other way in, for a deployment that cannot reach the platform
+    // at all: the public half, to register by hand (decisions/017).
+    assert!(body.contains("BEGIN PUBLIC KEY"), "{body}");
+}
+
+fn unenrolled(why: &str) -> EnrolmentState {
+    EnrolmentState {
+        deployment_id: "DEP-7".into(),
+        enrolled: false,
+        fingerprint: String::new(),
+        refusal_reason: why.into(),
+        public_key_pem: PUBLIC_KEY.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_new_enrolment_code_repairs_a_deployment_that_never_enrolled() {
+    // The whole point of requirement 9: no reinstall, no helm upgrade, and
+    // no claim code -- which could not work here anyway, because redeeming
+    // one is a signed call and this deployment has no key registered to sign
+    // as.
+    let app = app(true, unenrolled("expired"), RedeemClaimCodeReply::default());
+
+    let (status, body) = post_form(app, "/first-run/enrol", "code=ENR-GOOD").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(FINGERPRINT),
+        "the key is registered now: {body}"
+    );
+    assert!(
+        !body.contains("/first-run/enrol"),
+        "and there is nothing left to enter: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_enrolment_code_says_why_and_keeps_the_field() {
+    let app = app(true, unenrolled("expired"), RedeemClaimCodeReply::default());
+
+    let (_, body) = post_form(app, "/first-run/enrol", "code=ENR-WRONG").await;
+
+    assert!(body.contains("no such enrolment code"), "{body}");
+    assert!(
+        body.contains("/first-run/enrol"),
+        "still somewhere to try again: {body}"
+    );
+}
+
+/// A form post with no session, which is what this endpoint is for.
+async fn post_form(app: Arc<App>, path: &str, body: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .expect("a request");
+    read(app, request).await
 }
 
 #[tokio::test]

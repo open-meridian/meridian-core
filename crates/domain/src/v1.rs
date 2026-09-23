@@ -1277,6 +1277,17 @@ pub struct EnrolmentState {
     /// reason is carried rather than a bare false.
     #[prost(string, tag = "4")]
     pub refusal_reason: ::prost::alloc::string::String,
+    /// The public half the conductor generated, as the wizard shows it
+    /// (spec/installation-and-first-run, requirement 8).
+    ///
+    /// Nothing on the routine path needs it: the conductor registers it itself
+    /// with an enrolment code, and nobody sees it. It is here for the path that
+    /// recovers, where somebody registers a key by hand on the platform -- so
+    /// that what they copy is a public half off a screen, rather than a keypair
+    /// they generated on a laptop with the private half left in a file
+    /// (decisions/017).
+    #[prost(string, tag = "5")]
+    pub public_key_pem: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct FirstRunSealingKeyRequest {}
