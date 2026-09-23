@@ -273,10 +273,14 @@ chart-check:
 			| grep -q "meridian-$$component\"\]" \
 			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
 	done
-	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
-		| grep -c "^kind: Deployment" | grep -q "^3$$" \
-		|| { echo "chart-check FAILED: the street store, the instrument store and the conductor are not three Deployments" >&2; \
-		     echo "  one workload means none can be upgraded without the others" >&2; exit 1; }
+	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	for component in street instrument conductor; do \
+		count="$$(echo "$$rendered" | awk '/^kind: Deployment$$/{d=1} d&&/^  name: /{print $$2; d=0}' \
+			| grep -c "^check-meridian-runtime-$$component$$")"; \
+		[ "$$count" = "1" ] \
+			|| { echo "chart-check FAILED: $$component is not a Deployment of its own ($$count found)" >&2; \
+			     echo "  one workload means none can be upgraded without the others" >&2; exit 1; }; \
+	done
 	@# decisions/011. The key authenticates as the whole deployment, so exactly
 	@# one component may mount it. A second holder is a second thing that can
 	@# speak for the customer, and the last one appeared by accident.
@@ -335,7 +339,13 @@ chart-check:
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| grep -q '"meridian-dashboard"' \
 		|| { echo "chart-check FAILED: the dashboard does not render when enabled" >&2; exit 1; }
-	@for refused in "dashboard.url=" "dashboard.replicaCount=2"; do \
+	@# An address is what a directory needs, and a deployment nobody has set up
+	@# has neither: the wizard asks for both. What must not render is a second
+	@# dashboard, because one holds the wizard's single session.
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url= 2>/dev/null | grep -q '"meridian-dashboard"' \
+		|| { echo "chart-check FAILED: a deployment with no address yet renders no dashboard, so nothing serves its wizard" >&2; exit 1; }
+	@for refused in "dashboard.replicaCount=2"; do \
 		if $(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 			--set dashboard.url=https://meridian.example --set $$refused >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \

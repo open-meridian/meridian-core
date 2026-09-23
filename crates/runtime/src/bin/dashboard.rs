@@ -17,7 +17,7 @@ use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
-use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
+use meridian_runtime::{bus_from_env, now_ns, shutdown, var};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -42,12 +42,28 @@ fn run() -> Result<(), String> {
     // Where people reach this dashboard, which is where the directory sends
     // them back to. HTTPS everywhere but a developer's machine, and cookies
     // are marked Secure whenever it is.
-    let public_url = required("MERIDIAN_DASHBOARD_URL")?;
+    // Empty on a deployment nobody has configured yet: the wizard is what
+    // asks for it. A directory is what needs it, and the dashboard refuses to
+    // serve one without it rather than sending people back to a guess.
+    let public_url = var("MERIDIAN_DASHBOARD_URL").unwrap_or_default();
     let secure_cookies = public_url.starts_with("https://");
     // Both, because the chart knows the bundled Zitadel's issuer from the
     // moment it renders and the client exists only once setup has made one.
     // An issuer with no client is a deployment part-way through first run, and
     // it signs nobody in.
+    if !public_url.is_empty() && !secure_cookies {
+        tracing::warn!(
+            %public_url,
+            "this dashboard is reached over http, so its session cookies are not marked Secure"
+        );
+    }
+    if public_url.is_empty() && var("MERIDIAN_OIDC_ISSUER").is_some() {
+        return Err(
+            "MERIDIAN_DASHBOARD_URL is not set, and a directory needs it: \
+                    it is where people are sent back to after signing in"
+                .into(),
+        );
+    }
     let directory = var("MERIDIAN_OIDC_ISSUER")
         .zip(var("MERIDIAN_OIDC_CLIENT_ID"))
         .map(|(issuer, client_id)| OidcConfig {

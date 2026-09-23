@@ -158,12 +158,19 @@ street:
 # Off until its sign-in has run end to end against a real directory
 # (kernel/dashboard-sign-in-and-access); turning it on needs `url`.
 dashboard:
-  enabled: false
+  # On, because a deployment with no dashboard has no way to be set up: the
+  # wizard is what a fresh install serves, and every address, database and
+  # directory it holds is answered there (spec/installation-and-first-run,
+  # requirement 5).
+  enabled: true
   replicaCount: 1
   image:
     tag: ""
   # Where people reach it, https in any real deployment. Cookies are marked
   # Secure whenever it is.
+  # Where people reach this dashboard, which is where a directory sends them
+  # back to. Empty until the wizard asks for it; a deployment with a directory
+  # and no address refuses to serve rather than guessing one.
   url: ""
   # Its identity on the broker, launched with the admin role's grants. The key
   # in the broker secret defaults to the instance identifier, as a sidecar's does.
