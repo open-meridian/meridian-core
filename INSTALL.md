@@ -138,8 +138,29 @@ Now wait for the pods:
 kubectl --namespace meridian get pods --watch
 ```
 
-The dashboard and the conductor should reach `1/1`. If you chose the bundled
-directory, Zitadel takes a few minutes longer than the rest.
+**Some of them will sit in an error, and that is what a correct install looks
+like at this point.** Expect this:
+
+| | |
+|---|---|
+| `broker`, `conductor`, `dashboard`, `first-run` | reach **1/1**. These are what serve you the wizard |
+| `key` | **Completed** — the deployment has made its own keypair |
+| `street`, `instrument`, `migrate` | **`CreateContainerConfigError`**, and they stay there |
+
+That last row is not a failure. The chart creates the database Secret empty,
+for the wizard to fill, so those three report `couldn't find key url in Secret
+…-database`. They cannot start without a database and there is not one yet.
+They retry by themselves and come up a minute or two after you apply the
+wizard; nothing needs restarting and nothing needs deleting.
+
+The conductor and the dashboard treat that same key as optional, which is
+exactly what lets a fresh install serve a wizard at all.
+
+If you are watching this in a graphical cluster tool, it will report an error
+count for those three. Ignore it until after step 7.
+
+If you chose the bundled directory, Zitadel takes a few minutes longer than
+the rest.
 
 ## 4. Check the deployment enrolled, and that the key is yours
 
@@ -241,6 +262,7 @@ That is the install finished.
 | "already enrolled" when issuing an enrolment code | It holds a key already | You are reinstalling. Register the new key signed in, through the deployment's keys |
 | The wizard refuses the bundled directory | The chart did not render it | Add the four `identity.bundled` and `zitadel` values from step 3, `helm upgrade`, and apply again. Your answers are not kept, so have them to hand |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
+| `street`, `instrument` or `migrate` still in error **after** applying | They may not have retried yet | Give them two minutes. If they persist, read the message: a key named there that is still missing means the apply did not write the database Secret |
 | Zitadel never reaches `1/1` | It cannot reach its database | Check `identity.bundled.egress.allowCidrs` covers your cluster's pod and service ranges |
 
 ## What to back up
