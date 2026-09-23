@@ -1,0 +1,177 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.database.brought.enabled }}
+{{/*
+  A Postgres the deployment can bring, for a firm evaluating this and for a
+  developer on a laptop.
+
+  Rendered at zero replicas and started only if somebody chooses it in the
+  wizard. That is what keeps decisions/016: at zero there is no claim and no
+  disk, because the claim comes from the StatefulSet's own volumeClaimTemplate
+  and the StatefulSet controller makes it when it scales. Nothing in the
+  deployment creates a resource in its own cluster; the first-run Job scales,
+  which is a right it already holds for the bundled directory.
+
+  A StatefulSet rather than a Deployment with a claim beside it, for that
+  reason alone: a claim rendered next to a Deployment exists whether or not
+  anybody wanted a database.
+
+  It carries no `helm.sh/resource-policy: keep`, deliberately. The data is
+  already safe from `helm uninstall` twice over -- the claim comes from the
+  volumeClaimTemplate, so Helm never created it and never deletes it, and
+  Kubernetes retains a StatefulSet's claims when the StatefulSet goes. Keeping
+  the StatefulSet as well would only mean a Postgres still running after
+  somebody removed Meridian, which is not what removing it should leave
+  behind. Installing again re-binds the same disk: the claim's name is made
+  from the StatefulSet's, so there is one to find.
+
+  The passwords beside it are kept, because the roles inside that retained
+  database still hold them.
+
+  This is not what a firm runs its books on, and the wizard says so where it
+  is chosen. A database the chart owns is a database whose backups are
+  whoever remembers. `database.brought.enabled=false` renders none of it.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-database" $full }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (printf "%s-passwords" $name) }}
+{{- $held := dict }}
+{{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
+---
+# Made once and kept. These and the disk beside them are a pair, and the
+# reason is Postgres's: POSTGRES_PASSWORD is read by initdb on an empty data
+# directory and ignored on one that already holds a database. So a superuser
+# password regenerated over a surviving disk is a database nothing can open --
+# not the components, and not the Job that would repair them.
+#
+# Which is why this is kept, and why it is generated rather than fixed. A
+# default password would be one printed in a public chart and used by every
+# install; the network policy beside this is not a reason to publish one.
+#
+# Deleting this Secret while keeping the disk is the one combination that
+# breaks, and it is recoverable only from inside the pod, where the socket
+# admits the postgres user without one:
+#
+#   kubectl exec -n <ns> <release>-meridian-runtime-database-0 -- \
+#     psql -U postgres -c "alter user postgres password '<the new one>'"
+#
+# Nobody types these and nobody is shown them: the wizard offers a database,
+# the Job makes the roles with them, and the URLs it writes are what the
+# components read.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-passwords
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  superuser: {{ index $held "superuser" | default (randAlphaNum 32 | b64enc) }}
+  serving: {{ index $held "serving" | default (randAlphaNum 32 | b64enc) }}
+  migrating: {{ index $held "migrating" | default (randAlphaNum 32 | b64enc) }}
+  zitadel: {{ index $held "zitadel" | default (randAlphaNum 32 | b64enc) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  # Zero until the wizard says otherwise. Every other component in this chart
+  # waits at a Secret key; this one waits at a replica count, because what it
+  # waits for is a choice rather than a credential.
+  replicas: 0
+  serviceName: {{ $name }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: database
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: database
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ .Values.database.brought.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-passwords
+                  key: superuser
+            # Its own, so the databases the Job makes are made beside it
+            # rather than inside the one it connects through.
+            - name: POSTGRES_DB
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.database.brought.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.database.brought.size | quote }}
+---
+# Reached by this deployment's own components and by nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: database
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: 5432
+{{- end }}

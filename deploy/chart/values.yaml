@@ -44,6 +44,23 @@ database:
   existingSecret: ""
   key: url
 
+  # A Postgres this chart can bring, for evaluating the product and for a
+  # laptop. Rendered at zero replicas: until somebody chooses it in the
+  # wizard there is no claim, no disk and no database, and choosing it is a
+  # scale rather than a creation (decisions/016).
+  #
+  # Not what a firm runs its books on. It survives uninstalling the release
+  # and it does not survive deleting the cluster or the namespace, nobody
+  # backs it up, and the wizard says all of that where it is offered. Off
+  # renders none of it, and a deployment pointed at a database somebody else
+  # runs never starts it.
+  brought:
+    enabled: true
+    image: postgres:16-alpine
+    size: 20Gi
+    # The cluster's default provisioner, whatever it is.
+    storageClassName: ""
+
 key:
   # Let the instrument store make its own key, inside the cluster, in a volume only it
   # mounts.

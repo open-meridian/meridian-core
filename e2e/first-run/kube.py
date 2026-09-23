@@ -22,10 +22,11 @@ policies = {}
 deployments = {}
 deleted = []
 refused = []
+scaled = []
 
 SECRET = re.compile(r"^/api/v1/namespaces/[^/]+/secrets/([^/?]+)")
 POLICY = re.compile(r"^/apis/networking\.k8s\.io/v1/namespaces/[^/]+/networkpolicies/([^/?]+)")
-SCALE = re.compile(r"^/apis/apps/v1/namespaces/[^/]+/deployments/([^/?]+)/scale")
+SCALE = re.compile(r"^/apis/apps/v1/namespaces/[^/]+/(deployments|statefulsets)/([^/?]+)/scale")
 DEPLOYMENT = re.compile(r"^/apis/apps/v1/namespaces/[^/]+/deployments/([^/?]+)")
 BINDING = re.compile(r"^/apis/rbac\.authorization\.k8s\.io/v1/namespaces/[^/]+/rolebindings/([^/?]+)")
 
@@ -53,6 +54,7 @@ class Handler(BaseHTTPRequestHandler):
                                 for name, data in secrets.items()},
                     "policies": policies,
                     "deployments": deployments,
+                    "scaled": scaled,
                     "deleted": deleted,
                     "refused": refused,
                 })
@@ -64,8 +66,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         body = self.body()
+        # SCALE first, and with both of its groups: it names the kind as well
+        # as the resource, and DEPLOYMENT would otherwise match a deployment's
+        # scale path and record it as a restart.
+        found = SCALE.match(self.path)
+        if found:
+            with lock:
+                self.scale(found.group(1), found.group(2), body)
+            return self.reply(200, {"ok": True})
         for pattern, handler in ((SECRET, self.secret), (POLICY, self.policy),
-                                 (SCALE, self.scale), (DEPLOYMENT, self.deployment)):
+                                 (DEPLOYMENT, self.deployment)):
             found = pattern.match(self.path)
             if found:
                 with lock:
@@ -87,8 +97,19 @@ class Handler(BaseHTTPRequestHandler):
     def policy(self, name, body):
         policies[name] = body.get("spec", {}).get("egress")
 
-    def scale(self, name, body):
-        deployments.setdefault(name, {})["replicas"] = body.get("spec", {}).get("replicas")
+    def scale(self, kind, name, body):
+        replicas = body.get("spec", {}).get("replicas")
+        # Only a Deployment belongs in `deployments`. Putting a StatefulSet
+        # there made "were the named Deployments restarted?" ask about a
+        # database that was never going to be, which is a test failing
+        # because of how it was watched rather than what happened.
+        if kind == "deployments":
+            deployments.setdefault(name, {})["replicas"] = replicas
+        # Kept as its own list so a test can say what kind was scaled. The
+        # database this chart brings is a StatefulSet precisely so that its
+        # claim does not exist until it is scaled, and "it scaled a
+        # StatefulSet" is the observable part of that.
+        scaled.append({"kind": kind, "name": name, "replicas": replicas})
 
     def deployment(self, name, body):
         annotations = (body.get("spec", {}).get("template", {})

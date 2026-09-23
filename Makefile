@@ -6,6 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
+        e2e-first-run-brought \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -30,7 +31,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -152,6 +153,12 @@ test-store: network
 # things a deployment talks to while it is being set up.
 E2E_FIRST_RUN = $(COMPOSE) --profile first-run
 
+# The wizard's two database routes, each proven end to end. `external` points
+# at a database somebody already runs; `brought` starts one and makes
+# everything in it, which is what a person trying the product does.
+E2E_DB_ROUTE ?= external
+E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brought and made itself,)
+
 e2e-first-run: network
 	@rm -f .e2e-first-run.log
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
@@ -167,8 +174,29 @@ e2e-first-run: network
 		     echo "  services in .e2e-first-run.services.log" >&2; \
 		     $(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1; exit 1; }
 	@cat .e2e-first-run.run.log
+	@if [ "$(E2E_DB_ROUTE)" = "brought" ]; then \
+		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -d brought -Atc \
+		  "select rolname from pg_roles where rolname in ('brought_app','brought_migrate')" \
+		  | tee -a .e2e-first-run.log | grep -q brought_app \
+		  || { echo "e2e-first-run FAILED: the roles it said it made are not there" >&2; exit 1; }; \
+		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -d brought -Atc \
+		  "select has_schema_privilege('brought_app','public','CREATE')" | grep -qx f \
+		  || { echo "e2e-first-run FAILED: the serving role may create tables" >&2; exit 1; }; \
+		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -d brought -Atc \
+		  "select has_schema_privilege('brought_migrate','public','CREATE')" | grep -qx t \
+		  || { echo "e2e-first-run FAILED: the migrating role may not create tables" >&2; exit 1; }; \
+		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -Atc \
+		  "select datname from pg_database where datname = 'zitadel'" | grep -qx zitadel \
+		  || { echo "e2e-first-run FAILED: Zitadel's database was not made" >&2; exit 1; }; \
+		echo "  the roles are real: brought_app may not create tables, brought_migrate may, and zitadel has its own database"; \
+	fi
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1
-	@echo "e2e-first-run OK: an install given nothing, made to serve"
+	@echo "e2e-first-run OK: an install given nothing, made to serve$(E2E_ROUTE_SAID)"
+
+# The same run, taking the other route. Its own target rather than a loop, so
+# a failure says which route failed without anybody reading a log.
+e2e-first-run-brought:
+	@$(MAKE) --no-print-directory e2e-first-run E2E_DB_ROUTE=brought
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set key.generate=false --set database.existingSecret=d --set broker.existingSecret=b
@@ -402,7 +430,8 @@ chart-check:
 		|| { echo "chart-check FAILED: the dashboard cannot start without a client id, and the wizard that makes one is what it would be serving" >&2; exit 1; }
 	@role="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
-		| awk '/^kind: Role$$/{r=1} r; /^---/{r=0}' | grep -A30 'name: check-meridian-runtime-first-run')"; \
+		| awk '/^kind: Role$$/{r=1} r; /^---/{r=0}' \
+		| sed -n '/name: check-meridian-runtime-first-run/,/^---/p')"; \
 	echo "$$role" | grep -qE 'verbs:.*(create|\*)' \
 		&& { echo "chart-check FAILED: first run may create a resource. RBAC cannot narrow create to a name, so a Job that may create Secrets may create any" >&2; exit 1; }; \
 	echo "$$role" | grep -q 'resources: \["rolebindings"\]' \

@@ -30,6 +30,27 @@ impl std::fmt::Display for ClusterError {
     }
 }
 
+/// What is being scaled, because the two live at different paths and the Job's
+/// Role names each one separately.
+///
+/// The bundled directory is a Deployment; the database this chart can bring is
+/// a StatefulSet, so that its claim comes from a volumeClaimTemplate and does
+/// not exist until somebody chooses it (decisions/016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workload {
+    Deployment,
+    StatefulSet,
+}
+
+impl Workload {
+    fn path(self) -> &'static str {
+        match self {
+            Workload::Deployment => "deployments",
+            Workload::StatefulSet => "statefulsets",
+        }
+    }
+}
+
 /// The calls first run makes, as a trait so its own tests need no cluster.
 #[async_trait::async_trait]
 pub trait Cluster: Send + Sync {
@@ -46,7 +67,7 @@ pub trait Cluster: Send + Sync {
 
     /// How many replicas a named Deployment should run. Zero is how a bundled
     /// Zitadel is left when the firm brought its own directory.
-    async fn scale(&self, name: &str, replicas: u32) -> Result<(), ClusterError>;
+    async fn scale(&self, kind: Workload, name: &str, replicas: u32) -> Result<(), ClusterError>;
 
     /// Roll a named Deployment, so it reads what was just written.
     async fn restart(&self, name: &str) -> Result<(), ClusterError>;
@@ -197,11 +218,12 @@ impl Cluster for ApiServer {
         .await
     }
 
-    async fn scale(&self, name: &str, replicas: u32) -> Result<(), ClusterError> {
+    async fn scale(&self, kind: Workload, name: &str, replicas: u32) -> Result<(), ClusterError> {
         self.patch(
             &format!(
-                "/apis/apps/v1/namespaces/{}/deployments/{name}/scale",
-                self.namespace
+                "/apis/apps/v1/namespaces/{}/{}/{name}/scale",
+                self.namespace,
+                kind.path()
             ),
             "application/merge-patch+json",
             serde_json::json!({"spec": {"replicas": replicas}}),

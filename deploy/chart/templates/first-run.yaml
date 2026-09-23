@@ -59,6 +59,17 @@ rules:
     resources: ["deployments/scale"]
     resourceNames: [{{ range $i, $d := $bundled }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
     verbs: ["get", "patch"]
+{{- if .Values.database.brought.enabled }}
+  # Starting the database this chart brings, if somebody chooses it. Named,
+  # like everything else here, and scale only: the StatefulSet exists at zero
+  # replicas and the wizard turns it on. Creating is not among these verbs,
+  # and the claim comes from the StatefulSet's own template rather than from
+  # anything this Job does (decisions/016).
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    resourceNames: [{{ printf "%s-database" (include "meridian-runtime.fullname" .) | quote }}]
+    verbs: ["get", "patch"]
+{{- end }}
   # Deleting exactly one binding: its own. This is what makes "gives up its
   # rights" a thing that happens rather than a thing that was meant.
   - apiGroups: ["rbac.authorization.k8s.io"]
@@ -142,6 +153,41 @@ spec:
               value: {{ join "," $restart | quote }}
             - name: MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY
               value: {{ join "," $bundled | quote }}
+{{- if .Values.database.brought.enabled }}
+            # The database this chart can bring, and the passwords it makes
+            # for the roles that will live in it. Read from this Job's own
+            # environment rather than sealed over the bus, because nobody
+            # types them and they never travel: what would be protected in
+            # transit never leaves the cluster.
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_WORKLOAD
+              value: {{ printf "%s-database" (include "meridian-runtime.fullname" .) | quote }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_HOST
+              value: {{ printf "%s-database.%s.svc.cluster.local" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_PORT
+              value: "5432"
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER
+              value: postgres
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: superuser
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: serving
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_MIGRATING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: migrating
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_ZITADEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: zitadel
+{{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:

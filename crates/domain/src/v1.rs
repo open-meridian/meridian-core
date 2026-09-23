@@ -1339,10 +1339,46 @@ pub struct DatabaseLogin {
 /// that. The two may name the same server and database.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RuntimeDatabaseAnswer {
+    /// The firm's own database: two logins it made, tested as they are.
+    ///
+    /// Fields 1 and 2 rather than inside the oneof below, because this is what
+    /// every deployment configured before 2026-09-23 answered with, and a
+    /// renumbering would make those unreadable for no gain.
     #[prost(message, optional, tag = "1")]
     pub serving: ::core::option::Option<DatabaseLogin>,
     #[prost(message, optional, tag = "2")]
     pub migrating: ::core::option::Option<DatabaseLogin>,
+    /// Or a database the deployment brings, which is what a fresh install has
+    /// and what somebody trying the product has (ruled 2026-09-23). Absent means
+    /// the two logins above.
+    #[prost(message, optional, tag = "3")]
+    pub brought: ::core::option::Option<BroughtDatabase>,
+}
+/// A Postgres the chart ships, started when somebody chooses it.
+///
+/// It is rendered at zero replicas, and its claim comes from the StatefulSet's
+/// own volumeClaimTemplate -- so until this is chosen there is no claim and no
+/// disk, and when it is chosen the StatefulSet controller makes the claim
+/// rather than anything in the deployment (decisions/016). The wizard scales,
+/// which is a right the first-run Job already holds.
+///
+/// For evaluation and development. It survives uninstalling the release, and it
+/// does not survive deleting the cluster or the namespace; nobody backs it up.
+/// A deployment somebody depends on points at a database they run themselves --
+/// their own Postgres, one in Docker, a managed one from a cloud -- and the
+/// wizard says all of that where the choice is made.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BroughtDatabase {
+    /// What the runtime's two roles will be called. Their passwords are
+    /// generated in the cluster and never typed, so there is nothing here to
+    /// seal: a password nobody chose is a password nobody reuses.
+    #[prost(string, tag = "1")]
+    pub serving_role: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub migrating_role: ::prost::alloc::string::String,
+    /// And the database they live in, beside Zitadel's own on the same server.
+    #[prost(string, tag = "3")]
+    pub database: ::prost::alloc::string::String,
 }
 /// The firm's LDAP directory, brokered by the bundled Zitadel. The chart's
 /// identity.bundled.ldap settings, answered in the wizard instead.

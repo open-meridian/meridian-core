@@ -30,7 +30,23 @@ FIRST_RUN_CODE = os.environ["E2E_FIRST_RUN_CODE"]
 FIRST_ADMIN_CODE = os.environ["E2E_FIRST_ADMIN_CODE"]
 DATABASE_PASSWORD = os.environ["E2E_DATABASE_PASSWORD"]
 
+# Which of the wizard's two database routes this run takes. `external` points
+# at a database somebody already runs, which is every deployment a firm
+# depends on; `brought` starts one in the cluster, which is what somebody
+# trying the product does and what needs nothing of them.
+ROUTE = os.environ.get("E2E_DB_ROUTE", "external")
+
+# On the brought route the names are ones the harness has not prepared, so
+# that finding them afterwards means the Job made them rather than that they
+# were already there.
+BROUGHT_NAMES = {
+    "db_name": "brought",
+    "db_serving_role": "brought_app",
+    "db_migrating_role": "brought_migrate",
+}
+
 ANSWERS = {
+    "db_route": ROUTE,
     "db_host": "core-postgres", "db_port": "5432", "db_name": "firstrun",
     "db_sslmode": "disable",
     "db_serving_role": "firstrun_app", "db_serving_password": DATABASE_PASSWORD,
@@ -48,6 +64,9 @@ ANSWERS = {
     # sends the account it is creating.
     "admin_group": "",
 }
+
+if ROUTE == "brought":
+    ANSWERS.update(BROUGHT_NAMES)
 
 
 class Scorecard:
@@ -156,13 +175,20 @@ def main():
             "the platform returned the first administrator's code with it")
 
     print("D: an answer that does not work", flush=True)
-    wrong = dict(ANSWERS, db_serving_role="firstrun_migrate")
-    status, page = browser.post(f"{DASHBOARD}/first-run/check", wrong)
-    findings = re.findall(r"<li>([^<]*)</li>", page)
-    s.note(f"findings: {findings}")
-    s.check(any("may create tables" in f for f in findings),
-            "a serving role that may create tables is the finding worth having")
-    s.check(json_at(f"{KUBE}/e2e/state")["secrets"] == {}, "and nothing was written")
+    if ROUTE == "external":
+        wrong = dict(ANSWERS, db_serving_role="firstrun_migrate")
+        status, page = browser.post(f"{DASHBOARD}/first-run/check", wrong)
+        findings = re.findall(r"<li>([^<]*)</li>", page)
+        s.note(f"findings: {findings}")
+        s.check(any("may create tables" in f for f in findings),
+                "a serving role that may create tables is the finding worth having")
+        s.check(json_at(f"{KUBE}/e2e/state")["secrets"] == {}, "and nothing was written")
+    else:
+        # There is nothing to connect to yet: the database this chart brings
+        # does not exist until applying starts it, and the roles do not exist
+        # until applying makes them. A check that invented a finding here
+        # would be a check about nothing.
+        s.note("the brought route has no login to get wrong before it is applied")
 
     print("E: the answers, tested", flush=True)
     status, page = browser.post(f"{DASHBOARD}/first-run/check", ANSWERS)
@@ -192,10 +218,32 @@ def main():
     database = state["secrets"].get("first-run-database", {})
     s.check("url" in database and "migrate-url" in database,
             "with both logins: the serving one and the one that may migrate")
-    s.check(DATABASE_PASSWORD in database.get("url", ""),
-            "and the password the wizard was given reached it")
-    s.check("firstrun_app" in database.get("url", "")
-            and "firstrun_migrate" in database.get("migrate-url", ""),
+    if ROUTE == "external":
+        s.check(DATABASE_PASSWORD in database.get("url", ""),
+                "and the password the wizard was given reached it")
+    else:
+        # Nobody typed these. The chart made them, the Job read them from its
+        # own environment, and they never crossed the bus -- so unlike every
+        # other credential here there was nothing to seal, because what would
+        # be protected in transit never travelled.
+        s.check(os.environ["E2E_BROUGHT_SERVING_PASSWORD"] in database.get("url", ""),
+                "the serving URL carries the password the chart generated")
+        s.check(os.environ["E2E_BROUGHT_MIGRATING_PASSWORD"] in database.get("migrate-url", ""),
+                "and the migrating URL its own")
+        s.check(os.environ["E2E_SUPERUSER_PASSWORD"] not in database.get("url", "")
+                and os.environ["E2E_SUPERUSER_PASSWORD"] not in database.get("migrate-url", ""),
+                "and neither is the privileged one the Job connected with")
+        scaled = [c for c in state.get("scaled", [])
+                  if c.get("kind") == "statefulsets" and c.get("replicas") == 1]
+        s.note(f"scaled: {state.get('scaled')}")
+        s.check(bool(scaled), "the database it brought was started, by scaling and not creating")
+        zitadel = state["secrets"].get("first-run-zitadel-database", {}).get("dsn", "")
+        s.check("zitadel" in zitadel and os.environ["E2E_BROUGHT_ZITADEL_PASSWORD"] in zitadel,
+                "Zitadel was handed the role made for it")
+        s.check(os.environ["E2E_SUPERUSER_PASSWORD"] not in zitadel,
+                "and never the privileged connection the Job used to make it")
+    s.check(ANSWERS["db_serving_role"] in database.get("url", "")
+            and ANSWERS["db_migrating_role"] in database.get("migrate-url", ""),
             "each URL naming its own role")
     addresses = state["secrets"].get("first-run-addresses", {})
     s.check(addresses.get("dashboard-url") == ANSWERS["dashboard_url"],

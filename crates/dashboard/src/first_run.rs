@@ -33,12 +33,12 @@ use meridian_domain::v1::first_run_check_request::Answer as CheckAnswer;
 use meridian_domain::v1::login_backend_answer::Backend;
 use meridian_domain::v1::zitadel_database_answer::Route;
 use meridian_domain::v1::{
-    administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BundledZitadelAnswer,
-    ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState, EnrolmentStateRequest,
-    FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration,
-    FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer, LocalAccountAnswer,
-    LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply, RedeemClaimCodeRequest,
-    RuntimeDatabaseAnswer, SealedCredential, ZitadelDatabaseAnswer,
+    administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BroughtDatabase,
+    BundledZitadelAnswer, ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState,
+    EnrolmentStateRequest, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
+    FirstRunConfiguration, FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer,
+    LocalAccountAnswer, LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply,
+    RedeemClaimCodeRequest, RuntimeDatabaseAnswer, SealedCredential, ZitadelDatabaseAnswer,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -614,23 +614,39 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
         ssl_mode: field(&format!("{prefix}_sslmode")),
     };
 
-    let database = RuntimeDatabaseAnswer {
-        serving: Some(login(
-            "db",
-            &field("db_serving_role"),
-            seal_field(
-                "runtime_database.serving.password",
-                &field("db_serving_password"),
-            )?,
-        )),
-        migrating: Some(login(
-            "db",
-            &field("db_migrating_role"),
-            seal_field(
-                "runtime_database.migrating.password",
-                &field("db_migrating_password"),
-            )?,
-        )),
+    // Two routes, and the one that brings a database carries no credential at
+    // all: its passwords are generated in the cluster and the Job reads them
+    // from its own environment, so there is nothing here to seal and nothing
+    // for anybody to type, lose or reuse.
+    let database = match field("db_route").as_str() {
+        "brought" => RuntimeDatabaseAnswer {
+            serving: None,
+            migrating: None,
+            brought: Some(BroughtDatabase {
+                serving_role: field("db_serving_role"),
+                migrating_role: field("db_migrating_role"),
+                database: field("db_name"),
+            }),
+        },
+        _ => RuntimeDatabaseAnswer {
+            serving: Some(login(
+                "db",
+                &field("db_serving_role"),
+                seal_field(
+                    "runtime_database.serving.password",
+                    &field("db_serving_password"),
+                )?,
+            )),
+            migrating: Some(login(
+                "db",
+                &field("db_migrating_role"),
+                seal_field(
+                    "runtime_database.migrating.password",
+                    &field("db_migrating_password"),
+                )?,
+            )),
+            brought: None,
+        },
     };
 
     let backend = match field("backend").as_str() {
@@ -788,9 +804,21 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             "<h1>Set up this deployment</h1>{told}\
              <form method=\"post\">\
              <h2>Database</h2>\
-             <p>Two roles on one database: the migrating role may create a \
-             table and the serving role must not. Both are tested before \
-             anything is written.</p>\
+             <label>Database<select name=\"db_route\">\
+             <option value=\"external\">Use a database you already run</option>\
+             <option value=\"brought\">Start one inside this cluster</option>\
+             </select></label>\
+             <p><strong>Inside this cluster</strong> is for trying the \
+             product and for development. Nothing is asked of you: it is \
+             started here, and its roles and passwords are made here. It \
+             keeps its data if Meridian is removed and installed again. It \
+             loses everything if this cluster is deleted. Nobody backs it \
+             up.</p>\
+             <p><strong>A database you already run</strong> -- your own \
+             Postgres, one in Docker, a managed one from your cloud -- is \
+             what anything you depend on should use. It needs two roles: the \
+             migrating role may create a table and the serving role must \
+             not. Both are tested before anything is written.</p>\
              {}{}{}{}\
              {}{}\
              {}{}\

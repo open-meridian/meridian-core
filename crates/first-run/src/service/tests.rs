@@ -50,11 +50,16 @@ impl Cluster for Remembering {
         Ok(())
     }
 
-    async fn scale(&self, name: &str, replicas: u32) -> Result<(), crate::cluster::ClusterError> {
+    async fn scale(
+        &self,
+        kind: crate::cluster::Workload,
+        name: &str,
+        replicas: u32,
+    ) -> Result<(), crate::cluster::ClusterError> {
         self.done
             .lock()
             .unwrap()
-            .push(format!("scale {name} {replicas}"));
+            .push(format!("scale {kind:?} {name} {replicas}"));
         Ok(())
     }
 
@@ -76,6 +81,14 @@ impl Cluster for Remembering {
 /// Refuses whatever it is told to refuse, at the step named.
 struct Refusing(&'static str);
 
+impl crate::Provisioner for Refusing {
+    /// A test that reaches this wanted a database made and there is none, so
+    /// it says so rather than pretending one appeared.
+    fn provision(&self, _: &DatabaseLogin, _: &[u8], _: &crate::Provision) -> Result<(), String> {
+        Err("no database to provision in a test".into())
+    }
+}
+
 #[async_trait::async_trait]
 impl Cluster for Refusing {
     async fn put_secret(
@@ -92,7 +105,12 @@ impl Cluster for Refusing {
     ) -> Result<(), crate::cluster::ClusterError> {
         refuse_if(self.0, "egress")
     }
-    async fn scale(&self, _: &str, _: u32) -> Result<(), crate::cluster::ClusterError> {
+    async fn scale(
+        &self,
+        _: crate::cluster::Workload,
+        _: &str,
+        _: u32,
+    ) -> Result<(), crate::cluster::ClusterError> {
         refuse_if(self.0, "scale")
     }
     async fn restart(&self, _: &str) -> Result<(), crate::cluster::ClusterError> {
@@ -145,6 +163,8 @@ fn first_run(cluster: Box<dyn Cluster>, probe: Vec<String>) -> FirstRun {
         key: SealingKey::new("frk-1"),
         names: names(),
         cluster,
+        provisioner: Box::new(Refusing("provision")),
+        brought: None,
         probe: Box::new(Answers(probe)),
     }
 }
@@ -172,6 +192,7 @@ fn database(run: &FirstRun) -> RuntimeDatabaseAnswer {
             "runtime_database.migrating.password",
             "meridian_migrate",
         )),
+        brought: None,
     }
 }
 
@@ -432,6 +453,8 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         key: SealingKey::new("frk-1"),
         names: names(),
         cluster: Box::new(remembering),
+        provisioner: Box::new(Refusing("provision")),
+        brought: None,
         probe: Box::new(Answers(vec![])),
     };
     let configuration = FirstRunConfiguration {

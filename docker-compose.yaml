@@ -574,6 +574,20 @@ services:
       MERIDIAN_FIRST_RUN_BINDING: first-run
       MERIDIAN_FIRST_RUN_RESTART: first-run-conductor,first-run-dashboard
       MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY: first-run-zitadel,first-run-zitadel-login
+      # The database this chart can bring. In a cluster the Job scales a
+      # StatefulSet and then connects to it; here the stand-in Kubernetes
+      # records the scale and this points at a Postgres that is already
+      # running, so what is proven is the part that cannot be faked -- the
+      # databases, the roles and the grants it makes, and whether the URLs it
+      # writes can actually be connected with.
+      MERIDIAN_FIRST_RUN_BROUGHT_WORKLOAD: first-run-database
+      MERIDIAN_FIRST_RUN_BROUGHT_HOST: core-postgres
+      MERIDIAN_FIRST_RUN_BROUGHT_PORT: "5432"
+      MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER: meridian
+      MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD: meridian
+      MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD: brought-serving-dev-only
+      MERIDIAN_FIRST_RUN_BROUGHT_MIGRATING_PASSWORD: brought-migrating-dev-only
+      MERIDIAN_FIRST_RUN_BROUGHT_ZITADEL_PASSWORD: brought-zitadel-dev-only
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       fr-kube:
@@ -595,6 +609,14 @@ services:
       E2E_FIRST_RUN_CODE: FR-E2E-CODE
       E2E_FIRST_ADMIN_CODE: ADMIN-E2E-CODE
       E2E_DATABASE_PASSWORD: first-run-dev-only
+      # What the brought route should end up with, for the runner to connect
+      # with and for it to check nothing privileged was written.
+      E2E_BROUGHT_HOST: core-postgres
+      E2E_BROUGHT_SERVING_PASSWORD: brought-serving-dev-only
+      E2E_BROUGHT_MIGRATING_PASSWORD: brought-migrating-dev-only
+      E2E_BROUGHT_ZITADEL_PASSWORD: brought-zitadel-dev-only
+      E2E_SUPERUSER_PASSWORD: meridian
+      E2E_DB_ROUTE: ${E2E_DB_ROUTE:-external}
     volumes:
       - ./e2e/first-run:/e2e:ro
     networks: [meridian]
