@@ -160,6 +160,13 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
     if let Err(stale) = app.records.current(now) {
         return refused(&stale.to_string());
     }
+    if app.first_run {
+        // Somebody trying to sign in to a deployment nobody has set up yet is
+        // looking for the wizard, and the wizard is where a directory comes
+        // from. Refusing them with a sentence about configuration would be
+        // true and useless.
+        return redirect("/first-run");
+    }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
     };

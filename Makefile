@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard
+        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -29,7 +29,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -146,6 +146,28 @@ test-store: network
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
 	@echo "test-store OK: the three stores pass against Postgres, and the migration grants the serving role what it made"
+
+# First run, without a cluster: the wizard, the Job, and stand-ins for the two
+# things a deployment talks to while it is being set up.
+E2E_FIRST_RUN = $(COMPOSE) --profile first-run
+
+e2e-first-run: network
+	@rm -f .e2e-first-run.log
+	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
+	@set -e; \
+	$(E2E_FIRST_RUN) build dashboard-first-run conductor-first-run first-run >>.e2e-first-run.log 2>&1; \
+	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform >>.e2e-first-run.log 2>&1; \
+	$(E2E_FIRST_RUN) run --rm -T fr-database >>.e2e-first-run.log 2>&1; \
+	$(E2E_FIRST_RUN) up -d conductor-first-run dashboard-first-run first-run >>.e2e-first-run.log 2>&1; \
+	$(E2E_FIRST_RUN) run --rm -T fr-runner > .e2e-first-run.run.log 2>&1 \
+		|| { echo "e2e-first-run FAILED. The run:" >&2; tail -40 .e2e-first-run.run.log >&2; \
+		     $(E2E_FIRST_RUN) logs --no-color first-run dashboard-first-run conductor-first-run \
+		       > .e2e-first-run.services.log 2>&1; \
+		     echo "  services in .e2e-first-run.services.log" >&2; \
+		     $(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1; exit 1; }
+	@cat .e2e-first-run.run.log
+	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1
+	@echo "e2e-first-run OK: an install given nothing, made to serve"
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set key.generate=false --set database.existingSecret=d --set broker.existingSecret=b

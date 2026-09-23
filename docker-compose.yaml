@@ -426,7 +426,178 @@ services:
       - e2e-state:/state
     networks: [meridian]
 
+  # ── First run, without a cluster ────────────────────────────────────────────
+  #
+  # An install that was given nothing: no database, no directory, no broker
+  # credential of its own, no key. What stands in for a cluster is a
+  # Kubernetes API serving only the five calls first run may make, and a
+  # platform serving only the two a deployment makes while being set up.
+
+  fr-pki:
+    profiles: [first-run]
+    image: alpine/openssl:3.3.2
+    # The API server a pod reaches is TLS, and the code under test verifies
+    # it against the CA its service account carries. So the harness makes one.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        test -s /pki/tls.crt && exit 0
+        # A CA, and a serving certificate it signs: a cluster's own shape, and
+        # the client refuses a CA presented as the server it is verifying.
+        openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+          -subj "/CN=e2e-ca" -keyout /pki/ca.key -out /pki/ca.crt
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=fr-kube" \
+          -keyout /pki/tls.key -out /pki/tls.csr
+        printf 'subjectAltName=DNS:fr-kube\n' > /pki/ext.cnf
+        openssl x509 -req -in /pki/tls.csr -CA /pki/ca.crt -CAkey /pki/ca.key \
+          -CAcreateserial -days 30 -extfile /pki/ext.cnf -out /pki/tls.crt
+        printf 'e2e-token' > /pki/token
+        printf 'meridian' > /pki/namespace
+    volumes:
+      - fr-pki:/pki
+    networks: [meridian]
+
+  fr-kube:
+    profiles: [first-run]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/e2e/kube.py"]
+    depends_on:
+      fr-pki:
+        condition: service_completed_successfully
+    volumes:
+      - ./e2e/first-run:/e2e:ro
+      - fr-pki:/pki:ro
+    networks: [meridian]
+
+  fr-platform:
+    profiles: [first-run]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/e2e/platform.py"]
+    environment:
+      E2E_DEPLOYMENT_ID: DEP-first-run
+      E2E_PLATFORM_ADDRESS: http://fr-platform:8000
+      E2E_ENROLMENT_CODE: ENR-E2E-FIRST-RUN
+      E2E_FIRST_RUN_CODE: FR-E2E-CODE
+      E2E_FIRST_ADMIN_CODE: ADMIN-E2E-CODE
+    volumes:
+      - ./e2e/first-run:/e2e:ro
+    networks: [meridian]
+
+  # The database the wizard is going to be told about: two roles, one that may
+  # create a table and one that may not.
+  fr-database:
+    profiles: [first-run]
+    image: postgres:17-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        export PGPASSWORD=meridian
+        psql -h core-postgres -U meridian -d meridian -v ON_ERROR_STOP=0 \
+          -c "create database firstrun" \
+          -c "create database firstrun_zitadel" \
+          -c "create role firstrun_app login password 'first-run-dev-only'" \
+          -c "create role firstrun_migrate login password 'first-run-dev-only'" \
+          -c "create role firstrun_zitadel login password 'first-run-dev-only'" || true
+        psql -h core-postgres -U meridian -d firstrun -v ON_ERROR_STOP=1 \
+          -c "revoke create on schema public from public" \
+          -c "grant usage on schema public to firstrun_app" \
+          -c "grant create, usage on schema public to firstrun_migrate"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [meridian]
+
+  # The conductor, with no database: its configuration is in memory until the
+  # wizard applies one, which is the only way the wizard can run at all.
+  conductor-first-run:
+    profiles: [first-run]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-conductor"]
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: DEP-first-run
+      MERIDIAN_PLATFORM_ADDRESS: http://fr-platform:8000
+      MERIDIAN_ENROLMENT_CODE: ENR-E2E-FIRST-RUN
+      MERIDIAN_KEY_PATH: /var/lib/meridian/key.pem
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: conductor-first-run
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      nats:
+        condition: service_started
+      fr-platform:
+        condition: service_started
+    volumes:
+      - fr-keys:/var/lib/meridian
+    networks: [meridian]
+
+  dashboard-first-run:
+    profiles: [first-run]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-dashboard"]
+    environment:
+      MERIDIAN_DASHBOARD_URL: http://dashboard-first-run:8080
+      MERIDIAN_BROKER_URL: nats://dashboard-1:dashboard-1-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: dashboard-1
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      nats:
+        condition: service_started
+    networks: [meridian]
+
+  first-run:
+    profiles: [first-run]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-first-run"]
+    environment:
+      MERIDIAN_INSTANCE_ID: first-run
+      MERIDIAN_BROKER_URL: nats://first-run:first-run-dev-only@nats:4222
+      # What a pod finds, pointed at the stand-in.
+      KUBERNETES_SERVICE_HOST: fr-kube
+      KUBERNETES_SERVICE_PORT: "8443"
+      MERIDIAN_FIRST_RUN_DATABASE_SECRET: first-run-database
+      MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET: first-run-zitadel-database
+      MERIDIAN_FIRST_RUN_OIDC_SECRET: first-run-dashboard-oidc
+      MERIDIAN_FIRST_RUN_LDAP_SECRET: first-run-ldap-bind
+      MERIDIAN_FIRST_RUN_EGRESS_POLICY: first-run-egress
+      MERIDIAN_FIRST_RUN_BINDING: first-run
+      MERIDIAN_FIRST_RUN_RESTART: first-run-conductor,first-run-dashboard
+      MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY: first-run-zitadel,first-run-zitadel-login
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      fr-kube:
+        condition: service_started
+      nats:
+        condition: service_started
+    volumes:
+      - fr-pki:/var/run/secrets/kubernetes.io/serviceaccount:ro
+    networks: [meridian]
+
+  fr-runner:
+    profiles: [first-run]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/runner.py"]
+    environment:
+      DASHBOARD: http://dashboard-first-run:8080
+      PLATFORM: http://fr-platform:8000
+      KUBE: http://fr-kube:8080
+      E2E_FIRST_RUN_CODE: FR-E2E-CODE
+      E2E_FIRST_ADMIN_CODE: ADMIN-E2E-CODE
+      E2E_DATABASE_PASSWORD: first-run-dev-only
+    volumes:
+      - ./e2e/first-run:/e2e:ro
+    networks: [meridian]
+
 volumes:
+  fr-pki:
+  fr-keys:
   runtime-keys:
   e2e-bootstrap:
   e2e-state:
