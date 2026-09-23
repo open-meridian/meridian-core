@@ -165,6 +165,7 @@ fn first_run(cluster: Box<dyn Cluster>, probe: Vec<String>) -> FirstRun {
         cluster,
         provisioner: Box::new(Refusing("provision")),
         brought: None,
+        bundled_directory: true,
         probe: Box::new(Answers(probe)),
     }
 }
@@ -455,6 +456,7 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         cluster: Box::new(remembering),
         provisioner: Box::new(Refusing("provision")),
         brought: None,
+        bundled_directory: true,
         probe: Box::new(Answers(vec![])),
     };
     let configuration = FirstRunConfiguration {
@@ -495,4 +497,31 @@ fn a_zitadel_address_becomes_what_zitadel_calls_itself() {
             "{url}"
         );
     }
+}
+
+#[test]
+fn a_bundled_directory_this_chart_did_not_render_is_refused() {
+    // It used to pass every check and fail at the step that writes: Zitadel's
+    // database was made, and then the Secret to put its connection in did not
+    // exist, so applying stopped half done with the wizard closed behind it.
+    // Found on a cluster, where the chart's default is to render none.
+    let mut run = first_run(Box::new(Refusing("nothing")), vec![]);
+    run.bundled_directory = false;
+
+    let reply = run.check(&FirstRunCheckRequest {
+        answer: Some(Answer::LoginBackend(LoginBackendAnswer {
+            backend: Some(Backend::Bundled(BundledZitadelAnswer {
+                version: "v4.17.3".into(),
+                egress_cidrs: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            })),
+        })),
+    });
+
+    assert!(!reply.passed);
+    assert!(
+        reply.findings[0].contains("installed without the bundled directory"),
+        "{:?}",
+        reply.findings
+    );
 }

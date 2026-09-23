@@ -100,6 +100,11 @@ pub struct FirstRun {
     pub provisioner: Box<dyn Provisioner>,
     /// The database this chart can bring, when it renders one.
     pub brought: Option<BroughtServer>,
+    /// Whether this chart rendered the bundled directory.
+    ///
+    /// Told rather than inferred: the Job is given the workloads to scale
+    /// whether or not they exist, so the names it holds say nothing about it.
+    pub bundled_directory: bool,
 }
 
 /// A database and the roles that will live in it, made once.
@@ -229,6 +234,18 @@ impl FirstRun {
 
     fn check_backend(&self, backend: &LoginBackendAnswer) -> Vec<String> {
         match &backend.backend {
+            // Checked before its version and its ranges, because none of those
+            // matter if there is no directory here to configure. Choosing one
+            // the chart did not render used to pass every test and fail at the
+            // step that writes: Zitadel's database was made, and then the
+            // Secret to put its connection in did not exist, so applying
+            // stopped half done with the wizard already closed behind it.
+            Some(Backend::Bundled(_)) if !self.bundled_directory => vec![
+                "this deployment was installed without the bundled directory, so there is \
+                 none here to set up. Connect your own OpenID Connect provider, or \
+                 reinstall with identity.bundled.enabled."
+                    .into(),
+            ],
             Some(Backend::Bundled(bundled)) => {
                 let mut findings = Vec::new();
                 if bundled.version.trim().is_empty() {

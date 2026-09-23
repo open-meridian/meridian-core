@@ -153,6 +153,10 @@ spec:
               value: {{ join "," $restart | quote }}
             - name: MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY
               value: {{ join "," $bundled | quote }}
+            # Whether there is one to set up at all. The names above are given
+            # whether or not it was rendered, so they say nothing about it.
+            - name: MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY
+              value: {{ .Values.identity.bundled.enabled | quote }}
 {{- if .Values.database.brought.enabled }}
             # The database this chart can bring, and the passwords it makes
             # for the roles that will live in it. Read from this Job's own

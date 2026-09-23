@@ -73,6 +73,7 @@ fn run() -> Result<(), String> {
         probe: Box::new(Postgres),
         provisioner: Box::new(Postgres),
         brought: brought_server(),
+        bundled_directory: var("MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY").as_deref() == Some("true"),
     });
 
     tokio::runtime::Builder::new_multi_thread()

@@ -6,9 +6,9 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
-        e2e-first-run-brought \
+        e2e-first-run-brought e2e-cluster \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        zitadel-system-user \
+        zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
 
 help:
@@ -31,7 +31,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -64,6 +64,19 @@ check-test-targets:
 #
 # The key, not the word: the first version of this matched the string, and
 # the sentence explaining why the volume is a claim failed the gate.
+# The chart ships its own copy of the topic registry, because a cluster cannot
+# read meridian-design and the broker generates its permissions from it. A
+# second copy of a fact is a copy that goes stale, and this one did: the
+# registry gained a topic, deploy/topics.tsv was regenerated, the chart's was
+# not, and the deployment that came up refused its own conductor's
+# subscription with a permissions violation. Nothing compared them until now.
+check-chart-files:
+	@diff -q deploy/topics.tsv deploy/chart/files/topics.tsv >/dev/null \
+		|| { echo "check-chart-files FAILED: the chart's topic registry is not the one this repo uses" >&2; \
+		     diff deploy/topics.tsv deploy/chart/files/topics.tsv >&2; \
+		     echo "  cp deploy/topics.tsv deploy/chart/files/topics.tsv" >&2; exit 1; }
+	@echo "check-chart-files OK: the chart ships the topic registry this repo uses"
+
 check-local-storage:
 	@for f in deploy/local/*.yaml; do \
 		grep -Eq '^[[:space:]]*emptyDir:' "$$f" \
@@ -197,6 +210,51 @@ e2e-first-run: network
 # a failure says which route failed without anybody reading a log.
 e2e-first-run-brought:
 	@$(MAKE) --no-print-directory e2e-first-run E2E_DB_ROUTE=brought
+
+# Path 1 of the five: a real cluster, a real platform, and nobody in it.
+#
+# Not in ci-local. It wants a Kubernetes and the platform's compose, which a
+# runner does not have, and it is the only test here that stands nothing in --
+# the others use a Kubernetes that records calls without performing them and a
+# platform that implements three of its endpoints in Python. What it reaches
+# that they cannot is the wiring from the Job's Secret, through the chart's
+# environment, to the permission the conductor writes when it restarts.
+E2E_CLUSTER_NAMESPACE ?= meridian-e2e
+E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
+e2e-cluster:
+	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
+		|| { echo "e2e-cluster needs a cluster; point KUBECONFIG at one" >&2; exit 1; }
+	@test -f "$(PLATFORM)/docker-compose.yaml" \
+		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
+	@echo "e2e-cluster: building the image this cluster will run"
+	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	# A pod calls the platform host.docker.internal, so the platform has to
+	# admit that name and expect it as the audience a deployment signs for.
+	# Django refuses an unlisted Host before any view runs, which is a 400 with
+	# nothing in the application log -- the same 400 on every endpoint, which
+	# is what says it is not the endpoint.
+	@MERIDIAN_ALLOWED_HOSTS=localhost,127.0.0.1,site,host.docker.internal \
+	 MERIDIAN_EDGE_AUDIENCE=$(E2E_PLATFORM_FROM_POD) \
+	 docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
+		up -d --build --force-recreate site >/dev/null 2>&1
+	# Its schema, because a compose that starts the site does not apply one and
+	# the first command to touch a table is where that shows.
+	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
+		run --rm -T site python -m django migrate --settings platform_site.web.settings \
+		>/dev/null 2>&1 \
+		|| { echo "e2e-cluster: the platform's schema could not be applied" >&2; exit 1; }
+	@kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@E2E_NAMESPACE=$(E2E_CLUSTER_NAMESPACE) E2E_IMAGE=$(RUNTIME_IMAGE) PLATFORM=$(PLATFORM) \
+	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) \
+		$(PY) e2e/cluster/run.py; \
+	  held=$$?; \
+	  if [ $$held -ne 0 ]; then \
+	    echo "e2e-cluster: the namespace is left for reading. Remove it with:" >&2; \
+	    echo "  kubectl delete namespace $(E2E_CLUSTER_NAMESPACE)" >&2; \
+	  else \
+	    kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --wait >/dev/null 2>&1; \
+	  fi; \
+	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set key.generate=false --set database.existingSecret=d --set broker.existingSecret=b

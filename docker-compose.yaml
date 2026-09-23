@@ -574,6 +574,9 @@ services:
       MERIDIAN_FIRST_RUN_BINDING: first-run
       MERIDIAN_FIRST_RUN_RESTART: first-run-conductor,first-run-dashboard
       MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY: first-run-zitadel,first-run-zitadel-login
+      # Whether there is one to set up. The names above are given whether or
+      # not it was rendered, so they say nothing about it.
+      MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY: "true"
       # The database this chart can bring. In a cluster the Job scales a
       # StatefulSet and then connects to it; here the stand-in Kubernetes
       # records the scale and this points at a Postgres that is already
