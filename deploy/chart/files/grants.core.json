@@ -8,6 +8,7 @@
         "platform.config.event.person-signed-in",
         "platform.config.query.access-records",
         "platform.config.command.redeem-claim-code",
+        "platform.config.command.enrol-with-code",
         "platform.config.command.define-account",
         "platform.config.command.close-account",
         "platform.config.command.link-external-account",

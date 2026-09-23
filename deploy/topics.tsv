@@ -9,6 +9,7 @@ platform.config.command.define-access-group	command	admin	conductor
 platform.config.command.define-account	command	admin	conductor
 platform.config.command.define-account-group	command	admin	conductor
 platform.config.command.define-user-group	command	admin	conductor
+platform.config.command.enrol-with-code	command	admin	conductor
 platform.config.command.grant-permission	command	admin	conductor
 platform.config.command.link-external-account	command	admin	conductor
 platform.config.command.redeem-claim-code	command	admin	conductor

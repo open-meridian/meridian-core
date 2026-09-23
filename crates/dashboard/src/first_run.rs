@@ -33,11 +33,12 @@ use meridian_domain::v1::first_run_check_request::Answer as CheckAnswer;
 use meridian_domain::v1::login_backend_answer::Backend;
 use meridian_domain::v1::zitadel_database_answer::Route;
 use meridian_domain::v1::{
-    AddressesAnswer, BundledZitadelAnswer, ClaimCodePurpose, DatabaseLogin, EnrolmentState,
-    EnrolmentStateRequest, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
-    FirstRunConfiguration, FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer,
-    LocalAccountAnswer, LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply,
-    RedeemClaimCodeRequest, RuntimeDatabaseAnswer, SealedCredential, ZitadelDatabaseAnswer,
+    administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BundledZitadelAnswer,
+    ClaimCodePurpose, DatabaseLogin, EnrolmentState, EnrolmentStateRequest, FirstRunApplied,
+    FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration, FirstRunSealingKey,
+    FirstRunSealingKeyRequest, LdapDirectoryAnswer, LocalAccountAnswer, LoginBackendAnswer,
+    OidcProviderAnswer, RedeemClaimCodeReply, RedeemClaimCodeRequest, RuntimeDatabaseAnswer,
+    SealedCredential, ZitadelDatabaseAnswer,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -434,6 +435,7 @@ struct Answers {
     database: RuntimeDatabaseAnswer,
     backend: LoginBackendAnswer,
     addresses: AddressesAnswer,
+    administrator: AdministratorAnswer,
 }
 
 impl Answers {
@@ -451,6 +453,7 @@ impl Answers {
             runtime_database: Some(self.database.clone()),
             login_backend: Some(self.backend.clone()),
             addresses: Some(self.addresses.clone()),
+            administrator: Some(self.administrator.clone()),
         }
     }
 }
@@ -575,7 +578,36 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
             dashboard_url: field("dashboard_url"),
             zitadel_url: field("zitadel_url"),
         },
+        administrator: administrator(fields),
     })
+}
+
+/// Who administers this deployment once it is configured (W7.5).
+///
+/// One of two, and the form offers exactly the one that applies: on the
+/// bundled directory with a local account, that account is the administrator
+/// and there is nothing to ask twice; otherwise a directory group, because a
+/// person cannot be named before they have signed in once -- a login is
+/// matched against the issuer and subject joined, which nobody knows in
+/// advance (`design/naming-a-person-before-they-sign-in`).
+fn administrator(fields: &Fields) -> AdministratorAnswer {
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .trim()
+    };
+
+    // The local account route names itself. The wizard is already asking for
+    // that login and password on this page, and asking again for the same
+    // fact is how two answers come to disagree.
+    let named = match (field("directory"), field("admin_login")) {
+        ("local", login) if !login.is_empty() => Named::LocalAccountLogin(login.to_string()),
+        _ => Named::DirectoryGroup(field("admin_group").to_string()),
+    };
+
+    AdministratorAnswer { named: Some(named) }
 }
 
 fn split(value: &str) -> Vec<String> {
@@ -651,14 +683,27 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
              {}{}{}{}\
              {}{}{}{}\
              {}{}{}\
+             <h2>Administrators</h2>\
+             <p>Who runs this deployment once it is set up. With a directory, \
+             name a group: its members hold deployment admin, and adding \
+             somebody later is a change in your directory rather than here. \
+             With no directory, the account above is the administrator and \
+             this is left empty.</p>\
+             <p>A group is checked against LDAP and the bundled directory. \
+             Against your own OpenID Connect provider it cannot be checked: \
+             a provider states a person's groups inside their own token, and \
+             listing a directory's groups is a separate interface for every \
+             vendor. Spell it carefully there.</p>\
+             {}\
              <h2>Addresses</h2>\
              <p>Where a browser reaches this deployment. The directory sends \
              people back to the first of them.</p>\
              {}{}\
              <h2>Apply</h2>\
              <p>Test as often as you like: nothing is written until you apply. \
-             Applying writes it all at once, restarts what changed, and shows \
-             your first administrator's code once.</p>\
+             Applying writes it all at once and restarts what changed. When \
+             it is done, the administrators named above sign in through the \
+             directory you configured; nothing else is redeemed.</p>\
              <button type=\"submit\" formaction=\"/first-run/check\">Test</button>\
              <button type=\"submit\" formaction=\"/first-run/apply\">Apply</button>\
              </form>",
@@ -701,6 +746,11 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             text("oidc_issuer", "Issuer", "https://directory.firm.example"),
             text("oidc_client_id", "Client id", ""),
             secret("oidc_client_secret", "Client secret"),
+            text(
+                "admin_group",
+                "Administrators' directory group",
+                "meridian-admins"
+            ),
             text(
                 "dashboard_url",
                 "This dashboard",

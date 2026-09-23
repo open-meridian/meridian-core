@@ -16,9 +16,9 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::{
-    first_run_check_request::Answer, login_backend_answer::Backend, AddressesAnswer, DatabaseLogin,
-    FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration,
-    LoginBackendAnswer, RuntimeDatabaseAnswer,
+    administrator_answer::Named, first_run_check_request::Answer, login_backend_answer::Backend,
+    AddressesAnswer, AdministratorAnswer, DatabaseLogin, FirstRunApplied, FirstRunCheckReply,
+    FirstRunCheckRequest, FirstRunConfiguration, LoginBackendAnswer, RuntimeDatabaseAnswer,
 };
 
 use crate::cluster::Cluster;
@@ -92,6 +92,7 @@ impl FirstRun {
             Some(Answer::RuntimeDatabase(database)) => self.check_database(database),
             Some(Answer::LoginBackend(backend)) => self.check_backend(backend),
             Some(Answer::Addresses(addresses)) => check_addresses(addresses),
+            Some(Answer::Administrator(administrator)) => check_administrator(administrator),
             None => vec!["nothing to check".into()],
         };
         FirstRunCheckReply {
@@ -178,6 +179,14 @@ impl FirstRun {
                 .login_backend
                 .clone()
                 .map(Answer::LoginBackend),
+            // Named rather than optional: a configuration that names no
+            // administrator produces a deployment nobody can administer,
+            // which is recovered only with a claim code from the platform
+            // (decisions/017). Refusing it costs a sentence now and saves an
+            // afternoon after the components have restarted.
+            Some(Answer::Administrator(
+                configuration.administrator.clone().unwrap_or_default(),
+            )),
         ]
         .into_iter()
         .flatten()
@@ -486,6 +495,40 @@ fn encode(value: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+/// W7.4. Whether anybody will be able to administer this deployment.
+///
+/// Shape only, as the checks beside it are. Asking a directory whether a group
+/// exists is not done here and is not pretended: against LDAP and the bundled
+/// Zitadel it can be asked and should be, which is
+/// `kernel/first-run-names-the-administrator`; against a firm's own OIDC
+/// provider it cannot be at all, because a provider asserts a person's groups
+/// inside their own token and listing a directory's groups is a separate API
+/// per vendor (spec/installation-and-first-run, requirement 13).
+///
+/// What is caught here is the case worth catching without a directory: nobody
+/// named. That produces a configured deployment with no administrator, which
+/// is recovered only with a claim code from the platform, and it is far
+/// cheaper to refuse now than to discover after the components have restarted.
+fn check_administrator(administrator: &AdministratorAnswer) -> Vec<String> {
+    let named = |what: &str, value: &String| match value.trim().is_empty() {
+        true => vec![format!(
+            "the {what} naming this deployment's administrators is empty, so nobody would \
+             administer it"
+        )],
+        false => Vec::new(),
+    };
+
+    match &administrator.named {
+        Some(Named::DirectoryGroup(group)) => named("directory group", group),
+        Some(Named::LocalAccountLogin(login)) => named("login", login),
+        None => vec![
+            "nobody is named to administer this deployment. Name a directory group whose \
+             members administer it, or the local account being created."
+                .into(),
+        ],
+    }
 }
 
 fn check_addresses(addresses: &AddressesAnswer) -> Vec<String> {

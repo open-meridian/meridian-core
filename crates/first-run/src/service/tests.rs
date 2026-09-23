@@ -6,6 +6,15 @@ use meridian_domain::v1::{
 };
 
 use super::*;
+
+/// An administrator for a configuration under test. Every configuration needs
+/// one: a deployment nobody can administer is recovered only with a claim code
+/// from the platform, so the Job refuses to write one (decisions/017).
+fn administrator(group: &str) -> AdministratorAnswer {
+    AdministratorAnswer {
+        named: Some(Named::DirectoryGroup(group.into())),
+    }
+}
 use crate::sealing::seal;
 
 /// Remembers what it was asked to do, and answers yes.
@@ -250,6 +259,7 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
     let seen = cluster as Box<dyn Cluster>;
     let run = first_run(seen, vec![]);
     let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
             backend: Some(Backend::Bundled(BundledZitadelAnswer {
@@ -309,6 +319,7 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
 async fn a_failed_step_keeps_the_rights_and_says_where_it_stopped() {
     let run = first_run(Box::new(Refusing("restart")), vec![]);
     let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
             backend: Some(Backend::Oidc(OidcProviderAnswer {
@@ -335,6 +346,7 @@ async fn a_failed_step_keeps_the_rights_and_says_where_it_stopped() {
 async fn the_firms_own_directory_leaves_the_bundle_at_zero() {
     let run = first_run(Box::new(Remembering::default()), vec![]);
     let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
             backend: Some(Backend::Oidc(OidcProviderAnswer {
@@ -423,6 +435,7 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         probe: Box::new(Answers(vec![])),
     };
     let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
             backend: Some(Backend::Oidc(OidcProviderAnswer {

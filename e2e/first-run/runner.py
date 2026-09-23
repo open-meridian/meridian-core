@@ -43,6 +43,10 @@ ANSWERS = {
     "directory": "local", "admin_login": "ada", "admin_password": "Password1!",
     "dashboard_url": "http://dashboard-first-run:8080",
     "zitadel_url": "http://zitadel:8080",
+    # W7.5: who administers this deployment once it is configured. The local
+    # account route names itself, so this stays empty there and the wizard
+    # sends the account it is creating.
+    "admin_group": "",
 }
 
 
@@ -208,6 +212,13 @@ def main():
             "and the Job deleted its own binding, so nothing keeps its rights")
     s.check(state["refused"] == [],
             f"it asked for nothing else: {state['refused']}")
+
+    print("G: the administrator the wizard named", flush=True)
+    # Decisions/017: applying writes the permission, and nothing is redeemed
+    # for it afterwards. The local-account route names the account the wizard
+    # creates, so nobody types a login twice.
+    s.check("first-run/claim" not in page,
+            "the applied page does not send anybody back to redeem anything")
 
     print("G: what the platform was told", flush=True)
     calls = json_at(f"{PLATFORM}/e2e/calls")

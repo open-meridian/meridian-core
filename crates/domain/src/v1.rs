@@ -1500,9 +1500,68 @@ pub struct AddressesAnswer {
     #[prost(string, tag = "2")]
     pub zitadel_url: ::prost::alloc::string::String,
 }
+/// Who holds deployment admin once the configuration is applied
+/// (spec/installation-and-first-run, requirement 13; decisions/017).
+///
+/// Named here rather than claimed afterwards. Whoever answers this wizard has
+/// already chosen the deployment's directory, so a code standing between them
+/// and a permission they could take anyway is a ceremony; and on the bundled
+/// route the wizard was already asking for that administrator's login and
+/// password, so the same fact was established twice.
+///
+/// What is written is an ordinary permission -- a user group naming this, and
+/// a permission from it to the built-in deployment-admin access group -- so it
+/// is audited by reading the same table as every other grant.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AdministratorAnswer {
+    #[prost(oneof = "administrator_answer::Named", tags = "1, 2")]
+    pub named: ::core::option::Option<administrator_answer::Named>,
+}
+/// Nested message and enum types in `AdministratorAnswer`.
+pub mod administrator_answer {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Named {
+        /// A directory group whose members hold deployment admin. Onboarding then
+        /// stays a change in the firm's directory rather than in Meridian.
+        ///
+        /// Tested where the directory can be asked, which is LDAP and the bundled
+        /// Zitadel. Against a firm's own OIDC provider it cannot be: a provider
+        /// asserts a person's groups inside their own token, and listing a
+        /// directory's groups is a separate API per vendor with its own
+        /// registration and credentials. Taken unverified there, and a claim code
+        /// recovers a deployment left with nobody who can administer it.
+        #[prost(string, tag = "1")]
+        DirectoryGroup(::prost::alloc::string::String),
+        /// The local account the bundled route already creates, by its login.
+        /// Nothing is typed twice and nothing is matched later: the wizard makes
+        /// the account, so the deployment knows exactly whose it is.
+        ///
+        /// Naming an individual is possible only here. Everywhere else a person is
+        /// matched by the identity built at sign-in, which is the issuer and the
+        /// provider's subject joined, and nobody can state that before they have
+        /// signed in once (\[[design/naming-a-person-before-they-sign-in]\]).
+        #[prost(string, tag = "2")]
+        LocalAccountLogin(::prost::alloc::string::String),
+    }
+}
+/// A new enrolment code, handed to the conductor from the wizard's first page.
+///
+/// Requirement 9: a code that expired or was already spent leaves a deployment
+/// running and unenrolled, and a new one is entered in the wizard with nothing
+/// reinstalled. It carries no session and can carry none -- a deployment with
+/// no key cannot sign, so nothing it might present could be checked, and the
+/// code is itself the credential, which is what it was designed to be.
+///
+/// The reply is EnrolmentState: the same answer the wizard's first page already
+/// shows, so a retry and a page load cannot disagree about what happened.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnrolWithCodeRequest {
+    #[prost(string, tag = "1")]
+    pub code: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FirstRunCheckRequest {
-    #[prost(oneof = "first_run_check_request::Answer", tags = "1, 2, 3")]
+    #[prost(oneof = "first_run_check_request::Answer", tags = "1, 2, 3, 4")]
     pub answer: ::core::option::Option<first_run_check_request::Answer>,
 }
 /// Nested message and enum types in `FirstRunCheckRequest`.
@@ -1515,6 +1574,8 @@ pub mod first_run_check_request {
         LoginBackend(super::LoginBackendAnswer),
         #[prost(message, tag = "3")]
         Addresses(super::AddressesAnswer),
+        #[prost(message, tag = "4")]
+        Administrator(super::AdministratorAnswer),
     }
 }
 /// A pass, or what failed. Each finding names the check and the fix, and never
@@ -1536,6 +1597,11 @@ pub struct FirstRunConfiguration {
     pub login_backend: ::core::option::Option<LoginBackendAnswer>,
     #[prost(message, optional, tag = "3")]
     pub addresses: ::core::option::Option<AddressesAnswer>,
+    /// Required. A configuration that names nobody produces a deployment nobody
+    /// can administer, which is recoverable only with a claim code, so the Job
+    /// refuses it rather than writing it.
+    #[prost(message, optional, tag = "4")]
+    pub administrator: ::core::option::Option<AdministratorAnswer>,
 }
 /// What the Job did, step by step. Applying the same configuration again
 /// completes a partial one.
