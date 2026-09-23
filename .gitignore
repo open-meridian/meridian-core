@@ -24,3 +24,8 @@ deploy/nats/dev.conf
 
 # Written and removed by `make check-codegen`.
 .codegen-scratch/
+
+# Both halves of the e2e Zitadel system user, made fresh by
+# `make zitadel-system-user`. A committed public half whose private half is
+# ignored is a pair that works only on the machine that made it.
+e2e/zitadel/system-user.pub

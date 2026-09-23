@@ -7,6 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
+        zitadel-system-user \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
 
 help:
@@ -537,7 +538,27 @@ E2E := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-plat
 	$(COMPOSE) --profile e2e
 LDAP_ADMIN := -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
 
-e2e-dashboard: network
+# The system API user that Zitadel admits the setup step as, made fresh per run.
+#
+# It used to be a keypair somebody generated once by hand. The private half is
+# a credential, so `.gitignore` kept it out of the repository -- and the public
+# half was committed, which left a pair that works only on the machine that
+# made it. Every local run was green and CI was red for ten commits in a row,
+# waiting 180 seconds for a file that was never going to exist there.
+#
+# Both halves are generated here and both are ignored, so there is no way for
+# the repository to hold one without the other. Readable by anyone, because it
+# is a throwaway key for a Zitadel that lives for the length of one test.
+zitadel-system-user:
+	@$(DOCKER) run --rm -v "$(CURDIR)/e2e/zitadel":/k -w /k \
+		rust:$(RUST_VERSION)-slim-bookworm \
+		sh -c 'openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -quiet \
+		         -out system-user.key \
+		       && openssl pkey -in system-user.key -pubout -out system-user.pub \
+		       && chmod 644 system-user.key system-user.pub'
+	@echo "zitadel-system-user: a fresh keypair for this run"
+
+e2e-dashboard: network zitadel-system-user
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
 		--grants /w/deploy/nats/dev-grants.json \
