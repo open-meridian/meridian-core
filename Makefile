@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
-        e2e-first-run-brought e2e-cluster \
+        e2e-first-run-brought e2e-cluster e2e-cluster-external \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -220,6 +220,13 @@ e2e-first-run-brought:
 # that they cannot is the wiring from the Job's Secret, through the chart's
 # environment, to the permission the conductor writes when it restarts.
 E2E_CLUSTER_NAMESPACE ?= meridian-e2e
+E2E_EXTERNAL_CONTAINER ?= meridian-e2e-database
+E2E_EXTERNAL_PORT ?= 15440
+E2E_EXTERNAL_PASSWORD ?= e2e-dev-only
+# Its own name: E2E_DB_ROUTE is the compose run's and defaults to `external`
+# there, so sharing it would have made `make e2e-cluster` quietly take the
+# route nobody asked it for.
+E2E_CLUSTER_ROUTE ?= brought
 E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
 e2e-cluster:
 	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
@@ -245,7 +252,9 @@ e2e-cluster:
 		|| { echo "e2e-cluster: the platform's schema could not be applied" >&2; exit 1; }
 	@kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_CLUSTER_NAMESPACE) E2E_IMAGE=$(RUNTIME_IMAGE) PLATFORM=$(PLATFORM) \
-	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) \
+	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \
+	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
+	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ]; then \
@@ -254,6 +263,35 @@ e2e-cluster:
 	  else \
 	    kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --wait >/dev/null 2>&1; \
 	  fi; \
+	  exit $$held
+
+# Path 2: the same run, against a database somebody already runs.
+#
+# A container outside the cluster, which is what a firm's own Postgres, a
+# managed one from a cloud and one in Docker all look like from in here: a
+# host and a port with two roles already on it. The roles are made before any
+# of this, by the statements a firm's database administrator would run, which
+# is the half of this route the deployment never does.
+e2e-cluster-external:
+	@docker rm -f $(E2E_EXTERNAL_CONTAINER) >/dev/null 2>&1 || true
+	@docker run -d --name $(E2E_EXTERNAL_CONTAINER) \
+		-e POSTGRES_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
+		-p $(E2E_EXTERNAL_PORT):5432 postgres:16-alpine >/dev/null
+	@until docker exec $(E2E_EXTERNAL_CONTAINER) pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -v ON_ERROR_STOP=1 \
+		-c "create database meridian" \
+		-c "create database zitadel" \
+		-c "create role meridian_app login password '$(E2E_EXTERNAL_PASSWORD)'" \
+		-c "create role meridian_migrate login password '$(E2E_EXTERNAL_PASSWORD)'" \
+		-c "create role zitadel login password '$(E2E_EXTERNAL_PASSWORD)'" \
+		-c "alter database zitadel owner to zitadel" >/dev/null
+	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -d meridian -v ON_ERROR_STOP=1 \
+		-c "grant usage on schema public to meridian_app, meridian_migrate" \
+		-c "grant create on schema public to meridian_migrate" \
+		-c "revoke create on schema public from meridian_app, public" >/dev/null
+	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_ROUTE=external; \
+	  held=$$?; \
+	  docker rm -f $(E2E_EXTERNAL_CONTAINER) >/dev/null 2>&1 || true; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2

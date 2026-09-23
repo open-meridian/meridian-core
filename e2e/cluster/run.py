@@ -42,6 +42,16 @@ PLATFORM_FROM_HERE = os.environ.get("E2E_PLATFORM_FROM_HERE", "http://127.0.0.1:
 # deployment and was told no -- correctly.
 RUN = os.environ.get("E2E_RUN", str(int(time.time())))
 
+# Which of the wizard's two database routes this run takes. `brought` starts
+# the Postgres the chart ships; `external` points at one somebody already
+# runs, which here is a container outside the cluster -- a firm's own
+# database, a managed one from a cloud, or one in Docker like this.
+ROUTE = os.environ.get("E2E_DB_ROUTE", "brought")
+EXTERNAL_HOST = os.environ.get("E2E_EXTERNAL_HOST", "host.docker.internal")
+EXTERNAL_PORT = os.environ.get("E2E_EXTERNAL_PORT", "15440")
+EXTERNAL_CONTAINER = os.environ.get("E2E_EXTERNAL_CONTAINER", "meridian-e2e-database")
+EXTERNAL_PASSWORD = os.environ.get("E2E_EXTERNAL_PASSWORD", "e2e-dev-only")
+
 PORT = int(os.environ.get("E2E_PORT", "18480"))
 WIZARD = f"http://127.0.0.1:{PORT}"
 
@@ -74,16 +84,20 @@ def kubectl(*args):
 
 
 def psql(sql, database="meridian"):
-    """A query, or "" when it cannot be answered yet.
+    """A query against whichever database this deployment was given.
 
-    Waiting for a schema means asking for a table that does not exist, and a
-    helper that raised there turned "not yet" into "stop" -- which is how the
-    first run of this ended, on a relation the conductor had not made.
+    Returns "" when it cannot be answered yet. Waiting for a schema means
+    asking for a table that does not exist, and a helper that raised there
+    turned "not yet" into "stop" -- which is how the first run of this ended,
+    on a relation the conductor had not made.
     """
+    if ROUTE == "brought":
+        where = ["kubectl", "--namespace", NAMESPACE, "exec",
+                 f"{RELEASE}-meridian-runtime-database-0", "--"]
+    else:
+        where = ["docker", "exec", EXTERNAL_CONTAINER]
     done = subprocess.run(
-        ["kubectl", "--namespace", NAMESPACE, "exec",
-         f"{RELEASE}-meridian-runtime-database-0", "--",
-         "psql", "-U", "postgres", "-d", database, "-Atc", sql],
+        [*where, "psql", "-U", "postgres", "-d", database, "-Atc", sql],
         capture_output=True,
         text=True,
     )
@@ -246,9 +260,9 @@ def main():
         # Nothing else in this run proves enrolment as directly.
         s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
 
-        print("E: applied, on a database it brings", flush=True)
+        print(f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}", flush=True)
         answers = {
-            "db_route": "brought",
+            "db_route": ROUTE,
             "db_name": "meridian",
             "db_serving_role": "meridian_app",
             "db_migrating_role": "meridian_migrate",
@@ -261,6 +275,26 @@ def main():
             "admin_given_name": "Ada",
             "admin_password": "Password1!",
             "admin_group": "",
+            **(
+                {}
+                if ROUTE == "brought"
+                else {
+                    # A database somebody already runs, reached by the name a
+                    # pod can resolve. Its two roles were made before any of
+                    # this, as a firm's own database administrator would.
+                    "db_host": EXTERNAL_HOST,
+                    "db_port": EXTERNAL_PORT,
+                    "db_sslmode": "disable",
+                    "db_serving_password": EXTERNAL_PASSWORD,
+                    "db_migrating_password": EXTERNAL_PASSWORD,
+                    "zitadel_db_host": EXTERNAL_HOST,
+                    "zitadel_db_port": EXTERNAL_PORT,
+                    "zitadel_db_name": "zitadel",
+                    "zitadel_db_role": "zitadel",
+                    "zitadel_db_password": EXTERNAL_PASSWORD,
+                    "zitadel_db_sslmode": "disable",
+                }
+            ),
             "dashboard_url": WIZARD,
             "zitadel_url": f"http://{RELEASE}-meridian-runtime-zitadel.{NAMESPACE}.svc.cluster.local:8080",
         }
@@ -275,16 +309,26 @@ def main():
     finally:
         forward.terminate()
 
-    print("F: the database it brought", flush=True)
-    wait_for(
-        "the database",
-        lambda: "1/1" in kubectl("get", "pods", "-l", "meridian.dev/component=database", "--no-headers"),
-        seconds=300,
-    )
-    s.check(True, "a Postgres that did not exist before the wizard is running")
+    print("F: the database", flush=True)
+    if ROUTE == "brought":
+        wait_for(
+            "the database",
+            lambda: "1/1"
+            in kubectl("get", "pods", "-l", "meridian.dev/component=database", "--no-headers"),
+            seconds=300,
+        )
+        s.check(True, "a Postgres that did not exist before the wizard is running")
+    else:
+        s.check(
+            kubectl("get", "pods", "-l", "meridian.dev/component=database", "--no-headers") == "",
+            "the Postgres this chart could have brought was left at zero, unasked for",
+        )
     roles = psql("select rolname from pg_roles where rolname like 'meridian\\_%'")
     s.note(f"roles: {roles.split()}")
-    s.check("meridian_app" in roles and "meridian_migrate" in roles, "with both roles made")
+    s.check(
+        "meridian_app" in roles and "meridian_migrate" in roles,
+        "with both roles" + (" made" if ROUTE == "brought" else " it was pointed at"),
+    )
     s.check(
         psql("select has_schema_privilege('meridian_app','public','CREATE')") == "f",
         "and the serving role may not create tables",
