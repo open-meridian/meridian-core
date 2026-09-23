@@ -17,6 +17,7 @@
 {{- $zitadelDatabase := .Values.identity.bundled.databaseSecretName }}
 {{- $oidc := printf "%s-dashboard-oidc" $full }}
 {{- $ldap := .Values.identity.bundled.ldap.bindPasswordSecret | default (printf "%s-ldap-bind" $full) }}
+{{- $addresses := .Values.identity.bundled.addressesSecretName }}
 {{- $egress := printf "%s-zitadel-egress" .Release.Name }}
 {{- $restart := list (printf "%s-conductor" $full) (printf "%s-dashboard" $full) }}
 {{- $bundled := list (printf "%s-zitadel" .Release.Name) (printf "%s-zitadel-login" .Release.Name) }}
@@ -40,7 +41,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: [{{ $database | quote }}, {{ $zitadelDatabase | quote }}, {{ $oidc | quote }}, {{ $ldap | quote }}]
+    resourceNames: [{{ $database | quote }}, {{ $zitadelDatabase | quote }}, {{ $oidc | quote }}, {{ $ldap | quote }}, {{ $addresses | quote }}]
     verbs: ["get", "update", "patch"]
   # The one security resource it may change: the ranges the bundled Zitadel
   # may reach, which the administrator confirms in the wizard. It could widen
@@ -131,6 +132,8 @@ spec:
               value: {{ $oidc | quote }}
             - name: MERIDIAN_FIRST_RUN_LDAP_SECRET
               value: {{ $ldap | quote }}
+            - name: MERIDIAN_FIRST_RUN_ADDRESSES_SECRET
+              value: {{ $addresses | quote }}
             - name: MERIDIAN_FIRST_RUN_EGRESS_POLICY
               value: {{ $egress | quote }}
             - name: MERIDIAN_FIRST_RUN_BINDING

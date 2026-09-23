@@ -256,6 +256,10 @@ identity:
     # reads the public half through the mount in zitadel.extraVolumes below,
     # so the two names have to agree.
     systemUserSecretName: meridian-identity-system-user
+    # Where a browser reaches this deployment, written by first run and read by
+    # the dashboard, by Zitadel and by the setup Job. Its name is a value
+    # because Zitadel's own env references it below, and those are values.
+    addressesSecretName: meridian-addresses
 
 # The bundled Zitadel's own chart. Only what Meridian needs is set here; any of
 # Zitadel's chart values may be added.
@@ -307,6 +311,28 @@ zitadel:
     # egress is what limits it back to the hook, its database and directory.
     - name: ZITADEL_HTTPCLIENT_DENYLIST
       value: "169.254.0.0/16"
+    # What Zitadel calls itself, which it puts in every token it issues. The
+    # wizard is what learns it, so these come from what first run wrote rather
+    # than from configmapConfig below; an administrator who set the address
+    # there keeps it, because a value present wins over an absent key.
+    - name: ZITADEL_EXTERNALDOMAIN
+      valueFrom:
+        secretKeyRef:
+          name: meridian-addresses
+          key: zitadel-external-domain
+          optional: true
+    - name: ZITADEL_EXTERNALPORT
+      valueFrom:
+        secretKeyRef:
+          name: meridian-addresses
+          key: zitadel-external-port
+          optional: true
+    - name: ZITADEL_EXTERNALSECURE
+      valueFrom:
+        secretKeyRef:
+          name: meridian-addresses
+          key: zitadel-external-secure
+          optional: true
   # Where Zitadel reads the system API user's certificate from. Its name is
   # identity.bundled.systemUserSecretName above.
   extraVolumes:

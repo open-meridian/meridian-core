@@ -373,7 +373,7 @@ chart-check:
 	echo "$$role" | grep -qE 'verbs:.*(create|list|watch|delete|\*)' \
 		&& { echo "chart-check FAILED: the setup Job may do more than read and update its two Secrets" >&2; exit 1; }; \
 	for refused in "zitadel.image.tag=" "zitadel.login.image.tag=v4.17.4" "zitadel.image.tag=v4.15.3" \
-		"zitadel.zitadel.configmapConfig.ExternalDomain=" "dashboard.enabled=false" "identity.bundled.egress.allowCidrs=null" \
+		"dashboard.enabled=false" "identity.bundled.egress.allowCidrs=null" \
 		"identity.bundled.ldap.enabled=true"; do \
 		if $(HELM) template check deploy/chart $(CHART_VALUES) $$bundled --set $$refused >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the bundled Zitadel rendered with $$refused" >&2; exit 1; \
@@ -395,6 +395,18 @@ chart-check:
 		|| { echo "chart-check FAILED: first run cannot delete its own binding, so it never gives up its rights" >&2; exit 1; }; \
 	echo "$$role" | grep -c 'resourceNames:' | grep -qv '^0$$' \
 		|| { echo "chart-check FAILED: a first-run rule names no resource" >&2; exit 1; }; true
+	@# The address is the wizard's to learn, so the chart renders without one
+	@# and the dashboard, Zitadel and the setup Job read what first run wrote.
+	@without="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url= --set identity.bundled.enabled=true \
+		--set zitadel.image.tag=v4.17.3 --set zitadel.login.image.tag=v4.17.3 \
+		--set identity.bundled.egress.allowCidrs={10.0.0.0/8} 2>/dev/null)"; \
+	echo "$$without" | grep -q 'key: zitadel-external-domain' \
+		|| { echo "chart-check FAILED: with no address in values, nothing reads the one the wizard wrote" >&2; exit 1; }; \
+	echo "$$without" | grep -q 'key: issuer' \
+		|| { echo "chart-check FAILED: the dashboard does not read the issuer first run wrote" >&2; exit 1; }; \
+	echo "$$without" | grep -q 'key: dashboard-url' \
+		|| { echo "chart-check FAILED: the dashboard does not read the address first run wrote" >&2; exit 1; }; true
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \

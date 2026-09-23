@@ -123,6 +123,7 @@ fn names() -> Names {
         zitadel_database_secret: "m-zitadel-database".into(),
         dashboard_oidc_secret: "m-dashboard-oidc".into(),
         ldap_bind_secret: "m-ldap-bind".into(),
+        addresses_secret: "m-addresses".into(),
         zitadel_egress_policy: "m-zitadel-egress".into(),
         own_binding: "m-first-run".into(),
         restart: vec!["m-conductor".into(), "m-dashboard".into()],
@@ -294,7 +295,13 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
     assert!(applied.rights_released);
     assert_eq!(
         applied.steps,
-        vec!["secrets", "identity", "restart", "rights released"]
+        vec![
+            "secrets",
+            "identity",
+            "addresses",
+            "restart",
+            "rights released"
+        ]
     );
 }
 
@@ -320,7 +327,7 @@ async fn a_failed_step_keeps_the_rights_and_says_where_it_stopped() {
         !applied.rights_released,
         "a partial apply has to be retryable"
     );
-    assert_eq!(applied.steps, vec!["secrets", "identity"]);
+    assert_eq!(applied.steps, vec!["secrets", "identity", "addresses"]);
     assert!(applied.refusal_reason.contains("restart"));
 }
 
@@ -404,4 +411,52 @@ fn a_privileged_connection_creates_nothing_during_a_check() {
     // The cluster would have refused any write, and the check passes: it made
     // none. Testing "create this" is not creating it (requirement 14).
     assert!(reply.passed, "{:?}", reply.findings);
+}
+
+#[tokio::test]
+async fn the_addresses_are_written_as_the_components_read_them() {
+    let remembering = Remembering::default();
+    let run = FirstRun {
+        key: SealingKey::new("frk-1"),
+        names: names(),
+        cluster: Box::new(remembering),
+        probe: Box::new(Answers(vec![])),
+    };
+    let configuration = FirstRunConfiguration {
+        runtime_database: Some(database(&run)),
+        login_backend: Some(LoginBackendAnswer {
+            backend: Some(Backend::Oidc(OidcProviderAnswer {
+                issuer: "https://directory.firm.example".into(),
+                client_id: "meridian".into(),
+                ..Default::default()
+            })),
+        }),
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+            zitadel_url: "https://id.meridian.firm.example:8443".into(),
+        }),
+    };
+
+    let applied = run.apply(&configuration).await;
+
+    assert!(applied.applied, "{}", applied.refusal_reason);
+    assert!(applied.steps.contains(&"addresses".to_string()));
+}
+
+#[test]
+fn a_zitadel_address_becomes_what_zitadel_calls_itself() {
+    // Zitadel puts its own address in every token, and the dashboard checks
+    // that against the issuer it expects: one answer, spelled both ways.
+    for (url, domain, port, secure) in [
+        ("https://id.example", "id.example", "443", "true"),
+        ("http://id.example:8080", "id.example", "8080", "false"),
+        ("https://id.example:8443/", "id.example", "8443", "true"),
+    ] {
+        let split = super::split_zitadel_url(url).expect("a URL");
+        assert_eq!(
+            split,
+            (domain.to_string(), port.to_string(), secure.to_string()),
+            "{url}"
+        );
+    }
 }

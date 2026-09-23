@@ -54,6 +54,7 @@ fn run() -> Result<(), String> {
         zitadel_database_secret: required("MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET")?,
         dashboard_oidc_secret: required("MERIDIAN_FIRST_RUN_OIDC_SECRET")?,
         ldap_bind_secret: required("MERIDIAN_FIRST_RUN_LDAP_SECRET")?,
+        addresses_secret: required("MERIDIAN_FIRST_RUN_ADDRESSES_SECRET")?,
         zitadel_egress_policy: required("MERIDIAN_FIRST_RUN_EGRESS_POLICY")?,
         own_binding: required("MERIDIAN_FIRST_RUN_BINDING")?,
         restart: list("MERIDIAN_FIRST_RUN_RESTART"),

@@ -62,9 +62,20 @@ spec:
               value: {{ .Values.dashboard.instanceId | quote }}
             - name: MERIDIAN_DASHBOARD_LISTEN
               value: "0.0.0.0:8080"
-            {{- with .Values.dashboard.url }}
+            {{- $addresses := .Values.identity.bundled.addressesSecretName }}
+            {{- if .Values.dashboard.url }}
             - name: MERIDIAN_DASHBOARD_URL
-              value: {{ . | quote }}
+              value: {{ .Values.dashboard.url | quote }}
+            {{- else }}
+            # What the wizard was told, rather than a value nobody has set yet.
+            # Optional, because a deployment nobody has configured has no
+            # address and serves its wizard without one.
+            - name: MERIDIAN_DASHBOARD_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: dashboard-url
+                  optional: true
             {{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
@@ -75,8 +86,19 @@ spec:
             {{- $oidc := printf "%s-dashboard-oidc" (include "meridian-runtime.fullname" .) }}
             # The bundled Zitadel: its external address is the issuer, and the
             # client and the audience it adds come from its setup Job.
+            {{- if .Values.zitadel.zitadel.configmapConfig.ExternalDomain }}
             - name: MERIDIAN_OIDC_ISSUER
               value: {{ include "meridian-runtime.zitadelIssuer" . | quote }}
+            {{- else }}
+            # The address the wizard gave Zitadel, which is what Zitadel puts
+            # in every token it issues.
+            - name: MERIDIAN_OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: issuer
+                  optional: true
+            {{- end }}
             # Optional, and that is what makes first run possible: the client
             # exists only once the setup Job has made one, which cannot happen
             # before somebody has configured Zitadel's database in the wizard.

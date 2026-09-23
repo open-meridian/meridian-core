@@ -33,6 +33,9 @@ pub struct Names {
     pub zitadel_database_secret: String,
     pub dashboard_oidc_secret: String,
     pub ldap_bind_secret: String,
+    /// Where a browser reaches this deployment, which the components read
+    /// rather than take from a values file nobody edited.
+    pub addresses_secret: String,
     pub zitadel_egress_policy: String,
     pub own_binding: String,
     /// Restarted after the Secrets are written, in this order.
@@ -202,6 +205,13 @@ impl FirstRun {
         }
         steps.push("identity".into());
 
+        if let Err(refusal) = self.write_addresses(configuration).await {
+            applied.steps = steps;
+            applied.refusal_reason = refusal;
+            return applied;
+        }
+        steps.push("addresses".into());
+
         if let Err(refusal) = self.roll(configuration).await {
             applied.steps = steps;
             applied.refusal_reason = refusal;
@@ -369,6 +379,48 @@ impl FirstRun {
             .map_err(|failed| failed.to_string())
     }
 
+    /// Where a browser reaches this deployment, as the components read it.
+    ///
+    /// Written rather than rendered, because the wizard is what learns it: a
+    /// chart value would be a second place the same fact lives, and the one
+    /// nobody edited would win on the next upgrade.
+    ///
+    /// Zitadel is told the same thing in its own vocabulary, because it puts
+    /// its own address in every token it issues, and the dashboard checks that
+    /// against the issuer it was told to expect.
+    async fn write_addresses(&self, configuration: &FirstRunConfiguration) -> Result<(), String> {
+        let Some(addresses) = &configuration.addresses else {
+            return Ok(());
+        };
+
+        let mut values = BTreeMap::from([(
+            "dashboard-url".to_string(),
+            addresses.dashboard_url.clone().into_bytes(),
+        )]);
+
+        if !addresses.zitadel_url.trim().is_empty() {
+            let (domain, port, secure) = split_zitadel_url(&addresses.zitadel_url)?;
+            values.extend([
+                (
+                    "issuer".to_string(),
+                    addresses
+                        .zitadel_url
+                        .trim_end_matches('/')
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                ("zitadel-external-domain".to_string(), domain.into_bytes()),
+                ("zitadel-external-port".to_string(), port.into_bytes()),
+                ("zitadel-external-secure".to_string(), secure.into_bytes()),
+            ]);
+        }
+
+        self.cluster
+            .put_secret(&self.names.addresses_secret, &values)
+            .await
+            .map_err(|failed| failed.to_string())
+    }
+
     async fn roll(&self, _configuration: &FirstRunConfiguration) -> Result<(), String> {
         for name in &self.names.restart {
             self.cluster
@@ -378,6 +430,30 @@ impl FirstRun {
         }
         Ok(())
     }
+}
+
+/// Zitadel's address, in the three parts Zitadel itself is configured with.
+///
+/// It states its own address in every token it issues, and the dashboard
+/// checks that against the issuer it expects. One answer in the wizard, and
+/// both sides told the same thing, rather than a values file and a Secret
+/// that agree until somebody edits one.
+fn split_zitadel_url(url: &str) -> Result<(String, String, String), String> {
+    let (scheme, rest) = url
+        .trim()
+        .split_once("://")
+        .ok_or_else(|| format!("{url} is not a URL"))?;
+    let rest = rest.trim_end_matches('/');
+    let secure = scheme == "https";
+    let (host, port) = match rest.split_once(':') {
+        Some((host, port)) => (host, port.to_string()),
+        None if secure => (rest, "443".to_string()),
+        None => (rest, "80".to_string()),
+    };
+    if host.is_empty() {
+        return Err(format!("{url} names no host"));
+    }
+    Ok((host.to_string(), port, secure.to_string()))
 }
 
 /// A Postgres URL, with the password escaped rather than pasted.

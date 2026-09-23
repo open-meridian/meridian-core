@@ -566,6 +566,7 @@ services:
       MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET: first-run-zitadel-database
       MERIDIAN_FIRST_RUN_OIDC_SECRET: first-run-dashboard-oidc
       MERIDIAN_FIRST_RUN_LDAP_SECRET: first-run-ldap-bind
+      MERIDIAN_FIRST_RUN_ADDRESSES_SECRET: first-run-addresses
       MERIDIAN_FIRST_RUN_EGRESS_POLICY: first-run-egress
       MERIDIAN_FIRST_RUN_BINDING: first-run
       MERIDIAN_FIRST_RUN_RESTART: first-run-conductor,first-run-dashboard

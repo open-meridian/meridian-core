@@ -187,6 +187,15 @@ def main():
     s.check("firstrun_app" in database.get("url", "")
             and "firstrun_migrate" in database.get("migrate-url", ""),
             "each URL naming its own role")
+    addresses = state["secrets"].get("first-run-addresses", {})
+    s.check(addresses.get("dashboard-url") == ANSWERS["dashboard_url"],
+            "where a browser reaches this deployment was written, not left in a values file")
+    s.check(addresses.get("zitadel-external-domain") == "zitadel"
+            and addresses.get("zitadel-external-port") == "8080"
+            and addresses.get("zitadel-external-secure") == "false",
+            f"and Zitadel was told the same address in its own vocabulary: {addresses}")
+    s.check(addresses.get("issuer") == ANSWERS["zitadel_url"],
+            "which is also the issuer the dashboard will check tokens against")
     s.check(state["policies"].get("first-run-egress") is not None,
             "the one policy it may patch was patched")
     s.check(any("10.10.0.0/16" in json.dumps(rule) for rule in

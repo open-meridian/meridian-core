@@ -20,9 +20,12 @@
 {{- fail (printf "this Meridian release needs Zitadel %s or newer, and zitadel.image.tag is %s. It will not upgrade Zitadel for you: back up Zitadel's database, then set both tags to v%s or newer" $minimum $tag $minimum) }}
 {{- end }}
 {{- $domain := $z.zitadel.configmapConfig.ExternalDomain | default "" }}
-{{- if not $domain }}
-{{- fail "zitadel.zitadel.configmapConfig.ExternalDomain is not set: it is Zitadel's public host, and the dashboard's issuer" }}
-{{- end }}
+{{/*
+  No address in values is not a misconfiguration: the wizard asks for it, and
+  first run writes it where Zitadel, the dashboard and this Job all read it.
+  An administrator who set it here keeps it, because a value present wins over
+  an absent key.
+*/}}
 {{- if not .Values.dashboard.enabled }}
 {{- fail "identity.bundled.enabled needs dashboard.enabled: the bundled Zitadel exists to sign people in to the dashboard" }}
 {{- end }}
@@ -266,8 +269,17 @@ spec:
           env:
             - name: MERIDIAN_ZITADEL_API_URL
               value: "http://{{ $zitadel }}:8080"
+            {{- if $domain }}
             - name: MERIDIAN_ZITADEL_HOST
               value: {{ $domain | quote }}
+            {{- else }}
+            - name: MERIDIAN_ZITADEL_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  key: zitadel-external-domain
+                  optional: true
+            {{- end }}
             # A file rather than an env reference: Zitadel writes the token
             # with a trailing newline, and the file is read and trimmed once
             # it appears rather than failing the pod while it does not.
@@ -277,8 +289,17 @@ spec:
               value: /var/run/zitadel/tls.key
             # What Zitadel checks the credential's audience against: the
             # issuer it states, never the address this dials.
+            {{- if $domain }}
             - name: MERIDIAN_ZITADEL_ISSUER
               value: {{ include "meridian-runtime.zitadelIssuer" . | quote }}
+            {{- else }}
+            - name: MERIDIAN_ZITADEL_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  key: issuer
+                  optional: true
+            {{- end }}
             # First run can sit at the wizard for as long as the administrator
             # takes, and Zitadel's database is configured there. So this waits
             # an hour for the key rather than the three minutes an already
