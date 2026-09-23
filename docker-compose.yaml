@@ -176,7 +176,10 @@ services:
       MERIDIAN_INSTANCE_ID: sidecar-custody-1
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      - ./deploy/grants.example.json:/etc/meridian/grants.json:ro
+      # The harness's own grants: the role it launches a plugin as belongs to
+      # that plugin, not to core, and core ships only the roles it launches
+      # itself.
+      - ./deploy/nats/dev-grants.json:/etc/meridian/grants.json:ro
     networks: [meridian]
 
   # The Python SDK against a sidecar, which is the only check that the two

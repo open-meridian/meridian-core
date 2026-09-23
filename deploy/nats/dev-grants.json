@@ -1,0 +1,26 @@
+{
+  "_note": "The roles this repository's own harness launches, which are a plugin's vocabulary and not core's. Merged only by `make nats-permissions` into the development configuration compose mounts, beside dev-users.json. A deployment's grant table comes from the plugins it runs; core ships the roles it launches itself and nothing else.",
+  "roles": {
+    "custody": {
+      "publish": [
+        "platform.street.command.record-statement",
+        "platform.street.command.record-holding",
+        "platform.reference.query.resolve-identifier",
+        "platform.reference.query.resolve-instrument",
+        "platform.reference.event.instrument-missing",
+        "platform.custody.*.event.sync-status"
+      ],
+      "subscribe": [
+        "platform.reference.event.instrument-applied"
+      ]
+    },
+    "reporting": {
+      "publish": [
+        "platform.street.query.list-custodial-positions"
+      ],
+      "subscribe": [
+        "platform.street.event.custodial-position-updated"
+      ]
+    }
+  }
+}

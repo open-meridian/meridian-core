@@ -24,8 +24,26 @@ use meridian_sidecar::{GrantTable, Identity, Sidecar};
 use prost::Message;
 use tonic::Request;
 
-/// The grants the compose file mounts and the chart's ConfigMap carries.
-const GRANTS: &str = include_str!("../../../deploy/grants.example.json");
+/// What core ships: the roles it launches itself, which is one.
+const CORE_GRANTS: &str = include_str!("../../../deploy/grants.example.json");
+
+/// What this harness launches a plugin as. A plugin's role is that plugin's
+/// vocabulary, and a fresh install has no plugin, so the two are separate
+/// files and a deployment's table is the first merged with the second.
+const PLUGIN_GRANTS: &str = include_str!("../../../deploy/nats/dev-grants.json");
+
+/// A deployment that has installed this harness's plugin, which is what a
+/// grant table looks like once there is something to grant.
+fn grants() -> String {
+    let core: serde_json::Value = serde_json::from_str(CORE_GRANTS).expect("core's grants parse");
+    let plugin: serde_json::Value =
+        serde_json::from_str(PLUGIN_GRANTS).expect("the plugin's grants parse");
+    let mut roles = core["roles"].as_object().cloned().unwrap_or_default();
+    for (name, table) in plugin["roles"].as_object().cloned().unwrap_or_default() {
+        roles.insert(name, table);
+    }
+    serde_json::json!({ "roles": roles }).to_string()
+}
 
 const NOW: i64 = 1_757_376_000_000_000_000;
 
@@ -49,7 +67,7 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
         "DEP-test",
         Identity::new("custody-snaptrade-1", "custody"),
     );
-    sidecar.load_grants(GrantTable::from_json(GRANTS).expect("the shipped grants parse"));
+    sidecar.load_grants(GrantTable::from_json(&grants()).expect("the shipped grants parse"));
 
     (bus, sidecar)
 }
@@ -164,7 +182,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
     // where it changes, and this line is what should stop being necessary.
     let dashboard = Sidecar::new(bus, "DEP-test", Identity::new("dashboard-1", "admin"));
-    dashboard.load_grants(GrantTable::from_json(GRANTS).unwrap());
+    dashboard.load_grants(GrantTable::from_json(&grants()).unwrap());
     admitted(&dashboard, "admin").await;
 
     let listed: ListCustodialPositionsReply = call(
@@ -188,7 +206,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 /// plugin is admitted and then refused on its first useful call.
 #[test]
 fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
-    let table = GrantTable::from_json(GRANTS).expect("the shipped grants parse");
+    let table = GrantTable::from_json(&grants()).expect("the shipped grants parse");
 
     let custody = table.resolve("custody", &[]);
     assert!(custody.may_publish(meridian_street::service::RECORD_STATEMENT));

@@ -1,19 +1,6 @@
 {
-  "_note": "Two things to know. A query is a call and a call is gated by the publish grant, so a role that only reads still needs its query topics listed under publish. And a plugin's role and each of its tags are looked up in this one table and unioned, so a tag is an entry here like any other; giving a tag the same name as a role merges them silently.",
+  "_note": "The roles core launches itself. A deployment adds the roles its plugins are launched as, and a plugin brings its own: what a connector may publish is that plugin's to state and this deployment's to allow, not an example core ships. Decision 007 and the plugin registry decide the rest.",
   "roles": {
-    "custody": {
-      "publish": [
-        "platform.street.command.record-statement",
-        "platform.street.command.record-holding",
-        "platform.reference.query.resolve-identifier",
-        "platform.reference.query.resolve-instrument",
-        "platform.reference.event.instrument-missing",
-        "platform.custody.*.event.sync-status"
-      ],
-      "subscribe": [
-        "platform.reference.event.instrument-applied"
-      ]
-    },
     "admin": {
       "publish": [
         "platform.street.query.list-custodial-positions",
@@ -43,14 +30,6 @@
         "platform.custody.*.event.sync-status",
         "platform.deployment.event.plugin-report",
         "platform.config.event.unlinked-external-accounts"
-      ]
-    },
-    "reporting": {
-      "publish": [
-        "platform.street.query.list-custodial-positions"
-      ],
-      "subscribe": [
-        "platform.street.event.custodial-position-updated"
       ]
     }
   }

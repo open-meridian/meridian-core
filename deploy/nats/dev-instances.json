@@ -1,0 +1,20 @@
+{
+  "_note": "What this repository's harness launches, for the credentials its tests present. Not what a deployment runs: that is instances.example.json plus whatever plugins the administrator installed.",
+  "instances": [
+    {
+      "instance_id": "custody-1",
+      "role": "custody",
+      "tags": []
+    },
+    {
+      "instance_id": "custody-2",
+      "role": "custody",
+      "tags": []
+    },
+    {
+      "instance_id": "dashboard-1",
+      "role": "admin",
+      "tags": []
+    }
+  ]
+}

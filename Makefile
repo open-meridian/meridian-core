@@ -190,12 +190,22 @@ BROKER_CONFIG = $(DOCKER) run --rm -v "$(CURDIR)":/w -w /w $(RUNTIME_IMAGE) meri
 runtime-image:
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 
+# The committed file is the harness's: it carries the roles and instances this
+# repository launches for its own tests, merged over the ones core launches
+# itself. A deployment's own broker is generated in its cluster from its own
+# grant table (templates/broker.yaml), and never from this.
 nats-permissions: runtime-image
-	@$(BROKER_CONFIG) --out /w/deploy/nats/permissions.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--out /w/deploy/nats/permissions.conf
 	@echo "nats-permissions: wrote deploy/nats/permissions.conf"
 
 check-nats-permissions: runtime-image
-	@$(BROKER_CONFIG) --out /w/.permissions.check.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--out /w/.permissions.check.conf
 	@diff -q deploy/nats/permissions.conf .permissions.check.conf >/dev/null \
 		|| { echo "check-nats-permissions FAILED: deploy/nats/permissions.conf has drifted from the grant table. Run make nats-permissions" >&2; \
 		     rm -f .permissions.check.conf; exit 1; }
@@ -209,7 +219,10 @@ check-nats-permissions: runtime-image
 # message leaving a process.
 test-broker: network
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(BROKER_CONFIG) --dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null
 	@# Restarted rather than left running: a broker holds its permissions from
 	@# start, so a config generated a moment ago is not in force until it does.
@@ -439,7 +452,10 @@ install-hooks:
 # per release rather than every process racing to apply the same change.
 migrate: network
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(BROKER_CONFIG) --dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm -T street meridian-street migrate
@@ -483,7 +499,10 @@ interop: network
 	@# and the answers come from the other two across a broker. Before the
 	@# split this was one process, and the test could not tell the difference.
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(BROKER_CONFIG) --dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street instrument conductor sidecar >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
@@ -520,7 +539,10 @@ LDAP_ADMIN := -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-
 
 e2e-dashboard: network
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(BROKER_CONFIG) --dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(E2E) down -v >/dev/null 2>&1; started=$$(date +%s); \
 	step() { echo "e2e-dashboard: $$1"; echo "== $$1" >>.e2e-dashboard.log; }; \
 	boot() { $(E2E) run --rm -T --no-deps --entrypoint cat zitadel-bootstrap /bootstrap/$$1 2>>.e2e-dashboard.log; }; \

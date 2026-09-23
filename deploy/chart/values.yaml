@@ -394,8 +394,8 @@ broker:
 # credential and an entry here.
 #
 # sidecars:
-#   - instanceId: custody-1
-#     role: custody
+#   - instanceId: <the identifier you launch this plugin as>
+#     role: <the role it is launched with, from your grant table>
 #     tags: []
 #     # The plugin, as a second container in this sidecar's pod. Optional: a
 #     # sidecar with no plugin runs alone. Adding or removing an entry here is
