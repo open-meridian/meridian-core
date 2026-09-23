@@ -149,3 +149,83 @@ jobs:
           echo "architectures: $(echo $found | tr '\n' ' ')"
           echo "$found" | grep -qx amd64
           echo "$found" | grep -qx arm64
+
+  # The chart, pushed beside the image it names.
+  #
+  # Until this existed, a customer reached the chart by having the repository,
+  # which is the one thing an installing customer does not have: `meridian up`
+  # defaults to this reference, and a marketplace listing cannot clone a
+  # repository either. The image was published and the thing that installs it
+  # was not.
+  #
+  # After `publish` rather than beside it: a chart whose image tag names a
+  # manifest that does not exist yet is a chart that installs and cannot pull.
+  chart:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - id: version
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --short HEAD)
+          # The series comes from Chart.yaml and the patch from this run, so
+          # published versions increase -- which is what lets Helm resolve
+          # `oci://.../meridian-runtime` with no --version at all -- and
+          # bumping Chart.yaml still starts a new series.
+          series=$(awk '/^version:/ {print $2}' deploy/chart/Chart.yaml)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "chart=${series%.*}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # A chart and the image it runs are one build, or they are two things
+      # that drift. The repository's own copy keeps `latest`, because somebody
+      # working on the chart wants the image they just built.
+      - name: Pin the image this chart was published beside
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          sed -i "s|^  tag: latest$|  tag: $SHA|" deploy/chart/values.yaml
+          grep -qx "  tag: $SHA" deploy/chart/values.yaml
+
+      # Asserted by rendering rather than by trusting the edit above: a sed
+      # that matches nothing exits 0, and the failure would be a published
+      # chart that quietly still says `latest`.
+      - name: Check the rendered chart names that image
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          helm template check deploy/chart --set deployment.id=publish-check \
+            | grep -q "image: \"$IMAGE:$SHA\""
+
+      - name: Package and push
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+          CHART: ${{ steps.version.outputs.chart }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The bundled Zitadel is vendored under charts/, so packaging needs
+          # no network and no repository added.
+          helm package deploy/chart --version "$CHART" --app-version "$SHA" --destination /tmp
+          helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin <<<"$TOKEN"
+          helm push "/tmp/meridian-runtime-$CHART.tgz" oci://ghcr.io/open-meridian/charts
+
+      # Pulled back the way a customer meets it, rather than trusting that a
+      # push that exited 0 left something installable behind.
+      - name: Check it can be pulled back
+        env:
+          CHART: ${{ steps.version.outputs.chart }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          pulled=$(helm show chart oci://ghcr.io/open-meridian/charts/meridian-runtime --version "$CHART")
+          echo "$pulled"
+          # Quoted or not: Helm quotes an appVersion only when YAML would
+          # otherwise read it as something else, and whether a short commit
+          # hash needs that depends on whether it happens to be all digits.
+          echo "$pulled" | grep -qE "^appVersion: \"?$SHA\"?$"

@@ -155,8 +155,8 @@ street:
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
 # bundled Zitadel (not yet in this chart). One replica: sessions live in memory.
 #
-# Off until its sign-in has run end to end against a real directory
-# (kernel/dashboard-sign-in-and-access); turning it on needs `url`.
+# On. It was off until its sign-in had run end to end against a real
+# directory, and that is now what `make e2e-dashboard` proves on every run.
 dashboard:
   # On, because a deployment with no dashboard has no way to be set up: the
   # wizard is what a fresh install serves, and every address, database and
