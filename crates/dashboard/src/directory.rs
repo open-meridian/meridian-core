@@ -114,6 +114,20 @@ fn escaped(value: &str) -> String {
 }
 
 impl Directory {
+    /// What this directory is called in a login.
+    ///
+    /// A login is `{issuer}|{subject}`, and both halves are written into every
+    /// permission ever granted, so this must never change for a directory
+    /// that stays the same. The base is what identifies it: a firm may add a
+    /// replica or move a server, and neither makes their people different
+    /// people. The server URL would.
+    ///
+    /// **Not yet ruled.** [[design/naming-a-person-before-they-sign-in]] owns
+    /// the question, and changing this later invalidates every grant.
+    pub fn issuer(&self) -> String {
+        format!("ldap:{}", self.base_dn)
+    }
+
     /// Bind, find the person, bind as them, and read their groups.
     pub async fn authenticate(&self, name: &str, password: &str) -> Result<Person, Failure> {
         // Before anything reaches the network. An empty password is an

@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
@@ -64,7 +65,7 @@ fn run() -> Result<(), String> {
                 .into(),
         );
     }
-    let directory = var("MERIDIAN_OIDC_ISSUER")
+    let provider = var("MERIDIAN_OIDC_ISSUER")
         .zip(var("MERIDIAN_OIDC_CLIENT_ID"))
         .map(|(issuer, client_id)| OidcConfig {
             issuer,
@@ -83,6 +84,31 @@ fn run() -> Result<(), String> {
                 })
                 .unwrap_or_default(),
         });
+
+    // The other route (decisions/018). At most one of these is configured:
+    // two ways in would mean a person's groups depending on which they used.
+    let directory = var("MERIDIAN_LDAP_SERVERS").map(|servers| Directory {
+        servers: servers
+            .split(',')
+            .map(str::trim)
+            .filter(|server| !server.is_empty())
+            .map(String::from)
+            .collect(),
+        base_dn: var("MERIDIAN_LDAP_BASE_DN").unwrap_or_default(),
+        bind_dn: var("MERIDIAN_LDAP_BIND_DN").unwrap_or_default(),
+        bind_password: var("MERIDIAN_LDAP_BIND_PASSWORD").unwrap_or_default(),
+        // `{}` is the name somebody typed, escaped before it is put here.
+        user_filter: var("MERIDIAN_LDAP_USER_FILTER").unwrap_or_else(|| "(uid={})".into()),
+        group_attribute: var("MERIDIAN_LDAP_GROUP_ATTRIBUTE").unwrap_or_else(|| "memberOf".into()),
+    });
+    if directory.is_some() && provider.is_some() {
+        return Err(
+            "both MERIDIAN_OIDC_ISSUER and MERIDIAN_LDAP_SERVERS are set, and this \
+                    dashboard signs people in one way: whose groups a person arrived with \
+                    would depend on which they used"
+                .into(),
+        );
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -111,7 +137,7 @@ fn run() -> Result<(), String> {
                 }
             });
 
-            let oidc = match &directory {
+            let oidc = match &provider {
                 Some(config) => {
                     let oidc = Arc::new(discover(config).await?);
                     // The directory's keys, read again every 15 minutes, so a
@@ -144,7 +170,7 @@ fn run() -> Result<(), String> {
             // First run is the absence of a directory rather than a flag, so
             // ending it is the configuration landing and nothing anybody can
             // switch back from inside the dashboard (requirement 18).
-            let first_run = oidc.is_none();
+            let first_run = oidc.is_none() && directory.is_none();
 
             let app = router(Arc::new(App {
                 first_run,
@@ -154,6 +180,7 @@ fn run() -> Result<(), String> {
                 clock,
                 bus,
                 oidc,
+                directory: directory.map(Arc::new),
                 secure_cookies,
             }));
             let listener = tokio::net::TcpListener::bind(listen)

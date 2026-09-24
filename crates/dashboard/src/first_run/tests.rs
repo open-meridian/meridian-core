@@ -157,6 +157,7 @@ fn app_with(
         clock: Arc::new(At(T0)),
         bus,
         oidc: None,
+        directory: None,
         secure_cookies: true,
     })
 }

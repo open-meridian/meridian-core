@@ -30,6 +30,7 @@ fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> 
         clock: Arc::new(At(now)),
         bus: Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))),
         oidc: None,
+        directory: None,
         secure_cookies: true,
     })
 }
@@ -142,4 +143,97 @@ fn a_cookie_is_read_by_name_among_others() {
     );
     assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
     assert_eq!(cookie(&headers, "missing"), None);
+}
+
+// ── Signing in against a directory this deployment binds itself ────────────
+//
+// Decision 018. The sign-in page is here rather than at somebody else's
+// address, which is what removes the second address and the issuer whose URL
+// had to resolve from a pod and a browser at once.
+
+fn app_with_a_directory() -> Arc<App> {
+    let app = app_with(Some(admins()), T0, T0);
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.directory = Some(Arc::new(crate::directory::Directory {
+        // No servers: every test here refuses before anything is dialled, and
+        // a test that reached the network would be an e2e wearing a disguise.
+        base_dn: "ou=people,dc=example,dc=org".into(),
+        user_filter: "(uid={})".into(),
+        group_attribute: "memberOf".into(),
+        ..Default::default()
+    }));
+    Arc::new(built)
+}
+
+async fn body_of(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+#[tokio::test]
+async fn sign_in_serves_a_form_rather_than_sending_the_browser_away() {
+    let response = router(app_with_a_directory())
+        .oneshot(
+            Request::builder()
+                .uri("/sign-in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+
+    // Not a redirect. There is nowhere to redirect to, and that absence is
+    // the point of 018.
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_of(response).await;
+    assert!(page.contains("name=\"password\""), "{page}");
+    assert!(page.contains("action=\"/sign-in\""), "{page}");
+}
+
+#[tokio::test]
+async fn a_refused_sign_in_does_not_say_which_half_was_wrong() {
+    // An empty password is refused before anything is dialled, which is what
+    // lets this exercise the refusal without a server standing up.
+    let response = router(app_with_a_directory())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sign-in")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("name=alice&password="))
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let page = body_of(response).await;
+    assert!(page.contains("were not accepted"), "{page}");
+    // Naming the person back would confirm the name exists, which is how a
+    // sign-in page becomes a way to enumerate a firm's staff.
+    assert!(!page.contains("alice"), "{page}");
+}
+
+#[tokio::test]
+async fn a_password_post_where_no_directory_is_bound_is_refused() {
+    let response = router(app_with(Some(admins()), T0, T0))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sign-in")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("name=alice&password=whatever"))
+                .unwrap(),
+        )
+        .await
+        .expect("a response");
+
+    assert_ne!(response.status(), StatusCode::SEE_OTHER);
+    let page = body_of(response).await;
+    assert!(
+        page.contains("does not sign people in with a password"),
+        "{page}"
+    );
 }

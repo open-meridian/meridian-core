@@ -25,6 +25,7 @@ use meridian_domain::v1::SignInRecord;
 use prost::Message;
 
 use crate::clock::Clock;
+use crate::directory::Directory;
 use crate::html::{escape, page};
 use crate::oidc::Oidc;
 use crate::records::RecordsCache;
@@ -47,6 +48,10 @@ pub struct App {
     pub bus: Arc<Bus>,
     /// None when no directory is configured, which the sign-in page says.
     pub oidc: Option<Arc<Oidc>>,
+    /// The firm's LDAP, bound directly rather than brokered by an identity
+    /// server of ours (decisions/018). At most one of this and `oidc` is set:
+    /// two ways in would mean a person's groups depending on which they used.
+    pub directory: Option<Arc<Directory>>,
     /// Whether cookies carry `Secure`: true whenever this dashboard is served
     /// over HTTPS, which is always outside a developer's machine.
     pub secure_cookies: bool,
@@ -56,7 +61,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(home))
-        .route("/sign-in", get(sign_in))
+        .route("/sign-in", get(sign_in).post(sign_in_with_password))
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
         .merge(crate::admin::routes())
@@ -167,6 +172,13 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
         // true and useless.
         return redirect("/first-run");
     }
+    // A directory we bind to ourselves has nowhere to send the browser, so
+    // the form is here rather than at somebody else's address. That absence
+    // is the point of 018: no redirect means no second address, and no issuer
+    // whose URL has to resolve from a pod and a browser at once.
+    if app.directory.is_some() {
+        return Html(password_page("")).into_response();
+    }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
     };
@@ -175,6 +187,123 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
     response.headers_mut().insert(
         SET_COOKIE,
         set_cookie(&app, SIGN_IN_COOKIE, &state, "/callback", 600),
+    );
+    response
+}
+
+/// The sign-in form, for a directory this deployment binds to itself.
+///
+/// Deliberately plain about failure: one sentence, and the same one whether
+/// the name is unknown or the password is wrong. Telling them apart would let
+/// anybody who can reach this page enumerate a firm's staff.
+fn password_page(refusal: &str) -> String {
+    let told = if refusal.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"refusal\">{}</p>", escape(refusal))
+    };
+    page(
+        "Sign in",
+        &format!(
+            "<h1>Sign in</h1>{told}\
+             <form method=\"post\" action=\"/sign-in\">\
+             <label for=\"name\">Username</label>\
+             <input id=\"name\" name=\"name\" autocomplete=\"username\" required>\
+             <label for=\"password\">Password</label>\
+             <input id=\"password\" name=\"password\" type=\"password\" \
+             autocomplete=\"current-password\" required>\
+             <button type=\"submit\">Sign in</button>\
+             </form>"
+        ),
+    )
+}
+
+#[derive(serde::Deserialize)]
+pub struct Credentials {
+    name: String,
+    password: String,
+}
+
+/// W7.7 by the other route. The directory checks the password; we never do.
+async fn sign_in_with_password(
+    State(app): State<Arc<App>>,
+    Form(credentials): Form<Credentials>,
+) -> Response {
+    let now = app.clock.now_ns();
+    if let Err(stale) = app.records.current(now) {
+        return refused(&stale.to_string());
+    }
+    let Some(directory) = &app.directory else {
+        return refused("this deployment does not sign people in with a password");
+    };
+
+    let person = match directory
+        .authenticate(&credentials.name, &credentials.password)
+        .await
+    {
+        Ok(person) => person,
+        Err(crate::directory::Failure::Refused) => {
+            // 401 and the same sentence for both halves.
+            let mut response = Html(password_page(
+                "That username and password were not accepted.",
+            ))
+            .into_response();
+            *response.status_mut() = StatusCode::UNAUTHORIZED;
+            return response;
+        }
+        Err(ours) => {
+            // Not the person's fault and not something they can act on, so it
+            // is said plainly here and loudly in the log.
+            tracing::warn!(%ours, "a sign-in could not reach the directory");
+            let mut response = Html(password_page(&ours.to_string())).into_response();
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return response;
+        }
+    };
+
+    let subject = format!("{}|{}", directory.issuer(), person.subject);
+    began(&app, &subject, &person.name, person.groups, now)
+}
+
+/// Start the session, record who it was, and hand back the cookie.
+///
+/// One place, because both ways in owe the same things afterwards and a
+/// second copy is where they would drift: a person signed in through one
+/// route appearing in the access table and not the other.
+fn began(
+    app: &Arc<App>,
+    subject: &str,
+    display_name: &str,
+    groups: Vec<String>,
+    now: i64,
+) -> Response {
+    let key = app
+        .sessions
+        .start(subject, display_name, groups.clone(), now);
+    let record = SignInRecord {
+        subject: subject.to_string(),
+        display_name: display_name.to_string(),
+        directory_groups: groups,
+        signed_in_at_ns: now,
+    };
+    if let Err(failed) = app.bus.publish(
+        PERSON_SIGNED_IN,
+        "meridian.v1.SignInRecord",
+        record.encode_to_vec(),
+        None,
+        None,
+    ) {
+        // The session stands: recording who signed in is for the access table
+        // and the count, and a person should not be locked out because a
+        // broker hiccupped.
+        tracing::warn!("a sign-in was not recorded: {failed}");
+    }
+    tracing::info!(subject, "signed in");
+
+    let mut response = redirect("/");
+    response.headers_mut().append(
+        SET_COOKIE,
+        set_cookie(app, SESSION_COOKIE, &key, "/", ABSOLUTE_NS / 1_000_000_000),
     );
     response
 }
@@ -208,39 +337,16 @@ async fn callback(
         Err(failed) => return bad_request(&failed),
     };
 
-    let key = app.sessions.start(
+    let mut response = began(
+        &app,
         &identity.subject,
         &identity.display_name,
-        identity.groups.clone(),
+        identity.groups,
         now,
     );
-    let record = SignInRecord {
-        subject: identity.subject.clone(),
-        display_name: identity.display_name.clone(),
-        directory_groups: identity.groups,
-        signed_in_at_ns: now,
-    };
-    if let Err(failed) = app.bus.publish(
-        PERSON_SIGNED_IN,
-        "meridian.v1.SignInRecord",
-        record.encode_to_vec(),
-        None,
-        None,
-    ) {
-        // The session stands: recording who signed in is for the access table
-        // and the count, and a person should not be locked out because a
-        // broker hiccupped.
-        tracing::warn!("a sign-in was not recorded: {failed}");
-    }
-    tracing::info!(subject = identity.subject, "signed in");
-
-    let mut response = redirect("/");
-    let headers = response.headers_mut();
-    headers.append(
-        SET_COOKIE,
-        set_cookie(&app, SESSION_COOKIE, &key, "/", ABSOLUTE_NS / 1_000_000_000),
-    );
-    headers.append(
+    // And the one cookie only this route sets: the state it was matched
+    // against has done its work and should not outlive it.
+    response.headers_mut().append(
         SET_COOKIE,
         set_cookie(&app, SIGN_IN_COOKIE, "", "/callback", 0),
     );

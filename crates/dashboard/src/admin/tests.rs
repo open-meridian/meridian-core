@@ -103,6 +103,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         clock: Arc::new(At(T0)),
         bus,
         oidc: None,
+        directory: None,
         secure_cookies: true,
     });
     Harness {
