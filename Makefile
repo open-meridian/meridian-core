@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory \
+        test-directory e2e-dashboard-ldap \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -32,7 +32,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-ldap e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -383,6 +383,47 @@ test-broker: network
 # `test`, for the reason `test-broker` is: it needs a server standing up, and
 # a test that silently skips when one is missing is a gate reporting success
 # without doing its job.
+# The firm's LDAP, signed in against by the dashboard itself (decisions/018).
+# Beside e2e-dashboard rather than inside it: that suite's subject is the
+# bundled Zitadel, which is being removed, and this one has to outlive it.
+#
+# Two phases, because what is being proven is that a change at the directory
+# reaches the next sign-in: bob is removed from a group between them.
+# As E2E, minus the issuer: this branch has no identity server to point at.
+E2E_LDAP := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
+	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
+	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 \
+	MERIDIAN_LDAP_SERVERS=ldap://ldap:1389 \
+	MERIDIAN_LDAP_BASE_DN=ou=people,dc=example,dc=org \
+	MERIDIAN_LDAP_BIND_DN=cn=admin,dc=example,dc=org \
+	MERIDIAN_LDAP_BIND_PASSWORD=ldap-admin-dev-only \
+	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
+	$(COMPOSE) --profile e2e
+LDAP_DIR = -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
+
+e2e-dashboard-ldap: network
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@: >.e2e-dashboard-ldap.log
+	@$(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1 || true
+	@set -e; \
+	$(E2E_LDAP) build dashboard conductor >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) up -d postgres nats ldap fake-platform >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'; \
+	$(E2E_LDAP) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) exec -T ldap ldapadd $(LDAP_DIR) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) up -d conductor dashboard >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) run --rm -T ldap-runner main; \
+	printf 'dn: cn=ldap-group-b,ou=groups,dc=example,dc=org\nchangetype: modify\ndelete: member\nmember: uid=bob,ou=people,dc=example,dc=org\n' \
+	  | $(E2E_LDAP) exec -T ldap ldapmodify $(LDAP_DIR) >>.e2e-dashboard-ldap.log 2>&1; \
+	$(E2E_LDAP) run --rm -T ldap-runner after-removal
+	@$(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1
+	@echo "e2e-dashboard-ldap OK: the firm's directory signs people in, and a group taken away is gone at the next sign-in"
+
 test-directory: network
 	@$(COMPOSE) --profile e2e up -d ldap >/dev/null
 	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_ADMIN) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \

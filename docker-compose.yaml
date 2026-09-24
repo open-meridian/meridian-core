@@ -151,6 +151,13 @@ services:
       MERIDIAN_OIDC_CLIENT_ID: ${MERIDIAN_OIDC_CLIENT_ID:-}
       # Zitadel names the client's project in every ID token's audience.
       MERIDIAN_OIDC_TRUSTED_AUDIENCES: ${MERIDIAN_OIDC_TRUSTED_AUDIENCES:-}
+      # Or the firm's LDAP, bound by the dashboard itself (decisions/018).
+      # Unset here as the issuer above is: the e2e target sets one or the
+      # other, and the dashboard refuses to start with both.
+      MERIDIAN_LDAP_SERVERS: ${MERIDIAN_LDAP_SERVERS:-}
+      MERIDIAN_LDAP_BASE_DN: ${MERIDIAN_LDAP_BASE_DN:-}
+      MERIDIAN_LDAP_BIND_DN: ${MERIDIAN_LDAP_BIND_DN:-}
+      MERIDIAN_LDAP_BIND_PASSWORD: ${MERIDIAN_LDAP_BIND_PASSWORD:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
@@ -604,6 +611,19 @@ services:
       - fr-pki:/var/run/secrets/kubernetes.io/serviceaccount:ro
     networks: [meridian]
 
+  ldap-runner:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/ldap_runner.py"]
+    environment:
+      DASHBOARD: http://dashboard:8080
+      E2E_CLAIM_CODE: ${E2E_CLAIM_CODE:-E2E-CLAIM-CODE}
+      E2E_STATE: /state
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - dashboard-e2e-state:/state
+    networks: [meridian]
+
   fr-runner:
     profiles: [first-run]
     image: python:3.12-alpine
@@ -636,6 +656,7 @@ volumes:
   runtime-keys:
   e2e-bootstrap:
   e2e-state:
+  dashboard-e2e-state:
 
 networks:
   meridian:
