@@ -32,9 +32,20 @@ tonic = "0.13"
 # built on it, so naming it adds no dependency.
 axum = "0.8"
 # OpenID Connect for the dashboard's sign-in: pure Rust, verifying ID tokens
-# itself, over the reqwest client above rather than its own. No SAML: a SAML
-# directory is brokered by the bundled Zitadel (spec, ruling 1).
+# itself, over the reqwest client above rather than its own. No SAML: a firm
+# whose single sign-on speaks only SAML puts a maintained broker in front of
+# their deployment and is then an ordinary provider (decisions/018).
 openidconnect = { version = "4", default-features = false }
+# LDAP for the dashboard's other sign-in route, bound directly rather than
+# brokered by an identity server we run (decisions/018). Pure Rust, and in the
+# same place as the client above: a protocol translated at the boundary, which
+# is what the workspace rule asks for. It is not a third-party type reaching
+# the kernel's domain model, which is what that rule forbids -- a line this
+# repository drew in the wrong place once, and drawing it there is what made a
+# whole identity server look necessary.
+# `ring` rather than aws-lc-rs: both are already in this tree, and ring is
+# the one reqwest brought, so naming it adds no provider.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 http = "1"
 # Verifying the bundled Zitadel's webhook signature, HMAC-SHA256. Already in
 # the tree through ed25519 and oauth2.

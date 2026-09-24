@@ -7,6 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
+        test-directory \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -31,7 +32,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker interop e2e-dashboard e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -377,6 +378,28 @@ test-broker: network
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
 		     tail -40 .test-broker.log >&2; exit 1; }
 	@echo "test-broker OK: messages cross a process boundary through the broker"
+
+# Signing in against a real directory. Its own target rather than part of
+# `test`, for the reason `test-broker` is: it needs a server standing up, and
+# a test that silently skips when one is missing is a gate reporting success
+# without doing its job.
+test-directory: network
+	@$(COMPOSE) --profile e2e up -d ldap >/dev/null
+	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_ADMIN) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+		|| { echo "test-directory FAILED: the directory did not come up" >&2; exit 1; }
+	@# memberOf is an overlay, not a stored attribute. Without it every person
+	@# signs in holding no groups, which is a deployment where nobody can do
+	@# anything and nothing says why.
+	@$(COMPOSE) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// \
+		<e2e/dashboard/ldap/01-memberof.ldif >>.test-directory.log 2>&1 || true
+	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_ADMIN) \
+		<e2e/dashboard/ldap/02-tree.ldif >>.test-directory.log 2>&1 || true
+	@$(COMPOSE) run --rm -T --build tests \
+		cargo test --locked -p meridian-dashboard --test directory \
+		>.test-directory.log 2>&1 \
+		|| { echo "test-directory FAILED. The last 40 lines, and the whole of it in .test-directory.log:" >&2; \
+		     tail -40 .test-directory.log >&2; exit 1; }
+	@echo "test-directory OK: people sign in against a real directory, and the ways that go wrong stay apart"
 
 chart-check:
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \

@@ -14,6 +14,7 @@ meridian-first-run = { path = "../first-run" }
 axum.workspace = true
 http.workspace = true
 openidconnect.workspace = true
+ldap3.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

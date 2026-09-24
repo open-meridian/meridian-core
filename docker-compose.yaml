@@ -215,6 +215,9 @@ services:
     environment:
       MERIDIAN_TEST_DATABASE_URL: postgres://meridian:meridian@core-postgres:5432/meridian
       MERIDIAN_TEST_BROKER_URL: nats://tests:tests-dev-only@nats:4222
+      # The firm's directory, which the dashboard now binds to itself rather
+      # than having an identity server broker for it (decisions/018).
+      MERIDIAN_TEST_LDAP_URL: ldap://ldap:1389
       # The runtime's own identity, narrowed to what the registry says its
       # components publish and subscribe to.
       MERIDIAN_TEST_BROKER_URL_RUNTIME: nats://runtime:runtime-dev-only@nats:4222

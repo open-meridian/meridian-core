@@ -17,6 +17,7 @@
 
 pub mod admin;
 pub mod clock;
+pub mod directory;
 pub mod first_run;
 pub mod html;
 pub mod oidc;
