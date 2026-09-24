@@ -685,3 +685,61 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
     // And the login, lowercased, so `Ada` and `ada` cannot become two people.
     assert!(addresses.contains("administrator-login"), "{addresses}");
 }
+
+#[tokio::test]
+async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password() {
+    // The dashboard binds to this directory itself (decisions/018), so what
+    // it needs is the whole connection. Only the password was written until
+    // 2026-09-24, because the rest was configured into the identity server
+    // that used to do the binding -- so the dashboard would have come up
+    // knowing a password and no server to send it to.
+    let (cluster, done) = watched();
+    let run = first_run(Box::new(cluster), vec![]);
+    let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
+        runtime_database: Some(database(&run)),
+        login_backend: Some(LoginBackendAnswer {
+            backend: Some(Backend::Bundled(BundledZitadelAnswer {
+                version: "v4.17.3".into(),
+                egress_cidrs: vec!["10.20.0.0/16".into()],
+                directory: Some(
+                    meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(
+                        LdapDirectoryAnswer {
+                            servers: vec![
+                                "ldaps://one.firm.example".into(),
+                                "ldaps://two.firm.example".into(),
+                            ],
+                            base_dn: "ou=people,dc=firm,dc=example".into(),
+                            bind_dn: "cn=meridian,dc=firm,dc=example".into(),
+                            bind_password: Some(
+                                seal(
+                                    &run.key.public_key(),
+                                    &run.key.key_id,
+                                    "ldap.bind_password",
+                                    b"bind-secret",
+                                )
+                                .unwrap(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+                ..Default::default()
+            })),
+        }),
+        addresses: None,
+    };
+
+    let applied = run.apply(&configuration).await;
+
+    assert!(applied.applied, "{}", applied.refusal_reason);
+    let wrote = done.lock().unwrap().clone();
+    let ldap = wrote
+        .iter()
+        .find(|line| line.starts_with("secret m-ldap-bind "))
+        .expect("the directory secret was written");
+
+    for key in ["password", "servers", "base-dn", "bind-dn", "user-filter"] {
+        assert!(ldap.contains(key), "{key} is missing from {ldap}");
+    }
+}

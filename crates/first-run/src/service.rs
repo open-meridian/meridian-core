@@ -595,11 +595,28 @@ impl FirstRun {
                         .as_ref()
                         .ok_or("no LDAP bind password".to_string())
                         .and_then(|sealed| self.key.open(sealed, "ldap.bind_password"))?;
+                    // The whole connection, not only the password. The
+                    // dashboard binds to this directory itself now
+                    // (decisions/018), so what it needs is where the servers
+                    // are and how a person is found in them -- which the
+                    // wizard has always asked for and which used to be
+                    // configured into something else.
+                    let mut values = BTreeMap::from([
+                        ("password".to_string(), password),
+                        ("servers".to_string(), ldap.servers.join(",").into_bytes()),
+                        ("base-dn".to_string(), ldap.base_dn.clone().into_bytes()),
+                        ("bind-dn".to_string(), ldap.bind_dn.clone().into_bytes()),
+                    ]);
+                    // `{}` is where the name somebody typed goes, escaped.
+                    // A firm that said nothing gets the common case rather
+                    // than a filter that matches nobody.
+                    let filter = match ldap.user_filter.trim() {
+                        "" => "(uid={})".to_string(),
+                        given => given.to_string(),
+                    };
+                    values.insert("user-filter".to_string(), filter.into_bytes());
                     self.cluster
-                        .put_secret(
-                            &self.names.ldap_bind_secret,
-                            &BTreeMap::from([("password".to_string(), password)]),
-                        )
+                        .put_secret(&self.names.ldap_bind_secret, &values)
                         .await
                         .map_err(|failed| failed.to_string())?;
                 }

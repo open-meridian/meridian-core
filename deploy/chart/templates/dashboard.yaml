@@ -76,6 +76,41 @@ spec:
                   name: {{ $addresses }}
                   key: dashboard-url
                   optional: true
+            # The firm's LDAP, bound by this dashboard itself
+            # (decisions/018). Written by first run into the Secret the chart
+            # names for it; optional on every key, because the other two
+            # branches write none of them.
+            {{- $ldap := .Values.identity.bundled.ldap.bindPasswordSecret | default (printf "%s-ldap-bind" (include "meridian-runtime.fullname" .)) }}
+            - name: MERIDIAN_LDAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: servers
+                  optional: true
+            - name: MERIDIAN_LDAP_BASE_DN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: base-dn
+                  optional: true
+            - name: MERIDIAN_LDAP_BIND_DN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: bind-dn
+                  optional: true
+            - name: MERIDIAN_LDAP_BIND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: password
+                  optional: true
+            - name: MERIDIAN_LDAP_USER_FILTER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: user-filter
+                  optional: true
             # The first administrator's account, where this deployment holds
             # it rather than a directory (decisions/018). Written by first run
             # as a hash; the dashboard makes the account at its next start if
