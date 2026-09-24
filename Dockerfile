@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar \
-       target/release/meridian-dashboard target/release/meridian-group-hook \
+       target/release/meridian-dashboard \
        target/release/meridian-first-run target/release/meridian-broker-config \
        /usr/local/bin/
 
@@ -44,7 +44,6 @@ COPY --from=build /usr/local/bin/meridian-instrument /usr/local/bin/meridian-ins
 COPY --from=build /usr/local/bin/meridian-conductor /usr/local/bin/meridian-conductor
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar
 COPY --from=build /usr/local/bin/meridian-dashboard /usr/local/bin/meridian-dashboard
-COPY --from=build /usr/local/bin/meridian-group-hook /usr/local/bin/meridian-group-hook
 COPY --from=build /usr/local/bin/meridian-first-run /usr/local/bin/meridian-first-run
 COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-broker-config
 

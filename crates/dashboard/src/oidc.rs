@@ -1,9 +1,9 @@
 //! Signing a person in through the firm's directory, over OpenID Connect.
 //!
 //! The authorisation-code flow with PKCE, against whatever provider the
-//! deployment names: the firm's own, or the bundled Zitadel standing in for
-//! one or brokering a SAML or LDAP directory. The dashboard speaks OIDC and
-//! nothing else (spec, ruling 1).
+//! deployment names, which after decision 018 is always the firm's own: this
+//! deployment runs no identity server, and where a firm has LDAP or no
+//! directory at all the dashboard signs them in without a redirect.
 //!
 //! # Fresh, every time
 //!
@@ -57,10 +57,10 @@ pub struct OidcConfig {
     /// Where the directory sends the person back: this dashboard's `/callback`.
     pub redirect_url: String,
     /// The claim carrying directory groups. `groups` for Entra ID and for the
-    /// bundled Zitadel's group hook.
+    /// most providers that carry them.
     pub groups_claim: String,
     /// Audiences besides the client id that an ID token may also name. Empty
-    /// for most directories. Zitadel always adds the id of the project the
+    /// for most directories. Some providers add the id of the project the
     /// client belongs to, and a token naming an audience not listed here is
     /// refused, as OpenID Connect Core 3.1.3.7 says it must be.
     pub trusted_audiences: Vec<String>,

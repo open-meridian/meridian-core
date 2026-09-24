@@ -14,13 +14,10 @@
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-first-run" $full }}
 {{- $database := include "meridian-runtime.databaseSecret" . }}
-{{- $zitadelDatabase := .Values.identity.bundled.databaseSecretName }}
 {{- $oidc := printf "%s-dashboard-oidc" $full }}
-{{- $ldap := .Values.identity.bundled.ldap.bindPasswordSecret | default (printf "%s-ldap-bind" $full) }}
-{{- $addresses := .Values.identity.bundled.addressesSecretName }}
-{{- $egress := printf "%s-zitadel-egress" .Release.Name }}
+{{- $ldap := .Values.firstRun.directorySecretName | default (printf "%s-ldap-bind" $full) }}
+{{- $addresses := .Values.firstRun.addressesSecretName }}
 {{- $restart := list (printf "%s-conductor" $full) (printf "%s-dashboard" $full) }}
-{{- $bundled := list (printf "%s-zitadel" .Release.Name) (printf "%s-zitadel-login" .Release.Name) }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -41,23 +38,11 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: [{{ $database | quote }}, {{ $zitadelDatabase | quote }}, {{ $oidc | quote }}, {{ $ldap | quote }}, {{ $addresses | quote }}]
+    resourceNames: [{{ $database | quote }}, {{ $oidc | quote }}, {{ $ldap | quote }}, {{ $addresses | quote }}]
     verbs: ["get", "update", "patch"]
-  # The one security resource it may change: the ranges the bundled Zitadel
-  # may reach, which the administrator confirms in the wizard. It could widen
-  # that egress to what they entered, which is the point of asking them. It
-  # cannot touch any other policy.
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    resourceNames: [{{ $egress | quote }}]
-    verbs: ["get", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: [{{ range $i, $d := (concat $restart $bundled) }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
-    verbs: ["get", "patch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    resourceNames: [{{ range $i, $d := $bundled }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
+    resourceNames: [{{ range $i, $d := $restart }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
     verbs: ["get", "patch"]
 {{- if .Values.database.brought.enabled }}
   # Starting the database this chart brings, if somebody chooses it. Named,
@@ -137,26 +122,16 @@ spec:
             # the same ones.
             - name: MERIDIAN_FIRST_RUN_DATABASE_SECRET
               value: {{ $database | quote }}
-            - name: MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET
-              value: {{ $zitadelDatabase | quote }}
             - name: MERIDIAN_FIRST_RUN_OIDC_SECRET
               value: {{ $oidc | quote }}
             - name: MERIDIAN_FIRST_RUN_LDAP_SECRET
               value: {{ $ldap | quote }}
             - name: MERIDIAN_FIRST_RUN_ADDRESSES_SECRET
               value: {{ $addresses | quote }}
-            - name: MERIDIAN_FIRST_RUN_EGRESS_POLICY
-              value: {{ $egress | quote }}
             - name: MERIDIAN_FIRST_RUN_BINDING
               value: {{ $name | quote }}
             - name: MERIDIAN_FIRST_RUN_RESTART
               value: {{ join "," $restart | quote }}
-            - name: MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY
-              value: {{ join "," $bundled | quote }}
-            # Whether there is one to set up at all. The names above are given
-            # whether or not it was rendered, so they say nothing about it.
-            - name: MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY
-              value: {{ .Values.identity.bundled.enabled | quote }}
 {{- if .Values.database.brought.enabled }}
             # The database this chart can bring, and the passwords it makes
             # for the roles that will live in it. Read from this Job's own
@@ -186,11 +161,6 @@ spec:
                 secretKeyRef:
                   name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
                   key: migrating
-            - name: MERIDIAN_FIRST_RUN_BROUGHT_ZITADEL_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
-                  key: zitadel
 {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

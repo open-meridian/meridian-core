@@ -83,69 +83,25 @@ list, no failover order. The platform is allowed to grow, move and be redirected
 without anything here changing or restarting, which is only true while nothing
 here describes its shape.
 
-## The dashboard, and a bundled Zitadel
+## The dashboard, and how people sign in
 
 The dashboard is on, because a deployment with no dashboard has no way to be
-set up: the wizard is what a fresh install serves. The address your staff reach
-it at is one of the things the wizard asks for, so it is not a value you set.
-It signs people in through a directory over OpenID Connect: point
-`dashboard.oidc` at the one your firm already runs.
+set up: the wizard is what a fresh install serves. The address your staff
+reach it at is one of the things the wizard asks for, so it is not a value you
+set.
 
-A firm with no directory, or one whose directory speaks only SAML or LDAP, can
-have the chart run Zitadel beside the deployment instead, with
-`identity.bundled.enabled=true`. It is Zitadel's own chart, vendored under
-`charts/` at 10.0.6, plus a group hook that carries directory groups into the
-dashboard's token and a setup Job that configures Zitadel for the dashboard.
-It needs four things from you:
+This deployment runs no identity server (decision 018). It signs people in one
+of three ways, chosen in the wizard rather than here:
 
-1. **Its version**, in both `zitadel.image.tag` and `zitadel.login.image.tag`.
-   The chart has no default and never changes it: a Meridian upgrade that needs
-   a newer Zitadel refuses to render and names the version, rather than
-   upgrading it.
-2. **Its public host**, `zitadel.zitadel.configmapConfig.ExternalDomain`. The
-   dashboard's issuer is `https://` that host.
-3. **Its own database and login role.** On the route where this deployment
-   starts its own Postgres, these are made for you on that same server --
-   still a database of its own, because Zitadel's schema step is one-way and
-   putting its tables beside the ones holding positions would make a Zitadel
-   upgrade one-way there too. On the route where you point at a database you
-   run, you make them, and the wizard asks for the connection and writes it
-   into `meridian-zitadel-database` under `dsn`. Zitadel's init job makes only
-   its schema, as that role, so it never holds your Postgres superuser.
-4. **Where it may connect**, `identity.bundled.egress.allowCidrs`: its database,
-   and your LDAP directory if any. A NetworkPolicy allows those, the group hook
-   and DNS, and nothing else -- which is what makes it safe that Zitadel's
-   webhook deny list is narrowed so it can reach the hook.
+- **Your OpenID Connect provider.** The dashboard federates to it, and nothing
+  of ours authenticates anybody. Your provider **must return `auth_time`** --
+  Entra ID sends it only if the app registration asks for it, and a provider
+  that cannot is not usable. See the install guide.
+- **Your LDAP.** The dashboard binds to it directly: it forwards a password
+  once and stores none, and reads the person's groups from the directory.
+- **Neither.** The deployment holds the accounts itself, with hashed passwords
+  and a lockout, for a firm with no directory of its own.
 
-The chart makes Zitadel's master key once, in `meridian-zitadel-masterkey`, and
-never regenerates it; it survives `helm uninstall`. **Back it up apart from the
-database**: without it, the directory credentials and signing keys in Zitadel's
-database cannot be read.
-
-The setup Job runs after every install and upgrade. It alone holds Zitadel's
-admin token, and it may read and update two Secrets -- the dashboard's client,
-and the hook's signing keys -- and nothing else. It is idempotent: a second run
-changes nothing.
-
-### Upgrading Zitadel
-
-Only when you choose to, by changing both tags:
-
-1. Back up Zitadel's database. Its schema step is one-way; going back means
-   restoring this backup.
-2. Set `zitadel.image.tag` and `zitadel.login.image.tag` to the new version,
-   and `helm upgrade`.
-
-Its database, master key, people, groups and directory connections carry over,
-and nothing else restarts. People already signed in to the dashboard stay signed
-in, because sessions live in the dashboard; only new sign-ins wait while
-Zitadel rolls.
-
-Zitadel runs with its own chart's security context, which pins uid 1000: its
-image names its user rather than numbering it, so that is how Kubernetes knows
-it is not root. On OpenShift, set `runAsUser` and `fsGroup` to null under
-`zitadel.podSecurityContext` and `zitadel.securityContext`; the platform assigns
-the uid instead. Meridian's own templates pin none.
-
-Zitadel's chart also uses `alpine/k8s` (to write its admin token into a Secret)
-and `wait4x` (to wait for the database), at the versions its own chart pins.
+Nothing is configured here for any of them. `dashboard.oidc` exists for an
+administrator who would rather set a provider in values than in the wizard;
+everything else the wizard writes into Secrets this chart names.

@@ -209,8 +209,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # The bundled Zitadel is vendored under charts/, so packaging needs
-          # no network and no repository added.
+          # No subchart and no dependency, so packaging needs no network and
+          # no repository added.
           helm package deploy/chart --version "$CHART" --app-version "$SHA" --destination /tmp
           helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin <<<"$TOKEN"
           helm push "/tmp/meridian-runtime-$CHART.tgz" oci://ghcr.io/open-meridian/charts

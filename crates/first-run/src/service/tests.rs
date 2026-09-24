@@ -43,18 +43,6 @@ impl Cluster for Remembering {
         Ok(())
     }
 
-    async fn set_egress_cidrs(
-        &self,
-        name: &str,
-        cidrs: &[String],
-    ) -> Result<(), crate::cluster::ClusterError> {
-        self.done
-            .lock()
-            .unwrap()
-            .push(format!("egress {name} {}", cidrs.join(",")));
-        Ok(())
-    }
-
     async fn scale(
         &self,
         kind: crate::cluster::Workload,
@@ -103,13 +91,6 @@ impl Cluster for Refusing {
     ) -> Result<(), crate::cluster::ClusterError> {
         refuse_if(self.0, "secret")
     }
-    async fn set_egress_cidrs(
-        &self,
-        _: &str,
-        _: &[String],
-    ) -> Result<(), crate::cluster::ClusterError> {
-        refuse_if(self.0, "egress")
-    }
     async fn scale(
         &self,
         _: crate::cluster::Workload,
@@ -152,14 +133,11 @@ impl DatabaseProbe for Answers {
 fn names() -> Names {
     Names {
         database_secret: "m-database".into(),
-        zitadel_database_secret: "m-zitadel-database".into(),
         dashboard_oidc_secret: "m-dashboard-oidc".into(),
         ldap_bind_secret: "m-ldap-bind".into(),
         addresses_secret: "m-addresses".into(),
-        zitadel_egress_policy: "m-zitadel-egress".into(),
         own_binding: "m-first-run".into(),
         restart: vec!["m-conductor".into(), "m-dashboard".into()],
-        bundled_identity: vec!["m-zitadel".into(), "m-zitadel-login".into()],
     }
 }
 
@@ -170,7 +148,6 @@ fn first_run(cluster: Box<dyn Cluster>, probe: Vec<String>) -> FirstRun {
         cluster,
         provisioner: Box::new(Refusing("provision")),
         brought: None,
-        bundled_directory: true,
         probe: Box::new(Answers(probe)),
     }
 }
@@ -252,29 +229,6 @@ fn a_credential_sealed_to_another_job_is_a_finding_not_a_crash() {
     assert!(!reply.passed);
     assert!(
         reply.findings[0].contains("seal it again"),
-        "{:?}",
-        reply.findings
-    );
-}
-
-#[test]
-fn a_zitadel_answered_with_no_version_is_refused() {
-    let run = first_run(Box::new(Remembering::default()), vec![]);
-    let reply = run.check(&FirstRunCheckRequest {
-        answer: Some(Answer::LoginBackend(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: String::new(),
-                egress_cidrs: vec!["10.0.0.0/8".into()],
-                ..Default::default()
-            })),
-        })),
-    });
-
-    // Its version is the administrator's, and a blank one means the wizard
-    // chose for them (ruling 16).
-    assert!(!reply.passed);
-    assert!(
-        reply.findings[0].contains("version"),
         "{:?}",
         reply.findings
     );
@@ -461,7 +415,6 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         cluster: Box::new(remembering),
         provisioner: Box::new(Refusing("provision")),
         brought: None,
-        bundled_directory: true,
         probe: Box::new(Answers(vec![])),
     };
     let configuration = FirstRunConfiguration {
@@ -502,33 +455,6 @@ fn a_zitadel_address_becomes_what_zitadel_calls_itself() {
             "{url}"
         );
     }
-}
-
-#[test]
-fn a_bundled_directory_this_chart_did_not_render_is_refused() {
-    // It used to pass every check and fail at the step that writes: Zitadel's
-    // database was made, and then the Secret to put its connection in did not
-    // exist, so applying stopped half done with the wizard closed behind it.
-    // Found on a cluster, where the chart's default is to render none.
-    let mut run = first_run(Box::new(Refusing("nothing")), vec![]);
-    run.bundled_directory = false;
-
-    let reply = run.check(&FirstRunCheckRequest {
-        answer: Some(Answer::LoginBackend(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: "v4.17.3".into(),
-                egress_cidrs: vec!["10.0.0.0/8".into()],
-                ..Default::default()
-            })),
-        })),
-    });
-
-    assert!(!reply.passed);
-    assert!(
-        reply.findings[0].contains("installed without the bundled directory"),
-        "{:?}",
-        reply.findings
-    );
 }
 
 /// What the run wrote, as `secret <name> <comma-joined keys>` and so on.

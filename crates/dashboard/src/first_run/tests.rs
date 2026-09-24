@@ -499,7 +499,7 @@ fn wizard_app() -> Arc<App> {
 const ANSWERS: &str = "db_host=db.firm.internal&db_port=5432&db_name=meridian\
 &db_serving_role=meridian_app&db_serving_password=hunter2\
 &db_migrating_role=meridian_migrate&db_migrating_password=hunter2\
-&backend=bundled&zitadel_version=v4.17.3&zitadel_egress=10.20.0.0/16\
+&backend=bundled\
 &directory=local&admin_login=ada&admin_password=hunter2\
 &dashboard_url=https://meridian.firm.example";
 

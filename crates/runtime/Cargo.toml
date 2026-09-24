@@ -38,9 +38,6 @@ path = "src/bin/broker_config.rs"
 name = "meridian-first-run"
 path = "src/bin/first_run.rs"
 
-[[bin]]
-name = "meridian-group-hook"
-path = "src/bin/group_hook.rs"
 
 [dependencies]
 meridian-bus = { path = "../bus" }
@@ -50,7 +47,6 @@ meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
 meridian-dashboard = { path = "../dashboard" }
 meridian-first-run = { path = "../first-run" }
-meridian-group-hook = { path = "../group-hook" }
 axum.workspace = true
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true

@@ -5,8 +5,8 @@ a firm has LDAP, and the whole of it happens over HTTP between a browser and
 the dashboard, plus LDAP between the dashboard and the directory. Nothing is
 redirected anywhere, so there is no issuer, no second address, and no token.
 
-Self-contained rather than importing the Zitadel suite's runner, because that
-suite's subject is being deleted and this one has to outlive it.
+Self-contained, because the suite it replaced was built around an identity
+server this deployment no longer runs.
 
 Phases, because the directory is changed between them by the make target:
   main           -- somebody signs in, and their groups decide what they see

@@ -178,7 +178,7 @@ street:
 
 # The dashboard: the one address staff use. Signs people in through the firm's
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
-# bundled Zitadel (not yet in this chart). One replica: sessions live in memory.
+# One replica: sessions live in memory.
 #
 # On. It was off until its sign-in had run end to end against a real
 # directory, and that is now what `make e2e-dashboard` proves on every run.
@@ -211,195 +211,17 @@ dashboard:
     secretKey: client-secret
     groupsClaim: groups
     # Audiences besides clientId that an ID token may also name, and nothing
-    # else is accepted. Empty for most directories; for Zitadel, the id of the
+    # else is accepted. Empty for most directories; some name a project or
     # project the client belongs to, which it adds to every token.
     trustedAudiences: []
 
-# A bundled Zitadel, for a firm with no directory of its own or one that speaks
-# only SAML or LDAP (spec, rulings 9, 10, 14 to 16). Off by default: most firms
-# point dashboard.oidc at the directory they already run.
-#
-# Turning it on needs, from you:
-#   - zitadel.image.tag and zitadel.login.image.tag: the Zitadel version, the
-#     same in both. Yours to set and yours to change; a Meridian upgrade never
-#     changes it, and refuses to render when it needs a newer one.
-#   - zitadel.zitadel.configmapConfig.ExternalDomain: Zitadel's public host.
-#   - a Secret named meridian-zitadel-database, key `dsn`: a Postgres
-#     connection string for a database and login role you made for Zitadel.
-#     Zitadel never holds your Postgres superuser.
-#   - identity.bundled.egress.allowCidrs: where Zitadel may connect besides the
-#     group hook and DNS -- its database, and the LDAP directory if any.
-# The Job that turns the wizard's answers into this deployment's
-# configuration, and the only thing here that may change the cluster. It runs
-# with the dashboard, gives up its rights when the configuration is applied,
-# and exits; a deployment already configured finds its work done and exits.
+
 firstRun:
   # Its own key in the broker secret, never the runtime's: what the wizard
   # seals is sealed to this Job, and a shared credential would let any
   # component receive it.
   brokerKey: first-run
 
-identity:
-  bundled:
-    enabled: false
-    # Roles on the dashboard's Zitadel project, standing in for groups for
-    # people you make in Zitadel itself.
-    roles: []
-    # A directory Zitadel brokers over LDAP. Automatic update is always on and
-    # memberOf always mapped: without either, a removed group lingers.
-    ldap:
-      enabled: false
-      name: Directory
-      servers: []            # ldaps://ldap.firm.example:636
-      startTls: false
-      baseDn: ""
-      bindDn: ""
-      # A Secret holding the bind password.
-      bindPasswordSecret: ""
-      bindPasswordKey: password
-      userObjectClass: inetOrgPerson
-      userFilter: uid
-    # SAML attribute names the group hook reads, when SAML is brokered.
-    saml:
-      groupsAttribute: groups
-      usernameAttribute: uid
-      givenNameAttribute: givenName
-      familyNameAttribute: sn
-      emailAttribute: email
-    egress:
-      allowCidrs: []
-    # The Secret holding Zitadel's own Postgres URL, under the key `dsn`. Made
-    # by this chart and left empty for the first-run wizard to fill, because a
-    # fresh install has no database for Zitadel yet. Its database and role are
-    # still yours to make (ruling 16); what the wizard fills in is how to reach
-    # them. It must match what zitadel.env names below.
-    databaseSecretName: meridian-zitadel-database
-    # The key pair this chart makes for the system API user Zitadel trusts.
-    # Setup signs a short-lived credential with the private half whenever it
-    # runs, so nothing here is minted once and lost forever: Zitadel's own
-    # first-instance token is, which is why setup does not use it. Zitadel
-    # reads the public half through the mount in zitadel.extraVolumes below,
-    # so the two names have to agree.
-    systemUserSecretName: meridian-identity-system-user
-    # Where a browser reaches this deployment, written by first run and read by
-    # the dashboard, by Zitadel and by the setup Job. Its name is a value
-    # because Zitadel's own env references it below, and those are values.
-    addressesSecretName: meridian-addresses
-
-# The bundled Zitadel's own chart. Only what Meridian needs is set here; any of
-# Zitadel's chart values may be added.
-zitadel:
-  image:
-    tag: ""
-  login:
-    image:
-      tag: ""
-  # Its database and role are yours to make, so its init job does only the
-  # part its own role can: Zitadel's schema inside the database it owns. The
-  # rest of init -- the database, the role, their grants -- would need your
-  # Postgres superuser.
-  # Zitadel's own init and setup run as Helm hooks, and a hook has to succeed
-  # before any ordinary resource exists. On a fresh install its database is not
-  # configured until somebody has been through the first-run wizard, which the
-  # dashboard serves, so a hook would be waiting in front of the thing that
-  # unblocks it. Both are turned off here and run instead as our own Job, which
-  # waits (templates/identity.yaml).
-  #
-  # The setup job has no enabled flag, so it is annotated as a test hook: it
-  # renders, and nothing but `helm test` would ever run it.
-  initJob:
-    enabled: false
-  setupJob:
-    annotations:
-      helm.sh/hook: test
-      helm.sh/hook-delete-policy: before-hook-creation
-  # Zitadel's own security context is kept: its image names its user rather
-  # than numbering it, so Kubernetes can only verify it is non-root through the
-  # uid its chart pins. On OpenShift, which assigns each namespace its own
-  # range and refuses a pinned uid, set runAsUser and fsGroup to null here and
-  # in securityContext, and the platform's numeric uid does the same job.
-  # Zitadel's chart names its kubectl image after the cluster's Kubernetes
-  # version, and not every version has an image (alpine/k8s:1.28.8 does not).
-  # Pinned to one that exists.
-  tools:
-    kubectl:
-      image:
-        tag: "1.31.0"
-  env:
-    - name: ZITADEL_DATABASE_POSTGRES_DSN
-      valueFrom:
-        secretKeyRef:
-          name: meridian-zitadel-database
-          key: dsn
-    # Zitadel refuses webhook targets on private addresses, and the group hook
-    # is on one. Narrowed to link-local only; the NetworkPolicy on Zitadel's
-    # egress is what limits it back to the hook, its database and directory.
-    - name: ZITADEL_HTTPCLIENT_DENYLIST
-      value: "169.254.0.0/16"
-    # What Zitadel calls itself, which it puts in every token it issues. The
-    # wizard is what learns it, so these come from what first run wrote rather
-    # than from configmapConfig below; an administrator who set the address
-    # there keeps it, because a value present wins over an absent key.
-    - name: ZITADEL_EXTERNALDOMAIN
-      valueFrom:
-        secretKeyRef:
-          name: meridian-addresses
-          key: zitadel-external-domain
-          optional: true
-    - name: ZITADEL_EXTERNALPORT
-      valueFrom:
-        secretKeyRef:
-          name: meridian-addresses
-          key: zitadel-external-port
-          optional: true
-    - name: ZITADEL_EXTERNALSECURE
-      valueFrom:
-        secretKeyRef:
-          name: meridian-addresses
-          key: zitadel-external-secure
-          optional: true
-  # Where Zitadel reads the system API user's certificate from. Its name is
-  # identity.bundled.systemUserSecretName above.
-  extraVolumes:
-    - name: system-user
-      secret:
-        secretName: meridian-identity-system-user
-  extraVolumeMounts:
-    - name: system-user
-      mountPath: /system-user
-      readOnly: true
-  zitadel:
-    # Made once by this chart and never regenerated: it encrypts the directory
-    # credentials and signing keys in Zitadel's database, which is unreadable
-    # in part without it. Back it up apart from the database.
-    masterkeySecretName: meridian-zitadel-masterkey
-    configmapConfig:
-      # The one credential that administers this Zitadel. A system API user
-      # rather than the first instance's token, which Zitadel mints once and
-      # never again: losing it would leave the directory unadministrable with
-      # an empty database as the only way back.
-      #
-      # System membership, because this Zitadel serves exactly one deployment
-      # and exists to be configured by it. The roles are what setup needs to
-      # make the project, its application and the directory connection, and
-      # SYSTEM_OWNER is deliberately not among them.
-      SystemAPIUsers:
-        - meridian-setup:
-            Path: /system-user/tls.crt
-            Memberships:
-              - MemberType: System
-                Roles:
-                  - IAM_OWNER
-                  - ORG_OWNER
-      ExternalDomain: ""
-      ExternalPort: 443
-      ExternalSecure: true
-      TLS:
-        Enabled: false
-
-# The broker the components and sidecars meet on, per decision 010. One secret
-# holding one credential per identity, each mounted into that container alone:
-# a plugin can route to the broker and has nothing to present.
 broker:
   # A broker this deployment already has, holding a credential per component
   # under the keys below. Empty means this chart brings one, makes the
@@ -408,11 +230,23 @@ broker:
   # anybody to write by hand.
   existingSecret: ""
 
-  # The bundled broker's own image. Its version is yours, as Zitadel's is.
+  # The bundled broker's own image. Its version is yours.
   image: nats:2.10-alpine
   instrumentKey: instrument
   conductorKey: conductor
   streetKey: street
+
+# What first run writes, and what reads it. These are Secret names rather than
+# values: the wizard fills them in the cluster, and the chart names them so
+# that the Job may write those and nothing else.
+firstRun:
+  # Where a browser reaches this deployment, who administers it, and -- where
+  # the deployment holds the account itself -- that administrator's login and
+  # password hash. Never a password: there is no key for one.
+  addressesSecretName: meridian-addresses
+  # The firm's LDAP, where they have one: the servers, the base, the bind and
+  # how a person is found. The dashboard binds to it directly (decisions/018).
+  directorySecretName: ""
 
 # A sidecar per plugin, each with the identity it is launched with. The key in
 # the broker secret is the instance identifier, so adding a plugin is adding a

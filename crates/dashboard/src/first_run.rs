@@ -31,14 +31,13 @@ use axum::Router;
 use meridian_domain::v1::bundled_zitadel_answer::Directory;
 use meridian_domain::v1::first_run_check_request::Answer as CheckAnswer;
 use meridian_domain::v1::login_backend_answer::Backend;
-use meridian_domain::v1::zitadel_database_answer::Route;
 use meridian_domain::v1::{
     administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BroughtDatabase,
     BundledZitadelAnswer, ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState,
     EnrolmentStateRequest, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
     FirstRunConfiguration, FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer,
     LocalAccountAnswer, LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply,
-    RedeemClaimCodeRequest, RuntimeDatabaseAnswer, SealedCredential, ZitadelDatabaseAnswer,
+    RedeemClaimCodeRequest, RuntimeDatabaseAnswer, SealedCredential,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -650,8 +649,7 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
     };
 
     let backend = match field("backend").as_str() {
-        // The firm's own directory: the bundled Zitadel is not used, and the
-        // Job leaves it at zero replicas.
+        // The firm's own provider. Nothing of ours signs anybody in.
         "oidc" => LoginBackendAnswer {
             backend: Some(Backend::Oidc(OidcProviderAnswer {
                 issuer: field("oidc_issuer"),
@@ -665,23 +663,13 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
             })),
         },
         _ => LoginBackendAnswer {
+            // The firm's LDAP, or an account this deployment holds. Nothing
+            // of ours signs anybody in either way (decisions/018), so the
+            // fields that configured an identity server are gone and this
+            // message carries only what the firm was asked about. Its name
+            // is the last of it, and changing that is a contract revision of
+            // its own.
             backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: field("zitadel_version"),
-                database: Some(ZitadelDatabaseAnswer {
-                    route: Some(Route::Existing(DatabaseLogin {
-                        host: field("zitadel_db_host"),
-                        port: field("zitadel_db_port").parse().unwrap_or(5432),
-                        database: field("zitadel_db_name"),
-                        role: field("zitadel_db_role"),
-                        password: Some(seal_field(
-                            "zitadel_database.existing.password",
-                            &field("zitadel_db_password"),
-                        )?),
-                        ssl_mode: field("zitadel_db_sslmode"),
-                    })),
-                }),
-                egress_cidrs: split(&field("zitadel_egress")),
-                roles: split(&field("zitadel_roles")),
                 directory: match field("directory").as_str() {
                     "ldap" => Some(Directory::Ldap(LdapDirectoryAnswer {
                         name: field("ldap_name"),
@@ -696,8 +684,8 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
                         user_object_class: field("ldap_user_object_class"),
                         user_filter: field("ldap_user_filter"),
                     })),
-                    // A firm with no directory of its own: the first
-                    // administrator gets an account in the bundled Zitadel.
+                    // A firm with no directory of its own: the deployment
+                    // holds the account, and first run makes it.
                     _ => Some(Directory::LocalAccount(LocalAccountAnswer {
                         login_name: field("admin_login"),
                         email: field("admin_email"),
@@ -709,6 +697,7 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
                         )?),
                     })),
                 },
+                ..Default::default()
             })),
         },
     };
@@ -718,7 +707,10 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
         backend,
         addresses: AddressesAnswer {
             dashboard_url: field("dashboard_url"),
-            zitadel_url: field("zitadel_url"),
+            // Nothing of ours has an address to send a browser to any more
+            // (decisions/018). The field remains on the message until it is
+            // renamed, which is a contract revision of its own.
+            zitadel_url: String::new(),
         },
         administrator: administrator(fields),
     })
@@ -823,13 +815,13 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
              {}{}\
              {}{}\
              <h2>Signing in</h2>\
-             <p>Choose the bundled directory, or connect the firm's own.</p>\
+             <p>Connect the firm's provider, or let this deployment sign \
+             people in against their LDAP or against accounts it holds \
+             itself. Nothing else runs here either way.</p>\
              <label>Backend<select name=\"backend\">\
-             <option value=\"bundled\">Bundled (Zitadel in this cluster)</option>\
+             <option value=\"bundled\">This deployment signs them in</option>\
              <option value=\"oidc\">The firm's own OpenID Connect provider</option>\
              </select></label>\
-             {}{}{}\
-             {}{}{}{}{}\
              <label>Directory<select name=\"directory\">\
              <option value=\"local\">No directory: make me an account</option>\
              <option value=\"ldap\">Connect the firm's LDAP</option>\
@@ -851,9 +843,9 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
              means a claim code from the platform.</p>\
              {}\
              <h2>Addresses</h2>\
-             <p>Where a browser reaches this deployment. The directory sends \
-             people back to the first of them.</p>\
-             {}{}\
+             <p>Where a browser reaches this deployment. A firm's own \
+             provider sends people back to it.</p>\
+             {}\
              <h2>Apply</h2>\
              <p>Test as often as you like: nothing is written until you apply. \
              Applying writes it all at once and restarts what changed. When \
@@ -870,22 +862,6 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             secret("db_serving_password", "Serving password"),
             text("db_migrating_role", "Migrating role", "meridian_migrate"),
             secret("db_migrating_password", "Migrating password"),
-            text("zitadel_version", "Zitadel version", "v4.17.3"),
-            text(
-                "zitadel_egress",
-                "Address ranges Zitadel may reach",
-                "10.20.0.0/16"
-            ),
-            text("zitadel_roles", "Roles Zitadel issues", ""),
-            text(
-                "zitadel_db_host",
-                "Zitadel database host",
-                "postgres.firm.internal"
-            ),
-            text("zitadel_db_port", "Zitadel database port", "5432"),
-            text("zitadel_db_name", "Zitadel database", "zitadel"),
-            text("zitadel_db_role", "Zitadel database role", "zitadel"),
-            secret("zitadel_db_password", "Zitadel database password"),
             text("admin_login", "Your login name", ""),
             text("admin_email", "Your email", ""),
             text("admin_given_name", "Given name", ""),
@@ -911,11 +887,6 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
                 "dashboard_url",
                 "This dashboard",
                 "https://meridian.firm.example"
-            ),
-            text(
-                "zitadel_url",
-                "Zitadel, when bundled",
-                "https://id.meridian.firm.example"
             ),
         ),
     )

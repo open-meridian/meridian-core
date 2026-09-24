@@ -1,7 +1,7 @@
 //! The dashboard: the one address a firm's staff use for their deployment.
 //!
 //! It signs people in through the firm's directory over OpenID Connect -- a
-//! SAML or LDAP directory brokered by the bundled Zitadel -- and decides what
+//! firm's LDAP, or an account this deployment holds -- and decides what
 //! they may reach from the permissions the conductor's configuration store
 //! holds, evaluated by [`meridian_access`]. It holds no deployment key and
 //! never reaches the platform; what goes there goes through the conductor.

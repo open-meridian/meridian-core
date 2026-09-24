@@ -59,14 +59,11 @@ fn run() -> Result<(), String> {
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "first-run-1".into());
     let names = Names {
         database_secret: required("MERIDIAN_FIRST_RUN_DATABASE_SECRET")?,
-        zitadel_database_secret: required("MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET")?,
         dashboard_oidc_secret: required("MERIDIAN_FIRST_RUN_OIDC_SECRET")?,
         ldap_bind_secret: required("MERIDIAN_FIRST_RUN_LDAP_SECRET")?,
         addresses_secret: required("MERIDIAN_FIRST_RUN_ADDRESSES_SECRET")?,
-        zitadel_egress_policy: required("MERIDIAN_FIRST_RUN_EGRESS_POLICY")?,
         own_binding: required("MERIDIAN_FIRST_RUN_BINDING")?,
         restart: list("MERIDIAN_FIRST_RUN_RESTART"),
-        bundled_identity: list("MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY"),
     };
 
     let first_run = Arc::new(FirstRun {
@@ -79,7 +76,6 @@ fn run() -> Result<(), String> {
         probe: Box::new(Postgres),
         provisioner: Box::new(Postgres),
         brought: brought_server(),
-        bundled_directory: var("MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY").as_deref() == Some("true"),
     });
 
     tokio::runtime::Builder::new_multi_thread()
@@ -335,7 +331,6 @@ fn brought_server() -> Option<BroughtServer> {
         superuser_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD")?,
         serving_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD")?,
         migrating_password: var("MERIDIAN_FIRST_RUN_BROUGHT_MIGRATING_PASSWORD")?,
-        zitadel_password: var("MERIDIAN_FIRST_RUN_BROUGHT_ZITADEL_PASSWORD")?,
     })
 }
 

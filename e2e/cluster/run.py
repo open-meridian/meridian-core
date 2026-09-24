@@ -196,18 +196,6 @@ def main():
         "--set", f"deployment.id={deployment_id}",
         "--set", f"deployment.enrolmentCode={enrolment_code}",
         "--set", f"platform.address={PLATFORM_FROM_POD}",
-        # The wizard answers `bundled` below, and the Secrets it fills for
-        # Zitadel are rendered only when the chart brought one. Choosing a
-        # backend the chart did not render fails at the step that writes,
-        # which is late.
-        "--set", "identity.bundled.enabled=true",
-        "--set", "zitadel.image.tag=v4.17.3",
-        "--set", "zitadel.login.image.tag=v4.17.3",
-        # Where Zitadel may reach: the cluster's pod and service ranges, which
-        # is where its database and the group hook are. The chart refuses to
-        # render without this rather than installing something that reaches
-        # nothing.
-        "--set", 'identity.bundled.egress.allowCidrs={10.42.0.0/16,10.43.0.0/16}',
     ]
     if IMAGE:
         repository, _, tag = IMAGE.rpartition(":")
@@ -267,8 +255,6 @@ def main():
             "db_serving_role": "meridian_app",
             "db_migrating_role": "meridian_migrate",
             "backend": "bundled",
-            "zitadel_version": "v4.17.3",
-            "zitadel_egress": "10.42.0.0/16,10.43.0.0/16",
             "directory": "local",
             "admin_login": "ada",
             "admin_email": "ada@example.org",
@@ -287,16 +273,9 @@ def main():
                     "db_sslmode": "disable",
                     "db_serving_password": EXTERNAL_PASSWORD,
                     "db_migrating_password": EXTERNAL_PASSWORD,
-                    "zitadel_db_host": EXTERNAL_HOST,
-                    "zitadel_db_port": EXTERNAL_PORT,
-                    "zitadel_db_name": "zitadel",
-                    "zitadel_db_role": "zitadel",
-                    "zitadel_db_password": EXTERNAL_PASSWORD,
-                    "zitadel_db_sslmode": "disable",
                 }
             ),
             "dashboard_url": WIZARD,
-            "zitadel_url": f"http://{RELEASE}-meridian-runtime-zitadel.{NAMESPACE}.svc.cluster.local:8080",
         }
         status, page = post("/first-run/check", answers, cookies)
         s.check("passed" in page or "passes" in page, "the answers pass")
@@ -332,10 +311,6 @@ def main():
     s.check(
         psql("select has_schema_privilege('meridian_app','public','CREATE')") == "f",
         "and the serving role may not create tables",
-    )
-    s.check(
-        psql("select datname from pg_database where datname = 'zitadel'") == "zitadel",
-        "and Zitadel has its own database on the same server",
     )
 
     print("G: the administrator the wizard named", flush=True)

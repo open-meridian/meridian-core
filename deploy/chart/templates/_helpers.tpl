@@ -108,19 +108,3 @@ runtime
 {{- define "meridian-runtime.databaseSecret" -}}
 {{- .Values.database.existingSecret | default (printf "%s-database" (include "meridian-runtime.fullname" .)) -}}
 {{- end -}}
-
-{{/*
-The bundled Zitadel's issuer, as Zitadel itself states it: its external
-scheme, domain and port, the port left out when it is the scheme's default.
-*/}}
-{{- define "meridian-runtime.zitadelIssuer" -}}
-{{- $c := .Values.zitadel.zitadel.configmapConfig -}}
-{{- $scheme := ternary "https" "http" (ne (toString $c.ExternalSecure) "false") -}}
-{{- $port := int ($c.ExternalPort | default (ternary 443 80 (eq $scheme "https"))) -}}
-{{- if or (and (eq $scheme "https") (eq $port 443)) (and (eq $scheme "http") (eq $port 80)) -}}
-{{- printf "%s://%s" $scheme $c.ExternalDomain -}}
-{{- else -}}
-{{- printf "%s://%s:%d" $scheme $c.ExternalDomain $port -}}
-{{- end -}}
-{{- end -}}
-

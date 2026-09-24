@@ -146,10 +146,10 @@ services:
       MERIDIAN_DASHBOARD_LISTEN: 0.0.0.0:8080
       MERIDIAN_DASHBOARD_URL: ${MERIDIAN_DASHBOARD_URL:-http://localhost:8088}
       # A directory to sign in against. Unset here, so the dashboard serves and
-      # says nobody can sign in; the e2e target sets it to the bundled Zitadel.
+      # says nobody can sign in; the e2e targets set one of the three.
       MERIDIAN_OIDC_ISSUER: ${MERIDIAN_OIDC_ISSUER:-}
       MERIDIAN_OIDC_CLIENT_ID: ${MERIDIAN_OIDC_CLIENT_ID:-}
-      # Zitadel names the client's project in every ID token's audience.
+      # Some providers name a project or resource in the audience.
       MERIDIAN_OIDC_TRUSTED_AUDIENCES: ${MERIDIAN_OIDC_TRUSTED_AUDIENCES:-}
       # A confidential client. The stand-in signs with HS256 keyed by this,
       # which is what lets a provider be stood in for without an asymmetric
@@ -256,82 +256,14 @@ services:
       - runtime-keys:/var/lib/meridian:ro
     networks: [meridian]
 
-  # ── make e2e-dashboard ────────────────────────────────────────────────────
+  # ── the dashboard's three ways of signing people in ───────────────────────
   #
-  # The dashboard's sign-in against a real, self-hosted Zitadel, brokering a
-  # test LDAP directory, with the group hook between them and a stand-in for
-  # the one platform call a claim makes. Everything here is a local test value
-  # for an instance that lives for one run; none of it is a deployment's.
-  # Nothing publishes a host port: every caller is on the network, and the
-  # issuer is the name the dashboard and the tokens both use.
+  # A real LDAP directory, a stand-in for a firm's own provider, and a stand-in
+  # for the one platform call a claim makes. Everything here is a local test
+  # value for something that lives for one run; none of it is a deployment's.
 
-  # The bundled Zitadel, as the chart installs it: its own database and its
-  # own login role inside the deployment's Postgres (spec, requirement 6).
-  # Init creates both with the admin credential; Zitadel then runs as its own
-  # role.
-  zitadel:
-    profiles: [e2e]
-    image: ghcr.io/zitadel/zitadel:v4.17.3
-    # Root, to write the first instance's tokens onto the bootstrap volume.
-    user: "0"
-    command:
-      ["start-from-init", "--masterkeyFromEnv", "--tlsMode", "disabled",
-       "--config", "/zitadel-config/config.yaml"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      # Zitadel's documented example key. A deployment's is created once as a
-      # Secret and never regenerated.
-      ZITADEL_MASTERKEY: MasterkeyNeedsToHave32Characters
-      ZITADEL_LOG_LEVEL: info
-      # The issuer: http://zitadel:8080, the same string inside the network,
-      # in discovery, and in every token.
-      ZITADEL_EXTERNALDOMAIN: zitadel
-      ZITADEL_EXTERNALPORT: 8080
-      ZITADEL_EXTERNALSECURE: "false"
-      ZITADEL_TLS_ENABLED: "false"
-      # The default refuses webhook targets on private addresses, which is
-      # where the group hook lives. Narrowed to the metadata range only.
-      ZITADEL_HTTPCLIENT_DENYLIST: "169.254.0.0/16"
-      ZITADEL_DATABASE_POSTGRES_HOST: core-postgres
-      ZITADEL_DATABASE_POSTGRES_PORT: 5432
-      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
-      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
-      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel-dev-only
-      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
-      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: meridian
-      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: meridian
-      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
-      ZITADEL_DATABASE_POSTGRES_ADMIN_EXISTINGDATABASE: meridian
-      ZITADEL_FIRSTINSTANCE_ORG_NAME: E2E
-      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: zitadel-admin
-      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: "Password1!"
-      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
-      # A machine admin whose token the bootstrap uses, and the login client
-      # whose token drives sign-ins through the session API as Login v2 does.
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: admin-sa
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Admin SA
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
-      ZITADEL_FIRSTINSTANCE_PATPATH: /bootstrap/admin.pat
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Login Client
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
-      ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /bootstrap/login-client.pat
-      # Login v2, so an authorisation request is finished through the v2 API.
-      # The UI itself is not run: the test drives that API as the UI would.
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://zitadel-login:3000/ui/v2/login/
-      ZITADEL_OIDC_DEFAULTLOGINURLV2: http://zitadel-login:3000/ui/v2/login/login?authRequest=
-      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: http://zitadel-login:3000/ui/v2/login/logout?post_logout_redirect=
-    volumes:
-      - e2e-bootstrap:/bootstrap
-      # The system API user setup signs its credential for, as the chart
-      # configures in a cluster.
-      - ./e2e/zitadel:/zitadel-config:ro
-    networks: [meridian]
-
-  # A firm's LDAP directory, for Zitadel to broker. memberOf is switched on
+  # A firm's LDAP directory, bound by the dashboard itself. memberOf is
+  # switched on
   # and the tree loaded by the make target, because the overlay has to be in
   # place before the groups are written for it to maintain memberOf.
   ldap:
@@ -346,77 +278,6 @@ services:
       - ./e2e/dashboard/ldap:/e2e-ldap:ro
     networks: [meridian]
 
-  # The group hook, with the signing keys Zitadel returned when the bootstrap
-  # made its two targets, and the dashboard's project in Zitadel. Started before
-  # the bootstrap and waiting for it, because Zitadel refuses a target whose
-  # host does not resolve, and the key exists only once the target does.
-  group-hook:
-    profiles: [e2e]
-    build:
-      context: .
-      target: runtime
-    entrypoint:
-      - sh
-      - -c
-      - >-
-        until [ -s /bootstrap/token-signing-key ] && [ -s /bootstrap/project-id ]; do sleep 1; done;
-        MERIDIAN_GROUP_HOOK_INTENT_SIGNING_KEY="$$(cat /bootstrap/intent-signing-key)"
-        MERIDIAN_GROUP_HOOK_TOKEN_SIGNING_KEY="$$(cat /bootstrap/token-signing-key)"
-        MERIDIAN_GROUP_HOOK_PROJECT_ID="$$(cat /bootstrap/project-id)"
-        exec meridian-group-hook
-    environment:
-      MERIDIAN_GROUP_HOOK_LISTEN: 0.0.0.0:8090
-      RUST_LOG: ${RUST_LOG:-info}
-    volumes:
-      - e2e-bootstrap:/bootstrap:ro
-    networks: [meridian]
-
-  # The chart's setup Job, run here with files for output: the dashboard's
-  # project, client and roles, the LDAP provider, and the hook's targets and
-  # executions, through Zitadel's API, idempotently. The same code a
-  # customer's cluster runs, so this run tests it.
-  zitadel-setup:
-    profiles: [e2e]
-    build:
-      context: .
-      target: runtime
-    command: ["meridian-group-hook", "setup"]
-    environment:
-      MERIDIAN_ZITADEL_API_URL: http://zitadel:8080
-      MERIDIAN_ZITADEL_SYSTEM_USER: meridian-setup
-      MERIDIAN_ZITADEL_SYSTEM_USER_KEY_FILE: /zitadel-config/system-user.key
-      # What Zitadel checks the credential's audience against: the issuer it
-      # states, which here is its own name on this network.
-      MERIDIAN_ZITADEL_ISSUER: http://zitadel:8080
-      MERIDIAN_DASHBOARD_REDIRECT_URI: http://dashboard:8080/callback
-      MERIDIAN_GROUP_HOOK_URL: http://group-hook:8090
-      MERIDIAN_ZITADEL_ROLES: e2e-staff
-      MERIDIAN_ZITADEL_DEV_MODE: "true"
-      MERIDIAN_LDAP_NAME: Firm LDAP
-      MERIDIAN_LDAP_SERVERS: ldap://ldap:1389
-      MERIDIAN_LDAP_BASE_DN: ou=people,dc=example,dc=org
-      MERIDIAN_LDAP_BIND_DN: cn=admin,dc=example,dc=org
-      MERIDIAN_LDAP_BIND_PASSWORD: ldap-admin-dev-only
-      MERIDIAN_SETUP_OUTPUT: files:/bootstrap
-      RUST_LOG: ${RUST_LOG:-info}
-    volumes:
-      - e2e-bootstrap:/bootstrap
-      - ./e2e/zitadel:/zitadel-config:ro
-    networks: [meridian]
-
-  # What only the test needs, after setup: people made in Zitadel, and the
-  # identifiers the runner looks for.
-  zitadel-bootstrap:
-    profiles: [e2e]
-    image: python:3.12-alpine
-    command: ["python", "-u", "/e2e/bootstrap.py"]
-    environment:
-      ZITADEL: http://zitadel:8080
-    volumes:
-      - ./e2e/dashboard:/e2e:ro
-      - e2e-bootstrap:/bootstrap
-    networks: [meridian]
-
   # The one platform call a claim makes, answered: one known code, once.
   # The real platform does not serve it yet.
   fake-platform:
@@ -429,25 +290,6 @@ services:
       E2E_PLATFORM_ADDRESS: http://fake-platform:8000
     volumes:
       - ./e2e/dashboard:/e2e:ro
-    networks: [meridian]
-
-  # A browser, as far as the dashboard can tell, and Login v2, as far as
-  # Zitadel can: a cookie jar that follows the dashboard's redirects, and the
-  # session API that finishes each sign-in.
-  e2e-runner:
-    profiles: [e2e]
-    image: python:3.12-alpine
-    entrypoint: ["python", "-u", "/e2e/runner.py"]
-    environment:
-      ZITADEL: http://zitadel:8080
-      DASHBOARD: http://dashboard:8080
-      GROUP_HOOK: http://group-hook:8090
-      FAKE_PLATFORM: http://fake-platform:8000
-      E2E_CLAIM_CODE: E2E-7KQ2-MX4P
-    volumes:
-      - ./e2e/dashboard:/e2e:ro
-      - e2e-bootstrap:/bootstrap:ro
-      - e2e-state:/state
     networks: [meridian]
 
   # ── First run, without a cluster ────────────────────────────────────────────
@@ -520,10 +362,8 @@ services:
         export PGPASSWORD=meridian
         psql -h core-postgres -U meridian -d meridian -v ON_ERROR_STOP=0 \
           -c "create database firstrun" \
-          -c "create database firstrun_zitadel" \
           -c "create role firstrun_app login password 'first-run-dev-only'" \
-          -c "create role firstrun_migrate login password 'first-run-dev-only'" \
-          -c "create role firstrun_zitadel login password 'first-run-dev-only'" || true
+          -c "create role firstrun_migrate login password 'first-run-dev-only'" || true
         psql -h core-postgres -U meridian -d firstrun -v ON_ERROR_STOP=1 \
           -c "revoke create on schema public from public" \
           -c "grant usage on schema public to firstrun_app" \
@@ -587,17 +427,13 @@ services:
       KUBERNETES_SERVICE_HOST: fr-kube
       KUBERNETES_SERVICE_PORT: "8443"
       MERIDIAN_FIRST_RUN_DATABASE_SECRET: first-run-database
-      MERIDIAN_FIRST_RUN_ZITADEL_DATABASE_SECRET: first-run-zitadel-database
       MERIDIAN_FIRST_RUN_OIDC_SECRET: first-run-dashboard-oidc
       MERIDIAN_FIRST_RUN_LDAP_SECRET: first-run-ldap-bind
       MERIDIAN_FIRST_RUN_ADDRESSES_SECRET: first-run-addresses
-      MERIDIAN_FIRST_RUN_EGRESS_POLICY: first-run-egress
       MERIDIAN_FIRST_RUN_BINDING: first-run
       MERIDIAN_FIRST_RUN_RESTART: first-run-conductor,first-run-dashboard
-      MERIDIAN_FIRST_RUN_BUNDLED_IDENTITY: first-run-zitadel,first-run-zitadel-login
       # Whether there is one to set up. The names above are given whether or
       # not it was rendered, so they say nothing about it.
-      MERIDIAN_FIRST_RUN_BUNDLED_DIRECTORY: "true"
       # The database this chart can bring. In a cluster the Job scales a
       # StatefulSet and then connects to it; here the stand-in Kubernetes
       # records the scale and this points at a Postgres that is already
@@ -611,7 +447,6 @@ services:
       MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD: meridian
       MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD: brought-serving-dev-only
       MERIDIAN_FIRST_RUN_BROUGHT_MIGRATING_PASSWORD: brought-migrating-dev-only
-      MERIDIAN_FIRST_RUN_BROUGHT_ZITADEL_PASSWORD: brought-zitadel-dev-only
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       fr-kube:
@@ -623,8 +458,7 @@ services:
     networks: [meridian]
 
   # A firm's own OpenID Connect provider, standing in for one. Somebody
-  # else's software by construction, which is what the bundled Zitadel was
-  # being borrowed as until it started being deleted.
+  # else's software by construction, which is what a stand-in should be.
   fake-idp:
     profiles: [e2e]
     image: python:3.12-alpine
@@ -695,11 +529,9 @@ services:
       E2E_BROUGHT_HOST: core-postgres
       E2E_BROUGHT_SERVING_PASSWORD: brought-serving-dev-only
       E2E_BROUGHT_MIGRATING_PASSWORD: brought-migrating-dev-only
-      E2E_BROUGHT_ZITADEL_PASSWORD: brought-zitadel-dev-only
       E2E_SUPERUSER_PASSWORD: meridian
       E2E_DB_ROUTE: ${E2E_DB_ROUTE:-external}
-      # Which directory signs people in: the bundled Zitadel, or the firm's
-      # own provider with the bundle still rendered and switched off.
+      # Which way people sign in, for the first-run suite's two runs.
       E2E_BACKEND: ${E2E_BACKEND:-bundled}
     volumes:
       - ./e2e/first-run:/e2e:ro

@@ -55,17 +55,17 @@ GRANT ALL ON DATABASE meridian TO meridian_migrate;
 The wizard tests both and names the statement that fixes what it finds, so you
 do not have to get the grants exactly right here.
 
-**How people sign in.** Either the firm's own OpenID Connect provider, or a
-Zitadel the chart runs beside the deployment for firms that have no directory
-or whose directory speaks only LDAP or SAML.
+**How people sign in.** One of three, and unlike the database this one you
+can leave until the wizard — nothing about it is passed at install.
 
-You can keep this choice open until the wizard, and the easiest thing is to
-do so: install with the bundled Zitadel rendered, in step 3, and then answer
-either way. Choosing the firm's own provider leaves the bundle switched off
-and costs nothing. What you cannot do is the reverse — install without it and
-then choose it, which the wizard refuses, because Helm either rendered those
-resources or it did not. The price of keeping the choice open is naming a
-Zitadel version you might never use.
+| | |
+|---|---|
+| **Your OpenID Connect provider** | The deployment federates to it. Nothing of ours authenticates anybody. **It must return `auth_time`** — see step 7 |
+| **Your LDAP** | The deployment binds to it directly: it forwards a password once, stores none, and reads each person's groups from your directory |
+| **Neither** | The deployment holds the accounts itself, with hashed passwords and a lockout. For a firm with no directory of its own |
+
+Nothing of Meridian's signs people in as a separate service, so there is no
+identity server to size, version, back up or upgrade.
 
 ## 1. Register the deployment
 
@@ -101,33 +101,15 @@ Make a namespace and install. Substitute your identifier and your code:
 kubectl create namespace meridian
 ```
 
-**Unless you are certain you will use the firm's own provider**, install with
-the bundled Zitadel rendered and decide in the wizard. The chart has no default
-Zitadel version and never picks one, so that an upgrade needing a newer Zitadel
-refuses and names it rather than moving it underneath you — which is why you
-name one here even if you end up not using it:
-
 ```bash
 helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
   --namespace meridian \
   --set deployment.id=DEP-XXXX-XXXX \
-  --set deployment.enrolmentCode=ENR-XXXX-XXXX-XXXX \
-  --set identity.bundled.enabled=true \
-  --set zitadel.image.tag=v4.17.3 \
-  --set zitadel.login.image.tag=v4.17.3 \
-  --set 'identity.bundled.egress.allowCidrs={10.42.0.0/16,10.43.0.0/16}'
+  --set deployment.enrolmentCode=ENR-XXXX-XXXX-XXXX
 ```
 
-`allowCidrs` is where Zitadel is allowed to reach: its own database, the group
-hook, and your LDAP directory if you have one. Everything else is denied. The
-two above are k3s's pod and service ranges, which is what a laptop cluster
-uses. On a managed cluster, use that cluster's ranges — your provider's console
-calls them the pod and service CIDRs — and add your directory's range if it is
-elsewhere. The chart refuses to render without this rather than installing
-something that can reach nothing.
-
-If you are certain the firm's own provider is what you will use, leave all four
-off and install with the first three values alone.
+That is the whole command, on every branch. How people sign in is answered in
+the wizard, not here.
 
 You do not tell it where the platform is. Leave `platform.address` alone unless
 somebody has asked you to test against a staging platform.
@@ -159,8 +141,6 @@ exactly what lets a fresh install serve a wizard at all.
 If you are watching this in a graphical cluster tool, it will report an error
 count for those three. Ignore it until after step 7.
 
-If you chose the bundled directory, Zitadel takes a few minutes longer than
-the rest.
 
 ## 4. Check the deployment enrolled, and that the key is yours
 
@@ -212,12 +192,12 @@ be pressed as often as you like.
 asks you for nothing further. *Use a database you already run* wants the host,
 port, database name, TLS mode, and the two roles with their passwords.
 
-**Signing in.** Choose the backend you installed in step 3 — they must agree.
-For the firm's own provider, give the issuer, client id and client secret. For
-the bundled Zitadel, give its version and the rest of its fields. Then choose
-whether there is a directory: *Connect the firm's LDAP*, or *No directory: make
-me an account*, which asks for the login, email, name and password of the one
-account it then creates.
+**Signing in.** Choose one of the three. *The firm's own OpenID Connect
+provider* asks for the issuer, client id, client secret and the claim carrying
+groups. *Connect the firm's LDAP* asks for the servers, the base to search
+from, the bind to search as, and how a person is found — and tests it by
+binding and searching. *No directory: make me an account* asks for the login,
+email, name and password of the one account this deployment then holds.
 
 **If you are using your own provider, it must return `auth_time`.** This is
 the one thing about your provider that Meridian requires and that not every
@@ -254,10 +234,10 @@ the bundled directory has no database until this page is applied. A group that
 does not exist is a deployment nobody can administer, and getting back in then
 means a claim code from the platform.
 
-**Addresses.** Where a browser reaches this deployment — the dashboard's
-address, and Zitadel's if you bundled one. The directory sends people back to
-the first of them. These are the addresses your staff will use, not the
-`127.0.0.1` forward you are reading this through.
+**Addresses.** Where a browser reaches this deployment. One address: nothing
+of ours redirects a browser anywhere else, so there is no second host to
+arrange. This is the address your staff will use, not the `127.0.0.1` forward
+you are reading this through.
 
 Press **Test**. It checks the database roles, the directory and the addresses,
 and names what it finds. Fix what it names, test again, and when it is clean
@@ -284,11 +264,9 @@ That is the install finished.
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there. Codes are refused while it is retired |
 | "already enrolled" when issuing an enrolment code | It holds a key already | If the cluster still has it, register the new key signed in through the deployment's keys. If you deleted the namespace, see **Starting over** below |
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there |
-| The wizard refuses the bundled directory | The chart did not render it | Add the four `identity.bundled` and `zitadel` values from step 3, `helm upgrade`, and apply again. Your answers are not kept, so have them to hand |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
 | "the directory did not say when this person authenticated" | Your provider returned no `auth_time` | See the table in step 7. On Entra, add it as an optional claim on the app registration; nothing in the deployment needs changing |
 | `street`, `instrument` or `migrate` still in error **after** applying | They may not have retried yet | Give them two minutes. If they persist, read the message: a key named there that is still missing means the apply did not write the database Secret |
-| Zitadel never reaches `1/1` | It cannot reach its database | Check `identity.bundled.egress.allowCidrs` covers your cluster's pod and service ranges |
 
 ## Starting over
 
@@ -319,12 +297,6 @@ one, along with everything in it. Nothing warns you and nothing backs it up.
 ## What to back up
 
 If you pointed at a database you run, back it up as you back up any other.
-
-If you bundled Zitadel, back up **its master key** — the Secret
-`meridian-zitadel-masterkey` — separately from the database, and keep it. The
-chart makes it once and never regenerates it, and it survives uninstalling.
-Without it, the directory credentials and signing keys in Zitadel's database
-cannot be read, and no copy of the database will help you.
 
 If the deployment brought its own database, there is nothing to back up and
 nothing backing it up. That is the trade you accepted before you started; it is a fine

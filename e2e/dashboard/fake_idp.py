@@ -3,17 +3,15 @@
 Decision 018: where a firm has a provider, the dashboard federates to it and
 nothing of ours signs anybody in. What this stands in for is therefore
 somebody else's software, which is exactly what a stand-in should be -- and it
-has to outlive the bundled Zitadel, which is being deleted and which the
-OpenID Connect cases used to borrow as a provider.
+stands in for somebody else's software, which is what branch one federates to.
 
 Signs with RS256, and publishes the public half at /jwks. Done with a
 hardcoded key and `pow`, because nothing in these images has an asymmetric
 crypto library and RSA signing is one modular exponentiation: PKCS#1 v1.5 is
 a padding rule, not an algorithm. That is worth the forty lines, because
 HS256 would leave the dashboard's JWKS path and its key-rotation retry
-untested -- and that retry is deliberate code ("a token signed with a key the
-directory rotated in since the last read is not a bad token") which the
-bundled Zitadel was covering until it was removed.
+untested -- and that retry is deliberate code: "a token signed with a key the
+directory rotated in since the last read is not a bad token".
 
 Endpoints beyond the protocol's, all under /e2e:
   POST /e2e/stale      the next ID token claims a sign-in from an hour ago

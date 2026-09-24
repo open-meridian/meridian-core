@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
     // serve one without it rather than sending people back to a guess.
     let public_url = var("MERIDIAN_DASHBOARD_URL").unwrap_or_default();
     let secure_cookies = public_url.starts_with("https://");
-    // Both, because the chart knows the bundled Zitadel's issuer from the
+    // Both, because the chart may know the provider's issuer from the
     // moment it renders and the client exists only once setup has made one.
     // An issuer with no client is a deployment part-way through first run, and
     // it signs nobody in.
@@ -74,7 +74,7 @@ fn run() -> Result<(), String> {
             client_secret: var("MERIDIAN_OIDC_CLIENT_SECRET"),
             redirect_url: format!("{}/callback", public_url.trim_end_matches('/')),
             groups_claim: var("MERIDIAN_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into()),
-            // Comma-separated. For the bundled Zitadel, the dashboard's project id.
+            // Comma-separated. Some providers name a project or resource here.
             trusted_audiences: var("MERIDIAN_OIDC_TRUSTED_AUDIENCES")
                 .map(|list| {
                     list.split(',')
@@ -271,7 +271,7 @@ fn run() -> Result<(), String> {
 }
 
 /// The directory's discovery document, retried for a minute: a bundled
-/// Zitadel may still be starting. Past that, exit with the reason, and let the
+/// A provider may still be starting. Past that, exit with the reason, and let the
 /// cluster restart this rather than serve a sign-in that cannot work.
 async fn discover(config: &OidcConfig) -> Result<Oidc, String> {
     let mut last = String::new();

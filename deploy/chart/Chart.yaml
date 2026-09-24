@@ -11,14 +11,3 @@ appVersion: "0.1.0"
 home: https://github.com/open-meridian/meridian-core
 sources:
   - https://github.com/open-meridian/meridian-core
-
-# The bundled Zitadel (spec, rulings 14 to 16): Zitadel's own chart, pinned and
-# vendored under charts/, so rendering needs no network. Off unless
-# identity.bundled.enabled. Its image version is not this pin: the deployment
-# admin sets it in zitadel.image.tag, and nothing else changes it.
-dependencies:
-  - name: zitadel
-    version: 10.0.6
-    repository: https://charts.zitadel.com
-    condition: identity.bundled.enabled
-

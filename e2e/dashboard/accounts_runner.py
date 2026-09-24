@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Shared with the LDAP suite, which is self-contained for the same reason this
-# is: neither may depend on the Zitadel runner, which is being deleted.
+# is: neither depends on anything that was deleted with the identity server.
 from ldap_runner import (  # noqa: E402
     FAILURES,
     Browser,

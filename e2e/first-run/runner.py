@@ -35,7 +35,7 @@ DATABASE_PASSWORD = os.environ["E2E_DATABASE_PASSWORD"]
 # depends on; `brought` starts one in the cluster, which is what somebody
 # trying the product does and what needs nothing of them.
 ROUTE = os.environ.get("E2E_DB_ROUTE", "external")
-# Which directory signs people in. `bundled` is the Zitadel this chart runs;
+# Which way people sign in. `bundled` is what this deployment does itself;
 # `oidc` is the firm's own provider, and the deployment is still installed with
 # the bundle rendered -- which is the combination that keeps the choice open
 # until the wizard, and the combination three defects hid in until 2026-09-23:
@@ -58,14 +58,9 @@ ANSWERS = {
     "db_sslmode": "disable",
     "db_serving_role": "firstrun_app", "db_serving_password": DATABASE_PASSWORD,
     "db_migrating_role": "firstrun_migrate", "db_migrating_password": DATABASE_PASSWORD,
-    "backend": "bundled", "zitadel_version": "v4.17.3",
-    "zitadel_egress": "10.10.0.0/16",
-    "zitadel_db_host": "core-postgres", "zitadel_db_port": "5432",
-    "zitadel_db_name": "firstrun_zitadel", "zitadel_db_role": "firstrun_zitadel",
-    "zitadel_db_password": DATABASE_PASSWORD, "zitadel_db_sslmode": "disable",
+    "backend": "bundled",
     "directory": "local", "admin_login": "ada", "admin_password": "Password1!",
     "dashboard_url": "http://dashboard-first-run:8080",
-    "zitadel_url": "http://zitadel:8080",
     # W7.5: who administers this deployment once it is configured. The local
     # account route names itself, so this stays empty there and the wizard
     # sends the account it is creating.
@@ -95,7 +90,6 @@ if BACKEND == "oidc":
         # Not using the bundle, so it is given no address. Leaving one would
         # have written its issuer over the firm's and hidden the defect this
         # route exists to catch.
-        "zitadel_url": "",
         # A directory states a person's groups, so the administrators are a
         # group rather than the one account the local route creates.
         "directory": "ldap",
@@ -288,11 +282,6 @@ def main():
                   if c.get("kind") == "statefulsets" and c.get("replicas") == 1]
         s.note(f"scaled: {state.get('scaled')}")
         s.check(bool(scaled), "the database it brought was started, by scaling and not creating")
-        zitadel = state["secrets"].get("first-run-zitadel-database", {}).get("dsn", "")
-        s.check("zitadel" in zitadel and os.environ["E2E_BROUGHT_ZITADEL_PASSWORD"] in zitadel,
-                "Zitadel was handed the role made for it")
-        s.check(os.environ["E2E_SUPERUSER_PASSWORD"] not in zitadel,
-                "and never the privileged connection the Job used to make it")
     s.check(ANSWERS["db_serving_role"] in database.get("url", "")
             and ANSWERS["db_migrating_role"] in database.get("migrate-url", ""),
             "each URL naming its own role")
@@ -309,14 +298,7 @@ def main():
                 f"the first administrator's password was hashed and written: {hashed[:24]!r}")
         s.check(ANSWERS["admin_password"] not in json.dumps(addresses),
                 "and the password itself reached no Secret")
-    if BACKEND == "bundled":
-        s.check(addresses.get("zitadel-external-domain") == "zitadel"
-                and addresses.get("zitadel-external-port") == "8080"
-                and addresses.get("zitadel-external-secure") == "false",
-                f"and Zitadel was told the same address in its own vocabulary: {addresses}")
-        s.check(addresses.get("issuer") == ANSWERS["zitadel_url"],
-                "which is also the issuer the dashboard will check tokens against")
-    else:
+    if BACKEND == "oidc":
         # The chart reads one issuer, out of this Secret. It was written only
         # into the dashboard's OIDC Secret until 2026-09-23 -- which the chart
         # reads the client id out of and not the issuer -- so a deployment that
@@ -325,8 +307,6 @@ def main():
         # `https://x/` and `https://x` are not it.
         s.check(addresses.get("issuer") == FIRMS_ISSUER,
                 f"the firm's issuer reached the Secret the dashboard reads: {addresses.get('issuer')!r}")
-        s.check("zitadel-external-domain" not in addresses,
-                "and the bundle was told no address, having not been chosen")
 
         oidc = state["secrets"].get("first-run-dashboard-oidc", {})
         s.check(oidc.get("client-id") == ANSWERS["oidc_client_id"],
@@ -338,33 +318,15 @@ def main():
         # hardcoded the variable -- four links and none of them joined.
         s.check(oidc.get("groups-claim") == FIRMS_GROUPS_CLAIM,
                 f"and the groups claim it was told: {oidc.get('groups-claim')!r}")
-
-        # Scaled down rather than never started, which is what the chart does
-        # today: the bundle renders at one and the Job turns it off when the
-        # firm's own directory is chosen instead.
-        off = [c for c in state.get("scaled", [])
-               if c.get("kind") == "deployments" and c.get("replicas") == 0]
-        s.note(f"scaled: {state.get('scaled')}")
-        s.check(len(off) == 2,
-                f"and the bundled Zitadel and its login page were switched off: {off}")
-    if BACKEND == "bundled":
-        s.check(state["policies"].get("first-run-egress") is not None,
-                "the one policy it may patch was patched")
-        s.check(any("10.10.0.0/16" in json.dumps(rule) for rule in
-                    state["policies"].get("first-run-egress") or []),
-                "with the ranges the administrator confirmed")
-    else:
-        # The egress policy says where the bundled Zitadel may reach. There is
-        # no bundled Zitadel on this route, so patching one would be opening a
-        # path for something that is not running.
-        s.check(state["policies"].get("first-run-egress") is None,
-                "no egress was opened, there being no bundled directory to let out")
+    # Nothing of ours runs beside this deployment any more (decisions/018), so
+    # no egress is opened for anything: a policy patched here would be a path
+    # opened for something that does not exist.
+    s.check(state["policies"].get("first-run-egress") is None,
+            "no egress was opened, there being nothing of ours to let out")
 
     # The two it was told to restart, by name. This asked whether *every*
     # deployment the stand-in had heard of was restarted until 2026-09-23,
-    # which held only because nothing else ever touched one -- and stopped
-    # holding the moment a route appeared that scales the bundle to zero.
-    # Those two were never meant to restart; they were meant to stop.
+    # which held only because nothing else ever touched one.
     restarted = ["first-run-conductor", "first-run-dashboard"]
     s.check(all(state["deployments"].get(name, {}).get("restarted") for name in restarted),
             f"the named deployments were restarted: {restarted}")

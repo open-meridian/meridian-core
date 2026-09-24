@@ -62,7 +62,7 @@ spec:
               value: {{ .Values.dashboard.instanceId | quote }}
             - name: MERIDIAN_DASHBOARD_LISTEN
               value: "0.0.0.0:8080"
-            {{- $addresses := .Values.identity.bundled.addressesSecretName }}
+            {{- $addresses := .Values.firstRun.addressesSecretName }}
             {{- if .Values.dashboard.url }}
             - name: MERIDIAN_DASHBOARD_URL
               value: {{ .Values.dashboard.url | quote }}
@@ -76,11 +76,35 @@ spec:
                   name: {{ $addresses }}
                   key: dashboard-url
                   optional: true
+            {{- end }}
+            # The first administrator's account, where this deployment holds
+            # it rather than a directory (decisions/018). Written by first run
+            # as a hash; the dashboard makes the account at its next start if
+            # it is not there. Optional on every key, because the other two
+            # branches write none of them.
+            - name: MERIDIAN_LOCAL_ACCOUNT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-login
+                  optional: true
+            - name: MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-password-hash
+                  optional: true
+            - name: MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-display-name
+                  optional: true
             # The firm's LDAP, bound by this dashboard itself
             # (decisions/018). Written by first run into the Secret the chart
             # names for it; optional on every key, because the other two
             # branches write none of them.
-            {{- $ldap := .Values.identity.bundled.ldap.bindPasswordSecret | default (printf "%s-ldap-bind" (include "meridian-runtime.fullname" .)) }}
+            {{- $ldap := .Values.firstRun.directorySecretName | default (printf "%s-ldap-bind" (include "meridian-runtime.fullname" .)) }}
             - name: MERIDIAN_LDAP_SERVERS
               valueFrom:
                 secretKeyRef:
@@ -111,63 +135,62 @@ spec:
                   name: {{ $ldap }}
                   key: user-filter
                   optional: true
-            # The first administrator's account, where this deployment holds
-            # it rather than a directory (decisions/018). Written by first run
-            # as a hash; the dashboard makes the account at its next start if
-            # it is not there. Optional on every key, because the other two
-            # branches write none of them.
-            - name: MERIDIAN_LOCAL_ACCOUNT_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $addresses }}
-                  key: administrator-login
-                  optional: true
-            - name: MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $addresses }}
-                  key: administrator-password-hash
-                  optional: true
-            - name: MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $addresses }}
-                  key: administrator-display-name
-                  optional: true
-            {{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ .Values.dashboard.brokerKey | default .Values.dashboard.instanceId }}
-            {{- if .Values.identity.bundled.enabled }}
+            {{/*
+              The firm's own provider (decisions/018). Two ways it is known:
+              the wizard writes it into this Secret, which is the ordinary
+              route, or an administrator set it in values, which is the one
+              that survives without a wizard. Values win, because somebody
+              chose them on purpose.
+            */}}
             {{- $oidc := printf "%s-dashboard-oidc" (include "meridian-runtime.fullname" .) }}
-            # The bundled Zitadel: its external address is the issuer, and the
-            # client and the audience it adds come from its setup Job.
-            {{- if .Values.zitadel.zitadel.configmapConfig.ExternalDomain }}
+            {{- if .Values.dashboard.oidc.issuer }}
             - name: MERIDIAN_OIDC_ISSUER
-              value: {{ include "meridian-runtime.zitadelIssuer" . | quote }}
+              value: {{ .Values.dashboard.oidc.issuer | quote }}
+            - name: MERIDIAN_OIDC_CLIENT_ID
+              value: {{ .Values.dashboard.oidc.clientId | quote }}
+            - name: MERIDIAN_OIDC_GROUPS_CLAIM
+              value: {{ .Values.dashboard.oidc.groupsClaim | default "groups" | quote }}
+            {{- with .Values.dashboard.oidc.trustedAudiences }}
+            - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.dashboard.oidc.existingSecret }}
+            - name: MERIDIAN_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.dashboard.oidc.existingSecret }}
+                  key: {{ .Values.dashboard.oidc.secretKey | default "client-secret" }}
+            {{- end }}
             {{- else }}
-            # The address the wizard gave Zitadel, which is what Zitadel puts
-            # in every token it issues.
+            {{/*
+              Optional on every key, and that is what makes first run
+              possible: none of them exists until somebody has been through
+              the wizard, and a required key would leave the dashboard unable
+              to start and therefore unable to serve the wizard that fills
+              them (spec/installation-and-first-run, requirement 6).
+            */}}
             - name: MERIDIAN_OIDC_ISSUER
               valueFrom:
                 secretKeyRef:
                   name: {{ $addresses }}
                   key: issuer
                   optional: true
-            {{- end }}
-            # Optional, and that is what makes first run possible: the client
-            # exists only once the setup Job has made one, which cannot happen
-            # before somebody has configured Zitadel's database in the wizard.
-            # Without these the dashboard starts and serves that wizard; a
-            # required key would leave it unable to start at all
-            # (spec/installation-and-first-run, requirement 6).
             - name: MERIDIAN_OIDC_CLIENT_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ $oidc }}
                   key: client-id
+                  optional: true
+            - name: MERIDIAN_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oidc }}
+                  key: client-secret
                   optional: true
             - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
               valueFrom:
@@ -176,37 +199,14 @@ spec:
                   key: trusted-audiences
                   optional: true
             # `groups` unless the wizard was told otherwise: right for Entra
-            # ID, Okta and Zitadel, and wrong for a provider that puts them
-            # under another name. It was hardcoded here until 2026-09-23, so
-            # the answer the wizard collected reached nothing.
+            # ID and Okta, and wrong for a provider that puts them under
+            # another name.
             - name: MERIDIAN_OIDC_GROUPS_CLAIM
               valueFrom:
                 secretKeyRef:
                   name: {{ $oidc }}
                   key: groups-claim
                   optional: true
-            {{- else }}
-            {{- with .Values.dashboard.oidc }}
-            {{- if .issuer }}
-            - name: MERIDIAN_OIDC_ISSUER
-              value: {{ .issuer | quote }}
-            - name: MERIDIAN_OIDC_CLIENT_ID
-              value: {{ .clientId | quote }}
-            - name: MERIDIAN_OIDC_GROUPS_CLAIM
-              value: {{ .groupsClaim | default "groups" | quote }}
-            {{- with .trustedAudiences }}
-            - name: MERIDIAN_OIDC_TRUSTED_AUDIENCES
-              value: {{ join "," . | quote }}
-            {{- end }}
-            {{- if .existingSecret }}
-            - name: MERIDIAN_OIDC_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .existingSecret }}
-                  key: {{ .secretKey | default "client-secret" }}
-            {{- end }}
-            {{- end }}
-            {{- end }}
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

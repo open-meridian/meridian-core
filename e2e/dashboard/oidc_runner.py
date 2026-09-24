@@ -1,8 +1,8 @@
 """The firm's own provider: signing in, and the two ways it is refused.
 
-Decision 018, branch one. These cases used to borrow the bundled Zitadel as a
-provider; it is being deleted, so they run against a stand-in that is somebody
-else's software by construction (fake_idp.py).
+Decision 018, branch one. These cases used to borrow an identity server of
+ours as the firm's provider, which was always a little false; they run against
+a stand-in now (fake_idp.py).
 
   A  somebody signs in through their firm's provider
   E  freshness: a provider's own session, re-issued without asking anybody
@@ -89,8 +89,7 @@ def main_phase():
     # The dashboard read /jwks at start and holds the first key. The provider
     # now signs with a second and publishes only that. A token that does not
     # verify is not a bad token until the keys have been read again, which is
-    # what the retry in `finish` is for -- deliberate code the bundled Zitadel
-    # was covering until it was removed.
+    # what the retry in `finish` is for.
     Browser().post(IDP + "/e2e/rotate", {})
     rotated = Browser()
     _, back = signed_in(rotated)

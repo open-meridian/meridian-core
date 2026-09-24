@@ -54,18 +54,14 @@ use crate::sealing::SealingKey;
 #[derive(Debug, Clone)]
 pub struct Names {
     pub database_secret: String,
-    pub zitadel_database_secret: String,
     pub dashboard_oidc_secret: String,
     pub ldap_bind_secret: String,
     /// Where a browser reaches this deployment, which the components read
     /// rather than take from a values file nobody edited.
     pub addresses_secret: String,
-    pub zitadel_egress_policy: String,
     pub own_binding: String,
     /// Restarted after the Secrets are written, in this order.
     pub restart: Vec<String>,
-    /// Scaled to zero when the firm brought its own directory.
-    pub bundled_identity: Vec<String>,
 }
 
 /// The Postgres this chart can bring, as the Job knows it.
@@ -86,7 +82,6 @@ pub struct BroughtServer {
     pub superuser_password: String,
     pub serving_password: String,
     pub migrating_password: String,
-    pub zitadel_password: String,
 }
 
 pub struct FirstRun {
@@ -100,11 +95,6 @@ pub struct FirstRun {
     pub provisioner: Box<dyn Provisioner>,
     /// The database this chart can bring, when it renders one.
     pub brought: Option<BroughtServer>,
-    /// Whether this chart rendered the bundled directory.
-    ///
-    /// Told rather than inferred: the Job is given the workloads to scale
-    /// whether or not they exist, so the names it holds say nothing about it.
-    pub bundled_directory: bool,
 }
 
 /// A database and the roles that will live in it, made once.
@@ -234,32 +224,11 @@ impl FirstRun {
 
     fn check_backend(&self, backend: &LoginBackendAnswer) -> Vec<String> {
         match &backend.backend {
-            // Checked before its version and its ranges, because none of those
-            // matter if there is no directory here to configure. Choosing one
-            // the chart did not render used to pass every test and fail at the
-            // step that writes: Zitadel's database was made, and then the
-            // Secret to put its connection in did not exist, so applying
-            // stopped half done with the wizard already closed behind it.
-            Some(Backend::Bundled(_)) if !self.bundled_directory => vec![
-                "this deployment was installed without the bundled directory, so there is \
-                 none here to set up. Connect your own OpenID Connect provider, or \
-                 reinstall with identity.bundled.enabled."
-                    .into(),
-            ],
-            Some(Backend::Bundled(bundled)) => {
-                let mut findings = Vec::new();
-                if bundled.version.trim().is_empty() {
-                    // Ruling 16: its version is the administrator's, and a
-                    // blank one means the wizard chose for them.
-                    findings.push("no Zitadel version confirmed".into());
-                }
-                if bundled.egress_cidrs.is_empty() {
-                    findings.push(
-                        "no address ranges for Zitadel to reach: it would reach nothing".into(),
-                    );
-                }
-                findings
-            }
+            // Where the firm has no directory at all, this deployment holds
+            // the account (decisions/018) and there is nothing here to
+            // check: the wizard asked for a login and a password, the Job
+            // hashes the password, and the dashboard makes the account.
+            Some(Backend::Bundled(_)) => Vec::new(),
             Some(Backend::Oidc(oidc)) => {
                 let mut findings = Vec::new();
                 if oidc.issuer.trim().is_empty() {
@@ -562,31 +531,6 @@ impl FirstRun {
         match backend {
             Backend::Bundled(bundled) => {
                 // On the route that brings a database, Zitadel's lives on the
-                // same server and the wizard never asked for a connection to
-                // it: one server, one answer (ruled 2026-09-23). Its database
-                // is its own all the same, because its schema step is one-way
-                // and coupling it to the one holding positions would make a
-                // Zitadel upgrade a one-way step there too.
-                let brought = configuration
-                    .runtime_database
-                    .as_ref()
-                    .and_then(|database| database.brought.as_ref());
-                match brought {
-                    Some(_) => self.write_brought_zitadel_database().await?,
-                    None => {
-                        if let Some(route) = bundled
-                            .database
-                            .as_ref()
-                            .and_then(|database| database.route.as_ref())
-                        {
-                            self.write_zitadel_database(route).await?;
-                        }
-                    }
-                }
-                self.cluster
-                    .set_egress_cidrs(&self.names.zitadel_egress_policy, &bundled.egress_cidrs)
-                    .await
-                    .map_err(|failed| failed.to_string())?;
                 if let Some(meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(ldap)) =
                     &bundled.directory
                 {
@@ -651,12 +595,6 @@ impl FirstRun {
                     .await
                     .map_err(|failed| failed.to_string())?;
 
-                for name in &self.names.bundled_identity {
-                    self.cluster
-                        .scale(Workload::Deployment, name, 0)
-                        .await
-                        .map_err(|failed| failed.to_string())?;
-                }
                 Ok(())
             }
         }
@@ -674,124 +612,6 @@ impl FirstRun {
             },
             _ => None,
         }
-    }
-
-    /// Zitadel's database on the server this deployment brought.
-    async fn write_brought_zitadel_database(&self) -> Result<(), String> {
-        let server = self
-            .brought
-            .as_ref()
-            .ok_or("this deployment was installed with no database to bring")?;
-
-        let privileged = DatabaseLogin {
-            host: server.host.clone(),
-            port: server.port,
-            database: "postgres".into(),
-            role: server.superuser.clone(),
-            password: None,
-            ssl_mode: "disable".into(),
-        };
-        // Zitadel runs its own migrations, so its role owns its database. The
-        // runtime's roles own nothing: one of them may create tables and the
-        // other must not, which is a distinction an owner does not have.
-        let plan = Provision {
-            database: "zitadel".to_string(),
-            roles: vec![NewRole {
-                name: "zitadel".to_string(),
-                password: server.zitadel_password.clone(),
-                may_create: true,
-                owns_database: true,
-            }],
-        };
-        self.provision_when_ready(&privileged, server.superuser_password.as_bytes(), &plan)?;
-
-        let dsn = url_for(
-            &DatabaseLogin {
-                database: "zitadel".into(),
-                role: "zitadel".into(),
-                ..privileged
-            },
-            server.zitadel_password.as_bytes(),
-        );
-        self.put_zitadel_dsn(dsn).await
-    }
-
-    async fn write_zitadel_database(
-        &self,
-        route: &meridian_domain::v1::zitadel_database_answer::Route,
-    ) -> Result<(), String> {
-        use meridian_domain::v1::zitadel_database_answer::Route;
-
-        let dsn = match route {
-            Route::Existing(login) => {
-                let password = self.open_password(login, "zitadel_database.existing.password")?;
-                url_for(login, &password)
-            }
-            // Creating it is the administrator's own act, taken with a
-            // privileged connection used once and never stored. What Zitadel
-            // is handed is the role made here, never the privileged one.
-            //
-            // Until 2026-09-23 this created nothing: the `database` and `role`
-            // it carries were read by no code anywhere, and what was written
-            // was a connection naming the privileged role with the new role's
-            // password. It could not authenticate, and had those passwords
-            // ever matched, Zitadel would have run as superuser -- which the
-            // comment above this one has always said it never does.
-            Route::Create(create) => {
-                let privileged = create
-                    .privileged
-                    .as_ref()
-                    .ok_or("no privileged connection to create Zitadel's database with")?;
-                let privileged_password =
-                    self.open_password(privileged, "zitadel_database.create.privileged.password")?;
-                let role_password = self
-                    .key
-                    .open(
-                        create
-                            .role_password
-                            .as_ref()
-                            .ok_or("no password for the role Zitadel will hold")?,
-                        "zitadel_database.create.role_password",
-                    )
-                    .map(|password| String::from_utf8_lossy(&password).into_owned())?;
-
-                let plan = Provision {
-                    database: database_or(&create.database, "zitadel"),
-                    roles: vec![NewRole {
-                        name: role_or(&create.role, "zitadel"),
-                        password: role_password.clone(),
-                        may_create: true,
-                        owns_database: true,
-                    }],
-                };
-                self.provisioner
-                    .provision(privileged, &privileged_password, &plan)?;
-
-                url_for(
-                    &DatabaseLogin {
-                        host: privileged.host.clone(),
-                        port: privileged.port,
-                        database: plan.database.clone(),
-                        role: plan.roles[0].name.clone(),
-                        password: None,
-                        ssl_mode: privileged.ssl_mode.clone(),
-                    },
-                    role_password.as_bytes(),
-                )
-            }
-        };
-
-        self.put_zitadel_dsn(dsn).await
-    }
-
-    async fn put_zitadel_dsn(&self, dsn: String) -> Result<(), String> {
-        self.cluster
-            .put_secret(
-                &self.names.zitadel_database_secret,
-                &BTreeMap::from([("dsn".to_string(), dsn.into_bytes())]),
-            )
-            .await
-            .map_err(|failed| failed.to_string())
     }
 
     /// Where a browser reaches this deployment, as the components read it.

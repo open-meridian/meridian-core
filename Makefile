@@ -9,8 +9,8 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
-        zitadel-system-user check-chart-files \
-        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
+        check-chart-files \
+        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -26,13 +26,12 @@ help:
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
-	@echo "  make e2e-dashboard  the dashboard's sign-in and access against a bundled Zitadel and LDAP"
 	@echo "  make lint           rustfmt --check and clippy with warnings denied"
 	@echo "  make lock           regenerate Cargo.lock"
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -173,10 +172,8 @@ E2E_FIRST_RUN = $(COMPOSE) --profile first-run
 E2E_DB_ROUTE ?= external
 E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brought and made itself,)
 
-# And which directory signs people in. `bundled` is the Zitadel this chart
-# runs; `oidc` is the firm's own, with the bundle rendered and switched off,
-# which is the combination somebody keeping the choice open until the wizard
-# ends up in.
+# And which way people sign in: `bundled` is what this deployment does
+# itself -- an account it holds -- and `oidc` is the firm's own provider.
 E2E_BACKEND ?= bundled
 E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through the firm's own directory,)
 
@@ -206,10 +203,7 @@ e2e-first-run: network
 		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -d brought -Atc \
 		  "select has_schema_privilege('brought_migrate','public','CREATE')" | grep -qx t \
 		  || { echo "e2e-first-run FAILED: the migrating role may not create tables" >&2; exit 1; }; \
-		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -Atc \
-		  "select datname from pg_database where datname = 'zitadel'" | grep -qx zitadel \
-		  || { echo "e2e-first-run FAILED: Zitadel's database was not made" >&2; exit 1; }; \
-		echo "  the roles are real: brought_app may not create tables, brought_migrate may, and zitadel has its own database"; \
+		echo "  the roles are real: brought_app may not create tables and brought_migrate may"; \
 	fi
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1
 	@echo "e2e-first-run OK: an install given nothing, made to serve$(E2E_ROUTE_SAID)$(E2E_BACKEND_SAID)"
@@ -296,11 +290,9 @@ e2e-cluster-external:
 	@until docker exec $(E2E_EXTERNAL_CONTAINER) pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
 	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -v ON_ERROR_STOP=1 \
 		-c "create database meridian" \
-		-c "create database zitadel" \
 		-c "create role meridian_app login password '$(E2E_EXTERNAL_PASSWORD)'" \
 		-c "create role meridian_migrate login password '$(E2E_EXTERNAL_PASSWORD)'" \
-		-c "create role zitadel login password '$(E2E_EXTERNAL_PASSWORD)'" \
-		-c "alter database zitadel owner to zitadel" >/dev/null
+		>/dev/null
 	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -d meridian -v ON_ERROR_STOP=1 \
 		-c "grant usage on schema public to meridian_app, meridian_migrate" \
 		-c "grant create on schema public to meridian_migrate" \
@@ -384,8 +376,8 @@ test-broker: network
 # a test that silently skips when one is missing is a gate reporting success
 # without doing its job.
 # The firm's LDAP, signed in against by the dashboard itself (decisions/018).
-# Beside e2e-dashboard rather than inside it: that suite's subject is the
-# bundled Zitadel, which is being removed, and this one has to outlive it.
+# Its own target, so a failure says which branch failed without anybody
+# reading a log.
 #
 # Two phases, because what is being proven is that a change at the directory
 # reaches the next sign-in: bob is removed from a group between them.
@@ -425,8 +417,8 @@ e2e-dashboard-ldap: network
 	@echo "e2e-dashboard-ldap OK: the firm's directory signs people in, and a group taken away is gone at the next sign-in"
 
 # Branch one: the firm's own provider, stood in for. These cases borrowed the
-# bundled Zitadel as a provider; it is being deleted, so they run against
-# something that is somebody else's software by construction.
+# an identity server of ours as a provider, which was always a little false:
+# this is the branch where nothing of ours signs anybody in.
 E2E_OIDC := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
 	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
 	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 \
@@ -490,14 +482,14 @@ e2e-dashboard-accounts: network
 
 test-directory: network
 	@$(COMPOSE) --profile e2e up -d ldap >/dev/null
-	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_ADMIN) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
 		|| { echo "test-directory FAILED: the directory did not come up" >&2; exit 1; }
 	@# memberOf is an overlay, not a stored attribute. Without it every person
 	@# signs in holding no groups, which is a deployment where nobody can do
 	@# anything and nothing says why.
 	@$(COMPOSE) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// \
 		<e2e/dashboard/ldap/01-memberof.ldif >>.test-directory.log 2>&1 || true
-	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_ADMIN) \
+	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_DIR) \
 		<e2e/dashboard/ldap/02-tree.ldif >>.test-directory.log 2>&1 || true
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-dashboard --test directory \
@@ -632,41 +624,19 @@ chart-check:
 			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \
 		fi; \
 	done
-	@bundled="--set dashboard.enabled=true --set dashboard.url=https://meridian.example \
-		--set identity.bundled.enabled=true --set zitadel.image.tag=v4.17.3 --set zitadel.login.image.tag=v4.17.3 \
-		--set zitadel.zitadel.configmapConfig.ExternalDomain=id.example --set identity.bundled.egress.allowCidrs={10.0.0.0/8}"; \
-	rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) $$bundled 2>/dev/null)" \
-		|| { echo "chart-check FAILED: the chart does not render with the bundled Zitadel on" >&2; exit 1; }; \
-	echo "$$rendered" | awk '/^# Source: meridian-runtime\/templates\//{own=1;next} /^# Source: /{own=0} own' | grep -q "runAsUser" \
-		&& { echo "chart-check FAILED: a Meridian template pins a uid with the bundled Zitadel on" >&2; exit 1; }; \
-	echo "$$rendered" | grep -q '"meridian-group-hook", "setup"' \
-		|| { echo "chart-check FAILED: the bundled Zitadel has no setup Job" >&2; exit 1; }; \
-	job="$$(echo "$$rendered" | awk '/^---/{if(f)print d; d=""; f=0} {d=d $$0 "\n"} /"meridian-group-hook", "setup"/{f=1} END{if(f)print d}')"; \
-	echo "$$job" | grep -q 'helm.sh/hook' \
-		&& { echo "chart-check FAILED: the setup Job is a hook, and a hook waits on the pods that wait on it" >&2; exit 1; }; \
-	echo "$$job" | grep -q 'MERIDIAN_ZITADEL_SYSTEM_USER_KEY_FILE' \
-		|| { echo "chart-check FAILED: the setup Job does not sign its own credential. Zitadel's first-instance token is minted once and a deployment that loses it cannot administer its directory" >&2; exit 1; }; \
-	echo "$$rendered" | grep -A12 'name: check-zitadel-egress' | grep -q 'app.kubernetes.io/component: start' \
-		|| { echo "chart-check FAILED: the Zitadel egress policy reaches past the server to Zitadel's own jobs" >&2; exit 1; }; \
-	role="$$(echo "$$rendered" | awk '/^kind: Role$$/{r=1} r&&/^---/{r=0} r' | grep -A14 'name: check-meridian-runtime-identity-setup' )"; \
-	echo "$$role" | grep -q 'resourceNames: \["check-meridian-runtime-dashboard-oidc", "check-meridian-runtime-group-hook"\]' \
-		|| { echo "chart-check FAILED: the setup Job's Role is not limited to its two Secrets" >&2; exit 1; }; \
-	echo "$$role" | grep -qE 'verbs:.*(create|list|watch|delete|\*)' \
-		&& { echo "chart-check FAILED: the setup Job may do more than read and update its two Secrets" >&2; exit 1; }; \
-	for refused in "zitadel.image.tag=" "zitadel.login.image.tag=v4.17.4" "zitadel.image.tag=v4.15.3" \
-		"dashboard.enabled=false" "identity.bundled.egress.allowCidrs=null" \
-		"identity.bundled.ldap.enabled=true"; do \
-		if $(HELM) template check deploy/chart $(CHART_VALUES) $$bundled --set $$refused >/dev/null 2>&1; then \
-			echo "chart-check FAILED: the bundled Zitadel rendered with $$refused" >&2; exit 1; \
-		fi; \
-	done
+	@# The client id the dashboard signs people in with is optional, and that
+	@# is what makes first run possible: it does not exist until somebody has
+	@# been through the wizard, and a required key would leave the dashboard
+	@# unable to start and so unable to serve the wizard that fills it.
 	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
-		--set dashboard.url=https://meridian.example --set identity.bundled.enabled=true \
-		--set zitadel.image.tag=v4.17.3 --set zitadel.login.image.tag=v4.17.3 \
-		--set zitadel.zitadel.configmapConfig.ExternalDomain=id.example \
-		--set identity.bundled.egress.allowCidrs={10.0.0.0/8} 2>/dev/null \
+		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| awk '/name: MERIDIAN_OIDC_CLIENT_ID/{f=1} f&&/optional: true/{print "optional"; exit}' | grep -q optional \
 		|| { echo "chart-check FAILED: the dashboard cannot start without a client id, and the wizard that makes one is what it would be serving" >&2; exit 1; }
+	@# And the firm's LDAP, on the branch where the dashboard binds it itself.
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url=https://meridian.example 2>/dev/null \
+		| awk '/name: MERIDIAN_LDAP_SERVERS/{f=1} f&&/optional: true/{print "optional"; exit}' | grep -q optional \
+		|| { echo "chart-check FAILED: the dashboard cannot start without a directory, and first run is what configures one" >&2; exit 1; }
 	@role="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| awk '/^kind: Role$$/{r=1} r; /^---/{r=0}' \
@@ -678,13 +648,9 @@ chart-check:
 	echo "$$role" | grep -c 'resourceNames:' | grep -qv '^0$$' \
 		|| { echo "chart-check FAILED: a first-run rule names no resource" >&2; exit 1; }; true
 	@# The address is the wizard's to learn, so the chart renders without one
-	@# and the dashboard, Zitadel and the setup Job read what first run wrote.
+	@# and the dashboard reads what first run wrote.
 	@without="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
-		--set dashboard.url= --set identity.bundled.enabled=true \
-		--set zitadel.image.tag=v4.17.3 --set zitadel.login.image.tag=v4.17.3 \
-		--set identity.bundled.egress.allowCidrs={10.0.0.0/8} 2>/dev/null)"; \
-	echo "$$without" | grep -q 'key: zitadel-external-domain' \
-		|| { echo "chart-check FAILED: with no address in values, nothing reads the one the wizard wrote" >&2; exit 1; }; \
+		--set dashboard.url= 2>/dev/null)"; \
 	echo "$$without" | grep -q 'key: issuer' \
 		|| { echo "chart-check FAILED: the dashboard does not read the issuer first run wrote" >&2; exit 1; }; \
 	echo "$$without" | grep -q 'key: dashboard-url' \
@@ -692,7 +658,7 @@ chart-check:
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
-	echo "chart-check OK: four components, the dashboard and the bundled Zitadel, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
+	echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
@@ -784,102 +750,6 @@ interop: network
 			tail -40 .interop.log >&2; exit 1; \
 		fi
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface"
-
-# The dashboard's sign-in and access, against a real Zitadel.
-#
-# spec/deployment-dashboard-and-access, Verification, for the parts that exist:
-# a Zitadel-native person and an LDAP person brokered by Zitadel sign in; the
-# groups reach the dashboard through the group hook; a claim makes the first
-# deployment admin once; a group removed at the directory is gone at the next
-# sign-in; a Zitadel session reused without the directory is refused on
-# auth_time; the hook refuses what Zitadel did not sign; a restarted Zitadel
-# still signs people in; a callback from another browser is refused.
-#
-# Everything runs on the compose network with no host port, from an empty
-# project, and is taken down with its volumes whatever the outcome. The
-# platform is a stand-in answering the one call a claim makes. Two steps are
-# here rather than in the runner, because they need Docker: changing the
-# directory, and restarting Zitadel.
-E2E := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
-	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
-	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 MERIDIAN_OIDC_ISSUER=http://zitadel:8080 \
-	$(COMPOSE) --profile e2e
-LDAP_ADMIN := -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
-
-# The system API user that Zitadel admits the setup step as, made fresh per run.
-#
-# It used to be a keypair somebody generated once by hand. The private half is
-# a credential, so `.gitignore` kept it out of the repository -- and the public
-# half was committed, which left a pair that works only on the machine that
-# made it. Every local run was green and CI was red for ten commits in a row,
-# waiting 180 seconds for a file that was never going to exist there.
-#
-# Both halves are generated here and both are ignored, so there is no way for
-# the repository to hold one without the other. Readable by anyone, because it
-# is a throwaway key for a Zitadel that lives for the length of one test.
-zitadel-system-user:
-	@$(DOCKER) run --rm -v "$(CURDIR)/e2e/zitadel":/k -w /k \
-		rust:$(RUST_VERSION)-slim-bookworm \
-		sh -c 'openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -quiet \
-		         -out system-user.key \
-		       && openssl pkey -in system-user.key -pubout -out system-user.pub \
-		       && chmod 644 system-user.key system-user.pub'
-	@echo "zitadel-system-user: a fresh keypair for this run"
-
-e2e-dashboard: network zitadel-system-user
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
-		--grants /w/deploy/nats/dev-grants.json \
-		--instances /w/deploy/nats/dev-instances.json \
-		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
-	@$(E2E) down -v >/dev/null 2>&1; started=$$(date +%s); \
-	step() { echo "e2e-dashboard: $$1"; echo "== $$1" >>.e2e-dashboard.log; }; \
-	boot() { $(E2E) run --rm -T --no-deps --entrypoint cat zitadel-bootstrap /bootstrap/$$1 2>>.e2e-dashboard.log; }; \
-	bob() { $(E2E) exec -T ldap ldapsearch -LLL $(LDAP_ADMIN) -b ou=people,dc=example,dc=org '(uid=bob)' memberOf; }; \
-	: >.e2e-dashboard.log; \
-	{ step "building the runtime image" \
-	  && $(E2E) build dashboard conductor group-hook zitadel-setup >>.e2e-dashboard.log 2>&1 \
-	  && step "starting Postgres, the broker, Zitadel, LDAP, the group hook and the stand-in platform" \
-	  && $(E2E) up -d postgres nats zitadel ldap group-hook fake-platform >>.e2e-dashboard.log 2>&1 \
-	  && step "loading the directory, with memberOf" \
-	  && $(E2E) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_ADMIN) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
-	  && $(E2E) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >>.e2e-dashboard.log 2>&1 \
-	  && $(E2E) exec -T ldap ldapadd $(LDAP_ADMIN) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard.log 2>&1 \
-	  && step "applying the configuration store's schema" \
-	  && $(E2E) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard.log 2>&1 \
-	  && step "setting up Zitadel, as the chart's setup Job does" \
-	  && $(E2E) run --rm -T zitadel-setup >>.e2e-dashboard.log 2>&1 \
-	  && step "setting the same up again, which changes nothing" \
-	  && first=$$(boot client-id)$$(boot intent-signing-key) \
-	  && $(E2E) run --rm -T zitadel-setup >>.e2e-dashboard.log 2>&1 \
-	  && [ "$$first" = "$$(boot client-id)$$(boot intent-signing-key)" ] \
-	  && step "making the test's people" \
-	  && $(E2E) run --rm -T zitadel-bootstrap >>.e2e-dashboard.log 2>&1 \
-	  && step "Zitadel's database in the deployment's Postgres: $$($(E2E) exec -T postgres psql -U meridian -d meridian -Atc \
-	     "select datname || ' owned by ' || pg_get_userbyid(datdba) || ', login role ' || (select rolname from pg_roles where rolname = 'zitadel' and rolcanlogin and not rolsuper) from pg_database where datname = 'zitadel'")" \
-	  && client_id=$$(boot client-id) && project_id=$$(boot project-id) \
-	  && step "starting the conductor and the dashboard (client $$client_id)" \
-	  && MERIDIAN_OIDC_CLIENT_ID=$$client_id MERIDIAN_OIDC_TRUSTED_AUDIENCES=$$project_id \
-	     $(E2E) up -d conductor dashboard >>.e2e-dashboard.log 2>&1; } \
-	  || { echo "e2e-dashboard FAILED while setting up. The last 40 lines, and the whole of it in .e2e-dashboard.log:" >&2; \
-	       tail -40 .e2e-dashboard.log >&2; $(E2E) down -v >/dev/null 2>&1; exit 1; }; \
-	step "signing in: A, B, C, D (before), E, F, H"; \
-	$(E2E) run --rm -T e2e-runner main >>.e2e-dashboard.log 2>&1; \
-	step "removing bob from ldap-group-b at the directory"; \
-	{ echo "before:"; bob; $(E2E) exec -T ldap ldapmodify $(LDAP_ADMIN) <e2e/dashboard/ldap/03-remove-bob-from-b.ldif; \
-	  echo "after:"; bob; } >>.e2e-dashboard.log 2>&1; \
-	step "signing in again: D (after)"; \
-	$(E2E) run --rm -T e2e-runner after-removal >>.e2e-dashboard.log 2>&1; \
-	step "restarting Zitadel, and not its database"; \
-	$(E2E) restart zitadel >>.e2e-dashboard.log 2>&1; \
-	step "signing in after the restart: G"; \
-	$(E2E) run --rm -T e2e-runner after-restart >>.e2e-dashboard.log 2>&1; \
-	$(E2E) logs --no-color zitadel group-hook dashboard conductor fake-platform >.e2e-dashboard.services.log 2>&1; \
-	$(E2E) run --rm -T e2e-runner report 2>>.e2e-dashboard.log | tee -a .e2e-dashboard.log; status=$${PIPESTATUS[0]}; \
-	$(E2E) down -v >/dev/null 2>&1; \
-	echo "e2e-dashboard: $$(( $$(date +%s) - started ))s; the run in .e2e-dashboard.log, the services' logs in .e2e-dashboard.services.log"; \
-	if [ $$status -ne 0 ]; then echo "e2e-dashboard FAILED" >&2; exit 1; fi
-	@echo "e2e-dashboard OK: sign-in, groups, claim, freshness and the hook's refusals, against a real Zitadel"
 
 # The end-to-end check, run rather than described.
 #

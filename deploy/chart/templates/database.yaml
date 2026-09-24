@@ -9,7 +9,7 @@
   disk, because the claim comes from the StatefulSet's own volumeClaimTemplate
   and the StatefulSet controller makes it when it scales. Nothing in the
   deployment creates a resource in its own cluster; the first-run Job scales,
-  which is a right it already holds for the bundled directory.
+  which is a right it already holds.
 
   A StatefulSet rather than a Deployment with a claim beside it, for that
   reason alone: a claim rendered next to a Deployment exists whether or not
@@ -70,7 +70,6 @@ data:
   superuser: {{ index $held "superuser" | default (randAlphaNum 32 | b64enc) }}
   serving: {{ index $held "serving" | default (randAlphaNum 32 | b64enc) }}
   migrating: {{ index $held "migrating" | default (randAlphaNum 32 | b64enc) }}
-  zitadel: {{ index $held "zitadel" | default (randAlphaNum 32 | b64enc) }}
 ---
 apiVersion: v1
 kind: Service

@@ -80,13 +80,13 @@ spec:
             - name: MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  name: {{ .Values.firstRun.addressesSecretName }}
                   key: administrator-directory-group
                   optional: true
             - name: MERIDIAN_ADMINISTRATOR_LOGIN
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.identity.bundled.addressesSecretName }}
+                  name: {{ .Values.firstRun.addressesSecretName }}
                   key: administrator-login
                   optional: true
             {{- end }}

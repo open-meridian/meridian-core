@@ -7,14 +7,11 @@
 //! permits `create` on none of them, and this deletes its own binding when the
 //! configuration is applied (decisions/016).
 //!
-//! - **Update a named Secret**: the database, Zitadel's database, the
+//! - **Update a named Secret**: the database, the directory, the
 //!   directory's settings. Update, never create: the chart makes them empty so
 //!   that RBAC can name them, since `create` cannot be narrowed to a name.
-//! - **Patch one NetworkPolicy**: the ranges Zitadel may reach, which the
-//!   administrator confirms in the wizard.
-//! - **Restart or scale a named Deployment**: what makes a component read what
-//!   was just written, and what leaves the bundled Zitadel at zero when the
-//!   firm brought its own directory.
+//! - **Restart a named Deployment**: what makes a component read what was
+//!   just written.
 //! - **Delete its own RoleBinding**: which is what "gives up its rights"
 //!   means, rather than intends.
 
@@ -62,11 +59,8 @@ pub trait Cluster: Send + Sync {
         values: &BTreeMap<String, Vec<u8>>,
     ) -> Result<(), ClusterError>;
 
-    /// Replace the egress rule's address ranges on one NetworkPolicy.
-    async fn set_egress_cidrs(&self, name: &str, cidrs: &[String]) -> Result<(), ClusterError>;
-
-    /// How many replicas a named Deployment should run. Zero is how a bundled
-    /// Zitadel is left when the firm brought its own directory.
+    /// How many replicas a named workload should run. One is how the
+    /// database this chart can bring is started (decisions/016).
     async fn scale(&self, kind: Workload, name: &str, replicas: u32) -> Result<(), ClusterError>;
 
     /// Roll a named Deployment, so it reads what was just written.
@@ -191,29 +185,6 @@ impl Cluster for ApiServer {
             &format!("/api/v1/namespaces/{}/secrets/{name}", self.namespace),
             "application/merge-patch+json",
             serde_json::json!({ "data": data }),
-        )
-        .await
-    }
-
-    async fn set_egress_cidrs(&self, name: &str, cidrs: &[String]) -> Result<(), ClusterError> {
-        let to: Vec<serde_json::Value> = cidrs
-            .iter()
-            .map(|cidr| serde_json::json!({"ipBlock": {"cidr": cidr}}))
-            .collect();
-
-        // As the release's own field manager, because the chart owns this
-        // policy and renders these ranges back from the cluster on its next
-        // upgrade. Patching as anyone else leaves the field owned by a
-        // manager Helm does not know, and the next upgrade fails on the
-        // conflict rather than on anything being wrong -- found on a cluster
-        // on 2026-09-22.
-        self.patch(
-            &format!(
-                "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{name}?fieldManager=helm",
-                self.namespace
-            ),
-            "application/merge-patch+json",
-            serde_json::json!({"spec": {"egress": [{"to": to}]}}),
         )
         .await
     }

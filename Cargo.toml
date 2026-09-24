@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run", "crates/group-hook"]
+members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run"]
 
 [workspace.package]
 edition = "2021"
@@ -47,8 +47,7 @@ openidconnect = { version = "4", default-features = false }
 # the one reqwest brought, so naming it adds no provider.
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 http = "1"
-# Verifying the bundled Zitadel's webhook signature, HMAC-SHA256. Already in
-# the tree through ed25519 and oauth2.
+# HMAC-SHA256. Already in the tree through ed25519 and oauth2.
 # Hashing the passwords of accounts a deployment holds itself (decisions/018).
 # Argon2id, RustCrypto, pure Rust, in the same family as the primitives below.
 # `std` for the PHC string form, which carries its own salt and parameters so
@@ -65,9 +64,6 @@ serde_json = "1"
 # implementation of the standard.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 base64 = "0.22"
-# Signs the bundled Zitadel's system-user credential. ring rather than the
-# `rsa` crate: RUSTSEC-2023-0071 is a timing side channel in that crate's
-# private-key operations, and this workspace does none.
 ring = "0.17"
 # Seals a credential to the first-run Job, so the broker and everything else
 # on the bus see ciphertext (spec/installation-and-first-run, ruling 4).
