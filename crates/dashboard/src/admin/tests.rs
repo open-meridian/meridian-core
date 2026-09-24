@@ -104,6 +104,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         bus,
         oidc: None,
         directory: None,
+        accounts: None,
         secure_cookies: true,
     });
     Harness {

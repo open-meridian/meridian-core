@@ -24,6 +24,7 @@ use meridian_bus::Bus;
 use meridian_domain::v1::SignInRecord;
 use prost::Message;
 
+use crate::accounts::{self, Accounts};
 use crate::clock::Clock;
 use crate::directory::Directory;
 use crate::html::{escape, page};
@@ -52,6 +53,11 @@ pub struct App {
     /// server of ours (decisions/018). At most one of this and `oidc` is set:
     /// two ways in would mean a person's groups depending on which they used.
     pub directory: Option<Arc<Directory>>,
+    /// Accounts this deployment holds, where the firm has no directory at
+    /// all. None on the other two branches, which is what keeps a dashboard
+    /// signing people in through a provider or through LDAP holding nothing
+    /// but its sessions.
+    pub accounts: Option<Arc<dyn Accounts>>,
     /// Whether cookies carry `Secure`: true whenever this dashboard is served
     /// over HTTPS, which is always outside a developer's machine.
     pub secure_cookies: bool,
@@ -176,7 +182,7 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
     // the form is here rather than at somebody else's address. That absence
     // is the point of 018: no redirect means no second address, and no issuer
     // whose URL has to resolve from a pod and a browser at once.
-    if app.directory.is_some() {
+    if app.directory.is_some() || app.accounts.is_some() {
         return Html(password_page("")).into_response();
     }
     let Some(oidc) = &app.oidc else {
@@ -233,36 +239,68 @@ async fn sign_in_with_password(
     if let Err(stale) = app.records.current(now) {
         return refused(&stale.to_string());
     }
-    let Some(directory) = &app.directory else {
+    // The same sentence for both halves, wherever the refusal came from.
+    let no = |reason: &str, status: StatusCode| {
+        let mut response = Html(password_page(reason)).into_response();
+        *response.status_mut() = status;
+        response
+    };
+    let refused_them = || {
+        no(
+            "That username and password were not accepted.",
+            StatusCode::UNAUTHORIZED,
+        )
+    };
+
+    if let Some(directory) = &app.directory {
+        return match directory
+            .authenticate(&credentials.name, &credentials.password)
+            .await
+        {
+            Ok(person) => {
+                let subject = format!("{}|{}", directory.issuer(), person.subject);
+                began(&app, &subject, &person.name, person.groups, now)
+            }
+            Err(crate::directory::Failure::Refused) => refused_them(),
+            Err(ours) => {
+                // Not the person's fault and not something they can act on,
+                // so it is said plainly here and loudly in the log.
+                tracing::warn!(%ours, "a sign-in could not reach the directory");
+                no(&ours.to_string(), StatusCode::SERVICE_UNAVAILABLE)
+            }
+        };
+    }
+
+    let Some(accounts) = &app.accounts else {
         return refused("this deployment does not sign people in with a password");
     };
 
-    let person = match directory
-        .authenticate(&credentials.name, &credentials.password)
-        .await
-    {
-        Ok(person) => person,
-        Err(crate::directory::Failure::Refused) => {
-            // 401 and the same sentence for both halves.
-            let mut response = Html(password_page(
-                "That username and password were not accepted.",
-            ))
-            .into_response();
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            return response;
+    match accounts::authenticate(
+        accounts.as_ref(),
+        &credentials.name,
+        &credentials.password,
+        now,
+    ) {
+        accounts::Outcome::SignedIn {
+            subject,
+            display_name,
+            groups,
+        } => began(&app, &subject, &display_name, groups, now),
+        accounts::Outcome::Refused => refused_them(),
+        // Said plainly, and not as a refusal: somebody locked out and not
+        // told keeps trying and cannot tell it from a wrong password.
+        accounts::Outcome::Locked => no(
+            "Too many attempts. Try again in a little while.",
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
+        accounts::Outcome::Unavailable(ours) => {
+            tracing::warn!(%ours, "a sign-in could not be checked");
+            no(
+                "This deployment could not check that sign-in. Try again shortly.",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
         }
-        Err(ours) => {
-            // Not the person's fault and not something they can act on, so it
-            // is said plainly here and loudly in the log.
-            tracing::warn!(%ours, "a sign-in could not reach the directory");
-            let mut response = Html(password_page(&ours.to_string())).into_response();
-            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            return response;
-        }
-    };
-
-    let subject = format!("{}|{}", directory.issuer(), person.subject);
-    began(&app, &subject, &person.name, person.groups, now)
+    }
 }
 
 /// Start the session, record who it was, and hand back the cookie.

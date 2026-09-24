@@ -206,3 +206,138 @@ impl Accounts for InMemory {
 #[cfg(test)]
 #[path = "accounts/tests.rs"]
 mod tests;
+
+// ── In Postgres ──────────────────────────────────────────────────────────────
+
+/// The accounts, in the database the deployment already has.
+///
+/// Its own tables, prefixed `dashboard_`, beside the conductor's `config_`
+/// ones. Two components sharing a table is not supported; two components
+/// keeping their own tables in one database is the arrangement this
+/// deployment already runs.
+pub struct InPostgres {
+    pool: r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>,
+}
+
+/// Names this store's schema lock, distinct from every other component's, so
+/// a deployment migrating them together does not have one wait on another.
+const SCHEMA_LOCK: i64 = 0x6461_7368_626f_6172_u64 as i64;
+
+const MIGRATION: &str = include_str!("../migrations/0001_local_account.sql");
+
+impl InPostgres {
+    pub fn connect(url: &str, pool_size: u32) -> Result<Self, String> {
+        let config: postgres::Config = url.parse().map_err(|failed| format!("{failed}"))?;
+        let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
+        let pool = r2d2::Pool::builder()
+            .max_size(pool_size.max(1))
+            .build(manager)
+            .map_err(|failed| format!("{failed}"))?;
+        Ok(Self { pool })
+    }
+
+    /// Apply the schema, under an advisory lock.
+    ///
+    /// Safe to call at every start: the statement creates if absent, and the
+    /// lock means two starts cannot race. The dashboard runs at one replica,
+    /// so this is belt and braces rather than the only thing holding.
+    pub fn migrate(&self) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+            .map_err(|failed| format!("{failed}"))?;
+        let outcome = conn
+            .batch_execute(MIGRATION)
+            .map_err(|failed| format!("the accounts table could not be made: {failed}"));
+        let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
+        outcome
+    }
+
+    fn conn(
+        &self,
+    ) -> Result<
+        r2d2::PooledConnection<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>,
+        String,
+    > {
+        self.pool
+            .get()
+            .map_err(|failed| format!("no connection to the accounts database: {failed}"))
+    }
+}
+
+impl Accounts for InPostgres {
+    fn by_name(&self, name: &str) -> Result<Option<LocalAccount>, String> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT name, display_name, password_hash, groups, failed_attempts,
+                        locked_until_ns, created_at_ns
+                   FROM dashboard_local_account WHERE name = $1",
+                &[&keyed(name)],
+            )
+            .map_err(|failed| format!("{failed}"))?;
+        Ok(rows.first().map(|row| LocalAccount {
+            name: row.get(0),
+            display_name: row.get(1),
+            password_hash: row.get(2),
+            groups: row.get(3),
+            failed_attempts: row.get(4),
+            locked_until_ns: row.get(5),
+            created_at_ns: row.get(6),
+        }))
+    }
+
+    fn put(&self, account: &LocalAccount) -> Result<(), String> {
+        self.conn()?
+            .execute(
+                "INSERT INTO dashboard_local_account
+                     (name, display_name, password_hash, groups, failed_attempts,
+                      locked_until_ns, created_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (name) DO UPDATE
+                    SET display_name = excluded.display_name,
+                        password_hash = excluded.password_hash,
+                        groups = excluded.groups",
+                &[
+                    &keyed(&account.name),
+                    &account.display_name,
+                    &account.password_hash,
+                    &account.groups,
+                    &account.failed_attempts,
+                    &account.locked_until_ns,
+                    &account.created_at_ns,
+                ],
+            )
+            .map_err(|failed| format!("{failed}"))?;
+        Ok(())
+    }
+
+    fn count_attempt(&self, name: &str, succeeded: bool, now_ns: i64) -> Result<(), String> {
+        let name = keyed(name);
+        if succeeded {
+            self.conn()?
+                .execute(
+                    "UPDATE dashboard_local_account
+                        SET failed_attempts = 0, locked_until_ns = 0
+                      WHERE name = $1",
+                    &[&name],
+                )
+                .map_err(|failed| format!("{failed}"))?;
+            return Ok(());
+        }
+        // One statement, so two attempts racing cannot both read the same
+        // count and store the same increment.
+        self.conn()?
+            .execute(
+                "UPDATE dashboard_local_account
+                    SET failed_attempts = failed_attempts + 1,
+                        locked_until_ns = CASE
+                            WHEN failed_attempts + 1 >= $2 THEN $3 + $4
+                            ELSE locked_until_ns
+                        END
+                  WHERE name = $1",
+                &[&name, &LOCK_AFTER, &now_ns, &LOCK_FOR_NS],
+            )
+            .map_err(|failed| format!("{failed}"))?;
+        Ok(())
+    }
+}

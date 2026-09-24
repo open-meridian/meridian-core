@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_dashboard::accounts::InPostgres;
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
@@ -101,6 +102,29 @@ fn run() -> Result<(), String> {
         user_filter: var("MERIDIAN_LDAP_USER_FILTER").unwrap_or_else(|| "(uid={})".into()),
         group_attribute: var("MERIDIAN_LDAP_GROUP_ATTRIBUTE").unwrap_or_else(|| "memberOf".into()),
     });
+    // The third branch: accounts this deployment holds itself. Its database is
+    // the one the deployment already has, in tables of its own, and it is
+    // configured only here -- a deployment signing people in through a
+    // provider or through LDAP sets none of this and opens no connection.
+    let accounts_url = var("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL");
+
+    if [
+        provider.is_some(),
+        directory.is_some(),
+        accounts_url.is_some(),
+    ]
+    .iter()
+    .filter(|set| **set)
+    .count()
+        > 1
+    {
+        return Err(
+            "this dashboard signs people in one way, and more than one is \
+                    configured: whose groups a person arrived with would depend on \
+                    which they used"
+                .into(),
+        );
+    }
     if directory.is_some() && provider.is_some() {
         return Err(
             "both MERIDIAN_OIDC_ISSUER and MERIDIAN_LDAP_SERVERS are set, and this \
@@ -170,7 +194,20 @@ fn run() -> Result<(), String> {
             // First run is the absence of a directory rather than a flag, so
             // ending it is the configuration landing and nothing anybody can
             // switch back from inside the dashboard (requirement 18).
-            let first_run = oidc.is_none() && directory.is_none();
+            // Connected and migrated here rather than at App construction, so a
+            // database that is not there stops the dashboard with a sentence
+            // rather than failing at the first sign-in.
+            let accounts = match &accounts_url {
+                Some(url) => {
+                    let store = InPostgres::connect(url, 4)
+                        .map_err(|failed| format!("the accounts database: {failed}"))?;
+                    store.migrate()?;
+                    Some(Arc::new(store) as Arc<dyn meridian_dashboard::accounts::Accounts>)
+                }
+                None => None,
+            };
+
+            let first_run = oidc.is_none() && directory.is_none() && accounts.is_none();
 
             let app = router(Arc::new(App {
                 first_run,
@@ -181,6 +218,7 @@ fn run() -> Result<(), String> {
                 bus,
                 oidc,
                 directory: directory.map(Arc::new),
+                accounts,
                 secure_cookies,
             }));
             let listener = tokio::net::TcpListener::bind(listen)

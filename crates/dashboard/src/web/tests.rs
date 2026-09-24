@@ -31,6 +31,7 @@ fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> 
         bus: Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))),
         oidc: None,
         directory: None,
+        accounts: None,
         secure_cookies: true,
     })
 }
@@ -236,4 +237,88 @@ async fn a_password_post_where_no_directory_is_bound_is_refused() {
         page.contains("does not sign people in with a password"),
         "{page}"
     );
+}
+
+// ── And the branch where this deployment holds the account ──────────────────
+
+fn app_holding_ada() -> Arc<App> {
+    let accounts = crate::accounts::InMemory::default();
+    accounts
+        .put(&crate::accounts::LocalAccount {
+            name: "ada".into(),
+            display_name: "Ada Park".into(),
+            password_hash: crate::accounts::hash_password("correct horse battery").expect("hashed"),
+            groups: vec!["Admins".into()],
+            created_at_ns: T0,
+            ..Default::default()
+        })
+        .expect("stored");
+
+    let app = app_with(Some(admins()), T0, T0);
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.accounts = Some(Arc::new(accounts));
+    Arc::new(built)
+}
+
+async fn posting(app: Arc<App>, body: &'static str) -> Response {
+    router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/sign-in")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("a response")
+}
+
+#[tokio::test]
+async fn the_right_password_starts_a_session() {
+    let response = posting(app_holding_ada(), "name=ada&password=correct+horse+battery").await;
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("a session cookie")
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    assert!(cookie.starts_with(SESSION_COOKIE), "{cookie}");
+}
+
+#[tokio::test]
+async fn a_locked_account_is_told_so_rather_than_refused() {
+    let app = app_holding_ada();
+    for _ in 0..crate::accounts::LOCK_AFTER {
+        posting(Arc::clone(&app), "name=ada&password=not+it").await;
+    }
+
+    // Even with the right password, and said plainly: somebody locked out and
+    // not told keeps trying and cannot tell it from a wrong password.
+    let response = posting(app, "name=ada&password=correct+horse+battery").await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let page = body_of(response).await;
+    assert!(page.contains("Too many attempts"), "{page}");
+}
+
+#[tokio::test]
+async fn a_wrong_password_here_reads_as_it_does_on_the_other_branch() {
+    let response = posting(app_holding_ada(), "name=ada&password=not+it").await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // No session, checked on the headers. An earlier version of this looked
+    // for the cookie's name in the page body, where a cookie never appears,
+    // so it passed whatever the handler did.
+    assert!(
+        response.headers().get(SET_COOKIE).is_none(),
+        "a refused sign-in set a cookie: {:?}",
+        response.headers().get(SET_COOKIE)
+    );
+
+    let page = body_of(response).await;
+    assert!(page.contains("were not accepted"), "{page}");
 }

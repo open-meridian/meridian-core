@@ -158,6 +158,7 @@ fn app_with(
         bus,
         oidc: None,
         directory: None,
+        accounts: None,
         secure_cookies: true,
     })
 }
