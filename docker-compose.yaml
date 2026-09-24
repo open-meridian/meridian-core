@@ -151,6 +151,10 @@ services:
       MERIDIAN_OIDC_CLIENT_ID: ${MERIDIAN_OIDC_CLIENT_ID:-}
       # Zitadel names the client's project in every ID token's audience.
       MERIDIAN_OIDC_TRUSTED_AUDIENCES: ${MERIDIAN_OIDC_TRUSTED_AUDIENCES:-}
+      # A confidential client. The stand-in signs with HS256 keyed by this,
+      # which is what lets a provider be stood in for without an asymmetric
+      # crypto library in the image.
+      MERIDIAN_OIDC_CLIENT_SECRET: ${MERIDIAN_OIDC_CLIENT_SECRET:-}
       # Or the firm's LDAP, bound by the dashboard itself (decisions/018).
       # Unset here as the issuer above is: the e2e target sets one or the
       # other, and the dashboard refuses to start with both.
@@ -616,6 +620,35 @@ services:
         condition: service_started
     volumes:
       - fr-pki:/var/run/secrets/kubernetes.io/serviceaccount:ro
+    networks: [meridian]
+
+  # A firm's own OpenID Connect provider, standing in for one. Somebody
+  # else's software by construction, which is what the bundled Zitadel was
+  # being borrowed as until it started being deleted.
+  fake-idp:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/e2e/fake_idp.py"]
+    environment:
+      E2E_IDP_ISSUER: http://fake-idp:8100
+      E2E_IDP_CLIENT_ID: meridian-dashboard
+      E2E_IDP_CLIENT_SECRET: idp-dev-only-secret
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+    networks: [meridian]
+
+  oidc-runner:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/oidc_runner.py"]
+    environment:
+      DASHBOARD: http://dashboard:8080
+      FAKE_IDP: http://fake-idp:8100
+      E2E_CLAIM_CODE: ${E2E_CLAIM_CODE:-E2E-7KQ2-MX4P}
+      E2E_STATE: /state
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - dashboard-e2e-state:/state
     networks: [meridian]
 
   accounts-runner:

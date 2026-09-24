@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-ldap e2e-dashboard-accounts \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -32,7 +32,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -423,6 +423,35 @@ e2e-dashboard-ldap: network
 	$(E2E_LDAP) run --rm -T ldap-runner after-removal
 	@$(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1
 	@echo "e2e-dashboard-ldap OK: the firm's directory signs people in, and a group taken away is gone at the next sign-in"
+
+# Branch one: the firm's own provider, stood in for. These cases borrowed the
+# bundled Zitadel as a provider; it is being deleted, so they run against
+# something that is somebody else's software by construction.
+E2E_OIDC := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
+	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
+	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 \
+	MERIDIAN_OIDC_ISSUER=http://fake-idp:8100 \
+	MERIDIAN_OIDC_CLIENT_ID=meridian-dashboard \
+	MERIDIAN_OIDC_CLIENT_SECRET=idp-dev-only-secret \
+	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
+	$(COMPOSE) --profile e2e
+
+e2e-dashboard-oidc: network
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@: >.e2e-dashboard-oidc.log
+	@$(E2E_OIDC) down -v --remove-orphans >>.e2e-dashboard-oidc.log 2>&1 || true
+	@set -e; \
+	$(E2E_OIDC) build dashboard conductor >>.e2e-dashboard-oidc.log 2>&1; \
+	$(E2E_OIDC) up -d postgres nats fake-platform fake-idp >>.e2e-dashboard-oidc.log 2>&1; \
+	$(E2E_OIDC) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-oidc.log 2>&1; \
+	$(E2E_OIDC) up -d conductor dashboard >>.e2e-dashboard-oidc.log 2>&1; \
+	$(E2E_OIDC) run --rm -T oidc-runner
+	@$(E2E_OIDC) down -v --remove-orphans >>.e2e-dashboard-oidc.log 2>&1
+	@echo "e2e-dashboard-oidc OK: the firm's own provider signs people in, and a stale or misdirected callback does not"
 
 # Branch three: a firm with no directory at all, so the deployment holds the
 # account. The hash below is what first run writes -- Argon2id at this crate's
