@@ -28,8 +28,8 @@ use meridian_domain::v1::{
     AccessRecordsRequest, AccountRecord, AccountState, ClaimCodePurpose, CloseAccountRequest,
     DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
-    GrantPermissionRequest, LinkExternalAccountRequest, LocalAccountAuthentication, Permission,
-    PluginConfiguration, PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport,
+    GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
+    PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport,
     RedeemClaimCodeReply, RedeemClaimCodeRequest, SignInRecord, UserGroup, WithdrawPermissionReply,
     WithdrawPermissionRequest,
 };
@@ -723,124 +723,4 @@ pub fn serve(
             }
         }
     });
-}
-
-// ── Accounts this deployment holds itself ────────────────────────────────────
-//
-// Decision 018, for a firm with no directory of its own. The other two
-// branches never reach here: a firm's provider and a firm's LDAP both check
-// their own passwords, and this deployment learns only who signed in.
-
-/// Failures before an account is locked.
-///
-/// Low, because these accounts belong to the handful of people administering a
-/// deployment and nobody types four wrong passwords in earnest. It is the only
-/// branch where guessing happens against us rather than against somebody
-/// else's directory.
-pub const LOCK_AFTER: i32 = 5;
-
-/// And for how long. Long enough that guessing costs more than it is worth,
-/// short enough that somebody who locked themselves out before lunch is
-/// working again after it.
-pub const LOCK_FOR_NS: i64 = 15 * 60 * 1_000_000_000;
-
-/// A hash to check nothing against.
-///
-/// Verified when no account matches, so that an unknown name costs the same
-/// time as a known one. Argon2 takes long enough to measure, and skipping it
-/// for names that do not exist turns the sign-in page into a way to ask
-/// whether somebody works here.
-const ABSENT: &str = "$argon2id$v=19$m=19456,t=2,p=1$YWJzZW50YWJzZW50YWI$\
-                      3f5nQ2ZqRMHK0mVxvVeU3xPxCTLVxWAMd3lDbGLSJhQ";
-
-/// Hash a password for storage. PHC string form, with a fresh salt.
-pub fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-    let salt = SaltString::generate(&mut OsRng);
-    argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|failed| format!("a password could not be hashed: {failed}"))
-}
-
-/// W6.1, the branch where this deployment holds the account.
-///
-/// Answers rather than raises: a refusal is part of this operation's reply,
-/// and the dashboard shows the person one sentence from it.
-pub fn authenticate_local_account(
-    store: &dyn Store,
-    name: &str,
-    password: &str,
-    now_ns: i64,
-) -> LocalAccountAuthentication {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
-
-    let refused = |reason: &str| LocalAccountAuthentication {
-        authenticated: false,
-        refusal_reason: reason.to_string(),
-        ..Default::default()
-    };
-    // The same sentence for a wrong password and a name that is not there.
-    let no = || refused("that username and password were not accepted");
-
-    let account = match store.local_account(name) {
-        Ok(found) => found,
-        Err(failed) => {
-            tracing::warn!(%failed, "an account could not be read");
-            return refused("this deployment could not read its accounts");
-        }
-    };
-
-    // Before the hash, because a locked account should not be told whether it
-    // guessed right, and because verifying would cost time for nothing.
-    if let Some(account) = &account {
-        if account.locked_until_ns > now_ns {
-            // Said plainly. Somebody locked out and not told keeps trying and
-            // cannot tell this from a wrong password.
-            return refused("too many attempts; try again later");
-        }
-    }
-
-    let stored = account
-        .as_ref()
-        .map(|a| a.password_hash.as_str())
-        .unwrap_or(ABSENT);
-    let matched = PasswordHash::new(stored)
-        .map(|parsed| {
-            argon2::Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
-        })
-        .unwrap_or(false);
-
-    // An empty password never matches a stored hash, so it needs no special
-    // case here -- unlike LDAP, where an empty one is a bind the server may
-    // answer with success.
-    let Some(account) = account else {
-        return no();
-    };
-
-    if let Err(failed) =
-        store.count_sign_in_attempt(&account.name, matched, now_ns, LOCK_AFTER, LOCK_FOR_NS)
-    {
-        // The count not landing must not admit somebody: a store that cannot
-        // be written is a store that cannot lock, and letting the sign-in
-        // through would remove the limit exactly when it is needed.
-        tracing::warn!(%failed, "a sign-in attempt was not counted");
-        return refused("this deployment could not record the attempt");
-    }
-
-    if !matched {
-        return no();
-    }
-
-    LocalAccountAuthentication {
-        authenticated: true,
-        refusal_reason: String::new(),
-        // `local:` and the name, because an account here has no issuer of its
-        // own. Half of every permission ever granted, so it is settled once.
-        subject: format!("local|{}", account.name),
-        display_name: account.display_name.clone(),
-        groups: account.groups.clone(),
-    }
 }

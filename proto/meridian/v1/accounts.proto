@@ -17,10 +17,6 @@ syntax = "proto3";
 
 package meridian.v1;
 
-// For SealedCredential, which first run defined and this reuses rather than
-// declaring a second shape for the same thing.
-import "meridian/v1/first_run.proto";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Vocabulary
 // ─────────────────────────────────────────────────────────────────────────────
@@ -670,43 +666,6 @@ message RedeemClaimCodeReply {
   // directory sign-in (W7.7). The platform keeps only its hash.
   string first_admin_code = 3;
   int64 first_admin_code_expires_at_ns = 4;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// W6.1 — signing in against an account this deployment holds
-
-// Decision 018: where a firm has no directory of its own, the deployment holds
-// the accounts. This is the only sign-in carrying a bus message, because those
-// accounts live in the conductor's store and the dashboard has no database of
-// its own to check a password against.
-message AuthenticateLocalAccountRequest {
-  string name = 1;
-
-  // Sealed to the conductor rather than sent in the clear, for the reason
-  // first run seals credentials to its Job: the broker sees a deployment's
-  // every message, and a password on it is a password the broker holds
-  // (spec/installation-and-first-run, ruling 4).
-  SealedCredential password = 2;
-}
-
-message LocalAccountAuthentication {
-  bool authenticated = 1;
-
-  // One sentence, and the same one whether the name is unknown or the password
-  // is wrong: telling them apart lets anybody who can reach the sign-in page
-  // enumerate a firm's staff. Being locked out is said plainly, because a
-  // person who is not told will keep trying and cannot tell it from a wrong
-  // password.
-  string refusal_reason = 2;
-
-  // `{issuer}|{subject}`, as every login is. Half of every permission ever
-  // granted, so it is settled once and never changed.
-  string subject = 3;
-  string display_name = 4;
-
-  // What the access model joins, exactly as it joins a directory's groups. An
-  // account this deployment holds is not a different kind of person.
-  repeated string groups = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

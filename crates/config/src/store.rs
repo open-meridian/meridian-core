@@ -88,49 +88,4 @@ pub trait Store: Send + Sync {
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;
 
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()>;
-
-    /// An account this deployment holds, by the name somebody typed.
-    ///
-    /// Returns the hash and the lockout counters and never a password,
-    /// because there is nowhere for one to be. Verifying is the service's,
-    /// above this: a store that compared passwords would be a store that had
-    /// to be told what hashing means.
-    fn local_account(&self, name: &str) -> Result<Option<LocalAccount>>;
-
-    /// Insert or replace, by name.
-    fn put_local_account(&self, account: &LocalAccount) -> Result<()>;
-
-    /// Count an attempt, and lock the account when there have been too many.
-    ///
-    /// Atomic, and it has to be: two sign-ins racing on a read-modify-write
-    /// would each see the same count and store the same increment, so a
-    /// threshold of five would admit an attacker running six at a time. The
-    /// policy is the caller's and the arithmetic is here.
-    fn count_sign_in_attempt(
-        &self,
-        name: &str,
-        succeeded: bool,
-        now_ns: i64,
-        lock_after: i32,
-        lock_for_ns: i64,
-    ) -> Result<()>;
-}
-
-/// An account this deployment holds, as the store keeps it.
-///
-/// Not a protobuf message: nothing sends one of these anywhere. The wire
-/// carries a name and a sealed password in and an answer out, and the hash
-/// never leaves the process that reads it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LocalAccount {
-    pub name: String,
-    pub display_name: String,
-    /// Argon2id in PHC string form, carrying its own salt and parameters.
-    pub password_hash: String,
-    pub groups: Vec<String>,
-    pub failed_attempts: i32,
-    /// Zero when not locked. A time rather than a flag, so a lock lifts by
-    /// itself.
-    pub locked_until_ns: i64,
-    pub created_at_ns: i64,
 }

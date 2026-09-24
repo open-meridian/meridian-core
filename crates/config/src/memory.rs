@@ -9,14 +9,11 @@ use meridian_domain::v1::{
     UserGroup,
 };
 
-use crate::store::{KnownPlugin, LocalAccount, Result, Snapshot, Store, Withdrawal};
+use crate::store::{KnownPlugin, Result, Snapshot, Store, Withdrawal};
 use crate::DEPLOYMENT_ADMIN;
 
 pub struct MemoryStore {
     state: Mutex<Snapshot>,
-    /// Beside the snapshot rather than in it. A snapshot is what the store
-    /// hands out; password hashes are not part of what anybody reads.
-    local_accounts: Mutex<std::collections::HashMap<String, LocalAccount>>,
 }
 
 impl MemoryStore {
@@ -30,7 +27,6 @@ impl MemoryStore {
             .push(crate::deployment_admin());
         Self {
             state: Mutex::new(snapshot),
-            local_accounts: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -143,51 +139,6 @@ impl Store for MemoryStore {
         upsert(&mut state.records.people, record, |p| {
             p.subject == record.subject
         });
-        Ok(())
-    }
-
-    fn local_account(&self, name: &str) -> Result<Option<LocalAccount>> {
-        let name = name.trim().to_lowercase();
-        let accounts = self.local_accounts.lock().expect("store lock poisoned");
-        Ok(accounts.get(&name).cloned())
-    }
-
-    fn put_local_account(&self, account: &LocalAccount) -> Result<()> {
-        let mut accounts = self.local_accounts.lock().expect("store lock poisoned");
-        let mut stored = account.clone();
-        stored.name = account.name.trim().to_lowercase();
-        // Insert or replace, and leave the counters where a replace found
-        // them: rewriting somebody's password should not clear a lock.
-        if let Some(existing) = accounts.get(&stored.name) {
-            stored.failed_attempts = existing.failed_attempts;
-            stored.locked_until_ns = existing.locked_until_ns;
-        }
-        accounts.insert(stored.name.clone(), stored);
-        Ok(())
-    }
-
-    fn count_sign_in_attempt(
-        &self,
-        name: &str,
-        succeeded: bool,
-        now_ns: i64,
-        lock_after: i32,
-        lock_for_ns: i64,
-    ) -> Result<()> {
-        let name = name.trim().to_lowercase();
-        let mut accounts = self.local_accounts.lock().expect("store lock poisoned");
-        let Some(account) = accounts.get_mut(&name) else {
-            return Ok(());
-        };
-        if succeeded {
-            account.failed_attempts = 0;
-            account.locked_until_ns = 0;
-            return Ok(());
-        }
-        account.failed_attempts += 1;
-        if account.failed_attempts >= lock_after {
-            account.locked_until_ns = now_ns + lock_for_ns;
-        }
         Ok(())
     }
 

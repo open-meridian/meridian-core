@@ -38,7 +38,7 @@ pub use service::{
     configuration, deployment_admin, install_named_administrator, serve, Clock, SystemClock,
     Upstream,
 };
-pub use store::{KnownPlugin, LocalAccount, Snapshot, Store, StoreError, Withdrawal};
+pub use store::{KnownPlugin, Snapshot, Store, StoreError, Withdrawal};
 
 #[cfg(test)]
 mod tests;
