@@ -619,3 +619,69 @@ async fn the_groups_claim_is_written_only_when_the_wizard_was_told_one() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_first_administrators_account_is_written_where_the_dashboard_will_find_it() {
+    // Collected and discarded until 2026-09-24. The wizard sealed a login, a
+    // name and a password into `LocalAccountAnswer` and nothing opened it, so
+    // the branch for a firm with no directory produced a deployment holding
+    // an administrator's permission and no account to sign in as.
+    //
+    // Nothing caught it because the e2e asserted the permission, which was
+    // written, rather than a sign-in, which was impossible.
+    let (cluster, done) = watched();
+    let run = first_run(Box::new(cluster), vec![]);
+    let configuration = FirstRunConfiguration {
+        administrator: Some(AdministratorAnswer {
+            named: Some(Named::LocalAccountLogin("ada".into())),
+        }),
+        runtime_database: Some(database(&run)),
+        login_backend: Some(LoginBackendAnswer {
+            backend: Some(Backend::Bundled(BundledZitadelAnswer {
+                version: "v4.17.3".into(),
+                egress_cidrs: vec!["10.20.0.0/16".into()],
+                directory: Some(
+                    meridian_domain::v1::bundled_zitadel_answer::Directory::LocalAccount(
+                        meridian_domain::v1::LocalAccountAnswer {
+                            login_name: "Ada".into(),
+                            given_name: "Ada".into(),
+                            family_name: "Park".into(),
+                            initial_password: Some(
+                                seal(
+                                    &run.key.public_key(),
+                                    &run.key.key_id,
+                                    "local_account.initial_password",
+                                    b"correct horse battery",
+                                )
+                                .unwrap(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+                ..Default::default()
+            })),
+        }),
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+            zitadel_url: "https://id.meridian.firm.example".into(),
+        }),
+    };
+
+    let applied = run.apply(&configuration).await;
+
+    assert!(applied.applied, "{}", applied.refusal_reason);
+    let wrote = done.lock().unwrap().clone();
+    let addresses = wrote
+        .iter()
+        .find(|line| line.starts_with("secret m-addresses "))
+        .expect("the addresses secret was written");
+
+    // The hash, which is what the dashboard makes the account from.
+    assert!(
+        addresses.contains("administrator-password-hash"),
+        "the first administrator's password went nowhere: {addresses}"
+    );
+    // And the login, lowercased, so `Ada` and `ada` cannot become two people.
+    assert!(addresses.contains("administrator-login"), "{addresses}");
+}

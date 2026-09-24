@@ -16,10 +16,10 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::{
-    administrator_answer::Named, first_run_check_request::Answer, login_backend_answer::Backend,
-    AddressesAnswer, AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied,
-    FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration, LoginBackendAnswer,
-    RuntimeDatabaseAnswer,
+    administrator_answer::Named, bundled_zitadel_answer::Directory,
+    first_run_check_request::Answer, login_backend_answer::Backend, AddressesAnswer,
+    AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied, FirstRunCheckReply,
+    FirstRunCheckRequest, FirstRunConfiguration, LoginBackendAnswer, RuntimeDatabaseAnswer,
 };
 
 use crate::cluster::{Cluster, Workload};
@@ -645,6 +645,20 @@ impl FirstRun {
         }
     }
 
+    /// The account this deployment holds, if that is the branch chosen.
+    fn local_account<'a>(
+        &self,
+        configuration: &'a FirstRunConfiguration,
+    ) -> Option<&'a meridian_domain::v1::LocalAccountAnswer> {
+        match configuration.login_backend.as_ref()?.backend.as_ref()? {
+            Backend::Bundled(bundled) => match bundled.directory.as_ref()? {
+                Directory::LocalAccount(account) => Some(account),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Zitadel's database on the server this deployment brought.
     async fn write_brought_zitadel_database(&self) -> Result<(), String> {
         let server = self
@@ -781,6 +795,51 @@ impl FirstRun {
             "dashboard-url".to_string(),
             addresses.dashboard_url.clone().into_bytes(),
         )]);
+
+        // The first administrator's account, where this deployment holds it
+        // (decisions/018). The wizard sealed a password to this Job; the Job
+        // hashes it and writes only the hash, so the password stops here and
+        // no component reads one.
+        //
+        // Collected and discarded until 2026-09-24: the wizard sealed a login,
+        // an email, a name and a password into `LocalAccountAnswer` and
+        // nothing opened it, so that branch produced a deployment holding an
+        // administrator's permission and no account to sign in as. The e2e
+        // did not catch it because it asserted the permission, which was
+        // written, rather than a sign-in, which was impossible.
+        if let Some(account) = self.local_account(configuration) {
+            let password = self.key.open(
+                account
+                    .initial_password
+                    .as_ref()
+                    .ok_or("no password for the first administrator's account")?,
+                "local_account.initial_password",
+            )?;
+            let hashed = hash_password(&String::from_utf8_lossy(&password))?;
+            values.insert(
+                "administrator-password-hash".to_string(),
+                hashed.into_bytes(),
+            );
+            if !account.login_name.trim().is_empty() {
+                values.insert(
+                    "administrator-login".to_string(),
+                    account.login_name.trim().to_lowercase().into_bytes(),
+                );
+            }
+            if !account.given_name.trim().is_empty() {
+                values.insert(
+                    "administrator-display-name".to_string(),
+                    format!(
+                        "{} {}",
+                        account.given_name.trim(),
+                        account.family_name.trim()
+                    )
+                    .trim()
+                    .as_bytes()
+                    .to_vec(),
+                );
+            }
+        }
 
         // W7.5 records who administers this deployment; W7.6 writes the
         // permission. Here rather than in a Secret of its own because this is
@@ -963,3 +1022,18 @@ fn check_addresses(addresses: &AddressesAnswer) -> Vec<String> {
 #[cfg(test)]
 #[path = "service/tests.rs"]
 mod tests;
+
+/// Argon2id, PHC string form, with a fresh salt.
+///
+/// Here rather than in the dashboard because this is where the password is
+/// opened: the Job holds the only key that can read what the wizard sealed,
+/// and the hash is what leaves. Verified in the dashboard, which is where the
+/// accounts are kept (decisions/018).
+fn hash_password(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut OsRng);
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|failed| format!("the administrator's password could not be hashed: {failed}"))
+}

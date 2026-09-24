@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_dashboard::accounts::InPostgres;
+use meridian_dashboard::accounts::{Accounts as _, InPostgres};
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
@@ -202,6 +202,38 @@ fn run() -> Result<(), String> {
                     let store = InPostgres::connect(url, 4)
                         .map_err(|failed| format!("the accounts database: {failed}"))?;
                     store.migrate()?;
+                    // The first administrator, as first run left it: a name
+                    // and a hash in a Secret. Made here at start rather than
+                    // written by the Job, because the Job may not reach
+                    // another component's store and this is the dashboard's.
+                    //
+                    // Only when absent. A restart must not put back an
+                    // account somebody deleted, nor undo a password they
+                    // changed.
+                    if let (Some(name), Some(hash)) = (
+                        var("MERIDIAN_LOCAL_ACCOUNT_NAME"),
+                        var("MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH"),
+                    ) {
+                        let existing = store
+                            .by_name(&name)
+                            .map_err(|failed| format!("the accounts database: {failed}"))?;
+                        if existing.is_none() {
+                            store
+                                .put(&meridian_dashboard::accounts::LocalAccount {
+                                    name: name.clone(),
+                                    display_name: var("MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME")
+                                        .unwrap_or_else(|| name.clone()),
+                                    password_hash: hash,
+                                    groups: Vec::new(),
+                                    created_at_ns: now_ns(),
+                                    ..Default::default()
+                                })
+                                .map_err(|failed| {
+                                    format!("the first administrator's account: {failed}")
+                                })?;
+                            tracing::info!(name, "made the first administrator's account");
+                        }
+                    }
                     Some(Arc::new(store) as Arc<dyn meridian_dashboard::accounts::Accounts>)
                 }
                 None => None,

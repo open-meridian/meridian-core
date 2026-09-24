@@ -76,6 +76,29 @@ spec:
                   name: {{ $addresses }}
                   key: dashboard-url
                   optional: true
+            # The first administrator's account, where this deployment holds
+            # it rather than a directory (decisions/018). Written by first run
+            # as a hash; the dashboard makes the account at its next start if
+            # it is not there. Optional on every key, because the other two
+            # branches write none of them.
+            - name: MERIDIAN_LOCAL_ACCOUNT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-login
+                  optional: true
+            - name: MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-password-hash
+                  optional: true
+            - name: MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: administrator-display-name
+                  optional: true
             {{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
