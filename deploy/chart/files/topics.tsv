@@ -12,6 +12,7 @@ platform.config.command.define-user-group	command	admin	conductor
 platform.config.command.enrol-with-code	command	admin	conductor
 platform.config.command.grant-permission	command	admin	conductor
 platform.config.command.link-external-account	command	admin	conductor
+platform.config.command.authenticate-local-account	command	admin	conductor
 platform.config.command.redeem-claim-code	command	admin	conductor
 platform.config.command.send-diagnostic-bundle	command	admin	conductor
 platform.config.command.set-plugin-settings	command	admin	conductor
