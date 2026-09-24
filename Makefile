@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-ldap \
+        test-directory e2e-dashboard-ldap e2e-dashboard-accounts \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         zitadel-system-user check-chart-files \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-dashboard e2e-first-run
@@ -32,7 +32,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-ldap e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-chart-files check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -423,6 +423,41 @@ e2e-dashboard-ldap: network
 	$(E2E_LDAP) run --rm -T ldap-runner after-removal
 	@$(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1
 	@echo "e2e-dashboard-ldap OK: the firm's directory signs people in, and a group taken away is gone at the next sign-in"
+
+# Branch three: a firm with no directory at all, so the deployment holds the
+# account. The hash below is what first run writes -- Argon2id at this crate's
+# defaults, of the password the runner types. `e2e-first-run` asserts the Job
+# produces a hash of that shape; this asserts the dashboard turns one into a
+# working account. The two halves meet at the format, which is the seam and is
+# said out loud rather than left to be discovered.
+E2E_ACCOUNT_HASH := $$argon2id$$v=19$$m=19456,t=2,p=1$$bRwFidvdsjyWKVRlZIcW/g$$iHiNbcC7a78/4w3nTa0eDCBs/ZlaVzjoGBGb+bCQi30
+E2E_ACCOUNTS := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
+	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
+	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 \
+	MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
+	MERIDIAN_LOCAL_ACCOUNT_NAME=ada \
+	MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME="Ada Park" \
+	MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH='$(E2E_ACCOUNT_HASH)' \
+	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
+	$(COMPOSE) --profile e2e
+
+e2e-dashboard-accounts: network
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(BROKER_CONFIG) --core-grants /w/deploy/grants.example.json \
+		--grants /w/deploy/nats/dev-grants.json \
+		--instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@: >.e2e-dashboard-accounts.log
+	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1 || true
+	@set -e; \
+	$(E2E_ACCOUNTS) build dashboard conductor >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) up -d postgres nats fake-platform >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) up -d conductor dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner main; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
+	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
+	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, and enough wrong passwords stop it"
 
 test-directory: network
 	@$(COMPOSE) --profile e2e up -d ldap >/dev/null

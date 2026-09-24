@@ -299,6 +299,16 @@ def main():
     addresses = state["secrets"].get("first-run-addresses", {})
     s.check(addresses.get("dashboard-url") == ANSWERS["dashboard_url"],
             "where a browser reaches this deployment was written, not left in a values file")
+    if BACKEND == "bundled" and ANSWERS.get("admin_login"):
+        # The first administrator's account. Collected and discarded until
+        # 2026-09-24: the wizard sealed a login and a password and nothing
+        # opened them, so this branch produced a deployment holding an
+        # administrator's permission and no account to sign in as.
+        hashed = addresses.get("administrator-password-hash", "")
+        s.check(hashed.startswith("$argon2id$"),
+                f"the first administrator's password was hashed and written: {hashed[:24]!r}")
+        s.check(ANSWERS["admin_password"] not in json.dumps(addresses),
+                "and the password itself reached no Secret")
     if BACKEND == "bundled":
         s.check(addresses.get("zitadel-external-domain") == "zitadel"
                 and addresses.get("zitadel-external-port") == "8080"

@@ -158,6 +158,13 @@ services:
       MERIDIAN_LDAP_BASE_DN: ${MERIDIAN_LDAP_BASE_DN:-}
       MERIDIAN_LDAP_BIND_DN: ${MERIDIAN_LDAP_BIND_DN:-}
       MERIDIAN_LDAP_BIND_PASSWORD: ${MERIDIAN_LDAP_BIND_PASSWORD:-}
+      # Or accounts this deployment holds itself, the branch for a firm with
+      # no directory at all. Unset here as the two above are; the dashboard
+      # refuses to start with more than one configured.
+      MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL: ${MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL:-}
+      MERIDIAN_LOCAL_ACCOUNT_NAME: ${MERIDIAN_LOCAL_ACCOUNT_NAME:-}
+      MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH: ${MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH:-}
+      MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME: ${MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
@@ -609,6 +616,21 @@ services:
         condition: service_started
     volumes:
       - fr-pki:/var/run/secrets/kubernetes.io/serviceaccount:ro
+    networks: [meridian]
+
+  accounts-runner:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/accounts_runner.py"]
+    environment:
+      DASHBOARD: http://dashboard:8080
+      E2E_CLAIM_CODE: ${E2E_CLAIM_CODE:-E2E-7KQ2-MX4P}
+      E2E_LOCAL_ACCOUNT_NAME: ada
+      E2E_LOCAL_ACCOUNT_PASSWORD: Password1!
+      E2E_STATE: /state
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - dashboard-e2e-state:/state
     networks: [meridian]
 
   ldap-runner:

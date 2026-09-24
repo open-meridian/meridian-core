@@ -330,8 +330,13 @@ impl Accounts for InPostgres {
             .execute(
                 "UPDATE dashboard_local_account
                     SET failed_attempts = failed_attempts + 1,
+                        -- Cast, because two bare parameters added together
+                        -- give Postgres nothing to infer from: `unknown +
+                        -- unknown` has no unique operator, and the statement
+                        -- fails at execution rather than at compile time.
                         locked_until_ns = CASE
-                            WHEN failed_attempts + 1 >= $2 THEN $3 + $4
+                            WHEN failed_attempts + 1 >= $2::integer
+                            THEN $3::bigint + $4::bigint
                             ELSE locked_until_ns
                         END
                   WHERE name = $1",

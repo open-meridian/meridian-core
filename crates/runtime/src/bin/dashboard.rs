@@ -134,6 +134,53 @@ fn run() -> Result<(), String> {
         );
     }
 
+    // Before the runtime starts, because this is the blocking Postgres
+    // client and it makes a runtime of its own: constructed inside one it
+    // panics in a destructor, which reads as a crash with no cause.
+    //
+    // Connected and migrated here rather than at App construction, so a
+    // database that is not there stops the dashboard with a sentence rather
+    // than failing at the first sign-in.
+    let accounts = match &accounts_url {
+        Some(url) => {
+            let store = InPostgres::connect(url, 4)
+                .map_err(|failed| format!("the accounts database: {failed}"))?;
+            store.migrate()?;
+            // The first administrator, as first run left it: a name
+            // and a hash in a Secret. Made here at start rather than
+            // written by the Job, because the Job may not reach
+            // another component's store and this is the dashboard's.
+            //
+            // Only when absent. A restart must not put back an
+            // account somebody deleted, nor undo a password they
+            // changed.
+            if let (Some(name), Some(hash)) = (
+                var("MERIDIAN_LOCAL_ACCOUNT_NAME"),
+                var("MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH"),
+            ) {
+                let existing = store
+                    .by_name(&name)
+                    .map_err(|failed| format!("the accounts database: {failed}"))?;
+                if existing.is_none() {
+                    store
+                        .put(&meridian_dashboard::accounts::LocalAccount {
+                            name: name.clone(),
+                            display_name: var("MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME")
+                                .unwrap_or_else(|| name.clone()),
+                            password_hash: hash,
+                            groups: Vec::new(),
+                            created_at_ns: now_ns(),
+                            ..Default::default()
+                        })
+                        .map_err(|failed| format!("the first administrator's account: {failed}"))?;
+                    tracing::info!(name, "made the first administrator's account");
+                }
+            }
+            Some(Arc::new(store) as Arc<dyn meridian_dashboard::accounts::Accounts>)
+        }
+        None => None,
+    };
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -194,51 +241,6 @@ fn run() -> Result<(), String> {
             // First run is the absence of a directory rather than a flag, so
             // ending it is the configuration landing and nothing anybody can
             // switch back from inside the dashboard (requirement 18).
-            // Connected and migrated here rather than at App construction, so a
-            // database that is not there stops the dashboard with a sentence
-            // rather than failing at the first sign-in.
-            let accounts = match &accounts_url {
-                Some(url) => {
-                    let store = InPostgres::connect(url, 4)
-                        .map_err(|failed| format!("the accounts database: {failed}"))?;
-                    store.migrate()?;
-                    // The first administrator, as first run left it: a name
-                    // and a hash in a Secret. Made here at start rather than
-                    // written by the Job, because the Job may not reach
-                    // another component's store and this is the dashboard's.
-                    //
-                    // Only when absent. A restart must not put back an
-                    // account somebody deleted, nor undo a password they
-                    // changed.
-                    if let (Some(name), Some(hash)) = (
-                        var("MERIDIAN_LOCAL_ACCOUNT_NAME"),
-                        var("MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH"),
-                    ) {
-                        let existing = store
-                            .by_name(&name)
-                            .map_err(|failed| format!("the accounts database: {failed}"))?;
-                        if existing.is_none() {
-                            store
-                                .put(&meridian_dashboard::accounts::LocalAccount {
-                                    name: name.clone(),
-                                    display_name: var("MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME")
-                                        .unwrap_or_else(|| name.clone()),
-                                    password_hash: hash,
-                                    groups: Vec::new(),
-                                    created_at_ns: now_ns(),
-                                    ..Default::default()
-                                })
-                                .map_err(|failed| {
-                                    format!("the first administrator's account: {failed}")
-                                })?;
-                            tracing::info!(name, "made the first administrator's account");
-                        }
-                    }
-                    Some(Arc::new(store) as Arc<dyn meridian_dashboard::accounts::Accounts>)
-                }
-                None => None,
-            };
-
             let first_run = oidc.is_none() && directory.is_none() && accounts.is_none();
 
             let app = router(Arc::new(App {

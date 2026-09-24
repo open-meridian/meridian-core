@@ -275,12 +275,33 @@ async fn sign_in_with_password(
         return refused("this deployment does not sign people in with a password");
     };
 
-    match accounts::authenticate(
-        accounts.as_ref(),
-        &credentials.name,
-        &credentials.password,
-        now,
-    ) {
+    // On the blocking pool: this is the synchronous Postgres client, as every
+    // store in this deployment is, and it makes a runtime of its own. Called
+    // straight from an async handler it panics in a destructor, which arrives
+    // at the browser as a connection closed with no response and in the log
+    // as a backtrace with no cause.
+    //
+    // Argon2 belongs off the async threads anyway. It is deliberately slow,
+    // and a handful of sign-ins would otherwise stall every other request.
+    let asked = Arc::clone(accounts);
+    let name = credentials.name.clone();
+    let password = credentials.password.clone();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        accounts::authenticate(asked.as_ref(), &name, &password, now)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(joined) => {
+            tracing::error!(%joined, "a sign-in did not finish");
+            return no(
+                "This deployment could not check that sign-in. Try again shortly.",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+    };
+
+    match outcome {
         accounts::Outcome::SignedIn {
             subject,
             display_name,
