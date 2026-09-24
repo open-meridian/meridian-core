@@ -49,6 +49,11 @@ ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ri
 http = "1"
 # Verifying the bundled Zitadel's webhook signature, HMAC-SHA256. Already in
 # the tree through ed25519 and oauth2.
+# Hashing the passwords of accounts a deployment holds itself (decisions/018).
+# Argon2id, RustCrypto, pure Rust, in the same family as the primitives below.
+# `std` for the PHC string form, which carries its own salt and parameters so
+# changing those later does not invalidate rows written before the change.
+argon2 = { version = "0.5", features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

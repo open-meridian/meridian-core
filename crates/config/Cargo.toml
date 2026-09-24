@@ -7,6 +7,8 @@ license.workspace = true
 description = "The conductor's configuration store: accounts, access and plugin settings a deployment admin authors"
 
 [dependencies]
+argon2.workspace = true
+rand.workspace = true
 meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-domain.workspace = true
@@ -14,7 +16,6 @@ meridian-pb.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rand.workspace = true
 postgres.workspace = true
 r2d2.workspace = true
 r2d2_postgres.workspace = true

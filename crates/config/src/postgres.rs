@@ -20,7 +20,7 @@ use meridian_domain::v1::{
 };
 
 use crate::migrations;
-use crate::store::{KnownPlugin, Result, Snapshot, Store, StoreError, Withdrawal};
+use crate::store::{KnownPlugin, LocalAccount, Result, Snapshot, Store, StoreError, Withdrawal};
 use crate::DEPLOYMENT_ADMIN;
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -432,6 +432,89 @@ impl Store for PostgresStore {
                     &record.directory_groups,
                     &record.signed_in_at_ns,
                 ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn local_account(&self, name: &str) -> Result<Option<LocalAccount>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT name, display_name, password_hash, groups, failed_attempts,
+                        locked_until_ns, created_at_ns
+                   FROM config_local_account WHERE name = $1",
+                &[&name.trim().to_lowercase()],
+            )
+            .map_err(unavailable)?;
+        Ok(rows.first().map(|row| LocalAccount {
+            name: row.get(0),
+            display_name: row.get(1),
+            password_hash: row.get(2),
+            groups: row.get(3),
+            failed_attempts: row.get(4),
+            locked_until_ns: row.get(5),
+            created_at_ns: row.get(6),
+        }))
+    }
+
+    fn put_local_account(&self, account: &LocalAccount) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_local_account
+                     (name, display_name, password_hash, groups, failed_attempts,
+                      locked_until_ns, created_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (name) DO UPDATE
+                    SET display_name = excluded.display_name,
+                        password_hash = excluded.password_hash,
+                        groups = excluded.groups",
+                &[
+                    &account.name.trim().to_lowercase(),
+                    &account.display_name,
+                    &account.password_hash,
+                    &account.groups,
+                    &account.failed_attempts,
+                    &account.locked_until_ns,
+                    &account.created_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn count_sign_in_attempt(
+        &self,
+        name: &str,
+        succeeded: bool,
+        now_ns: i64,
+        lock_after: i32,
+        lock_for_ns: i64,
+    ) -> Result<()> {
+        let name = name.trim().to_lowercase();
+        if succeeded {
+            self.conn()?
+                .execute(
+                    "UPDATE config_local_account
+                        SET failed_attempts = 0, locked_until_ns = 0
+                      WHERE name = $1",
+                    &[&name],
+                )
+                .map_err(unavailable)?;
+            return Ok(());
+        }
+        // One statement, so two attempts racing cannot both read the same
+        // count and store the same increment.
+        self.conn()?
+            .execute(
+                "UPDATE config_local_account
+                    SET failed_attempts = failed_attempts + 1,
+                        locked_until_ns = CASE
+                            WHEN failed_attempts + 1 >= $2 THEN $3 + $4
+                            ELSE locked_until_ns
+                        END
+                  WHERE name = $1",
+                &[&name, &lock_after, &now_ns, &lock_for_ns],
             )
             .map_err(unavailable)?;
         Ok(())
