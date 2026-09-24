@@ -219,6 +219,29 @@ whether there is a directory: *Connect the firm's LDAP*, or *No directory: make
 me an account*, which asks for the login, email, name and password of the one
 account it then creates.
 
+**If you are using your own provider, it must return `auth_time`.** This is
+the one thing about your provider that Meridian requires and that not every
+provider does by default. It is what makes withdrawn access actually go away:
+a provider with its own session can hand out a token without asking the person
+anything, carrying groups your directory has since removed, and `auth_time` is
+the only thing that says when they really authenticated. Meridian asks for it
+correctly, with `max_age=0` and `prompt=login`, which obliges a provider to
+answer under the OpenID Connect specification.
+
+Check yours before you go on, because the failure comes at the very end and
+reads like a problem with your directory:
+
+| Provider | What you need to do |
+|---|---|
+| **Microsoft Entra ID** | **Add `auth_time` as an optional claim** on the app registration — Token configuration, add optional claim, ID token, `auth_time`. Entra does not send it otherwise |
+| **Okta** | Nothing. It is sent automatically when `prompt=login` or `max_age=0` is asked for, which Meridian does |
+| **Ping** | Check. Their documentation does not say either way; sign in once and look at the token |
+| **dex** | Not usable. It does not implement `auth_time`, and the request to add it has been open since 2017 |
+
+If your provider cannot return it, stop here and talk to us rather than
+working around it: the alternative is a deployment where somebody removed from
+a group keeps their access until their session happens to end.
+
 **Administrators.** Who runs this deployment once it is set up. With a
 directory, name a group — its members hold deployment admin, and adding
 somebody later is a change in your directory rather than here. With no
@@ -263,6 +286,7 @@ That is the install finished.
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there |
 | The wizard refuses the bundled directory | The chart did not render it | Add the four `identity.bundled` and `zitadel` values from step 3, `helm upgrade`, and apply again. Your answers are not kept, so have them to hand |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
+| "the directory did not say when this person authenticated" | Your provider returned no `auth_time` | See the table in step 7. On Entra, add it as an optional claim on the app registration; nothing in the deployment needs changing |
 | `street`, `instrument` or `migrate` still in error **after** applying | They may not have retried yet | Give them two minutes. If they persist, read the message: a key named there that is still missing means the apply did not write the database Secret |
 | Zitadel never reaches `1/1` | It cannot reach its database | Check `identity.bundled.egress.allowCidrs` covers your cluster's pod and service ranges |
 

@@ -6,6 +6,7 @@ else's software by construction (fake_idp.py).
 
   A  somebody signs in through their firm's provider
   E  freshness: a provider's own session, re-issued without asking anybody
+  G  the provider rotates its signing key, and people still sign in
   H  a callback whose state was not the one this browser started with
 """
 import json
@@ -83,6 +84,21 @@ def main_phase():
               f"and the provider really did claim an older sign-in: {issued[-1:]}")
     finally:
         stale(False)
+
+    say("G: the provider rotates its signing key, and people still sign in")
+    # The dashboard read /jwks at start and holds the first key. The provider
+    # now signs with a second and publishes only that. A token that does not
+    # verify is not a bad token until the keys have been read again, which is
+    # what the retry in `finish` is for -- deliberate code the bundled Zitadel
+    # was covering until it was removed.
+    Browser().post(IDP + "/e2e/rotate", {})
+    rotated = Browser()
+    _, back = signed_in(rotated)
+    check(back is not None and back.status == 303,
+          f"a token signed with the new key is accepted: {back.status if back else None}")
+    page = home(rotated)
+    check(signed_in_as(page) == "Ada Park",
+          f"and they are who the provider said: {signed_in_as(page)!r}")
 
     say("H: a callback whose state was not the one this browser started with")
     honest = Browser()
