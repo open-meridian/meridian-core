@@ -241,6 +241,10 @@ E2E_CLUSTER_ROUTE ?= brought
 # to it from a real browser, say. One that failed is always kept.
 E2E_CLUSTER_KEEP ?=
 E2E_BROWSER_IMAGE ?= meridian-e2e-browser:local
+# Who installs and answers the wizard: this runner, or `meridian up --params`
+# from meridian-cli's e2e image (its `make e2e-up` sets these).
+E2E_DRIVER ?= runner
+E2E_CLI_IMAGE ?= meridian-cli-e2e:local
 # How people sign in: `local` (an account the deployment holds) or `ldap`
 # (the firm's directory, which e2e-cluster-ldap starts).
 E2E_CLUSTER_SIGN_IN ?= local
@@ -283,6 +287,7 @@ e2e-cluster:
 	 E2E_SIGN_IN=$(E2E_CLUSTER_SIGN_IN) E2E_LDAP_SERVER=ldap://host.docker.internal:$(E2E_LDAP_PORT) \
 	 E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) \
 	 E2E_BROWSER_IMAGE=$(E2E_BROWSER_IMAGE) \
+	 E2E_DRIVER=$(E2E_DRIVER) E2E_CLI_IMAGE=$(E2E_CLI_IMAGE) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \

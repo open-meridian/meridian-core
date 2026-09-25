@@ -129,6 +129,12 @@ WAY_IN = WAYS_IN[SIGN_IN]
 
 PORT = int(os.environ.get("E2E_PORT", "18480"))
 
+# Who installs the chart and answers the wizard: this runner (`runner`), or
+# `meridian up --params`, as a person does (`cli`), from E2E_CLI_IMAGE --
+# meridian-cli's `e2e` image, the binary with the helm and kubectl it drives.
+DRIVER = os.environ.get("E2E_DRIVER", "runner")
+CLI_IMAGE = os.environ.get("E2E_CLI_IMAGE", "meridian-cli-e2e:local")
+
 # Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
 BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
 WIZARD = f"http://127.0.0.1:{PORT}"
@@ -303,6 +309,102 @@ def sign_in_at_provider(hint):
     return status, session
 
 
+def the_answers():
+    """What the wizard is told, whichever driver tells it.
+
+    One place, because the runner and `meridian up --params` must answer the
+    same questions the same way, or a difference between them is a difference
+    in what was asked rather than in who asked it.
+    """
+    return {
+        "db_route": ROUTE,
+        "db_name": "meridian",
+        "db_serving_role": "meridian_app",
+        "db_migrating_role": "meridian_migrate",
+        **WAY_IN["answers"],
+        **(
+            {}
+            if ROUTE == "brought"
+            else {
+                # A database somebody already runs, reached by the name a
+                # pod can resolve. Its two roles were made before any of
+                # this, as a firm's own database administrator would.
+                "db_host": EXTERNAL_HOST,
+                "db_port": EXTERNAL_PORT,
+                "db_sslmode": "disable",
+                "db_serving_password": EXTERNAL_PASSWORD,
+                "db_migrating_password": EXTERNAL_PASSWORD,
+            }
+        ),
+        "dashboard_url": WIZARD,
+    }
+
+
+def by_cli(s, deployment_id, enrolment_code):
+    """Install and answer the wizard with `meridian up --params`, as a person does.
+
+    Result 1 of plans/a-person-reaches-a-plugin, and spec/the-cli's `e2e-up`:
+    the chart installed and the wizard answered by the CLI rather than by this
+    runner's own HTTP calls. It runs in a container holding the binary and the
+    helm and kubectl it drives, on this machine's network, so its kubeconfig
+    and its port-forward are this machine's.
+
+    `--no-doctor`: the doctor asks the registry whether the image exists, and
+    this image is the working tree's, built here and in no registry. Every
+    other check is the machine's, which the rest of this run proves anyway.
+    """
+    import tempfile
+
+    first_run_code = platform(
+        "issue_claim_code", "--deployment", deployment_id, "--purpose", "first-run"
+    ).splitlines()[-1]
+
+    # Credentials never go in the params file -- the CLI refuses one that holds
+    # any -- so each comes from MERIDIAN_<FIELD>, as a person's would.
+    answers = the_answers()
+    secret = {k: v for k, v in answers.items() if k.endswith(("password", "secret"))}
+    plain = {k: v for k, v in answers.items() if k not in secret}
+    params = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    params.write("".join(f"{k}: {json.dumps(v)}\n" for k, v in plain.items()))
+    params.close()
+    os.chmod(params.name, 0o644)
+
+    kubeconfig = os.environ.get("KUBECONFIG") or os.path.expanduser("~/.kube/config")
+    environment = {
+        "MERIDIAN_ENROLMENT_CODE": enrolment_code,
+        "MERIDIAN_FIRST_RUN_CODE": first_run_code,
+        **{f"MERIDIAN_{k.upper()}": v for k, v in secret.items()},
+    }
+    command = [
+        "docker", "run", "--rm", "--network", "host",
+        "--add-host", "host.docker.internal:host-gateway",
+        "-v", f"{kubeconfig}:/kube/config:ro", "-e", "KUBECONFIG=/kube/config",
+        "-v", f"{os.path.abspath(CHART)}:/chart:ro",
+        "-v", f"{params.name}:/params.yaml:ro",
+        *[flag for name in environment for flag in ("-e", name)],
+        CLI_IMAGE, "up",
+        "--namespace", NAMESPACE, "--release", RELEASE, "--chart", "/chart",
+        "--id", deployment_id, "--platform", PLATFORM_FROM_POD,
+        *(["--image", IMAGE] if IMAGE else []),
+        "--params", "/params.yaml", "--port", str(PORT), "--no-doctor",
+    ]
+    done = subprocess.run(
+        command, capture_output=True, text=True, env={**os.environ, **environment}
+    )
+    os.unlink(params.name)
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"    | {line}", flush=True)
+    s.check(done.returncode == 0, f"meridian up finished: exit {done.returncode}")
+    s.check(
+        "administers this deployment" in done.stdout,
+        "and said who administers the deployment it configured",
+    )
+    held = platform_psql(
+        f"select fingerprint from domain_deploymentkey where deployment_id = '{deployment_id}'"
+    )
+    s.check(bool(held), "the platform holds the key the conductor enrolled")
+
+
 def wait_for(what, ready, seconds=420):
     for _ in range(seconds):
         try:
@@ -333,128 +435,111 @@ def main():
     ).splitlines()[-1]
     s.check(enrolment_code.startswith("ENR-"), "and it has an enrolment code to carry")
 
-    print("B: installed, carrying only those two values", flush=True)
-    run("kubectl", "create", "namespace", NAMESPACE)
-    values = [
-        "--set", f"deployment.id={deployment_id}",
-        "--set", f"deployment.enrolmentCode={enrolment_code}",
-        "--set", f"platform.address={PLATFORM_FROM_POD}",
-    ]
-    if IMAGE:
-        repository, _, tag = IMAGE.rpartition(":")
-        values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
-    run("helm", "upgrade", "--install", RELEASE, CHART, "--namespace", NAMESPACE, *values)
+    if DRIVER == "cli":
+        print("B-E: meridian up, answering the wizard from a file", flush=True)
+        by_cli(s, deployment_id, enrolment_code)
+    else:
+        print("B: installed, carrying only those two values", flush=True)
+        run("kubectl", "create", "namespace", NAMESPACE)
+        values = [
+            "--set", f"deployment.id={deployment_id}",
+            "--set", f"deployment.enrolmentCode={enrolment_code}",
+            "--set", f"platform.address={PLATFORM_FROM_POD}",
+        ]
+        if IMAGE:
+            repository, _, tag = IMAGE.rpartition(":")
+            values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
+        run("helm", "upgrade", "--install", RELEASE, CHART, "--namespace", NAMESPACE, *values)
 
-    wait_for(
-        "the dashboard",
-        lambda: "1/1" in kubectl("get", "pods", "-l", "meridian.dev/component=dashboard", "--no-headers"),
-    )
-    s.check(True, "the dashboard is up")
-
-    forward = subprocess.Popen(
-        ["kubectl", "--namespace", NAMESPACE, "port-forward",
-         f"svc/{RELEASE}-meridian-runtime-dashboard", f"{PORT}:80"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        wait_for("the forward", lambda: urllib.request.urlopen(f"{WIZARD}/healthz").status == 200)
-
-        print("C: the conductor enrolled its own key", flush=True)
         wait_for(
-            "enrolment",
-            lambda: "not registered"
-            not in urllib.request.urlopen(f"{WIZARD}/first-run").read().decode(),
-            seconds=180,
+            "the dashboard",
+            lambda: "1/1" in kubectl("get", "pods", "-l", "meridian.dev/component=dashboard", "--no-headers"),
         )
-        page = urllib.request.urlopen(f"{WIZARD}/first-run").read().decode()
-        # Requirement 8, and the reason it exists: an administrator comparing
-        # the two is how a code somebody else spent is noticed. Both sides are
-        # asked here, which no other test does -- the stand-in platform simply
-        # returns a fingerprint the runner already knows.
-        held = platform_psql(
-            f"select fingerprint from domain_deploymentkey "
-            f"where deployment_id = '{deployment_id}'"
-        )
-        s.note(f"the platform holds {held}")
-        s.check(bool(held), "the platform holds a key nobody handled")
-        s.check(held in page, "and the wizard shows that same fingerprint")
+        s.check(True, "the dashboard is up")
 
-        print("D: the wizard, opened with a first-run code", flush=True)
-        first_run_code = platform(
-            "issue_claim_code", "--deployment", deployment_id, "--purpose", "first-run"
-        ).splitlines()[-1]
-        cookies = {}
-        status, page = post("/first-run/claim", {"code": first_run_code}, cookies)
-        # Redeeming is a signed call through the conductor, so a yes here is
-        # the platform verifying a signature against the key it registered.
-        # Nothing else in this run proves enrolment as directly.
-        s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
-
-        print(
-            f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
-            f"signing people in with {dict(local='an account it holds', ldap='the firm LDAP', oidc='the firm provider')[SIGN_IN]}",
-            flush=True,
+        forward = subprocess.Popen(
+            ["kubectl", "--namespace", NAMESPACE, "port-forward",
+             f"svc/{RELEASE}-meridian-runtime-dashboard", f"{PORT}:80"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        answers = {
-            "db_route": ROUTE,
-            "db_name": "meridian",
-            "db_serving_role": "meridian_app",
-            "db_migrating_role": "meridian_migrate",
-            **WAY_IN["answers"],
-            **(
-                {}
-                if ROUTE == "brought"
-                else {
-                    # A database somebody already runs, reached by the name a
-                    # pod can resolve. Its two roles were made before any of
-                    # this, as a firm's own database administrator would.
-                    "db_host": EXTERNAL_HOST,
-                    "db_port": EXTERNAL_PORT,
-                    "db_sslmode": "disable",
-                    "db_serving_password": EXTERNAL_PASSWORD,
-                    "db_migrating_password": EXTERNAL_PASSWORD,
-                }
-            ),
-            "dashboard_url": WIZARD,
-        }
-        passes = "Everything answered so far passes"
-        if SIGN_IN == "ldap":
-            # The check binds to the directory from the Job, in the cluster,
-            # as the dashboard will. Until 2026-09-25 it dialled nothing and
-            # passed this; a wrong password was found by the first sign-in.
-            wrong = {**answers, "ldap_bind_password": "not-the-bind-password"}
-            status, page = post("/first-run/check", wrong, cookies)
-            s.check(
-                passes not in page and "could not sign in to the directory" in page,
-                "a wrong bind password is refused before anything is written",
+        try:
+            wait_for("the forward", lambda: urllib.request.urlopen(f"{WIZARD}/healthz").status == 200)
+
+            print("C: the conductor enrolled its own key", flush=True)
+            wait_for(
+                "enrolment",
+                lambda: "not registered"
+                not in urllib.request.urlopen(f"{WIZARD}/first-run").read().decode(),
+                seconds=180,
             )
-        if SIGN_IN == "oidc":
-            # Read from the pod, as the dashboard will: the discovery
-            # document names its issuer, and one character off is another.
-            wrong = {**answers, "oidc_issuer": IDP_ISSUER + "/"}
-            status, page = post("/first-run/check", wrong, cookies)
-            import re
-
-            # The findings, not the page: the form itself has an issuer field.
-            findings = re.findall(r"<li>([^<]*)</li>", page)
-            s.note(f"findings: {findings}")
-            s.check(
-                passes not in page and any("issuer" in f for f in findings),
-                "an issuer the provider does not call itself is refused before anything is written",
+            page = urllib.request.urlopen(f"{WIZARD}/first-run").read().decode()
+            # Requirement 8, and the reason it exists: an administrator comparing
+            # the two is how a code somebody else spent is noticed. Both sides are
+            # asked here, which no other test does -- the stand-in platform simply
+            # returns a fingerprint the runner already knows.
+            held = platform_psql(
+                f"select fingerprint from domain_deploymentkey "
+                f"where deployment_id = '{deployment_id}'"
             )
-        status, page = post("/first-run/check", answers, cookies)
-        s.check(passes in page, "the answers pass")
-        status, page = post("/first-run/apply", answers, cookies)
-        if "administers this deployment" not in page:
-            import re as _re
+            s.note(f"the platform holds {held}")
+            s.check(bool(held), "the platform holds a key nobody handled")
+            s.check(held in page, "and the wizard shows that same fingerprint")
 
-            s.note(f"page: {_re.sub(r'<[^>]*>', ' ', page)[:400]}")
-        s.check("administers this deployment" in page, "applied, and it names who administers it")
-    finally:
-        forward.terminate()
-        # Gone before H binds the same port again.
-        forward.wait()
+            print("D: the wizard, opened with a first-run code", flush=True)
+            first_run_code = platform(
+                "issue_claim_code", "--deployment", deployment_id, "--purpose", "first-run"
+            ).splitlines()[-1]
+            cookies = {}
+            status, page = post("/first-run/claim", {"code": first_run_code}, cookies)
+            # Redeeming is a signed call through the conductor, so a yes here is
+            # the platform verifying a signature against the key it registered.
+            # Nothing else in this run proves enrolment as directly.
+            s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
+
+            print(
+                f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
+                f"signing people in with {dict(local='an account it holds', ldap='the firm LDAP', oidc='the firm provider')[SIGN_IN]}",
+                flush=True,
+            )
+            answers = the_answers()
+            passes = "Everything answered so far passes"
+            if SIGN_IN == "ldap":
+                # The check binds to the directory from the Job, in the cluster,
+                # as the dashboard will. Until 2026-09-25 it dialled nothing and
+                # passed this; a wrong password was found by the first sign-in.
+                wrong = {**answers, "ldap_bind_password": "not-the-bind-password"}
+                status, page = post("/first-run/check", wrong, cookies)
+                s.check(
+                    passes not in page and "could not sign in to the directory" in page,
+                    "a wrong bind password is refused before anything is written",
+                )
+            if SIGN_IN == "oidc":
+                # Read from the pod, as the dashboard will: the discovery
+                # document names its issuer, and one character off is another.
+                wrong = {**answers, "oidc_issuer": IDP_ISSUER + "/"}
+                status, page = post("/first-run/check", wrong, cookies)
+                import re
+
+                # The findings, not the page: the form itself has an issuer field.
+                findings = re.findall(r"<li>([^<]*)</li>", page)
+                s.note(f"findings: {findings}")
+                s.check(
+                    passes not in page and any("issuer" in f for f in findings),
+                    "an issuer the provider does not call itself is refused before anything is written",
+                )
+            status, page = post("/first-run/check", answers, cookies)
+            s.check(passes in page, "the answers pass")
+            status, page = post("/first-run/apply", answers, cookies)
+            if "administers this deployment" not in page:
+                import re as _re
+
+                s.note(f"page: {_re.sub(r'<[^>]*>', ' ', page)[:400]}")
+            s.check("administers this deployment" in page, "applied, and it names who administers it")
+        finally:
+            forward.terminate()
+            # Gone before H binds the same port again.
+            forward.wait()
 
     print("F: the database", flush=True)
     if ROUTE == "brought":
