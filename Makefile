@@ -252,6 +252,10 @@ e2e-cluster:
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
 	@echo "e2e-cluster: building the image this cluster will run"
 	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@# A cluster on the daemon that built the image sees it already; one that
+	@# is not (k3d, kind) is handed it, or its pods pull a tag that exists
+	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) >/dev/null,:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -361,6 +365,65 @@ e2e-cluster-oidc:
 	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_SIGN_IN=oidc; \
 	  held=$$?; \
 	  docker rm -f $(E2E_IDP_CONTAINER) >/dev/null 2>&1 || true; \
+	  exit $$held
+
+# Any of the four cluster runs, on a k3d cluster made for it and removed after:
+# what CI runs, and what anybody with Docker and k3d can run to reproduce it.
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-oidc
+#
+# The four reach everything outside the cluster -- the platform, a database
+# somebody runs, the directory, the provider -- as host.docker.internal.
+# Rancher Desktop and Docker Desktop resolve that inside a pod; Linux does not.
+# So the cluster is put on a network whose gateway is fixed, the name is
+# pointed at that gateway in the nodes and in CoreDNS, and the host's published
+# ports answer there. Nothing the runs assert changes.
+#
+# CoreDNS is restarted once it is made. k3d adds the name after CoreDNS has
+# started, and CoreDNS reads that file through a mount that never updates:
+# without the restart the name resolves to nothing on a runner, and to the
+# desktop's own answer on a laptop, which hides the defect.
+K3D ?= k3d
+E2E_K3D_CLUSTER ?= meridian-e2e
+E2E_K3D_NETWORK ?= meridian-k3d
+E2E_K3D_SUBNET ?= 172.28.0.0/16
+E2E_K3D_GATEWAY ?= 172.28.0.1
+E2E_K3D_API ?= 127.0.0.1:16443
+E2E_K3D_KUBECONFIG ?= $(CURDIR)/.e2e-k3d.kubeconfig
+E2E_CLUSTER_TARGET ?= e2e-cluster
+# Set to anything to keep the cluster afterwards, for reading.
+E2E_K3D_KEEP ?=
+
+e2e-cluster-k3d:
+	@docker network inspect $(E2E_K3D_NETWORK) >/dev/null 2>&1 \
+		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
+	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
+	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET)"
+	@$(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
+		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
+		--api-port $(E2E_K3D_API) --k3s-arg "--disable=traefik@server:0" --wait >/dev/null
+	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
+	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout restart deploy/coredns >/dev/null
+	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout status deploy/coredns --timeout=120s >/dev/null
+	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
+		E2E_IMAGE_LOAD="$(K3D) image import -c $(E2E_K3D_CLUSTER)"; \
+	  held=$$?; \
+	  if [ $$held -ne 0 ]; then \
+	    echo "e2e-cluster-k3d: what the cluster said, in .e2e-cluster.log" >&2; \
+	    { KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl get pods -A -o wide; \
+	      for pod in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get pods -o name); do \
+	        echo "== $$pod"; \
+	        KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod --all-containers --tail=80; \
+	        echo "== $$pod, the container before, if it restarted"; \
+	        KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod --all-containers --previous --tail=80; \
+	      done; } > .e2e-cluster.log 2>&1; \
+	  fi; \
+	  if [ -n "$(E2E_K3D_KEEP)" ]; then \
+	    echo "e2e-cluster-k3d: kept; KUBECONFIG=$(E2E_K3D_KUBECONFIG)" >&2; \
+	  else \
+	    $(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1; \
+	    rm -f $(E2E_K3D_KUBECONFIG); \
+	  fi; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
