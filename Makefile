@@ -253,7 +253,7 @@ E2E_LDAP_PORT ?= 15389
 E2E_IDP_CONTAINER ?= meridian-e2e-idp
 E2E_IDP_PORT ?= 18100
 E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
-e2e-cluster:
+e2e-cluster: network
 	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
 		|| { echo "e2e-cluster needs a cluster; point KUBECONFIG at one" >&2; exit 1; }
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
