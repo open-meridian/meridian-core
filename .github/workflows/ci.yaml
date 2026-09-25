@@ -81,3 +81,92 @@ jobs:
           path: workspace/meridian-core/.e2e-*.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # The four runs that install the chart on a real cluster and sign a person
+  # in: spec/installation-and-first-run, paths 1 and 2 and path 1's other two
+  # ways in. Everything above stands something in; these stand in nothing,
+  # and on 2026-09-24 and 25 they found seven defects in a chart that every
+  # job above had passed -- one of them published, because `publish` waited
+  # on this workflow and this workflow had never installed a chart.
+  #
+  # Part of `ci` rather than a workflow of its own for exactly that reason:
+  # `publish` runs on a green `ci`, so a red run here publishes nothing.
+  #
+  # After ci-local, and only on main or by hand. They need a cluster and the
+  # platform, which is private: a pull request from a fork gets no secret to
+  # check it out with, and a commit ci-local has refused is not worth a
+  # cluster. One job per run, so a failure names its half.
+  e2e-cluster-k3d:
+    needs: ci-local
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+
+      # Said plainly, because without them the steps below fail with an
+      # authentication error that reads like the platform is gone.
+      - name: The platform's app credentials are there
+        env:
+          HELD: ${{ secrets.MERIDIAN_PLATFORM_APP_ID != '' && secrets.MERIDIAN_PLATFORM_APP_KEY != '' }}
+        run: |
+          if [ "$HELD" != "true" ]; then
+            echo "::error::MERIDIAN_PLATFORM_APP_ID and MERIDIAN_PLATFORM_APP_KEY are not both set. These runs start the real platform from meridian-platform, which is private: they need a GitHub App installed on it with Contents: read, and its id and private key as these secrets."
+            exit 1
+          fi
+
+      # A token for meridian-platform alone, read only, minted for this run
+      # and expiring within the hour. The organisation has deploy keys off,
+      # and an app belongs to no person and does not lapse the way a personal
+      # token does.
+      - id: platform
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.MERIDIAN_PLATFORM_APP_ID }}
+          private-key: ${{ secrets.MERIDIAN_PLATFORM_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: meridian-platform
+
+      # The real platform, at its main, as design's gates read siblings. The
+      # token is not left behind for any later step.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/meridian-platform
+          token: ${{ steps.platform.outputs.token }}
+          persist-credentials: false
+          path: workspace/meridian-platform
+
+      # Pinned, and checked against the release's own checksum, rather than
+      # piping an install script from a branch into a shell.
+      - name: k3d
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
+          echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
+          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: make e2e-cluster-k3d
+        working-directory: workspace/meridian-core
+        env:
+          DOCKER_BUILDKIT: "1"
+          TARGET: ${{ matrix.target }}
+        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET"
+
+      - name: Keep what the cluster said
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-logs
+          path: workspace/meridian-core/.e2e-*.log
+          if-no-files-found: ignore
+          retention-days: 14
