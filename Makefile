@@ -237,6 +237,11 @@ E2E_EXTERNAL_PASSWORD ?= e2e-dev-only
 # there, so sharing it would have made `make e2e-cluster` quietly take the
 # route nobody asked it for.
 E2E_CLUSTER_ROUTE ?= brought
+# How people sign in: `local` (an account the deployment holds) or `ldap`
+# (the firm's directory, which e2e-cluster-ldap starts).
+E2E_CLUSTER_SIGN_IN ?= local
+E2E_LDAP_CONTAINER ?= meridian-e2e-ldap
+E2E_LDAP_PORT ?= 15389
 E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
 e2e-cluster:
 	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
@@ -263,6 +268,7 @@ e2e-cluster:
 	@kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_CLUSTER_NAMESPACE) E2E_IMAGE=$(RUNTIME_IMAGE) PLATFORM=$(PLATFORM) \
 	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \
+	 E2E_SIGN_IN=$(E2E_CLUSTER_SIGN_IN) E2E_LDAP_SERVER=ldap://host.docker.internal:$(E2E_LDAP_PORT) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
@@ -300,6 +306,30 @@ e2e-cluster-external:
 	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_ROUTE=external; \
 	  held=$$?; \
 	  docker rm -f $(E2E_EXTERNAL_CONTAINER) >/dev/null 2>&1 || true; \
+	  exit $$held
+
+# The same run, signing people in through the firm's LDAP.
+#
+# Outside the cluster, as path 2's database is, because that is where a
+# firm's directory is: a host and a port the deployment was told about. The
+# tree is the compose suite's, loaded the way that suite loads it, so both
+# mean the same alice and bob. The database is the one the chart brings;
+# which database it is and how people sign in are independent, and each has
+# its own run so a failure says which it was.
+e2e-cluster-ldap:
+	@docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null 2>&1 || true
+	@docker run -d --name $(E2E_LDAP_CONTAINER) \
+		-e LDAP_ROOT=dc=example,dc=org -e LDAP_ADMIN_USERNAME=admin \
+		-e LDAP_ADMIN_PASSWORD=ldap-admin-dev-only -e LDAP_SKIP_DEFAULT_TREE=yes \
+		-v "$(CURDIR)/e2e/dashboard/ldap":/e2e-ldap:ro \
+		-p $(E2E_LDAP_PORT):1389 bitnamilegacy/openldap:2.6 >/dev/null
+	@docker exec $(E2E_LDAP_CONTAINER) sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+		|| { echo "e2e-cluster-ldap: the directory did not come up" >&2; docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null; exit 1; }
+	@docker exec -i $(E2E_LDAP_CONTAINER) ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >/dev/null
+	@docker exec -i $(E2E_LDAP_CONTAINER) ldapadd $(LDAP_DIR) <e2e/dashboard/ldap/02-tree.ldif >/dev/null
+	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_SIGN_IN=ldap; \
+	  held=$$?; \
+	  docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null 2>&1 || true; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
@@ -514,7 +544,14 @@ chart-check:
 		|| { echo "chart-check FAILED: a fresh install rendered no first run, so the check below would prove nothing" >&2; exit 1; }; \
 	empty="$$(echo "$$fresh" | grep -nE '^[[:space:]]+key:[[:space:]]*("")?[[:space:]]*$$')"; \
 	[ -z "$$empty" ] || { echo "chart-check FAILED: a fresh install renders a Secret reference with no key, which the API server refuses:" >&2; \
-		echo "$$empty" >&2; exit 1; }
+		echo "$$empty" >&2; exit 1; }; \
+	written="$$(echo "$$fresh" | grep -A1 'resources: \["secrets"\]' | grep resourceNames | tr -d '[]",' | sed 's/.*resourceNames://')"; \
+	[ -n "$$written" ] || { echo "chart-check FAILED: found no Secrets the first-run Job may write, so the check below would prove nothing" >&2; exit 1; }; \
+	for secret in $$written; do \
+		echo "$$fresh" | awk -v n="$$secret" '/^---/{s=0;m=0} /^kind: Secret$$/{s=1} $$0=="  name: "n{m=1} s&&m{f=1} END{exit !f}' \
+			|| { echo "chart-check FAILED: first run may write the Secret $$secret and a fresh install does not make it." >&2; \
+			     echo "  The Job holds update and never create (decisions/016), so its apply fails with a 404." >&2; exit 1; }; \
+	done
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }

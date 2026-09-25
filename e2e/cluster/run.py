@@ -52,6 +52,56 @@ EXTERNAL_PORT = os.environ.get("E2E_EXTERNAL_PORT", "15440")
 EXTERNAL_CONTAINER = os.environ.get("E2E_EXTERNAL_CONTAINER", "meridian-e2e-database")
 EXTERNAL_PASSWORD = os.environ.get("E2E_EXTERNAL_PASSWORD", "e2e-dev-only")
 
+# How people sign in, which is the other half of what the wizard asks. The
+# database route and this are independent: each branch is the same install
+# with different answers, so a failure says which half it came from.
+#
+# `local` is an account this deployment holds. `ldap` is the firm's directory,
+# run as a container outside the cluster exactly as the external database is:
+# from in here a firm's LDAP is a host and a port. The tree is the compose
+# suite's (e2e/dashboard/ldap), so both suites mean the same people.
+SIGN_IN = os.environ.get("E2E_SIGN_IN", "local")
+LDAP_SERVER = os.environ.get("E2E_LDAP_SERVER", "ldap://host.docker.internal:15389")
+LDAP_GROUP_A = "cn=ldap-group-a,ou=groups,dc=example,dc=org"  # alice and bob
+LDAP_GROUP_B = "cn=ldap-group-b,ou=groups,dc=example,dc=org"  # bob alone
+
+WAYS_IN = {
+    "local": {
+        "answers": {
+            "directory": "local",
+            "admin_login": "ada",
+            "admin_email": "ada@example.org",
+            "admin_given_name": "Ada",
+            "admin_password": "Password1!",
+            "admin_group": "",
+        },
+        # What G finds in the user group, and who H signs in as.
+        "granted": "local|ada",
+        "administrator": ("ada", "Password1!"),
+        "somebody_else": None,
+    },
+    "ldap": {
+        "answers": {
+            "directory": "ldap",
+            "ldap_servers": LDAP_SERVER,
+            "ldap_base_dn": "ou=people,dc=example,dc=org",
+            "ldap_bind_dn": "cn=admin,dc=example,dc=org",
+            "ldap_bind_password": "ldap-admin-dev-only",
+            # A group only bob is in, so that alice -- who is in the
+            # directory and may sign in -- is the case where a person gets in
+            # and is not an administrator. Every person in the other group
+            # would be one, which proves nothing about the group.
+            "admin_group": LDAP_GROUP_B,
+        },
+        "granted": LDAP_GROUP_B,
+        "administrator": ("bob", "bobpass"),
+        "somebody_else": ("alice", "alicepass"),
+    },
+}
+if SIGN_IN not in WAYS_IN:
+    raise SystemExit(f"E2E_SIGN_IN is {SIGN_IN!r}; it is one of {sorted(WAYS_IN)}")
+WAY_IN = WAYS_IN[SIGN_IN]
+
 PORT = int(os.environ.get("E2E_PORT", "18480"))
 WIZARD = f"http://127.0.0.1:{PORT}"
 
@@ -257,19 +307,18 @@ def main():
         # Nothing else in this run proves enrolment as directly.
         s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
 
-        print(f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}", flush=True)
+        print(
+            f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
+            f"signing people in with {'an account it holds' if SIGN_IN == 'local' else 'the firm LDAP'}",
+            flush=True,
+        )
         answers = {
             "db_route": ROUTE,
             "db_name": "meridian",
             "db_serving_role": "meridian_app",
             "db_migrating_role": "meridian_migrate",
             "backend": "bundled",
-            "directory": "local",
-            "admin_login": "ada",
-            "admin_email": "ada@example.org",
-            "admin_given_name": "Ada",
-            "admin_password": "Password1!",
-            "admin_group": "",
+            **WAY_IN["answers"],
             **(
                 {}
                 if ROUTE == "brought"
@@ -335,9 +384,12 @@ def main():
     )
     groups = psql("select logins, directory_groups from config_user_group")
     s.note(f"user groups: {groups}")
-    s.check("ada" in groups, "the account the wizard created holds deployment admin")
+    s.check(
+        WAY_IN["granted"] in groups,
+        f"{WAY_IN['granted']}, as the wizard named it, holds deployment admin",
+    )
 
-    print("H: and she signs in, which is what the permission was for", flush=True)
+    print("H: and they sign in, which is what the permission was for", flush=True)
     # G is a row. A row was what the compose run asserted for weeks while the
     # account it named did not exist, so nobody could have used it. This is
     # the dashboard in its target configuration, on this cluster, checking a
@@ -363,13 +415,25 @@ def main():
 
     try:
         wait_for("the dashboard, out of first run", signing_in, seconds=300)
-        status, _ = post("/sign-in", {"name": "ada", "password": "not-her-password"}, {})
-        s.check(status == 401, f"a wrong password is refused: {status}")
+        name, password = WAY_IN["administrator"]
+        status, _ = post("/sign-in", {"name": name, "password": "not-the-password"}, {})
+        s.check(status == 401, f"a wrong password for {name} is refused: {status}")
         session = {}
-        status, _ = post("/sign-in", {"name": "ada", "password": "Password1!"}, session)
-        s.check(status == 303 and bool(session), f"hers is not, and she holds a session: {status}")
-        home = get("/", session)
-        s.check("You are a deployment admin" in home, "and home says she administers it")
+        status, _ = post("/sign-in", {"name": name, "password": password}, session)
+        s.check(status == 303 and bool(session), f"the right one is not, and {name} holds a session: {status}")
+        s.check("You are a deployment admin" in get("/", session), f"and home says {name} administers it")
+        if WAY_IN["somebody_else"]:
+            # In the directory, so in; not in the group, so not an
+            # administrator. Without this, a permission granted to everybody
+            # who signs in passes every check above.
+            name, password = WAY_IN["somebody_else"]
+            session = {}
+            status, _ = post("/sign-in", {"name": name, "password": password}, session)
+            s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
+            s.check(
+                "You are a deployment admin" not in get("/", session),
+                f"and is not an administrator, being outside the group the wizard named",
+            )
     finally:
         if forward is not None:
             forward.terminate()
