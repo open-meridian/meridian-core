@@ -100,6 +100,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions,
+        terminals: Arc::new(crate::terminal::Terminals::default()),
         clock: Arc::new(At(T0)),
         bus,
         oidc: None,

@@ -24,6 +24,7 @@ pub mod html;
 pub mod oidc;
 pub mod records;
 pub mod session;
+pub mod terminal;
 pub mod web;
 
 pub use clock::{Clock, SystemClock};

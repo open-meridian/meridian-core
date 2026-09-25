@@ -31,6 +31,10 @@ use crate::html::{escape, page};
 use crate::oidc::Oidc;
 use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
+use crate::terminal::Terminals;
+
+mod terminal;
+pub use terminal::terminal_session_of;
 
 pub const SESSION_COOKIE: &str = "meridian_session";
 pub const SIGN_IN_COOKIE: &str = "meridian_signin";
@@ -45,6 +49,9 @@ pub struct App {
     pub wizard: Arc<crate::first_run::WizardSession>,
     pub records: Arc<RecordsCache>,
     pub sessions: Arc<Sessions>,
+    /// Terminals' requests, codes and sessions (W6.13, W6.14). Apart from
+    /// `sessions` because a terminal's session is never a browser's.
+    pub terminals: Arc<Terminals>,
     pub clock: Arc<dyn Clock>,
     pub bus: Arc<Bus>,
     /// None when no directory is configured, which the sign-in page says.
@@ -70,6 +77,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-in", get(sign_in).post(sign_in_with_password))
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
+        .merge(terminal::routes())
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
         .with_state(app)
@@ -115,7 +123,7 @@ pub fn session_of(app: &App, headers: &HeaderMap) -> Option<Session> {
     app.sessions.find(&key, app.clock.now_ns())
 }
 
-fn redirect(to: &str) -> Response {
+pub(crate) fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to.to_string())]).into_response()
 }
 
@@ -183,7 +191,7 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
     // is the point of 018: no redirect means no second address, and no issuer
     // whose URL has to resolve from a pod and a browser at once.
     if app.directory.is_some() || app.accounts.is_some() {
-        return Html(password_page("")).into_response();
+        return Html(password_page("", None)).into_response();
     }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
@@ -202,17 +210,31 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
 /// Deliberately plain about failure: one sentence, and the same one whether
 /// the name is unknown or the password is wrong. Telling them apart would let
 /// anybody who can reach this page enumerate a firm's staff.
-fn password_page(refusal: &str) -> String {
+///
+/// The same form signs somebody in for a terminal (W6.13), carrying the
+/// terminal's request so the sign-in ends in a confirmation rather than a
+/// browser session.
+fn password_page(refusal: &str, terminal: Option<&str>) -> String {
     let told = if refusal.is_empty() {
         String::new()
     } else {
         format!("<p class=\"refusal\">{}</p>", escape(refusal))
     };
+    let (heading, carried) = match terminal {
+        Some(id) => (
+            "Sign in to connect a terminal",
+            format!(
+                "<input type=\"hidden\" name=\"terminal\" value=\"{}\">",
+                escape(id)
+            ),
+        ),
+        None => ("Sign in", String::new()),
+    };
     page(
         "Sign in",
         &format!(
-            "<h1>Sign in</h1>{told}\
-             <form method=\"post\" action=\"/sign-in\">\
+            "<h1>{heading}</h1>{told}\
+             <form method=\"post\" action=\"/sign-in\">{carried}\
              <label for=\"name\">Username</label>\
              <input id=\"name\" name=\"name\" autocomplete=\"username\" required>\
              <label for=\"password\">Password</label>\
@@ -228,6 +250,9 @@ fn password_page(refusal: &str) -> String {
 pub struct Credentials {
     name: String,
     password: String,
+    /// A terminal's request, when this sign-in is for one.
+    #[serde(default)]
+    terminal: String,
 }
 
 /// W7.7 by the other route. The directory checks the password; we never do.
@@ -239,9 +264,10 @@ async fn sign_in_with_password(
     if let Err(stale) = app.records.current(now) {
         return refused(&stale.to_string());
     }
+    let terminal = Some(credentials.terminal.as_str()).filter(|id| !id.is_empty());
     // The same sentence for both halves, wherever the refusal came from.
     let no = |reason: &str, status: StatusCode| {
-        let mut response = Html(password_page(reason)).into_response();
+        let mut response = Html(password_page(reason, terminal)).into_response();
         *response.status_mut() = status;
         response
     };
@@ -259,7 +285,12 @@ async fn sign_in_with_password(
         {
             Ok(person) => {
                 let subject = format!("{}|{}", directory.issuer(), person.subject);
-                began(&app, &subject, &person.name, person.groups, now).await
+                match terminal {
+                    Some(id) => {
+                        terminal::signed_in(&app, id, &subject, &person.name, person.groups, now)
+                    }
+                    None => began(&app, &subject, &person.name, person.groups, now).await,
+                }
             }
             Err(crate::directory::Failure::Refused) => refused_them(),
             Err(ours) => {
@@ -306,7 +337,10 @@ async fn sign_in_with_password(
             subject,
             display_name,
             groups,
-        } => began(&app, &subject, &display_name, groups, now).await,
+        } => match terminal {
+            Some(id) => terminal::signed_in(&app, id, &subject, &display_name, groups, now),
+            None => began(&app, &subject, &display_name, groups, now).await,
+        },
         accounts::Outcome::Refused => refused_them(),
         // Said plainly, and not as a refusal: somebody locked out and not
         // told keeps trying and cannot tell it from a wrong password.
@@ -349,6 +383,26 @@ async fn began(
     let key = app
         .sessions
         .start(subject, display_name, groups.clone(), now);
+    record_sign_in(app, subject, display_name, groups, now);
+    tracing::info!(subject, "signed in");
+
+    let mut response = redirect("/");
+    response.headers_mut().append(
+        SET_COOKIE,
+        set_cookie(app, SESSION_COOKIE, &key, "/", ABSOLUTE_NS / 1_000_000_000),
+    );
+    response
+}
+
+/// Say who signed in, for the access table and the count. Every sign-in,
+/// a browser's or a terminal's, because W6.1 records them all.
+pub(crate) fn record_sign_in(
+    app: &App,
+    subject: &str,
+    display_name: &str,
+    groups: Vec<String>,
+    now: i64,
+) {
     let record = SignInRecord {
         subject: subject.to_string(),
         display_name: display_name.to_string(),
@@ -367,14 +421,6 @@ async fn began(
         // broker hiccupped.
         tracing::warn!("a sign-in was not recorded: {failed}");
     }
-    tracing::info!(subject, "signed in");
-
-    let mut response = redirect("/");
-    response.headers_mut().append(
-        SET_COOKIE,
-        set_cookie(app, SESSION_COOKIE, &key, "/", ABSOLUTE_NS / 1_000_000_000),
-    );
-    response
 }
 
 async fn callback(
@@ -401,19 +447,34 @@ async fn callback(
         return bad_request("this sign-in was started in another browser; start again here");
     }
 
+    // Whether this sign-in was a terminal's, asked before it is finished so
+    // a state is matched to at most one request, whatever happens next.
+    let terminal = app.terminals.for_provider_state(state);
     let identity = match oidc.finish(state, code, now).await {
         Ok(identity) => identity,
         Err(failed) => return bad_request(&failed),
     };
 
-    let mut response = began(
-        &app,
-        &identity.subject,
-        &identity.display_name,
-        identity.groups,
-        now,
-    )
-    .await;
+    let mut response = match terminal {
+        Some(id) => terminal::signed_in(
+            &app,
+            &id,
+            &identity.subject,
+            &identity.display_name,
+            identity.groups,
+            now,
+        ),
+        None => {
+            began(
+                &app,
+                &identity.subject,
+                &identity.display_name,
+                identity.groups,
+                now,
+            )
+            .await
+        }
+    };
     // And the one cookie only this route sets: the state it was matched
     // against has done its work and should not outlive it.
     response.headers_mut().append(

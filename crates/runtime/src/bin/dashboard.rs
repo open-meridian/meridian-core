@@ -19,6 +19,7 @@ use std::time::Duration;
 use meridian_dashboard::accounts::{Accounts as _, InPostgres};
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
+use meridian_dashboard::terminal::Terminals;
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
@@ -227,6 +228,7 @@ fn run() -> Result<(), String> {
             let bus = bus_from_env(&instance_id).await?;
             let records = Arc::new(RecordsCache::default());
             let sessions = Arc::new(Sessions::default());
+            let terminals = Arc::new(Terminals::default());
             let clock = Arc::new(SystemClock);
 
             // Once before listening, so the first request finds records when
@@ -238,11 +240,13 @@ fn run() -> Result<(), String> {
             tokio::spawn(refresh_forever(Arc::clone(&bus), Arc::clone(&records), clock.clone()));
 
             let sweeping = Arc::clone(&sessions);
+            let sweeping_terminals = Arc::clone(&terminals);
             tokio::spawn(async move {
                 let mut every = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     every.tick().await;
                     sweeping.sweep(now_ns());
+                    sweeping_terminals.sweep(now_ns());
                 }
             });
 
@@ -289,6 +293,7 @@ fn run() -> Result<(), String> {
                 wizard: Arc::new(WizardSession::default()),
                 records,
                 sessions,
+                terminals,
                 clock,
                 bus,
                 oidc,
