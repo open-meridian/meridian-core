@@ -5,8 +5,8 @@ What this proves, in the order the spec asks for it:
 - the wizard answers one page until a first-run claim code is redeemed, and a
   wrong code is refused with the platform's own reason;
 - a wrong answer is refused with a finding, and nothing is written;
-- applying writes the named Secrets, patches the one policy, restarts the
-  named Deployments and deletes the Job's own binding;
+- applying writes the named Secrets, restarts the named Deployments and
+  deletes the Job's own binding;
 - the credentials reach the first-run Job sealed: what the wizard sent is not
   in the clear anywhere the broker could see it, and what the Job wrote is;
 - the same answers through the endpoints a CLI would call leave the same
