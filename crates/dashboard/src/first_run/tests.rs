@@ -154,6 +154,7 @@ fn app_with(
         wizard: Arc::new(WizardSession::default()),
         records,
         sessions: Arc::new(Sessions::default()),
+        terminals: Arc::new(crate::terminal::Terminals::default()),
         clock: Arc::new(At(T0)),
         bus,
         oidc: None,

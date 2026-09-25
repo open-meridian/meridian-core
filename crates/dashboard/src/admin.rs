@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Form, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -51,6 +51,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/access-groups", post(define_access_group))
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
+        .route("/admin/end-terminal-sessions", post(end_terminal_sessions))
 }
 
 fn field<'a>(fields: &'a Fields, name: &str) -> &'a str {
@@ -185,6 +186,33 @@ fn after(outcome: Result<(), String>) -> Response {
     }
 }
 
+/// W6.14: every terminal session a person holds, ended. Nothing goes to the
+/// conductor: the sessions are this dashboard's, and so is ending them.
+async fn end_terminal_sessions(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let login = field(&fields, "login");
+    let ended = app.terminals.end_person(login);
+    tracing::info!(login, ended, by = %session.subject, "terminal sessions ended");
+    (
+        StatusCode::SEE_OTHER,
+        [(
+            axum::http::header::LOCATION,
+            format!("/admin?terminal_sessions_ended={ended}"),
+        )],
+    )
+        .into_response()
+}
+
 // ── The first deployment admin ──────────────────────────────────────────────
 
 async fn claim_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -271,13 +299,24 @@ fn level_name(level: i32) -> &'static str {
     }
 }
 
-async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+async fn admin_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
     let (session, records) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
     };
     let token = token_input(&session);
     let mut body = String::from("<h1>Administer this deployment</h1><p><a href=\"/\">Home</a></p>");
+    // What the last form did, where it has something to say.
+    if let Ok(ended) = field(&query, "terminal_sessions_ended").parse::<usize>() {
+        body.push_str(&format!(
+            "<p class=\"done\">Ended {ended} terminal session{}.</p>",
+            if ended == 1 { "" } else { "s" }
+        ));
+    }
 
     body.push_str(
         "<h2>Accounts</h2><table><tr><th>Account</th><th>Name</th><th>State</th><th></th></tr>",
@@ -396,6 +435,27 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
          <label>External account <input name=\"external_account_id\" required></label> \
          <label>Account (empty unlinks) <input name=\"account_id\"></label> <button>Link</button></form>"
     ));
+
+    // W6.14. Per person: what is being ended is their access from a
+    // terminal, so there is no choosing among their sessions to offer.
+    body.push_str("<h2>Terminal sessions</h2>");
+    let holders = app.terminals.holders(app.clock.now_ns());
+    if holders.is_empty() {
+        body.push_str("<p>Nobody holds a terminal session.</p>");
+    } else {
+        body.push_str("<table><tr><th>Person</th><th>Login</th><th>Sessions</th><th></th></tr>");
+        for (login, name, count) in &holders {
+            body.push_str(&format!(
+                "<tr><td>{name}</td><td>{login}</td><td>{count}</td><td>\
+                 <form method=\"post\" action=\"/admin/end-terminal-sessions\">{token}\
+                 <input type=\"hidden\" name=\"login\" value=\"{login}\">\
+                 <button>End them</button></form></td></tr>",
+                name = escape(name),
+                login = escape(login),
+            ));
+        }
+        body.push_str("</table>");
+    }
 
     Html(page("Administer", &body)).into_response()
 }

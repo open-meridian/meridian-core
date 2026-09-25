@@ -7,17 +7,17 @@ use tower::ServiceExt;
 use super::*;
 use crate::records::CEILING_NS;
 
-struct At(i64);
+pub(in crate::web) struct At(pub i64);
 impl Clock for At {
     fn now_ns(&self) -> i64 {
         self.0
     }
 }
 
-const T0: i64 = 1_790_380_800_000_000_000;
-const ADA: &str = "https://directory.example.org|8812";
+pub(in crate::web) const T0: i64 = 1_790_380_800_000_000_000;
+pub(in crate::web) const ADA: &str = "https://directory.example.org|8812";
 
-fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> {
+pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> {
     let cache = Arc::new(RecordsCache::default());
     if let Some(records) = records {
         cache.store(records, read_at);
@@ -27,6 +27,7 @@ fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> 
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions: Arc::new(Sessions::default()),
+        terminals: Arc::new(crate::terminal::Terminals::default()),
         clock: Arc::new(At(now)),
         bus: Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))),
         oidc: None,
@@ -36,7 +37,7 @@ fn app_with(records: Option<AccessRecords>, read_at: i64, now: i64) -> Arc<App> 
     })
 }
 
-fn admins() -> AccessRecords {
+pub(in crate::web) fn admins() -> AccessRecords {
     AccessRecords {
         user_groups: vec![UserGroup {
             user_group_id: "UG-1".into(),
@@ -166,7 +167,7 @@ fn app_with_a_directory() -> Arc<App> {
     Arc::new(built)
 }
 
-async fn body_of(response: Response) -> String {
+pub(in crate::web) async fn body_of(response: Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("a body");
@@ -241,7 +242,7 @@ async fn a_password_post_where_no_directory_is_bound_is_refused() {
 
 // ── And the branch where this deployment holds the account ──────────────────
 
-fn app_holding_ada() -> Arc<App> {
+pub(in crate::web) fn app_holding_ada() -> Arc<App> {
     let accounts = crate::accounts::InMemory::default();
     accounts
         .put(&crate::accounts::LocalAccount {
