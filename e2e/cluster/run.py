@@ -684,6 +684,68 @@ def main():
             print(f"    {line}" if line else "", flush=True)
         s.check(phase == "Succeeded", f"the browser's checks held: {phase or 'it never ran'}")
 
+    print("T: a terminal connects, as the person running it", flush=True)
+    # W6.13 and W6.14. The loopback redirect needs the terminal and the
+    # browser on one machine, and a pod is one: its containers share
+    # 127.0.0.1. So they run together, with a forwarder to the dashboard on
+    # the port the dashboard thinks is its address -- which is also what
+    # lets a provider's redirect back land in here, on every branch. The
+    # terminal is the real CLI where this run has its image (E2E_DRIVER=cli,
+    # meridian-cli's `make e2e-up`) and a stand-in for it where it does not.
+    name, password = WAY_IN["administrator"]
+    real_cli = DRIVER == "cli"
+    kubectl("delete", "pod", "e2e-terminal", "--ignore-not-found", "--wait")
+    cli_container = f"""
+    - name: cli
+      image: {CLI_IMAGE}
+      imagePullPolicy: Never
+      env: [{{name: XDG_CONFIG_HOME, value: /shared/config}}]
+      volumeMounts: [{{name: shared, mountPath: /shared}}]
+      command:
+        - sh
+        - -c
+        - |
+          meridian connect http://127.0.0.1:{PORT} > /shared/connect-1.out 2>&1; echo "exit=$?" >> /shared/connect-1.out
+          until [ -f /shared/sign-out-now ]; do sleep 1; done
+          meridian sign-out > /shared/sign-out.out 2>&1; echo "exit=$?" >> /shared/sign-out.out
+          until [ -f /shared/connect-again ]; do sleep 1; done
+          meridian connect http://127.0.0.1:{PORT} > /shared/connect-2.out 2>&1; echo "exit=$?" >> /shared/connect-2.out
+""" if real_cli else ""
+    apply(f"""
+apiVersion: v1
+kind: Pod
+metadata: {{name: e2e-terminal}}
+spec:
+  restartPolicy: Never
+  volumes: [{{name: shared, emptyDir: {{}}}}]
+  containers:
+    - name: browser
+      image: {BROWSER_IMAGE}
+      imagePullPolicy: Never
+      command: [python, /e2e/terminal.py]
+      volumeMounts: [{{name: shared, mountPath: /shared}}]
+      env:
+        - {{name: E2E_DASHBOARD, value: "http://{RELEASE}-meridian-runtime-dashboard"}}
+        - {{name: E2E_PORT, value: "{PORT}"}}
+        - {{name: E2E_BY, value: "{WAY_IN['by']}"}}
+        - {{name: E2E_NAME, value: "{name}"}}
+        - {{name: E2E_PASSWORD, value: "{password or ''}"}}
+        - {{name: E2E_TERMINAL, value: "{'cli' if real_cli else 'python'}"}}
+{cli_container}""")
+    phase = ""
+    for _ in range(420):
+        phase = kubectl("get", "pod", "e2e-terminal", "-o", "jsonpath={.status.phase}")
+        if phase in ("Succeeded", "Failed"):
+            break
+        time.sleep(1)
+    for line in kubectl("logs", "e2e-terminal", "-c", "browser").splitlines():
+        print(f"    {line}" if line else "", flush=True)
+    s.check(
+        phase == "Succeeded",
+        f"a terminal connected, signed out and was ended, by {'the real CLI' if real_cli else 'a stand-in'}: "
+        f"{phase or 'it never ran'}",
+    )
+
     print("R: the deployment's own registry", flush=True)
     # spec/the-local-plugin-registry: an image put in the registry from inside
     # the cluster is pulled by the node from its own localhost, through the

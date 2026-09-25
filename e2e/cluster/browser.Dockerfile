@@ -7,4 +7,7 @@
 FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
 RUN pip install --no-cache-dir --break-system-packages playwright==1.63.0
 COPY browser.py /e2e/browser.py
+# Section T's: a terminal connecting, in the same image because it is the
+# same browser.
+COPY terminal.py /e2e/terminal.py
 ENTRYPOINT ["python", "/e2e/browser.py"]
