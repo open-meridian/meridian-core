@@ -119,6 +119,23 @@ fn refuse_if(refusing: &str, step: &str) -> Result<(), crate::cluster::ClusterEr
     }
 }
 
+/// A directory that answers with these findings, and remembers the bind
+/// password it was handed -- which is how a test sees the Job opened it.
+#[derive(Default, Clone)]
+struct Directories {
+    findings: Vec<String>,
+    handed: Arc<Mutex<Vec<String>>>,
+}
+impl DirectoryProbe for Directories {
+    fn check(&self, _: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String> {
+        self.handed
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(bind_password).into_owned());
+        self.findings.clone()
+    }
+}
+
 struct Answers(Vec<String>);
 impl DatabaseProbe for Answers {
     fn check(&self, _: &DatabaseLogin, _: &[u8], may_create: bool) -> Vec<String> {
@@ -149,6 +166,7 @@ fn first_run(cluster: Box<dyn Cluster>, probe: Vec<String>) -> FirstRun {
         provisioner: Box::new(Refusing("provision")),
         brought: None,
         probe: Box::new(Answers(probe)),
+        directory_probe: Box::new(Directories::default()),
     }
 }
 
@@ -257,7 +275,12 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
                 }),
                 directory: Some(
                     meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(
+                        // Whole, now that applying re-checks it: an answer
+                        // with no server passed until the check dialled one.
                         LdapDirectoryAnswer {
+                            servers: vec!["ldaps://one.firm.example".into()],
+                            base_dn: "ou=people,dc=firm,dc=example".into(),
+                            bind_dn: "cn=meridian,dc=firm,dc=example".into(),
                             bind_password: Some(
                                 seal(
                                     &run.key.public_key(),
@@ -416,6 +439,7 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         provisioner: Box::new(Refusing("provision")),
         brought: None,
         probe: Box::new(Answers(vec![])),
+        directory_probe: Box::new(Directories::default()),
     };
     let configuration = FirstRunConfiguration {
         administrator: Some(administrator("meridian-admins")),
@@ -684,4 +708,127 @@ async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password()
     for key in ["password", "servers", "base-dn", "bind-dn", "user-filter"] {
         assert!(ldap.contains(key), "{key} is missing from {ldap}");
     }
+}
+
+fn ldap_answer(run: &FirstRun, filter: &str) -> LoginBackendAnswer {
+    LoginBackendAnswer {
+        backend: Some(Backend::Bundled(BundledZitadelAnswer {
+            directory: Some(
+                meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(LdapDirectoryAnswer {
+                    servers: vec!["ldaps://one.firm.example".into()],
+                    base_dn: "ou=people,dc=firm,dc=example".into(),
+                    bind_dn: "cn=meridian,dc=firm,dc=example".into(),
+                    bind_password: Some(
+                        seal(
+                            &run.key.public_key(),
+                            &run.key.key_id,
+                            "ldap.bind_password",
+                            b"bind-secret",
+                        )
+                        .unwrap(),
+                    ),
+                    user_filter: filter.into(),
+                    ..Default::default()
+                }),
+            ),
+            ..Default::default()
+        })),
+    }
+}
+
+fn check_backend_with(run: &FirstRun, backend: LoginBackendAnswer) -> FirstRunCheckReply {
+    run.check(&FirstRunCheckRequest {
+        answer: Some(Answer::LoginBackend(backend)),
+    })
+}
+
+#[test]
+fn an_ldap_answer_is_bound_to_with_the_password_the_wizard_sealed() {
+    // Until 2026-09-25 every LDAP answer passed without anything being
+    // dialled, so a wrong bind password was found by the first sign-in.
+    let directories = Directories::default();
+    let handed = directories.handed.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.directory_probe = Box::new(directories);
+
+    let reply = check_backend_with(&run, ldap_answer(&run, ""));
+
+    assert!(reply.passed, "{:?}", reply.findings);
+    assert_eq!(
+        *handed.lock().unwrap(),
+        ["bind-secret"],
+        "opened and handed over"
+    );
+}
+
+#[test]
+fn what_the_directory_says_is_wrong_is_what_the_wizard_shows() {
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.directory_probe = Box::new(Directories {
+        findings: vec!["this deployment could not sign in to the directory".into()],
+        ..Default::default()
+    });
+
+    let reply = check_backend_with(&run, ldap_answer(&run, ""));
+
+    assert!(!reply.passed);
+    assert_eq!(
+        reply.findings,
+        ["this deployment could not sign in to the directory"]
+    );
+}
+
+#[test]
+fn an_ldap_answer_missing_half_of_itself_is_told_so_without_dialling() {
+    let directories = Directories::default();
+    let handed = directories.handed.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.directory_probe = Box::new(directories);
+    let mut answer = ldap_answer(&run, "(mail=alice@firm.example)");
+    if let Some(Backend::Bundled(bundled)) = answer.backend.as_mut() {
+        if let Some(meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(ldap)) =
+            bundled.directory.as_mut()
+        {
+            ldap.servers.clear();
+            ldap.base_dn.clear();
+        }
+    }
+
+    let reply = check_backend_with(&run, answer);
+
+    assert!(!reply.passed);
+    assert_eq!(reply.findings.len(), 3, "{:?}", reply.findings);
+    assert!(reply
+        .findings
+        .iter()
+        .any(|f| f.contains("no directory server")));
+    assert!(reply.findings.iter().any(|f| f.contains("no base DN")));
+    // A filter naming one person finds them whoever signs in.
+    assert!(reply.findings.iter().any(|f| f.contains("has no {}")));
+    assert!(handed.lock().unwrap().is_empty(), "nothing was dialled");
+}
+
+#[test]
+fn a_local_account_answer_dials_nothing() {
+    let directories = Directories::default();
+    let handed = directories.handed.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.directory_probe = Box::new(directories);
+
+    let reply = check_backend_with(
+        &run,
+        LoginBackendAnswer {
+            backend: Some(Backend::Bundled(BundledZitadelAnswer {
+                directory: Some(
+                    meridian_domain::v1::bundled_zitadel_answer::Directory::LocalAccount(
+                        Default::default(),
+                    ),
+                ),
+                ..Default::default()
+            })),
+        },
+    );
+
+    assert!(reply.passed, "{:?}", reply.findings);
+    assert!(handed.lock().unwrap().is_empty());
 }

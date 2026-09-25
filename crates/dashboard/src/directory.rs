@@ -200,6 +200,56 @@ impl Directory {
         })
     }
 
+    /// Whether this deployment can use this directory at all: a server
+    /// answers, the service account binds, and the base is there to search.
+    ///
+    /// What first run tests a firm's answer with (W7.4), so a wrong address
+    /// or password is a finding on the wizard's page rather than every
+    /// sign-in failing after the configuration has been applied. It signs
+    /// nobody in and reads one entry, the base's own.
+    pub async fn check(&self) -> Result<(), Failure> {
+        // The same reason as a person's: an empty password is an
+        // unauthenticated bind, the server says yes, and a check that passed
+        // on it would pass an answer that can read nothing.
+        if self.bind_dn.trim().is_empty() || self.bind_password.is_empty() {
+            return Err(Failure::NotOurs(
+                "a bind DN and its password are both needed; an empty password \
+                 is an anonymous bind"
+                    .into(),
+            ));
+        }
+
+        let (mut ldap, connection) = self.connect().await?;
+        ldap3::drive!(connection);
+
+        ldap.simple_bind(&self.bind_dn, &self.bind_password)
+            .await
+            .map_err(|failed| Failure::NotOurs(failed.to_string()))?
+            .success()
+            .map_err(|failed| Failure::NotOurs(failed.to_string()))?;
+
+        let (entries, _) = ldap
+            .search(&self.base_dn, Scope::Base, "(objectClass=*)", ["dn"])
+            .await
+            .map_err(|failed| Failure::Confused(failed.to_string()))?
+            .success()
+            .map_err(|failed| {
+                Failure::Confused(format!(
+                    "the base {} could not be read: {failed}",
+                    self.base_dn
+                ))
+            })?;
+        let _ = ldap.unbind().await;
+
+        match entries.len() {
+            1 => Ok(()),
+            _ => Err(Failure::Confused(format!(
+                "the base {} is not an entry this account can read",
+                self.base_dn
+            ))),
+        }
+    }
+
     /// The first server that answers.
     async fn connect(&self) -> Result<(ldap3::Ldap, ldap3::LdapConnAsync), Failure> {
         let mut refusals = Vec::new();

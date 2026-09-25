@@ -65,6 +65,12 @@ LDAP_SERVER = os.environ.get("E2E_LDAP_SERVER", "ldap://host.docker.internal:153
 LDAP_GROUP_A = "cn=ldap-group-a,ou=groups,dc=example,dc=org"  # alice and bob
 LDAP_GROUP_B = "cn=ldap-group-b,ou=groups,dc=example,dc=org"  # bob alone
 
+# The firm's own provider, stood in for by e2e/dashboard/fake_idp.py outside
+# the cluster. Its issuer is one name for the pod and for the browser, as a
+# real one's is: the pod resolves host.docker.internal, and this runner --
+# the browser -- connects to 127.0.0.1 for that name (see `fetch`).
+IDP_ISSUER = os.environ.get("E2E_IDP_ISSUER", "http://host.docker.internal:18100")
+
 WAYS_IN = {
     "local": {
         "answers": {
@@ -79,6 +85,7 @@ WAYS_IN = {
         "granted": "local|ada",
         "administrator": ("ada", "Password1!"),
         "somebody_else": None,
+        "by": "password",
     },
     "ldap": {
         "answers": {
@@ -96,6 +103,24 @@ WAYS_IN = {
         "granted": LDAP_GROUP_B,
         "administrator": ("bob", "bobpass"),
         "somebody_else": ("alice", "alicepass"),
+        "by": "password",
+    },
+    "oidc": {
+        "answers": {
+            "backend": "oidc",
+            "oidc_issuer": IDP_ISSUER,
+            "oidc_client_id": "meridian-dashboard",
+            "oidc_client_secret": "idp-dev-only-secret",
+            # Empty is the default claim, `groups`, which the stand-in uses.
+            "oidc_groups_claim": "",
+            "admin_group": "meridian-admins",
+        },
+        "granted": "meridian-admins",
+        # Nobody types a password here: the provider decides who they are.
+        # Ada is its default person, in meridian-admins; Ben is in staff.
+        "administrator": ("", None),
+        "somebody_else": ("ben", None),
+        "by": "redirect",
     },
 }
 if SIGN_IN not in WAYS_IN:
@@ -219,6 +244,62 @@ def get(path, cookies):
         return refused.read().decode()
 
 
+def fetch(method, url, cookies, fields=None):
+    """One request, as a browser would make it, following nothing.
+
+    `host.docker.internal` is what the pod calls this machine, and a real
+    provider's issuer is one name everybody resolves. This machine does not
+    resolve that one, so the connection goes to 127.0.0.1 and the name stays
+    in the Host header -- a hosts entry, in effect, and the issuer string the
+    dashboard checks is the same on both sides.
+    """
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    target = url
+    headers = {}
+    if parts.hostname == "host.docker.internal":
+        target = urllib.parse.urlunsplit(parts._replace(netloc=f"127.0.0.1:{parts.port}"))
+        headers["Host"] = parts.netloc
+    data = urllib.parse.urlencode(fields).encode() if fields is not None else None
+    request = urllib.request.Request(target, data=data, method=method, headers=headers)
+    if cookies:
+        request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
+
+    class NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_k):
+            return None
+
+    try:
+        answered = urllib.request.build_opener(NoRedirects).open(request)
+    except urllib.error.HTTPError as refused:
+        answered = refused
+    for value in answered.headers.get_all("Set-Cookie") or []:
+        name, _, rest = value.partition("=")
+        cookies[name] = rest.split(";")[0]
+    return answered.status if hasattr(answered, "status") else answered.code, \
+        answered.headers.get("Location"), answered.read().decode()
+
+
+def sign_in_at_provider(hint):
+    """Start at the dashboard, sign in at the provider, and come back.
+
+    Returns the callback's status and the dashboard's cookies. The provider
+    is given none of them, as a browser would give it none.
+    """
+    session = {}
+    status, away, _ = fetch("GET", f"{WIZARD}/sign-in", session)
+    if status not in (302, 303) or "/authorize" not in (away or ""):
+        return status, session
+    if hint:
+        away += f"&login_hint={hint}"
+    status, back, _ = fetch("GET", away, {})
+    if status not in (302, 303) or not back:
+        return status, session
+    status, _, _ = fetch("GET", back, session)
+    return status, session
+
+
 def wait_for(what, ready, seconds=420):
     for _ in range(seconds):
         try:
@@ -309,7 +390,7 @@ def main():
 
         print(
             f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
-            f"signing people in with {'an account it holds' if SIGN_IN == 'local' else 'the firm LDAP'}",
+            f"signing people in with {dict(local='an account it holds', ldap='the firm LDAP', oidc='the firm provider')[SIGN_IN]}",
             flush=True,
         )
         answers = {
@@ -335,8 +416,19 @@ def main():
             ),
             "dashboard_url": WIZARD,
         }
+        passes = "Everything answered so far passes"
+        if SIGN_IN == "ldap":
+            # The check binds to the directory from the Job, in the cluster,
+            # as the dashboard will. Until 2026-09-25 it dialled nothing and
+            # passed this; a wrong password was found by the first sign-in.
+            wrong = {**answers, "ldap_bind_password": "not-the-bind-password"}
+            status, page = post("/first-run/check", wrong, cookies)
+            s.check(
+                passes not in page and "could not sign in to the directory" in page,
+                "a wrong bind password is refused before anything is written",
+            )
         status, page = post("/first-run/check", answers, cookies)
-        s.check("passed" in page or "passes" in page, "the answers pass")
+        s.check(passes in page, "the answers pass")
         status, page = post("/first-run/apply", answers, cookies)
         if "administers this deployment" not in page:
             import re as _re
@@ -411,24 +503,36 @@ def main():
                 stderr=subprocess.DEVNULL,
             )
             time.sleep(2)
-        return 'name="password"' in urllib.request.urlopen(f"{WIZARD}/sign-in").read().decode()
+        # Out of first run, which looks different by the way in: a form for
+        # a password, or a redirect to the provider.
+        status, away, page = fetch("GET", f"{WIZARD}/sign-in", {})
+        if WAY_IN["by"] == "password":
+            return 'name="password"' in page
+        return status in (302, 303) and (away or "").startswith(IDP_ISSUER)
 
     try:
         wait_for("the dashboard, out of first run", signing_in, seconds=300)
+        def signed_in(name, password):
+            if WAY_IN["by"] == "redirect":
+                return sign_in_at_provider(name)
+            session = {}
+            status, _ = post("/sign-in", {"name": name, "password": password}, session)
+            return status, session
+
         name, password = WAY_IN["administrator"]
-        status, _ = post("/sign-in", {"name": name, "password": "not-the-password"}, {})
-        s.check(status == 401, f"a wrong password for {name} is refused: {status}")
-        session = {}
-        status, _ = post("/sign-in", {"name": name, "password": password}, session)
-        s.check(status == 303 and bool(session), f"the right one is not, and {name} holds a session: {status}")
-        s.check("You are a deployment admin" in get("/", session), f"and home says {name} administers it")
+        who = name or "the provider's person"
+        if WAY_IN["by"] == "password":
+            status, _ = post("/sign-in", {"name": name, "password": "not-the-password"}, {})
+            s.check(status == 401, f"a wrong password for {name} is refused: {status}")
+        status, session = signed_in(name, password)
+        s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
+        s.check("You are a deployment admin" in get("/", session), f"and home says {who} administers it")
         if WAY_IN["somebody_else"]:
             # In the directory, so in; not in the group, so not an
             # administrator. Without this, a permission granted to everybody
             # who signs in passes every check above.
             name, password = WAY_IN["somebody_else"]
-            session = {}
-            status, _ = post("/sign-in", {"name": name, "password": password}, session)
+            status, session = signed_in(name, password)
             s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
             s.check(
                 "You are a deployment admin" not in get("/", session),

@@ -354,33 +354,35 @@ async fn check(
         return closed(&app, "").await;
     };
 
-    let (request, refusals) = match answers(&app, &fields).await {
+    let requests = match answers(&app, &fields).await {
         Err(refusal) => return Html(open_page(&fields, &[refusal], "")).into_response(),
         Ok(answers) => answers.to_check(),
     };
-    if !refusals.is_empty() {
-        return Html(open_page(&fields, &refusals, "")).into_response();
-    }
 
-    let findings = match ask(
-        &app,
-        CHECK_ANSWER,
-        "meridian.v1.FirstRunCheckRequest",
-        request.encode_to_vec(),
-        TESTING,
-    )
-    .await
-    {
-        Err(failed) => vec![failed],
-        Ok(payload) => {
-            let reply = FirstRunCheckReply::decode(&payload[..]).unwrap_or_default();
-            if reply.passed {
-                vec![]
-            } else {
-                reply.findings
+    // Every answer, one request each, because a check request carries one.
+    // Until 2026-09-25 this sent the database alone, so a wrong directory
+    // password read "passes" here and was refused only by Apply -- which
+    // re-checks all four, and is where the cluster run found it.
+    let mut findings = Vec::new();
+    for request in requests {
+        match ask(
+            &app,
+            CHECK_ANSWER,
+            "meridian.v1.FirstRunCheckRequest",
+            request.encode_to_vec(),
+            TESTING,
+        )
+        .await
+        {
+            Err(failed) => findings.push(failed),
+            Ok(payload) => {
+                let reply = FirstRunCheckReply::decode(&payload[..]).unwrap_or_default();
+                if !reply.passed {
+                    findings.extend(reply.findings);
+                }
             }
         }
-    };
+    }
 
     let passed = if findings.is_empty() {
         "Everything answered so far passes. Nothing has been written."
@@ -562,13 +564,19 @@ struct Answers {
 }
 
 impl Answers {
-    fn to_check(&self) -> (FirstRunCheckRequest, Vec<String>) {
-        (
-            FirstRunCheckRequest {
-                answer: Some(CheckAnswer::RuntimeDatabase(self.database.clone())),
-            },
-            Vec::new(),
-        )
+    /// What Check tests: everything Apply will test first, in its order.
+    fn to_check(&self) -> Vec<FirstRunCheckRequest> {
+        [
+            CheckAnswer::RuntimeDatabase(self.database.clone()),
+            CheckAnswer::LoginBackend(self.backend.clone()),
+            CheckAnswer::Addresses(self.addresses.clone()),
+            CheckAnswer::Administrator(self.administrator.clone()),
+        ]
+        .into_iter()
+        .map(|answer| FirstRunCheckRequest {
+            answer: Some(answer),
+        })
+        .collect()
     }
 
     fn to_configuration(&self) -> FirstRunConfiguration {

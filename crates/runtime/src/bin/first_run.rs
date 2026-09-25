@@ -23,11 +23,12 @@ use std::sync::Arc;
 
 use meridian_domain::v1::{
     DatabaseLogin, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
-    FirstRunConfiguration, FirstRunSealingKey,
+    FirstRunConfiguration, FirstRunSealingKey, LdapDirectoryAnswer,
 };
 use meridian_first_run::cluster::ApiServer;
 use meridian_first_run::{
-    BroughtServer, DatabaseProbe, FirstRun, Names, Provision, Provisioner, SealingKey,
+    BroughtServer, DatabaseProbe, DirectoryProbe, FirstRun, Names, Provision, Provisioner,
+    SealingKey,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var};
 use prost::Message;
@@ -74,6 +75,7 @@ fn run() -> Result<(), String> {
         names,
         cluster: Box::new(ApiServer::in_cluster().map_err(|failed| failed.to_string())?),
         probe: Box::new(Postgres),
+        directory_probe: Box::new(Ldap),
         provisioner: Box::new(Postgres),
         brought: brought_server(),
     });
@@ -210,6 +212,55 @@ fn list(name: &str) -> Vec<String> {
 /// answer's `sslmode` travels into the Secret and is what the components
 /// themselves present; making this connection match them is its own task.
 struct Postgres;
+
+/// The firm's LDAP, checked with the dashboard's own client: the bind this
+/// passes is the bind every sign-in will make.
+struct Ldap;
+
+impl DirectoryProbe for Ldap {
+    /// On a thread and a runtime of its own, because this is called from a
+    /// synchronous bus handler already inside one, and blocking that on an
+    /// async client is a panic. Bounded, because a firewall that drops rather
+    /// than refuses leaves a connection waiting on nothing, and the wizard's
+    /// page with it.
+    fn check(&self, answer: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String> {
+        let directory = meridian_dashboard::directory::Directory {
+            servers: answer.servers.clone(),
+            base_dn: answer.base_dn.clone(),
+            bind_dn: answer.bind_dn.clone(),
+            bind_password: String::from_utf8_lossy(bind_password).into_owned(),
+            ..Default::default()
+        };
+        let checked = std::thread::scope(|threads| {
+            threads
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|failed| failed.to_string())?;
+                    // The timeout inside the block: building one outside a
+                    // runtime panics, which is what the first cluster run of
+                    // this did on every check.
+                    runtime
+                        .block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                directory.check(),
+                            )
+                            .await
+                        })
+                        .map_err(|_| "no directory server answered within 15 seconds".to_string())?
+                        .map_err(|failed| failed.to_string())
+                })
+                .join()
+                .unwrap_or_else(|_| Err("the directory could not be checked".into()))
+        });
+        match checked {
+            Ok(()) => Vec::new(),
+            Err(finding) => vec![finding],
+        }
+    }
+}
 
 impl Provisioner for Postgres {
     /// On a thread of its own, for the reason the check below gives.

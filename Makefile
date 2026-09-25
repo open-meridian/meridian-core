@@ -242,6 +242,8 @@ E2E_CLUSTER_ROUTE ?= brought
 E2E_CLUSTER_SIGN_IN ?= local
 E2E_LDAP_CONTAINER ?= meridian-e2e-ldap
 E2E_LDAP_PORT ?= 15389
+E2E_IDP_CONTAINER ?= meridian-e2e-idp
+E2E_IDP_PORT ?= 18100
 E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
 e2e-cluster:
 	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
@@ -269,6 +271,7 @@ e2e-cluster:
 	@E2E_NAMESPACE=$(E2E_CLUSTER_NAMESPACE) E2E_IMAGE=$(RUNTIME_IMAGE) PLATFORM=$(PLATFORM) \
 	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \
 	 E2E_SIGN_IN=$(E2E_CLUSTER_SIGN_IN) E2E_LDAP_SERVER=ldap://host.docker.internal:$(E2E_LDAP_PORT) \
+	 E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
@@ -323,13 +326,41 @@ e2e-cluster-ldap:
 		-e LDAP_ADMIN_PASSWORD=ldap-admin-dev-only -e LDAP_SKIP_DEFAULT_TREE=yes \
 		-v "$(CURDIR)/e2e/dashboard/ldap":/e2e-ldap:ro \
 		-p $(E2E_LDAP_PORT):1389 bitnamilegacy/openldap:2.6 >/dev/null
-	@docker exec $(E2E_LDAP_CONTAINER) sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+	@# The image sets itself up on a temporary server, stops it, and starts
+	@# the real one; both doors answer during the first, and loading the
+	@# overlay into it failed with "Can't contact LDAP server" two runs in
+	@# five. So: the real server's own line in the log, then both doors -- the
+	@# port a pod will use and the socket the overlay is loaded through.
+	@for i in $$(seq 1 60); do docker logs $(E2E_LDAP_CONTAINER) 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
+		echo "e2e-cluster-ldap: the directory never started" >&2; docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null; exit 1
+	@docker exec $(E2E_LDAP_CONTAINER) sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b cn=config -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
 		|| { echo "e2e-cluster-ldap: the directory did not come up" >&2; docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null; exit 1; }
 	@docker exec -i $(E2E_LDAP_CONTAINER) ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >/dev/null
 	@docker exec -i $(E2E_LDAP_CONTAINER) ldapadd $(LDAP_DIR) <e2e/dashboard/ldap/02-tree.ldif >/dev/null
 	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_SIGN_IN=ldap; \
 	  held=$$?; \
 	  docker rm -f $(E2E_LDAP_CONTAINER) >/dev/null 2>&1 || true; \
+	  exit $$held
+
+# The same run, signing people in through the firm's own provider.
+#
+# The stand-in the compose suite uses, outside the cluster: real RS256, real
+# discovery, a real token exchange from the pod. Its issuer is
+# host.docker.internal, which is what the pod calls this machine; the runner
+# plays the browser and reaches the same name at 127.0.0.1. Both sides
+# holding one issuer string is what a real provider gives, and what the
+# dashboard checks every token against.
+e2e-cluster-oidc:
+	@docker rm -f $(E2E_IDP_CONTAINER) >/dev/null 2>&1 || true
+	@docker run -d --name $(E2E_IDP_CONTAINER) \
+		-e E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) -e E2E_IDP_PORT=8100 \
+		-v "$(CURDIR)/e2e/dashboard":/e2e:ro \
+		-p $(E2E_IDP_PORT):8100 python:3.12-alpine python -u /e2e/fake_idp.py >/dev/null
+	@for i in $$(seq 1 30); do curl -sf http://127.0.0.1:$(E2E_IDP_PORT)/.well-known/openid-configuration >/dev/null && exit 0; sleep 1; done; \
+		echo "e2e-cluster-oidc: the provider did not come up" >&2; docker rm -f $(E2E_IDP_CONTAINER) >/dev/null; exit 1
+	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_SIGN_IN=oidc; \
+	  held=$$?; \
+	  docker rm -f $(E2E_IDP_CONTAINER) >/dev/null 2>&1 || true; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
@@ -434,6 +465,7 @@ e2e-dashboard-ldap: network
 	@set -e; \
 	$(E2E_LDAP) build dashboard conductor >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) up -d postgres nats ldap fake-platform >>.e2e-dashboard-ldap.log 2>&1; \
+	for i in $$(seq 1 60); do $(E2E_LDAP) logs ldap 2>&1 | grep -q "slapd starting" && break; sleep 1; done; \
 	$(E2E_LDAP) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'; \
 	$(E2E_LDAP) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) exec -T ldap ldapadd $(LDAP_DIR) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard-ldap.log 2>&1; \
@@ -514,6 +546,9 @@ e2e-dashboard-accounts: network
 
 test-directory: network
 	@$(COMPOSE) --profile e2e up -d ldap >/dev/null
+	@# After its own setup server has stopped and the real one started: the
+	@# port answers during setup too, and the overlay loaded then is lost.
+	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; exit 1
 	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
 		|| { echo "test-directory FAILED: the directory did not come up" >&2; exit 1; }
 	@# memberOf is an overlay, not a stored attribute. Without it every person

@@ -19,7 +19,8 @@ use meridian_domain::v1::{
     administrator_answer::Named, bundled_zitadel_answer::Directory,
     first_run_check_request::Answer, login_backend_answer::Backend, AddressesAnswer,
     AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied, FirstRunCheckReply,
-    FirstRunCheckRequest, FirstRunConfiguration, LoginBackendAnswer, RuntimeDatabaseAnswer,
+    FirstRunCheckRequest, FirstRunConfiguration, LdapDirectoryAnswer, LoginBackendAnswer,
+    RuntimeDatabaseAnswer,
 };
 
 use crate::cluster::{Cluster, Workload};
@@ -91,6 +92,8 @@ pub struct FirstRun {
     /// Tests a Postgres login, returning what is wrong with it. Injected so
     /// this crate's tests need no database and the real one needs no mock.
     pub probe: Box<dyn DatabaseProbe>,
+    /// Tests the firm's LDAP, the same way and for the same reason.
+    pub directory_probe: Box<dyn DirectoryProbe>,
     /// Makes a database and its roles, for the routes that bring one.
     pub provisioner: Box<dyn Provisioner>,
     /// The database this chart can bring, when it renders one.
@@ -148,6 +151,13 @@ pub trait DatabaseProbe: Send + Sync {
     /// a serving role that may is the finding worth having: it is the one
     /// that turns a restart into a migration.
     fn check(&self, login: &DatabaseLogin, password: &[u8], may_create: bool) -> Vec<String>;
+}
+
+/// What an LDAP answer is checked against.
+pub trait DirectoryProbe: Send + Sync {
+    /// Bind as the answer's service account and read its base, reporting
+    /// what is wrong: empty is a pass. Signs nobody in.
+    fn check(&self, directory: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String>;
 }
 
 impl FirstRun {
@@ -224,11 +234,19 @@ impl FirstRun {
 
     fn check_backend(&self, backend: &LoginBackendAnswer) -> Vec<String> {
         match &backend.backend {
-            // Where the firm has no directory at all, this deployment holds
-            // the account (decisions/018) and there is nothing here to
-            // check: the wizard asked for a login and a password, the Job
-            // hashes the password, and the dashboard makes the account.
-            Some(Backend::Bundled(_)) => Vec::new(),
+            Some(Backend::Bundled(bundled)) => match &bundled.directory {
+                // The firm's LDAP, bound to from here as the dashboard will
+                // bind to it. Until 2026-09-25 this arm was the next one's:
+                // any LDAP answer passed, and a wrong address or password was
+                // found by the first person who could not sign in, after the
+                // configuration had been applied.
+                Some(Directory::Ldap(ldap)) => self.check_ldap(ldap),
+                // Where the firm has no directory at all, this deployment
+                // holds the account (decisions/018) and there is nothing to
+                // connect to: the Job hashes the password, and the dashboard
+                // makes the account.
+                _ => Vec::new(),
+            },
             Some(Backend::Oidc(oidc)) => {
                 let mut findings = Vec::new();
                 if oidc.issuer.trim().is_empty() {
@@ -240,6 +258,40 @@ impl FirstRun {
                 findings
             }
             None => vec!["no login backend chosen".into()],
+        }
+    }
+
+    fn check_ldap(&self, ldap: &LdapDirectoryAnswer) -> Vec<String> {
+        // What can be said without the network first, so an answer missing
+        // half of itself is told that rather than a connection error.
+        let mut findings = Vec::new();
+        if ldap.servers.iter().all(|server| server.trim().is_empty()) {
+            findings.push("no directory server".to_string());
+        }
+        if ldap.base_dn.trim().is_empty() {
+            findings.push("no base DN to search people under".to_string());
+        }
+        if ldap.bind_dn.trim().is_empty() {
+            findings.push("no bind DN for this deployment to search as".to_string());
+        }
+        // Empty means the default, `(uid={})`. One without the placeholder
+        // finds the same entry whatever anybody types at sign-in.
+        let filter = ldap.user_filter.trim();
+        if !filter.is_empty() && !filter.contains("{}") {
+            findings.push(format!(
+                "the user filter {filter} has no {{}} for the name typed at sign-in"
+            ));
+        }
+        if !findings.is_empty() {
+            return findings;
+        }
+
+        let Some(sealed) = &ldap.bind_password else {
+            return vec!["no bind password".into()];
+        };
+        match self.key.open(sealed, "ldap.bind_password") {
+            Err(refusal) => vec![refusal],
+            Ok(password) => self.directory_probe.check(ldap, &password),
         }
     }
 

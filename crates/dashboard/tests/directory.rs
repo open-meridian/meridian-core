@@ -137,3 +137,62 @@ async fn no_server_answering_is_not_a_refusal() {
         other => panic!("expected unreachable, got {other:?}"),
     }
 }
+
+// The wizard's check (W7.4): the firm's answer, tested before it is applied.
+
+#[tokio::test]
+async fn a_right_answer_passes_the_check() {
+    directory()
+        .check()
+        .await
+        .expect("the answer the e2e tree was made for");
+}
+
+#[tokio::test]
+async fn a_wrong_bind_password_fails_the_check_as_ours() {
+    let mut wrong = directory();
+    wrong.bind_password = "not-the-service-password".into();
+    match wrong.check().await {
+        Err(Failure::NotOurs(_)) => {}
+        other => panic!("expected the service bind to fail, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_empty_bind_password_fails_the_check_before_anything_is_dialled() {
+    // A server that does not exist, so a pass could only come from binding
+    // anonymously somewhere -- and the refusal has to come first.
+    let anonymous = Directory {
+        servers: vec!["ldap://127.0.0.1:1".into()],
+        bind_password: String::new(),
+        ..directory()
+    };
+    match anonymous.check().await {
+        Err(Failure::NotOurs(_)) => {}
+        other => panic!("expected an empty password to be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_base_that_is_not_there_fails_the_check() {
+    let elsewhere = Directory {
+        base_dn: "ou=nobody,dc=example,dc=org".into(),
+        ..directory()
+    };
+    match elsewhere.check().await {
+        Err(Failure::Confused(_)) => {}
+        other => panic!("expected a missing base to fail, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn no_server_answering_fails_the_check() {
+    let nowhere = Directory {
+        servers: vec!["ldap://127.0.0.1:1".into()],
+        ..directory()
+    };
+    match nowhere.check().await {
+        Err(Failure::Unreachable(_)) => {}
+        other => panic!("expected unreachable, got {other:?}"),
+    }
+}

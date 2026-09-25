@@ -40,6 +40,14 @@ SUBJECT = os.environ.get("E2E_IDP_SUBJECT", "8812")
 NAME = os.environ.get("E2E_IDP_NAME", "Ada Park")
 GROUPS = os.environ.get("E2E_IDP_GROUPS", "meridian-admins").split(",")
 
+# Somebody else, chosen with `login_hint` -- what a person typing their own
+# name on the provider's page would be. The cluster run needs a second person
+# outside the administrators' group: without one, a permission granted to
+# everybody who signs in passes every check it makes.
+PEOPLE = {
+    "ben": {"sub": "8813", "name": "Ben Okafor", "groups": ["meridian-staff"]},
+}
+
 STATE = {"stale": False, "rotated": False, "issued": [], "pending": {}}
 LOCK = threading.Lock()
 
@@ -150,6 +158,10 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["pending"][code] = {
                     "nonce": (fields.get("nonce") or [""])[0],
                     "stale": STATE["stale"],
+                    "person": PEOPLE.get(
+                        (fields.get("login_hint") or [""])[0],
+                        {"sub": SUBJECT, "name": NAME, "groups": GROUPS},
+                    ),
                 }
             back = (fields.get("redirect_uri") or [""])[0]
             state = (fields.get("state") or [""])[0]
@@ -203,15 +215,15 @@ class Handler(BaseHTTPRequestHandler):
             authenticated_at = now - 3600 if pending["stale"] else now
             claims = {
                 "iss": ISSUER,
-                "sub": SUBJECT,
+                "sub": pending["person"]["sub"],
                 "aud": CLIENT_ID,
                 "exp": now + 300,
                 "iat": now,
                 "auth_time": authenticated_at,
                 "nonce": pending["nonce"],
-                "name": NAME,
-                "email": f"{SUBJECT}@example.org",
-                "groups": GROUPS,
+                "name": pending["person"]["name"],
+                "email": f"{pending['person']['sub']}@example.org",
+                "groups": pending["person"]["groups"],
             }
             with LOCK:
                 STATE["issued"].append({"auth_time": authenticated_at, "iat": now})
