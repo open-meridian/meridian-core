@@ -608,8 +608,14 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
         addresses.contains("administrator-password-hash"),
         "the first administrator's password went nowhere: {addresses}"
     );
-    // And the login, lowercased, so `Ada` and `ada` cannot become two people.
+    // The account's name, for the dashboard to make it under, and the login
+    // the permission names, for the conductor: two keys, because they are two
+    // strings (`ada` and `local|ada`).
+    assert!(addresses.contains("local-account-name"), "{addresses}");
     assert!(addresses.contains("administrator-login"), "{addresses}");
+    // And the switch, without which the dashboard read none of it: on a
+    // cluster it came back up in first run, serving its wizard again.
+    assert!(addresses.contains("local-accounts"), "{addresses}");
 }
 
 #[tokio::test]
@@ -653,13 +659,23 @@ async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password()
                 ..Default::default()
             })),
         }),
-        addresses: None,
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+            ..Default::default()
+        }),
     };
 
     let applied = run.apply(&configuration).await;
 
     assert!(applied.applied, "{}", applied.refusal_reason);
     let wrote = done.lock().unwrap().clone();
+    let addresses = wrote
+        .iter()
+        .find(|line| line.starts_with("secret m-addresses "))
+        .expect("the addresses secret was written");
+    // One way in: a firm with a directory gets no accounts of this
+    // deployment's own, and a dashboard given both refuses to start.
+    assert!(!addresses.contains("local-accounts"), "{addresses}");
     let ldap = wrote
         .iter()
         .find(|line| line.starts_with("secret m-ldap-bind "))

@@ -1,10 +1,13 @@
 //! The dashboard, as its own process: the one address a firm's staff use.
 //!
 //! Signs people in through the firm's directory and serves what they may
-//! reach. It holds no deployment key and no database of its own: it reads the
-//! access records from the conductor's configuration store over the bus, as
-//! the instance its launch configuration names, with the `admin` role's
-//! grants. Sessions live in memory, so a restart signs everyone out.
+//! reach. It holds no deployment key, and a database only where the deployment
+//! holds its own accounts (decisions/018): it reads the access records from
+//! the conductor's configuration store over the bus, as the instance its
+//! launch configuration names, with the `admin` role's grants. Sessions live
+//! in memory, so a restart signs everyone out.
+//!
+//! `meridian-dashboard migrate` applies the accounts table, once per release.
 //!
 //! Refuses to serve until it has read the records once, and again whenever it
 //! has not read them for 10 minutes (decisions/015).
@@ -19,7 +22,7 @@ use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
-use meridian_runtime::{bus_from_env, now_ns, shutdown, var};
+use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -35,6 +38,23 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // The accounts table, once per release, as the migrating role: the
+    // migrate Job's container, beside every other store's. Made in every
+    // deployment whichever way it signs people in, because the Job cannot
+    // know which the wizard chose, and an empty table is cheaper than a race.
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        let url = required("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL")?;
+        InPostgres::connect(&url, 1)
+            .and_then(|store| store.migrate())
+            .map_err(|failed| format!("the accounts schema could not be applied: {failed}"))?;
+        tracing::info!("the accounts schema is applied");
+        // The table belongs to the role that just made it.
+        return match var("MERIDIAN_SERVING_DATABASE_URL") {
+            Some(serving) => meridian_runtime::grant_serving(&url, &serving),
+            None => Ok(()),
+        };
+    }
+
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "dashboard-1".into());
     let listen: SocketAddr = var("MERIDIAN_DASHBOARD_LISTEN")
         .unwrap_or_else(|| "0.0.0.0:8080".into())
@@ -102,11 +122,28 @@ fn run() -> Result<(), String> {
         user_filter: var("MERIDIAN_LDAP_USER_FILTER").unwrap_or_else(|| "(uid={})".into()),
         group_attribute: var("MERIDIAN_LDAP_GROUP_ATTRIBUTE").unwrap_or_else(|| "memberOf".into()),
     });
-    // The third branch: accounts this deployment holds itself. Its database is
-    // the one the deployment already has, in tables of its own, and it is
-    // configured only here -- a deployment signing people in through a
-    // provider or through LDAP sets none of this and opens no connection.
-    let accounts_url = var("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL");
+    // The third branch: accounts this deployment holds itself, in tables of
+    // its own in the database it already has. Chosen by first run saying so,
+    // not by a database being reachable: every deployment has one, and a
+    // chart hands its address to the dashboard whichever way it signs people
+    // in. Deciding by the address put every deployment on this branch, and
+    // deciding by its absence -- which is what this did -- left a cluster
+    // with an account in a Secret and no dashboard that would read it.
+    let accounts_url = match var("MERIDIAN_LOCAL_ACCOUNTS").as_deref() {
+        None => None,
+        Some("on") => Some(
+            required("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL").map_err(|_| {
+                "this deployment holds its own accounts, and no database was given for them: \
+             MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL is not set"
+                    .to_string()
+            })?,
+        ),
+        Some(other) => {
+            return Err(format!(
+                "MERIDIAN_LOCAL_ACCOUNTS is {other:?}, and the only value it takes is \"on\""
+            ))
+        }
+    };
 
     if [
         provider.is_some(),
@@ -138,14 +175,14 @@ fn run() -> Result<(), String> {
     // client and it makes a runtime of its own: constructed inside one it
     // panics in a destructor, which reads as a crash with no cause.
     //
-    // Connected and migrated here rather than at App construction, so a
+    // Connected and verified here rather than at App construction, so a
     // database that is not there stops the dashboard with a sentence rather
     // than failing at the first sign-in.
     let accounts = match &accounts_url {
         Some(url) => {
             let store = InPostgres::connect(url, 4)
                 .map_err(|failed| format!("the accounts database: {failed}"))?;
-            store.migrate()?;
+            store.verify()?;
             // The first administrator, as first run left it: a name
             // and a hash in a Secret. Made here at start rather than
             // written by the Job, because the Job may not reach
@@ -227,21 +264,24 @@ fn run() -> Result<(), String> {
                     });
                     Some(oidc)
                 }
-                None => {
-                    // Not an error, and the ordinary state of a deployment
-                    // nobody has set up yet: no directory means the wizard,
-                    // which is where a directory is configured (W7).
-                    tracing::info!(
-                        "no directory is configured: this deployment serves its first-run wizard"
-                    );
-                    None
-                }
+                None => None,
             };
 
             // First run is the absence of a directory rather than a flag, so
             // ending it is the configuration landing and nothing anybody can
             // switch back from inside the dashboard (requirement 18).
             let first_run = oidc.is_none() && directory.is_none() && accounts.is_none();
+            if first_run {
+                // Not an error, and the ordinary state of a deployment nobody
+                // has set up yet: no way in means the wizard, which is where
+                // one is configured (W7). Said only here, where it is true --
+                // it used to be said whenever there was no provider, which a
+                // deployment holding its own accounts read as being in first
+                // run while it was not.
+                tracing::info!(
+                    "no way to sign in is configured: this deployment serves its first-run wizard"
+                );
+            }
 
             let app = router(Arc::new(App {
                 first_run,

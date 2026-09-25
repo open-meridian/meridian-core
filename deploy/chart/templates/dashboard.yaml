@@ -86,7 +86,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ $addresses }}
-                  key: administrator-login
+                  key: local-account-name
                   optional: true
             - name: MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH
               valueFrom:
@@ -99,6 +99,22 @@ spec:
                 secretKeyRef:
                   name: {{ $addresses }}
                   key: administrator-display-name
+                  optional: true
+            # Whether this deployment holds its accounts at all, which first
+            # run says; and where, which is the database every deployment has,
+            # as the role the components serve as. The address alone decides
+            # nothing, because every branch has one.
+            - name: MERIDIAN_LOCAL_ACCOUNTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $addresses }}
+                  key: local-accounts
+                  optional: true
+            - name: MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.databaseSecret" $ }}
+                  key: {{ .Values.database.key }}
                   optional: true
             # The firm's LDAP, bound by this dashboard itself
             # (decisions/018). Written by first run into the Secret the chart

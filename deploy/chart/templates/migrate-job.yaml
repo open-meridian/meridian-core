@@ -112,6 +112,39 @@ spec:
               value: {{ .Values.logLevel | quote }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.dashboard.enabled }}
+        {{/*
+          The accounts a deployment holds itself (decisions/018). Made in
+          every deployment, because which way people sign in is decided by
+          the wizard after this Job is rendered; an empty table where nobody
+          uses it costs less than a migration that depends on a race.
+        */}}
+        - name: dashboard
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-dashboard", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ include "meridian-runtime.migrateKey" $ }}
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.databaseSecret" $ }}
+                  key: {{ .Values.database.key }}
+                  optional: true
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        {{- end }}
       containers:
         - name: instrument
           image: "{{ .Values.image.repository }}:{{ .Values.instrument.image.tag | default .Values.image.tag }}"

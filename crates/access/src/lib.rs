@@ -40,6 +40,17 @@ use meridian_pb::v1::{PersonAccess, PluginAccessReply, TagAccess, UserGroupAcces
 /// permission.
 pub const DEPLOYMENT_ADMIN: &str = "deployment-admin";
 
+/// The login of an account this deployment holds itself (decisions/018).
+///
+/// Here because this is where a login is matched: the dashboard signs a
+/// person in as this, and first run names the first administrator by it,
+/// and when those were two `format!`s in two crates the administrator the
+/// wizard named held a permission for `ada` and signed in as `local|ada`.
+/// Lowercased, as the account's name is, so `Ada` and `ada` are one person.
+pub fn local_login(name: &str) -> String {
+    format!("local|{}", name.trim().to_lowercase())
+}
+
 /// The accounts reachable at each level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Levels {

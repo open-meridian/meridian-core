@@ -216,12 +216,6 @@ dashboard:
     trustedAudiences: []
 
 
-firstRun:
-  # Its own key in the broker secret, never the runtime's: what the wizard
-  # seals is sealed to this Job, and a shared credential would let any
-  # component receive it.
-  brokerKey: first-run
-
 broker:
   # A broker this deployment already has, holding a credential per component
   # under the keys below. Empty means this chart brings one, makes the
@@ -240,6 +234,10 @@ broker:
 # values: the wizard fills them in the cluster, and the chart names them so
 # that the Job may write those and nothing else.
 firstRun:
+  # Its own key in the broker secret, never the runtime's: what the wizard
+  # seals is sealed to this Job, and a shared credential would let any
+  # component receive it.
+  brokerKey: first-run
   # Where a browser reaches this deployment, who administers it, and -- where
   # the deployment holds the account itself -- that administrator's login and
   # password hash. Never a password: there is no key for one.

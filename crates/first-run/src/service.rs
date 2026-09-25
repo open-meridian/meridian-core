@@ -653,14 +653,28 @@ impl FirstRun {
                 "local_account.initial_password",
             )?;
             let hashed = hash_password(&String::from_utf8_lossy(&password))?;
+            // What turns the dashboard's accounts on. Its own key rather than
+            // the hash's presence, because the hash only seeds the first
+            // account: an operator who removes it afterwards must not turn a
+            // configured deployment back into one serving its wizard.
+            values.insert("local-accounts".to_string(), b"on".to_vec());
             values.insert(
                 "administrator-password-hash".to_string(),
                 hashed.into_bytes(),
             );
+            // Two keys for two readers. The account's name is what the
+            // dashboard makes it under; the login is what the conductor's
+            // permission names, and it is the name as the dashboard will sign
+            // them in. One key serving both gave the administrator a
+            // permission for a login nobody signs in as.
             if !account.login_name.trim().is_empty() {
                 values.insert(
-                    "administrator-login".to_string(),
+                    "local-account-name".to_string(),
                     account.login_name.trim().to_lowercase().into_bytes(),
+                );
+                values.insert(
+                    "administrator-login".to_string(),
+                    meridian_access::local_login(&account.login_name).into_bytes(),
                 );
             }
             if !account.given_name.trim().is_empty() {
@@ -691,10 +705,14 @@ impl FirstRun {
                     );
                 }
                 Some(Named::LocalAccountLogin(login)) if !login.trim().is_empty() => {
-                    values.insert(
-                        "administrator-login".to_string(),
-                        login.trim().as_bytes().to_vec(),
-                    );
+                    // In the form the dashboard signs this person in as, where
+                    // the account is this deployment's; as given where it is
+                    // somebody else's, whose form this does not know.
+                    let login = match self.local_account(configuration) {
+                        Some(_) => meridian_access::local_login(login),
+                        None => login.trim().to_string(),
+                    };
+                    values.insert("administrator-login".to_string(), login.into_bytes());
                 }
                 _ => {}
             }

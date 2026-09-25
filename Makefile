@@ -455,6 +455,7 @@ E2E_ACCOUNT_HASH := $$argon2id$$v=19$$m=19456,t=2,p=1$$bRwFidvdsjyWKVRlZIcW/g$$i
 E2E_ACCOUNTS := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake-platform:8000 \
 	MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
 	MERIDIAN_DASHBOARD_URL=http://dashboard:8080 \
+	MERIDIAN_LOCAL_ACCOUNTS=on \
 	MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=postgres://meridian:meridian@core-postgres:5432/meridian \
 	MERIDIAN_LOCAL_ACCOUNT_NAME=ada \
 	MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME="Ada Park" \
@@ -474,6 +475,7 @@ e2e-dashboard-accounts: network
 	$(E2E_ACCOUNTS) build dashboard conductor >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) up -d postgres nats fake-platform >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T dashboard meridian-dashboard migrate >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) up -d conductor dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner main; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
@@ -499,6 +501,20 @@ test-directory: network
 	@echo "test-directory OK: people sign in against a real directory, and the ways that go wrong stay apart"
 
 chart-check:
+	# A key written twice is not an error to YAML or to Helm: the second wins
+	# and the first vanishes. Removing the bundled identity server left two
+	# `firstRun:` blocks, which dropped the Job's broker key and rendered a
+	# secretKeyRef with no key -- a chart that lints, renders, and that no
+	# cluster will accept. Found by the first install on a real one.
+	@dup="$$(grep -E '^[A-Za-z][A-Za-z0-9]*:' deploy/chart/values.yaml | cut -d: -f1 | sort | uniq -d)"; \
+	[ -z "$$dup" ] || { echo "chart-check FAILED: values.yaml says these twice, and only the second counts: $$dup" >&2; exit 1; }
+	@fresh="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render as a fresh install, with only the two values the runbook gives" >&2; exit 1; }; \
+	echo "$$fresh" | grep -q "first-run" \
+		|| { echo "chart-check FAILED: a fresh install rendered no first run, so the check below would prove nothing" >&2; exit 1; }; \
+	empty="$$(echo "$$fresh" | grep -nE '^[[:space:]]+key:[[:space:]]*("")?[[:space:]]*$$')"; \
+	[ -z "$$empty" ] || { echo "chart-check FAILED: a fresh install renders a Secret reference with no key, which the API server refuses:" >&2; \
+		echo "$$empty" >&2; exit 1; }
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
@@ -518,7 +534,7 @@ chart-check:
 	echo "$$unset" | awk '/name: check-meridian-runtime-database$$/{f=1} f&&/^data:/{print "has data"} /^---/{f=0}' | grep -q . \
 		&& { echo "chart-check FAILED: the database secret the chart makes is not empty" >&2; exit 1; }; true
 	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
-	for store in meridian-conductor meridian-street meridian-instrument; do \
+	for store in meridian-conductor meridian-street meridian-instrument meridian-dashboard; do \
 		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
 			|| { echo "chart-check FAILED: the chart renders no migration for $$store" >&2; \
 			     echo "  each store verifies its schema and refuses to serve without one" >&2; exit 1; }; \

@@ -1786,30 +1786,13 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "hpke",
+ "meridian-access",
  "meridian-domain",
  "meridian-pb",
  "rand 0.8.8",
  "reqwest",
  "serde_json",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "meridian-group-hook"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "hex",
- "hmac 0.12.1",
- "reqwest",
- "ring",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tower",
  "tracing",
 ]
 
@@ -1852,7 +1835,6 @@ dependencies = [
  "meridian-dashboard",
  "meridian-domain",
  "meridian-first-run",
- "meridian-group-hook",
  "meridian-instrument",
  "meridian-pb",
  "meridian-sidecar",

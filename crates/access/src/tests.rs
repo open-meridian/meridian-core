@@ -212,3 +212,21 @@ fn the_access_table_lists_groups_holding_access_and_people_who_have_signed_in() 
     assert_eq!(tam.last_signed_in_at_ns, 7);
     assert_eq!(tam.access[0].write_account_ids, ["ACC-GROWTH"]);
 }
+
+#[test]
+fn a_local_account_is_found_by_the_login_first_run_names_it_by() {
+    // The two ends of one string: first run names the administrator with
+    // `local_login`, and the dashboard signs the account in with it. They
+    // were two `format!`s, and a real cluster found them disagreeing.
+    assert_eq!(local_login(" Ada "), "local|ada");
+    let mut records = records();
+    records.user_groups.push(UserGroup {
+        user_group_id: "UG-admins".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec![],
+        logins: vec![local_login("Ada")],
+    });
+    assert!(user_groups_of(&records, &local_login("ada"), &[])
+        .iter()
+        .any(|group| group.user_group_id == "UG-admins"));
+}

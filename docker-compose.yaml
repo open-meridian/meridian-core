@@ -165,6 +165,7 @@ services:
       # Or accounts this deployment holds itself, the branch for a firm with
       # no directory at all. Unset here as the two above are; the dashboard
       # refuses to start with more than one configured.
+      MERIDIAN_LOCAL_ACCOUNTS: ${MERIDIAN_LOCAL_ACCOUNTS:-}
       MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL: ${MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL:-}
       MERIDIAN_LOCAL_ACCOUNT_NAME: ${MERIDIAN_LOCAL_ACCOUNT_NAME:-}
       MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH: ${MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH:-}

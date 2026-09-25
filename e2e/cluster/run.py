@@ -160,6 +160,15 @@ def post(path, fields, cookies):
     return status, body
 
 
+def get(path, cookies):
+    request = urllib.request.Request(f"{WIZARD}{path}")
+    request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
+    try:
+        return urllib.request.urlopen(request).read().decode()
+    except urllib.error.HTTPError as refused:
+        return refused.read().decode()
+
+
 def wait_for(what, ready, seconds=420):
     for _ in range(seconds):
         try:
@@ -287,6 +296,8 @@ def main():
         s.check("administers this deployment" in page, "applied, and it names who administers it")
     finally:
         forward.terminate()
+        # Gone before H binds the same port again.
+        forward.wait()
 
     print("F: the database", flush=True)
     if ROUTE == "brought":
@@ -325,6 +336,44 @@ def main():
     groups = psql("select logins, directory_groups from config_user_group")
     s.note(f"user groups: {groups}")
     s.check("ada" in groups, "the account the wizard created holds deployment admin")
+
+    print("H: and she signs in, which is what the permission was for", flush=True)
+    # G is a row. A row was what the compose run asserted for weeks while the
+    # account it named did not exist, so nobody could have used it. This is
+    # the dashboard in its target configuration, on this cluster, checking a
+    # password against the hash the Job wrote and the store the chart gave it.
+    # A new forward, because the one above went to a container apply
+    # restarted -- and started again whenever it dies, since the dashboard
+    # restarts once more when the conductor it reads from does, and a forward
+    # to a restarted container exits rather than reconnecting. Waiting on a
+    # dead one was 300 seconds of asking a closed port.
+    forward = None
+
+    def signing_in():
+        nonlocal forward
+        if forward is None or forward.poll() is not None:
+            forward = subprocess.Popen(
+                ["kubectl", "--namespace", NAMESPACE, "port-forward",
+                 f"svc/{RELEASE}-meridian-runtime-dashboard", f"{PORT}:80"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(2)
+        return 'name="password"' in urllib.request.urlopen(f"{WIZARD}/sign-in").read().decode()
+
+    try:
+        wait_for("the dashboard, out of first run", signing_in, seconds=300)
+        status, _ = post("/sign-in", {"name": "ada", "password": "not-her-password"}, {})
+        s.check(status == 401, f"a wrong password is refused: {status}")
+        session = {}
+        status, _ = post("/sign-in", {"name": "ada", "password": "Password1!"}, session)
+        s.check(status == 303 and bool(session), f"hers is not, and she holds a session: {status}")
+        home = get("/", session)
+        s.check("You are a deployment admin" in home, "and home says she administers it")
+    finally:
+        if forward is not None:
+            forward.terminate()
+            forward.wait()
 
     print(flush=True)
     if s.failures:

@@ -148,7 +148,7 @@ pub fn authenticate(accounts: &dyn Accounts, name: &str, password: &str, now_ns:
         // `local` and the name, because an account here has no issuer of its
         // own. Half of every permission ever granted, so it is settled once
         // and never changed ([[design/naming-a-person-before-they-sign-in]]).
-        subject: format!("local|{}", account.name),
+        subject: meridian_access::local_login(&account.name),
         display_name: account.display_name.clone(),
         groups: account.groups.clone(),
     }
@@ -236,11 +236,9 @@ impl InPostgres {
         Ok(Self { pool })
     }
 
-    /// Apply the schema, under an advisory lock.
-    ///
-    /// Safe to call at every start: the statement creates if absent, and the
-    /// lock means two starts cannot race. The dashboard runs at one replica,
-    /// so this is belt and braces rather than the only thing holding.
+    /// Apply the schema, under an advisory lock. `meridian-dashboard migrate`,
+    /// as the migrating role, once per release -- never at start, where the
+    /// role the dashboard serves as may not create a table.
     pub fn migrate(&self) -> Result<(), String> {
         let mut conn = self.conn()?;
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
@@ -250,6 +248,27 @@ impl InPostgres {
             .map_err(|failed| format!("the accounts table could not be made: {failed}"));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome
+    }
+
+    /// Verified at start, never applied: the other stores' rule, for the same
+    /// reason. One table and one migration, so "there" is the whole of the
+    /// version; a second migration is where this grows a version table.
+    pub fn verify(&self) -> Result<(), String> {
+        let there: bool = self
+            .conn()?
+            .query_one(
+                "SELECT to_regclass('dashboard_local_account') IS NOT NULL",
+                &[],
+            )
+            .map_err(|failed| format!("{failed}"))?
+            .get(0);
+        if there {
+            Ok(())
+        } else {
+            Err("the accounts database has no accounts table. \
+                 Run `meridian-dashboard migrate` before starting."
+                .into())
+        }
     }
 
     fn conn(
