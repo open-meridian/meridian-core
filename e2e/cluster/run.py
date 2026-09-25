@@ -427,6 +427,20 @@ def main():
                 passes not in page and "could not sign in to the directory" in page,
                 "a wrong bind password is refused before anything is written",
             )
+        if SIGN_IN == "oidc":
+            # Read from the pod, as the dashboard will: the discovery
+            # document names its issuer, and one character off is another.
+            wrong = {**answers, "oidc_issuer": IDP_ISSUER + "/"}
+            status, page = post("/first-run/check", wrong, cookies)
+            import re
+
+            # The findings, not the page: the form itself has an issuer field.
+            findings = re.findall(r"<li>([^<]*)</li>", page)
+            s.note(f"findings: {findings}")
+            s.check(
+                passes not in page and any("issuer" in f for f in findings),
+                "an issuer the provider does not call itself is refused before anything is written",
+            )
         status, page = post("/first-run/check", answers, cookies)
         s.check(passes in page, "the answers pass")
         status, page = post("/first-run/apply", answers, cookies)

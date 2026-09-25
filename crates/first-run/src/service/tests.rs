@@ -136,6 +136,20 @@ impl DirectoryProbe for Directories {
     }
 }
 
+/// A provider that answers with these findings, and remembers which issuers
+/// it was asked about.
+#[derive(Default, Clone)]
+struct Providers {
+    findings: Vec<String>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+impl ProviderProbe for Providers {
+    fn check(&self, provider: &OidcProviderAnswer) -> Vec<String> {
+        self.asked.lock().unwrap().push(provider.issuer.clone());
+        self.findings.clone()
+    }
+}
+
 struct Answers(Vec<String>);
 impl DatabaseProbe for Answers {
     fn check(&self, _: &DatabaseLogin, _: &[u8], may_create: bool) -> Vec<String> {
@@ -167,6 +181,7 @@ fn first_run(cluster: Box<dyn Cluster>, probe: Vec<String>) -> FirstRun {
         brought: None,
         probe: Box::new(Answers(probe)),
         directory_probe: Box::new(Directories::default()),
+        provider_probe: Box::new(Providers::default()),
     }
 }
 
@@ -440,6 +455,7 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         brought: None,
         probe: Box::new(Answers(vec![])),
         directory_probe: Box::new(Directories::default()),
+        provider_probe: Box::new(Providers::default()),
     };
     let configuration = FirstRunConfiguration {
         administrator: Some(administrator("meridian-admins")),
@@ -831,4 +847,56 @@ fn a_local_account_answer_dials_nothing() {
 
     assert!(reply.passed, "{:?}", reply.findings);
     assert!(handed.lock().unwrap().is_empty());
+}
+
+fn provider_answer(issuer: &str) -> LoginBackendAnswer {
+    LoginBackendAnswer {
+        backend: Some(Backend::Oidc(OidcProviderAnswer {
+            issuer: issuer.into(),
+            client_id: "meridian".into(),
+            ..Default::default()
+        })),
+    }
+}
+
+#[test]
+fn a_providers_issuer_is_asked_of_the_provider_exactly_as_given() {
+    // Exactly: the trailing slash is the provider's to say, and a check that
+    // tidied it would pass an issuer every token then contradicts.
+    let providers = Providers::default();
+    let asked = providers.asked.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.provider_probe = Box::new(providers);
+
+    let reply = check_backend_with(&run, provider_answer("https://tenant.auth.example/"));
+
+    assert!(reply.passed, "{:?}", reply.findings);
+    assert_eq!(*asked.lock().unwrap(), ["https://tenant.auth.example/"]);
+}
+
+#[test]
+fn what_the_provider_says_is_wrong_is_what_the_wizard_shows() {
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.provider_probe = Box::new(Providers {
+        findings: vec!["unexpected issuer URI".into()],
+        ..Default::default()
+    });
+
+    let reply = check_backend_with(&run, provider_answer("https://directory.firm.example"));
+
+    assert!(!reply.passed);
+    assert_eq!(reply.findings, ["unexpected issuer URI"]);
+}
+
+#[test]
+fn a_provider_answer_missing_its_issuer_is_told_so_without_asking_anybody() {
+    let providers = Providers::default();
+    let asked = providers.asked.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.provider_probe = Box::new(providers);
+
+    let reply = check_backend_with(&run, provider_answer(" "));
+
+    assert_eq!(reply.findings, ["no issuer"]);
+    assert!(asked.lock().unwrap().is_empty(), "nothing was fetched");
 }

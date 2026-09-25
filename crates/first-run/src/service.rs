@@ -20,7 +20,7 @@ use meridian_domain::v1::{
     first_run_check_request::Answer, login_backend_answer::Backend, AddressesAnswer,
     AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied, FirstRunCheckReply,
     FirstRunCheckRequest, FirstRunConfiguration, LdapDirectoryAnswer, LoginBackendAnswer,
-    RuntimeDatabaseAnswer,
+    OidcProviderAnswer, RuntimeDatabaseAnswer,
 };
 
 use crate::cluster::{Cluster, Workload};
@@ -94,6 +94,8 @@ pub struct FirstRun {
     pub probe: Box<dyn DatabaseProbe>,
     /// Tests the firm's LDAP, the same way and for the same reason.
     pub directory_probe: Box<dyn DirectoryProbe>,
+    /// And the firm's own provider.
+    pub provider_probe: Box<dyn ProviderProbe>,
     /// Makes a database and its roles, for the routes that bring one.
     pub provisioner: Box<dyn Provisioner>,
     /// The database this chart can bring, when it renders one.
@@ -158,6 +160,14 @@ pub trait DirectoryProbe: Send + Sync {
     /// Bind as the answer's service account and read its base, reporting
     /// what is wrong: empty is a pass. Signs nobody in.
     fn check(&self, directory: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String>;
+}
+
+/// What an OpenID Connect answer is checked against.
+pub trait ProviderProbe: Send + Sync {
+    /// Read the issuer's discovery document and keys, reporting what is
+    /// wrong: empty is a pass. What it cannot test is the client: a secret
+    /// is proven only by a sign-in, which needs a person.
+    fn check(&self, provider: &OidcProviderAnswer) -> Vec<String>;
 }
 
 impl FirstRun {
@@ -254,6 +264,13 @@ impl FirstRun {
                 }
                 if oidc.client_id.trim().is_empty() {
                     findings.push("no client id".into());
+                }
+                // Asked of the provider only once the answer is whole. Until
+                // 2026-09-25 this was the whole check, so an issuer nobody
+                // could reach passed, and the dashboard it configured failed
+                // at its first start.
+                if findings.is_empty() {
+                    findings.extend(self.provider_probe.check(oidc));
                 }
                 findings
             }
@@ -803,11 +820,13 @@ impl FirstRun {
             .as_ref()
             .and_then(|backend| backend.backend.as_ref())
         {
+            // Exactly as given, which the check has just proven is exactly
+            // what the provider calls itself. A trailing slash was trimmed
+            // here until 2026-09-25, which is right for some providers and
+            // leaves nobody able to sign in through the ones whose issuer
+            // ends in one.
             if !oidc.issuer.trim().is_empty() {
-                values.insert(
-                    "issuer".to_string(),
-                    oidc.issuer.trim().trim_end_matches('/').as_bytes().to_vec(),
-                );
+                values.insert("issuer".to_string(), oidc.issuer.trim().as_bytes().to_vec());
             }
         }
 

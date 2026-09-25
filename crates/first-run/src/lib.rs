@@ -14,5 +14,6 @@ pub mod service;
 
 pub use sealing::{seal, SealingKey};
 pub use service::{
-    BroughtServer, DatabaseProbe, DirectoryProbe, FirstRun, Names, NewRole, Provision, Provisioner,
+    BroughtServer, DatabaseProbe, DirectoryProbe, FirstRun, Names, NewRole, ProviderProbe,
+    Provision, Provisioner,
 };

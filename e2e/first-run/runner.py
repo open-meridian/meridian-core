@@ -70,10 +70,11 @@ ANSWERS = {
 if ROUTE == "brought":
     ANSWERS.update(BROUGHT_NAMES)
 
-# The firm's own provider. Nothing is asked of a real one: the wizard checks
-# that an issuer and a client id are there and writes them, so this needs no
-# directory standing by to be a true test of what gets written where.
-FIRMS_ISSUER = "https://directory.firm.example"
+# The firm's own provider, stood in for by e2e/dashboard/fake_idp.py. It has
+# to be there: the wizard reads its discovery document and keys before it
+# passes the answer (W7.4). It checked only that an issuer was typed until
+# 2026-09-25, so this pointed at an address nothing answered.
+FIRMS_ISSUER = "http://fake-idp:8100"
 # Deliberately not `groups`, which is the dashboard's own default: a claim that
 # matched the default would pass whether or not the answer reached anything,
 # which is how the wizard collected this one into nowhere for as long as it did.
@@ -83,7 +84,7 @@ ADMIN_GROUP = "meridian-admins"
 if BACKEND == "oidc":
     ANSWERS.update({
         "backend": "oidc",
-        "oidc_issuer": FIRMS_ISSUER + "/",
+        "oidc_issuer": FIRMS_ISSUER,
         "oidc_client_id": "meridian-dashboard",
         "oidc_client_secret": "shh-dev-only",
         "oidc_groups_claim": FIRMS_GROUPS_CLAIM,
@@ -212,12 +213,24 @@ def main():
         s.check(any("may create tables" in f for f in findings),
                 "a serving role that may create tables is the finding worth having")
         s.check(json_at(f"{KUBE}/e2e/state")["secrets"] == {}, "and nothing was written")
-    else:
+    elif BACKEND != "oidc":
         # There is nothing to connect to yet: the database this chart brings
         # does not exist until applying starts it, and the roles do not exist
         # until applying makes them. A check that invented a finding here
         # would be a check about nothing.
         s.note("the brought route has no login to get wrong before it is applied")
+
+    if BACKEND == "oidc":
+        # One character from right, and the provider says so. The slash was
+        # trimmed on the way to the Secret until 2026-09-25, which guessed
+        # right for this provider and wrong for any whose issuer ends in one.
+        wrong = dict(ANSWERS, oidc_issuer=FIRMS_ISSUER + "/")
+        status, page = browser.post(f"{DASHBOARD}/first-run/check", wrong)
+        findings = re.findall(r"<li>([^<]*)</li>", page)
+        s.note(f"findings: {findings}")
+        s.check(any("issuer" in f for f in findings) and "passes" not in page,
+                "an issuer the provider does not call itself is refused")
+        s.check(json_at(f"{KUBE}/e2e/state")["secrets"] == {}, "and nothing was written")
 
     print("E: the answers, tested", flush=True)
     status, page = browser.post(f"{DASHBOARD}/first-run/check", ANSWERS)
@@ -303,8 +316,8 @@ def main():
         # into the dashboard's OIDC Secret until 2026-09-23 -- which the chart
         # reads the client id out of and not the issuer -- so a deployment that
         # chose the firm's directory came up with no issuer and nobody could
-        # sign in. Trailing slash trimmed, because a token says one thing and
-        # `https://x/` and `https://x` are not it.
+        # sign in. Exactly as given, which the check proved is what the
+        # provider says.
         s.check(addresses.get("issuer") == FIRMS_ISSUER,
                 f"the firm's issuer reached the Secret the dashboard reads: {addresses.get('issuer')!r}")
 

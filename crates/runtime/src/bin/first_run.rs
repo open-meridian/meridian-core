@@ -23,12 +23,12 @@ use std::sync::Arc;
 
 use meridian_domain::v1::{
     DatabaseLogin, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
-    FirstRunConfiguration, FirstRunSealingKey, LdapDirectoryAnswer,
+    FirstRunConfiguration, FirstRunSealingKey, LdapDirectoryAnswer, OidcProviderAnswer,
 };
 use meridian_first_run::cluster::ApiServer;
 use meridian_first_run::{
-    BroughtServer, DatabaseProbe, DirectoryProbe, FirstRun, Names, Provision, Provisioner,
-    SealingKey,
+    BroughtServer, DatabaseProbe, DirectoryProbe, FirstRun, Names, ProviderProbe, Provision,
+    Provisioner, SealingKey,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var};
 use prost::Message;
@@ -76,6 +76,7 @@ fn run() -> Result<(), String> {
         cluster: Box::new(ApiServer::in_cluster().map_err(|failed| failed.to_string())?),
         probe: Box::new(Postgres),
         directory_probe: Box::new(Ldap),
+        provider_probe: Box::new(Provider),
         provisioner: Box::new(Postgres),
         brought: brought_server(),
     });
@@ -218,11 +219,6 @@ struct Postgres;
 struct Ldap;
 
 impl DirectoryProbe for Ldap {
-    /// On a thread and a runtime of its own, because this is called from a
-    /// synchronous bus handler already inside one, and blocking that on an
-    /// async client is a panic. Bounded, because a firewall that drops rather
-    /// than refuses leaves a connection waiting on nothing, and the wizard's
-    /// page with it.
     fn check(&self, answer: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String> {
         let directory = meridian_dashboard::directory::Directory {
             servers: answer.servers.clone(),
@@ -231,34 +227,57 @@ impl DirectoryProbe for Ldap {
             bind_password: String::from_utf8_lossy(bind_password).into_owned(),
             ..Default::default()
         };
-        let checked = std::thread::scope(|threads| {
-            threads
-                .spawn(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|failed| failed.to_string())?;
-                    // The timeout inside the block: building one outside a
-                    // runtime panics, which is what the first cluster run of
-                    // this did on every check.
-                    runtime
-                        .block_on(async {
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(15),
-                                directory.check(),
-                            )
-                            .await
-                        })
-                        .map_err(|_| "no directory server answered within 15 seconds".to_string())?
-                        .map_err(|failed| failed.to_string())
-                })
-                .join()
-                .unwrap_or_else(|_| Err("the directory could not be checked".into()))
-        });
-        match checked {
-            Ok(()) => Vec::new(),
-            Err(finding) => vec![finding],
-        }
+        apart("directory server", async {
+            directory.check().await.map_err(|failed| failed.to_string())
+        })
+    }
+}
+
+/// The firm's own provider, asked with the dashboard's own discovery: the
+/// document and keys this reads are the ones the dashboard reads at start.
+struct Provider;
+
+impl ProviderProbe for Provider {
+    fn check(&self, answer: &OidcProviderAnswer) -> Vec<String> {
+        let issuer = answer.issuer.trim().to_string();
+        apart("provider", async move {
+            meridian_dashboard::oidc::check(&issuer).await
+        })
+    }
+}
+
+/// A check against somebody else's server, run where it cannot hurt.
+///
+/// On a thread and a runtime of its own, because the probes are called from a
+/// synchronous bus handler already inside one, and blocking that on an async
+/// client is a panic. Bounded, because a firewall that drops rather than
+/// refuses leaves a connection waiting on nothing, and the wizard's page with
+/// it. The timeout is built inside the runtime: built outside, it panicked
+/// on every call, which only a Job on a real cluster showed.
+fn apart<F>(what: &str, check: F) -> Vec<String>
+where
+    F: std::future::Future<Output = Result<(), String>> + Send,
+{
+    const SECONDS: u64 = 15;
+    let checked = std::thread::scope(|threads| {
+        threads
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|failed| failed.to_string())?;
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(SECONDS), check).await
+                    })
+                    .map_err(|_| format!("no {what} answered within {SECONDS} seconds"))?
+            })
+            .join()
+            .unwrap_or_else(|_| Err(format!("the {what} could not be checked")))
+    });
+    match checked {
+        Ok(()) => Vec::new(),
+        Err(finding) => vec![finding],
     }
 }
 

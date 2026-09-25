@@ -182,7 +182,7 @@ e2e-first-run: network
 	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
 	@set -e; \
 	$(E2E_FIRST_RUN) build dashboard-first-run conductor-first-run first-run >>.e2e-first-run.log 2>&1; \
-	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform >>.e2e-first-run.log 2>&1; \
+	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform fake-idp >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) run --rm -T fr-database >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) up -d conductor-first-run dashboard-first-run first-run >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) run --rm -T fr-runner > .e2e-first-run.run.log 2>&1 \

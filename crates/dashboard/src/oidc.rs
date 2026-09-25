@@ -133,11 +133,7 @@ async fn send(
 impl Oidc {
     /// Read the provider's discovery document and keys.
     pub async fn discover(config: &OidcConfig) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|failed| failed.to_string())?;
+        let http = client()?;
         let provider = fetch(config, &http).await?;
         Ok(Self {
             config: config.clone(),
@@ -260,6 +256,34 @@ impl Oidc {
 }
 
 /// The provider as its discovery document and keys describe it now.
+fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|failed| failed.to_string())
+}
+
+/// Whether this dashboard could sign people in through this issuer: its
+/// discovery document is there, names exactly this issuer, and its keys can
+/// be read -- the half of `discover` that needs nothing but the issuer.
+///
+/// What first run tests a firm's answer with (W7.4). Exactly, because the
+/// dashboard checks every token's `iss` against this string, and a provider
+/// whose issuer ends in `/` and one whose does not are different issuers.
+/// First run used to trim the slash, which guessed right for some providers
+/// and left the others with a deployment nobody could sign in to; now the
+/// provider is asked, and a wrong guess is a finding on the wizard's page.
+pub async fn check(issuer: &str) -> Result<(), String> {
+    let http = client()?;
+    let issuer =
+        IssuerUrl::new(issuer.to_string()).map_err(|failed| format!("the issuer: {failed}"))?;
+    CoreProviderMetadata::discover_async(issuer, &move |request| send(http.clone(), request))
+        .await
+        .map(|_| ())
+        .map_err(|failed| format!("the directory's discovery document could not be read: {failed}"))
+}
+
 async fn fetch(config: &OidcConfig, http: &reqwest::Client) -> Result<Provider, String> {
     let issuer =
         IssuerUrl::new(config.issuer.clone()).map_err(|failed| format!("the issuer: {failed}"))?;
