@@ -267,6 +267,20 @@ firstRun:
 #       resources: {}              # defaults to the runtime's own
 sidecars: []
 
+# The deployment's own plugin registry, which `meridian plugin upload` sends a
+# plugin to and the cluster pulls launched plugins from
+# (spec/the-local-plugin-registry).
+registry:
+  enabled: true
+  image: registry:2.8.3
+  storage: 10Gi
+  # Empty is the cluster's default storage class.
+  storageClassName: ""
+  # The port each node's pull-through proxy listens on, on 127.0.0.1 only, and
+  # what a launched plugin's image is named with: localhost:<hostPort>/...
+  # Unique on a cluster: two deployments on one cluster need two ports.
+  hostPort: 5000
+
 
 resources:
   requests:

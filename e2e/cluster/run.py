@@ -135,6 +135,9 @@ PORT = int(os.environ.get("E2E_PORT", "18480"))
 DRIVER = os.environ.get("E2E_DRIVER", "runner")
 CLI_IMAGE = os.environ.get("E2E_CLI_IMAGE", "meridian-cli-e2e:local")
 
+# The registry's node proxy port, as the chart's registry.hostPort.
+REGISTRY_PORT = int(os.environ.get("E2E_REGISTRY_PORT", "5000"))
+
 # Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
 BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
 WIZARD = f"http://127.0.0.1:{PORT}"
@@ -405,6 +408,16 @@ def by_cli(s, deployment_id, enrolment_code):
     s.check(bool(held), "the platform holds the key the conductor enrolled")
 
 
+def apply(manifest):
+    """A manifest applied in this run's namespace."""
+    done = subprocess.run(
+        ["kubectl", "--namespace", NAMESPACE, "apply", "-f", "-"],
+        input=manifest, capture_output=True, text=True,
+    )
+    if done.returncode != 0:
+        raise SystemExit(f"kubectl apply failed\n{done.stdout}\n{done.stderr}")
+
+
 def wait_for(what, ready, seconds=420):
     for _ in range(seconds):
         try:
@@ -670,6 +683,70 @@ def main():
         for line in kubectl("logs", "e2e-browser").splitlines():
             print(f"    {line}" if line else "", flush=True)
         s.check(phase == "Succeeded", f"the browser's checks held: {phase or 'it never ran'}")
+
+    print("R: the deployment's own registry", flush=True)
+    # spec/the-local-plugin-registry: an image put in the registry from inside
+    # the cluster is pulled by the node from its own localhost, through the
+    # node's proxy, with nothing configured on the node. The Job stands in for
+    # the dashboard's upload, which is what will put plugins there; it carries
+    # the release's label because the registry admits this release's pods and
+    # nothing else.
+    registry = f"{RELEASE}-meridian-runtime-registry"
+    wait_for(
+        "the registry",
+        lambda: "1/1" in kubectl("get", "statefulset", registry, "--no-headers"),
+        seconds=300,
+    )
+    apply(f"""
+apiVersion: batch/v1
+kind: Job
+metadata: {{name: e2e-upload}}
+spec:
+  backoffLimit: 4
+  template:
+    metadata: {{labels: {{app.kubernetes.io/instance: {RELEASE}}}}}
+    spec:
+      restartPolicy: Never
+      # Until the registry answers. A pod's first seconds are refused by the
+      # registry's NetworkPolicy while the cluster's policy engine learns the
+      # new address, so a pod that copies the moment it starts is refused
+      # every time -- and each retry of the Job is a new pod with a new one.
+      initContainers:
+        - name: until-reachable
+          image: curlimages/curl:8.10.1
+          command: [sh, -c, "for i in $(seq 1 60); do curl -sf -o /dev/null http://{registry}:5000/v2/ && exit 0; sleep 1; done; exit 1"]
+      containers:
+        - name: copy
+          image: gcr.io/go-containerregistry/crane:v0.22.1
+          args: [copy, --insecure, "busybox:1.36", "{registry}:5000/e2e/busybox:1"]
+""")
+    wait_for(
+        "the upload",
+        lambda: kubectl("get", "job", "e2e-upload", "-o", "jsonpath={.status.succeeded}") == "1",
+        seconds=300,
+    )
+    apply(f"""
+apiVersion: v1
+kind: Pod
+metadata: {{name: e2e-pulled}}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: pulled
+      image: localhost:{REGISTRY_PORT}/e2e/busybox:1
+      imagePullPolicy: Always
+      command: [echo, pulled]
+""")
+    wait_for(
+        "the pull",
+        lambda: kubectl("get", "pod", "e2e-pulled", "-o", "jsonpath={.status.phase}")
+        in ("Succeeded", "Failed"),
+        seconds=180,
+    )
+    s.check(
+        kubectl("get", "pod", "e2e-pulled", "-o", "jsonpath={.status.phase}") == "Succeeded",
+        f"the node pulled localhost:{REGISTRY_PORT}/e2e/busybox:1 from the registry",
+    )
 
     print(flush=True)
     if s.failures:

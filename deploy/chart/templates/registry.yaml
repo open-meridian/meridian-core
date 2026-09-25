@@ -1,0 +1,179 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.registry.enabled }}
+{{/*
+  The deployment's own plugin registry (spec/the-local-plugin-registry).
+
+  Two parts, because a node's container runtime pulls an image, not a pod: it
+  resolves no Service name, and it refuses plain HTTP from anywhere but its own
+  localhost unless the node is configured, which nobody installing this should
+  have to do.
+
+  - The registry: one, with the volume uploads land on, reached only by this
+    release's own pods. Nothing outside the cluster reaches it except through
+    the dashboard's authenticated upload.
+  - A pull-through proxy on every node, listening on that node's 127.0.0.1 and
+    nowhere else, which the runtime pulls `localhost:<hostPort>/...` from and
+    which fetches from the registry. It refuses pushes, so the only way in is
+    the upload.
+
+  Proven 2026-09-25: a node pulls from its own localhost with nothing
+  configured, on the Docker runtime and on containerd.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-registry" $full }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: registry
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+# One, with its volume, as the database this chart brings is: the claim comes
+# from the StatefulSet's template, and outlives an uninstall, so a plugin
+# uploaded before reinstalling is still there after.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: registry
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: registry
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: registry
+          image: {{ .Values.registry.image | quote }}
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: ":5000"
+            # Nothing uploaded is deleted through the registry's own API;
+            # removing a plugin is the conductor's, when it is designed.
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "false"
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet: {path: /v2/, port: 5000}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: images
+              mountPath: /var/lib/registry
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: images
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.registry.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.registry.storage | quote }}
+---
+# Reached by this release's own pods and nothing else: the node proxies that
+# pull from it, and the dashboard that uploads to it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: registry
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: 5000
+---
+# On every node, on 127.0.0.1 alone: a node's runtime pulls from its own
+# localhost over HTTP with nothing configured, and nothing else on the node's
+# network reaches it. A pull-through cache of the registry, so it holds no
+# upload of its own and refuses pushes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}-node
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: registry-node
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: registry-node
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: proxy
+          image: {{ .Values.registry.image | quote }}
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: ":5000"
+            - name: REGISTRY_PROXY_REMOTEURL
+              value: "http://{{ $name }}:5000"
+          ports:
+            - containerPort: 5000
+              hostPort: {{ .Values.registry.hostPort }}
+              hostIP: 127.0.0.1
+          readinessProbe:
+            httpGet: {path: /v2/, port: 5000}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/registry
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: cache
+          emptyDir: {}
+{{- end }}

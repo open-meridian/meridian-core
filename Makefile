@@ -691,6 +691,16 @@ chart-check:
 			case "$$first" in [A-Za-z]) ;; *) echo "chart-check FAILED: a broker password starts with '$$first', which the broker reads as the start of a number" >&2; exit 1;; esac; \
 		done || exit 1; \
 	done
+	@# One host port in the whole chart, the registry's node proxy, and on
+	@# 127.0.0.1 alone: on a node's other interfaces anybody who can reach the
+	@# node could pull a firm's plugins, and anything else holding a host port
+	@# is a pod reachable from outside the cluster by accident.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	ports="$$(echo "$$rendered" | grep -c 'hostPort:')"; bound="$$(echo "$$rendered" | grep -c 'hostIP: 127.0.0.1')"; \
+	[ "$$ports" = 1 ] && [ "$$bound" = 1 ] \
+		|| { echo "chart-check FAILED: $$ports host ports and $$bound bound to 127.0.0.1; the registry's node proxy is the only one, on localhost only" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q 'REGISTRY_PROXY_REMOTEURL' \
+		|| { echo "chart-check FAILED: the node's registry is not a pull-through proxy, so it would accept pushes" >&2; exit 1; }
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
