@@ -608,7 +608,12 @@ e2e-dashboard-accounts: network
 	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, and enough wrong passwords stop it"
 
 test-directory: network
-	@$(COMPOSE) --profile e2e up -d ldap >/dev/null
+	@# Recreated, with a fresh volume, every time. The image keeps its data in
+	@# an anonymous volume and treats what it finds there as set up: a
+	@# container whose first start was interrupted before it set the admin
+	@# password came back "Using persisted data", refused every bind, and
+	@# failed this as "the directory did not come up".
+	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap >/dev/null
 	@# After its own setup server has stopped and the real one started: the
 	@# port answers during setup too, and the overlay loaded then is lost.
 	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; exit 1
