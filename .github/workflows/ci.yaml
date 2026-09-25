@@ -129,7 +129,7 @@ jobs:
       # and expiring within the hour. The organisation has deploy keys off,
       # and an app belongs to no person and does not lapse the way a personal
       # token does.
-      - id: platform
+      - id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.MERIDIAN_PLATFORM_APP_ID }}
@@ -142,7 +142,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/meridian-platform
-          token: ${{ steps.platform.outputs.token }}
+          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
           path: workspace/meridian-platform
 
