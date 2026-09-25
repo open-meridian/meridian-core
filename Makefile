@@ -240,6 +240,7 @@ E2E_CLUSTER_ROUTE ?= brought
 # Set to anything to keep the namespace after a run that passed -- to sign in
 # to it from a real browser, say. One that failed is always kept.
 E2E_CLUSTER_KEEP ?=
+E2E_BROWSER_IMAGE ?= meridian-e2e-browser:local
 # How people sign in: `local` (an account the deployment holds) or `ldap`
 # (the firm's directory, which e2e-cluster-ldap starts).
 E2E_CLUSTER_SIGN_IN ?= local
@@ -255,10 +256,12 @@ e2e-cluster:
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
 	@echo "e2e-cluster: building the image this cluster will run"
 	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@# A cluster on the daemon that built the image sees it already; one that
-	@# is not (k3d, kind) is handed it, or its pods pull a tag that exists
+	@# And the browser the password branches are signed in with, in a pod.
+	@$(DOCKER) build -q -t $(E2E_BROWSER_IMAGE) -f e2e/cluster/browser.Dockerfile e2e/cluster >/dev/null
+	@# A cluster on the daemon that built the images sees them already; one
+	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) >/dev/null,:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(E2E_BROWSER_IMAGE) >/dev/null,:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -279,6 +282,7 @@ e2e-cluster:
 	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \
 	 E2E_SIGN_IN=$(E2E_CLUSTER_SIGN_IN) E2E_LDAP_SERVER=ldap://host.docker.internal:$(E2E_LDAP_PORT) \
 	 E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) \
+	 E2E_BROWSER_IMAGE=$(E2E_BROWSER_IMAGE) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
@@ -657,6 +661,18 @@ chart-check:
 		echo "$$fresh" | awk -v n="$$secret" '/^---/{s=0;m=0} /^kind: Secret$$/{s=1} $$0=="  name: "n{m=1} s&&m{f=1} END{exit !f}' \
 			|| { echo "chart-check FAILED: first run may write the Secret $$secret and a fresh install does not make it." >&2; \
 			     echo "  The Job holds update and never create (decisions/016), so its apply fails with a 404." >&2; exit 1; }; \
+	done
+	@# Every broker password the chart makes starts with a letter: the broker
+	@# reads a variable's value as a value, and one that begins like a number
+	@# stops it starting. Rendered three times, because the passwords are
+	@# random and the old template drew a bad one in about three renders of four.
+	@for i in 1 2 3; do \
+		$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| awk '/^kind: Secret/{s=1} /^---/{s=0} s && /-password: /{print $$2}' \
+		| while read -r encoded; do \
+			first=$$(printf '%s' "$$encoded" | base64 -d | cut -c1); \
+			case "$$first" in [A-Za-z]) ;; *) echo "chart-check FAILED: a broker password starts with '$$first', which the broker reads as the start of a number" >&2; exit 1;; esac; \
+		done || exit 1; \
 	done
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \

@@ -128,6 +128,9 @@ if SIGN_IN not in WAYS_IN:
 WAY_IN = WAYS_IN[SIGN_IN]
 
 PORT = int(os.environ.get("E2E_PORT", "18480"))
+
+# Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
+BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
 WIZARD = f"http://127.0.0.1:{PORT}"
 
 
@@ -555,6 +558,33 @@ def main():
         if forward is not None:
             forward.terminate()
             forward.wait()
+
+    if WAY_IN["by"] == "password":
+        print("I: and in a real browser", flush=True)
+        # Everything above is an HTTP client copying a cookie by hand, which
+        # proves the server's half. This is Chromium keeping and sending the
+        # cookie itself, honouring HttpOnly and SameSite, and carrying the
+        # sign-out form's token. In the cluster, as a pod, so it reaches the
+        # dashboard by the one name every cluster resolves alike. Not on the
+        # provider's branch: the provider sends the browser back to the
+        # dashboard's address as the runner forwards it, which no pod can reach.
+        name, password = WAY_IN["administrator"]
+        kubectl("delete", "pod", "e2e-browser", "--ignore-not-found", "--wait")
+        kubectl(
+            "run", "e2e-browser", f"--image={BROWSER_IMAGE}",
+            "--image-pull-policy=Never", "--restart=Never",
+            f"--env=E2E_DASHBOARD=http://{RELEASE}-meridian-runtime-dashboard",
+            f"--env=E2E_NAME={name}", f"--env=E2E_PASSWORD={password}",
+        )
+        phase = ""
+        for _ in range(300):
+            phase = kubectl("get", "pod", "e2e-browser", "-o", "jsonpath={.status.phase}")
+            if phase in ("Succeeded", "Failed"):
+                break
+            time.sleep(1)
+        for line in kubectl("logs", "e2e-browser").splitlines():
+            print(f"    {line}" if line else "", flush=True)
+        s.check(phase == "Succeeded", f"the browser's checks held: {phase or 'it never ran'}")
 
     print(flush=True)
     if s.failures:
