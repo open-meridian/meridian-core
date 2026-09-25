@@ -29,7 +29,7 @@ use crate::clock::Clock;
 use crate::directory::Directory;
 use crate::html::{escape, page};
 use crate::oidc::Oidc;
-use crate::records::RecordsCache;
+use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
 
 pub const SESSION_COOKIE: &str = "meridian_session";
@@ -259,7 +259,7 @@ async fn sign_in_with_password(
         {
             Ok(person) => {
                 let subject = format!("{}|{}", directory.issuer(), person.subject);
-                began(&app, &subject, &person.name, person.groups, now)
+                began(&app, &subject, &person.name, person.groups, now).await
             }
             Err(crate::directory::Failure::Refused) => refused_them(),
             Err(ours) => {
@@ -306,7 +306,7 @@ async fn sign_in_with_password(
             subject,
             display_name,
             groups,
-        } => began(&app, &subject, &display_name, groups, now),
+        } => began(&app, &subject, &display_name, groups, now).await,
         accounts::Outcome::Refused => refused_them(),
         // Said plainly, and not as a refusal: somebody locked out and not
         // told keeps trying and cannot tell it from a wrong password.
@@ -329,13 +329,23 @@ async fn sign_in_with_password(
 /// One place, because both ways in owe the same things afterwards and a
 /// second copy is where they would drift: a person signed in through one
 /// route appearing in the access table and not the other.
-fn began(
+async fn began(
     app: &Arc<App>,
     subject: &str,
     display_name: &str,
     groups: Vec<String>,
     now: i64,
 ) -> Response {
+    // The access records read again, so a person lands holding what they
+    // hold now rather than what they held at the last 30-second read. First
+    // run is where that differs: the dashboard restarts and reads, then the
+    // conductor writes the administrator the wizard named, and the page that
+    // told them to sign in sent them to a dashboard that did not know yet.
+    // Best effort: records that cannot be read now are the ones already held,
+    // and the ceiling, not this, decides when they are too old to serve.
+    if let Err(failed) = refresh(&app.bus, &app.records, app.clock.as_ref()).await {
+        tracing::warn!("the access records could not be read at sign-in: {failed}");
+    }
     let key = app
         .sessions
         .start(subject, display_name, groups.clone(), now);
@@ -402,7 +412,8 @@ async fn callback(
         &identity.display_name,
         identity.groups,
         now,
-    );
+    )
+    .await;
     // And the one cookie only this route sets: the state it was matched
     // against has done its work and should not outlive it.
     response.headers_mut().append(

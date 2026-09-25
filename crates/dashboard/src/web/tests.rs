@@ -322,3 +322,39 @@ async fn a_wrong_password_here_reads_as_it_does_on_the_other_branch() {
     let page = body_of(response).await;
     assert!(page.contains("were not accepted"), "{page}");
 }
+
+#[tokio::test]
+async fn a_person_signing_in_sees_the_access_they_hold_now() {
+    // The records this dashboard read last were read before the conductor
+    // wrote ada's permission -- which is the order a first run goes in: the
+    // dashboard restarts, reads, and the conductor writes the administrator
+    // the wizard named a moment later. Records are read every 30 seconds, so
+    // the administrator the wizard's last page told to sign in signed in and
+    // was not one. Found on a fresh cluster, where the timing lands there.
+    let app = app_holding_ada();
+    app.records.store(AccessRecords::default(), T0);
+    let mut now_held = admins();
+    now_held.user_groups[0].logins = vec![meridian_access::local_login("ada")];
+    app.bus.serve(crate::records::ACCESS_RECORDS, move |_| {
+        Ok((
+            "meridian.v1.AccessRecords".to_string(),
+            now_held.encode_to_vec(),
+        ))
+    });
+
+    let response = posting(Arc::clone(&app), "name=ada&password=correct+horse+battery").await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("a session cookie")
+        .to_str()
+        .expect("ascii")
+        .split(';')
+        .next()
+        .expect("a name and value")
+        .to_string();
+
+    let (_, page) = get(app, "/", Some(&cookie)).await;
+    assert!(page.contains("You are a deployment admin"), "{page}");
+}
