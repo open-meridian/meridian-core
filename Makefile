@@ -274,13 +274,16 @@ e2e-cluster:
 	@MERIDIAN_ALLOWED_HOSTS=localhost,127.0.0.1,site,host.docker.internal \
 	 MERIDIAN_EDGE_AUDIENCE=$(E2E_PLATFORM_FROM_POD) \
 	 docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
-		up -d --build --force-recreate site >/dev/null 2>&1
+		up -d --build --force-recreate site >.e2e-platform.log 2>&1 \
+		|| { echo "e2e-cluster: the platform did not start; the tail of .e2e-platform.log:" >&2; \
+		     tail -40 .e2e-platform.log >&2; exit 1; }
 	# Its schema, because a compose that starts the site does not apply one and
 	# the first command to touch a table is where that shows.
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" \
 		run --rm -T site python -m django migrate --settings platform_site.web.settings \
-		>/dev/null 2>&1 \
-		|| { echo "e2e-cluster: the platform's schema could not be applied" >&2; exit 1; }
+		>>.e2e-platform.log 2>&1 \
+		|| { echo "e2e-cluster: the platform's schema could not be applied; the tail of .e2e-platform.log:" >&2; \
+		     tail -40 .e2e-platform.log >&2; exit 1; }
 	@kubectl delete namespace $(E2E_CLUSTER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_CLUSTER_NAMESPACE) E2E_IMAGE=$(RUNTIME_IMAGE) PLATFORM=$(PLATFORM) \
 	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \

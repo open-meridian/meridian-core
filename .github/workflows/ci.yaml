@@ -79,7 +79,11 @@ jobs:
         with:
           name: e2e-logs
           path: workspace/meridian-core/.e2e-*.log
-          if-no-files-found: ignore
+          # The logs are dotfiles, which v4 leaves out unless told; with
+          # `ignore` as well, every failure uploaded nothing and said nothing
+          # until 2026-09-25.
+          include-hidden-files: true
+          if-no-files-found: warn
           retention-days: 14
 
   # The four runs that install the chart on a real cluster and sign a person
@@ -168,5 +172,9 @@ jobs:
         with:
           name: ${{ matrix.target }}-logs
           path: workspace/meridian-core/.e2e-*.log
-          if-no-files-found: ignore
+          # The logs are dotfiles, which v4 leaves out unless told; with
+          # `ignore` as well, every failure uploaded nothing and said nothing
+          # until 2026-09-25.
+          include-hidden-files: true
+          if-no-files-found: warn
           retention-days: 14
