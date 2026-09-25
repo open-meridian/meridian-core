@@ -633,6 +633,18 @@ test-directory: network
 		<e2e/dashboard/ldap/01-memberof.ldif >>.test-directory.log 2>&1 || true
 	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_DIR) \
 		<e2e/dashboard/ldap/02-tree.ldif >>.test-directory.log 2>&1 || true
+	@# And the same over ldaps://, with a certificate signed by a CA made now
+	@# and trusted by nothing: an encrypted connection is made and verified.
+	@rm -rf .e2e-ldap-tls && mkdir -p .e2e-ldap-tls
+	@docker run --rm --entrypoint sh -v "$(CURDIR)/.e2e-ldap-tls":/ca -w /ca alpine/openssl:3.3.2 -c '\
+		openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=An untrusted CA" -keyout ca.key -out ca.crt && \
+		openssl req -newkey rsa:2048 -nodes -subj "/CN=ldap-tls" -keyout server.key -out server.csr && \
+		printf "subjectAltName=DNS:ldap-tls\n" > ext.cnf && \
+		openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile ext.cnf -out server.crt && \
+		chmod 644 server.key' >>.test-directory.log 2>&1
+	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap-tls >/dev/null
+	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
+		echo "test-directory FAILED: the ldaps:// directory did not come up" >&2; exit 1
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-dashboard --test directory \
 		>.test-directory.log 2>&1 \

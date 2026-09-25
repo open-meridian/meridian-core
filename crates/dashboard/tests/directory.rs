@@ -218,3 +218,26 @@ async fn start_tls_is_asked_of_the_server_and_not_assumed() {
         Ok(_) => panic!("signed in over a connection that was meant to be encrypted and was not"),
     }
 }
+
+#[tokio::test]
+async fn an_encrypted_directory_is_verified_and_refused_on_its_certificate() {
+    // ldaps://, to a server whose certificate a CA made for this run signed
+    // and nothing trusts. Until 2026-09-25 this panicked inside rustls before
+    // a byte was sent: two TLS providers were compiled in and it could not
+    // choose one, so every ldaps:// sign-in and wizard check failed that way,
+    // over the address the wizard itself suggests. Now the handshake happens,
+    // the certificate is checked, and it is refused -- which also says the
+    // check is not skipped.
+    let url = std::env::var("MERIDIAN_TEST_LDAPS_URL").expect(
+        "MERIDIAN_TEST_LDAPS_URL is not set. This test needs the ldaps:// directory; \
+         run it with `make test-directory`.",
+    );
+    let encrypted = Directory {
+        servers: vec![url],
+        ..directory()
+    };
+    match encrypted.check().await {
+        Err(Failure::Unreachable(detail)) if detail.contains("certificate") => {}
+        other => panic!("expected the certificate to be refused, got {other:?}"),
+    }
+}

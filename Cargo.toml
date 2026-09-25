@@ -25,7 +25,13 @@ tokio-stream = "0.1"
 
 # The broker the bus runs on, per decision 010. Pinned to a minor version like
 # every other dependency a customer inherits.
-async-nats = "0.47"
+# Its defaults, with aws-lc-rs where they name ring: one TLS provider in the
+# tree, or rustls cannot choose and panics at the first handshake that does
+# not name one (see ldap3 below).
+async-nats = { version = "0.47", default-features = false, features = [
+  "server_2_10", "server_2_11", "server_2_12", "service", "aws-lc-rs",
+  "jetstream", "nkeys", "crypto", "object-store", "kv", "websockets", "nuid",
+] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tonic = "0.13"
 # The dashboard's HTTP server. Already in the tree through tonic, which is
@@ -43,9 +49,13 @@ openidconnect = { version = "4", default-features = false }
 # the kernel's domain model, which is what that rule forbids -- a line this
 # repository drew in the wrong place once, and drawing it there is what made a
 # whole identity server look necessary.
-# `ring` rather than aws-lc-rs: both are already in this tree, and ring is
-# the one reqwest brought, so naming it adds no provider.
-ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+# aws-lc-rs, the provider reqwest's rustls feature brings, so there is one in
+# the tree. This named `ring` until 2026-09-25, on the belief that ring was
+# reqwest's; it is not, so both were compiled in, rustls could not choose a
+# default, and the first ldaps:// handshake panicked -- every sign-in and
+# every wizard check on the LDAP branch, over the encrypted address the wizard
+# itself suggests. Every test had used ldap://.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 http = "1"
 # HMAC-SHA256. Already in the tree through ed25519 and oauth2.
 # Hashing the passwords of accounts a deployment holds itself (decisions/018).
