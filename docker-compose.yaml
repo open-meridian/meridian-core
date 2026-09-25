@@ -237,6 +237,7 @@ services:
       # The firm's directory, which the dashboard now binds to itself rather
       # than having an identity server broker for it (decisions/018).
       MERIDIAN_TEST_LDAP_URL: ldap://ldap:1389
+      MERIDIAN_TEST_LDAPS_URL: ldaps://ldap-tls:1636
       # The runtime's own identity, narrowed to what the registry says its
       # components publish and subscribe to.
       MERIDIAN_TEST_BROKER_URL_RUNTIME: nats://runtime:runtime-dev-only@nats:4222
@@ -277,6 +278,27 @@ services:
       LDAP_SKIP_DEFAULT_TREE: "yes"
     volumes:
       - ./e2e/dashboard/ldap:/e2e-ldap:ro
+    networks: [meridian]
+
+  # The same directory over ldaps://, with a certificate from a CA nothing
+  # here trusts, made fresh by `make test-directory`. What it proves is that an
+  # encrypted connection is made, verified and refused on its certificate --
+  # until 2026-09-25 the first ldaps:// handshake panicked, and every other
+  # directory test used ldap://.
+  ldap-tls:
+    profiles: [e2e]
+    image: bitnamilegacy/openldap:2.6
+    environment:
+      LDAP_ROOT: dc=example,dc=org
+      LDAP_ADMIN_USERNAME: admin
+      LDAP_ADMIN_PASSWORD: ldap-admin-dev-only
+      LDAP_SKIP_DEFAULT_TREE: "yes"
+      LDAP_ENABLE_TLS: "yes"
+      LDAP_TLS_CERT_FILE: /certs/server.crt
+      LDAP_TLS_KEY_FILE: /certs/server.key
+      LDAP_TLS_CA_FILE: /certs/ca.crt
+    volumes:
+      - ./.e2e-ldap-tls:/certs:ro
     networks: [meridian]
 
   # The one platform call a claim makes, answered: one known code, once.
@@ -533,7 +555,7 @@ services:
       E2E_SUPERUSER_PASSWORD: meridian
       E2E_DB_ROUTE: ${E2E_DB_ROUTE:-external}
       # Which way people sign in, for the first-run suite's two runs.
-      E2E_BACKEND: ${E2E_BACKEND:-bundled}
+      E2E_BACKEND: ${E2E_BACKEND:-local}
     volumes:
       - ./e2e/first-run:/e2e:ro
     networks: [meridian]

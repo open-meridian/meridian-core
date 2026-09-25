@@ -24,6 +24,7 @@ fn directory() -> Directory {
     );
     Directory {
         servers: vec![url],
+        start_tls: false,
         base_dn: PEOPLE.into(),
         bind_dn: "cn=admin,dc=example,dc=org".into(),
         bind_password: "ldap-admin-dev-only".into(),
@@ -194,5 +195,49 @@ async fn no_server_answering_fails_the_check() {
     match nowhere.check().await {
         Err(Failure::Unreachable(_)) => {}
         other => panic!("expected unreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn start_tls_is_asked_of_the_server_and_not_assumed() {
+    // The test directory speaks no TLS. Asked to upgrade, the connection has
+    // to fail: a client that ignored the setting would bind in the clear and
+    // pass, which is what the contract carried and the code did until
+    // 2026-09-25.
+    let upgrading = Directory {
+        start_tls: true,
+        ..directory()
+    };
+    match upgrading.check().await {
+        Err(_) => {}
+        Ok(()) => panic!("a server with no TLS cannot have been upgraded to it"),
+    }
+    match upgrading.authenticate("alice", "alicepass").await {
+        Err(Failure::Refused) => panic!("a TLS failure is not a wrong password"),
+        Err(_) => {}
+        Ok(_) => panic!("signed in over a connection that was meant to be encrypted and was not"),
+    }
+}
+
+#[tokio::test]
+async fn an_encrypted_directory_is_verified_and_refused_on_its_certificate() {
+    // ldaps://, to a server whose certificate a CA made for this run signed
+    // and nothing trusts. Until 2026-09-25 this panicked inside rustls before
+    // a byte was sent: two TLS providers were compiled in and it could not
+    // choose one, so every ldaps:// sign-in and wizard check failed that way,
+    // over the address the wizard itself suggests. Now the handshake happens,
+    // the certificate is checked, and it is refused -- which also says the
+    // check is not skipped.
+    let url = std::env::var("MERIDIAN_TEST_LDAPS_URL").expect(
+        "MERIDIAN_TEST_LDAPS_URL is not set. This test needs the ldaps:// directory; \
+         run it with `make test-directory`.",
+    );
+    let encrypted = Directory {
+        servers: vec![url],
+        ..directory()
+    };
+    match encrypted.check().await {
+        Err(Failure::Unreachable(detail)) if detail.contains("certificate") => {}
+        other => panic!("expected the certificate to be refused, got {other:?}"),
     }
 }

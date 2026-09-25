@@ -174,7 +174,7 @@ E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brough
 
 # And which way people sign in: `bundled` is what this deployment does
 # itself -- an account it holds -- and `oidc` is the firm's own provider.
-E2E_BACKEND ?= bundled
+E2E_BACKEND ?= local
 E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through the firm's own directory,)
 
 e2e-first-run: network
@@ -237,6 +237,14 @@ E2E_EXTERNAL_PASSWORD ?= e2e-dev-only
 # there, so sharing it would have made `make e2e-cluster` quietly take the
 # route nobody asked it for.
 E2E_CLUSTER_ROUTE ?= brought
+# Set to anything to keep the namespace after a run that passed -- to sign in
+# to it from a real browser, say. One that failed is always kept.
+E2E_CLUSTER_KEEP ?=
+E2E_BROWSER_IMAGE ?= meridian-e2e-browser:local
+# Who installs and answers the wizard: this runner, or `meridian up --params`
+# from meridian-cli's e2e image (its `make e2e-up` sets these).
+E2E_DRIVER ?= runner
+E2E_CLI_IMAGE ?= meridian-cli-e2e:local
 # How people sign in: `local` (an account the deployment holds) or `ldap`
 # (the firm's directory, which e2e-cluster-ldap starts).
 E2E_CLUSTER_SIGN_IN ?= local
@@ -252,10 +260,12 @@ e2e-cluster:
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
 	@echo "e2e-cluster: building the image this cluster will run"
 	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@# A cluster on the daemon that built the image sees it already; one that
-	@# is not (k3d, kind) is handed it, or its pods pull a tag that exists
+	@# And the browser the password branches are signed in with, in a pod.
+	@$(DOCKER) build -q -t $(E2E_BROWSER_IMAGE) -f e2e/cluster/browser.Dockerfile e2e/cluster >/dev/null
+	@# A cluster on the daemon that built the images sees them already; one
+	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) >/dev/null,:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(E2E_BROWSER_IMAGE) >/dev/null,:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -276,11 +286,13 @@ e2e-cluster:
 	 E2E_PLATFORM_FROM_POD=$(E2E_PLATFORM_FROM_POD) E2E_DB_ROUTE=$(E2E_CLUSTER_ROUTE) \
 	 E2E_SIGN_IN=$(E2E_CLUSTER_SIGN_IN) E2E_LDAP_SERVER=ldap://host.docker.internal:$(E2E_LDAP_PORT) \
 	 E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) \
+	 E2E_BROWSER_IMAGE=$(E2E_BROWSER_IMAGE) \
+	 E2E_DRIVER=$(E2E_DRIVER) E2E_CLI_IMAGE=$(E2E_CLI_IMAGE) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
 	  held=$$?; \
-	  if [ $$held -ne 0 ]; then \
+	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
 	    echo "e2e-cluster: the namespace is left for reading. Remove it with:" >&2; \
 	    echo "  kubectl delete namespace $(E2E_CLUSTER_NAMESPACE)" >&2; \
 	  else \
@@ -626,6 +638,18 @@ test-directory: network
 		<e2e/dashboard/ldap/01-memberof.ldif >>.test-directory.log 2>&1 || true
 	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_DIR) \
 		<e2e/dashboard/ldap/02-tree.ldif >>.test-directory.log 2>&1 || true
+	@# And the same over ldaps://, with a certificate signed by a CA made now
+	@# and trusted by nothing: an encrypted connection is made and verified.
+	@rm -rf .e2e-ldap-tls && mkdir -p .e2e-ldap-tls
+	@docker run --rm --entrypoint sh -v "$(CURDIR)/.e2e-ldap-tls":/ca -w /ca alpine/openssl:3.3.2 -c '\
+		openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=An untrusted CA" -keyout ca.key -out ca.crt && \
+		openssl req -newkey rsa:2048 -nodes -subj "/CN=ldap-tls" -keyout server.key -out server.csr && \
+		printf "subjectAltName=DNS:ldap-tls\n" > ext.cnf && \
+		openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile ext.cnf -out server.crt && \
+		chmod 644 server.key' >>.test-directory.log 2>&1
+	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap-tls >/dev/null
+	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
+		echo "test-directory FAILED: the ldaps:// directory did not come up" >&2; exit 1
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-dashboard --test directory \
 		>.test-directory.log 2>&1 \
@@ -655,6 +679,28 @@ chart-check:
 			|| { echo "chart-check FAILED: first run may write the Secret $$secret and a fresh install does not make it." >&2; \
 			     echo "  The Job holds update and never create (decisions/016), so its apply fails with a 404." >&2; exit 1; }; \
 	done
+	@# Every broker password the chart makes starts with a letter: the broker
+	@# reads a variable's value as a value, and one that begins like a number
+	@# stops it starting. Rendered three times, because the passwords are
+	@# random and the old template drew a bad one in about three renders of four.
+	@for i in 1 2 3; do \
+		$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| awk '/^kind: Secret/{s=1} /^---/{s=0} s && /-password: /{print $$2}' \
+		| while read -r encoded; do \
+			first=$$(printf '%s' "$$encoded" | base64 -d | cut -c1); \
+			case "$$first" in [A-Za-z]) ;; *) echo "chart-check FAILED: a broker password starts with '$$first', which the broker reads as the start of a number" >&2; exit 1;; esac; \
+		done || exit 1; \
+	done
+	@# One host port in the whole chart, the registry's node proxy, and on
+	@# 127.0.0.1 alone: on a node's other interfaces anybody who can reach the
+	@# node could pull a firm's plugins, and anything else holding a host port
+	@# is a pod reachable from outside the cluster by accident.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	ports="$$(echo "$$rendered" | grep -c 'hostPort:')"; bound="$$(echo "$$rendered" | grep -c 'hostIP: 127.0.0.1')"; \
+	[ "$$ports" = 1 ] && [ "$$bound" = 1 ] \
+		|| { echo "chart-check FAILED: $$ports host ports and $$bound bound to 127.0.0.1; the registry's node proxy is the only one, on localhost only" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q 'REGISTRY_PROXY_REMOTEURL' \
+		|| { echo "chart-check FAILED: the node's registry is not a pull-through proxy, so it would accept pushes" >&2; exit 1; }
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }

@@ -192,12 +192,24 @@ be pressed as often as you like.
 asks you for nothing further. *Use a database you already run* wants the host,
 port, database name, TLS mode, and the two roles with their passwords.
 
-**Signing in.** Choose one of the three. *The firm's own OpenID Connect
-provider* asks for the issuer, client id, client secret and the claim carrying
-groups. *Connect the firm's LDAP* asks for the servers, the base to search
-from, the bind to search as, and how a person is found — and tests it by
-binding and searching. *No directory: make me an account* asks for the login,
-email, name and password of the one account this deployment then holds.
+**Signing in.** Choose one of the three, and answer only that part.
+
+- *Our own OpenID Connect provider* asks for the issuer, the client id, the
+  client secret (none for a public client) and the claim carrying groups. The
+  issuer must be **exactly** what your provider calls itself, trailing slash
+  and all: Test reads your provider's discovery document and says so if one
+  character is off. Leave *other audiences* empty unless your provider puts
+  something besides the client id in a token's audience — some add the
+  project the client belongs to, and then every sign-in is refused until
+  that is listed here.
+- *Our LDAP or Active Directory* asks for the servers, where people are, the
+  account this deployment searches as, and how a person is found (`{}` is the
+  name they type; empty is `(uid={})`, and Active Directory usually wants
+  `(sAMAccountName={})`). Tick **StartTLS** for an `ldap://` address, or every
+  password crosses your network as it was typed; an `ldaps://` address is
+  already encrypted. Test binds with that account and reads where people are.
+- *We have no directory: make me an account* asks for the login, email, name
+  and password of the one account this deployment then holds.
 
 **If you are using your own provider, it must return `auth_time`.** This is
 the one thing about your provider that Meridian requires and that not every
@@ -229,9 +241,8 @@ directory, the account you just described is the administrator and this is left
 empty.
 
 **Spell the group exactly.** It is not checked and cannot be: a directory
-states a person's groups when they sign in, it is not asked to list them, and
-the bundled directory has no database until this page is applied. A group that
-does not exist is a deployment nobody can administer, and getting back in then
+states a person's groups when they sign in, and it is not asked to list them.
+A group that does not exist is a deployment nobody can administer, and getting back in then
 means a claim code from the platform.
 
 **Addresses.** Where a browser reaches this deployment. One address: nothing
@@ -239,8 +250,9 @@ of ours redirects a browser anywhere else, so there is no second host to
 arrange. This is the address your staff will use, not the `127.0.0.1` forward
 you are reading this through.
 
-Press **Test**. It checks the database roles, the directory and the addresses,
-and names what it finds. Fix what it names, test again, and when it is clean
+Press **Test**. It checks every answer the way Apply will: the database roles,
+your provider or directory (by connecting to it, from inside the cluster), the
+addresses and the administrators. It names what it finds. Fix what it names, test again, and when it is clean
 press **Apply**.
 
 Applying writes it all at once and restarts what changed. It takes a couple of

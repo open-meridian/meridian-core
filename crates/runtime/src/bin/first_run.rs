@@ -222,6 +222,7 @@ impl DirectoryProbe for Ldap {
     fn check(&self, answer: &LdapDirectoryAnswer, bind_password: &[u8]) -> Vec<String> {
         let directory = meridian_dashboard::directory::Directory {
             servers: answer.servers.clone(),
+            start_tls: answer.start_tls,
             base_dn: answer.base_dn.clone(),
             bind_dn: answer.bind_dn.clone(),
             bind_password: String::from_utf8_lossy(bind_password).into_owned(),
@@ -351,11 +352,6 @@ fn connect_and_provision(
         server
             .batch_execute(&format!("grant connect on database {database} to {name}"))
             .map_err(|failed| format!("{name} could not be let into {database}: {failed}"))?;
-        if role.owns_database {
-            server
-                .batch_execute(&format!("alter database {database} owner to {name}"))
-                .map_err(|failed| format!("{name} could not be given {database}: {failed}"))?;
-        }
     }
 
     // The schema's grants are made from inside the database, by the only role

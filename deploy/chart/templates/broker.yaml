@@ -41,10 +41,18 @@
   give the broker one password and its components another, and a deployment
   whose components cannot connect to their own bus.
 */}}
+{{/*
+  Each starts with a letter. The broker reads its configuration's variables as
+  values rather than strings, so a password that begins like a number -- `12`,
+  `8.5x`, `4KB9...` -- is a number followed by garbage, and the broker refuses
+  to start: every component with it, on the install that drew it. About one
+  install in six did, found by the first run of the cluster suite on a fresh
+  cluster. A letter first always reads as a string; the rest is still random.
+*/}}
 {{- $passwords := dict }}
 {{- range $user := $users }}
 {{- if $user }}
-{{- $_ := set $passwords $user (index $held (printf "%s-password" $user) | default (randAlphaNum 32 | b64enc)) }}
+{{- $_ := set $passwords $user (index $held (printf "%s-password" $user) | default (printf "%s%s" (randAlpha 1) (randAlphaNum 31) | b64enc)) }}
 {{- end }}
 {{- end }}
 ---

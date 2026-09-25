@@ -1,9 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use meridian_domain::v1::{
-    BundledZitadelAnswer, CreateZitadelDatabase, LdapDirectoryAnswer, OidcProviderAnswer,
-    ZitadelDatabaseAnswer,
-};
+use meridian_domain::v1::{LdapDirectoryAnswer, OidcProviderAnswer};
 
 use super::*;
 
@@ -276,45 +273,28 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: "v4.17.3".into(),
-                egress_cidrs: vec!["10.20.0.0/16".into()],
-                database: Some(ZitadelDatabaseAnswer {
-                    route: Some(
-                        meridian_domain::v1::zitadel_database_answer::Route::Existing(login(
-                            &run,
-                            "zitadel_database.existing.password",
-                            "zitadel",
-                        )),
+            backend: Some(Backend::Ldap(
+                // Whole, now that applying re-checks it: an answer
+                // with no server passed until the check dialled one.
+                LdapDirectoryAnswer {
+                    servers: vec!["ldaps://one.firm.example".into()],
+                    base_dn: "ou=people,dc=firm,dc=example".into(),
+                    bind_dn: "cn=meridian,dc=firm,dc=example".into(),
+                    bind_password: Some(
+                        seal(
+                            &run.key.public_key(),
+                            &run.key.key_id,
+                            "ldap.bind_password",
+                            b"bind",
+                        )
+                        .unwrap(),
                     ),
-                }),
-                directory: Some(
-                    meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(
-                        // Whole, now that applying re-checks it: an answer
-                        // with no server passed until the check dialled one.
-                        LdapDirectoryAnswer {
-                            servers: vec!["ldaps://one.firm.example".into()],
-                            base_dn: "ou=people,dc=firm,dc=example".into(),
-                            bind_dn: "cn=meridian,dc=firm,dc=example".into(),
-                            bind_password: Some(
-                                seal(
-                                    &run.key.public_key(),
-                                    &run.key.key_id,
-                                    "ldap.bind_password",
-                                    b"bind",
-                                )
-                                .unwrap(),
-                            ),
-                            ..Default::default()
-                        },
-                    ),
-                ),
-                ..Default::default()
-            })),
+                    ..Default::default()
+                },
+            )),
         }),
         addresses: Some(AddressesAnswer {
             dashboard_url: "https://meridian.firm.example".into(),
-            zitadel_url: "https://id.meridian.firm.example".into(),
         }),
     };
 
@@ -413,34 +393,33 @@ fn a_password_with_an_at_sign_cannot_rewrite_the_host() {
 }
 
 #[test]
-fn a_privileged_connection_creates_nothing_during_a_check() {
-    let run = first_run(Box::new(Refusing("secret")), vec![]);
+fn a_database_to_be_made_is_not_made_by_testing_it() {
+    // Requirement 14: testing "start a database here and make its roles" is
+    // not doing it. The cluster refuses every write and the provisioner every
+    // creation, and the check passes -- it asked for neither. (This was the
+    // identity server's database until that went; the route that brings the
+    // runtime's own is the one left that makes anything.)
+    let mut run = first_run(Box::new(Refusing("secret")), vec![]);
+    run.brought = Some(BroughtServer {
+        workload: "m-database".into(),
+        host: "m-database".into(),
+        port: 5432,
+        superuser: "postgres".into(),
+        superuser_password: "generated".into(),
+        serving_password: "generated".into(),
+        migrating_password: "generated".into(),
+    });
     let reply = run.check(&FirstRunCheckRequest {
-        answer: Some(Answer::LoginBackend(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: "v4.17.3".into(),
-                egress_cidrs: vec!["10.0.0.0/8".into()],
-                database: Some(ZitadelDatabaseAnswer {
-                    route: Some(meridian_domain::v1::zitadel_database_answer::Route::Create(
-                        CreateZitadelDatabase {
-                            privileged: Some(login(
-                                &run,
-                                "zitadel_database.create.role_password",
-                                "superuser",
-                            )),
-                            database: "zitadel".into(),
-                            role: "zitadel".into(),
-                            role_password: None,
-                        },
-                    )),
-                }),
-                ..Default::default()
-            })),
+        answer: Some(Answer::RuntimeDatabase(RuntimeDatabaseAnswer {
+            brought: Some(BroughtDatabase {
+                serving_role: "meridian_app".into(),
+                migrating_role: "meridian_migrate".into(),
+                database: "meridian".into(),
+            }),
+            ..Default::default()
         })),
     });
 
-    // The cluster would have refused any write, and the check passes: it made
-    // none. Testing "create this" is not creating it (requirement 14).
     assert!(reply.passed, "{:?}", reply.findings);
 }
 
@@ -469,7 +448,6 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         }),
         addresses: Some(AddressesAnswer {
             dashboard_url: "https://meridian.firm.example".into(),
-            zitadel_url: "https://id.meridian.firm.example:8443".into(),
         }),
     };
 
@@ -477,24 +455,6 @@ async fn the_addresses_are_written_as_the_components_read_them() {
 
     assert!(applied.applied, "{}", applied.refusal_reason);
     assert!(applied.steps.contains(&"addresses".to_string()));
-}
-
-#[test]
-fn a_zitadel_address_becomes_what_zitadel_calls_itself() {
-    // Zitadel puts its own address in every token, and the dashboard checks
-    // that against the issuer it expects: one answer, spelled both ways.
-    for (url, domain, port, secure) in [
-        ("https://id.example", "id.example", "443", "true"),
-        ("http://id.example:8080", "id.example", "8080", "false"),
-        ("https://id.example:8443/", "id.example", "8443", "true"),
-    ] {
-        let split = super::split_zitadel_url(url).expect("a URL");
-        assert_eq!(
-            split,
-            (domain.to_string(), port.to_string(), secure.to_string()),
-            "{url}"
-        );
-    }
 }
 
 /// What the run wrote, as `secret <name> <comma-joined keys>` and so on.
@@ -517,14 +477,11 @@ fn firms_own_directory(groups_claim: &str) -> LoginBackendAnswer {
 
 #[tokio::test]
 async fn the_firms_own_issuer_reaches_the_secret_the_dashboard_reads() {
-    // The chart reads one issuer, out of the addresses Secret. On the bundled
-    // route that is Zitadel's address; on this route it is the firm's, and it
-    // was written only into the dashboard's OIDC Secret, which the chart reads
-    // the client id out of and not the issuer.
-    //
-    // So a deployment installed with the bundle rendered -- which is what
-    // keeps the choice open until the wizard -- and then pointed at the firm's
-    // directory came up with no issuer, and nobody could sign in.
+    // The chart reads one issuer, out of the addresses Secret. Until
+    // 2026-09-23 the firm's was written only into the dashboard's OIDC Secret,
+    // which the chart reads the client id out of and not the issuer, so a
+    // deployment pointed at the firm's provider came up with no issuer and
+    // nobody could sign in.
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
@@ -533,8 +490,6 @@ async fn the_firms_own_issuer_reaches_the_secret_the_dashboard_reads() {
         login_backend: Some(firms_own_directory("")),
         addresses: Some(AddressesAnswer {
             dashboard_url: "https://meridian.firm.example".into(),
-            // Empty, because this deployment is not using the bundled Zitadel.
-            zitadel_url: String::new(),
         }),
     };
 
@@ -555,7 +510,7 @@ async fn the_firms_own_issuer_reaches_the_secret_the_dashboard_reads() {
 #[tokio::test]
 async fn the_groups_claim_is_written_only_when_the_wizard_was_told_one() {
     // Absent means the dashboard's own default, `groups`, which is what Entra
-    // ID, Okta and Zitadel use. Writing an empty one would override that
+    // ID and Okta use. Writing an empty one would override that
     // default with nothing, and a claim of "" matches no claim at all: every
     // token would present no groups, the administrators' group would never
     // match, and nobody would hold deployment admin.
@@ -603,34 +558,26 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
         }),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: "v4.17.3".into(),
-                egress_cidrs: vec!["10.20.0.0/16".into()],
-                directory: Some(
-                    meridian_domain::v1::bundled_zitadel_answer::Directory::LocalAccount(
-                        meridian_domain::v1::LocalAccountAnswer {
-                            login_name: "Ada".into(),
-                            given_name: "Ada".into(),
-                            family_name: "Park".into(),
-                            initial_password: Some(
-                                seal(
-                                    &run.key.public_key(),
-                                    &run.key.key_id,
-                                    "local_account.initial_password",
-                                    b"correct horse battery",
-                                )
-                                .unwrap(),
-                            ),
-                            ..Default::default()
-                        },
+            backend: Some(Backend::LocalAccount(
+                meridian_domain::v1::LocalAccountAnswer {
+                    login_name: "Ada".into(),
+                    given_name: "Ada".into(),
+                    family_name: "Park".into(),
+                    initial_password: Some(
+                        seal(
+                            &run.key.public_key(),
+                            &run.key.key_id,
+                            "local_account.initial_password",
+                            b"correct horse battery",
+                        )
+                        .unwrap(),
                     ),
-                ),
-                ..Default::default()
-            })),
+                    ..Default::default()
+                },
+            )),
         }),
         addresses: Some(AddressesAnswer {
             dashboard_url: "https://meridian.firm.example".into(),
-            zitadel_url: "https://id.meridian.firm.example".into(),
         }),
     };
 
@@ -671,37 +618,27 @@ async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password()
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                version: "v4.17.3".into(),
-                egress_cidrs: vec!["10.20.0.0/16".into()],
-                directory: Some(
-                    meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(
-                        LdapDirectoryAnswer {
-                            servers: vec![
-                                "ldaps://one.firm.example".into(),
-                                "ldaps://two.firm.example".into(),
-                            ],
-                            base_dn: "ou=people,dc=firm,dc=example".into(),
-                            bind_dn: "cn=meridian,dc=firm,dc=example".into(),
-                            bind_password: Some(
-                                seal(
-                                    &run.key.public_key(),
-                                    &run.key.key_id,
-                                    "ldap.bind_password",
-                                    b"bind-secret",
-                                )
-                                .unwrap(),
-                            ),
-                            ..Default::default()
-                        },
-                    ),
+            backend: Some(Backend::Ldap(LdapDirectoryAnswer {
+                servers: vec![
+                    "ldaps://one.firm.example".into(),
+                    "ldaps://two.firm.example".into(),
+                ],
+                base_dn: "ou=people,dc=firm,dc=example".into(),
+                bind_dn: "cn=meridian,dc=firm,dc=example".into(),
+                bind_password: Some(
+                    seal(
+                        &run.key.public_key(),
+                        &run.key.key_id,
+                        "ldap.bind_password",
+                        b"bind-secret",
+                    )
+                    .unwrap(),
                 ),
                 ..Default::default()
             })),
         }),
         addresses: Some(AddressesAnswer {
             dashboard_url: "https://meridian.firm.example".into(),
-            ..Default::default()
         }),
     };
 
@@ -728,25 +665,20 @@ async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password()
 
 fn ldap_answer(run: &FirstRun, filter: &str) -> LoginBackendAnswer {
     LoginBackendAnswer {
-        backend: Some(Backend::Bundled(BundledZitadelAnswer {
-            directory: Some(
-                meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(LdapDirectoryAnswer {
-                    servers: vec!["ldaps://one.firm.example".into()],
-                    base_dn: "ou=people,dc=firm,dc=example".into(),
-                    bind_dn: "cn=meridian,dc=firm,dc=example".into(),
-                    bind_password: Some(
-                        seal(
-                            &run.key.public_key(),
-                            &run.key.key_id,
-                            "ldap.bind_password",
-                            b"bind-secret",
-                        )
-                        .unwrap(),
-                    ),
-                    user_filter: filter.into(),
-                    ..Default::default()
-                }),
+        backend: Some(Backend::Ldap(LdapDirectoryAnswer {
+            servers: vec!["ldaps://one.firm.example".into()],
+            base_dn: "ou=people,dc=firm,dc=example".into(),
+            bind_dn: "cn=meridian,dc=firm,dc=example".into(),
+            bind_password: Some(
+                seal(
+                    &run.key.public_key(),
+                    &run.key.key_id,
+                    "ldap.bind_password",
+                    b"bind-secret",
+                )
+                .unwrap(),
             ),
+            user_filter: filter.into(),
             ..Default::default()
         })),
     }
@@ -801,13 +733,9 @@ fn an_ldap_answer_missing_half_of_itself_is_told_so_without_dialling() {
     let mut run = first_run(Box::new(Remembering::default()), vec![]);
     run.directory_probe = Box::new(directories);
     let mut answer = ldap_answer(&run, "(mail=alice@firm.example)");
-    if let Some(Backend::Bundled(bundled)) = answer.backend.as_mut() {
-        if let Some(meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(ldap)) =
-            bundled.directory.as_mut()
-        {
-            ldap.servers.clear();
-            ldap.base_dn.clear();
-        }
+    if let Some(Backend::Ldap(ldap)) = answer.backend.as_mut() {
+        ldap.servers.clear();
+        ldap.base_dn.clear();
     }
 
     let reply = check_backend_with(&run, answer);
@@ -834,14 +762,7 @@ fn a_local_account_answer_dials_nothing() {
     let reply = check_backend_with(
         &run,
         LoginBackendAnswer {
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                directory: Some(
-                    meridian_domain::v1::bundled_zitadel_answer::Directory::LocalAccount(
-                        Default::default(),
-                    ),
-                ),
-                ..Default::default()
-            })),
+            backend: Some(Backend::LocalAccount(Default::default())),
         },
     );
 
@@ -899,4 +820,95 @@ fn a_provider_answer_missing_its_issuer_is_told_so_without_asking_anybody() {
 
     assert_eq!(reply.findings, ["no issuer"]);
     assert!(asked.lock().unwrap().is_empty(), "nothing was fetched");
+}
+
+#[tokio::test]
+async fn trusted_audiences_reach_the_key_the_chart_reads_them_from() {
+    // The chart has read `trusted-audiences` out of the OIDC Secret all along,
+    // and until 2026-09-25 nothing wrote it: a provider that names its
+    // project in a token's audience had every sign-in refused.
+    let (cluster, done) = watched();
+    let run = first_run(Box::new(cluster), vec![]);
+    let mut backend = firms_own_directory("");
+    if let Some(Backend::Oidc(oidc)) = backend.backend.as_mut() {
+        oidc.trusted_audiences = vec!["project-8812".into(), " ".into()];
+    }
+    let configuration = FirstRunConfiguration {
+        administrator: Some(administrator("meridian-admins")),
+        runtime_database: Some(database(&run)),
+        login_backend: Some(backend),
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+        }),
+    };
+
+    let applied = run.apply(&configuration).await;
+
+    assert!(applied.applied, "{}", applied.refusal_reason);
+    let wrote = done.lock().unwrap().clone();
+    let oidc = wrote
+        .iter()
+        .find(|line| line.starts_with("secret m-dashboard-oidc "))
+        .expect("the OIDC secret was written");
+    assert!(oidc.contains("trusted-audiences"), "{oidc}");
+}
+
+#[tokio::test]
+async fn start_tls_reaches_the_dashboard_only_when_it_was_asked_for() {
+    for (asked, expected) in [(true, true), (false, false)] {
+        let (cluster, done) = watched();
+        let run = first_run(Box::new(cluster), vec![]);
+        let mut backend = ldap_answer(&run, "");
+        if let Some(Backend::Ldap(ldap)) = backend.backend.as_mut() {
+            ldap.servers = vec!["ldap://ldap.firm.example:389".into()];
+            ldap.start_tls = asked;
+        }
+        let configuration = FirstRunConfiguration {
+            administrator: Some(administrator("meridian-admins")),
+            runtime_database: Some(database(&run)),
+            login_backend: Some(backend),
+            addresses: Some(AddressesAnswer {
+                dashboard_url: "https://meridian.firm.example".into(),
+            }),
+        };
+
+        let applied = run.apply(&configuration).await;
+
+        assert!(applied.applied, "{}", applied.refusal_reason);
+        let wrote = done.lock().unwrap().clone();
+        let ldap = wrote
+            .iter()
+            .find(|line| line.starts_with("secret m-ldap-bind "))
+            .expect("the directory secret was written");
+        assert_eq!(
+            ldap.contains("start-tls"),
+            expected,
+            "asked {asked}: {ldap}"
+        );
+    }
+}
+
+#[test]
+fn start_tls_on_an_address_already_encrypted_is_refused_before_dialling() {
+    let directories = Directories::default();
+    let handed = directories.handed.clone();
+    let mut run = first_run(Box::new(Remembering::default()), vec![]);
+    run.directory_probe = Box::new(directories);
+    let mut answer = ldap_answer(&run, "");
+    if let Some(Backend::Ldap(ldap)) = answer.backend.as_mut() {
+        ldap.start_tls = true;
+    }
+
+    let reply = check_backend_with(&run, answer);
+
+    assert!(!reply.passed);
+    assert!(
+        reply
+            .findings
+            .iter()
+            .any(|f| f.contains("already encrypted")),
+        "{:?}",
+        reply.findings
+    );
+    assert!(handed.lock().unwrap().is_empty(), "nothing was dialled");
 }

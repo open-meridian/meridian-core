@@ -115,6 +115,7 @@ fn run() -> Result<(), String> {
             .filter(|server| !server.is_empty())
             .map(String::from)
             .collect(),
+        start_tls: var("MERIDIAN_LDAP_START_TLS").as_deref() == Some("true"),
         base_dn: var("MERIDIAN_LDAP_BASE_DN").unwrap_or_default(),
         bind_dn: var("MERIDIAN_LDAP_BIND_DN").unwrap_or_default(),
         bind_password: var("MERIDIAN_LDAP_BIND_PASSWORD").unwrap_or_default(),

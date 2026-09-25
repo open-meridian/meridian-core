@@ -1376,54 +1376,81 @@ pub struct BroughtDatabase {
     pub serving_role: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub migrating_role: ::prost::alloc::string::String,
-    /// And the database they live in, beside Zitadel's own on the same server.
+    /// And the database they live in.
     #[prost(string, tag = "3")]
     pub database: ::prost::alloc::string::String,
 }
-/// The firm's LDAP directory, brokered by the bundled Zitadel. The chart's
-/// identity.bundled.ldap settings, answered in the wizard instead.
+/// How people sign in: one of three, each asking only about what the firm has
+/// (decisions/018). Nothing here names an identity server, because the
+/// deployment runs none -- it federates to the firm's provider, binds to their
+/// LDAP, or holds the accounts itself.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoginBackendAnswer {
+    #[prost(oneof = "login_backend_answer::Backend", tags = "2, 3, 4")]
+    pub backend: ::core::option::Option<login_backend_answer::Backend>,
+}
+/// Nested message and enum types in `LoginBackendAnswer`.
+pub mod login_backend_answer {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Backend {
+        #[prost(message, tag = "2")]
+        Oidc(super::OidcProviderAnswer),
+        #[prost(message, tag = "3")]
+        Ldap(super::LdapDirectoryAnswer),
+        #[prost(message, tag = "4")]
+        LocalAccount(super::LocalAccountAnswer),
+    }
+}
+/// The firm's own OpenID Connect provider. The dashboard federates to it and
+/// nothing of ours signs anybody in.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OidcProviderAnswer {
+    /// Exactly as the provider states it in its discovery document: the
+    /// dashboard checks every token's `iss` against this string, and first run
+    /// reads the document before it passes the answer.
+    #[prost(string, tag = "1")]
+    pub issuer: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub client_id: ::prost::alloc::string::String,
+    /// Absent for a public client, which PKCE makes safe.
+    #[prost(message, optional, tag = "3")]
+    pub client_secret: ::core::option::Option<SealedCredential>,
+    /// The claim carrying a person's groups. Empty is `groups`.
+    #[prost(string, tag = "4")]
+    pub groups_claim: ::prost::alloc::string::String,
+    /// Audiences besides the client id that an ID token may also name. Some
+    /// providers add the project the client belongs to, and a token naming an
+    /// audience not listed here is refused (OpenID Connect Core 3.1.3.7).
+    #[prost(string, repeated, tag = "5")]
+    pub trusted_audiences: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// The firm's LDAP, bound to by the dashboard itself.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LdapDirectoryAnswer {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
+    /// In order; the first that answers is used.
     #[prost(string, repeated, tag = "2")]
     pub servers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Upgrade an `ldap://` connection before anything is sent, so the bind and
+    /// every person's password are encrypted. An `ldaps://` address already is,
+    /// and asking for both is refused.
     #[prost(bool, tag = "3")]
     pub start_tls: bool,
+    /// Where people are searched for, and who searches: an account that can
+    /// read people and their groups and nothing else.
     #[prost(string, tag = "4")]
     pub base_dn: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub bind_dn: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "6")]
     pub bind_password: ::core::option::Option<SealedCredential>,
-    #[prost(string, tag = "7")]
-    pub user_object_class: ::prost::alloc::string::String,
+    /// How a person is found from what they typed; `{}` is the name, escaped.
+    /// Empty is `(uid={})`.
     #[prost(string, tag = "8")]
     pub user_filter: ::prost::alloc::string::String,
 }
-/// The firm's SAML directory, brokered by the bundled Zitadel. Zitadel maps no
-/// profile attributes from SAML, so the group hook takes these names (spec
-/// `deployment-dashboard-and-access`).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SamlDirectoryAnswer {
-    /// One of the two.
-    #[prost(string, tag = "1")]
-    pub metadata_url: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub metadata_xml: ::prost::alloc::vec::Vec<u8>,
-    #[prost(string, tag = "3")]
-    pub groups_attribute: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub username_attribute: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub given_name_attribute: ::prost::alloc::string::String,
-    #[prost(string, tag = "6")]
-    pub family_name_attribute: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub email_attribute: ::prost::alloc::string::String,
-}
-/// The first administrator's account in the bundled Zitadel, for a firm with no
-/// directory of its own.
+/// An account this deployment holds, for a firm with no directory of its own:
+/// the first administrator's. First run hashes the password and the dashboard
+/// makes the account; nobody else ever sees the password.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LocalAccountAnswer {
     #[prost(string, tag = "1")]
@@ -1437,124 +1464,21 @@ pub struct LocalAccountAnswer {
     #[prost(message, optional, tag = "5")]
     pub initial_password: ::core::option::Option<SealedCredential>,
 }
-/// The firm's own OIDC provider, which leaves the bundled Zitadel at zero
-/// replicas. The chart's dashboard.oidc settings, answered in the wizard.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct OidcProviderAnswer {
-    #[prost(string, tag = "1")]
-    pub issuer: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub client_id: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "3")]
-    pub client_secret: ::core::option::Option<SealedCredential>,
-    #[prost(string, tag = "4")]
-    pub groups_claim: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "5")]
-    pub trusted_audiences: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Where the bundled Zitadel's own data lives. Its database and role are the
-/// administrator's (spec `deployment-dashboard-and-access` ruling 16).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ZitadelDatabaseAnswer {
-    #[prost(oneof = "zitadel_database_answer::Route", tags = "1, 2")]
-    pub route: ::core::option::Option<zitadel_database_answer::Route>,
-}
-/// Nested message and enum types in `ZitadelDatabaseAnswer`.
-pub mod zitadel_database_answer {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Route {
-        /// A database and role the firm's database administrator made, from
-        /// statements the wizard showed them.
-        #[prost(message, tag = "1")]
-        Existing(super::DatabaseLogin),
-        /// Created once, in W7.5, with a privileged connection that is then
-        /// forgotten: never stored, never handed to Zitadel. A test does not
-        /// create anything.
-        #[prost(message, tag = "2")]
-        Create(super::CreateZitadelDatabase),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateZitadelDatabase {
-    #[prost(message, optional, tag = "1")]
-    pub privileged: ::core::option::Option<DatabaseLogin>,
-    /// What to create, and the login Zitadel will hold. Never the superuser.
-    #[prost(string, tag = "2")]
-    pub database: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub role: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "4")]
-    pub role_password: ::core::option::Option<SealedCredential>,
-}
-/// The bundled Zitadel, whichever way it is used.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BundledZitadelAnswer {
-    /// Offered as the version the chart was tested against, and confirmed by the
-    /// administrator: never chosen for them.
-    #[prost(string, tag = "1")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub database: ::core::option::Option<ZitadelDatabaseAnswer>,
-    /// The ranges Zitadel may reach: its directory's, suggested by the wizard and
-    /// confirmed. Patched into Zitadel's egress NetworkPolicy.
-    #[prost(string, repeated, tag = "3")]
-    pub egress_cidrs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The project roles Zitadel issues, which are the firm's own names.
-    #[prost(string, repeated, tag = "4")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// How people sign in through it. For a firm with no directory, the first
-    /// administrator's local account.
-    #[prost(oneof = "bundled_zitadel_answer::Directory", tags = "5, 6, 7")]
-    pub directory: ::core::option::Option<bundled_zitadel_answer::Directory>,
-}
-/// Nested message and enum types in `BundledZitadelAnswer`.
-pub mod bundled_zitadel_answer {
-    /// How people sign in through it. For a firm with no directory, the first
-    /// administrator's local account.
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Directory {
-        #[prost(message, tag = "5")]
-        LocalAccount(super::LocalAccountAnswer),
-        #[prost(message, tag = "6")]
-        Ldap(super::LdapDirectoryAnswer),
-        #[prost(message, tag = "7")]
-        Saml(super::SamlDirectoryAnswer),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LoginBackendAnswer {
-    #[prost(oneof = "login_backend_answer::Backend", tags = "1, 2")]
-    pub backend: ::core::option::Option<login_backend_answer::Backend>,
-}
-/// Nested message and enum types in `LoginBackendAnswer`.
-pub mod login_backend_answer {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Backend {
-        #[prost(message, tag = "1")]
-        Bundled(super::BundledZitadelAnswer),
-        #[prost(message, tag = "2")]
-        Oidc(super::OidcProviderAnswer),
-    }
-}
 /// The addresses a browser uses. In a cloud, from the listing's load balancer
 /// and DNS name; locally, `localhost` names the CLI port-forwards.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AddressesAnswer {
     #[prost(string, tag = "1")]
     pub dashboard_url: ::prost::alloc::string::String,
-    /// Only with the bundled Zitadel: its external domain, port and scheme, as
-    /// one URL.
-    #[prost(string, tag = "2")]
-    pub zitadel_url: ::prost::alloc::string::String,
 }
 /// Who holds deployment admin once the configuration is applied
 /// (spec/installation-and-first-run, requirement 13; decisions/017).
 ///
 /// Named here rather than claimed afterwards. Whoever answers this wizard has
-/// already chosen the deployment's directory, so a code standing between them
-/// and a permission they could take anyway is a ceremony; and on the bundled
-/// route the wizard was already asking for that administrator's login and
-/// password, so the same fact was established twice.
+/// already chosen how people sign in, so a code standing between them and a
+/// permission they could take anyway is a ceremony; and where the deployment
+/// holds the account, the wizard was already asking for that administrator's
+/// login and password, so the same fact was established twice.
 ///
 /// What is written is an ordinary permission -- a user group naming this, and
 /// a permission from it to the built-in deployment-admin access group -- so it
@@ -1571,15 +1495,15 @@ pub mod administrator_answer {
         /// A directory group whose members hold deployment admin. Onboarding then
         /// stays a change in the firm's directory rather than in Meridian.
         ///
-        /// Not checked against the directory, for any backend, and the wizard says
-        /// so rather than implying otherwise: nothing in the deployment speaks
-        /// LDAP, the bundled Zitadel has no database until this configuration is
-        /// applied, and a provider asserts a person's groups inside their own
-        /// token rather than listing a directory's. A misspelled group is a
-        /// deployment nobody can administer, recovered with a claim code.
+        /// Not checked against the directory, and the wizard says so rather than
+        /// implying otherwise: a provider asserts a person's groups inside their
+        /// own token rather than listing a directory's, and first run binds to
+        /// LDAP as an account that may read people, not enumerate every group. A
+        /// misspelled group is a deployment nobody can administer, recovered with
+        /// a claim code.
         #[prost(string, tag = "1")]
         DirectoryGroup(::prost::alloc::string::String),
-        /// The local account the bundled route already creates, by its login.
+        /// The local account the wizard already creates, by its login.
         /// Nothing is typed twice and nothing is matched later: the wizard makes
         /// the account, so the deployment knows exactly whose it is.
         ///
@@ -1656,7 +1580,8 @@ pub struct FirstRunConfiguration {
 pub struct FirstRunApplied {
     #[prost(bool, tag = "1")]
     pub applied: bool,
-    /// Each step taken, in order: Secrets, the NetworkPolicy, scaling, restarts.
+    /// Each step taken, in order: "secrets" (the database), "identity" (how
+    /// people sign in), "addresses", "restart", "rights released".
     #[prost(string, repeated, tag = "2")]
     pub steps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Why it stopped, when it did.

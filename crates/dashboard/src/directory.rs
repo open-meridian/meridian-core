@@ -21,7 +21,7 @@
 //! every person in the tree, and a crafted value closes the filter and opens
 //! another. Values are escaped by RFC 4515.
 
-use ldap3::{LdapConnAsync, Scope, SearchEntry};
+use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 
 /// Where the firm's directory is, and how a person is found in it.
 #[derive(Clone, Debug, Default)]
@@ -29,6 +29,10 @@ pub struct Directory {
     /// In order. The first that answers is used, so a firm may name a replica
     /// and have a sign-in survive one server being down.
     pub servers: Vec<String>,
+    /// Upgrade an `ldap://` connection to TLS before anything is sent. Off,
+    /// a plain `ldap://` server receives the bind and every person's password
+    /// as they were typed; an `ldaps://` one is encrypted either way.
+    pub start_tls: bool,
     /// Where the search starts.
     pub base_dn: String,
     /// Who this deployment searches as. It reads people and their groups and
@@ -253,8 +257,9 @@ impl Directory {
     /// The first server that answers.
     async fn connect(&self) -> Result<(ldap3::Ldap, ldap3::LdapConnAsync), Failure> {
         let mut refusals = Vec::new();
+        let settings = LdapConnSettings::new().set_starttls(self.start_tls);
         for server in &self.servers {
-            match LdapConnAsync::new(server).await {
+            match LdapConnAsync::with_settings(settings.clone(), server).await {
                 Ok((connection, ldap)) => return Ok((ldap, connection)),
                 Err(failed) => refusals.push(format!("{server}: {failed}")),
             }

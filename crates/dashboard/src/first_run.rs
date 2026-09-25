@@ -28,16 +28,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use meridian_domain::v1::bundled_zitadel_answer::Directory;
 use meridian_domain::v1::first_run_check_request::Answer as CheckAnswer;
 use meridian_domain::v1::login_backend_answer::Backend;
 use meridian_domain::v1::{
     administrator_answer::Named, AddressesAnswer, AdministratorAnswer, BroughtDatabase,
-    BundledZitadelAnswer, ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState,
-    EnrolmentStateRequest, FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest,
-    FirstRunConfiguration, FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer,
-    LocalAccountAnswer, LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply,
-    RedeemClaimCodeRequest, RuntimeDatabaseAnswer, SealedCredential,
+    ClaimCodePurpose, DatabaseLogin, EnrolWithCodeRequest, EnrolmentState, EnrolmentStateRequest,
+    FirstRunApplied, FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration,
+    FirstRunSealingKey, FirstRunSealingKeyRequest, LdapDirectoryAnswer, LocalAccountAnswer,
+    LoginBackendAnswer, OidcProviderAnswer, RedeemClaimCodeReply, RedeemClaimCodeRequest,
+    RuntimeDatabaseAnswer, SealedCredential,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -466,9 +465,9 @@ async fn closed(app: &Arc<App>, refusal: &str) -> Response {
 ///
 /// The default is five seconds, which is right for a question a component
 /// answers from memory and wrong for every question on this page. Applying
-/// writes three Secrets, patches a NetworkPolicy, scales the bundled
-/// directory, restarts two Deployments and deletes a RoleBinding: half a
-/// dozen round trips to a cluster's API server. Testing opens a database
+/// writes three Secrets, may start the database this chart brings and make
+/// its roles, restarts two Deployments and deletes a RoleBinding: round trips
+/// to a cluster's API server and a database that may be starting. Testing opens a database
 /// connection, and sometimes an LDAP one, over a network somebody has just
 /// described for the first time.
 ///
@@ -656,58 +655,53 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
         },
     };
 
+    // One of three, and only what the firm has is asked about (decisions/018).
+    // Anything else is refused rather than read as one of them: a form that
+    // arrived without a choice has nothing true to default to.
     let backend = match field("backend").as_str() {
         // The firm's own provider. Nothing of ours signs anybody in.
-        "oidc" => LoginBackendAnswer {
-            backend: Some(Backend::Oidc(OidcProviderAnswer {
-                issuer: field("oidc_issuer"),
-                client_id: field("oidc_client_id"),
-                client_secret: match field("oidc_client_secret").as_str() {
-                    "" => None,
-                    secret => Some(seal_field("oidc.client_secret", secret)?),
-                },
-                groups_claim: field("oidc_groups_claim"),
-                trusted_audiences: split(&field("oidc_trusted_audiences")),
-            })),
-        },
-        _ => LoginBackendAnswer {
-            // The firm's LDAP, or an account this deployment holds. Nothing
-            // of ours signs anybody in either way (decisions/018), so the
-            // fields that configured an identity server are gone and this
-            // message carries only what the firm was asked about. Its name
-            // is the last of it, and changing that is a contract revision of
-            // its own.
-            backend: Some(Backend::Bundled(BundledZitadelAnswer {
-                directory: match field("directory").as_str() {
-                    "ldap" => Some(Directory::Ldap(LdapDirectoryAnswer {
-                        name: field("ldap_name"),
-                        servers: split(&field("ldap_servers")),
-                        start_tls: field("ldap_start_tls") == "on",
-                        base_dn: field("ldap_base_dn"),
-                        bind_dn: field("ldap_bind_dn"),
-                        bind_password: Some(seal_field(
-                            "ldap.bind_password",
-                            &field("ldap_bind_password"),
-                        )?),
-                        user_object_class: field("ldap_user_object_class"),
-                        user_filter: field("ldap_user_filter"),
-                    })),
-                    // A firm with no directory of its own: the deployment
-                    // holds the account, and first run makes it.
-                    _ => Some(Directory::LocalAccount(LocalAccountAnswer {
-                        login_name: field("admin_login"),
-                        email: field("admin_email"),
-                        given_name: field("admin_given_name"),
-                        family_name: field("admin_family_name"),
-                        initial_password: Some(seal_field(
-                            "local_account.initial_password",
-                            &field("admin_password"),
-                        )?),
-                    })),
-                },
-                ..Default::default()
-            })),
-        },
+        "oidc" => Backend::Oidc(OidcProviderAnswer {
+            issuer: field("oidc_issuer"),
+            client_id: field("oidc_client_id"),
+            client_secret: match field("oidc_client_secret").as_str() {
+                "" => None,
+                secret => Some(seal_field("oidc.client_secret", secret)?),
+            },
+            groups_claim: field("oidc_groups_claim"),
+            trusted_audiences: split(&field("oidc_trusted_audiences")),
+        }),
+        // The firm's LDAP, which the dashboard binds to itself.
+        "ldap" => Backend::Ldap(LdapDirectoryAnswer {
+            servers: split(&field("ldap_servers")),
+            start_tls: field("ldap_start_tls") == "on",
+            base_dn: field("ldap_base_dn"),
+            bind_dn: field("ldap_bind_dn"),
+            bind_password: Some(seal_field(
+                "ldap.bind_password",
+                &field("ldap_bind_password"),
+            )?),
+            user_filter: field("ldap_user_filter"),
+        }),
+        // A firm with no directory of its own: the deployment holds the
+        // account, and first run makes it.
+        "local" => Backend::LocalAccount(LocalAccountAnswer {
+            login_name: field("admin_login"),
+            email: field("admin_email"),
+            given_name: field("admin_given_name"),
+            family_name: field("admin_family_name"),
+            initial_password: Some(seal_field(
+                "local_account.initial_password",
+                &field("admin_password"),
+            )?),
+        }),
+        other => {
+            return Err(format!(
+                "choose how people sign in: {other:?} is not one of the three ways"
+            ))
+        }
+    };
+    let backend = LoginBackendAnswer {
+        backend: Some(backend),
     };
 
     Ok(Answers {
@@ -715,10 +709,6 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
         backend,
         addresses: AddressesAnswer {
             dashboard_url: field("dashboard_url"),
-            // Nothing of ours has an address to send a browser to any more
-            // (decisions/018). The field remains on the message until it is
-            // renamed, which is a contract revision of its own.
-            zitadel_url: String::new(),
         },
         administrator: administrator(fields),
     })
@@ -726,9 +716,9 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
 
 /// Who administers this deployment once it is configured (W7.5).
 ///
-/// One of two, and the form offers exactly the one that applies: on the
-/// bundled directory with a local account, that account is the administrator
-/// and there is nothing to ask twice; otherwise a directory group, because a
+/// One of two, and the form offers exactly the one that applies: where the
+/// deployment holds the account, that account is the administrator and there
+/// is nothing to ask twice; otherwise a directory group, because a
 /// person cannot be named before they have signed in once -- a login is
 /// matched against the issuer and subject joined, which nobody knows in
 /// advance (`design/naming-a-person-before-they-sign-in`).
@@ -744,7 +734,7 @@ fn administrator(fields: &Fields) -> AdministratorAnswer {
     // The local account route names itself. The wizard is already asking for
     // that login and password on this page, and asking again for the same
     // fact is how two answers come to disagree.
-    let named = match (field("directory"), field("admin_login")) {
+    let named = match (field("backend"), field("admin_login")) {
         ("local", login) if !login.is_empty() => Named::LocalAccountLogin(login.to_string()),
         _ => Named::DirectoryGroup(field("admin_group").to_string()),
     };
@@ -781,6 +771,34 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"off\"></label>"
         )
     };
+    // A choice keeps what was chosen. A page re-rendered after a failed test
+    // used to show every select at its first option, so correcting a typo
+    // and testing again quietly switched the database route or the way
+    // people sign in back to the default.
+    let choice = |name: &str, label: &str, options: &[(&str, &str)]| {
+        let chosen = fields.get(name).map(String::as_str).unwrap_or_default();
+        format!(
+            "<label>{label}<select name=\"{name}\">{}</select></label>",
+            options
+                .iter()
+                .map(|(option, said)| format!(
+                    "<option value=\"{option}\"{}>{}</option>",
+                    if *option == chosen { " selected" } else { "" },
+                    escape(said)
+                ))
+                .collect::<String>()
+        )
+    };
+    let flag = |name: &str, label: &str| {
+        format!(
+            "<label><input type=\"checkbox\" name=\"{name}\" value=\"on\"{}> {label}</label>",
+            if fields.get(name).map(String::as_str) == Some("on") {
+                " checked"
+            } else {
+                ""
+            }
+        )
+    };
 
     let told = if findings.is_empty() {
         if passed.is_empty() {
@@ -798,94 +816,129 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
         )
     };
 
+    let database = [
+        choice(
+            "db_route",
+            "Database",
+            &[
+                ("external", "Use a database you already run"),
+                ("brought", "Start one inside this cluster"),
+            ],
+        ),
+        "<p><strong>Inside this cluster</strong> is for trying the product and for \
+         development. Nothing is asked of you: it is started here, and its roles and \
+         passwords are made here. It keeps its data if Meridian is removed and installed \
+         again. It loses everything if this cluster is deleted. Nobody backs it up.</p>\
+         <p><strong>A database you already run</strong> -- your own Postgres, one in \
+         Docker, a managed one from your cloud -- is what anything you depend on should \
+         use. It needs two roles: the migrating role may create a table and the serving \
+         role must not. Both are tested before anything is written.</p>"
+            .to_string(),
+        text("db_host", "Host", "postgres.firm.internal"),
+        text("db_port", "Port", "5432"),
+        text("db_name", "Database", "meridian"),
+        text("db_sslmode", "TLS mode", "verify-full"),
+        text("db_serving_role", "Serving role", "meridian_app"),
+        secret("db_serving_password", "Serving password"),
+        text("db_migrating_role", "Migrating role", "meridian_migrate"),
+        secret("db_migrating_password", "Migrating password"),
+    ]
+    .concat();
+
+    // One question, three answers, and each asks only about what the firm
+    // has. Nothing here names software the firm did not choose.
+    let signing_in = [
+        "<p>Connect what your firm already has, or, if it has nothing, let this \
+         deployment hold an account for you. Answer only the part you choose.</p>"
+            .to_string(),
+        choice(
+            "backend",
+            "How people sign in",
+            &[
+                ("local", "We have no directory: make me an account"),
+                ("ldap", "Our LDAP or Active Directory"),
+                ("oidc", "Our own OpenID Connect provider"),
+            ],
+        ),
+        "<h3>An account here</h3>".to_string(),
+        text("admin_login", "Your login name", ""),
+        text("admin_email", "Your email", ""),
+        text("admin_given_name", "Given name", ""),
+        text("admin_family_name", "Family name", ""),
+        secret("admin_password", "Your password"),
+        "<h3>Your LDAP</h3>".to_string(),
+        text(
+            "ldap_servers",
+            "Servers, in order",
+            "ldaps://ldap.firm.internal:636",
+        ),
+        flag(
+            "ldap_start_tls",
+            "Use StartTLS (for an ldap:// address; an ldaps:// one is already encrypted)",
+        ),
+        text(
+            "ldap_base_dn",
+            "Where people are",
+            "ou=people,dc=firm,dc=internal",
+        ),
+        text("ldap_bind_dn", "Account this deployment searches as", ""),
+        secret("ldap_bind_password", "Its password"),
+        text(
+            "ldap_user_filter",
+            "How a person is found ({} is the name typed)",
+            "(uid={})",
+        ),
+        "<h3>Your OpenID Connect provider</h3>".to_string(),
+        text(
+            "oidc_issuer",
+            "Issuer, exactly as the provider states it",
+            "https://login.firm.example",
+        ),
+        text("oidc_client_id", "Client id", ""),
+        secret(
+            "oidc_client_secret",
+            "Client secret (none for a public client)",
+        ),
+        text("oidc_groups_claim", "Groups claim", "groups"),
+        text(
+            "oidc_trusted_audiences",
+            "Other audiences a token may name, comma-separated (most providers need none)",
+            "",
+        ),
+    ]
+    .concat();
+
     page(
         "Set up this deployment",
         &format!(
             "<h1>Set up this deployment</h1>{told}\
              <form method=\"post\">\
-             <h2>Database</h2>\
-             <label>Database<select name=\"db_route\">\
-             <option value=\"external\">Use a database you already run</option>\
-             <option value=\"brought\">Start one inside this cluster</option>\
-             </select></label>\
-             <p><strong>Inside this cluster</strong> is for trying the \
-             product and for development. Nothing is asked of you: it is \
-             started here, and its roles and passwords are made here. It \
-             keeps its data if Meridian is removed and installed again. It \
-             loses everything if this cluster is deleted. Nobody backs it \
-             up.</p>\
-             <p><strong>A database you already run</strong> -- your own \
-             Postgres, one in Docker, a managed one from your cloud -- is \
-             what anything you depend on should use. It needs two roles: the \
-             migrating role may create a table and the serving role must \
-             not. Both are tested before anything is written.</p>\
-             {}{}{}{}\
-             {}{}\
-             {}{}\
-             <h2>Signing in</h2>\
-             <p>Connect the firm's provider, or let this deployment sign \
-             people in against their LDAP or against accounts it holds \
-             itself. Nothing else runs here either way.</p>\
-             <label>Backend<select name=\"backend\">\
-             <option value=\"bundled\">This deployment signs them in</option>\
-             <option value=\"oidc\">The firm's own OpenID Connect provider</option>\
-             </select></label>\
-             <label>Directory<select name=\"directory\">\
-             <option value=\"local\">No directory: make me an account</option>\
-             <option value=\"ldap\">Connect the firm's LDAP</option>\
-             </select></label>\
-             {}{}{}{}\
-             {}{}{}{}\
-             {}{}{}{}\
+             <h2>Database</h2>{database}\
+             <h2>Signing in</h2>{signing_in}\
              <h2>Administrators</h2>\
-             <p>Who runs this deployment once it is set up. With a directory, \
-             name a group: its members hold deployment admin, and adding \
-             somebody later is a change in your directory rather than here. \
-             With no directory, the account above is the administrator and \
+             <p>Who runs this deployment once it is set up. With LDAP or a \
+             provider, name a group: its members hold deployment admin, and \
+             adding somebody later is a change in your directory rather than \
+             here. With an account here, that account is the administrator and \
              this is left empty.</p>\
-             <p><strong>The group is not checked.</strong> A directory \
-             states a person's groups when they sign in; it is not asked to \
-             list them, and the bundled directory has no database until this \
-             page is applied. Spell it carefully: a group that does not exist \
-             is a deployment nobody can administer, and getting back in then \
-             means a claim code from the platform.</p>\
+             <p><strong>The group is not checked.</strong> A directory states a \
+             person's groups when they sign in; it is not asked to list them. \
+             Spell it carefully: a group that does not exist is a deployment \
+             nobody can administer, and getting back in then means a claim code \
+             from the platform.</p>\
              {}\
              <h2>Addresses</h2>\
-             <p>Where a browser reaches this deployment. A firm's own \
-             provider sends people back to it.</p>\
+             <p>Where a browser reaches this deployment. A firm's own provider \
+             sends people back to it.</p>\
              {}\
              <h2>Apply</h2>\
              <p>Test as often as you like: nothing is written until you apply. \
-             Applying writes it all at once and restarts what changed. When \
-             it is done, the administrators named above sign in through the \
-             directory you configured; nothing else is redeemed.</p>\
+             Applying writes it all at once and restarts what changed. When it \
+             is done, the administrators named above sign in the way you chose; \
+             nothing else is redeemed.</p>\
              <button type=\"submit\" formaction=\"/first-run/check\">Test</button>\
              <button type=\"submit\" formaction=\"/first-run/apply\">Apply</button>\
              </form>",
-            text("db_host", "Host", "postgres.firm.internal"),
-            text("db_port", "Port", "5432"),
-            text("db_name", "Database", "meridian"),
-            text("db_sslmode", "TLS mode", "verify-full"),
-            text("db_serving_role", "Serving role", "meridian_app"),
-            secret("db_serving_password", "Serving password"),
-            text("db_migrating_role", "Migrating role", "meridian_migrate"),
-            secret("db_migrating_password", "Migrating password"),
-            text("admin_login", "Your login name", ""),
-            text("admin_email", "Your email", ""),
-            text("admin_given_name", "Given name", ""),
-            secret("admin_password", "Your password"),
-            text(
-                "ldap_servers",
-                "LDAP servers",
-                "ldaps://ldap.firm.internal:636"
-            ),
-            text("ldap_base_dn", "Base DN", "dc=firm,dc=internal"),
-            text("ldap_bind_dn", "Bind DN", ""),
-            secret("ldap_bind_password", "Bind password"),
-            text("oidc_issuer", "Issuer", "https://directory.firm.example"),
-            text("oidc_client_id", "Client id", ""),
-            secret("oidc_client_secret", "Client secret"),
-            text("oidc_groups_claim", "Groups claim", "groups"),
             text(
                 "admin_group",
                 "Administrators' directory group",

@@ -35,13 +35,11 @@ DATABASE_PASSWORD = os.environ["E2E_DATABASE_PASSWORD"]
 # depends on; `brought` starts one in the cluster, which is what somebody
 # trying the product does and what needs nothing of them.
 ROUTE = os.environ.get("E2E_DB_ROUTE", "external")
-# Which way people sign in. `bundled` is what this deployment does itself;
-# `oidc` is the firm's own provider, and the deployment is still installed with
-# the bundle rendered -- which is the combination that keeps the choice open
-# until the wizard, and the combination three defects hid in until 2026-09-23:
-# the issuer was written where the chart does not read it, the groups claim was
-# collected and dropped, and nothing here walked the route to notice either.
-BACKEND = os.environ.get("E2E_BACKEND", "bundled")
+# Which way people sign in: `local`, an account this deployment holds, or
+# `oidc`, the firm's own provider. Three defects hid in the second until
+# 2026-09-23, because nothing here walked it: the issuer was written where the
+# chart does not read it, and the groups claim was collected and dropped.
+BACKEND = os.environ.get("E2E_BACKEND", "local")
 
 # On the brought route the names are ones the harness has not prepared, so
 # that finding them afterwards means the Job made them rather than that they
@@ -58,8 +56,8 @@ ANSWERS = {
     "db_sslmode": "disable",
     "db_serving_role": "firstrun_app", "db_serving_password": DATABASE_PASSWORD,
     "db_migrating_role": "firstrun_migrate", "db_migrating_password": DATABASE_PASSWORD,
-    "backend": "bundled",
-    "directory": "local", "admin_login": "ada", "admin_password": "Password1!",
+    "backend": "local", "admin_login": "ada", "admin_password": "Password1!",
+    "admin_given_name": "Ada", "admin_family_name": "Park",
     "dashboard_url": "http://dashboard-first-run:8080",
     # W7.5: who administers this deployment once it is configured. The local
     # account route names itself, so this stays empty there and the wizard
@@ -88,12 +86,8 @@ if BACKEND == "oidc":
         "oidc_client_id": "meridian-dashboard",
         "oidc_client_secret": "shh-dev-only",
         "oidc_groups_claim": FIRMS_GROUPS_CLAIM,
-        # Not using the bundle, so it is given no address. Leaving one would
-        # have written its issuer over the firm's and hidden the defect this
-        # route exists to catch.
-        # A directory states a person's groups, so the administrators are a
+        # A provider states a person's groups, so the administrators are a
         # group rather than the one account the local route creates.
-        "directory": "ldap",
         "admin_login": "",
         "admin_group": ADMIN_GROUP,
     })
@@ -301,7 +295,7 @@ def main():
     addresses = state["secrets"].get("first-run-addresses", {})
     s.check(addresses.get("dashboard-url") == ANSWERS["dashboard_url"],
             "where a browser reaches this deployment was written, not left in a values file")
-    if BACKEND == "bundled" and ANSWERS.get("admin_login"):
+    if BACKEND == "local" and ANSWERS.get("admin_login"):
         # The first administrator's account. Collected and discarded until
         # 2026-09-24: the wizard sealed a login and a password and nothing
         # opened them, so this branch produced a deployment holding an
