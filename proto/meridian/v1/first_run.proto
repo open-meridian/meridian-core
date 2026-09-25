@@ -133,40 +133,77 @@ message BroughtDatabase {
   string serving_role = 1;
   string migrating_role = 2;
 
-  // And the database they live in, beside Zitadel's own on the same server.
+  // And the database they live in.
   string database = 3;
 }
 
-// The firm's LDAP directory, brokered by the bundled Zitadel. The chart's
-// identity.bundled.ldap settings, answered in the wizard instead.
+// How people sign in: one of three, each asking only about what the firm has
+// (decisions/018). Nothing here names an identity server, because the
+// deployment runs none -- it federates to the firm's provider, binds to their
+// LDAP, or holds the accounts itself.
+message LoginBackendAnswer {
+  // The bundled identity server, with its version, database, egress ranges and
+  // roles. Removed with it on 2026-09-25; never to be reused.
+  reserved 1;
+  reserved "bundled";
+
+  oneof backend {
+    OidcProviderAnswer oidc = 2;
+    LdapDirectoryAnswer ldap = 3;
+    LocalAccountAnswer local_account = 4;
+  }
+}
+
+// The firm's own OpenID Connect provider. The dashboard federates to it and
+// nothing of ours signs anybody in.
+message OidcProviderAnswer {
+  // Exactly as the provider states it in its discovery document: the
+  // dashboard checks every token's `iss` against this string, and first run
+  // reads the document before it passes the answer.
+  string issuer = 1;
+  string client_id = 2;
+
+  // Absent for a public client, which PKCE makes safe.
+  SealedCredential client_secret = 3;
+
+  // The claim carrying a person's groups. Empty is `groups`.
+  string groups_claim = 4;
+
+  // Audiences besides the client id that an ID token may also name. Some
+  // providers add the project the client belongs to, and a token naming an
+  // audience not listed here is refused (OpenID Connect Core 3.1.3.7).
+  repeated string trusted_audiences = 5;
+}
+
+// The firm's LDAP, bound to by the dashboard itself.
 message LdapDirectoryAnswer {
-  string name = 1;
+  // A display name and a user object class, which configured the identity
+  // server that used to broker LDAP. The filter below finds a person.
+  reserved 1, 7;
+  reserved "name", "user_object_class";
+
+  // In order; the first that answers is used.
   repeated string servers = 2;
+
+  // Upgrade an `ldap://` connection before anything is sent, so the bind and
+  // every person's password are encrypted. An `ldaps://` address already is,
+  // and asking for both is refused.
   bool start_tls = 3;
+
+  // Where people are searched for, and who searches: an account that can
+  // read people and their groups and nothing else.
   string base_dn = 4;
   string bind_dn = 5;
   SealedCredential bind_password = 6;
-  string user_object_class = 7;
+
+  // How a person is found from what they typed; `{}` is the name, escaped.
+  // Empty is `(uid={})`.
   string user_filter = 8;
 }
 
-// The firm's SAML directory, brokered by the bundled Zitadel. Zitadel maps no
-// profile attributes from SAML, so the group hook takes these names (spec
-// `deployment-dashboard-and-access`).
-message SamlDirectoryAnswer {
-  // One of the two.
-  string metadata_url = 1;
-  bytes metadata_xml = 2;
-
-  string groups_attribute = 3;
-  string username_attribute = 4;
-  string given_name_attribute = 5;
-  string family_name_attribute = 6;
-  string email_attribute = 7;
-}
-
-// The first administrator's account in the bundled Zitadel, for a firm with no
-// directory of its own.
+// An account this deployment holds, for a firm with no directory of its own:
+// the first administrator's. First run hashes the password and the dashboard
+// makes the account; nobody else ever sees the password.
 message LocalAccountAnswer {
   string login_name = 1;
   string email = 2;
@@ -175,89 +212,24 @@ message LocalAccountAnswer {
   SealedCredential initial_password = 5;
 }
 
-// The firm's own OIDC provider, which leaves the bundled Zitadel at zero
-// replicas. The chart's dashboard.oidc settings, answered in the wizard.
-message OidcProviderAnswer {
-  string issuer = 1;
-  string client_id = 2;
-  SealedCredential client_secret = 3;
-  string groups_claim = 4;
-  repeated string trusted_audiences = 5;
-}
-
-// Where the bundled Zitadel's own data lives. Its database and role are the
-// administrator's (spec `deployment-dashboard-and-access` ruling 16).
-message ZitadelDatabaseAnswer {
-  oneof route {
-    // A database and role the firm's database administrator made, from
-    // statements the wizard showed them.
-    DatabaseLogin existing = 1;
-
-    // Created once, in W7.5, with a privileged connection that is then
-    // forgotten: never stored, never handed to Zitadel. A test does not
-    // create anything.
-    CreateZitadelDatabase create = 2;
-  }
-}
-
-message CreateZitadelDatabase {
-  DatabaseLogin privileged = 1;
-
-  // What to create, and the login Zitadel will hold. Never the superuser.
-  string database = 2;
-  string role = 3;
-  SealedCredential role_password = 4;
-}
-
-// The bundled Zitadel, whichever way it is used.
-message BundledZitadelAnswer {
-  // Offered as the version the chart was tested against, and confirmed by the
-  // administrator: never chosen for them.
-  string version = 1;
-
-  ZitadelDatabaseAnswer database = 2;
-
-  // The ranges Zitadel may reach: its directory's, suggested by the wizard and
-  // confirmed. Patched into Zitadel's egress NetworkPolicy.
-  repeated string egress_cidrs = 3;
-
-  // The project roles Zitadel issues, which are the firm's own names.
-  repeated string roles = 4;
-
-  // How people sign in through it. For a firm with no directory, the first
-  // administrator's local account.
-  oneof directory {
-    LocalAccountAnswer local_account = 5;
-    LdapDirectoryAnswer ldap = 6;
-    SamlDirectoryAnswer saml = 7;
-  }
-}
-
-message LoginBackendAnswer {
-  oneof backend {
-    BundledZitadelAnswer bundled = 1;
-    OidcProviderAnswer oidc = 2;
-  }
-}
-
 // The addresses a browser uses. In a cloud, from the listing's load balancer
 // and DNS name; locally, `localhost` names the CLI port-forwards.
 message AddressesAnswer {
   string dashboard_url = 1;
 
-  // Only with the bundled Zitadel: its external domain, port and scheme, as
-  // one URL.
-  string zitadel_url = 2;
+  // The identity server's own address. Removed with it; never to be reused.
+  reserved 2;
+  reserved "zitadel_url";
 }
 
 // Who holds deployment admin once the configuration is applied
 // (spec/installation-and-first-run, requirement 13; decisions/017).
 //
 // Named here rather than claimed afterwards. Whoever answers this wizard has
-// already chosen the deployment's directory, so a code standing between them
-// and a permission they could take anyway is a ceremony; and on the bundled
-// route the wizard was already asking for that administrator's login and
-// password, so the same fact was established twice.
+// already chosen how people sign in, so a code standing between them and a
+// permission they could take anyway is a ceremony; and where the deployment
+// holds the account, the wizard was already asking for that administrator's
+// login and password, so the same fact was established twice.
 //
 // What is written is an ordinary permission -- a user group naming this, and
 // a permission from it to the built-in deployment-admin access group -- so it
@@ -267,15 +239,15 @@ message AdministratorAnswer {
     // A directory group whose members hold deployment admin. Onboarding then
     // stays a change in the firm's directory rather than in Meridian.
     //
-    // Not checked against the directory, for any backend, and the wizard says
-    // so rather than implying otherwise: nothing in the deployment speaks
-    // LDAP, the bundled Zitadel has no database until this configuration is
-    // applied, and a provider asserts a person's groups inside their own
-    // token rather than listing a directory's. A misspelled group is a
-    // deployment nobody can administer, recovered with a claim code.
+    // Not checked against the directory, and the wizard says so rather than
+    // implying otherwise: a provider asserts a person's groups inside their
+    // own token rather than listing a directory's, and first run binds to
+    // LDAP as an account that may read people, not enumerate every group. A
+    // misspelled group is a deployment nobody can administer, recovered with
+    // a claim code.
     string directory_group = 1;
 
-    // The local account the bundled route already creates, by its login.
+    // The local account the wizard already creates, by its login.
     // Nothing is typed twice and nothing is matched later: the wizard makes
     // the account, so the deployment knows exactly whose it is.
     //
@@ -347,7 +319,8 @@ message FirstRunConfiguration {
 message FirstRunApplied {
   bool applied = 1;
 
-  // Each step taken, in order: Secrets, the NetworkPolicy, scaling, restarts.
+  // Each step taken, in order: "secrets" (the database), "identity" (how
+  // people sign in), "addresses", "restart", "rights released".
   repeated string steps = 2;
 
   // Why it stopped, when it did.

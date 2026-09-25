@@ -74,7 +74,7 @@ IDP_ISSUER = os.environ.get("E2E_IDP_ISSUER", "http://host.docker.internal:18100
 WAYS_IN = {
     "local": {
         "answers": {
-            "directory": "local",
+            "backend": "local",
             "admin_login": "ada",
             "admin_email": "ada@example.org",
             "admin_given_name": "Ada",
@@ -89,7 +89,7 @@ WAYS_IN = {
     },
     "ldap": {
         "answers": {
-            "directory": "ldap",
+            "backend": "ldap",
             "ldap_servers": LDAP_SERVER,
             "ldap_base_dn": "ou=people,dc=example,dc=org",
             "ldap_bind_dn": "cn=admin,dc=example,dc=org",
@@ -398,7 +398,6 @@ def main():
             "db_name": "meridian",
             "db_serving_role": "meridian_app",
             "db_migrating_role": "meridian_migrate",
-            "backend": "bundled",
             **WAY_IN["answers"],
             **(
                 {}

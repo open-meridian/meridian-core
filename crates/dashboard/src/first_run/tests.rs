@@ -453,8 +453,8 @@ async fn applying_waits_for_a_job_slower_than_a_question_from_memory() {
     // The bug this pins reached the end-to-end test as an intermittent
     // failure and was recorded there as a flake for a day. The dashboard
     // asked the Job to apply and waited the bus default of five seconds.
-    // Applying writes three Secrets, patches a NetworkPolicy, scales the
-    // bundled directory, restarts two Deployments and deletes a RoleBinding;
+    // Applying writes three Secrets, may start a database and make its
+    // roles, restarts two Deployments and deletes a RoleBinding;
     // when that took longer, the Job finished the work and the dashboard
     // stopped listening. The deployment was configured, the wizard said the
     // Job had not answered, and the first administrator's code was never
@@ -499,8 +499,7 @@ fn wizard_app() -> Arc<App> {
 const ANSWERS: &str = "db_host=db.firm.internal&db_port=5432&db_name=meridian\
 &db_serving_role=meridian_app&db_serving_password=hunter2\
 &db_migrating_role=meridian_migrate&db_migrating_password=hunter2\
-&backend=bundled\
-&directory=local&admin_login=ada&admin_password=hunter2\
+&backend=local&admin_login=ada&admin_password=hunter2\
 &dashboard_url=https://meridian.firm.example";
 
 #[tokio::test]
@@ -553,4 +552,62 @@ async fn the_wizard_refuses_anybody_without_a_session() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("first-run/claim"), "the closed page: {body}");
+}
+
+#[test]
+fn a_page_shown_again_keeps_what_was_chosen() {
+    // Re-rendered after a failed test, every select used to fall back to its
+    // first option: correcting a typo and testing again quietly switched a
+    // firm that chose LDAP to an account held here, and an external database
+    // to one started in the cluster.
+    let fields: Fields = [
+        ("backend".to_string(), "ldap".to_string()),
+        ("db_route".to_string(), "brought".to_string()),
+        ("ldap_start_tls".to_string(), "on".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let page = open_page(&fields, &["a finding".to_string()], "");
+
+    assert!(page.contains("<option value=\"ldap\" selected>"), "{page}");
+    assert!(
+        !page.contains("<option value=\"local\" selected>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("<option value=\"brought\" selected>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("name=\"ldap_start_tls\" value=\"on\" checked"),
+        "{page}"
+    );
+}
+
+#[test]
+fn the_page_asks_three_ways_and_names_nothing_the_firm_did_not_choose() {
+    let page = open_page(&Fields::default(), &[], "");
+    for option in ["local", "ldap", "oidc"] {
+        assert!(
+            page.contains(&format!("<option value=\"{option}\"")),
+            "{option}"
+        );
+    }
+    for field in [
+        "ldap_start_tls",
+        "ldap_user_filter",
+        "oidc_trusted_audiences",
+        "admin_family_name",
+    ] {
+        assert!(
+            page.contains(&format!("name=\"{field}\"")),
+            "{field} is read and never asked for"
+        );
+    }
+    let lower = page.to_lowercase();
+    assert!(
+        !lower.contains("zitadel") && !lower.contains("bundled"),
+        "{page}"
+    );
 }

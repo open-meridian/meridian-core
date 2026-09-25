@@ -24,6 +24,7 @@ fn directory() -> Directory {
     );
     Directory {
         servers: vec![url],
+        start_tls: false,
         base_dn: PEOPLE.into(),
         bind_dn: "cn=admin,dc=example,dc=org".into(),
         bind_password: "ldap-admin-dev-only".into(),
@@ -194,5 +195,26 @@ async fn no_server_answering_fails_the_check() {
     match nowhere.check().await {
         Err(Failure::Unreachable(_)) => {}
         other => panic!("expected unreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn start_tls_is_asked_of_the_server_and_not_assumed() {
+    // The test directory speaks no TLS. Asked to upgrade, the connection has
+    // to fail: a client that ignored the setting would bind in the clear and
+    // pass, which is what the contract carried and the code did until
+    // 2026-09-25.
+    let upgrading = Directory {
+        start_tls: true,
+        ..directory()
+    };
+    match upgrading.check().await {
+        Err(_) => {}
+        Ok(()) => panic!("a server with no TLS cannot have been upgraded to it"),
+    }
+    match upgrading.authenticate("alice", "alicepass").await {
+        Err(Failure::Refused) => panic!("a TLS failure is not a wrong password"),
+        Err(_) => {}
+        Ok(_) => panic!("signed in over a connection that was meant to be encrypted and was not"),
     }
 }

@@ -8,19 +8,18 @@
 //!   rights that did the writing.
 //!
 //! A check never writes. That is worth stating because one of the answers is
-//! "create Zitadel's database with this privileged connection", and the
-//! difference between testing that and doing it is the difference between a
-//! wizard somebody can back out of and one they cannot
-//! (spec/installation-and-first-run, requirement 14).
+//! "start a database here and make its roles", and the difference between
+//! testing that and doing it is the difference between a wizard somebody can
+//! back out of and one they cannot (spec/installation-and-first-run,
+//! requirement 14).
 
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::{
-    administrator_answer::Named, bundled_zitadel_answer::Directory,
-    first_run_check_request::Answer, login_backend_answer::Backend, AddressesAnswer,
-    AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied, FirstRunCheckReply,
-    FirstRunCheckRequest, FirstRunConfiguration, LdapDirectoryAnswer, LoginBackendAnswer,
-    OidcProviderAnswer, RuntimeDatabaseAnswer,
+    administrator_answer::Named, first_run_check_request::Answer, login_backend_answer::Backend,
+    AddressesAnswer, AdministratorAnswer, BroughtDatabase, DatabaseLogin, FirstRunApplied,
+    FirstRunCheckReply, FirstRunCheckRequest, FirstRunConfiguration, LdapDirectoryAnswer,
+    LoginBackendAnswer, OidcProviderAnswer, RuntimeDatabaseAnswer,
 };
 
 use crate::cluster::{Cluster, Workload};
@@ -122,9 +121,6 @@ pub struct NewRole {
     /// database by restarting is the finding this wizard exists to make
     /// impossible.
     pub may_create: bool,
-    /// Whether it owns the database, which is what a component that runs its
-    /// own migrations needs -- Zitadel does, and the runtime's roles do not.
-    pub owns_database: bool,
 }
 
 /// Makes a database and its roles, with a privileged connection used once.
@@ -244,19 +240,16 @@ impl FirstRun {
 
     fn check_backend(&self, backend: &LoginBackendAnswer) -> Vec<String> {
         match &backend.backend {
-            Some(Backend::Bundled(bundled)) => match &bundled.directory {
-                // The firm's LDAP, bound to from here as the dashboard will
-                // bind to it. Until 2026-09-25 this arm was the next one's:
-                // any LDAP answer passed, and a wrong address or password was
-                // found by the first person who could not sign in, after the
-                // configuration had been applied.
-                Some(Directory::Ldap(ldap)) => self.check_ldap(ldap),
-                // Where the firm has no directory at all, this deployment
-                // holds the account (decisions/018) and there is nothing to
-                // connect to: the Job hashes the password, and the dashboard
-                // makes the account.
-                _ => Vec::new(),
-            },
+            // The firm's LDAP, bound to from here as the dashboard will bind
+            // to it. Until 2026-09-25 any LDAP answer passed, and a wrong
+            // address or password was found by the first person who could
+            // not sign in, after the configuration had been applied.
+            Some(Backend::Ldap(ldap)) => self.check_ldap(ldap),
+            // Where the firm has no directory at all, this deployment holds
+            // the account (decisions/018) and there is nothing to connect to:
+            // the Job hashes the password, and the dashboard makes the
+            // account.
+            Some(Backend::LocalAccount(_)) => Vec::new(),
             Some(Backend::Oidc(oidc)) => {
                 let mut findings = Vec::new();
                 if oidc.issuer.trim().is_empty() {
@@ -290,6 +283,20 @@ impl FirstRun {
         }
         if ldap.bind_dn.trim().is_empty() {
             findings.push("no bind DN for this deployment to search as".to_string());
+        }
+        // StartTLS upgrades a plain connection; one that is already TLS has
+        // nothing to upgrade, and asking for both is a misunderstanding worth
+        // saying rather than a handshake failure worth debugging.
+        if ldap.start_tls
+            && ldap
+                .servers
+                .iter()
+                .any(|server| server.trim().starts_with("ldaps://"))
+        {
+            findings.push(
+                "StartTLS is for ldap:// addresses; an ldaps:// address is already encrypted"
+                    .to_string(),
+            );
         }
         // Empty means the default, `(uid={})`. One without the placeholder
         // finds the same entry whatever anybody types at sign-in.
@@ -458,13 +465,11 @@ impl FirstRun {
                     name: role_or(&brought.serving_role, "meridian_app"),
                     password: server.serving_password.clone(),
                     may_create: false,
-                    owns_database: false,
                 },
                 NewRole {
                     name: role_or(&brought.migrating_role, "meridian_migrate"),
                     password: server.migrating_password.clone(),
                     may_create: true,
-                    owns_database: false,
                 },
             ],
         };
@@ -598,47 +603,45 @@ impl FirstRun {
         };
 
         match backend {
-            Backend::Bundled(bundled) => {
-                // On the route that brings a database, Zitadel's lives on the
-                if let Some(meridian_domain::v1::bundled_zitadel_answer::Directory::Ldap(ldap)) =
-                    &bundled.directory
-                {
-                    let password = ldap
-                        .bind_password
-                        .as_ref()
-                        .ok_or("no LDAP bind password".to_string())
-                        .and_then(|sealed| self.key.open(sealed, "ldap.bind_password"))?;
-                    // The whole connection, not only the password. The
-                    // dashboard binds to this directory itself now
-                    // (decisions/018), so what it needs is where the servers
-                    // are and how a person is found in them -- which the
-                    // wizard has always asked for and which used to be
-                    // configured into something else.
-                    let mut values = BTreeMap::from([
-                        ("password".to_string(), password),
-                        ("servers".to_string(), ldap.servers.join(",").into_bytes()),
-                        ("base-dn".to_string(), ldap.base_dn.clone().into_bytes()),
-                        ("bind-dn".to_string(), ldap.bind_dn.clone().into_bytes()),
-                    ]);
-                    // `{}` is where the name somebody typed goes, escaped.
-                    // A firm that said nothing gets the common case rather
-                    // than a filter that matches nobody.
-                    let filter = match ldap.user_filter.trim() {
-                        "" => "(uid={})".to_string(),
-                        given => given.to_string(),
-                    };
-                    values.insert("user-filter".to_string(), filter.into_bytes());
-                    self.cluster
-                        .put_secret(&self.names.ldap_bind_secret, &values)
-                        .await
-                        .map_err(|failed| failed.to_string())?;
+            Backend::LocalAccount(_) => Ok(()),
+            Backend::Ldap(ldap) => {
+                let password = ldap
+                    .bind_password
+                    .as_ref()
+                    .ok_or("no LDAP bind password".to_string())
+                    .and_then(|sealed| self.key.open(sealed, "ldap.bind_password"))?;
+                // The whole connection, not only the password. The
+                // dashboard binds to this directory itself now
+                // (decisions/018), so what it needs is where the servers
+                // are and how a person is found in them -- which the
+                // wizard has always asked for and which used to be
+                // configured into something else.
+                let mut values = BTreeMap::from([
+                    ("password".to_string(), password),
+                    ("servers".to_string(), ldap.servers.join(",").into_bytes()),
+                    ("base-dn".to_string(), ldap.base_dn.clone().into_bytes()),
+                    ("bind-dn".to_string(), ldap.bind_dn.clone().into_bytes()),
+                ]);
+                // `{}` is where the name somebody typed goes, escaped.
+                // A firm that said nothing gets the common case rather
+                // than a filter that matches nobody.
+                let filter = match ldap.user_filter.trim() {
+                    "" => "(uid={})".to_string(),
+                    given => given.to_string(),
+                };
+                values.insert("user-filter".to_string(), filter.into_bytes());
+                // Written only when asked for, so its absence reads as
+                // what it is: a plain or an ldaps:// connection.
+                if ldap.start_tls {
+                    values.insert("start-tls".to_string(), b"true".to_vec());
                 }
+                self.cluster
+                    .put_secret(&self.names.ldap_bind_secret, &values)
+                    .await
+                    .map_err(|failed| failed.to_string())?;
                 Ok(())
             }
             Backend::Oidc(oidc) => {
-                // The firm's own directory: the bundle is not used, so it is
-                // left at zero replicas rather than waiting forever for a
-                // database nobody is going to configure.
                 let mut values = BTreeMap::from([
                     ("issuer".to_string(), oidc.issuer.clone().into_bytes()),
                     ("client-id".to_string(), oidc.client_id.clone().into_bytes()),
@@ -650,13 +653,28 @@ impl FirstRun {
                     );
                 }
                 // Absent means the dashboard's own default, `groups`, which is
-                // what Entra ID, Okta and Zitadel use. Written only when the
+                // what Entra ID and Okta use. Written only when the
                 // wizard was told something else, so a firm whose provider
                 // names the claim differently can say so.
                 if !oidc.groups_claim.trim().is_empty() {
                     values.insert(
                         "groups-claim".to_string(),
                         oidc.groups_claim.trim().as_bytes().to_vec(),
+                    );
+                }
+                // Where the chart already read them from, and where nothing
+                // wrote them until 2026-09-25: a provider that names its
+                // project in the audience had every token refused.
+                let audiences: Vec<&str> = oidc
+                    .trusted_audiences
+                    .iter()
+                    .map(|audience| audience.trim())
+                    .filter(|audience| !audience.is_empty())
+                    .collect();
+                if !audiences.is_empty() {
+                    values.insert(
+                        "trusted-audiences".to_string(),
+                        audiences.join(",").into_bytes(),
                     );
                 }
                 self.cluster
@@ -675,10 +693,7 @@ impl FirstRun {
         configuration: &'a FirstRunConfiguration,
     ) -> Option<&'a meridian_domain::v1::LocalAccountAnswer> {
         match configuration.login_backend.as_ref()?.backend.as_ref()? {
-            Backend::Bundled(bundled) => match bundled.directory.as_ref()? {
-                Directory::LocalAccount(account) => Some(account),
-                _ => None,
-            },
+            Backend::LocalAccount(account) => Some(account),
             _ => None,
         }
     }
@@ -688,10 +703,6 @@ impl FirstRun {
     /// Written rather than rendered, because the wizard is what learns it: a
     /// chart value would be a second place the same fact lives, and the one
     /// nobody edited would win on the next upgrade.
-    ///
-    /// Zitadel is told the same thing in its own vocabulary, because it puts
-    /// its own address in every token it issues, and the dashboard checks that
-    /// against the issuer it was told to expect.
     async fn write_addresses(&self, configuration: &FirstRunConfiguration) -> Result<(), String> {
         let Some(addresses) = &configuration.addresses else {
             return Ok(());
@@ -787,34 +798,11 @@ impl FirstRun {
             }
         }
 
-        if !addresses.zitadel_url.trim().is_empty() {
-            let (domain, port, secure) = split_zitadel_url(&addresses.zitadel_url)?;
-            values.extend([
-                (
-                    "issuer".to_string(),
-                    addresses
-                        .zitadel_url
-                        .trim_end_matches('/')
-                        .as_bytes()
-                        .to_vec(),
-                ),
-                ("zitadel-external-domain".to_string(), domain.into_bytes()),
-                ("zitadel-external-port".to_string(), port.into_bytes()),
-                ("zitadel-external-secure".to_string(), secure.into_bytes()),
-            ]);
-        }
-
-        // Whoever signs people in, whichever route was chosen. The dashboard
-        // reads one issuer, from this Secret: on the bundled route it is
-        // Zitadel's own address, written just above from the address the
-        // wizard gave it. On the firm's own directory it is theirs, and until
+        // The firm's issuer, where the chart reads the dashboard's from. Until
         // 2026-09-23 it was written only into the dashboard's OIDC Secret,
-        // which the chart reads the client id out of and not the issuer. A
-        // deployment installed with the bundle rendered and then pointed at
-        // the firm's directory therefore came up with no issuer at all, and
-        // nobody could sign in. That is the combination somebody installing
-        // from the runbook hits, because rendering the bundle is what keeps
-        // the choice open until the wizard.
+        // which the chart reads the client id out of and not the issuer, so a
+        // deployment pointed at the firm's provider came up with no issuer
+        // and nobody could sign in.
         if let Some(Backend::Oidc(oidc)) = configuration
             .login_backend
             .as_ref()
@@ -845,30 +833,6 @@ impl FirstRun {
         }
         Ok(())
     }
-}
-
-/// Zitadel's address, in the three parts Zitadel itself is configured with.
-///
-/// It states its own address in every token it issues, and the dashboard
-/// checks that against the issuer it expects. One answer in the wizard, and
-/// both sides told the same thing, rather than a values file and a Secret
-/// that agree until somebody edits one.
-fn split_zitadel_url(url: &str) -> Result<(String, String, String), String> {
-    let (scheme, rest) = url
-        .trim()
-        .split_once("://")
-        .ok_or_else(|| format!("{url} is not a URL"))?;
-    let rest = rest.trim_end_matches('/');
-    let secure = scheme == "https";
-    let (host, port) = match rest.split_once(':') {
-        Some((host, port)) => (host, port.to_string()),
-        None if secure => (rest, "443".to_string()),
-        None => (rest, "80".to_string()),
-    };
-    if host.is_empty() {
-        return Err(format!("{url} names no host"));
-    }
-    Ok((host.to_string(), port, secure.to_string()))
 }
 
 /// A Postgres URL, with the password escaped rather than pasted.
@@ -907,11 +871,11 @@ fn encode(value: &str) -> String {
 ///
 /// Shape only, and that is the whole of what can be checked here. Asking a
 /// directory whether a group exists is not done for any backend, and the
-/// wizard says so on the page rather than implying otherwise: nothing in the
-/// deployment speaks LDAP, the bundled Zitadel has no database until this
-/// very configuration is applied, and a firm's own provider asserts a
-/// person's groups inside their own token rather than listing a directory's
-/// (spec/installation-and-first-run, requirement 13).
+/// wizard says so on the page rather than implying otherwise: a firm's own
+/// provider asserts a person's groups inside their own token rather than
+/// listing a directory's, and the LDAP bind account may read people without
+/// being able to enumerate every group (spec/installation-and-first-run,
+/// requirement 13).
 ///
 /// What is caught here is the case worth catching without a directory: nobody
 /// named. That produces a configured deployment with no administrator, which

@@ -533,7 +533,7 @@ services:
       E2E_SUPERUSER_PASSWORD: meridian
       E2E_DB_ROUTE: ${E2E_DB_ROUTE:-external}
       # Which way people sign in, for the first-run suite's two runs.
-      E2E_BACKEND: ${E2E_BACKEND:-bundled}
+      E2E_BACKEND: ${E2E_BACKEND:-local}
     volumes:
       - ./e2e/first-run:/e2e:ro
     networks: [meridian]

@@ -174,7 +174,7 @@ E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brough
 
 # And which way people sign in: `bundled` is what this deployment does
 # itself -- an account it holds -- and `oidc` is the firm's own provider.
-E2E_BACKEND ?= bundled
+E2E_BACKEND ?= local
 E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through the firm's own directory,)
 
 e2e-first-run: network
@@ -237,6 +237,9 @@ E2E_EXTERNAL_PASSWORD ?= e2e-dev-only
 # there, so sharing it would have made `make e2e-cluster` quietly take the
 # route nobody asked it for.
 E2E_CLUSTER_ROUTE ?= brought
+# Set to anything to keep the namespace after a run that passed -- to sign in
+# to it from a real browser, say. One that failed is always kept.
+E2E_CLUSTER_KEEP ?=
 # How people sign in: `local` (an account the deployment holds) or `ldap`
 # (the firm's directory, which e2e-cluster-ldap starts).
 E2E_CLUSTER_SIGN_IN ?= local
@@ -280,7 +283,7 @@ e2e-cluster:
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
 	  held=$$?; \
-	  if [ $$held -ne 0 ]; then \
+	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
 	    echo "e2e-cluster: the namespace is left for reading. Remove it with:" >&2; \
 	    echo "  kubectl delete namespace $(E2E_CLUSTER_NAMESPACE)" >&2; \
 	  else \

@@ -151,6 +151,12 @@ spec:
                   name: {{ $ldap }}
                   key: user-filter
                   optional: true
+            - name: MERIDIAN_LDAP_START_TLS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ldap }}
+                  key: start-tls
+                  optional: true
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
