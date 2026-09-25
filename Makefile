@@ -315,13 +315,18 @@ e2e-cluster-external:
 	@docker run -d --name $(E2E_EXTERNAL_CONTAINER) \
 		-e POSTGRES_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		-p $(E2E_EXTERNAL_PORT):5432 postgres:16-alpine >/dev/null
-	@until docker exec $(E2E_EXTERNAL_CONTAINER) pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
-	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -v ON_ERROR_STOP=1 \
+	@# Over TCP, not the socket. The image initialises behind a server that
+	@# listens on its socket alone, says ready there, and then restarts; a
+	@# check on the socket passes during that first one, and the statements
+	@# below land in the gap between the two. The real server is the only one
+	@# on TCP.
+	@until docker exec $(E2E_EXTERNAL_CONTAINER) pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; do sleep 1; done
+	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 \
 		-c "create database meridian" \
 		-c "create role meridian_app login password '$(E2E_EXTERNAL_PASSWORD)'" \
 		-c "create role meridian_migrate login password '$(E2E_EXTERNAL_PASSWORD)'" \
 		>/dev/null
-	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -U postgres -d meridian -v ON_ERROR_STOP=1 \
+	@docker exec $(E2E_EXTERNAL_CONTAINER) psql -h 127.0.0.1 -U postgres -d meridian -v ON_ERROR_STOP=1 \
 		-c "grant usage on schema public to meridian_app, meridian_migrate" \
 		-c "grant create on schema public to meridian_migrate" \
 		-c "revoke create on schema public from meridian_app, public" >/dev/null
