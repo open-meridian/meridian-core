@@ -222,9 +222,19 @@ impl Backend for NatsBackend {
                 return Err(BusError::NotPublishable(subject));
             }
 
+            // The caller's timeout, on the request itself. The client has one
+            // of its own, ten seconds unless told otherwise, and it fired
+            // first and was reported as this one: every call on this bus was
+            // ten seconds at most whatever it asked for, which a first-run
+            // Apply on a fresh cluster outlasts.
             let asked = tokio::time::timeout(
                 timeout,
-                client.request(subject.clone(), envelope.encode_to_vec().into()),
+                client.send_request(
+                    subject.clone(),
+                    async_nats::Request::new()
+                        .payload(envelope.encode_to_vec().into())
+                        .timeout(Some(timeout)),
+                ),
             )
             .await;
 

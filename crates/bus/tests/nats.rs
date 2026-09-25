@@ -249,6 +249,36 @@ async fn nothing_serving_is_distinct_from_nobody_answering() {
 }
 
 #[tokio::test]
+async fn a_caller_waits_as_long_as_it_asked_to_and_no_less() {
+    // The client library has a request timeout of its own, ten seconds unless
+    // told otherwise, and its expiry was reported as the caller's: a wizard
+    // that allowed Apply two minutes was told "did not answer within 120s"
+    // ten seconds in, while the first-run Job carried on and finished. Found
+    // on the first fresh cluster, where starting the database the wizard
+    // chose takes longer than ten seconds; a warm one had always been quicker.
+    let asking = bus("asking-patiently").await;
+    let answering = bus("answering-in-eleven").await;
+    let topic = topic("query.slower-than-ten-seconds");
+    answering.serve(&topic, |_| {
+        std::thread::sleep(Duration::from_secs(11));
+        Ok(("meridian.test.Answer".to_string(), b"late".to_vec()))
+    });
+    settle().await;
+
+    let (_, payload) = asking
+        .call(
+            &topic,
+            "meridian.test.Question",
+            vec![],
+            None,
+            Some(Duration::from_secs(20)),
+        )
+        .await
+        .expect("answered within the twenty seconds the caller allowed");
+    assert_eq!(payload, b"late".to_vec());
+}
+
+#[tokio::test]
 async fn a_refusal_crosses_with_its_reason() {
     let asking = bus("asking-refused").await;
     let answering = bus("answering-refused").await;
