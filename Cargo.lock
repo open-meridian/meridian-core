@@ -1811,7 +1811,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=b343d2322a04e6b379b605f205ab2f0d972cc70b#b343d2322a04e6b379b605f205ab2f0d972cc70b"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=430bfb0e3b8d6c0e07a8cdf8a3d8dc3d9510e34d#430bfb0e3b8d6c0e07a8cdf8a3d8dc3d9510e34d"
 dependencies = [
  "prost",
  "tonic",
@@ -1846,6 +1846,7 @@ name = "meridian-sidecar"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
+ "meridian-domain",
  "meridian-pb",
  "prost",
  "serde",

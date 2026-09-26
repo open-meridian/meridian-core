@@ -66,9 +66,9 @@ impl Identity {
 }
 
 pub struct Sidecar {
-    bus: Arc<Bus>,
+    pub(crate) bus: Arc<Bus>,
     deployment_id: String,
-    identity: Identity,
+    pub(crate) identity: Identity,
 
     /// Decided once, at launch, from the contract compiled in: the union of
     /// the roles' grants, or why the roles were refused. Nothing loads later,
@@ -76,6 +76,12 @@ pub struct Sidecar {
     grants: Result<Grants, String>,
 
     state: Arc<RwLock<Option<Registration>>>,
+
+    /// The plugin's external accounts and the accounts they are linked to
+    /// (W6.4), read from the conductor when a typed operation first needs
+    /// them and forgotten whenever the conductor says the configuration
+    /// changed. `None` until then.
+    pub(crate) links: crate::typed::Links,
 }
 
 impl Sidecar {
@@ -104,6 +110,7 @@ impl Sidecar {
             identity,
             grants,
             state: Arc::new(RwLock::new(None)),
+            links: crate::typed::Links::default(),
         }
     }
 
@@ -116,7 +123,7 @@ impl Sidecar {
     // here alone would buy nothing and cost an unbox at each of the six call
     // sites.
     #[allow(clippy::result_large_err)]
-    fn admitted(&self) -> Result<Registration, Status> {
+    pub(crate) fn admitted(&self) -> Result<Registration, Status> {
         match self.state.read().expect("state lock poisoned").clone() {
             Some(r) if !r.departed => Ok(r),
             Some(_) => Err(Status::failed_precondition(

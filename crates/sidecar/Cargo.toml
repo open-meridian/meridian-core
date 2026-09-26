@@ -8,6 +8,7 @@ description = "The surface a Meridian plugin binds to"
 
 [dependencies]
 meridian-pb.workspace = true
+meridian-domain.workspace = true
 meridian-bus = { path = "../bus" }
 tokio.workspace = true
 tokio-stream.workspace = true

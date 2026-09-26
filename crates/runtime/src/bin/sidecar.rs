@@ -13,7 +13,11 @@
 //! that named its own roles would be choosing its own privileges.
 
 use meridian_runtime::{bus_from_env, names_from, required, shutdown, var};
-use meridian_sidecar::{Identity, Sidecar, DEFAULT_BIND};
+use std::sync::Arc;
+
+use meridian_sidecar::{
+    Identity, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
+};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -55,7 +59,15 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "sidecar-1".into());
+    // On the bus as its plugin's instance, so what it sends names the plugin
+    // and what the conductor answers it -- its configuration, its links -- is
+    // that plugin's: the conductor answers for the instance the envelope
+    // names. A sidecar launched with no plugin instance falls back to its
+    // own name, and has no plugin to answer for.
+    let instance_id = Some(identity.instance_id.clone())
+        .filter(|id| !id.is_empty())
+        .or_else(|| var("MERIDIAN_INSTANCE_ID"))
+        .unwrap_or_else(|| "sidecar-1".into());
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -63,12 +75,14 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
-            let sidecar = Sidecar::new(bus, &deployment_id, identity);
+            let sidecar = Arc::new(Sidecar::new(bus, &deployment_id, identity));
 
             tracing::info!(instance_id, %listening, "the sidecar is serving");
 
             let serving = tonic::transport::Server::builder()
-                .add_service(meridian_sidecar::SidecarServiceServer::new(sidecar))
+                .add_service(SidecarServiceServer::from_arc(Arc::clone(&sidecar)))
+                // The typed operations (spec/typed-sidecar-operations).
+                .add_service(PluginOperationsServer::from_arc(sidecar))
                 .serve(listening);
 
             tokio::select! {
