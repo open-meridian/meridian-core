@@ -709,6 +709,17 @@ chart-check:
 		|| { echo "chart-check FAILED: $$ports host ports and $$bound bound to 127.0.0.1; the registry's node proxy is the only one, on localhost only" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q 'REGISTRY_PROXY_REMOTEURL' \
 		|| { echo "chart-check FAILED: the node's registry is not a pull-through proxy, so it would accept pushes" >&2; exit 1; }
+	@# A sidecar on the broker this chart brings: it has a credential under its
+	@# instance, and the broker knows its role. Every other render here passes
+	@# broker.existingSecret, so for weeks the bundled broker read a sidecar's
+	@# instance and role from a key the values do not have, gave it neither,
+	@# and no sidecar could have started on it.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].role=check-role' 2>/dev/null)"; \
+	echo "$$rendered" | grep -q '^  check-1: ' \
+		|| { echo "chart-check FAILED: the bundled broker makes no credential for a sidecar's instance" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '"instance_id":"check-1","role":"check-role"' \
+		|| { echo "chart-check FAILED: the bundled broker does not know a sidecar's instance and role" >&2; exit 1; }
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }

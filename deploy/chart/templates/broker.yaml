@@ -34,7 +34,7 @@
 {{- $users = append $users .Values.firstRun.brokerKey }}
 {{- end }}
 {{- range .Values.sidecars }}
-{{- $users = append $users (.plugin).instanceId }}
+{{- $users = append $users .instanceId }}
 {{- end }}
 {{/*
   Decided once, here, and used by both Secrets below: generating in each would
@@ -110,7 +110,7 @@ data:
         {{- $entries = append $entries (dict "instance_id" (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) "role" "admin" "tags" list) }}
         {{- end }}
         {{- range .Values.sidecars }}
-        {{- $entries = append $entries (dict "instance_id" (.plugin).instanceId "role" (.plugin).role "tags" ((.plugin).tags | default list)) }}
+        {{- $entries = append $entries (dict "instance_id" .instanceId "role" .role "tags" (.tags | default list)) }}
         {{- end }}
         {{- range $i, $entry := $entries }}{{ if $i }},{{ end }}
         {{ toJson $entry }}
