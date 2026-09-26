@@ -234,6 +234,13 @@ async fn pass_through(
         Ok(Step::Push) => {}
     }
 
+    if !mounts_from_a_plugin(request.uri().query()) {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "a blob is mounted from another plugin's repository, and from nowhere else",
+        );
+    }
+
     let (parts, body) = request.into_parts();
     let query = parts
         .uri
@@ -276,6 +283,19 @@ async fn pass_through(
     response
         .body(Body::from_stream(answer.bytes_stream()))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Whether every repository a request mounts a blob `from` is a plugin's.
+/// The registry links a blob from any repository it holds into this one,
+/// and what it holds beyond `plugins/` is none of an upload's business.
+fn mounts_from_a_plugin(query: Option<&str>) -> bool {
+    query.unwrap_or_default().split('&').all(|pair| {
+        let Some(from) = pair.strip_prefix("from=") else {
+            return true;
+        };
+        let from = from.replace("%2F", "/").replace("%2f", "/");
+        from.strip_prefix("plugins/").is_some_and(is_name)
+    })
 }
 
 /// Whether the registry holds this manifest in plugins/{name}.

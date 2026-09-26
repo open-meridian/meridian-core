@@ -401,6 +401,11 @@ async fn nothing_but_pushing_reaches_the_registry() {
             format!("{base}/snaptrade/manifests/0.1.0"),
             StatusCode::CONFLICT,
         ),
+        (
+            "POST",
+            format!("{base}/snaptrade/blobs/uploads/?mount={DIGEST}&from=e2e/busybox"),
+            StatusCode::FORBIDDEN,
+        ),
     ] {
         assert_eq!(
             send(&h, method, &path, Some(&h.ada), "").await.0,
@@ -521,4 +526,25 @@ async fn the_catalogue_launching_and_stopping() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn a_blob_is_mounted_from_another_plugins_repository_alone() {
+    for held in [
+        None,
+        Some("digest=sha256:ab"),
+        Some("mount=sha256:ab&from=plugins/reference-plugin"),
+        Some("mount=sha256:ab&from=plugins%2Freference-plugin"),
+    ] {
+        assert!(mounts_from_a_plugin(held), "{held:?}");
+    }
+    for refused in [
+        "mount=sha256:ab&from=e2e/busybox",
+        "mount=sha256:ab&from=plugins/../e2e/busybox",
+        "mount=sha256:ab&from=plugins/Reference",
+        "mount=sha256:ab&from=plugins/a&from=elsewhere/b",
+        "from=",
+    ] {
+        assert!(!mounts_from_a_plugin(Some(refused)), "{refused}");
+    }
 }

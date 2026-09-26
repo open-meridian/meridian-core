@@ -148,8 +148,12 @@ WIZARD = f"http://127.0.0.1:{PORT}"
 # runner's own requests go to WIZARD, the same port-forward, since the
 # dashboard answers whatever it is called there.
 DASHBOARD_URL = f"http://localhost:{PORT}"
-# The plugin section P launches, by the name its page is found under.
+# The plugins section P launches, by the names their pages are found under:
+# the reference plugin as `meridian plugin new` makes it, declaring nothing,
+# and a copy of it declaring `custody`, which is what recording a statement
+# needs, so that acting-for is what decides.
 PLUGIN_INSTANCE = "reference-plugin"
+CUSTODY_INSTANCE = "reference-custody"
 
 
 class Scorecard:
@@ -860,6 +864,15 @@ spec:
             step("connect", f"meridian connect {DASHBOARD_URL}"),
             step("upload", "meridian plugin upload --dir /shared/reference-plugin"),
             step("launch", f"meridian plugin launch reference-plugin 0.1.0 --instance {instance} --yes"),
+            # The copy: made the same way, with `custody` declared in its own
+            # pyproject.toml, as an author declares a role.
+            step("new-custody", "meridian plugin new reference-custody --into /shared/reference-custody"),
+            step("declare-custody",
+                 "sed -i 's/^roles = \\[\\]$/roles = [\"custody\"]/' /shared/reference-custody/pyproject.toml"
+                 " && grep '^roles' /shared/reference-custody/pyproject.toml"),
+            step("upload-custody", "meridian plugin upload --dir /shared/reference-custody"),
+            step("launch-custody",
+                 f"meridian plugin launch reference-custody 0.1.0 --instance {CUSTODY_INSTANCE} --yes"),
             step("list", "meridian plugin list"),
         ])
         apply(f"""
@@ -884,6 +897,7 @@ spec:
         - {{name: E2E_NAME, value: "{name}"}}
         - {{name: E2E_PASSWORD, value: "{password or ''}"}}
         - {{name: E2E_INSTANCE, value: "{instance}"}}
+        - {{name: E2E_CUSTODY_INSTANCE, value: "{CUSTODY_INSTANCE}"}}
     - name: cli
       image: {CLI_IMAGE}
       imagePullPolicy: Never
@@ -899,21 +913,22 @@ spec:
 """)
         # Up means available: its sidecar registered with the broker's new
         # credential and its plugin reported. Then the browser is told.
-        deployment = f"{RELEASE}-meridian-runtime-plugin-{instance}"
+        deployments = [f"{RELEASE}-meridian-runtime-plugin-{each}" for each in (instance, CUSTODY_INSTANCE)]
         up = False
-        for _ in range(900):
+        for _ in range(1200):
             phase = kubectl("get", "pod", "e2e-plugin", "-o", "jsonpath={.status.phase}")
             if phase in ("Succeeded", "Failed"):
                 break
-            available = kubectl(
-                "get", "deployment", deployment, "--ignore-not-found",
-                "-o", "jsonpath={.status.availableReplicas}",
-            )
-            if available == "1":
+            available = [
+                kubectl("get", "deployment", each, "--ignore-not-found",
+                        "-o", "jsonpath={.status.availableReplicas}")
+                for each in deployments
+            ]
+            if available == ["1", "1"]:
                 up = True
                 break
             time.sleep(1)
-        s.check(up, f"the launcher made {deployment}, and it came up")
+        s.check(up, f"the launcher made {' and '.join(deployments)}, and they came up")
         if up:
             kubectl("exec", "e2e-plugin", "-c", "browser", "--", "touch", "/shared/open-now")
         phase = ""
@@ -926,12 +941,13 @@ spec:
             print(f"    {line}" if line else "", flush=True)
         s.check(
             phase == "Succeeded",
-            f"the reference plugin was made, uploaded, launched and opened: {phase or 'it never ran'}",
+            f"the reference plugin and its custody copy were made, uploaded, launched and "
+            f"opened, and acting-for decided: {phase or 'it never ran'}",
         )
         if phase != "Succeeded" or not up:
             # For reading, and never the reason the run stops: the plugin
             # may not exist to be read.
-            for container in ("sidecar", "plugin"):
+            for deployment, container in [(d, c) for d in deployments for c in ("sidecar", "plugin")]:
                 s.note(f"{deployment}, {container}:")
                 try:
                     said = kubectl("logs", f"deployment/{deployment}", "-c", container, "--tail=40")
