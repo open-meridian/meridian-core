@@ -10,6 +10,7 @@ description = "Topic routing and in-process transport for the Meridian bus"
 async-nats.workspace = true
 futures-util.workspace = true
 meridian-pb.workspace = true
+meridian-domain.workspace = true
 tokio.workspace = true
 prost.workspace = true
 thiserror.workspace = true

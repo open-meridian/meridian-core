@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use meridian_pb::v1::Envelope;
+use meridian_domain::v1::Envelope;
 use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;

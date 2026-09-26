@@ -38,6 +38,9 @@ WORKDIR /src
 COPY codegen/Cargo.toml codegen/Cargo.lock codegen/
 COPY codegen/src codegen/src
 COPY proto/ proto/
+# meridian-schema's protos at the pinned revision, a build context the Makefile
+# names from Cargo.toml, so the import resolves against what the runtime links.
+COPY --from=schema-proto . /schema-proto/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/codegen/target \
     cd codegen && cargo run --release --locked

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use meridian_pb::v1::{Envelope, MessageMeta};
+use meridian_domain::v1::Envelope;
+use meridian_pb::v1::MessageMeta;
 use tokio::sync::Notify;
 
 use crate::backend::{Backend, BusError, Subscription};

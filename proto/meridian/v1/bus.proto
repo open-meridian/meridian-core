@@ -1,0 +1,35 @@
+// The bus's own framing. Every message on the bus is wrapped in one.
+//
+// Justified by decisions/003-every-bus-message-carries-an-envelope.md rather
+// than by a workflow step: the envelope is not an operation, it is the frame
+// every operation travels in. It is recorded in matrix/proto-carve-outs.tsv
+// with that reference.
+//
+// Here rather than in meridian-schema since design/envelope-moves-into-core:
+// a plugin reaches the bus through typed operations and never sees bytes, so
+// the frame is the runtime's internal traffic, as the domain messages are. The
+// metadata it carries stays plugin-facing, and is imported from there at the
+// revision this repository pins.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+import "meridian/v1/envelope.proto";
+
+// Envelope wraps one payload.
+//
+// The payload is opaque bytes rather than a oneof over every message type. A
+// oneof would make the envelope a compile-time dependency of every message in
+// the system, so adding any message would rebuild everything and the bus could
+// not carry a payload it had not been compiled against.
+message Envelope {
+  MessageMeta meta = 1;
+
+  // Fully-qualified name of the payload message, e.g. "meridian.v1.Position".
+  // A subscriber checks this before decoding rather than guessing from topic.
+  string payload_type = 2;
+
+  // The serialized payload.
+  bytes payload = 3;
+}

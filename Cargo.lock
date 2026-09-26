@@ -1688,6 +1688,7 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "futures-util",
+ "meridian-domain",
  "meridian-pb",
  "prost",
  "thiserror 2.0.21",
@@ -1773,6 +1774,7 @@ dependencies = [
 name = "meridian-domain"
 version = "0.1.0"
 dependencies = [
+ "meridian-pb",
  "prost",
 ]
 
@@ -1816,7 +1818,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=77d8a9842a29f59d6d4781287c5733540d8b147a#77d8a9842a29f59d6d4781287c5733540d8b147a"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=1296436d3dd20a399d76ac8338bb8d8193865683#1296436d3dd20a399d76ac8338bb8d8193865683"
 dependencies = [
  "prost",
  "tonic",

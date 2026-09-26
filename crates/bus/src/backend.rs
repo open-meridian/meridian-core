@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_pb::v1::Envelope;
+use meridian_domain::v1::Envelope;
 use tokio::sync::{mpsc, Notify};
 
 #[derive(Debug, thiserror::Error)]

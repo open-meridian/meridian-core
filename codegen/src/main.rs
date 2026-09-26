@@ -7,6 +7,10 @@ use std::{fs, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = PathBuf::from("../proto");
+    // meridian-schema's protos at the revision the workspace pins, for the
+    // plugin-facing messages a domain one carries -- the envelope's metadata.
+    // On the include path only: those are generated there, and referred to here.
+    let schema_root = PathBuf::from("/schema-proto");
     let out_dir = PathBuf::from("/out");
     fs::create_dir_all(&out_dir)?;
 
@@ -26,7 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .build_server(false)
         .build_client(false)
-        .compile_protos(&protos, &[proto_root.clone()])?;
+        .extern_path(".meridian.v1.MessageMeta", "::meridian_pb::v1::MessageMeta")
+        .compile_protos(&protos, &[proto_root.clone(), schema_root])?;
 
     // The package stays meridian.v1, so a message's wire name is unchanged by
     // the move out of meridian-schema.

@@ -8,3 +8,5 @@ description = "The domain messages the runtime carries past its sidecar, generat
 
 [dependencies]
 prost.workspace = true
+# The envelope's metadata is plugin-facing, and generated there.
+meridian-pb.workspace = true

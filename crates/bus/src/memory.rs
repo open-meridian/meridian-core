@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use meridian_pb::v1::Envelope;
+use meridian_domain::v1::Envelope;
 use tokio::sync::mpsc;
 
 use crate::backend::{Backend, BusError, Delivery, Subscription};

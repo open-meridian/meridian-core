@@ -929,6 +929,24 @@ impl ClaimCodePurpose {
         }
     }
 }
+/// Envelope wraps one payload.
+///
+/// The payload is opaque bytes rather than a oneof over every message type. A
+/// oneof would make the envelope a compile-time dependency of every message in
+/// the system, so adding any message would rebuild everything and the bus could
+/// not carry a payload it had not been compiled against.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Envelope {
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<::meridian_pb::v1::MessageMeta>,
+    /// Fully-qualified name of the payload message, e.g. "meridian.v1.Position".
+    /// A subscriber checks this before decoding rather than guessing from topic.
+    #[prost(string, tag = "2")]
+    pub payload_type: ::prost::alloc::string::String,
+    /// The serialized payload.
+    #[prost(bytes = "vec", tag = "3")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+}
 /// Published by the dashboard at each sign-in and kept by the conductor, for
 /// the access table (W4.10) and the per-plugin count. Only people who have
 /// signed in are in it, and it never leaves the deployment.

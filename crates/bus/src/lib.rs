@@ -34,7 +34,10 @@ pub use nats::NatsBackend;
 pub use router::{Bus, RouteRule};
 
 /// Envelope and metadata, re-exported so consumers need not depend on the
-/// generated crate directly to use the bus.
-pub use meridian_pb::v1::{Envelope, MessageMeta};
+/// generated crates directly to use the bus. The envelope is the runtime's own
+/// framing, in meridian-domain; the metadata it carries is plugin-facing, in
+/// meridian-pb (design/envelope-moves-into-core).
+pub use meridian_domain::v1::Envelope;
+pub use meridian_pb::v1::MessageMeta;
 
 pub type Result<T> = std::result::Result<T, BusError>;

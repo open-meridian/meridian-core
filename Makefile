@@ -77,11 +77,15 @@ contract-diff:
 
 DOMAIN_RS := crates/domain/src/v1.rs
 SCRATCH   := .codegen-scratch
+# The meridian-schema revision the workspace links, whose protos a domain
+# proto may import (bus.proto takes MessageMeta from there).
+SCHEMA_REV   := $(shell sed -n 's/^meridian-pb = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml)
+SCHEMA_PROTO := --build-context schema-proto=https://github.com/open-meridian/meridian-schema.git\#$(SCHEMA_REV):proto
 
 # Regenerate in place. The only sanctioned way to change $(DOMAIN_RS).
 codegen:
 	@rm -rf $(SCRATCH)
-	@$(DOCKER) build -f Dockerfile.codegen --target export \
+	@$(DOCKER) build $(SCHEMA_PROTO) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) .
 	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && rm -rf $(SCRATCH)
 	@echo "codegen: wrote $(DOMAIN_RS)"
@@ -91,7 +95,7 @@ codegen:
 # same bug: the runtime building against types proto/ does not describe.
 check-codegen:
 	@rm -rf $(SCRATCH)
-	@$(DOCKER) build -f Dockerfile.codegen --target export \
+	@$(DOCKER) build $(SCHEMA_PROTO) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
 		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
 	@if diff -q $(DOMAIN_RS) $(SCRATCH)/v1.rs >/dev/null 2>&1; then \
@@ -604,7 +608,7 @@ e2e-plugin-page: network
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "e2e-plugin-page FAILED: the SDK's image did not build" >&2; exit 1; }
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
@@ -961,9 +965,9 @@ SDK ?= ../meridian-python
 interop: network
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
