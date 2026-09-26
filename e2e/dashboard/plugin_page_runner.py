@@ -127,9 +127,20 @@ def main():
     redeemed = ada.post(dash("/claim"), {"code": CLAIM_CODE, "form_token": form_token(claim)})
     check(redeemed.status == 303, f"claims: {redeemed.status}")
 
-    say("B: administering the deployment is not access to a plugin")
-    refused = ada.get(dash(f"/plugins/{INSTANCE}"))
-    check(refused.status == 403, f"before any grant, /plugins/{INSTANCE}: {refused.status}")
+    say("B: administering the deployment opens a plugin, and is not access to it")
+    # spec/deployment-dashboard-and-access, ruling 19: a deployment admin
+    # opens any plugin's page, and is asserted with what she holds on it --
+    # before any grant, nothing. Somebody who is neither admin nor granted is
+    # refused at both doors; the dashboard's own tests hold that.
+    opened = ada.get(dash(f"/plugins/{INSTANCE}"))
+    check(opened.status == 303, f"before any grant, /plugins/{INSTANCE}: {opened.status} {sentence(opened)}")
+    before = Browser()
+    status, _, _, _ = on_plugin_host(before, (opened.location or "")[len(f"http://{PLUGIN_HOST}"):])
+    check(status == 303, f"the code redeemed: {status}")
+    status, body, _, _ = on_plugin_host(before, "/holdings")
+    seen = json.loads(body) if status == 200 else {}
+    check(status == 200 and (seen.get("caller") or {}).get("access") == [],
+          f"and the plugin is told she holds nothing on it: {status} {(seen.get('caller') or {}).get('access')}")
 
     say("C: she grants herself read on one account through the plugin")
     page = administer(ada, "/admin/accounts", {"account_id": "", "name": "Plugin page account"})
