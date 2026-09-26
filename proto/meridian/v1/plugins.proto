@@ -29,8 +29,9 @@ message PluginMetadata {
   string name = 1;
   // As its pyproject.toml has it. An uploaded version is never replaced.
   string version = 2;
-  // A set, from matrix/roles.tsv: never a component and never `admin`.
-  // Empty is a plugin admitted with no topics, as the reference plugin is.
+  // A set, from matrix/roles.tsv, and never a component's name -- the
+  // dashboard's among them (decisions/020). Empty is a plugin admitted with
+  // no topics, as the reference plugin is.
   repeated string roles = 3;
   // The plugin's own names for its parts, which people are granted at read
   // or write (W6.7). They grant nothing on the bus.

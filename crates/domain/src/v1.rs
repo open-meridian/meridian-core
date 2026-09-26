@@ -2169,8 +2169,9 @@ pub struct PluginMetadata {
     /// As its pyproject.toml has it. An uploaded version is never replaced.
     #[prost(string, tag = "2")]
     pub version: ::prost::alloc::string::String,
-    /// A set, from matrix/roles.tsv: never a component and never `admin`.
-    /// Empty is a plugin admitted with no topics, as the reference plugin is.
+    /// A set, from matrix/roles.tsv, and never a component's name -- the
+    /// dashboard's among them (decisions/020). Empty is a plugin admitted with
+    /// no topics, as the reference plugin is.
     #[prost(string, repeated, tag = "3")]
     pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// The plugin's own names for its parts, which people are granted at read
