@@ -26,8 +26,11 @@
 /// bites the first time somebody wants to raise it.
 pub const CONTRACT_FLOOR: u32 = 1;
 
-/// The contract this sidecar implements.
-pub const CONTRACT_CURRENT: u32 = 1;
+/// The contract this sidecar implements. v2 is typed operations, acting-for,
+/// and the settings, access and scope streams (spec/typed-sidecar-operations);
+/// v1 is still admitted until the release deletes the generic operations and
+/// raises the floor with it (decisions/013).
+pub const CONTRACT_CURRENT: u32 = 2;
 
 /// Admit a plugin's declared contract version, or say why not.
 ///
@@ -122,7 +125,7 @@ mod tests {
             admit("v0"),
             Err(
                 "the plugin was built against contract v0, older than this sidecar accepts \
-                 (v1 through v1); rebuild it against v1 or later"
+                 (v1 through v2); rebuild it against v1 or later"
                     .into()
             )
         );
@@ -131,11 +134,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v2"),
+            admit("v3"),
             Err(
-                "the plugin was built against contract v2, newer than this sidecar \
-                 (v1 through v1); upgrade the runtime, or rebuild the plugin against \
-                 v1 or earlier"
+                "the plugin was built against contract v3, newer than this sidecar \
+                 (v1 through v2); upgrade the runtime, or rebuild the plugin against \
+                 v2 or earlier"
                     .into()
             )
         );
@@ -146,7 +149,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v1 through v1"
+                "the plugin declared no contract version; this sidecar accepts v1 through v2"
                     .into()
             )
         );

@@ -12,30 +12,13 @@
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
 //! did not answer in time, `aborted` when it answered with a refusal.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use meridian_bus::BusError;
-use meridian_domain::v1::{PluginConfiguration, PluginConfigurationRequest};
 use meridian_pb::plugin::v1 as plugin;
 use meridian_pb::v1::CallerAssertion;
 use prost::Message;
-use tokio::sync::Mutex;
 use tonic::{Response, Status};
 
 use crate::service::Sidecar;
-
-pub const PLUGIN_CONFIGURATION: &str = "platform.config.query.plugin-configuration";
-pub const PLUGIN_CONFIGURATION_CHANGED: &str = "platform.config.event.plugin-configuration-changed";
-
-/// External account to account, for this sidecar's plugin, once read; and
-/// whether the watch that forgets them on a change has started.
-#[derive(Clone, Default)]
-pub struct Links {
-    held: Arc<Mutex<Option<HashMap<String, String>>>>,
-    watching: Arc<AtomicBool>,
-}
 
 // The tonic surface already returns `Result<_, Status>` everywhere; boxing the
 // error here alone would buy nothing.
@@ -137,7 +120,8 @@ impl Sidecar {
         self.granted(&topic)?;
         let now = now_ns();
         if let Some(account) = &account {
-            if !self.write_scope(now).await?.contains(account) {
+            let configuration = self.configuration(now).await?;
+            if !configuration.write_account_ids.contains(account) {
                 let refusal = format!(
                     "account {account} is outside this plugin's write scope: nobody may write \
                      it through this plugin"
@@ -187,102 +171,33 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
-        let may_write = crate::scope::writes(&claims.access);
+        let may_write: std::collections::BTreeSet<&String> = claims
+            .access
+            .iter()
+            .flat_map(|held| &held.write_account_ids)
+            .collect();
         match account {
-            Some(account) if !may_write.contains(account) => Err(Status::permission_denied(
-                format!("the person may not write account {account} through this plugin"),
-            )),
+            Some(account) if !may_write.iter().any(|held| *held == account) => {
+                Err(Status::permission_denied(format!(
+                    "the person may not write account {account} through this plugin"
+                )))
+            }
             None if may_write.is_empty() => Err(Status::permission_denied(
                 "the person may write nothing through this plugin",
             )),
             _ => Ok(claims.subject),
         }
     }
-
-    /// The account an external account is linked to (W6.4), or the refusal
-    /// that names what to do: a row for an unlinked account is refused, not
-    /// guessed at, and recorded once somebody links it.
-    pub(crate) async fn linked_account(&self, external_account_id: &str) -> Result<String, Status> {
-        if external_account_id.is_empty() {
-            return Err(Status::invalid_argument(
-                "external_account_id is required: the account as the rail knows it",
-            ));
-        }
-        let links = self.links().await?;
-        links.get(external_account_id).cloned().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "external account {external_account_id} is not linked to an account; a \
-                 deployment admin links it (W6.4), and the next statement records it"
-            ))
-        })
-    }
-
-    /// This plugin's links, from the conductor the first time and after each
-    /// change it announces. Asked as this instance, since the conductor
-    /// answers for the instance the envelope names.
-    async fn links(&self) -> Result<HashMap<String, String>, Status> {
-        // Watching before reading, so a change that lands between the two is
-        // not missed; and once, however often the links are read again.
-        if !self.links.watching.swap(true, Ordering::SeqCst) {
-            self.forget_links_on_change();
-        }
-        let mut held = self.links.held.lock().await;
-        if let Some(links) = held.as_ref() {
-            return Ok(links.clone());
-        }
-        let (_, payload) = self
-            .bus
-            .call(
-                PLUGIN_CONFIGURATION,
-                "meridian.v1.PluginConfigurationRequest",
-                PluginConfigurationRequest {}.encode_to_vec(),
-                None,
-                None,
-            )
-            .await
-            .map_err(refused)?;
-        let configuration = PluginConfiguration::decode(payload.as_slice()).map_err(|failed| {
-            Status::internal(format!(
-                "the plugin's configuration did not decode: {failed}"
-            ))
-        })?;
-        let links: HashMap<String, String> = configuration
-            .links
-            .into_iter()
-            .filter(|link| link.plugin_instance_id == self.instance_id())
-            .map(|link| (link.external_account_id, link.account_id))
-            .collect();
-        *held = Some(links.clone());
-        Ok(links)
-    }
-
-    /// Forget the links whenever the conductor says this plugin's
-    /// configuration changed, so the next operation reads them afresh.
-    fn forget_links_on_change(&self) {
-        let mut changes = self.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
-        let links = self.links.clone();
-        let instance = self.instance_id().to_string();
-        tokio::spawn(async move {
-            while let Some(delivery) = changes.recv().await {
-                let changed = meridian_domain::v1::PluginConfigurationChangedEvent::decode(
-                    &delivery.envelope.payload[..],
-                );
-                if matches!(changed, Ok(event) if event.plugin_instance_id == instance) {
-                    *links.held.lock().await = None;
-                }
-            }
-        });
-    }
 }
 
-fn now_ns() -> i64 {
+pub(crate) fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
 }
 
-fn refused(failed: BusError) -> Status {
+pub(crate) fn refused(failed: BusError) -> Status {
     match failed {
         BusError::NoHandler(topic) => Status::unavailable(format!("nothing serves {topic}")),
         timeout @ BusError::Timeout { .. } => Status::deadline_exceeded(timeout.to_string()),

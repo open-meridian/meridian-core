@@ -39,6 +39,18 @@ pub struct Registration {
     pub health_detail: String,
     /// The contract version it registered with.
     pub contract_version: String,
+    /// The settings it declared (W4.7): what WatchSettings delivers, and what
+    /// makes it unhealthy while a required one has no value.
+    pub settings: Vec<meridian_pb::v1::SettingDeclaration>,
+}
+
+/// An external account nobody has linked: rows refused for it, and when it
+/// was first and last seen.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Unlinked {
+    pub refused_rows: i64,
+    pub first_seen_at_ns: i64,
+    pub last_seen_at_ns: i64,
 }
 
 /// Who a sidecar was launched to serve.
@@ -84,15 +96,17 @@ pub struct Sidecar {
 
     state: Arc<RwLock<Option<Registration>>>,
 
-    /// The plugin's external accounts and the accounts they are linked to
-    /// (W6.4), read from the conductor when a typed operation first needs
-    /// them and forgotten whenever the conductor says the configuration
-    /// changed. `None` until then.
-    pub(crate) links: crate::typed::Links,
+    /// The plugin's configuration -- settings, links and account scope -- as
+    /// the conductor last said it (W4.7).
+    pub(crate) configuration: crate::configuration::Configuration,
 
     /// Grants refused, and the latest reason, for the plugin report (W4.8):
     /// the sidecar sees refusals the plugin cannot report about itself.
     pub(crate) refusals: Arc<std::sync::Mutex<(i64, String)>>,
+    /// External accounts the plugin sent rows for that nobody has linked,
+    /// with how many rows were refused for each (W4.8). Forgotten once one
+    /// is linked and a row for it recorded.
+    pub(crate) unlinked: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Unlinked>>>,
     /// Woken when registration changes, so a report goes out at once rather
     /// than at the next interval.
     pub(crate) changed: Arc<tokio::sync::Notify>,
@@ -101,8 +115,6 @@ pub struct Sidecar {
     /// (W4.9). None where the sidecar was given none: such a command is
     /// refused, since nobody can be vouched for.
     pub(crate) verifier: Option<Arc<crate::front_door::Verifier>>,
-    /// The plugin's write scope, as the conductor last said it.
-    pub(crate) scope: crate::scope::Scope,
 }
 
 impl Sidecar {
@@ -125,17 +137,21 @@ impl Sidecar {
                 "launched with roles that are refused: {refusal}"
             );
         }
+        let configuration = crate::configuration::Configuration::new(
+            Arc::clone(&bus),
+            identity.instance_id.clone(),
+        );
         Self {
             bus,
             deployment_id: deployment_id.into(),
             identity,
             grants,
             state: Arc::new(RwLock::new(None)),
-            links: crate::typed::Links::default(),
+            configuration,
             refusals: Arc::default(),
+            unlinked: Arc::default(),
             changed: Arc::default(),
             verifier: None,
-            scope: crate::scope::Scope::default(),
         }
     }
 
@@ -171,17 +187,6 @@ impl Sidecar {
 type DeliveryStream = Pin<Box<dyn Stream<Item = Result<Delivery, Status>> + Send>>;
 type SettingsStream = Pin<Box<dyn Stream<Item = Result<SettingsDelivery, Status>> + Send>>;
 type ScopeStream = Pin<Box<dyn Stream<Item = Result<AccountScopeDelivery, Status>> + Send>>;
-
-/// What a v1 sidecar says to the operations contract v2 adds (W4.7, W4.10,
-/// W4.11). A plugin built against v1 never calls them, and one built against
-/// v2 is refused at registration until this sidecar admits v2, so this answer
-/// is reached only by a plugin that skipped registering.
-fn not_until_v2(operation: &str) -> Status {
-    Status::unimplemented(format!(
-        "{operation} is contract v2, and this sidecar admits v1; it arrives with the \
-         dashboard's settings slice (kernel/dashboard-health-settings-and-bundle)"
-    ))
-}
 
 #[tonic::async_trait]
 impl SidecarService for Sidecar {
@@ -258,6 +263,7 @@ impl SidecarService for Sidecar {
             interface_port,
             health_detail: String::new(),
             contract_version: req.schema_version.clone(),
+            settings: req.settings.clone(),
         });
         self.changed.notify_one();
 
@@ -443,27 +449,41 @@ impl SidecarService for Sidecar {
 
     type WatchSettingsStream = SettingsStream;
 
+    /// W4.7: the settings it declared, as the deployment holds them, now and
+    /// on every change.
     async fn watch_settings(
         &self,
         _request: Request<WatchSettingsRequest>,
     ) -> Result<Response<Self::WatchSettingsStream>, Status> {
-        Err(not_until_v2("WatchSettings"))
+        let declared = self.admitted()?.settings;
+        Ok(Response::new(crate::streams::following(
+            self.configuration.clone(),
+            move |configuration| crate::streams::settings(&declared, configuration),
+        )))
     }
 
+    /// W4.10: who may use this plugin, asked as it.
     async fn plugin_access(
         &self,
         _request: Request<PluginAccessRequest>,
     ) -> Result<Response<PluginAccessReply>, Status> {
-        Err(not_until_v2("PluginAccess"))
+        self.admitted()?;
+        self.access_table().await.map(Response::new)
     }
 
     type WatchAccountScopeStream = ScopeStream;
 
+    /// W4.11: every account anybody may read or write through this plugin,
+    /// now and on every change.
     async fn watch_account_scope(
         &self,
         _request: Request<WatchAccountScopeRequest>,
     ) -> Result<Response<Self::WatchAccountScopeStream>, Status> {
-        Err(not_until_v2("WatchAccountScope"))
+        self.admitted()?;
+        Ok(Response::new(crate::streams::following(
+            self.configuration.clone(),
+            crate::streams::scope,
+        )))
     }
 }
 
@@ -593,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v0", "v2"] {
+        for declared in ["v0", "v3"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -602,7 +622,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v1 through v1"));
+            assert!(reply.refusal_reason.contains("v1 through v2"));
             assert!(sc.registration().is_none());
         }
     }

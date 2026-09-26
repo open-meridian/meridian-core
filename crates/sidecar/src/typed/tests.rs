@@ -16,9 +16,7 @@ use meridian_pb::plugin::v1::{
     ReportSyncStatusParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{
-    CallerAssertion, CallerClaims, PluginAccessReply, RegisterRequest, TagAccess, UserGroupAccess,
-};
+use meridian_pb::v1::{CallerAssertion, CallerClaims, RegisterRequest, TagAccess};
 use prost::Message;
 use tonic::{Code, Request};
 
@@ -68,7 +66,7 @@ async fn registered_with(
             .encode_to_vec(),
         ))
     });
-    bus.serve(super::PLUGIN_CONFIGURATION, |_| {
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
         Ok((
             "meridian.v1.PluginConfiguration".into(),
             PluginConfiguration {
@@ -93,24 +91,8 @@ async fn registered_with(
                         account_id: "ACC-9".into(),
                     },
                 ],
-                ..Default::default()
-            }
-            .encode_to_vec(),
-        ))
-    });
-    bus.serve(crate::scope::PLUGIN_ACCESS, |_| {
-        Ok((
-            "meridian.v1.PluginAccessReply".into(),
-            PluginAccessReply {
-                user_groups: vec![UserGroupAccess {
-                    user_group_id: "UG-1".into(),
-                    name: "Operations".into(),
-                    access: vec![TagAccess {
-                        tag: "custody".into(),
-                        read_account_ids: vec!["ACC-1".into(), "ACC-3".into(), "ACC-R".into()],
-                        write_account_ids: vec!["ACC-1".into(), "ACC-3".into()],
-                    }],
-                }],
+                read_account_ids: vec!["ACC-1".into(), "ACC-3".into(), "ACC-R".into()],
+                write_account_ids: vec!["ACC-1".into(), "ACC-3".into()],
                 ..Default::default()
             }
             .encode_to_vec(),
@@ -307,7 +289,7 @@ async fn a_link_made_later_is_used_once_the_conductor_says_so() {
         .is_err());
 
     // The conductor now links it, and announces the change.
-    bus.serve(super::PLUGIN_CONFIGURATION, |_| {
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
         Ok((
             "meridian.v1.PluginConfiguration".into(),
             PluginConfiguration {
@@ -317,13 +299,14 @@ async fn a_link_made_later_is_used_once_the_conductor_says_so() {
                     external_account_id: "ext-3".into(),
                     account_id: "ACC-3".into(),
                 }],
+                write_account_ids: vec!["ACC-3".into()],
                 ..Default::default()
             }
             .encode_to_vec(),
         ))
     });
     bus.publish(
-        super::PLUGIN_CONFIGURATION_CHANGED,
+        crate::configuration::PLUGIN_CONFIGURATION_CHANGED,
         "meridian.v1.PluginConfigurationChangedEvent",
         PluginConfigurationChangedEvent {
             plugin_instance_id: "snaptrade-1".into(),
@@ -377,53 +360,54 @@ async fn a_linked_account_nobody_may_write_through_the_plugin_is_refused() {
 }
 
 #[tokio::test]
-async fn the_write_scope_is_read_again_after_30_seconds_and_trusted_for_10_minutes() {
+async fn the_configuration_is_read_again_after_30_seconds_and_trusted_for_10_minutes() {
     let (sidecar, bus, _) = registered(&["custody"]).await;
     const T0: i64 = 1_790_000_000_000_000_000;
     const SECOND: i64 = 1_000_000_000;
-    assert!(sidecar.write_scope(T0).await.unwrap().contains("ACC-1"));
+    let scope = |c: meridian_domain::v1::PluginConfiguration| c.write_account_ids;
+    assert!(scope(sidecar.configuration(T0).await.unwrap()).contains(&"ACC-1".to_string()));
 
     // The conductor now says ACC-1 is out, and then stops answering.
     let answers = Arc::new(Mutex::new(0));
     let counting = Arc::clone(&answers);
-    bus.serve(crate::scope::PLUGIN_ACCESS, move |_| {
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
         let mut answered = counting.lock().unwrap();
         *answered += 1;
         if *answered > 1 {
             return Err("the conductor is down".into());
         }
         Ok((
-            "meridian.v1.PluginAccessReply".into(),
-            PluginAccessReply::default().encode_to_vec(),
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
         ))
     });
     assert!(
-        sidecar
-            .write_scope(T0 + 29 * SECOND)
-            .await
-            .unwrap()
-            .contains("ACC-1"),
+        scope(sidecar.configuration(T0 + 29 * SECOND).await.unwrap())
+            .contains(&"ACC-1".to_string()),
         "inside 30 seconds, as last read"
     );
     assert_eq!(*answers.lock().unwrap(), 0);
     assert!(
-        sidecar
-            .write_scope(T0 + 31 * SECOND)
-            .await
-            .unwrap()
-            .is_empty(),
+        scope(sidecar.configuration(T0 + 31 * SECOND).await.unwrap()).is_empty(),
         "past it, read again"
     );
     let read_at = T0 + 31 * SECOND;
     assert!(
-        sidecar.write_scope(read_at + 9 * 60 * SECOND).await.is_ok(),
+        sidecar
+            .configuration(read_at + 9 * 60 * SECOND)
+            .await
+            .is_ok(),
         "the conductor down: as last read, within 10 minutes"
     );
     let refused = sidecar
-        .write_scope(read_at + 11 * 60 * SECOND)
+        .configuration(read_at + 11 * 60 * SECOND)
         .await
         .unwrap_err();
-    assert_eq!(refused.code(), Code::Unavailable, "and refused past them");
+    assert_eq!(
+        refused.code(),
+        Code::Aborted,
+        "and refused past them, with the conductor's reason"
+    );
 }
 
 const KEY_ID: &str = "dashboard-2026-09-0a1b2c3d";
