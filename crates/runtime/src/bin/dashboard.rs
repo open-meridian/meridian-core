@@ -145,6 +145,14 @@ fn run() -> Result<(), String> {
             None
         }
     };
+    // The deployment's own registry, which a plugin's image is pushed to
+    // through this dashboard (W8.1).
+    let registry = match var("MERIDIAN_REGISTRY_UPSTREAM") {
+        Some(base) => Some(Arc::new(meridian_dashboard::catalogue::Registry::new(
+            base,
+        )?)),
+        None => None,
+    };
     let provider = var("MERIDIAN_OIDC_ISSUER")
         .zip(var("MERIDIAN_OIDC_CLIENT_ID"))
         .map(|(issuer, client_id)| OidcConfig {
@@ -363,6 +371,7 @@ fn run() -> Result<(), String> {
                 accounts,
                 secure_cookies,
                 plugins,
+                registry,
             }));
             let listener = tokio::net::TcpListener::bind(listen)
                 .await

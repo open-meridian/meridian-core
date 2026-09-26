@@ -162,6 +162,7 @@ fn app_with(
         accounts: None,
         secure_cookies: true,
         plugins: None,
+        registry: None,
     })
 }
 

@@ -35,6 +35,7 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         accounts: None,
         secure_cookies: true,
         plugins: None,
+        registry: None,
     })
 }
 

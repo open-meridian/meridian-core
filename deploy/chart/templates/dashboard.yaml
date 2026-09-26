@@ -240,6 +240,12 @@ spec:
               value: {{ printf "http://{instance}.%s-sidecars.%s.svc.cluster.local:%v" (include "meridian-runtime.fullname" .) .Release.Namespace .Values.sidecar.frontDoorPort | quote }}
             - name: MERIDIAN_DASHBOARD_SIGNING_KEY_DIR
               value: /etc/meridian/dashboard-signing
+            {{- if .Values.registry.enabled }}
+            # The deployment's registry, which a plugin's image is pushed to
+            # through here and nowhere else from outside the cluster (W8.1).
+            - name: MERIDIAN_REGISTRY_UPSTREAM
+              value: {{ printf "http://%s-registry.%s.svc.cluster.local:5000" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           # Read when first needed and kept once found, so the Job finishing

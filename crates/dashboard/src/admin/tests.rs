@@ -108,6 +108,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         accounts: None,
         secure_cookies: true,
         plugins: None,
+        registry: None,
     });
     Harness {
         app,

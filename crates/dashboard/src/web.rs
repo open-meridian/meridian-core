@@ -72,6 +72,9 @@ pub struct App {
     /// dashboard has no public address to put them under, or no front door
     /// to send them to; it says so rather than serving them from its own.
     pub plugins: Option<Arc<crate::plugins::Plugins>>,
+    /// The deployment's own registry, which a plugin's image is pushed to
+    /// through here (W8.1). None where the deployment runs none.
+    pub registry: Option<Arc<crate::catalogue::Registry>>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -82,6 +85,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
         .merge(terminal::routes())
+        .merge(crate::catalogue::routes())
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
         .route("/plugins/{instance}", get(crate::plugins::open))

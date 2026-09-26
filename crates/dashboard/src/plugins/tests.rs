@@ -188,6 +188,7 @@ fn dashboard(
         accounts: None,
         secure_cookies: true,
         plugins: Some(Arc::new(plugins)),
+        registry: None,
     });
     (app, session)
 }
