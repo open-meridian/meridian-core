@@ -116,7 +116,7 @@ async fn registered() -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>
     ));
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             settings: vec![declared("api_key", true)],
             ..Default::default()
         }))

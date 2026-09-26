@@ -124,7 +124,7 @@ async fn harness(instances: &[&str]) -> Harness {
     ));
     let reply = sidecar
         .register(tonic::Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             interface: Some(InterfaceDeclaration {
                 loopback_port: plugin_port.into(),
                 title: "Holdings".into(),

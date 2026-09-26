@@ -110,7 +110,7 @@ async fn registered_with(
     }
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             ..Default::default()
         }))
         .await

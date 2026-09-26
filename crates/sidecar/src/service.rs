@@ -8,17 +8,16 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use meridian_bus::{Bus, BusError};
+use meridian_bus::Bus;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    AccountScopeDelivery, CallFailure, CallReply, CallRequest, Delivery, HeartbeatReply,
-    HeartbeatRequest, LeaveReply, LeaveRequest, PluginAccessReply, PluginAccessRequest,
-    PublishReply, PublishRequest, RegisterReply, RegisterRequest, SettingsDelivery,
-    SubscribeRequest, WatchAccountScopeRequest, WatchSettingsRequest,
+    AccountScopeDelivery, HeartbeatReply, HeartbeatRequest, LeaveReply, LeaveRequest,
+    PluginAccessReply, PluginAccessRequest, RegisterReply, RegisterRequest, SettingsDelivery,
+    WatchAccountScopeRequest, WatchSettingsRequest,
 };
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::grants::{Contract, Grants};
@@ -184,7 +183,6 @@ impl Sidecar {
     }
 }
 
-type DeliveryStream = Pin<Box<dyn Stream<Item = Result<Delivery, Status>> + Send>>;
 type SettingsStream = Pin<Box<dyn Stream<Item = Result<SettingsDelivery, Status>> + Send>>;
 type ScopeStream = Pin<Box<dyn Stream<Item = Result<AccountScopeDelivery, Status>> + Send>>;
 
@@ -290,125 +288,6 @@ impl SidecarService for Sidecar {
         }))
     }
 
-    async fn publish(
-        &self,
-        request: Request<PublishRequest>,
-    ) -> Result<Response<PublishReply>, Status> {
-        let registration = self.admitted()?;
-        let req = request.into_inner();
-
-        if !registration.grants.may_publish(&req.topic) {
-            let refusal_reason = format!("no publish grant for {}", req.topic);
-            self.note_refusal(&refusal_reason);
-            return Ok(Response::new(PublishReply {
-                accepted: false,
-                message_id: String::new(),
-                refusal_reason,
-            }));
-        }
-
-        let correlation = non_empty(&req.correlation_id);
-        let causation = non_empty(&req.causation_id);
-
-        match self.bus.publish(
-            &req.topic,
-            &req.payload_type,
-            req.payload,
-            correlation.as_deref(),
-            causation.as_deref(),
-        ) {
-            Ok(message_id) => Ok(Response::new(PublishReply {
-                accepted: true,
-                message_id,
-                refusal_reason: String::new(),
-            })),
-            Err(BusError::NotPublishable(topic)) => Ok(Response::new(PublishReply {
-                accepted: false,
-                message_id: String::new(),
-                refusal_reason: format!("`{topic}` is not a publishable topic"),
-            })),
-            Err(other) => Err(Status::internal(other.to_string())),
-        }
-    }
-
-    type SubscribeStream = DeliveryStream;
-
-    async fn subscribe(
-        &self,
-        request: Request<SubscribeRequest>,
-    ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let registration = self.admitted()?;
-        let pattern = request.into_inner().pattern;
-
-        // Checked once, here, rather than per delivered message. A subscription
-        // is a standing decision; re-deciding it on every message would cost
-        // the same answer thousands of times.
-        if !registration.grants.may_subscribe(&pattern) {
-            let refusal = format!("no subscribe grant for {pattern}");
-            self.note_refusal(&refusal);
-            return Err(Status::permission_denied(refusal));
-        }
-
-        let stream = self.bus.subscribe(&pattern).into_stream().map(|d| {
-            Ok(Delivery {
-                envelope: Some(d.envelope),
-            })
-        });
-
-        Ok(Response::new(Box::pin(stream) as Self::SubscribeStream))
-    }
-
-    async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallReply>, Status> {
-        let registration = self.admitted()?;
-        let req = request.into_inner();
-
-        // A call publishes a question, so it needs the publish grant. Treating
-        // it as a read would let a plugin reach any handler in the deployment.
-        if !registration.grants.may_publish(&req.topic) {
-            let refusal = format!("no grant for {}", req.topic);
-            self.note_refusal(&refusal);
-            return Ok(Response::new(failed_call(CallFailure::Refused, refusal)));
-        }
-
-        let timeout = match req.timeout_ms {
-            ms if ms > 0 => Some(Duration::from_millis(ms as u64)),
-            // Zero means the sidecar's default, never unbounded: the surface
-            // offers no way to wait forever.
-            _ => None,
-        };
-
-        let result = self
-            .bus
-            .call(
-                &req.topic,
-                &req.payload_type,
-                req.payload,
-                non_empty(&req.correlation_id).as_deref(),
-                timeout,
-            )
-            .await;
-
-        Ok(Response::new(match result {
-            Ok((payload_type, payload)) => CallReply {
-                ok: true,
-                payload_type,
-                payload,
-                failure: CallFailure::Unspecified as i32,
-                failure_detail: String::new(),
-            },
-            // Each of these leads the caller somewhere different, which is why
-            // they are distinct rather than one error string.
-            Err(BusError::NoHandler(topic)) => {
-                failed_call(CallFailure::NoHandler, format!("nothing serves {topic}"))
-            }
-            Err(e @ BusError::Timeout { .. }) => failed_call(CallFailure::Timeout, e.to_string()),
-            Err(BusError::HandlerFailed { detail, .. }) => {
-                failed_call(CallFailure::HandlerError, detail)
-            }
-            Err(other) => failed_call(CallFailure::HandlerError, other.to_string()),
-        }))
-    }
-
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -487,26 +366,6 @@ impl SidecarService for Sidecar {
     }
 }
 
-fn failed_call(failure: CallFailure, detail: String) -> CallReply {
-    CallReply {
-        ok: false,
-        payload_type: String::new(),
-        payload: Vec::new(),
-        failure: failure as i32,
-        failure_detail: detail,
-    }
-}
-
-/// An empty string in a proto field means "not set". Turning it into `None`
-/// here keeps that translation in one place instead of at every call site.
-fn non_empty(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -518,6 +377,7 @@ fn now_ns() -> i64 {
 mod tests {
     use super::*;
     use meridian_bus::MemoryBackend;
+    use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 
     /// A contract of the shape the real one has, with a read-only role the
     /// real one has no rows for yet.
@@ -552,9 +412,17 @@ mod tests {
         Sidecar::under(&contract(), bus, "dep-local-1", identity)
     }
 
+    fn statement() -> meridian_pb::plugin::v1::RecordHoldingsStatementParams {
+        meridian_pb::plugin::v1::RecordHoldingsStatementParams {
+            source: "snaptrade".into(),
+            expected_rows: 1,
+            ..Default::default()
+        }
+    }
+
     fn register_req() -> RegisterRequest {
         RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             ..Default::default()
         }
     }
@@ -600,20 +468,16 @@ mod tests {
             assert!(reply.admitted, "{held:?}: {}", reply.refusal_reason);
             assert!(reply.publish_grants.is_empty() && reply.subscribe_grants.is_empty());
             let refused = sc
-                .publish(Request::new(PublishRequest {
-                    topic: "platform.street.command.record-holding".into(),
-                    ..Default::default()
-                }))
+                .record_holdings_statement(Request::new(statement()))
                 .await
-                .unwrap()
-                .into_inner();
-            assert!(!refused.accepted);
+                .unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::PermissionDenied);
         }
     }
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v0", "v3"] {
+        for declared in ["v1", "v3"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -622,7 +486,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v1 through v2"));
+            assert!(reply.refusal_reason.contains("v2 through v2"));
             assert!(sc.registration().is_none());
         }
     }
@@ -771,187 +635,11 @@ mod tests {
     async fn nothing_works_before_registering() {
         let sc = sidecar();
         let err = sc
-            .publish(Request::new(PublishRequest {
-                topic: "platform.street.command.record-holding".into(),
-                ..Default::default()
-            }))
+            .record_holdings_statement(Request::new(statement()))
             .await
             .unwrap_err();
 
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
-    async fn publishing_an_ungranted_topic_names_the_missing_grant() {
-        let sc = admitted_sidecar().await;
-        let reply = sc
-            .publish(Request::new(PublishRequest {
-                topic: "platform.street.command.record-statement".into(),
-                payload_type: "meridian.v1.RecordHoldingsStatementRequest".into(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(!reply.accepted);
-        assert!(reply.refusal_reason.contains("record-statement"));
-    }
-
-    #[tokio::test]
-    async fn a_granted_publish_reaches_the_bus_stamped_by_the_sidecar() {
-        let sc = admitted_sidecar().await;
-        let mut sub = sc.bus.subscribe("platform.street.**");
-
-        let reply = sc
-            .publish(Request::new(PublishRequest {
-                topic: "platform.street.command.record-holding".into(),
-                payload_type: "meridian.v1.RecordHoldingRequest".into(),
-                payload: vec![1, 2, 3],
-                correlation_id: "corr-1".into(),
-                causation_id: "msg-0".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(reply.accepted);
-
-        let meta = sub.recv().await.unwrap().envelope.meta.unwrap();
-        // The plugin supplied neither of these and could not have.
-        assert_eq!(meta.publisher_instance_id, "sidecar-custody-1");
-        assert!(meta.published_at_ns > 0);
-        // The causal links it did supply were carried through.
-        assert_eq!(meta.correlation_id, "corr-1");
-        assert_eq!(meta.causation_id, "msg-0");
-    }
-
-    #[tokio::test]
-    async fn an_instance_scoped_topic_is_covered_by_its_wildcard_grant() {
-        let sc = admitted_sidecar().await;
-        let reply = sc
-            .publish(Request::new(PublishRequest {
-                topic: "platform.custody.custody-snaptrade-1.event.sync-status".into(),
-                payload_type: "meridian.v1.SyncStatusEvent".into(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(reply.accepted, "{}", reply.refusal_reason);
-    }
-
-    #[tokio::test]
-    async fn an_ungranted_subscription_is_refused_rather_than_silently_empty() {
-        let sc = admitted_sidecar().await;
-        // A boxed stream is not Debug, so unwrap_err is unavailable here.
-        match sc
-            .subscribe(Request::new(SubscribeRequest {
-                pattern: "platform.street.**".into(),
-            }))
-            .await
-        {
-            Err(status) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
-            Ok(_) => panic!("an ungranted subscription was accepted"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_granted_subscription_delivers() {
-        let sc = admitted_sidecar().await;
-        let response = sc
-            .subscribe(Request::new(SubscribeRequest {
-                pattern: "platform.reference.event.instrument-applied".into(),
-            }))
-            .await
-            .unwrap();
-
-        sc.bus
-            .publish(
-                "platform.reference.event.instrument-applied",
-                "meridian.v1.InstrumentAppliedEvent",
-                vec![4, 2],
-                None,
-                None,
-            )
-            .unwrap();
-
-        let mut stream = response.into_inner();
-        let delivery = stream.next().await.unwrap().unwrap();
-        assert_eq!(delivery.envelope.unwrap().payload, vec![4, 2]);
-    }
-
-    #[tokio::test]
-    async fn a_call_reaches_its_handler() {
-        let sc = admitted_sidecar().await;
-        sc.bus
-            .serve("platform.reference.query.resolve-identifier", |_| {
-                Ok(("meridian.v1.ResolveIdentifierReply".to_string(), vec![7]))
-            });
-
-        let reply = sc
-            .call(Request::new(CallRequest {
-                topic: "platform.reference.query.resolve-identifier".into(),
-                payload_type: "meridian.v1.ResolveIdentifierRequest".into(),
-                payload: vec![],
-                correlation_id: String::new(),
-                timeout_ms: 1000,
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(reply.ok);
-        assert_eq!(reply.payload, vec![7]);
-    }
-
-    #[tokio::test]
-    async fn call_failures_are_distinguished() {
-        let sc = admitted_sidecar().await;
-
-        // Nothing serving: distinct from a timeout, because the caller's next
-        // move differs.
-        let reply = sc
-            .call(Request::new(CallRequest {
-                topic: "platform.reference.query.resolve-identifier".into(),
-                timeout_ms: 100,
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(reply.failure, CallFailure::NoHandler as i32);
-
-        // Not granted.
-        let reply = sc
-            .call(Request::new(CallRequest {
-                topic: "platform.street.query.list-positions".into(),
-                timeout_ms: 100,
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(reply.failure, CallFailure::Refused as i32);
-
-        // Slow handler.
-        sc.bus
-            .serve("platform.reference.query.resolve-identifier", |_| {
-                std::thread::sleep(Duration::from_millis(200));
-                Ok(("t".to_string(), vec![]))
-            });
-        let reply = sc
-            .call(Request::new(CallRequest {
-                topic: "platform.reference.query.resolve-identifier".into(),
-                timeout_ms: 20,
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(reply.failure, CallFailure::Timeout as i32);
     }
 
     #[tokio::test]
@@ -981,10 +669,7 @@ mod tests {
         assert!(sc.registration().unwrap().departed);
 
         let err = sc
-            .publish(Request::new(PublishRequest {
-                topic: "platform.street.command.record-holding".into(),
-                ..Default::default()
-            }))
+            .record_holdings_statement(Request::new(statement()))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);

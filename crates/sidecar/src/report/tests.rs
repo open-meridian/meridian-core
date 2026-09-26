@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, MemoryBackend, Subscription};
 use meridian_domain::v1::PluginReport;
+use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
+use meridian_pb::plugin::v1::RecordHoldingsStatementParams;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{HeartbeatRequest, LeaveRequest, PublishRequest, RegisterRequest};
+use meridian_pb::v1::{HeartbeatRequest, LeaveRequest, RegisterRequest};
 use prost::Message;
 use tonic::Request;
 
@@ -36,7 +38,7 @@ fn memory() -> Arc<Bus> {
 async fn register(sidecar: &Sidecar) {
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             ..Default::default()
         }))
         .await
@@ -66,14 +68,17 @@ async fn what_the_plugin_said_and_what_it_was_refused_are_reported() {
         }))
         .await
         .unwrap();
+    // Custody holds no row in this contract, so each is refused its grant.
     for _ in 0..2 {
-        sidecar
-            .publish(Request::new(PublishRequest {
-                topic: "platform.street.command.record-holding".into(),
-                ..Default::default()
-            }))
+        let statement = RecordHoldingsStatementParams {
+            source: "snaptrade".into(),
+            expected_rows: 1,
+            ..Default::default()
+        };
+        assert!(sidecar
+            .record_holdings_statement(Request::new(statement))
             .await
-            .unwrap();
+            .is_err());
     }
 
     let report = sidecar.report(7);
@@ -81,11 +86,11 @@ async fn what_the_plugin_said_and_what_it_was_refused_are_reported() {
     assert!(!report.healthy);
     assert_eq!(report.health_detail, "required setting api_key is not set");
     assert!(report.last_heartbeat_at_ns > 0);
-    assert_eq!(report.contract_version, "v1");
+    assert_eq!(report.contract_version, "v2");
     assert_eq!(report.refused_grants, 2);
     assert_eq!(
         report.last_refusal_reason,
-        "no publish grant for platform.street.command.record-holding"
+        "no grant for platform.street.command.record-statement: this plugin holds custody"
     );
 
     sidecar

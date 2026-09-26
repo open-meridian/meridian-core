@@ -14,12 +14,15 @@ use std::sync::Arc;
 
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
-    ListCustodialPositionsReply, ListCustodialPositionsRequest, RecordHoldingReply,
-    RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
-    ResolveIdentifierReply, ResolveIdentifierRequest,
+    ExternalAccountLink, ListCustodialPositionsReply, ListCustodialPositionsRequest,
+    PluginConfiguration,
+};
+use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
+use meridian_pb::plugin::v1::{
+    RecordHoldingParams, RecordHoldingsStatementParams, ResolveIdentifierParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{CallRequest, RegisterRequest};
+use meridian_pb::v1::RegisterRequest;
 use meridian_sidecar::{Contract, Identity, Sidecar};
 use prost::Message;
 use tonic::Request;
@@ -40,6 +43,25 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
         &bus,
         Arc::new(meridian_instrument::MemoryStore::new()),
     );
+    // The conductor's part, stood in for: this plugin's external account
+    // `ext-1` is linked to ACC-1, which somebody may write through it.
+    bus.serve("platform.config.query.plugin-configuration", |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration {
+                plugin_instance_id: "custody-snaptrade-1".into(),
+                links: vec![ExternalAccountLink {
+                    plugin_instance_id: "custody-snaptrade-1".into(),
+                    external_account_id: "ext-1".into(),
+                    account_id: "ACC-1".into(),
+                }],
+                read_account_ids: vec!["ACC-1".into()],
+                write_account_ids: vec!["ACC-1".into()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
 
     // Its grants are the contract's, compiled in: no table to load.
     let sidecar = Sidecar::new(
@@ -57,7 +79,7 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
 async fn admitted(sidecar: &Sidecar, expected_role: &str) {
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             ..Default::default()
         }))
         .await
@@ -71,31 +93,6 @@ async fn admitted(sidecar: &Sidecar, expected_role: &str) {
     assert_eq!(reply.roles, vec![expected_role.to_string()]);
 }
 
-/// Call a topic the way a plugin does, and fail loudly rather than decoding
-/// whatever a refusal left behind.
-async fn call<T: Message + Default>(
-    sidecar: &Sidecar,
-    topic: &str,
-    payload_type: &str,
-    body: impl Message,
-) -> T {
-    let reply = sidecar
-        .call(Request::new(CallRequest {
-            topic: topic.into(),
-            payload_type: payload_type.into(),
-            payload: body.encode_to_vec(),
-            correlation_id: String::new(),
-            timeout_ms: 5_000,
-            ..Default::default()
-        }))
-        .await
-        .expect("call is served")
-        .into_inner();
-
-    assert!(reply.ok, "{topic} was refused: {}", reply.failure_detail);
-    T::decode(&reply.payload[..]).expect("the reply decodes")
-}
-
 /// A connector's whole path, through the sidecar, against one runtime.
 #[tokio::test]
 async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
@@ -105,52 +102,45 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     // The reference side answers on the same process. Nothing is loaded, so the
     // answer is a miss — which is the honest one, and still proves the handler
     // is registered rather than absent.
-    let resolved: ResolveIdentifierReply = call(
-        &sidecar,
-        meridian_instrument::service::RESOLVE_IDENTIFIER,
-        "meridian.v1.ResolveIdentifierRequest",
-        ResolveIdentifierRequest {
-            identifiers: vec![],
+    let resolved = sidecar
+        .resolve_identifier(Request::new(ResolveIdentifierParams {
             as_of_ns: NOW,
-            exchange_mic: String::new(),
-            currency: String::new(),
-        },
-    )
-    .await;
+            ..Default::default()
+        }))
+        .await
+        .expect("resolve is served")
+        .into_inner();
     assert!(!resolved.found);
 
-    // The street store side, on that same bus: open a statement promising one row.
-    let opened: RecordHoldingsStatementReply = call(
-        &sidecar,
-        meridian_street::service::RECORD_STATEMENT,
-        "meridian.v1.RecordHoldingsStatementRequest",
-        RecordHoldingsStatementRequest {
+    // The street store side, on that same bus: open a statement promising one
+    // row, through the typed operations a plugin has (decisions/013).
+    let opened = sidecar
+        .record_holdings_statement(Request::new(RecordHoldingsStatementParams {
             source: "snaptrade".into(),
             external_statement_id: "st-1".into(),
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
             expected_rows: 1,
-        },
-    )
-    .await;
+            acting_for: None,
+        }))
+        .await
+        .expect("the statement is opened")
+        .into_inner();
     assert!(!opened.already_recorded);
 
-    let recorded: RecordHoldingReply = call(
-        &sidecar,
-        meridian_street::service::RECORD_HOLDING,
-        "meridian.v1.RecordHoldingRequest",
-        RecordHoldingRequest {
+    let recorded = sidecar
+        .record_holding(Request::new(RecordHoldingParams {
             statement_id: opened.statement_id,
-            account_id: "ACC-1".into(),
             instrument_id: "INS-1".into(),
-            unresolved_identifiers: vec![],
             quantity_scaled_1e8: 1_250_000_000,
             market_value_scaled_1e8: 281_250_000_000,
             currency: "USD".into(),
-            external_account_id: String::new(),
-        },
-    )
-    .await;
+            external_account_id: "ext-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the row is recorded against the linked account")
+        .into_inner();
     assert!(recorded.resolved);
 
     // The dashboard reading what the connector wrote. One store behind one

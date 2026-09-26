@@ -33,7 +33,7 @@ EXTERNAL_ACCOUNT = "ext-e2e"
 def register():
     stub = sidecar_pb2_grpc.SidecarServiceStub(grpc.insecure_channel(SIDECAR))
     request = sidecar_pb2.RegisterRequest(
-        schema_version="v1",
+        schema_version="v2",
         interface=sidecar_pb2.InterfaceDeclaration(loopback_port=PORT, title="Plugin page"),
     )
     for _ in range(60):

@@ -303,7 +303,7 @@ async fn front_door(key: &SigningKey, port: Option<u32>) -> String {
     ));
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v1".into(),
+            schema_version: "v2".into(),
             interface: port.map(|loopback_port| InterfaceDeclaration {
                 loopback_port,
                 title: "Holdings".into(),
@@ -467,7 +467,7 @@ async fn an_interface_on_a_port_that_is_not_one_is_refused_at_registration() {
         );
         let reply = sidecar
             .register(Request::new(RegisterRequest {
-                schema_version: "v1".into(),
+                schema_version: "v2".into(),
                 interface: Some(InterfaceDeclaration {
                     loopback_port,
                     title: "Holdings".into(),
