@@ -32,3 +32,9 @@ deploy/nats/dev.conf
 # Made and replaced by `make test-directory`: a throwaway CA and the ldaps://
 # test directory's certificate, trusted by nothing.
 .e2e-ldap-tls/
+
+# Keys made on this machine, which never belong in a repository -- least of
+# all this public one. .live/ held a deployment key pair committed by
+# accident in c6b35b8 and removed from tracking on 2026-09-26; removing it
+# un-leaks nothing, so the key it held is revoked on the platform instead.
+.live/
