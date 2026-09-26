@@ -27,6 +27,12 @@ metadata:
     {{- include "meridian-runtime.labels" $top | nindent 4 }}
 spec:
   replicas: 1
+  # One copy of an instance at a time, always: a rolling update would start the
+  # new pod beside the old, two plugins under one instance's name, hostname
+  # and credential. The old stops first, and the page is away for the moment
+  # between.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
@@ -39,6 +45,14 @@ spec:
         meridian.dev/component: sidecar
         meridian.dev/instance: {{ .instanceId }}
     spec:
+      {{- /*
+        Named for its instance under the one Service every plugin shares
+        (sidecars.yaml), so `{instance}.{release}-sidecars` resolves to this
+        pod and nothing else: how the dashboard reaches its front door, with
+        no Service made per plugin (the registry spec, decision 4).
+      */}}
+      hostname: {{ .instanceId }}
+      subdomain: {{ include "meridian-runtime.fullname" $top }}-sidecars
       {{- with $top.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -183,51 +197,5 @@ spec:
             name: {{ include "meridian-runtime.fullname" $top }}-dashboard-keys
         {{- end }}
       {{- end }}
-{{- if $top.Values.dashboard.enabled }}
----
-# Where the dashboard finds this instance's front door: named for the
-# instance, so the dashboard needs no list of plugins to fall behind.
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "meridian-runtime.fullname" $top }}-sidecar-{{ .instanceId }}
-  labels:
-    meridian.dev/component: sidecar
-    meridian.dev/instance: {{ .instanceId }}
-    {{- include "meridian-runtime.labels" $top | nindent 4 }}
-spec:
-  selector:
-    app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
-    app.kubernetes.io/instance: {{ $top.Release.Name }}
-    meridian.dev/instance: {{ .instanceId }}
-  ports:
-    - name: front-door
-      port: {{ $top.Values.sidecar.frontDoorPort }}
-      targetPort: front-door
----
-# The front door admits the dashboard's pods and nothing else: not another
-# plugin, not another component. Everything else in this pod is on loopback.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ include "meridian-runtime.fullname" $top }}-sidecar-{{ .instanceId }}
-  labels:
-    {{- include "meridian-runtime.labels" $top | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
-      app.kubernetes.io/instance: {{ $top.Release.Name }}
-      meridian.dev/instance: {{ .instanceId }}
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/instance: {{ $top.Release.Name }}
-              meridian.dev/component: dashboard
-      ports:
-        - port: {{ $top.Values.sidecar.frontDoorPort }}
-{{- end }}
 ---
 {{- end }}

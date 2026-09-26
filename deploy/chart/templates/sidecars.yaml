@@ -1,0 +1,61 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.dashboard.enabled }}
+{{/*
+  What reaches and fences every plugin, made once, whether the chart runs the
+  plugin (sidecars[]) or the launcher does (spec/the-local-plugin-registry,
+  decision 4, ruled 2026-09-26).
+
+  Made per plugin, a Service and a NetworkPolicy would be two more kinds the
+  launcher could create, and one able to create NetworkPolicies can open a
+  plugin to everything. So there is one of each here, and a launched plugin's
+  Deployment is all the launcher makes (decisions/019).
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+# Headless: no address of its own, only a name for each sidecar pod, which
+# sets its hostname to its instance and its subdomain to this. So
+# {instance}.{{ $full }}-sidecars resolves to that plugin's pod while it is
+# ready, and to nothing once it is gone -- which is how the dashboard tells a
+# plugin that runs from one that does not, keeping no list of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-sidecars
+  labels:
+    meridian.dev/component: sidecar
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: sidecar
+  ports:
+    - name: front-door
+      port: {{ .Values.sidecar.frontDoorPort }}
+      targetPort: front-door
+---
+# Every plugin's front door admits the dashboard's pods and nothing else: not
+# another plugin, not another component. Everything else in a plugin's pod is
+# on loopback. Selected by the component label, so a plugin launched after
+# install is fenced from its first moment without anything made for it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $full }}-sidecars
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: sidecar
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: dashboard
+      ports:
+        - port: {{ .Values.sidecar.frontDoorPort }}
+{{- end }}

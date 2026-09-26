@@ -885,7 +885,7 @@ chart-check:
 		--set 'sidecars[0].instanceId=check-1' 2>/dev/null)"; \
 	doc() { echo "$$rendered" | awk -v k="kind: $$1" -v n="  name: $$2" \
 		'function f(){ if (a && b) printf "%s", d; d=""; a=0; b=0 } /^---/{f(); next} {d=d $$0 "\n"} $$0==k{a=1} $$0==n{b=1} END{f()}'; }; \
-	policy="$$(doc NetworkPolicy check-meridian-runtime-sidecar-check-1)"; \
+	policy="$$(doc NetworkPolicy check-meridian-runtime-sidecars)"; \
 	[ -n "$$policy" ] || { echo "chart-check FAILED: a sidecar's front door has no NetworkPolicy, so any pod can reach it" >&2; exit 1; }; \
 	[ "$$(echo "$$policy" | grep -c -- '- podSelector:')" = 1 ] && echo "$$policy" | grep -q 'meridian.dev/component: dashboard' \
 		&& ! echo "$$policy" | grep -q 'namespaceSelector\|ipBlock' \
@@ -899,7 +899,15 @@ chart-check:
 	[ "$$(echo "$$rendered" | grep -c 'secretName: check-meridian-runtime-dashboard-signing')" = 1 ] \
 		|| { echo "chart-check FAILED: the dashboard's private key is mounted somewhere besides the dashboard" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q 'MERIDIAN_DASHBOARD_KEYS_DIR' \
-		|| { echo "chart-check FAILED: a sidecar is not given the dashboard's public keys" >&2; exit 1; }
+		|| { echo "chart-check FAILED: a sidecar is not given the dashboard's public keys" >&2; exit 1; }; \
+	doc Deployment check-meridian-runtime-sidecar-check-1 | grep -q '^    type: Recreate$$' \
+		|| { echo "chart-check FAILED: a plugin's Deployment rolls, so two copies of one instance would run under one name" >&2; exit 1; }; \
+	echo "$$policy" | grep -q 'meridian.dev/component: sidecar' \
+		|| { echo "chart-check FAILED: the plugins' NetworkPolicy does not select every sidecar by its component" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '^      subdomain: check-meridian-runtime-sidecars$$' \
+		|| { echo "chart-check FAILED: a sidecar pod is not named under the plugins' one Service, so the dashboard cannot reach it" >&2; exit 1; }; \
+	[ "$$(echo "$$rendered" | grep -c '^kind: NetworkPolicy$$')" = "$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null | grep -c '^kind: NetworkPolicy$$')" ] \
+		|| { echo "chart-check FAILED: a plugin brought its own NetworkPolicy; every plugin shares one, so the launcher never makes one" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
