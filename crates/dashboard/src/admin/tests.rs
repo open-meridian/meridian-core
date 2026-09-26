@@ -107,6 +107,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         directory: None,
         accounts: None,
         secure_cookies: true,
+        plugins: None,
     });
     Harness {
         app,
@@ -126,14 +127,14 @@ async fn send(h: &Harness, request: Request<Body>) -> (StatusCode, String) {
 fn get(h: &Harness, path: &str, signed_in: bool) -> Request<Body> {
     let mut request = Request::get(path);
     if signed_in {
-        request = request.header(COOKIE, format!("{SESSION_COOKIE}={}", h.session));
+        request = request.header(COOKIE, format!("__Host-{SESSION_COOKIE}={}", h.session));
     }
     request.body(Body::empty()).unwrap()
 }
 
 fn post(h: &Harness, path: &str, form: &str) -> Request<Body> {
     Request::post(path)
-        .header(COOKIE, format!("{SESSION_COOKIE}={}", h.session))
+        .header(COOKIE, format!("__Host-{SESSION_COOKIE}={}", h.session))
         .header("content-type", "application/x-www-form-urlencoded")
         .body(Body::from(form.to_string()))
         .unwrap()

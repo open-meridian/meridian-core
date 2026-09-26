@@ -92,6 +92,18 @@ impl Sessions {
         Some(session.clone())
     }
 
+    /// Whether a session is live, without touching it: for a sweep, which
+    /// would otherwise keep alive everything it looked at.
+    pub fn is_live(&self, key: &str, now_ns: i64) -> bool {
+        self.live
+            .lock()
+            .expect("session lock poisoned")
+            .get(key)
+            .is_some_and(|s| {
+                now_ns - s.last_seen_at_ns <= IDLE_NS && now_ns - s.started_at_ns <= ABSOLUTE_NS
+            })
+    }
+
     pub fn end(&self, key: &str) {
         self.live.lock().expect("session lock poisoned").remove(key);
     }

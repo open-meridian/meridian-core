@@ -78,6 +78,17 @@ spec:
               value: {{ join "," (.tags | default list) | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
+            {{- if $top.Values.dashboard.enabled }}
+            {{/*
+              The front door: the dashboard's requests for the plugin's page,
+              each carrying an assertion signed by a key this reads from the
+              mount below, by key id, when it first meets one.
+            */}}
+            - name: MERIDIAN_FRONT_DOOR_ADDRESS
+              value: "0.0.0.0:{{ $top.Values.sidecar.frontDoorPort }}"
+            - name: MERIDIAN_DASHBOARD_KEYS_DIR
+              value: /etc/meridian/dashboard-keys
+            {{- end }}
             {{/*
               The credential this instance presents, which the plugin's
               container has no mount for. Containers in a pod share a network
@@ -88,6 +99,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $top }}
                   key: {{ .instanceId }}
+          {{- if $top.Values.dashboard.enabled }}
+          ports:
+            - name: front-door
+              containerPort: {{ $top.Values.sidecar.frontDoorPort }}
+          volumeMounts:
+            - name: dashboard-keys
+              mountPath: /etc/meridian/dashboard-keys
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml $top.Values.resources | nindent 12 }}
         {{- with .plugin }}
@@ -146,10 +166,68 @@ spec:
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
-      {{- if .plugin }}
+      {{- if or .plugin $top.Values.dashboard.enabled }}
       volumes:
+        {{- if .plugin }}
         - name: plugin-tmp
           emptyDir: {}
+        {{- end }}
+        {{- if $top.Values.dashboard.enabled }}
+        {{- /*
+          The dashboard's public keys, one file per key id. A ConfigMap
+          mounted whole, not by subPath, so a key the Job makes after this pod
+          started arrives in it without a restart.
+        */}}
+        - name: dashboard-keys
+          configMap:
+            name: {{ include "meridian-runtime.fullname" $top }}-dashboard-keys
+        {{- end }}
       {{- end }}
+{{- if $top.Values.dashboard.enabled }}
+---
+# Where the dashboard finds this instance's front door: named for the
+# instance, so the dashboard needs no list of plugins to fall behind.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-sidecar-{{ .instanceId }}
+  labels:
+    meridian.dev/component: sidecar
+    meridian.dev/instance: {{ .instanceId }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
+    app.kubernetes.io/instance: {{ $top.Release.Name }}
+    meridian.dev/instance: {{ .instanceId }}
+  ports:
+    - name: front-door
+      port: {{ $top.Values.sidecar.frontDoorPort }}
+      targetPort: front-door
+---
+# The front door admits the dashboard's pods and nothing else: not another
+# plugin, not another component. Everything else in this pod is on loopback.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-sidecar-{{ .instanceId }}
+  labels:
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
+      app.kubernetes.io/instance: {{ $top.Release.Name }}
+      meridian.dev/instance: {{ .instanceId }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $top.Release.Name }}
+              meridian.dev/component: dashboard
+      ports:
+        - port: {{ $top.Values.sidecar.frontDoorPort }}
+{{- end }}
 ---
 {{- end }}

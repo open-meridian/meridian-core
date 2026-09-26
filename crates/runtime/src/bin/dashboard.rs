@@ -19,11 +19,16 @@ use std::time::Duration;
 use meridian_dashboard::accounts::{Accounts as _, InPostgres};
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
+use meridian_dashboard::plugins::Plugins;
+use meridian_dashboard::signing::Signer;
 use meridian_dashboard::terminal::Terminals;
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
 use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
+
+/// Where the chart mounts the dashboard's signing key.
+const SIGNING_KEY: &str = "/etc/meridian/dashboard-signing";
 
 fn main() {
     tracing_subscriber::fmt()
@@ -54,6 +59,38 @@ fn run() -> Result<(), String> {
             Some(serving) => meridian_runtime::grant_serving(&url, &serving),
             None => Ok(()),
         };
+    }
+
+    // The dashboard's signing key, made once by the chart's Job: the public
+    // half into the ConfigMap every sidecar mounts, the private half into the
+    // Secret only the dashboard mounts, and the Job's rights given up
+    // (meridian_dashboard::signing).
+    if std::env::args().nth(1).as_deref() == Some("signing-key") {
+        let secret = required("MERIDIAN_DASHBOARD_SIGNING_SECRET")?;
+        let config_map = required("MERIDIAN_DASHBOARD_KEYS_CONFIG_MAP")?;
+        let binding = required("MERIDIAN_DASHBOARD_KEY_BINDING")?;
+        let cluster =
+            meridian_first_run::cluster::ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let done = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|failed| failed.to_string())?
+            .block_on(meridian_dashboard::signing::provision(
+                &cluster,
+                &secret,
+                &config_map,
+                &binding,
+                now_ns(),
+            ))?;
+        match done {
+            meridian_dashboard::signing::Provisioned::Made(key_id) => {
+                tracing::info!(key_id, "the dashboard's signing key is made")
+            }
+            meridian_dashboard::signing::Provisioned::Kept => {
+                tracing::info!("the dashboard already has a signing key; nothing was changed")
+            }
+        }
+        return Ok(());
     }
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "dashboard-1".into());
@@ -87,6 +124,27 @@ fn run() -> Result<(), String> {
                 .into(),
         );
     }
+    // Plugins' pages, each on a host of its own below this dashboard's
+    // (decisions/021), so both its address and where each instance's sidecar
+    // listens are needed; the second names `{instance}`. Without either, the
+    // dashboard serves no plugin pages and says so when one is opened.
+    let plugins = match (public_url.is_empty(), var("MERIDIAN_PLUGIN_FRONT_DOOR")) {
+        (false, Some(front_door)) => {
+            let key =
+                var("MERIDIAN_DASHBOARD_SIGNING_KEY_DIR").unwrap_or_else(|| SIGNING_KEY.into());
+            Some(Arc::new(Plugins::new(
+                &public_url,
+                &front_door,
+                Signer::at(key),
+            )?))
+        }
+        _ => {
+            tracing::info!(
+                "no plugin pages: they need MERIDIAN_DASHBOARD_URL and MERIDIAN_PLUGIN_FRONT_DOOR"
+            );
+            None
+        }
+    };
     let provider = var("MERIDIAN_OIDC_ISSUER")
         .zip(var("MERIDIAN_OIDC_CLIENT_ID"))
         .map(|(issuer, client_id)| OidcConfig {
@@ -241,12 +299,16 @@ fn run() -> Result<(), String> {
 
             let sweeping = Arc::clone(&sessions);
             let sweeping_terminals = Arc::clone(&terminals);
+            let sweeping_plugins = plugins.clone();
             tokio::spawn(async move {
                 let mut every = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     every.tick().await;
                     sweeping.sweep(now_ns());
                     sweeping_terminals.sweep(now_ns());
+                    if let Some(plugins) = &sweeping_plugins {
+                        plugins.sweep(&sweeping, now_ns());
+                    }
                 }
             });
 
@@ -300,6 +362,7 @@ fn run() -> Result<(), String> {
                 directory: directory.map(Arc::new),
                 accounts,
                 secure_cookies,
+                plugins,
             }));
             let listener = tokio::net::TcpListener::bind(listen)
                 .await

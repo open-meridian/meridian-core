@@ -25,11 +25,17 @@ serde_json.workspace = true
 base64.workspace = true
 prost.workspace = true
 rand.workspace = true
+meridian-pb.workspace = true
+ed25519-dalek.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+# The real sidecar's front door, so a test proves what it verifies.
+meridian-sidecar = { path = "../sidecar" }
+tonic.workspace = true
+async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

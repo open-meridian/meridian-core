@@ -77,9 +77,9 @@ impl Sidecar {
         } else {
             registration.roles.join(", ")
         };
-        Err(Status::permission_denied(format!(
-            "no grant for {topic}: this plugin holds {held}"
-        )))
+        let refusal = format!("no grant for {topic}: this plugin holds {held}");
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
     }
 
     /// An event: checked, published, and its identifier handed back.

@@ -307,6 +307,11 @@ sidecar:
   # Changing the host here opens the boundary to anything that can route to the
   # pod. The runtime warns when it is not loopback.
   address: 127.0.0.1:9191
+  # Where the dashboard sends a person's requests for the plugin's page
+  # (decisions/014, 021). Off loopback, since the dashboard is another pod,
+  # and closed by a NetworkPolicy to everything but the dashboard's pods. The
+  # plugin's own page stays on loopback, where only its sidecar reaches it.
+  frontDoorPort: 9292
 
 nameOverride: ""
 fullnameOverride: ""

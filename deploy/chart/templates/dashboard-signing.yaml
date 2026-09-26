@@ -1,0 +1,142 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.dashboard.enabled }}
+{{/*
+  The dashboard's own signing key (decisions/014; plans/a-person-reaches-a-
+  plugin, ruling 4). The dashboard signs, per request, who a person is and
+  what they hold on a plugin; the plugin's sidecar verifies it before anything
+  reaches the plugin. The key is the dashboard's alone -- never the
+  deployment's, which only the conductor holds.
+
+  Made inside the cluster by a Job, the way first run works (decisions/016):
+  the chart makes an empty Secret and an empty ConfigMap so a Role can name
+  them, and the Job patches them by name, creates nothing, and deletes its own
+  RoleBinding when done. The private half goes to the Secret only the
+  dashboard mounts; the public half to the ConfigMap every sidecar mounts,
+  named by its key id, so a rotation is a new file beside the old one.
+
+  Both are rendered with whatever they already hold and kept when the release
+  goes, so an upgrade never replaces a key sidecars already trust, and a Job
+  that finds a key already made gives its rights up and does nothing else.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-dashboard-key" $full }}
+{{- $secret := printf "%s-dashboard-signing" $full }}
+{{- $keys := printf "%s-dashboard-keys" $full }}
+{{- $existingSecret := lookup "v1" "Secret" .Release.Namespace $secret }}
+{{- $existingKeys := lookup "v1" "ConfigMap" .Release.Namespace $keys }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secret }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+{{- if and $existingSecret $existingSecret.data }}
+data:
+  {{- toYaml $existingSecret.data | nindent 2 }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $keys }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- if and $existingKeys $existingKeys.data }}
+data:
+  {{- toYaml $existingKeys.data | nindent 2 }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# The two it fills, by name, and its own binding. `create` on nothing: RBAC
+# cannot narrow `create` to a name, which is why the chart makes both.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $secret | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ $keys | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    resourceNames: [{{ $name | quote }}]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-{{ .Release.Revision }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: dashboard-key
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $name }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dashboard-key
+          image: "{{ .Values.image.repository }}:{{ .Values.dashboard.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-dashboard", "signing-key"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            # Every name it may touch, from the chart, because the Role names
+            # the same ones.
+            - name: MERIDIAN_DASHBOARD_SIGNING_SECRET
+              value: {{ $secret | quote }}
+            - name: MERIDIAN_DASHBOARD_KEYS_CONFIG_MAP
+              value: {{ $keys | quote }}
+            - name: MERIDIAN_DASHBOARD_KEY_BINDING
+              value: {{ $name | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- end }}

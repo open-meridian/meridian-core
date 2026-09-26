@@ -34,6 +34,7 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         directory: None,
         accounts: None,
         secure_cookies: true,
+        plugins: None,
     })
 }
 
@@ -116,7 +117,12 @@ async fn without_a_directory_configured_sign_in_says_so() {
 async fn a_signed_in_person_sees_what_the_records_give_them_now() {
     let app = app_with(Some(admins()), T0, T0);
     let key = app.sessions.start(ADA, "Ada <Park>", vec![], T0);
-    let (status, body) = get(app.clone(), "/", Some(&format!("{SESSION_COOKIE}={key}"))).await;
+    let (status, body) = get(
+        app.clone(),
+        "/",
+        Some(&format!("__Host-{SESSION_COOKIE}={key}")),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Ada &lt;Park&gt;"), "names are escaped");
     assert!(body.contains("deployment admin"));
@@ -124,16 +130,42 @@ async fn a_signed_in_person_sees_what_the_records_give_them_now() {
     // Withdrawn in the records: the same live session loses it at once,
     // because access is evaluated per request and never kept in a session.
     app.records.store(AccessRecords::default(), T0);
-    let (_, after) = get(app, "/", Some(&format!("{SESSION_COOKIE}={key}"))).await;
+    let (_, after) = get(app, "/", Some(&format!("__Host-{SESSION_COOKIE}={key}"))).await;
     assert!(!after.contains("deployment admin"));
 }
 
 #[test]
 fn cookies_are_http_only_lax_and_secure_over_https() {
     let app = app_with(None, 0, T0);
-    let value = set_cookie(&app, SESSION_COOKIE, "k", "/", 60);
+    let value = set_cookie(&app, SIGN_IN_COOKIE, "k", "/callback", 60);
     let text = value.to_str().unwrap();
     assert!(text.contains("HttpOnly") && text.contains("SameSite=Lax") && text.contains("Secure"));
+    // Prefixed, so no subdomain -- a plugin's page -- can set one for us.
+    assert!(
+        text.starts_with("__Host-meridian_signin=k; Path=/;"),
+        "{text}"
+    );
+    assert!(!text.contains("Domain"), "{text}");
+}
+
+#[test]
+fn over_plain_http_cookies_are_neither_secure_nor_prefixed() {
+    let mut app = Arc::try_unwrap(app_with(None, 0, T0)).ok().unwrap();
+    app.secure_cookies = false;
+    let text = set_cookie(&app, SIGN_IN_COOKIE, "k", "/callback", 60);
+    assert_eq!(
+        text.to_str().unwrap(),
+        "meridian_signin=k; Path=/callback; Max-Age=60; HttpOnly; SameSite=Lax"
+    );
+}
+
+#[test]
+fn over_https_an_unprefixed_cookie_is_not_ours() {
+    // One a plugin's script set for the parent domain, beside nothing of ours.
+    let app = app_with(None, 0, T0);
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_static("meridian_session=tossed"));
+    assert_eq!(cookie(&app, &headers, SESSION_COOKIE), None);
 }
 
 #[test]
@@ -143,8 +175,8 @@ fn a_cookie_is_read_by_name_among_others() {
         COOKIE,
         HeaderValue::from_static("a=1; meridian_session=abc; b=2"),
     );
-    assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
-    assert_eq!(cookie(&headers, "missing"), None);
+    assert_eq!(named(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
+    assert_eq!(named(&headers, "missing"), None);
 }
 
 // ── Signing in against a directory this deployment binds itself ────────────
@@ -287,7 +319,10 @@ async fn the_right_password_starts_a_session() {
         .to_str()
         .expect("ascii")
         .to_string();
-    assert!(cookie.starts_with(SESSION_COOKIE), "{cookie}");
+    assert!(
+        cookie.starts_with(&format!("__Host-{SESSION_COOKIE}=")),
+        "{cookie}"
+    );
 }
 
 #[tokio::test]

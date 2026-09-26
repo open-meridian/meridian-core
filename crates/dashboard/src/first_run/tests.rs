@@ -161,6 +161,7 @@ fn app_with(
         directory: None,
         accounts: None,
         secure_cookies: true,
+        plugins: None,
     })
 }
 

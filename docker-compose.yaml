@@ -171,7 +171,13 @@ services:
       MERIDIAN_LOCAL_ACCOUNT_NAME: ${MERIDIAN_LOCAL_ACCOUNT_NAME:-}
       MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH: ${MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH:-}
       MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME: ${MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME:-}
+      # Plugins' pages, for e2e-plugin-page: each instance's sidecar, by the
+      # alias the sidecar below carries. Unset, the dashboard serves none.
+      MERIDIAN_PLUGIN_FRONT_DOOR: ${MERIDIAN_PLUGIN_FRONT_DOOR:-}
+      MERIDIAN_DASHBOARD_SIGNING_KEY_DIR: /keys/signing
       RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - plugin-page-keys:/keys:ro
     ports:
       - "127.0.0.1:${MERIDIAN_DASHBOARD_PORT:-8088}:8080"
     networks: [meridian]
@@ -197,8 +203,17 @@ services:
       MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_PLUGIN_ROLES:-custody}
       MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
       MERIDIAN_INSTANCE_ID: sidecar-custody-test-1
+      # The front door, for e2e-plugin-page; unset, there is none.
+      MERIDIAN_FRONT_DOOR_ADDRESS: ${MERIDIAN_FRONT_DOOR_ADDRESS:-}
+      MERIDIAN_DASHBOARD_KEYS_DIR: /keys/public
       RUST_LOG: ${RUST_LOG:-info}
-    networks: [meridian]
+    volumes:
+      - plugin-page-keys:/keys:ro
+    networks:
+      meridian:
+        # Named for its instance, as the chart's Service is, which is how the
+        # dashboard finds an instance's front door.
+        aliases: ["sidecar-${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-test-1}"]
 
   # The Python SDK against a sidecar, which is the only check that the two
   # implementations of the sidecar surface agree.
@@ -510,6 +525,58 @@ services:
       - dashboard-e2e-state:/state
     networks: [meridian]
 
+  # The dashboard's signing key, made as the chart's Job makes it but into a
+  # volume: the private half where the dashboard reads it, the public half
+  # under its key id where the sidecar does. Kept if already made. One volume
+  # here for both halves, which the chart never does -- a stand-in's economy.
+  plugin-page-keys:
+    profiles: [e2e]
+    image: alpine/openssl:3.3.2
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -f /keys/signing/key-id ] && exit 0
+        mkdir -p /keys/signing /keys/public
+        id=dashboard-e2e-$$(openssl rand -hex 4)
+        openssl genpkey -algorithm ed25519 -out /keys/signing/private-key.pem
+        openssl pkey -in /keys/signing/private-key.pem -pubout -out /keys/public/$$id.pem
+        printf %s "$$id" > /keys/signing/key-id
+        chmod -R a+rX /keys
+    volumes:
+      - plugin-page-keys:/keys
+    networks: [meridian]
+
+  # A plugin serving a page, in the sidecar's network namespace as a plugin is
+  # in its sidecar's pod, saying what reached it.
+  plugin-page:
+    profiles: [e2e]
+    image: meridian-python-interop
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    depends_on:
+      sidecar:
+        condition: service_started
+    environment:
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
+    volumes:
+      - ./e2e/plugin-page:/stand-in:ro
+    network_mode: "service:sidecar"
+
+  plugin-page-runner:
+    profiles: [e2e]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/e2e/plugin_page_runner.py"]
+    environment:
+      DASHBOARD: http://dashboard:8080
+      E2E_CLAIM_CODE: ${E2E_CLAIM_CODE:-E2E-7KQ2-MX4P}
+      E2E_LOCAL_ACCOUNT_NAME: ada
+      E2E_LOCAL_ACCOUNT_PASSWORD: Password1!
+      E2E_STATE: /state
+    volumes:
+      - ./e2e/dashboard:/e2e:ro
+      - dashboard-e2e-state:/state
+    networks: [meridian]
+
   accounts-runner:
     profiles: [e2e]
     image: python:3.12-alpine
@@ -569,6 +636,7 @@ volumes:
   e2e-bootstrap:
   e2e-state:
   dashboard-e2e-state:
+  plugin-page-keys:
 
 networks:
   meridian:

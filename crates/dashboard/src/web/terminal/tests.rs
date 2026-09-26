@@ -195,7 +195,7 @@ async fn a_browser_session_already_held_is_neither_used_nor_extended() {
     let response = send(
         &app,
         Request::get(asking(BACK, "S256"))
-            .header(COOKIE, format!("{SESSION_COOKIE}={key}"))
+            .header(COOKIE, format!("__Host-{SESSION_COOKIE}={key}"))
             .body(Body::empty())
             .unwrap(),
     )
@@ -282,7 +282,7 @@ async fn neither_client_can_act_through_the_others_credential() {
 
     // A browser's cookie on a terminal path is not a session there.
     let key = app.sessions.start("local|ada", "Ada Park", vec![], T0);
-    let cookie = format!("{SESSION_COOKIE}={key}");
+    let cookie = format!("__Host-{SESSION_COOKIE}={key}");
     let (status, body) = probe(&app, None, Some(&cookie)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
@@ -348,7 +348,7 @@ async fn no_session_at_all_is_refused_with_a_reason_too() {
 fn admin_session(app: &Arc<App>) -> (String, String) {
     let key = app.sessions.start(ADA, "Ada", vec![], T0);
     let token = app.sessions.find(&key, T0).unwrap().form_token;
-    (format!("{SESSION_COOKIE}={key}"), token)
+    (format!("__Host-{SESSION_COOKIE}={key}"), token)
 }
 
 async fn ending(app: &Arc<App>, cookie: &str, body: String) -> Response {
@@ -411,7 +411,7 @@ async fn only_an_admin_with_their_form_token_ends_anybodys_sessions() {
     // Not an administrator.
     let key = app.sessions.start("local|ada", "Ada Park", vec![], T0);
     let token = app.sessions.find(&key, T0).unwrap().form_token;
-    let cookie = format!("{SESSION_COOKIE}={key}");
+    let cookie = format!("__Host-{SESSION_COOKIE}={key}");
     let refused = ending(
         &app,
         &cookie,

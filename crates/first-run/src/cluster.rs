@@ -59,6 +59,14 @@ pub trait Cluster: Send + Sync {
         values: &BTreeMap<String, Vec<u8>>,
     ) -> Result<(), ClusterError>;
 
+    /// Merge keys into a ConfigMap that already exists: what is public, such
+    /// as the half of the dashboard's key every sidecar verifies with.
+    async fn put_config_map(
+        &self,
+        name: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(), ClusterError>;
+
     /// How many replicas a named workload should run. One is how the
     /// database this chart can bring is started (decisions/016).
     async fn scale(&self, kind: Workload, name: &str, replicas: u32) -> Result<(), ClusterError>;
@@ -185,6 +193,20 @@ impl Cluster for ApiServer {
             &format!("/api/v1/namespaces/{}/secrets/{name}", self.namespace),
             "application/merge-patch+json",
             serde_json::json!({ "data": data }),
+        )
+        .await
+    }
+
+    async fn put_config_map(
+        &self,
+        name: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(), ClusterError> {
+        // The same merge patch as a Secret's, in plain text.
+        self.patch(
+            &format!("/api/v1/namespaces/{}/configmaps/{name}", self.namespace),
+            "application/merge-patch+json",
+            serde_json::json!({ "data": values }),
         )
         .await
     }

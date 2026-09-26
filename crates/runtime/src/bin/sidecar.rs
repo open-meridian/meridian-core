@@ -15,9 +15,13 @@
 use meridian_runtime::{bus_from_env, names_from, required, shutdown, var};
 use std::sync::Arc;
 
+use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
 use meridian_sidecar::{
     Identity, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
 };
+
+/// Where the chart mounts the dashboard's public keys, one file per key id.
+const DASHBOARD_KEYS: &str = "/etc/meridian/dashboard-keys";
 
 fn main() {
     tracing_subscriber::fmt()
@@ -59,6 +63,28 @@ fn run() -> Result<(), String> {
         );
     }
 
+    // The front door (decisions/014, 021): where the dashboard sends a
+    // person's requests for this plugin's page. Off loopback by necessity,
+    // since the dashboard is another pod, and closed to everything else by the
+    // chart's NetworkPolicy; unset, there is none, and nobody reaches the page.
+    let front = match var("MERIDIAN_FRONT_DOOR_ADDRESS") {
+        None => None,
+        Some(address) => {
+            if identity.instance_id.is_empty() {
+                return Err(
+                    "a front door needs MERIDIAN_PLUGIN_INSTANCE_ID: it admits only \
+                     assertions for this instance"
+                        .into(),
+                );
+            }
+            let at: std::net::SocketAddr = address
+                .parse()
+                .map_err(|failed| format!("{address} is not an address: {failed}"))?;
+            let keys = var("MERIDIAN_DASHBOARD_KEYS_DIR").unwrap_or_else(|| DASHBOARD_KEYS.into());
+            Some((at, Verifier::new(identity.instance_id.clone(), keys)))
+        }
+    };
+
     // On the bus as its plugin's instance, so what it sends names the plugin
     // and what the conductor answers it -- its configuration, its links -- is
     // that plugin's: the conductor answers for the instance the envelope
@@ -79,6 +105,30 @@ fn run() -> Result<(), String> {
 
             tracing::info!(instance_id, %listening, "the sidecar is serving");
 
+            // What it knows of its plugin, for the conductor and the
+            // dashboard (W4.8): now, on each registration, and every 30s.
+            tokio::spawn(meridian_sidecar::report::report_forever(Arc::clone(&sidecar)));
+
+            let door = match front {
+                None => None,
+                Some((at, verifier)) => {
+                    let door = FrontDoor::new(Arc::clone(&sidecar), verifier)?;
+                    let listener = tokio::net::TcpListener::bind(at)
+                        .await
+                        .map_err(|failed| format!("the front door could not bind {at}: {failed}"))?;
+                    tracing::info!(%at, "the front door is open to the dashboard");
+                    Some(axum::serve(listener, front_door::router(door)))
+                }
+            };
+            let front_door = async {
+                match door {
+                    Some(serving) => serving
+                        .await
+                        .map_err(|failed| format!("the front door stopped: {failed}")),
+                    None => std::future::pending().await,
+                }
+            };
+
             let serving = tonic::transport::Server::builder()
                 .add_service(SidecarServiceServer::from_arc(Arc::clone(&sidecar)))
                 // The typed operations (spec/typed-sidecar-operations).
@@ -93,6 +143,9 @@ fn run() -> Result<(), String> {
                 served = serving => {
                     served.map_err(|failed| format!("the sidecar surface at {listening} stopped: {failed}"))
                 }
+                // The page is how a person reaches the plugin, so a door that
+                // stopped is a sidecar to restart, as the surface is.
+                stopped = front_door => stopped,
                 _ = shutdown() => {
                     tracing::info!("stopping");
                     Ok(())

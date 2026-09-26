@@ -14,7 +14,7 @@ license = "AGPL-3.0-or-later"
 # reviewable change rather than something that drifts in on a rebuild -- a
 # schema change lands in every consumer as one arc or it is not landed.
 [workspace.dependencies]
-meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "430bfb0e3b8d6c0e07a8cdf8a3d8dc3d9510e34d" }
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "b57c1202c7c4e3baa20ab54a26b62851960b4cdd" }
 # The domain messages, generated here from proto/ rather than taken from the
 # schema: they are the runtime's own traffic past the sidecar.
 meridian-domain = { path = "crates/domain" }
@@ -85,8 +85,9 @@ prost = "0.13"
 # The client a deployment calls the platform with. rustls rather than the
 # system TLS stack, so the container needs no OpenSSL headers and the build
 # stays a pinned toolchain and nothing else. Redirects are followed by hand, so
-# the built-in policy is switched off where the client is constructed.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset"] }
+# the built-in policy is switched off where the client is constructed. Streams,
+# so a sidecar's front door passes a page through without holding it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "stream"] }
 
 # A trait with an async method has to be boxed to be usable behind `dyn`, and
 # the transport is behind `dyn` so a test can answer without a network.

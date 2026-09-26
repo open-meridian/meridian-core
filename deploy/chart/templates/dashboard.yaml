@@ -230,8 +230,24 @@ spec:
                   key: groups-claim
                   optional: true
             {{- end }}
+            {{/*
+              Plugins' pages, each on its own host below the dashboard's
+              (decisions/021), sent to that instance's sidecar at the Service
+              named for it. `{instance}` is filled in per request, never here.
+            */}}
+            - name: MERIDIAN_PLUGIN_FRONT_DOOR
+              value: {{ printf "http://%s-sidecar-{instance}.%s.svc.cluster.local:%v" (include "meridian-runtime.fullname" .) .Release.Namespace .Values.sidecar.frontDoorPort | quote }}
+            - name: MERIDIAN_DASHBOARD_SIGNING_KEY_DIR
+              value: /etc/meridian/dashboard-signing
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+          # Read when first needed and kept once found, so the Job finishing
+          # after this started needs no restart. Mounted whole for the same
+          # reason: a subPath mount never sees an update.
+          volumeMounts:
+            - name: dashboard-signing
+              mountPath: /etc/meridian/dashboard-signing
+              readOnly: true
           # Ready only while the records are fresh: a dashboard that cannot read
           # who may do what is taken out rather than sending people to a
           # refusal. Alive is only that it answers at all, so a stale one is
@@ -247,6 +263,12 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        # The private half, which only this pod mounts.
+        - name: dashboard-signing
+          secret:
+            secretName: {{ include "meridian-runtime.fullname" . }}-dashboard-signing
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

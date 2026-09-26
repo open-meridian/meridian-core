@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page \
         build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -30,7 +30,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -592,6 +592,38 @@ e2e-dashboard-accounts: network
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
 	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, and enough wrong passwords stop it"
 
+# A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
+# of their own: the account branch's dashboard, holding a key made as the
+# chart's Job makes it, a sidecar with its front door open, and a stand-in
+# plugin in the sidecar's namespace saying what reached it.
+E2E_PLUGIN_PAGE := MERIDIAN_PLUGIN_FRONT_DOOR='http://sidecar-{instance}:9292' \
+	MERIDIAN_FRONT_DOOR_ADDRESS=0.0.0.0:9292 \
+	$(E2E_ACCOUNTS)
+
+e2e-plugin-page: network
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-plugin-page FAILED: the SDK's image did not build" >&2; exit 1; }
+	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@: >.e2e-plugin-page.log
+	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1 || true
+	@set -e; \
+	$(E2E_PLUGIN_PAGE) build dashboard conductor sidecar >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) up -d postgres nats fake-platform >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-keys >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) run --rm -T conductor meridian-conductor migrate >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) run --rm -T dashboard meridian-dashboard migrate >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) up -d conductor dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
+	status=0; $(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner || status=$$?; \
+	if [ $$status -ne 0 ]; then $(E2E_PLUGIN_PAGE) logs dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
+		echo "e2e-plugin-page FAILED; the components' logs are in .e2e-plugin-page.log" >&2; \
+		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
+	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
+	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, and the plugin is told who they are by its sidecar alone"
+
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
 	@# an anonymous volume and treats what it finds there as set up: a
@@ -840,10 +872,33 @@ chart-check:
 		|| { echo "chart-check FAILED: the dashboard does not read the issuer first run wrote" >&2; exit 1; }; \
 	echo "$$without" | grep -q 'key: dashboard-url' \
 		|| { echo "chart-check FAILED: the dashboard does not read the address first run wrote" >&2; exit 1; }; true
+	@# The front door (decisions/014, 021). Each sidecar's HTTP port admits the
+	@# dashboard's pods and nothing else, the dashboard's private key is
+	@# mounted by the dashboard alone, and the Job that makes it may create
+	@# nothing and gives its rights up.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--set 'sidecars[0].instanceId=check-1' 2>/dev/null)"; \
+	doc() { echo "$$rendered" | awk -v k="kind: $$1" -v n="  name: $$2" \
+		'function f(){ if (a && b) printf "%s", d; d=""; a=0; b=0 } /^---/{f(); next} {d=d $$0 "\n"} $$0==k{a=1} $$0==n{b=1} END{f()}'; }; \
+	policy="$$(doc NetworkPolicy check-meridian-runtime-sidecar-check-1)"; \
+	[ -n "$$policy" ] || { echo "chart-check FAILED: a sidecar's front door has no NetworkPolicy, so any pod can reach it" >&2; exit 1; }; \
+	[ "$$(echo "$$policy" | grep -c -- '- podSelector:')" = 1 ] && echo "$$policy" | grep -q 'meridian.dev/component: dashboard' \
+		&& ! echo "$$policy" | grep -q 'namespaceSelector\|ipBlock' \
+		|| { echo "chart-check FAILED: a sidecar's front door admits something besides the dashboard's pods:" >&2; echo "$$policy" >&2; exit 1; }; \
+	role="$$(doc Role check-meridian-runtime-dashboard-key)"; \
+	[ -n "$$role" ] || { echo "chart-check FAILED: found no Role for the dashboard's key Job, so the checks below would prove nothing" >&2; exit 1; }; \
+	echo "$$role" | grep -q '"create"' \
+		&& { echo "chart-check FAILED: the dashboard's key Job may create a resource; RBAC cannot narrow create to a name" >&2; exit 1; }; \
+	[ "$$(echo "$$role" | grep -c 'resourceNames:')" = 3 ] \
+		|| { echo "chart-check FAILED: a rule of the dashboard's key Job names no resource" >&2; exit 1; }; \
+	[ "$$(echo "$$rendered" | grep -c 'secretName: check-meridian-runtime-dashboard-signing')" = 1 ] \
+		|| { echo "chart-check FAILED: the dashboard's private key is mounted somewhere besides the dashboard" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q 'MERIDIAN_DASHBOARD_KEYS_DIR' \
+		|| { echo "chart-check FAILED: a sidecar is not given the dashboard's public keys" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
-	echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, and a plugin held to its side of the pod"
+	echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, and its front door open to the dashboard alone"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

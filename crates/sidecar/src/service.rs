@@ -32,6 +32,13 @@ pub struct Registration {
     pub healthy: bool,
     pub last_heartbeat_ns: i64,
     pub departed: bool,
+    /// The loopback port the plugin serves its page on, if it declared one
+    /// (decisions/014). The front door forwards there and nowhere else.
+    pub interface_port: Option<u16>,
+    /// The plugin's own reason when it last said it was unhealthy.
+    pub health_detail: String,
+    /// The contract version it registered with.
+    pub contract_version: String,
 }
 
 /// Who a sidecar was launched to serve.
@@ -82,6 +89,13 @@ pub struct Sidecar {
     /// them and forgotten whenever the conductor says the configuration
     /// changed. `None` until then.
     pub(crate) links: crate::typed::Links,
+
+    /// Grants refused, and the latest reason, for the plugin report (W4.8):
+    /// the sidecar sees refusals the plugin cannot report about itself.
+    pub(crate) refusals: Arc<std::sync::Mutex<(i64, String)>>,
+    /// Woken when registration changes, so a report goes out at once rather
+    /// than at the next interval.
+    pub(crate) changed: Arc<tokio::sync::Notify>,
 }
 
 impl Sidecar {
@@ -111,6 +125,8 @@ impl Sidecar {
             grants,
             state: Arc::new(RwLock::new(None)),
             links: crate::typed::Links::default(),
+            refusals: Arc::default(),
+            changed: Arc::default(),
         }
     }
 
@@ -184,6 +200,26 @@ impl SidecarService for Sidecar {
             }));
         }
 
+        // A page, if the plugin serves one, on a port that is a port. Refused
+        // here rather than when the first person opens it, where the failure
+        // would look like the plugin being down.
+        let interface_port = match &req.interface {
+            None => None,
+            Some(declared) => match u16::try_from(declared.loopback_port) {
+                Ok(port) if port != 0 => Some(port),
+                _ => {
+                    return Ok(Response::new(RegisterReply {
+                        admitted: false,
+                        refusal_reason: format!(
+                            "the interface's loopback_port {} is not a port",
+                            declared.loopback_port
+                        ),
+                        ..Default::default()
+                    }));
+                }
+            },
+        };
+
         // Grants come from what this sidecar was launched as, never from the
         // request. The request has nothing in it that could decide them.
         //
@@ -203,7 +239,11 @@ impl SidecarService for Sidecar {
             healthy: true,
             last_heartbeat_ns: now_ns(),
             departed: false,
+            interface_port,
+            health_detail: String::new(),
+            contract_version: req.schema_version.clone(),
         });
+        self.changed.notify_one();
 
         tracing::info!(
             instance = self.identity.instance_id,
@@ -236,10 +276,12 @@ impl SidecarService for Sidecar {
         let req = request.into_inner();
 
         if !registration.grants.may_publish(&req.topic) {
+            let refusal_reason = format!("no publish grant for {}", req.topic);
+            self.note_refusal(&refusal_reason);
             return Ok(Response::new(PublishReply {
                 accepted: false,
                 message_id: String::new(),
-                refusal_reason: format!("no publish grant for {}", req.topic),
+                refusal_reason,
             }));
         }
 
@@ -280,9 +322,9 @@ impl SidecarService for Sidecar {
         // is a standing decision; re-deciding it on every message would cost
         // the same answer thousands of times.
         if !registration.grants.may_subscribe(&pattern) {
-            return Err(Status::permission_denied(format!(
-                "no subscribe grant for {pattern}"
-            )));
+            let refusal = format!("no subscribe grant for {pattern}");
+            self.note_refusal(&refusal);
+            return Err(Status::permission_denied(refusal));
         }
 
         let stream = self.bus.subscribe(&pattern).into_stream().map(|d| {
@@ -301,10 +343,9 @@ impl SidecarService for Sidecar {
         // A call publishes a question, so it needs the publish grant. Treating
         // it as a read would let a plugin reach any handler in the deployment.
         if !registration.grants.may_publish(&req.topic) {
-            return Ok(Response::new(failed_call(
-                CallFailure::Refused,
-                format!("no grant for {}", req.topic),
-            )));
+            let refusal = format!("no grant for {}", req.topic);
+            self.note_refusal(&refusal);
+            return Ok(Response::new(failed_call(CallFailure::Refused, refusal)));
         }
 
         let timeout = match req.timeout_ms {
@@ -356,6 +397,11 @@ impl SidecarService for Sidecar {
         if let Some(state) = self.state.write().expect("state lock poisoned").as_mut() {
             state.healthy = req.healthy;
             state.last_heartbeat_ns = now_ns();
+            state.health_detail = if req.healthy {
+                String::new()
+            } else {
+                req.detail.clone()
+            };
         }
 
         if !req.healthy {
@@ -373,6 +419,7 @@ impl SidecarService for Sidecar {
             state.departed = true;
             state.healthy = false;
         }
+        self.changed.notify_one();
 
         tracing::info!(instance = registration.instance_id, reason, "plugin left");
         Ok(Response::new(LeaveReply {}))

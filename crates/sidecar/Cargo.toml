@@ -18,6 +18,12 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The front door: a person's way to the plugin's page (decisions/014, 021).
+axum.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
+rand.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

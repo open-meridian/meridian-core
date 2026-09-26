@@ -68,6 +68,10 @@ pub struct App {
     /// Whether cookies carry `Secure`: true whenever this dashboard is served
     /// over HTTPS, which is always outside a developer's machine.
     pub secure_cookies: bool,
+    /// Plugins' pages, each on its own host (decisions/021). None when this
+    /// dashboard has no public address to put them under, or no front door
+    /// to send them to; it says so rather than serving them from its own.
+    pub plugins: Option<Arc<crate::plugins::Plugins>>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -80,7 +84,14 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(terminal::routes())
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
-        .with_state(app)
+        .route("/plugins/{instance}", get(crate::plugins::open))
+        .with_state(Arc::clone(&app))
+        // Outermost, so a request for a plugin's host meets none of the
+        // dashboard's pages, whatever its path.
+        .layer(axum::middleware::from_fn_with_state(
+            app,
+            crate::plugins::on_plugin_host,
+        ))
 }
 
 /// Alive, and whether the records are fresh enough to serve. A load balancer
@@ -92,7 +103,27 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     }
 }
 
-pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+/// A cookie's name as the browser holds it. Over HTTPS every cookie of ours
+/// is `__Host-`: the browser then refuses one set with a `Domain`, or from
+/// anywhere but this host. That matters since plugin pages are served from
+/// subdomains of this host (decisions/021): without it, a plugin's script
+/// could set `meridian_session` for the parent domain and have the dashboard
+/// read it -- somebody else's session, or one it chose. Over plain HTTP, on a
+/// developer's machine, no prefix is possible and none is used.
+pub fn cookie_name(secure: bool, name: &str) -> String {
+    if secure {
+        format!("__Host-{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The value of one of our cookies, by its unprefixed name.
+pub(crate) fn cookie(app: &App, headers: &HeaderMap, name: &str) -> Option<String> {
+    named(headers, &cookie_name(app.secure_cookies, name))
+}
+
+pub(crate) fn named(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(COOKIE)
         .iter()
@@ -103,6 +134,8 @@ pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
+/// `__Host-` requires the whole host, so a prefixed cookie's path is `/`
+/// whatever the caller asked for; the narrower path was only ever tidiness.
 pub(crate) fn set_cookie(
     app: &App,
     name: &str,
@@ -110,7 +143,12 @@ pub(crate) fn set_cookie(
     path: &str,
     max_age_s: i64,
 ) -> HeaderValue {
-    let secure = if app.secure_cookies { "; Secure" } else { "" };
+    let (secure, path) = if app.secure_cookies {
+        ("; Secure", "/")
+    } else {
+        ("", path)
+    };
+    let name = cookie_name(app.secure_cookies, name);
     HeaderValue::from_str(&format!(
         "{name}={value}; Path={path}; Max-Age={max_age_s}; HttpOnly; SameSite=Lax{secure}"
     ))
@@ -119,7 +157,7 @@ pub(crate) fn set_cookie(
 
 /// The session a request carries, if it carries a live one.
 pub fn session_of(app: &App, headers: &HeaderMap) -> Option<Session> {
-    let key = cookie(headers, SESSION_COOKIE)?;
+    let key = cookie(app, headers, SESSION_COOKIE)?;
     app.sessions.find(&key, app.clock.now_ns())
 }
 
@@ -162,7 +200,17 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     } else {
         body.push_str("<h2>Plugins</h2><ul>");
         for plugin in access.plugins.keys() {
-            body.push_str(&format!("<li>{}</li>", escape(plugin)));
+            // Linked when it can be opened: access to no account yet is
+            // listed, and would be refused at the door.
+            let openable = !access.on_plugin(plugin).is_empty();
+            if app.plugins.is_some() && openable && crate::plugins::is_instance(plugin) {
+                body.push_str(&format!(
+                    "<li><a href=\"/plugins/{0}\">{0}</a></li>",
+                    escape(plugin)
+                ));
+            } else {
+                body.push_str(&format!("<li>{}</li>", escape(plugin)));
+            }
         }
         body.push_str("</ul>");
     }
@@ -443,7 +491,7 @@ async fn callback(
     };
     // The state must come back to the browser that started it. Without this,
     // someone could send a person a link that signs them in as someone else.
-    if cookie(&headers, SIGN_IN_COOKIE).as_deref() != Some(state.as_str()) {
+    if cookie(&app, &headers, SIGN_IN_COOKIE).as_deref() != Some(state.as_str()) {
         return bad_request("this sign-in was started in another browser; start again here");
     }
 
@@ -494,9 +542,10 @@ async fn sign_out(
     headers: HeaderMap,
     Form(posted): Form<Posted>,
 ) -> Response {
-    if let (Some(key), Some(session)) =
-        (cookie(&headers, SESSION_COOKIE), session_of(&app, &headers))
-    {
+    if let (Some(key), Some(session)) = (
+        cookie(&app, &headers, SESSION_COOKIE),
+        session_of(&app, &headers),
+    ) {
         if session.form_token != posted.form_token {
             return bad_request("this form did not come from your session");
         }

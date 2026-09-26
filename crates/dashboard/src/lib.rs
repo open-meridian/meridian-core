@@ -22,8 +22,10 @@ pub mod directory;
 pub mod first_run;
 pub mod html;
 pub mod oidc;
+pub mod plugins;
 pub mod records;
 pub mod session;
+pub mod signing;
 pub mod terminal;
 pub mod web;
 

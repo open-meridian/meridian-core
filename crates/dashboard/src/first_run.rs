@@ -124,7 +124,7 @@ async fn first_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     let now = app.clock.now_ns();
     let held = app
         .wizard
-        .of(cookie(&headers, WIZARD_COOKIE).as_deref(), now);
+        .of(cookie(&app, &headers, WIZARD_COOKIE).as_deref(), now);
 
     let enrolment = enrolment_state(&app).await;
     match held {
@@ -447,7 +447,7 @@ fn live(app: &Arc<App>, headers: &HeaderMap) -> Option<Wizard> {
         return None;
     }
     app.wizard.of(
-        cookie(headers, WIZARD_COOKIE).as_deref(),
+        cookie(app, headers, WIZARD_COOKIE).as_deref(),
         app.clock.now_ns(),
     )
 }

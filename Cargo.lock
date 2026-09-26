@@ -1740,14 +1740,18 @@ name = "meridian-dashboard"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "ed25519-dalek",
  "http",
  "ldap3",
  "meridian-access",
  "meridian-bus",
  "meridian-domain",
  "meridian-first-run",
+ "meridian-pb",
+ "meridian-sidecar",
  "openidconnect",
  "postgres",
  "prost",
@@ -1760,6 +1764,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
  "tower",
  "tracing",
 ]
@@ -1811,7 +1816,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=430bfb0e3b8d6c0e07a8cdf8a3d8dc3d9510e34d#430bfb0e3b8d6c0e07a8cdf8a3d8dc3d9510e34d"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=b57c1202c7c4e3baa20ab54a26b62851960b4cdd#b57c1202c7c4e3baa20ab54a26b62851960b4cdd"
 dependencies = [
  "prost",
  "tonic",
@@ -1845,10 +1850,15 @@ dependencies = [
 name = "meridian-sidecar"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "ed25519-dalek",
  "meridian-bus",
  "meridian-domain",
  "meridian-pb",
  "prost",
+ "rand 0.8.8",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2626,6 +2636,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -2645,12 +2656,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -3831,6 +3844,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

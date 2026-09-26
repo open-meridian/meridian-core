@@ -39,6 +39,18 @@ impl Cluster for Remembering {
             .push(format!("secret {name} {}", keys.join(",")));
         Ok(())
     }
+    async fn put_config_map(
+        &self,
+        name: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(), crate::cluster::ClusterError> {
+        let keys: Vec<&str> = values.keys().map(String::as_str).collect();
+        self.done
+            .lock()
+            .unwrap()
+            .push(format!("config-map {name} {}", keys.join(",")));
+        Ok(())
+    }
 
     async fn scale(
         &self,
@@ -87,6 +99,13 @@ impl Cluster for Refusing {
         _: &BTreeMap<String, Vec<u8>>,
     ) -> Result<(), crate::cluster::ClusterError> {
         refuse_if(self.0, "secret")
+    }
+    async fn put_config_map(
+        &self,
+        _: &str,
+        _: &BTreeMap<String, String>,
+    ) -> Result<(), crate::cluster::ClusterError> {
+        refuse_if(self.0, "config-map")
     }
     async fn scale(
         &self,
