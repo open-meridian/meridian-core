@@ -11,10 +11,13 @@ platform.config.command.define-account-group	command	admin	conductor
 platform.config.command.define-user-group	command	admin	conductor
 platform.config.command.enrol-with-code	command	admin	conductor
 platform.config.command.grant-permission	command	admin	conductor
+platform.config.command.launch-plugin	command	admin	conductor
 platform.config.command.link-external-account	command	admin	conductor
+platform.config.command.record-plugin-upload	command	admin	conductor
 platform.config.command.redeem-claim-code	command	admin	conductor
 platform.config.command.send-diagnostic-bundle	command	admin	conductor
 platform.config.command.set-plugin-settings	command	admin	conductor
+platform.config.command.stop-plugin	command	admin	conductor
 platform.config.command.withdraw-permission	command	admin	conductor
 platform.config.event.person-signed-in	event	admin	conductor
 platform.config.event.plugin-configuration-changed	event	conductor	sidecar
@@ -24,8 +27,11 @@ platform.config.query.check-first-run-answer	query	admin	first-run
 platform.config.query.enrolment	query	admin	conductor
 platform.config.query.first-run-sealing-key	query	admin	first-run
 platform.config.query.plugin-access	query	sidecar	conductor
+platform.config.query.plugin-catalogue	query	admin	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor
 platform.custody.*.event.sync-status	event	custody	admin
+platform.deployment.command.create-plugin	command	conductor	launcher
+platform.deployment.command.remove-plugin	command	conductor	launcher
 platform.deployment.event.component-report	event	street	conductor
 platform.deployment.event.plugin-report	event	sidecar	admin,conductor
 platform.reference.event.instrument-applied	event	instrument	street,admin

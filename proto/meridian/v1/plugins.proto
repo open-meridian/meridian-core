@@ -1,0 +1,152 @@
+// Bringing a plugin into a deployment: its catalogue, and launching and
+// stopping it.
+//
+// Derived from workflow W8 (spec/the-local-plugin-registry). Every message
+// here traces to a matrix row; see matrix/matrix.tsv.
+//
+// A plugin arrives as an image, built on the developer's machine on a base
+// image that carries a pinned SDK, and pushed through the dashboard into the
+// deployment's own registry; its metadata arrives beside it. What it may do
+// is extracted from that metadata when a deployment admin launches it, never
+// written: its roles are a set from the fixed list in matrix/roles.tsv, and
+// their grants are generated from the matrix (decisions/020). The conductor
+// decides and records; the launcher only acts (decisions/019).
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.1 — an uploaded version
+// ─────────────────────────────────────────────────────────────────────────────
+
+// What a plugin says about itself, from `[tool.meridian]` in its
+// pyproject.toml. Declarations for an administrator to approve, not grants.
+message PluginMetadata {
+  // Lowercase letters, digits and single hyphens, starting with a letter:
+  // the name `meridian plugin new` gave it, and its repository in the
+  // deployment's registry, plugins/<name>.
+  string name = 1;
+  // As its pyproject.toml has it. An uploaded version is never replaced.
+  string version = 2;
+  // A set, from matrix/roles.tsv: never a component and never `admin`.
+  // Empty is a plugin admitted with no topics, as the reference plugin is.
+  repeated string roles = 3;
+  // The plugin's own names for its parts, which people are granted at read
+  // or write (W6.7). They grant nothing on the bus.
+  repeated string tags = 4;
+  // Whether it serves a page through its sidecar (decisions/014).
+  bool interface = 5;
+  // The open-meridian version its base image carries, so an administrator
+  // can see which plugins stand on a base that needs a fix.
+  string sdk_version = 6;
+}
+
+// The dashboard records a version once its image is in the registry.
+message RecordPluginUploadRequest {
+  PluginMetadata metadata = 1;
+  // The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
+  // runs exactly this, never a tag that could move.
+  string image_digest = 2;
+}
+
+// A version in the catalogue.
+message PluginVersion {
+  PluginMetadata metadata = 1;
+  string image_digest = 2;
+  // The deployment-local login of the administrator who uploaded it.
+  string uploaded_by = 3;
+  int64 uploaded_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.2 — the catalogue
+// ─────────────────────────────────────────────────────────────────────────────
+
+message PluginCatalogueRequest {}
+
+// Every version uploaded and every launch, live or stopped.
+message PluginCatalogue {
+  repeated PluginVersion versions = 1;
+  repeated PluginLaunch launches = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.3 — launching
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A deployment admin launches a version. The roles and tags are the ones
+// they were shown and approved, and the launch is refused unless they are
+// exactly the version's metadata: an approval of something other than what
+// runs is no approval.
+message LaunchPluginRequest {
+  string name = 1;
+  string version = 2;
+  // What it runs as, and what its sidecar's credential and grants are for.
+  // Unique among the deployment's live plugins.
+  string instance_id = 3;
+  repeated string approved_roles = 4;
+  repeated string approved_tags = 5;
+}
+
+enum PluginLaunchState {
+  PLUGIN_LAUNCH_STATE_UNSPECIFIED = 0;
+  // Recorded, and the launcher asked.
+  PLUGIN_LAUNCH_STATE_LAUNCHED = 1;
+  // Stopped by an administrator; its instance may be launched again.
+  PLUGIN_LAUNCH_STATE_STOPPED = 2;
+  // The launcher refused or failed, with the reason in `failure`.
+  PLUGIN_LAUNCH_STATE_FAILED = 3;
+}
+
+// A launch, as the conductor records it.
+message PluginLaunch {
+  string instance_id = 1;
+  string name = 2;
+  string version = 3;
+  string image_digest = 4;
+  repeated string roles = 5;
+  repeated string tags = 6;
+  string launched_by = 7;
+  int64 launched_at_ns = 8;
+  PluginLaunchState state = 9;
+  string stopped_by = 10;
+  int64 stopped_at_ns = 11;
+  string failure = 12;
+}
+
+// The conductor to the launcher: create this plugin, in the chart's plugin
+// shape and no other.
+message CreatePluginRequest {
+  string instance_id = 1;
+  // Always the deployment's own registry, by digest:
+  // `localhost:<port>/plugins/<name>@sha256:<hex>`.
+  string image = 2;
+  repeated string roles = 3;
+  repeated string tags = 4;
+  bool interface = 5;
+}
+
+message CreatePluginReply {
+  // The workload the launcher made, which it alone may later remove.
+  string workload = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.4 — stopping
+// ─────────────────────────────────────────────────────────────────────────────
+
+message StopPluginRequest {
+  string instance_id = 1;
+}
+
+// The conductor to the launcher: remove what it made for this instance.
+message RemovePluginRequest {
+  string instance_id = 1;
+}
+
+message RemovePluginReply {
+  // False when there was nothing to remove, which is not an error: stopping
+  // is asked for an outcome, and the outcome holds.
+  bool removed = 1;
+}
