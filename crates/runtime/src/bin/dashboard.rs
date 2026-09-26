@@ -129,15 +129,24 @@ fn run() -> Result<(), String> {
     // listens are needed; the second names `{instance}`. Without either, the
     // dashboard serves no plugin pages and says so when one is opened.
     let plugins = match (public_url.is_empty(), var("MERIDIAN_PLUGIN_FRONT_DOOR")) {
-        (false, Some(front_door)) => {
-            let key =
-                var("MERIDIAN_DASHBOARD_SIGNING_KEY_DIR").unwrap_or_else(|| SIGNING_KEY.into());
-            Some(Arc::new(Plugins::new(
-                &public_url,
-                &front_door,
-                Signer::at(key),
-            )?))
-        }
+        (false, Some(front_door)) => match meridian_dashboard::plugins::pages_possible(&public_url)
+        {
+            // Said and carried on: everything else a dashboard does works at
+            // an IP address, and refusing to start would take it all away.
+            Err(reason) => {
+                tracing::warn!("no plugin pages: {reason}");
+                None
+            }
+            Ok(()) => {
+                let key =
+                    var("MERIDIAN_DASHBOARD_SIGNING_KEY_DIR").unwrap_or_else(|| SIGNING_KEY.into());
+                Some(Arc::new(Plugins::new(
+                    &public_url,
+                    &front_door,
+                    Signer::at(key),
+                )?))
+            }
+        },
         _ => {
             tracing::info!(
                 "no plugin pages: they need MERIDIAN_DASHBOARD_URL and MERIDIAN_PLUGIN_FRONT_DOOR"

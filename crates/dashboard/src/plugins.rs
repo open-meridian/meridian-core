@@ -127,6 +127,7 @@ impl Plugins {
     /// From the dashboard's public address, the front door's template and the
     /// key it signs with.
     pub fn new(public_url: &str, front_door: &str, signer: Signer) -> Result<Plugins, String> {
+        pages_possible(public_url)?;
         let url = reqwest::Url::parse(public_url)
             .map_err(|failed| format!("{public_url} is not an address: {failed}"))?;
         let host = url
@@ -351,6 +352,25 @@ pub(crate) async fn open(
         "{}{ENTER_PATH}?code={code}",
         plugins.origin(&instance)
     ))
+}
+
+/// Whether plugins' pages can be served below this dashboard's address: not
+/// below an IP address, which has no names under it -- a browser reads
+/// `snaptrade-1.plugins.127.0.0.1` as no address at all.
+pub fn pages_possible(public_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(public_url)
+        .map_err(|failed| format!("{public_url} is not an address: {failed}"))?;
+    // A domain, as against an address: `domain()` is none for either kind
+    // of IP address.
+    match (url.domain(), url.host_str()) {
+        (Some(_), _) => Ok(()),
+        (None, Some(_)) => Err(format!(
+            "{public_url} is an IP address, and each plugin's page is served on a name \
+             below the dashboard's ({{instance}}.plugins.<host>), which an address has none \
+             of; give the dashboard a name -- http://localhost:<port> on one machine"
+        )),
+        (None, None) => Err(format!("{public_url} names no host")),
+    }
 }
 
 /// What a person carries onto a plugin's page, if they may open it: their

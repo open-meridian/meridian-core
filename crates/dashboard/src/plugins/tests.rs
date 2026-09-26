@@ -584,6 +584,31 @@ fn a_front_door_that_does_not_name_the_instance_is_refused() {
     assert!(refused.is_err());
 }
 
+#[test]
+fn plugin_pages_need_a_name_to_go_below() {
+    for named in [
+        "https://meridian.test",
+        "http://localhost:18480",
+        "https://dash.firm.example",
+    ] {
+        assert_eq!(pages_possible(named), Ok(()), "{named}");
+    }
+    for address in [
+        "http://127.0.0.1:18480",
+        "https://[::1]:8443",
+        "https://10.0.0.7",
+    ] {
+        let refused = pages_possible(address).unwrap_err();
+        assert!(refused.contains("an IP address"), "{refused}");
+        assert!(Plugins::new(
+            address,
+            "http://{instance}.sidecars:9292",
+            Signer::holding(KEY_ID, SigningKey::from_bytes(&[7; 32])),
+        )
+        .is_err());
+    }
+}
+
 #[tokio::test]
 async fn a_code_minted_before_signing_out_opens_nothing_after() {
     let h = harness(&[INSTANCE]).await;
