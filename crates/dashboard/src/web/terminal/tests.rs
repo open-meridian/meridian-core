@@ -464,3 +464,42 @@ async fn a_dashboard_not_set_up_or_past_its_ceiling_connects_nobody() {
     let exchanged = post_form(&stale, "/terminal/token", "code=x".into()).await;
     assert_eq!(exchanged.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn a_cli_older_than_this_serves_is_refused_saying_what_it_serves() {
+    let app = app_holding_ada();
+    let asked = |version: Option<&'static str>, path: &'static str| {
+        let app = Arc::clone(&app);
+        async move {
+            let mut request =
+                Request::post(path).header("content-type", "application/x-www-form-urlencoded");
+            if let Some(version) = version {
+                request = request.header(CLI_VERSION, version);
+            }
+            let response = routes(app)
+                .oneshot(request.body(Body::from("code=nothing")).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, body_of(response).await)
+        }
+    };
+    for old in ["0.0.9", "0.0.1-rc.1", "not-a-version", "1.2", "1.2.3.4", ""] {
+        let (status, body) = asked(Some(old), "/terminal/token").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{old}");
+        assert!(body.contains(r#""error":"cli_version""#), "{old}: {body}");
+        assert!(
+            body.contains("serves meridian 0.1.0 or later"),
+            "{old}: {body}"
+        );
+    }
+    // Served: a version it serves, a newer one, and none at all -- each
+    // reaches the route, which refuses a code it never issued as it would.
+    for served in [Some("0.1.0"), Some("0.2.0-dev+abc"), Some("10.0.0"), None] {
+        let (status, body) = asked(served, "/terminal/token").await;
+        assert!(!body.contains("cli_version"), "{served:?}: {status} {body}");
+    }
+    // Only the terminal's paths: a browser's page is not the CLI's.
+    let (_, body) = asked(Some("0.0.1"), "/sign-out").await;
+    assert!(!body.contains("cli_version"), "{body}");
+}

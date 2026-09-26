@@ -26,6 +26,61 @@ use crate::html::{escape, page};
 use crate::session::IDLE_NS;
 use crate::terminal::{check, rfc3339, Person, Refusal};
 
+/// The header the CLI names its version in (W6.13; spec/the-cli, ruling 8).
+pub const CLI_VERSION: &str = "meridian-cli-version";
+
+/// The oldest CLI this dashboard serves. Raised when the terminal's surface
+/// changes in a way an older CLI would get wrong, and never otherwise.
+pub const OLDEST_CLI: &str = "0.1.0";
+
+/// Every request on a terminal path naming a CLI version older than
+/// [`OLDEST_CLI`], or one that does not read as a version, is refused here
+/// with what this serves, before any route sees it. One naming none is
+/// served: anybody may do by hand what the CLI does.
+pub(crate) async fn cli_version(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/terminal/") {
+        if let Some(named) = request.headers().get(CLI_VERSION) {
+            if let Err(reason) = served(named.to_str().unwrap_or_default()) {
+                return json(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "cli_version",
+                        "reason": reason,
+                        "serves": format!("{OLDEST_CLI} or later"),
+                    }),
+                );
+            }
+        }
+    }
+    next.run(request).await
+}
+
+/// `x.y.z`, with anything after a `-` or `+` set aside.
+fn version(named: &str) -> Option<[u64; 3]> {
+    let core = named.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let read = [parts.next()??, parts.next()??, parts.next()??];
+    parts.next().is_none().then_some(read)
+}
+
+fn served(named: &str) -> Result<(), String> {
+    let asked = version(named).ok_or_else(|| {
+        format!(
+            "`{named}` is not a CLI version; this deployment serves meridian {OLDEST_CLI} or later"
+        )
+    })?;
+    let oldest = version(OLDEST_CLI).expect("OLDEST_CLI is a version");
+    if asked < oldest {
+        return Err(format!(
+            "meridian {named} is older than this deployment serves; it serves meridian {OLDEST_CLI} or later"
+        ));
+    }
+    Ok(())
+}
+
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/terminal/authorize", get(authorize).post(decide))

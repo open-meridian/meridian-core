@@ -90,6 +90,9 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::first_run::routes())
         .route("/plugins/{instance}", get(crate::plugins::open))
         .with_state(Arc::clone(&app))
+        // A CLI this does not serve is told so before any terminal path
+        // reads what it sent (W6.13).
+        .layer(axum::middleware::from_fn(terminal::cli_version))
         // Outermost, so a request for a plugin's host meets none of the
         // dashboard's pages, whatever its path.
         .layer(axum::middleware::from_fn_with_state(
