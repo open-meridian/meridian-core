@@ -4,7 +4,7 @@ Run as a pod by e2e/cluster/run.py, section T. The loopback redirect needs
 the terminal and the browser on one machine, and a pod is one: its
 containers share 127.0.0.1. So this container holds
 
-- a forwarder from 127.0.0.1:<port> to the dashboard's Service, on the port
+- a forwarder from localhost:<port> to the dashboard's Service, on the port
   the dashboard believes is its own address, so that a provider sending the
   browser back to that address reaches it from in here too;
 - headless Chromium, which signs in and confirms as a person would;
@@ -49,7 +49,9 @@ from playwright.sync_api import sync_playwright
 
 UPSTREAM = os.environ["E2E_DASHBOARD"].removeprefix("http://").rstrip("/")
 PORT = int(os.environ["E2E_PORT"])
-DASHBOARD = f"http://127.0.0.1:{PORT}"
+# The dashboard's own address, as it was told it: a provider sends the
+# browser back there, and a browser keeps one host's cookies for that host.
+DASHBOARD = f"http://localhost:{PORT}"
 BY = os.environ["E2E_BY"]  # password or redirect
 NAME = os.environ.get("E2E_NAME", "")
 PASSWORD = os.environ.get("E2E_PASSWORD", "")
@@ -68,9 +70,12 @@ def check(held, said):
 # ── The forwarder ─────────────────────────────────────────────────────────
 
 
-def forward():
+def forward(family, address):
     host, _, port = UPSTREAM.partition(":")
-    listening = socket.create_server(("127.0.0.1", PORT))
+    try:
+        listening = socket.create_server((address, PORT), family=family)
+    except OSError:
+        return  # no IPv6 in this pod: IPv4 alone serves
 
     def pipe(source, sink):
         try:
@@ -106,7 +111,9 @@ def forward():
         threading.Thread(target=serve, args=(client,), daemon=True).start()
 
 
-threading.Thread(target=forward, daemon=True).start()
+# Both loopbacks, because `localhost` is either and a browser tries both.
+for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    threading.Thread(target=forward, args=(family, address), daemon=True).start()
 
 
 def reachable():
@@ -232,7 +239,7 @@ class RealCli:
                 time.sleep(1)
             for line in text.splitlines():
                 print(f"  | {line}", flush=True)
-            held = f"{SHARED}/config/meridian/sessions/127.0.0.1_{PORT}.json"
+            held = f"{SHARED}/config/meridian/sessions/localhost_{PORT}.json"
             if "exit=0" not in text or not os.path.exists(held):
                 return None
             mode = os.stat(held).st_mode & 0o777

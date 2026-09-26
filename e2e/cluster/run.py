@@ -141,6 +141,15 @@ REGISTRY_PORT = int(os.environ.get("E2E_REGISTRY_PORT", "5000"))
 # Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
 BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
 WIZARD = f"http://127.0.0.1:{PORT}"
+# What the dashboard is told its address is: a name, because each plugin's
+# page is served on a name below it, and an IP address has none
+# (spec/deployment-dashboard-and-access, ruling 19; decisions/021). A browser
+# sends `localhost` and every name under it to loopback by itself. This
+# runner's own requests go to WIZARD, the same port-forward, since the
+# dashboard answers whatever it is called there.
+DASHBOARD_URL = f"http://localhost:{PORT}"
+# The plugin section P launches, by the name its page is found under.
+PLUGIN_INSTANCE = "reference-plugin"
 
 
 class Scorecard:
@@ -339,7 +348,7 @@ def the_answers():
                 "db_migrating_password": EXTERNAL_PASSWORD,
             }
         ),
-        "dashboard_url": WIZARD,
+        "dashboard_url": DASHBOARD_URL,
     }
 
 
@@ -705,11 +714,11 @@ def main():
         - sh
         - -c
         - |
-          meridian connect http://127.0.0.1:{PORT} > /shared/connect-1.out 2>&1; echo "exit=$?" >> /shared/connect-1.out
+          meridian connect {DASHBOARD_URL} > /shared/connect-1.out 2>&1; echo "exit=$?" >> /shared/connect-1.out
           until [ -f /shared/sign-out-now ]; do sleep 1; done
           meridian sign-out > /shared/sign-out.out 2>&1; echo "exit=$?" >> /shared/sign-out.out
           until [ -f /shared/connect-again ]; do sleep 1; done
-          meridian connect http://127.0.0.1:{PORT} > /shared/connect-2.out 2>&1; echo "exit=$?" >> /shared/connect-2.out
+          meridian connect {DASHBOARD_URL} > /shared/connect-2.out 2>&1; echo "exit=$?" >> /shared/connect-2.out
 """ if real_cli else ""
     apply(f"""
 apiVersion: v1
@@ -829,6 +838,107 @@ spec:
         and "launched plugins could not be read" not in broker_log,
         "the broker runs as its own process's child, and reads the Deployments and its Secret",
     )
+
+    print("P: a person makes a plugin, launches it, and opens its page", flush=True)
+    # Results 2 and 3 of plans/a-person-reaches-a-plugin, by the real CLI:
+    # `meridian plugin new`, `connect`, `upload`, `launch` and `list`, then
+    # the page in a real browser (e2e/cluster/plugin.py). The CLI builds with
+    # docker as it does on a person's machine, and is given the node's own
+    # daemon to do it with -- which exists on Rancher Desktop and Docker
+    # Desktop, the local clusters the registry is for, and not on k3d or kind.
+    if DRIVER != "cli":
+        s.note("skipped: it is the real CLI's, which meridian-cli's `make e2e-up` runs")
+    else:
+        name, password = WAY_IN["administrator"]
+        instance = PLUGIN_INSTANCE
+        kubectl("delete", "pod", "e2e-plugin", "--ignore-not-found", "--wait")
+        step = lambda said, command: (
+            f"          {command} > /shared/{said}.out 2>&1; echo \"exit=$?\" >> /shared/{said}.out"
+        )
+        script = "\n".join([
+            step("new", "meridian plugin new reference-plugin --into /shared/reference-plugin"),
+            step("connect", f"meridian connect {DASHBOARD_URL}"),
+            step("upload", "meridian plugin upload --dir /shared/reference-plugin"),
+            step("launch", f"meridian plugin launch reference-plugin 0.1.0 --instance {instance} --yes"),
+            step("list", "meridian plugin list"),
+        ])
+        apply(f"""
+apiVersion: v1
+kind: Pod
+metadata: {{name: e2e-plugin}}
+spec:
+  restartPolicy: Never
+  volumes:
+    - {{name: shared, emptyDir: {{}}}}
+    - {{name: docker, hostPath: {{path: /var/run/docker.sock, type: Socket}}}}
+  containers:
+    - name: browser
+      image: {BROWSER_IMAGE}
+      imagePullPolicy: Never
+      command: [python, /e2e/plugin.py]
+      volumeMounts: [{{name: shared, mountPath: /shared}}]
+      env:
+        - {{name: E2E_DASHBOARD, value: "http://{RELEASE}-meridian-runtime-dashboard"}}
+        - {{name: E2E_PORT, value: "{PORT}"}}
+        - {{name: E2E_BY, value: "{WAY_IN['by']}"}}
+        - {{name: E2E_NAME, value: "{name}"}}
+        - {{name: E2E_PASSWORD, value: "{password or ''}"}}
+        - {{name: E2E_INSTANCE, value: "{instance}"}}
+    - name: cli
+      image: {CLI_IMAGE}
+      imagePullPolicy: Never
+      env: [{{name: XDG_CONFIG_HOME, value: /shared/config}}]
+      volumeMounts:
+        - {{name: shared, mountPath: /shared}}
+        - {{name: docker, mountPath: /var/run/docker.sock}}
+      command:
+        - sh
+        - -c
+        - |
+{script}
+""")
+        # Up means available: its sidecar registered with the broker's new
+        # credential and its plugin reported. Then the browser is told.
+        deployment = f"{RELEASE}-meridian-runtime-plugin-{instance}"
+        up = False
+        for _ in range(900):
+            phase = kubectl("get", "pod", "e2e-plugin", "-o", "jsonpath={.status.phase}")
+            if phase in ("Succeeded", "Failed"):
+                break
+            available = kubectl(
+                "get", "deployment", deployment, "--ignore-not-found",
+                "-o", "jsonpath={.status.availableReplicas}",
+            )
+            if available == "1":
+                up = True
+                break
+            time.sleep(1)
+        s.check(up, f"the launcher made {deployment}, and it came up")
+        if up:
+            kubectl("exec", "e2e-plugin", "-c", "browser", "--", "touch", "/shared/open-now")
+        phase = ""
+        for _ in range(600):
+            phase = kubectl("get", "pod", "e2e-plugin", "-o", "jsonpath={.status.phase}")
+            if phase in ("Succeeded", "Failed"):
+                break
+            time.sleep(1)
+        for line in kubectl("logs", "e2e-plugin", "-c", "browser").splitlines():
+            print(f"    {line}" if line else "", flush=True)
+        s.check(
+            phase == "Succeeded",
+            f"the reference plugin was made, uploaded, launched and opened: {phase or 'it never ran'}",
+        )
+        if phase != "Succeeded" or not up:
+            # For reading, and never the reason the run stops: the plugin
+            # may not exist to be read.
+            for container in ("sidecar", "plugin"):
+                s.note(f"{deployment}, {container}:")
+                try:
+                    said = kubectl("logs", f"deployment/{deployment}", "-c", container, "--tail=40")
+                except SystemExit as failed:
+                    said = str(failed)
+                for line in said.splitlines():
+                    print(f"      {line}", flush=True)
 
     print(flush=True)
     if s.failures:

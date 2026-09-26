@@ -10,4 +10,6 @@ COPY browser.py /e2e/browser.py
 # Section T's: a terminal connecting, in the same image because it is the
 # same browser.
 COPY terminal.py /e2e/terminal.py
+# Section P's: a person opening the plugin they launched.
+COPY plugin.py /e2e/plugin.py
 ENTRYPOINT ["python", "/e2e/browser.py"]
