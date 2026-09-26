@@ -21,6 +21,12 @@ herself read on an account through it and the button is refused, since she
 may write nothing through it; the grant becomes write, and the same button
 records the statement. What decides is her access, not the plugin's role.
 
+Last, the upload's path as the first terminal path with a permission behind
+it (kernel/terminal-sessions left this to it): the terminal's session is
+what it takes, the browser's cookie in its place is refused, and once her
+permission is withdrawn her terminal session -- still live -- is refused as
+somebody who may not, rather than as nobody.
+
 Prints one line per check and exits non-zero if any failed.
 """
 
@@ -346,6 +352,42 @@ with sync_playwright() as playwright:
         time.sleep(5)
         said = statement(page, CUSTODY)
     check(said.startswith("Opened statement"), f"once she writes, it is recorded for her: {said}")
+
+    # The terminal's paths take the terminal's session, and nothing else: the
+    # browser's cookie, which the CLI's upload and list above did without, is
+    # nobody there.
+    by_cookie = context.request.get(f"{DASHBOARD}/terminal/plugins")
+    check(
+        by_cookie.status == 401,
+        f"her browser's session in place of the terminal's is refused: {by_cookie.status}",
+    )
+
+    # Her permission withdrawn. A deployment is never left without an
+    # administrator, so first a second one, for a login nobody holds.
+    admin = administer(
+        context, "/admin/user-groups",
+        {"user_group_id": "", "name": "Stand-in administrators", "directory_groups": "",
+         "logins": "local|nobody-e2e"},
+    )
+    stand_in = row_id(admin, "User groups", "Stand-in administrators")
+    admin = administer(
+        context, "/admin/permissions",
+        {"user_group_id": stand_in or "", "account_group_id": "", "access_group_id": "deployment-admin"},
+    )
+    hers = admins and re.search(
+        r"<tr><td>([^<]+)</td><td>" + re.escape(admins.group(1))
+        + r"</td><td>every account</td><td>deployment-admin</td>",
+        admin,
+    )
+    check(bool(hers), f"her permission to deployment admin is listed: {hers and hers.group(1)}")
+    if hers:
+        administer(context, "/admin/permissions/withdraw", {"permission_id": hers.group(1)})
+    open(f"{SHARED}/list-again", "w").close()
+    again = said_by("list-again.out", 120)
+    check(
+        "exit=0" not in again and "403" in again and "only a deployment admin" in again,
+        "and her terminal session, still live, is refused as somebody who may not, not as nobody",
+    )
     context.close()
     browser.close()
 

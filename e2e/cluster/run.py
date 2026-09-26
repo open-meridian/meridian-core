@@ -874,6 +874,9 @@ spec:
             step("launch-custody",
                  f"meridian plugin launch reference-custody 0.1.0 --instance {CUSTODY_INSTANCE} --yes"),
             step("list", "meridian plugin list"),
+            # Once the browser has withdrawn her permission: the same session.
+            "          until [ -f /shared/list-again ]; do sleep 1; done",
+            step("list-again", "meridian plugin list"),
         ])
         apply(f"""
 apiVersion: v1
@@ -942,7 +945,8 @@ spec:
         s.check(
             phase == "Succeeded",
             f"the reference plugin and its custody copy were made, uploaded, launched and "
-            f"opened, and acting-for decided: {phase or 'it never ran'}",
+            f"opened, acting-for decided, and the terminal's session held to its permission: "
+            f"{phase or 'it never ran'}",
         )
         if phase != "Succeeded" or not up:
             # For reading, and never the reason the run stops: the plugin
