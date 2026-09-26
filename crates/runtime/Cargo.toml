@@ -53,9 +53,15 @@ meridian-pb.workspace = true
 meridian-domain.workspace = true
 postgres.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+# The broker checks a launched plugin's password against a hash of it, so
+# the configuration it reloads holds no password (the registry spec, decision 3).
+bcrypt.workspace = true
+# To have the broker, this process's own child, reload.
+libc.workspace = true
 prost.workspace = true
 tonic.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

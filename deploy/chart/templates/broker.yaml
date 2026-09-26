@@ -118,6 +118,66 @@ data:
       ]
     }
 ---
+# Credentials for plugins launched after install (W8.3), one key pair per
+# instance, which the broker's own process writes and a launched sidecar
+# reads its connection string from (spec/the-local-plugin-registry, decision
+# 3). Made here, empty, so a Role can name it: RBAC cannot narrow `create` to
+# a name. Kept with what it holds, as the credentials above are.
+{{- $launched := lookup "v1" "Secret" .Release.Namespace (printf "%s-launched" $name) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-launched
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+{{- if and $launched $launched.data }}
+data:
+  {{- toYaml $launched.data | nindent 2 }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# What the broker's own process may do: read the Deployments the launcher
+# made, to learn which plugins exist and with which roles, and write the one
+# Secret above. It creates nothing, and touches no other Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ printf "%s-launched" $name | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -157,51 +217,77 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      serviceAccountName: {{ $name }}
       initContainers:
-        # The permissions, from the contract compiled into this image and the
-        # instances above, by the same binary this repository generates its
-        # committed copy with. Written to
-        # a volume that lives and dies with the pod: nothing stores a policy
-        # that can be recomputed.
-        - name: permissions
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        # The broker itself, from its own image, whose version is yours: a
+        # single static binary, copied where this pod's own process can run
+        # it as its child.
+        - name: nats-server
+          image: {{ .Values.broker.image | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - meridian-broker-config
-            - --instances
-            - /etc/meridian/instances/instances.json
-            - --out
-            - /etc/nats/nats.conf
+          command: ["cp", "/usr/local/bin/nats-server", "/opt/nats/nats-server"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
           volumeMounts:
-            - name: config
-              mountPath: /etc/nats
-            - name: instances
-              mountPath: /etc/meridian/instances
-              readOnly: true
+            - name: nats-server
+              mountPath: /opt/nats
       containers:
+        # The permissions, from the contract compiled into this image, the
+        # instances above and the plugins launched since, written by the same
+        # binary this repository generates its committed copy with; and the
+        # broker, run as that process's child so a launch reloads it without
+        # a restart (spec/the-local-plugin-registry, decision 3). The
+        # configuration lives and dies with the pod, and holds no password:
+        # the chart's instances' are read from the environment, a launched
+        # plugin's is checked against a hash.
         - name: broker
-          image: {{ .Values.broker.image | quote }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["-c", "/etc/nats/nats.conf"]
+          args:
+            - meridian-broker-config
+            - serve
+            - --nats
+            - /opt/nats/nats-server
+            - --instances
+            - /etc/meridian/instances/instances.json
+            - --out
+            - /etc/nats/nats.conf
+            - --secret
+            - {{ $name }}-launched
+            - --broker
+            - {{ printf "%s.%s.svc.cluster.local:4222" $name .Release.Namespace }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           envFrom:
             - secretRef:
                 name: {{ $name }}-passwords
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
           ports:
             - name: client
               containerPort: 4222
           volumeMounts:
             - name: config
               mountPath: /etc/nats
+            - name: instances
+              mountPath: /etc/meridian/instances
+              readOnly: true
+            - name: nats-server
+              mountPath: /opt/nats
               readOnly: true
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: config
+          emptyDir: {}
+        - name: nats-server
           emptyDir: {}
         - name: instances
           configMap:

@@ -11,6 +11,7 @@
 //! sitting, which is the point of them being separate.
 
 pub mod broker;
+pub mod launched;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

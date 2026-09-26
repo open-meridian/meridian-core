@@ -67,7 +67,7 @@ impl Instance {
         }
     }
 
-    fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         match self {
             Instance::Plugin { instance_id, .. } | Instance::Component { instance_id, .. } => {
                 instance_id
@@ -76,13 +76,24 @@ impl Instance {
     }
 }
 
+/// Where the broker finds a user's password. Neither puts one in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Password {
+    /// An environment variable the broker reads at start: the components and
+    /// the plugins the chart runs, whose passwords the chart made.
+    Env(String),
+    /// A bcrypt hash of it, which the broker checks a password against: a
+    /// plugin launched after the broker started, whose password reached the
+    /// broker's environment too late to be read from there
+    /// (spec/the-local-plugin-registry, decision 3).
+    Bcrypt(String),
+}
+
 /// One user the broker admits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     pub user: String,
-    /// The environment variable the broker reads the password from, so a
-    /// password is never in a generated file.
-    pub password_env: String,
+    pub password: Password,
     pub publish: Vec<String>,
     pub subscribe: Vec<String>,
     pub note: String,
@@ -185,7 +196,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         subscribe.push(INBOX.to_string());
         users.push(User {
             user: component.to_string(),
-            password_env: variable(component),
+            password: Password::Env(variable(component)),
             publish,
             subscribe,
             note: format!(
@@ -200,58 +211,71 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
     subscribe.push(INBOX.to_string());
     users.push(User {
         user: "runtime".to_string(),
-        password_env: variable("runtime"),
+        password: Password::Env(variable("runtime")),
         publish,
         subscribe,
         note: "The runtime's components, from the contract's own columns.".to_string(),
     });
 
     for instance in instances {
-        let (mut publish, mut subscribe, note) = match instance {
-            Instance::Plugin { instance_id, roles } => {
-                let (publish, subscribe) = permissions_for(contract, roles, instance_id)
-                    .map_err(|refusal| format!("{instance_id} is launched with {refusal}"))?;
-                let held = if roles.is_empty() {
-                    "no role, so no topics but its sidecar's own".to_string()
-                } else {
-                    roles.join(", ")
-                };
-                (
-                    publish,
-                    subscribe,
-                    format!("{instance_id}, launched as {held}"),
-                )
-            }
-            Instance::Component {
-                instance_id,
-                component,
-            } => {
-                if !contract.is_component(component) {
-                    return Err(format!(
-                        "{instance_id} is configured as the component `{component}`, which the \
-                         contract does not have"
-                    ));
-                }
-                let (publish, subscribe) = component_subjects(contract, &[component]);
-                (
-                    publish,
-                    subscribe,
-                    format!("{instance_id}, the {component} component, with its own credential"),
-                )
-            }
-        };
-        publish.push(INBOX.to_string());
-        subscribe.push(INBOX.to_string());
-        users.push(User {
-            user: instance.id().to_string(),
-            password_env: variable(instance.id()),
-            publish,
-            subscribe,
-            note,
-        });
+        users.push(instance_user(
+            contract,
+            instance,
+            Password::Env(variable(instance.id())),
+        )?);
     }
 
     Ok(users)
+}
+
+/// One instance's user: a plugin's roles' topics, or a component's own.
+pub fn instance_user(
+    contract: &Contract,
+    instance: &Instance,
+    password: Password,
+) -> Result<User, String> {
+    let (mut publish, mut subscribe, note) = match instance {
+        Instance::Plugin { instance_id, roles } => {
+            let (publish, subscribe) = permissions_for(contract, roles, instance_id)
+                .map_err(|refusal| format!("{instance_id} is launched with {refusal}"))?;
+            let held = if roles.is_empty() {
+                "no role, so no topics but its sidecar's own".to_string()
+            } else {
+                roles.join(", ")
+            };
+            (
+                publish,
+                subscribe,
+                format!("{instance_id}, launched as {held}"),
+            )
+        }
+        Instance::Component {
+            instance_id,
+            component,
+        } => {
+            if !contract.is_component(component) {
+                return Err(format!(
+                    "{instance_id} is configured as the component `{component}`, which the \
+                     contract does not have"
+                ));
+            }
+            let (publish, subscribe) = component_subjects(contract, &[component]);
+            (
+                publish,
+                subscribe,
+                format!("{instance_id}, the {component} component, with its own credential"),
+            )
+        }
+    };
+    publish.push(INBOX.to_string());
+    subscribe.push(INBOX.to_string());
+    Ok(User {
+        user: instance.id().to_string(),
+        password,
+        publish,
+        subscribe,
+        note,
+    })
 }
 
 /// The users, as the broker's own configuration.
@@ -261,10 +285,15 @@ pub fn rendered(header: &str, users: &[User]) -> String {
     for user in users {
         out.push_str(&format!("    # {}\n", user.note));
         out.push_str(&format!(
-            "    {{ user: {}, password: ${}, permissions: {{ publish: {{ allow: {} }}, \
+            "    {{ user: {}, password: {}, permissions: {{ publish: {{ allow: {} }}, \
              subscribe: {{ allow: {} }}, allow_responses: true }} }}\n",
             user.user,
-            user.password_env,
+            match &user.password {
+                Password::Env(variable) => format!("${variable}"),
+                // Quoted, so the `$` a hash begins with is not read as a
+                // variable.
+                Password::Bcrypt(hash) => format!("\"{hash}\""),
+            },
             list(&user.publish),
             list(&user.subscribe),
         ));

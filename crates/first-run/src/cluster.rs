@@ -138,6 +138,86 @@ impl ApiServer {
         })
     }
 
+    /// One resource or list, as the API has it.
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, ClusterError> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        if !(200..300).contains(&status) {
+            return Err(ClusterError(format!("GET {path} -> {status}: {body}")));
+        }
+        serde_json::from_str(&body).map_err(|failed| ClusterError(format!("GET {path}: {failed}")))
+    }
+
+    /// The Deployments in this namespace carrying `selector`, as a list.
+    pub async fn deployments(&self, selector: &str) -> Result<serde_json::Value, ClusterError> {
+        self.get_json(&format!(
+            "/apis/apps/v1/namespaces/{}/deployments?labelSelector={}",
+            self.namespace,
+            selector.replace('=', "%3D").replace(',', "%2C")
+        ))
+        .await
+    }
+
+    /// A Secret's data, decoded. Keys whose value is not text are left out.
+    pub async fn secret_text(&self, name: &str) -> Result<BTreeMap<String, String>, ClusterError> {
+        use base64::Engine;
+        let secret = self
+            .get_json(&format!(
+                "/api/v1/namespaces/{}/secrets/{name}",
+                self.namespace
+            ))
+            .await?;
+        Ok(secret["data"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value.as_str()?)
+                    .ok()?;
+                Some((key.clone(), String::from_utf8(bytes).ok()?))
+            })
+            .collect())
+    }
+
+    /// Set some of a Secret's keys and remove others (None), in one merge
+    /// patch, leaving the rest alone.
+    pub async fn patch_secret_text(
+        &self,
+        name: &str,
+        changes: &BTreeMap<String, Option<String>>,
+    ) -> Result<(), ClusterError> {
+        use base64::Engine;
+        let data: serde_json::Map<String, serde_json::Value> = changes
+            .iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    Some(text) => serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(text),
+                    ),
+                    None => serde_json::Value::Null,
+                };
+                (key.clone(), value)
+            })
+            .collect();
+        self.patch(
+            &format!("/api/v1/namespaces/{}/secrets/{name}", self.namespace),
+            "application/merge-patch+json",
+            serde_json::json!({ "data": data }),
+        )
+        .await
+    }
+
     async fn patch(
         &self,
         path: &str,

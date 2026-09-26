@@ -80,6 +80,8 @@ ring = "0.17"
 # RFC 9180, and a pure-Rust implementation.
 hpke = { version = "0.12", default-features = false, features = ["x25519", "alloc"] }
 rand = "0.8"
+bcrypt = "0.17"
+libc = "0.2"
 prost = "0.13"
 
 # The client a deployment calls the platform with. rustls rather than the

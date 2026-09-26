@@ -900,6 +900,10 @@ chart-check:
 		|| { echo "chart-check FAILED: the dashboard's private key is mounted somewhere besides the dashboard" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q 'MERIDIAN_DASHBOARD_KEYS_DIR' \
 		|| { echo "chart-check FAILED: a sidecar is not given the dashboard's public keys" >&2; exit 1; }; \
+	broker="$$(doc Role check-meridian-runtime-broker)"; \
+	[ -n "$$broker" ] && ! echo "$$broker" | grep -q '"create"\|"delete"\|"update"' \
+		&& [ "$$(echo "$$broker" | grep -A1 'resources: \["secrets"\]' | grep -c 'resourceNames: \["check-meridian-runtime-broker-launched"\]')" = 1 ] \
+		|| { echo "chart-check FAILED: the broker's process may do more than read Deployments and write its launched plugins' credentials:" >&2; echo "$$broker" >&2; exit 1; }; \
 	doc Deployment check-meridian-runtime-sidecar-check-1 | grep -q '^    type: Recreate$$' \
 		|| { echo "chart-check FAILED: a plugin's Deployment rolls, so two copies of one instance would run under one name" >&2; exit 1; }; \
 	echo "$$policy" | grep -q 'meridian.dev/component: sidecar' \

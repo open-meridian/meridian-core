@@ -9,6 +9,16 @@
 //! Passwords are never read here. Each user names the environment variable the
 //! broker reads its own password from, so this writes a file nobody has to
 //! protect.
+//!
+//! `meridian-broker-config serve` is the bundled broker's own process: it
+//! runs `nats-server` as its child, and watches for plugins launched after
+//! install, giving each a credential and the broker a configuration that
+//! admits it -- by a bcrypt hash, so the file still holds no password -- and
+//! having its child reload (spec/the-local-plugin-registry, decision 3). The
+//! broker is its child so that the reload is a signal to its own process:
+//! signalling across containers would take a shared process namespace, in
+//! which the watcher could read the broker's environment, and with it every
+//! component's password.
 
 use meridian_runtime::broker::{rendered, users, Instance};
 use meridian_sidecar::Contract;
@@ -22,9 +32,244 @@ const HEADER: &str = "\
 ";
 
 fn main() {
-    if let Err(failed) = run() {
+    let failed = if std::env::args().nth(1).as_deref() == Some("serve") {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
+        serve::run().err()
+    } else {
+        run().err()
+    };
+    if let Some(failed) = failed {
         eprintln!("broker-config: {failed}");
         std::process::exit(1);
+    }
+}
+
+/// The instance list the chart renders.
+fn chart_instances(path: &str) -> Result<Vec<Instance>, String> {
+    let instances: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|failed| format!("the instance list is not JSON: {failed}"))?,
+        Err(_) => serde_json::json!({"instances": []}),
+    };
+    instances["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(instance)
+        .collect()
+}
+
+mod serve {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use meridian_first_run::cluster::ApiServer;
+    use meridian_runtime::broker::Instance;
+    use meridian_runtime::launched::{self, LAUNCHED_SELECTOR};
+    use meridian_sidecar::Contract;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    use super::{chart_instances, HEADER};
+
+    struct Args {
+        nats: String,
+        instances: String,
+        out: String,
+        secret: String,
+        broker: String,
+        every: Duration,
+    }
+
+    fn args() -> Result<Args, String> {
+        let mut parsed = Args {
+            nats: "nats-server".into(),
+            instances: String::new(),
+            out: String::new(),
+            secret: String::new(),
+            broker: String::new(),
+            every: Duration::from_secs(5),
+        };
+        let mut args = std::env::args().skip(2);
+        while let Some(argument) = args.next() {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{argument} needs a value"))?;
+            match argument.as_str() {
+                "--nats" => parsed.nats = value,
+                "--instances" => parsed.instances = value,
+                "--out" => parsed.out = value,
+                // The Secret the chart made for launched plugins' credentials,
+                // the one thing this may write.
+                "--secret" => parsed.secret = value,
+                // Where a sidecar reaches the broker, for its connection string.
+                "--broker" => parsed.broker = value,
+                "--every" => {
+                    parsed.every = Duration::from_secs(
+                        value
+                            .parse()
+                            .map_err(|_| format!("--every {value} is not seconds"))?,
+                    )
+                }
+                other => return Err(format!("{other} is not an argument serve takes")),
+            }
+        }
+        for (name, value) in [
+            ("--out", &parsed.out),
+            ("--secret", &parsed.secret),
+            ("--broker", &parsed.broker),
+        ] {
+            if value.is_empty() {
+                return Err(format!("serve needs {name}"));
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Hashes made once per password: bcrypt is slow on purpose.
+    type Hashes = BTreeMap<(String, String), String>;
+
+    /// The launched plugins' credentials put right, and the configuration
+    /// admitting them.
+    async fn reconciled(
+        api: &ApiServer,
+        args: &Args,
+        chart: &[Instance],
+        hashes: &mut Hashes,
+    ) -> Result<String, String> {
+        let list = api
+            .deployments(LAUNCHED_SELECTOR)
+            .await
+            .map_err(|failed| failed.0)?;
+        let launched = launched::from_deployments(&list);
+        let held = api
+            .secret_text(&args.secret)
+            .await
+            .map_err(|failed| failed.0)?;
+        let reconciled = launched::reconcile(&launched, &held, &args.broker, launched::mint);
+        if !reconciled.changes.is_empty() {
+            api.patch_secret_text(&args.secret, &reconciled.changes)
+                .await
+                .map_err(|failed| failed.0)?;
+            for (key, change) in &reconciled.changes {
+                if key.ends_with(".password") {
+                    let instance = key.trim_end_matches(".password");
+                    match change {
+                        Some(_) => tracing::info!(instance, "a credential for a launched plugin"),
+                        None => tracing::info!(instance, "a stopped plugin's credential removed"),
+                    }
+                }
+            }
+        }
+        let mut by_instance = BTreeMap::new();
+        for (instance, password) in &reconciled.passwords {
+            let key = (instance.clone(), password.clone());
+            if !hashes.contains_key(&key) {
+                let hashing = password.clone();
+                let hash = tokio::task::spawn_blocking(move || {
+                    bcrypt::hash(hashing, bcrypt::DEFAULT_COST)
+                })
+                .await
+                .map_err(|failed| failed.to_string())?
+                .map_err(|failed| failed.to_string())?;
+                hashes.insert(key.clone(), hash);
+            }
+            by_instance.insert(instance.clone(), hashes[&key].clone());
+        }
+        hashes.retain(|(instance, _), _| reconciled.passwords.contains_key(instance));
+        let (configuration, left_out) =
+            launched::configuration(HEADER, Contract::embedded(), chart, &launched, &by_instance)?;
+        for why in left_out {
+            tracing::warn!("a launched plugin is not admitted: {why}");
+        }
+        Ok(configuration)
+    }
+
+    fn signal_child(pid: Option<u32>, signal: libc::c_int) {
+        if let Some(pid) = pid {
+            // Its own child, so no right beyond this process's is needed.
+            unsafe {
+                libc::kill(pid as libc::pid_t, signal);
+            }
+        }
+    }
+
+    pub fn run() -> Result<(), String> {
+        let args = args()?;
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|failed| failed.to_string())?
+            .block_on(serve(args))
+    }
+
+    async fn serve(args: Args) -> Result<(), String> {
+        let chart = chart_instances(&args.instances)?;
+        let api = ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let mut hashes = Hashes::new();
+
+        // The broker starts whatever the cluster's API says, with the chart's
+        // instances at least: the components are not held up by a plugin.
+        let mut current = match reconciled(&api, &args, &chart, &mut hashes).await {
+            Ok(configuration) => configuration,
+            Err(failed) => {
+                tracing::warn!("launched plugins could not be read yet: {failed}");
+                launched::configuration(
+                    HEADER,
+                    Contract::embedded(),
+                    &chart,
+                    &[],
+                    &BTreeMap::new(),
+                )?
+                .0
+            }
+        };
+        std::fs::write(&args.out, &current)
+            .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
+
+        let mut broker = tokio::process::Command::new(&args.nats)
+            .args(["-c", &args.out])
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|failed| format!("{} did not start: {failed}", args.nats))?;
+        let pid = broker.id();
+        tracing::info!(pid, "the broker is running");
+
+        let mut terminate = signal(SignalKind::terminate()).map_err(|failed| failed.to_string())?;
+        let mut every = tokio::time::interval(args.every);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                ended = broker.wait() => {
+                    // The broker is this container: it stopping is this
+                    // stopping, and the orchestrator restarts both.
+                    let status = ended.map_err(|failed| failed.to_string())?;
+                    return Err(format!("the broker stopped: {status}"));
+                }
+                _ = terminate.recv() => {
+                    signal_child(pid, libc::SIGTERM);
+                    let _ = broker.wait().await;
+                    return Ok(());
+                }
+                _ = every.tick() => {
+                    match reconciled(&api, &args, &chart, &mut hashes).await {
+                        Ok(configuration) if configuration != current => {
+                            std::fs::write(&args.out, &configuration)
+                                .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
+                            signal_child(pid, libc::SIGHUP);
+                            current = configuration;
+                            tracing::info!("the broker reloaded its configuration");
+                        }
+                        Ok(_) => {}
+                        Err(failed) => tracing::warn!("launched plugins could not be read: {failed}"),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -110,10 +355,12 @@ fn run() -> Result<(), String> {
             let name = user["user"].as_str().unwrap_or_default().to_string();
             admitted.push(meridian_runtime::broker::User {
                 note: format!("{name}: a development identity, from {dev_users}"),
-                password_env: user["password_env"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
+                password: meridian_runtime::broker::Password::Env(
+                    user["password_env"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
                 user: name,
                 publish: listed("publish"),
                 subscribe: listed("subscribe"),
