@@ -24,6 +24,7 @@
 
 pub mod ids;
 pub mod migrations;
+pub mod plugins;
 pub mod postgres;
 pub mod rules;
 pub mod service;
@@ -33,12 +34,13 @@ mod memory;
 
 pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
+pub use plugins::serve_plugins;
 pub use postgres::PostgresStore;
 pub use service::{
     configuration, deployment_admin, install_named_administrator, serve, Clock, SystemClock,
     Upstream,
 };
-pub use store::{KnownPlugin, Snapshot, Store, StoreError, Withdrawal};
+pub use store::{Ending, KnownPlugin, Snapshot, Store, StoreError, Withdrawal};
 
 #[cfg(test)]
 mod tests;

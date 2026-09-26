@@ -31,6 +31,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "plugin_roles",
         sql: include_str!("../migrations/0002_plugin_roles.sql"),
     },
+    Migration {
+        version: 3,
+        name: "plugin_catalogue",
+        sql: include_str!("../migrations/0003_plugin_catalogue.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

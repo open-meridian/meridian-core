@@ -13,7 +13,7 @@
 
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Permission,
-    SignInRecord, UserGroup,
+    PluginCatalogue, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,30 @@ pub struct Snapshot {
     pub records: AccessRecords,
     pub links: Vec<ExternalAccountLink>,
     pub plugins: Vec<KnownPlugin>,
+    /// Every plugin version uploaded and every launch, live or ended (W8).
+    pub catalogue: PluginCatalogue,
+}
+
+/// How a live launch ended: stopped by an administrator, or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ending {
+    pub state: PluginLaunchState,
+    pub by: String,
+    pub at_ns: i64,
+    pub failure: String,
+}
+
+impl Ending {
+    /// The launch as it reads once ended this way.
+    pub fn applied_to(&self, launch: &PluginLaunch) -> PluginLaunch {
+        PluginLaunch {
+            state: self.state as i32,
+            stopped_by: self.by.clone(),
+            stopped_at_ns: self.at_ns,
+            failure: self.failure.clone(),
+            ..launch.clone()
+        }
+    }
 }
 
 /// What withdrawing a permission did.
@@ -93,4 +117,18 @@ pub trait Store: Send + Sync {
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;
 
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()>;
+
+    /// Record an uploaded version, unless that name and version is recorded
+    /// already: false then, and the recorded one stands. An uploaded version
+    /// is never replaced (W8).
+    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool>;
+
+    /// Record a launch as live, unless its instance has a live launch
+    /// already: false then. Checked and written in one step, so two launches
+    /// of one instance cannot both pass.
+    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool>;
+
+    /// End an instance's live launch, returning it as ended, or None when
+    /// none was live.
+    fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>>;
 }

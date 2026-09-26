@@ -16,11 +16,11 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Permission,
-    SignInRecord, UserGroup,
+    PluginLaunch, PluginMetadata, PluginVersion, SignInRecord, UserGroup,
 };
 
 use crate::migrations;
-use crate::store::{KnownPlugin, Result, Snapshot, Store, StoreError, Withdrawal};
+use crate::store::{Ending, KnownPlugin, Result, Snapshot, Store, StoreError, Withdrawal};
 use crate::DEPLOYMENT_ADMIN;
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -228,6 +228,40 @@ impl Store for PostgresStore {
                 tags: row.get(2),
                 last_reported_at_ns: row.get(3),
             });
+        }
+
+        for row in tx
+            .query(
+                "SELECT name, version, roles, tags, interface, sdk_version, image_digest,
+                        uploaded_by, uploaded_at_ns
+                   FROM config_plugin_version ORDER BY name, version",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.catalogue.versions.push(PluginVersion {
+                metadata: Some(PluginMetadata {
+                    name: row.get(0),
+                    version: row.get(1),
+                    roles: row.get(2),
+                    tags: row.get(3),
+                    interface: row.get(4),
+                    sdk_version: row.get(5),
+                }),
+                image_digest: row.get(6),
+                uploaded_by: row.get(7),
+                uploaded_at_ns: row.get(8),
+            });
+        }
+
+        for row in tx
+            .query(
+                &format!("SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch ORDER BY launch_id"),
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.catalogue.launches.push(launch_from(&row));
         }
 
         tx.commit().map_err(unavailable)?;
@@ -454,6 +488,99 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         Ok(())
+    }
+
+    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+        let metadata = version.metadata.clone().unwrap_or_default();
+        let written = self
+            .conn()?
+            .execute(
+                "INSERT INTO config_plugin_version
+                        (name, version, roles, tags, interface, sdk_version, image_digest,
+                         uploaded_by, uploaded_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (name, version) DO NOTHING",
+                &[
+                    &metadata.name,
+                    &metadata.version,
+                    &metadata.roles,
+                    &metadata.tags,
+                    &metadata.interface,
+                    &metadata.sdk_version,
+                    &version.image_digest,
+                    &version.uploaded_by,
+                    &version.uploaded_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(written == 1)
+    }
+
+    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool> {
+        let written = self
+            .conn()?
+            .execute(
+                "INSERT INTO config_plugin_launch
+                        (instance_id, name, version, image_digest, roles, tags, launched_by,
+                         launched_at_ns, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+                 ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
+                &[
+                    &launch.instance_id,
+                    &launch.name,
+                    &launch.version,
+                    &launch.image_digest,
+                    &launch.roles,
+                    &launch.tags,
+                    &launch.launched_by,
+                    &launch.launched_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(written == 1)
+    }
+
+    fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {
+        let state = ending.state as i16;
+        let ended = self
+            .conn()?
+            .query_opt(
+                &format!(
+                    "UPDATE config_plugin_launch
+                        SET state = $2, stopped_by = $3, stopped_at_ns = $4, failure = $5
+                      WHERE instance_id = $1 AND state = 1
+                  RETURNING {LAUNCH_COLUMNS}"
+                ),
+                &[
+                    &instance_id,
+                    &state,
+                    &ending.by,
+                    &ending.at_ns,
+                    &ending.failure,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(ended.as_ref().map(launch_from))
+    }
+}
+
+const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, tags, \
+     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure";
+
+fn launch_from(row: &postgres::Row) -> PluginLaunch {
+    PluginLaunch {
+        instance_id: row.get(0),
+        name: row.get(1),
+        version: row.get(2),
+        image_digest: row.get(3),
+        roles: row.get(4),
+        tags: row.get(5),
+        launched_by: row.get(6),
+        launched_at_ns: row.get(7),
+        state: i32::from(row.get::<_, i16>(8)),
+        stopped_by: row.get(9),
+        stopped_at_ns: row.get(10),
+        failure: row.get(11),
     }
 }
 

@@ -8,11 +8,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_config::store::{KnownPlugin, Store, Withdrawal};
+use meridian_config::store::{Ending, KnownPlugin, Store, Withdrawal};
 use meridian_config::{PostgresStore, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccountGroup, AccountRecord, AccountState,
-    ExternalAccountLink, Permission, SignInRecord, UserGroup,
+    ExternalAccountLink, Permission, PluginLaunch, PluginLaunchState, PluginMetadata,
+    PluginVersion, SignInRecord, UserGroup,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -251,4 +252,115 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
         store.withdraw_permission("PRM-missing").unwrap(),
         Withdrawal::Unknown
     );
+}
+
+// ── The plugin catalogue (W8) ───────────────────────────────────────────────
+
+fn version(name: &str, version: &str) -> PluginVersion {
+    PluginVersion {
+        metadata: Some(PluginMetadata {
+            name: name.into(),
+            version: version.into(),
+            roles: vec!["custody".into()],
+            tags: vec!["holdings".into()],
+            interface: true,
+            sdk_version: "0.2.0".into(),
+        }),
+        image_digest: format!("sha256:{}", "a".repeat(64)),
+        uploaded_by: "local|ada".into(),
+        uploaded_at_ns: 1,
+    }
+}
+
+fn launch(instance: &str) -> PluginLaunch {
+    PluginLaunch {
+        instance_id: instance.into(),
+        name: "snaptrade".into(),
+        version: "0.1.0".into(),
+        image_digest: format!("sha256:{}", "a".repeat(64)),
+        roles: vec!["custody".into()],
+        tags: vec!["holdings".into()],
+        launched_by: "local|ada".into(),
+        launched_at_ns: 2,
+        state: PluginLaunchState::Launched as i32,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_version_is_recorded_once_and_read_back_whole() {
+    let store = store("versions");
+    assert!(store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap());
+    let mut changed = version("snaptrade", "0.1.0");
+    changed.image_digest = format!("sha256:{}", "b".repeat(64));
+    assert!(
+        !store.record_plugin_version(&changed).unwrap(),
+        "the same name and version again is refused, not an update"
+    );
+    let catalogue = store.snapshot().unwrap().catalogue;
+    assert_eq!(catalogue.versions, vec![version("snaptrade", "0.1.0")]);
+}
+
+#[test]
+fn one_live_launch_per_instance_and_it_ends_once() {
+    let store = store("launches");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    assert!(store.begin_launch(&launch("snaptrade-1")).unwrap());
+    assert!(
+        !store.begin_launch(&launch("snaptrade-1")).unwrap(),
+        "live already"
+    );
+    assert!(
+        store.begin_launch(&launch("snaptrade-2")).unwrap(),
+        "another instance"
+    );
+
+    let stop = Ending {
+        state: PluginLaunchState::Stopped,
+        by: "local|ada".into(),
+        at_ns: 3,
+        failure: String::new(),
+    };
+    let stopped = store
+        .end_launch("snaptrade-1", &stop)
+        .unwrap()
+        .expect("was live");
+    assert_eq!(stopped.state, PluginLaunchState::Stopped as i32);
+    assert_eq!(stopped.stopped_at_ns, 3);
+    assert!(
+        store.end_launch("snaptrade-1", &stop).unwrap().is_none(),
+        "none live now"
+    );
+    assert!(
+        store.begin_launch(&launch("snaptrade-1")).unwrap(),
+        "free again"
+    );
+
+    let launches = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(launches.len(), 3);
+    assert_eq!(launches[0], stop.applied_to(&launch("snaptrade-1")));
+}
+
+#[test]
+fn two_launches_of_one_instance_at_once_admit_one() {
+    let store = Arc::new(store("race"));
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let racing: Vec<_> = (0..8)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.begin_launch(&launch("snaptrade-1")).unwrap())
+        })
+        .collect();
+    let admitted = racing
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .filter(|won| *won)
+        .count();
+    assert_eq!(admitted, 1);
 }

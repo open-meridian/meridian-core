@@ -5,11 +5,11 @@
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Permission, SignInRecord,
-    UserGroup,
+    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Permission, PluginLaunch,
+    PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
 
-use crate::store::{KnownPlugin, Result, Snapshot, Store, Withdrawal};
+use crate::store::{Ending, KnownPlugin, Result, Snapshot, Store, Withdrawal};
 use crate::DEPLOYMENT_ADMIN;
 
 pub struct MemoryStore {
@@ -148,5 +148,44 @@ impl Store for MemoryStore {
             p.plugin_instance_id == plugin.plugin_instance_id
         });
         Ok(())
+    }
+
+    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let metadata = version.metadata.clone().unwrap_or_default();
+        let recorded = state.catalogue.versions.iter().any(|held| {
+            held.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == metadata.name && m.version == metadata.version)
+        });
+        if recorded {
+            return Ok(false);
+        }
+        state.catalogue.versions.push(version.clone());
+        Ok(true)
+    }
+
+    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let live = state.catalogue.launches.iter().any(|held| {
+            held.instance_id == launch.instance_id
+                && held.state == PluginLaunchState::Launched as i32
+        });
+        if live {
+            return Ok(false);
+        }
+        state.catalogue.launches.push(launch.clone());
+        Ok(true)
+    }
+
+    fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let live = state.catalogue.launches.iter_mut().find(|held| {
+            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+        });
+        Ok(live.map(|launch| {
+            *launch = ending.applied_to(launch);
+            launch.clone()
+        }))
     }
 }

@@ -92,6 +92,12 @@ spec:
             {{- end }}
             - name: MERIDIAN_KEY_PATH
               value: {{ if include "meridian-runtime.generatedKey" . }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}
+            {{- if .Values.registry.enabled }}
+            # Where each node reaches the deployment's own registry, which a
+            # launched plugin's image is named from (W8.3).
+            - name: MERIDIAN_REGISTRY_ADDRESS
+              value: {{ printf "localhost:%v" .Values.registry.hostPort | quote }}
+            {{- end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
             # Optional, and that is what lets first run happen at all: the

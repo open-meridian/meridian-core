@@ -12,6 +12,9 @@ meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-domain.workspace = true
 meridian-pb.workspace = true
+# The deployment's fixed roles and components, which an upload's are held to
+# (decisions/020), compiled in as the sidecar's are.
+meridian-sidecar = { path = "../sidecar" }
 prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

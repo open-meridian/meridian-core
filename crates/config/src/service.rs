@@ -231,7 +231,7 @@ pub fn install_named_administrator(
         .map_err(|failed| failed.to_string())
 }
 
-fn subject(envelope: &Envelope) -> String {
+pub(crate) fn subject(envelope: &Envelope) -> String {
     envelope
         .meta
         .as_ref()
@@ -258,9 +258,25 @@ fn answer<Req, Rep, F>(
     Rep: Message,
     F: Fn(&Context, Req, &Envelope) -> Result<Rep, String> + Send + Sync + 'static,
 {
+    answer_on(&Arc::clone(&context.bus), context, topic, types, handle)
+}
+
+/// [`answer`], for any context: the one decode-handle-encode for every
+/// handler this crate serves.
+pub(crate) fn answer_on<C, Req, Rep, F>(
+    bus: &Arc<Bus>,
+    context: &Arc<C>,
+    topic: &'static str,
+    types: (&'static str, &'static str),
+    handle: F,
+) where
+    C: Send + Sync + 'static,
+    Req: Message + Default,
+    Rep: Message,
+    F: Fn(&C, Req, &Envelope) -> Result<Rep, String> + Send + Sync + 'static,
+{
     let (request_type, reply_type) = types;
     let context = Arc::clone(context);
-    let bus = Arc::clone(&context.bus);
     bus.serve(topic, move |envelope| {
         if envelope.payload_type != request_type {
             return Err(format!(

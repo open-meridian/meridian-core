@@ -148,6 +148,16 @@ fn run() -> Result<(), String> {
                 Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
             );
 
+            // W8: the plugin catalogue, and launching from it. Every launch
+            // runs an image from the deployment's own registry as each node
+            // reaches it, by digest (spec/the-local-plugin-registry).
+            meridian_config::serve_plugins(
+                Arc::clone(&bus),
+                Arc::clone(&store),
+                Arc::new(meridian_config::SystemClock),
+                var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
+            );
+
             let carrying = Arc::clone(&bus);
             let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
             let running = tokio::spawn(conductor.consume(misses));

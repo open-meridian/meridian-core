@@ -1761,6 +1761,7 @@ dependencies = [
  "meridian-bus",
  "meridian-domain",
  "meridian-pb",
+ "meridian-sidecar",
  "postgres",
  "prost",
  "r2d2",
