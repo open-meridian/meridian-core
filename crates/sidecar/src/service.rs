@@ -21,13 +21,13 @@ use meridian_pb::v1::{
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use crate::grants::{GrantTable, Grants};
+use crate::grants::{Contract, Grants};
 
 /// What the sidecar knows about the plugin it serves, once admitted.
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub instance_id: String,
-    pub role: String,
+    pub roles: Vec<String>,
     pub grants: Grants,
     pub healthy: bool,
     pub last_heartbeat_ns: i64,
@@ -37,23 +37,24 @@ pub struct Registration {
 /// Who a sidecar was launched to serve.
 ///
 /// Supplied when the sidecar is built, which is to say by whoever deployed it,
-/// and never by the plugin. These three decide the plugin's topic access: a
-/// plugin that named its own role would be choosing its own privileges, and one
-/// that named its own instance could publish as a sibling, because grants are
-/// written with instance wildcards so an instance-scoped topic needs no grant
-/// minted per instance.
+/// and never by the plugin. The instance and the roles decide the plugin's
+/// topic access: a plugin that named its own roles would be choosing its own
+/// privileges, and one that named its own instance could publish as a
+/// sibling, because grants are written with instance wildcards so an
+/// instance-scoped topic needs no grant minted per instance. The tags decide
+/// nothing here; they are for people (decisions/020).
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub instance_id: String,
-    pub role: String,
+    pub roles: Vec<String>,
     pub tags: Vec<String>,
 }
 
 impl Identity {
-    pub fn new(instance_id: impl Into<String>, role: impl Into<String>) -> Self {
+    pub fn new(instance_id: impl Into<String>, roles: Vec<String>) -> Self {
         Self {
             instance_id: instance_id.into(),
-            role: role.into(),
+            roles,
             tags: Vec::new(),
         }
     }
@@ -69,30 +70,41 @@ pub struct Sidecar {
     deployment_id: String,
     identity: Identity,
 
-    /// `None` until access control has loaded.
-    ///
-    /// Distinct from an empty table on purpose: an empty table denies
-    /// everything and is a decision, while a missing table means nothing is
-    /// known yet, and admitting a plugin then would admit it unenforced.
-    grants: Arc<RwLock<Option<GrantTable>>>,
+    /// Decided once, at launch, from the contract compiled in: the union of
+    /// the roles' grants, or why the roles were refused. Nothing loads later,
+    /// so there is no moment when a plugin could register unenforced.
+    grants: Result<Grants, String>,
 
     state: Arc<RwLock<Option<Registration>>>,
 }
 
 impl Sidecar {
     pub fn new(bus: Arc<Bus>, deployment_id: impl Into<String>, identity: Identity) -> Self {
+        Self::under(Contract::embedded(), bus, deployment_id, identity)
+    }
+
+    /// Against a contract other than the one compiled in, for a test that
+    /// wants roles the contract does not have yet.
+    pub fn under(
+        contract: &Contract,
+        bus: Arc<Bus>,
+        deployment_id: impl Into<String>,
+        identity: Identity,
+    ) -> Self {
+        let grants = contract.grants_for(&identity.roles);
+        if let Err(refusal) = &grants {
+            tracing::warn!(
+                instance = identity.instance_id,
+                "launched with roles that are refused: {refusal}"
+            );
+        }
         Self {
             bus,
             deployment_id: deployment_id.into(),
             identity,
-            grants: Arc::new(RwLock::new(None)),
+            grants,
             state: Arc::new(RwLock::new(None)),
         }
-    }
-
-    /// Make access control available. Nothing is admitted before this.
-    pub fn load_grants(&self, table: GrantTable) {
-        *self.grants.write().expect("grant lock poisoned") = Some(table);
     }
 
     pub fn registration(&self) -> Option<Registration> {
@@ -140,19 +152,15 @@ impl SidecarService for Sidecar {
     ) -> Result<Response<RegisterReply>, Status> {
         let req = request.into_inner();
 
-        // Fail closed. A plugin that starts before access control has loaded is
-        // refused rather than admitted unenforced, because the second failure
-        // mode is invisible: it publishes successfully and nobody finds out.
-        let table = match self.grants.read().expect("grant lock poisoned").clone() {
-            Some(t) => t,
-            None => {
-                tracing::warn!(
-                    instance = self.identity.instance_id,
-                    "refused: access control not loaded"
-                );
+        // Fail closed. A sidecar launched with a name that is not a role is
+        // refused rather than admitted with nothing, where the failure would
+        // be invisible until the first refused publish.
+        let grants = match &self.grants {
+            Ok(grants) => grants.clone(),
+            Err(refusal) => {
                 return Ok(Response::new(RegisterReply {
                     admitted: false,
-                    refusal_reason: "access control not loaded".into(),
+                    refusal_reason: format!("this sidecar was launched with {refusal}"),
                     ..Default::default()
                 }));
             }
@@ -176,21 +184,14 @@ impl SidecarService for Sidecar {
         // escalation: it gets the same identity and the same grants, because
         // there is only one set to get. It is still not separable from the
         // first, and separating them is what one sidecar per plugin is for.
-        let grants = table.resolve(&self.identity.role, &self.identity.tags);
-        if grants.publish.is_empty() && grants.subscribe.is_empty() {
-            return Ok(Response::new(RegisterReply {
-                admitted: false,
-                refusal_reason: format!(
-                    "this sidecar was launched as `{}`, which has no grants",
-                    self.identity.role
-                ),
-                ..Default::default()
-            }));
-        }
+        //
+        // No grants at all is admitted: a plugin holding no role, or only
+        // roles no row names yet, registers and is refused every topic
+        // (decisions/020). The reference plugin is one.
 
         *self.state.write().expect("state lock poisoned") = Some(Registration {
             instance_id: self.identity.instance_id.clone(),
-            role: self.identity.role.clone(),
+            roles: self.identity.roles.clone(),
             grants: grants.clone(),
             healthy: true,
             last_heartbeat_ns: now_ns(),
@@ -199,7 +200,7 @@ impl SidecarService for Sidecar {
 
         tracing::info!(
             instance = self.identity.instance_id,
-            role = self.identity.role,
+            roles = self.identity.roles.join(","),
             "admitted"
         );
 
@@ -215,7 +216,7 @@ impl SidecarService for Sidecar {
             // Returned so a plugin can log what it is and stop when that is not
             // what it expected to be. Learning it is not declaring it.
             instance_id: self.identity.instance_id.clone(),
-            role: self.identity.role.clone(),
+            roles: self.identity.roles.clone(),
             tags: self.identity.tags.clone(),
         }))
     }
@@ -428,39 +429,37 @@ mod tests {
     use super::*;
     use meridian_bus::MemoryBackend;
 
-    const GRANTS: &str = r#"{
-      "roles": {
-        "custody": {
-          "publish": [
-            "platform.street.command.record-holding",
-            "platform.reference.event.instrument-missing",
-            "platform.reference.query.resolve-identifier",
-            "platform.custody.*.event.sync-status"
-          ],
-          "subscribe": ["platform.reference.event.instrument-applied"]
-        },
-        "admin": {
-          "publish": [],
-          "subscribe": ["platform.street.event.*"]
-        }
-      }
-    }"#;
+    /// A contract of the shape the real one has, with a read-only role the
+    /// real one has no rows for yet.
+    fn contract() -> Contract {
+        Contract::parse(
+            "topic\tkind\tpublisher\tsubscriber\n\
+             platform.street.command.record-holding\tcommand\tcustody\tstreet\n\
+             platform.reference.event.instrument-missing\tevent\tcustody\tinstrument\n\
+             platform.reference.query.resolve-identifier\tquery\tcustody\tinstrument\n\
+             platform.custody.*.event.sync-status\tevent\tcustody\tdashboard\n\
+             platform.reference.event.instrument-applied\tevent\tinstrument\tcustody\n\
+             platform.street.event.*\tevent\tstreet\treporting\n",
+            "name\tkind\ncustody\trole\nreporting\trole\noms\trole\nstreet\tcomponent\n",
+        )
+        .unwrap()
+    }
 
-    fn sidecar(load_grants: bool) -> Sidecar {
-        launched_as(load_grants, Identity::new("custody-snaptrade-1", "custody"))
+    fn roles(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn sidecar() -> Sidecar {
+        launched_as(Identity::new("custody-snaptrade-1", roles(&["custody"])))
     }
 
     /// A sidecar deployed to serve one particular plugin.
-    fn launched_as(load_grants: bool, identity: Identity) -> Sidecar {
+    fn launched_as(identity: Identity) -> Sidecar {
         let bus = Arc::new(Bus::single(
             "sidecar-custody-1",
             Arc::new(MemoryBackend::new()),
         ));
-        let sc = Sidecar::new(bus, "dep-local-1", identity);
-        if load_grants {
-            sc.load_grants(GrantTable::from_json(GRANTS).unwrap());
-        }
-        sc
+        Sidecar::under(&contract(), bus, "dep-local-1", identity)
     }
 
     fn register_req() -> RegisterRequest {
@@ -471,7 +470,7 @@ mod tests {
     }
 
     async fn admitted_sidecar() -> Sidecar {
-        let sc = sidecar(true);
+        let sc = sidecar();
         let reply = sc
             .register(Request::new(register_req()))
             .await
@@ -482,24 +481,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_is_refused_before_access_control_loads() {
-        let sc = sidecar(false);
-        let reply = sc
-            .register(Request::new(register_req()))
-            .await
-            .unwrap()
-            .into_inner();
+    async fn a_sidecar_launched_with_a_name_that_is_not_a_role_admits_nobody() {
+        // Refused, not admitted with nothing: a misspelt role would otherwise
+        // be a plugin that registers and then fails at every publish.
+        for launched in [roles(&["custdy"]), roles(&["custody", "street"])] {
+            let sc = launched_as(Identity::new("mystery-1", launched.clone()));
+            let reply = sc
+                .register(Request::new(register_req()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!reply.admitted, "{launched:?} was admitted");
+            assert!(reply.refusal_reason.contains("launched with"));
+            assert!(sc.registration().is_none());
+        }
+    }
 
-        assert!(!reply.admitted);
-        assert_eq!(reply.refusal_reason, "access control not loaded");
-        // Refused, not deferred: nothing was admitted unenforced.
-        assert!(sc.registration().is_none());
+    #[tokio::test]
+    async fn a_plugin_holding_no_role_is_admitted_with_no_topics() {
+        // The reference plugin: registered, and refused everything it asks.
+        for held in [roles(&[]), roles(&["oms"])] {
+            let sc = launched_as(Identity::new("reference-1", held.clone()));
+            let reply = sc
+                .register(Request::new(register_req()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(reply.admitted, "{held:?}: {}", reply.refusal_reason);
+            assert!(reply.publish_grants.is_empty() && reply.subscribe_grants.is_empty());
+            let refused = sc
+                .publish(Request::new(PublishRequest {
+                    topic: "platform.street.command.record-holding".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!refused.accepted);
+        }
     }
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
         for declared in ["v0", "v2"] {
-            let sc = sidecar(true);
+            let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
 
@@ -516,7 +541,7 @@ mod tests {
     async fn a_plugin_that_declares_no_contract_is_no_longer_admitted() {
         // It was, until 2026-09-21, which made omitting the version the safest
         // thing a vendor could do.
-        let sc = sidecar(true);
+        let sc = sidecar();
         let mut req = register_req();
         req.schema_version = String::new();
 
@@ -528,24 +553,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_is_refused_for_a_role_with_no_grants() {
-        // The refusal names what the sidecar was launched as, because that is
-        // what an operator has to go and change.
-        let sc = launched_as(true, Identity::new("mystery-1", "nonexistent"));
-
-        let reply = sc
-            .register(Request::new(register_req()))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!reply.admitted);
-        assert!(reply.refusal_reason.contains("no grants"));
-        assert!(reply.refusal_reason.contains("nonexistent"));
-    }
-
-    #[tokio::test]
     async fn admission_returns_the_grants_so_a_plugin_can_fail_at_startup() {
-        let sc = sidecar(true);
+        let sc = sidecar();
         let reply = sc
             .register(Request::new(register_req()))
             .await
@@ -566,9 +575,9 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_cannot_ask_to_be_a_role_it_was_not_launched_as() {
         // The hole this closed: the plugin used to supply role and tags, so a
-        // dashboard could ask to be a connector and be admitted with write
-        // grants. There is now nothing in the request that could ask.
-        let sc = launched_as(true, Identity::new("dashboard-1", "admin"));
+        // read-only plugin could ask to be a connector and be admitted with
+        // write grants. There is now nothing in the request that could ask.
+        let sc = launched_as(Identity::new("reporting-1", roles(&["reporting"])));
 
         let reply = sc
             .register(Request::new(register_req()))
@@ -577,8 +586,8 @@ mod tests {
             .into_inner();
 
         assert!(reply.admitted);
-        assert_eq!(reply.role, "admin");
-        assert_eq!(reply.instance_id, "dashboard-1");
+        assert_eq!(reply.roles, vec!["reporting".to_string()]);
+        assert_eq!(reply.instance_id, "reporting-1");
         assert!(reply.publish_grants.is_empty());
         assert!(!sc
             .registration()
@@ -592,8 +601,8 @@ mod tests {
         // So a plugin can stop at startup when it is not what it expected to
         // be, rather than running as something else and finding out by refusal.
         let sc = launched_as(
-            true,
-            Identity::new("custody-snaptrade-1", "custody").with_tags(vec!["admin".to_string()]),
+            Identity::new("custody-snaptrade-1", roles(&["custody", "reporting"]))
+                .with_tags(vec!["holdings".to_string()]),
         );
 
         let reply = sc
@@ -604,14 +613,32 @@ mod tests {
 
         assert!(reply.admitted);
         assert_eq!(reply.instance_id, "custody-snaptrade-1");
-        assert_eq!(reply.role, "custody");
-        assert_eq!(reply.tags, vec!["admin".to_string()]);
-        // A tag adds to the role rather than replacing it, and the reply's
-        // grants are the merged set the plugin will actually be held to.
+        assert_eq!(reply.roles, roles(&["custody", "reporting"]));
+        assert_eq!(reply.tags, vec!["holdings".to_string()]);
+        // Both roles' grants, the union the plugin will actually be held to.
         assert!(reply
             .publish_grants
             .contains(&"platform.street.command.record-holding".to_string()));
         assert!(reply
+            .subscribe_grants
+            .contains(&"platform.street.event.*".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_tag_grants_nothing_on_the_bus() {
+        // decisions/020: tags divide a plugin among people. A tag named like a
+        // role adds none of that role's topics.
+        let sc = launched_as(
+            Identity::new("custody-snaptrade-1", roles(&["custody"]))
+                .with_tags(vec!["reporting".to_string()]),
+        );
+        let reply = sc
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.admitted);
+        assert!(!reply
             .subscribe_grants
             .contains(&"platform.street.event.*".to_string()));
     }
@@ -652,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_works_before_registering() {
-        let sc = sidecar(true);
+        let sc = sidecar();
         let err = sc
             .publish(Request::new(PublishRequest {
                 topic: "platform.street.command.record-holding".into(),

@@ -84,7 +84,7 @@ fn harness(instance: &str) -> Harness {
     store
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "oms-1".into(),
-            role: "oms".into(),
+            roles: vec!["oms".into()],
             tags: vec!["reporting".into()],
             last_reported_at_ns: 0,
         })

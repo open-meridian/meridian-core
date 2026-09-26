@@ -711,7 +711,7 @@ pub fn serve(
             };
             let plugin = KnownPlugin {
                 plugin_instance_id: report.plugin_instance_id,
-                role: report.role,
+                roles: report.roles,
                 tags: report.tags,
                 last_reported_at_ns: report.reported_at_ns,
             };

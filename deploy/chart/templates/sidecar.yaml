@@ -66,12 +66,14 @@ spec:
               value: sidecar-{{ .instanceId }}
             {{/*
               Assigned here, at launch, never declared by the plugin: a plugin
-              that named its own role would be choosing its own privileges.
+              that named its own roles would be choosing its own privileges.
+              What they may do is the contract's, compiled into the image
+              (decisions/020); none, a plugin admitted with no topics.
             */}}
             - name: MERIDIAN_PLUGIN_INSTANCE_ID
               value: {{ .instanceId | quote }}
-            - name: MERIDIAN_PLUGIN_ROLE
-              value: {{ .role | quote }}
+            - name: MERIDIAN_PLUGIN_ROLES
+              value: {{ join "," (.roles | default list) | quote }}
             - name: MERIDIAN_PLUGIN_TAGS
               value: {{ join "," (.tags | default list) | quote }}
             - name: RUST_LOG
@@ -84,12 +86,8 @@ spec:
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ $top.Values.broker.existingSecret }}
+                  name: {{ include "meridian-runtime.brokerSecret" $top }}
                   key: {{ .instanceId }}
-          volumeMounts:
-            - name: grants
-              mountPath: /etc/meridian
-              readOnly: true
           resources:
             {{- toYaml $top.Values.resources | nindent 12 }}
         {{- with .plugin }}
@@ -100,8 +98,8 @@ spec:
           pod can.
 
           It is given the sidecar's address and nothing else of the sidecar's.
-          No broker credential and no grants mount -- that seam is the boundary.
-          And not its role or tags: a plugin that named its own role would be
+          No broker credential -- that seam is the boundary. And not its roles
+          or tags: a plugin that named its own roles would be
           choosing its own privileges (decision 007), so it learns them from
           the sidecar's reply to registration instead.
 
@@ -148,16 +146,10 @@ spec:
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
+      {{- if .plugin }}
       volumes:
-        - name: grants
-          configMap:
-            name: {{ $top.Values.grants.existingConfigMap }}
-            items:
-              - key: {{ $top.Values.grants.key }}
-                path: grants.json
-        {{- if .plugin }}
         - name: plugin-tmp
           emptyDir: {}
-        {{- end }}
+      {{- end }}
 ---
 {{- end }}

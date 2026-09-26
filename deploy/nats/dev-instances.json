@@ -1,20 +1,9 @@
 {
-  "_note": "What this repository's harness launches, for the credentials its tests present. Not what a deployment runs: that is instances.example.json plus whatever plugins the administrator installed.",
+  "_note": "What this repository's harness launches, for the credentials its tests present. Not what a deployment runs: that is instances.example.json plus the plugins an administrator launched. `reference-1` is the reference plugin, holding no role; the two `custody-test` instances hold custody, whose topics W2 names, and are two so a test can show one cannot publish as the other.",
   "instances": [
-    {
-      "instance_id": "custody-1",
-      "role": "custody",
-      "tags": []
-    },
-    {
-      "instance_id": "custody-2",
-      "role": "custody",
-      "tags": []
-    },
-    {
-      "instance_id": "dashboard-1",
-      "role": "admin",
-      "tags": []
-    }
+    {"instance_id": "reference-1", "roles": []},
+    {"instance_id": "custody-test-1", "roles": ["custody"]},
+    {"instance_id": "custody-test-2", "roles": ["custody"]},
+    {"instance_id": "dashboard-1", "component": "dashboard"}
   ]
 }

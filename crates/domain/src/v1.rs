@@ -474,8 +474,10 @@ pub struct RestoreOrganisationOwnerRequest {
 pub struct PluginReport {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub role: ::prost::alloc::string::String,
+    /// What it was launched as: a set of roles from the fixed list
+    /// (decisions/020), and its tags, which are for people.
+    #[prost(string, repeated, tag = "12")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "3")]
     pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "4")]

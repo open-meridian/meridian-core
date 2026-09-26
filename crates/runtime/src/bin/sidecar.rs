@@ -10,9 +10,9 @@
 //! admitted on it would inherit the first's grants.
 //!
 //! Who this serves is launch configuration and never what registers: a plugin
-//! that named its own role would be choosing its own privileges.
+//! that named its own roles would be choosing its own privileges.
 
-use meridian_runtime::{bus_from_env, grants_at, required, shutdown, tags_from, var, GRANTS_PATH};
+use meridian_runtime::{bus_from_env, names_from, required, shutdown, var};
 use meridian_sidecar::{Identity, Sidecar, DEFAULT_BIND};
 
 fn main() {
@@ -30,13 +30,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let deployment_id = required("MERIDIAN_DEPLOYMENT_ID")?;
-    let grants = grants_at(&var("MERIDIAN_GRANTS_PATH").unwrap_or_else(|| GRANTS_PATH.into()))?;
 
+    // Roles, never a grant table: what they may do is the contract's, compiled
+    // into this binary (decisions/020).
     let identity = Identity::new(
         var("MERIDIAN_PLUGIN_INSTANCE_ID").unwrap_or_default(),
-        var("MERIDIAN_PLUGIN_ROLE").unwrap_or_default(),
+        names_from(var("MERIDIAN_PLUGIN_ROLES")),
     )
-    .with_tags(tags_from(var("MERIDIAN_PLUGIN_TAGS")));
+    .with_tags(names_from(var("MERIDIAN_PLUGIN_TAGS")));
 
     let address = var("MERIDIAN_SIDECAR_ADDRESS").unwrap_or_else(|| DEFAULT_BIND.into());
     let listening: std::net::SocketAddr = address
@@ -63,7 +64,6 @@ fn run() -> Result<(), String> {
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
             let sidecar = Sidecar::new(bus, &deployment_id, identity);
-            sidecar.load_grants(grants);
 
             tracing::info!(instance_id, %listening, "the sidecar is serving");
 

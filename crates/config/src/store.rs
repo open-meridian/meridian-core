@@ -30,16 +30,21 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownPlugin {
     pub plugin_instance_id: String,
-    pub role: String,
+    pub roles: Vec<String>,
     pub tags: Vec<String>,
     pub last_reported_at_ns: i64,
 }
 
 impl KnownPlugin {
-    /// A role is a grant-table entry like a tag, so an access entry may name
-    /// either.
-    pub fn carries(&self, tag: &str) -> bool {
-        self.role == tag || self.tags.iter().any(|carried| carried == tag)
+    /// A part of the plugin people may be granted: one of its roles, or one
+    /// of its tags (decisions/020). A compliance plugin holding `compliance`
+    /// and `reporting` is granted as those two parts; a tag names a part the
+    /// roles do not divide.
+    pub fn carries(&self, part: &str) -> bool {
+        self.roles
+            .iter()
+            .chain(&self.tags)
+            .any(|carried| carried == part)
     }
 }
 

@@ -139,8 +139,7 @@ pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
                 )
             })?;
         if !plugin.carries(&entry.tag) {
-            let mut carried = vec![plugin.role.clone()];
-            carried.extend(plugin.tags.iter().cloned());
+            let carried: Vec<String> = plugin.roles.iter().chain(&plugin.tags).cloned().collect();
             return Err(format!(
                 "plugin {} does not carry `{}`; it carries {}",
                 entry.plugin_instance_id,

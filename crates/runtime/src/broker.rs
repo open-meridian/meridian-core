@@ -1,26 +1,25 @@
-//! The broker's permissions, from the grant table and the topic registry.
+//! The broker's permissions, from the contract.
 //!
 //! Decision 010: a broker carries the bus, and what it enforces has to be the
-//! same policy the grant table states. A permission list maintained beside the
-//! grants it mirrors is two policies that must agree, and v1's recorded
-//! failures are what that looks like when they stop.
+//! same policy the sidecars enforce. Decision 020: that policy is the
+//! contract's -- a role holds a topic exactly when the matrix names it, and a
+//! component likewise -- compiled into this image as the sidecar's is, so the
+//! two cannot disagree and nobody writes either down.
 //!
-//! So this generates one from the other, and it lives in the runtime image
-//! rather than in a script beside the chart because a bundled broker has to
-//! generate its own configuration at start, from the grants the deployment
-//! was given and the instances it was configured with. A chart that computed
-//! the same thing in templates would be the second policy this exists to
-//! avoid.
+//! It lives in the runtime image rather than in a script beside the chart
+//! because a bundled broker has to generate its own configuration at start,
+//! from the instances it was configured with. A chart that computed the same
+//! thing in templates would be a second policy.
 //!
 //! One credential per plugin instance, never per role. Two plugins sharing a
-//! role would otherwise publish as each other: the grant table writes
+//! role would otherwise publish as each other: the contract writes
 //! `platform.custody.*.event.sync-status`, and that `*` is the instance
 //! segment, so a role-wide credential carries the right to speak as every
 //! instance of it.
 
 use std::collections::BTreeSet;
 
-use serde_json::Value;
+use meridian_sidecar::Contract;
 
 /// Where a reply lands. A caller has to hear its own answer, and a responder
 /// has to be able to reply to whoever asked; the broker scopes the second to
@@ -38,12 +37,43 @@ const RUNTIME_COMPONENTS: [&str; 3] = ["instrument", "street", "conductor"];
 /// component's rights (spec/installation-and-first-run, ruling 5).
 const OWN_CREDENTIAL: [&str; 1] = ["first-run"];
 
-/// A plugin instance, as the deployment launches it.
-#[derive(Debug, Clone)]
-pub struct Instance {
-    pub instance_id: String,
-    pub role: String,
-    pub tags: Vec<String>,
+/// Something the broker admits by instance: a plugin's sidecar, holding a
+/// set of roles, or a component with a credential of its own under an
+/// instance name -- the dashboard, which is one (decisions/020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Instance {
+    Plugin {
+        instance_id: String,
+        roles: Vec<String>,
+    },
+    Component {
+        instance_id: String,
+        component: String,
+    },
+}
+
+impl Instance {
+    pub fn plugin(instance_id: impl Into<String>, roles: &[&str]) -> Self {
+        Instance::Plugin {
+            instance_id: instance_id.into(),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+        }
+    }
+
+    pub fn component(instance_id: impl Into<String>, component: impl Into<String>) -> Self {
+        Instance::Component {
+            instance_id: instance_id.into(),
+            component: component.into(),
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Instance::Plugin { instance_id, .. } | Instance::Component { instance_id, .. } => {
+                instance_id
+            }
+        }
+    }
 }
 
 /// One user the broker admits.
@@ -76,14 +106,14 @@ fn subject(pattern: &str) -> String {
 /// The instance's own version of a topic it publishes.
 ///
 /// Two conditions, the second learned by getting it wrong: the domain must be
-/// the instance's own. A dashboard subscribes to
+/// one of the instance's own roles. A dashboard subscribes to
 /// `platform.custody.*.event.sync-status` to hear every connector, and
 /// rewriting that to its own identifier leaves it subscribed to a topic nobody
 /// publishes. You may speak only as yourself; you may listen to everyone your
 /// grants allow.
-fn scoped(pattern: &str, instance_id: &str, role: &str) -> String {
+fn scoped(pattern: &str, instance_id: &str, roles: &[String]) -> String {
     let segments: Vec<&str> = pattern.split('.').collect();
-    if segments.len() == 5 && segments[2] == "*" && segments[1] == role {
+    if segments.len() == 5 && segments[2] == "*" && roles.iter().any(|role| role == segments[1]) {
         return format!(
             "{}.{}.{}.{}.{}",
             segments[0], segments[1], instance_id, segments[3], segments[4]
@@ -92,88 +122,45 @@ fn scoped(pattern: &str, instance_id: &str, role: &str) -> String {
     pattern.to_string()
 }
 
-fn listed(table: &Value, key: &str) -> Vec<String> {
-    table
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
+/// A component's topics, in the broker's grammar.
+fn component_subjects(contract: &Contract, names: &[&str]) -> (Vec<String>, Vec<String>) {
+    let mut publish = BTreeSet::new();
+    let mut subscribe = BTreeSet::new();
+    for name in names {
+        let grants = contract.component(name);
+        publish.extend(grants.publish.iter().map(|topic| subject(topic)));
+        subscribe.extend(grants.subscribe.iter().map(|topic| subject(topic)));
+    }
+    (
+        publish.into_iter().collect(),
+        subscribe.into_iter().collect(),
+    )
 }
 
-/// What one instance may publish and subscribe to.
-///
-/// A role and each of its tags are looked up in the one table and unioned,
-/// which is what the grant table's own note says: a tag is an entry there like
-/// any other.
+/// What one plugin instance may publish and subscribe to: its roles' topics,
+/// with what it publishes in its own domains narrowed to itself, and every
+/// sidecar's own traffic -- asking for its configuration and access,
+/// reporting its plugin -- which is the sidecar's rather than the plugin's
+/// and which every plugin credential carries (topics.md, Config).
 pub fn permissions_for(
-    grants: &Value,
-    role: &str,
-    tags: &[String],
+    contract: &Contract,
+    roles: &[String],
     instance_id: &str,
-) -> (Vec<String>, Vec<String>) {
-    let roles = grants.get("roles").cloned().unwrap_or(Value::Null);
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let granted = contract.grants_for(roles)?;
+    let sidecar = contract.component("sidecar");
     let mut publish = BTreeSet::new();
     let mut subscribe = BTreeSet::new();
-
-    for name in std::iter::once(role).chain(tags.iter().map(String::as_str)) {
-        let Some(table) = roles.get(name) else {
-            continue;
-        };
-        // Publishing is narrowed to this instance; subscribing is not,
-        // because hearing every instance of another role is what a dashboard
-        // is for.
-        for topic in listed(table, "publish") {
-            publish.insert(subject(&scoped(&topic, instance_id, role)));
-        }
-        for topic in listed(table, "subscribe") {
-            subscribe.insert(subject(&topic));
-        }
+    for topic in granted.publish.iter().chain(&sidecar.publish) {
+        publish.insert(subject(&scoped(topic, instance_id, roles)));
     }
-
-    (
+    for topic in granted.subscribe.iter().chain(&sidecar.subscribe) {
+        subscribe.insert(subject(topic));
+    }
+    Ok((
         publish.into_iter().collect(),
         subscribe.into_iter().collect(),
-    )
-}
-
-/// The registry's own publisher and subscriber columns, for one set of
-/// components.
-pub fn from_manifest(manifest: &str, components: &[&str]) -> (Vec<String>, Vec<String>) {
-    let mut publish = BTreeSet::new();
-    let mut subscribe = BTreeSet::new();
-
-    for line in manifest.lines() {
-        if line.starts_with('#') || line.starts_with("topic\t") || line.trim().is_empty() {
-            continue;
-        }
-        let columns: Vec<&str> = line.split('\t').collect();
-        let [topic, _kind, publisher, subscriber] = columns[..] else {
-            continue;
-        };
-        let named = |column: &str| {
-            column
-                .split(',')
-                .map(str::trim)
-                .any(|name| components.contains(&name))
-        };
-        if named(publisher) {
-            publish.insert(subject(topic));
-        }
-        if named(subscriber) {
-            subscribe.insert(subject(topic));
-        }
-    }
-
-    (
-        publish.into_iter().collect(),
-        subscribe.into_iter().collect(),
-    )
+    ))
 }
 
 fn variable(user: &str) -> String {
@@ -182,14 +169,15 @@ fn variable(user: &str) -> String {
 
 /// Every user this deployment's broker admits, in the order they are written.
 ///
-/// Refuses an instance launched as a role the grant table does not define: an
-/// instance with no grants has no bus, and saying so here is better than a
-/// connector that connects and is refused every topic.
-pub fn users(manifest: &str, grants: &Value, instances: &[Instance]) -> Result<Vec<User>, String> {
+/// Refuses an instance launched with a name that is not a role, or as a name
+/// that is not one of the deployment's components: said here, where the
+/// broker is configured, rather than as a connector that connects and is
+/// refused every topic.
+pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, String> {
     let mut users = Vec::new();
 
     for component in OWN_CREDENTIAL {
-        let (mut publish, mut subscribe) = from_manifest(manifest, &[component]);
+        let (mut publish, mut subscribe) = component_subjects(contract, &[component]);
         if publish.is_empty() && subscribe.is_empty() {
             continue;
         }
@@ -207,7 +195,7 @@ pub fn users(manifest: &str, grants: &Value, instances: &[Instance]) -> Result<V
         });
     }
 
-    let (mut publish, mut subscribe) = from_manifest(manifest, &RUNTIME_COMPONENTS);
+    let (mut publish, mut subscribe) = component_subjects(contract, &RUNTIME_COMPONENTS);
     publish.push(INBOX.to_string());
     subscribe.push(INBOX.to_string());
     users.push(User {
@@ -215,46 +203,51 @@ pub fn users(manifest: &str, grants: &Value, instances: &[Instance]) -> Result<V
         password_env: variable("runtime"),
         publish,
         subscribe,
-        note: "The runtime's components, from the registry's own columns.".to_string(),
+        note: "The runtime's components, from the contract's own columns.".to_string(),
     });
 
-    let roles = grants.get("roles").cloned().unwrap_or(Value::Null);
     for instance in instances {
-        let known = |name: &str| roles.get(name).is_some();
-        if !instance.role.is_empty()
-            && !known(&instance.role)
-            && !instance.tags.iter().any(|tag| known(tag))
-        {
-            return Err(format!(
-                "{} is launched as `{}`, which the grant table does not define. \
-                 An instance with no grants has no bus.",
-                instance.instance_id, instance.role
-            ));
-        }
-
-        let (mut publish, mut subscribe) = permissions_for(
-            grants,
-            &instance.role,
-            &instance.tags,
-            &instance.instance_id,
-        );
+        let (mut publish, mut subscribe, note) = match instance {
+            Instance::Plugin { instance_id, roles } => {
+                let (publish, subscribe) = permissions_for(contract, roles, instance_id)
+                    .map_err(|refusal| format!("{instance_id} is launched with {refusal}"))?;
+                let held = if roles.is_empty() {
+                    "no role, so no topics but its sidecar's own".to_string()
+                } else {
+                    roles.join(", ")
+                };
+                (
+                    publish,
+                    subscribe,
+                    format!("{instance_id}, launched as {held}"),
+                )
+            }
+            Instance::Component {
+                instance_id,
+                component,
+            } => {
+                if !contract.is_component(component) {
+                    return Err(format!(
+                        "{instance_id} is configured as the component `{component}`, which the \
+                         contract does not have"
+                    ));
+                }
+                let (publish, subscribe) = component_subjects(contract, &[component]);
+                (
+                    publish,
+                    subscribe,
+                    format!("{instance_id}, the {component} component, with its own credential"),
+                )
+            }
+        };
         publish.push(INBOX.to_string());
         subscribe.push(INBOX.to_string());
-
-        let tags = if instance.tags.is_empty() {
-            String::new()
-        } else {
-            format!(" with {}", instance.tags.join(", "))
-        };
         users.push(User {
-            user: instance.instance_id.clone(),
-            password_env: variable(&instance.instance_id),
+            user: instance.id().to_string(),
+            password_env: variable(instance.id()),
             publish,
             subscribe,
-            note: format!(
-                "{}, launched as {}{tags}",
-                instance.instance_id, instance.role
-            ),
+            note,
         });
     }
 

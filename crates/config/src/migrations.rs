@@ -20,11 +20,18 @@ pub struct Migration {
 
 /// In order, and never reordered or edited after release: the record of what
 /// ran names a version, and editing one makes that record a lie.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "config",
-    sql: include_str!("../migrations/0001_config.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "config",
+        sql: include_str!("../migrations/0001_config.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "plugin_roles",
+        sql: include_str!("../migrations/0002_plugin_roles.sql"),
+    },
+];
 
 pub const HISTORY: &str = "\
 CREATE TABLE IF NOT EXISTS config_schema_migration (

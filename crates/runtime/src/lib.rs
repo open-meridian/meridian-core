@@ -4,7 +4,7 @@
 //! Decision 010 gave them a bus that crosses a process boundary, and
 //! `design/split-the-runtime-into-services` ruled that they are separate
 //! processes upgraded on their own schedules. This is what they share: the
-//! bus they connect to, the key they present, the grant table, and the
+//! bus they connect to, the key they present, and the
 //! environment they read.
 //!
 //! Each binary is in `src/bin`, and each is small enough to read in one
@@ -19,7 +19,6 @@ use std::time::Duration;
 use meridian_bus::{Backend, Bus, MemoryBackend, NatsBackend};
 use meridian_conductor::platform::ComponentReport;
 use meridian_conductor::{DeploymentKey, Platform};
-use meridian_sidecar::GrantTable;
 
 /// How long a component waits on the platform before giving up on one attempt.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,10 +46,6 @@ pub const REPORT_INWARD_EVERY: Duration = Duration::from_secs(20);
 /// others yet, and at-most-once delivery means what they said before this
 /// process subscribed is gone. Long enough that they have said it again.
 pub const REPORT_AGAIN_AFTER: Duration = Duration::from_secs(45);
-
-/// Where the grant table is mounted. A file rather than a setting, because it
-/// decides access and a deployment should be able to read what it granted.
-pub const GRANTS_PATH: &str = "/etc/meridian/grants.json";
 
 /// The bus this component talks on.
 ///
@@ -236,49 +231,22 @@ pub fn now_ns() -> i64 {
         .unwrap_or_default()
 }
 
-/// Tags from one comma-separated value, blanks dropped.
+/// Names from one comma-separated value, blanks dropped: a sidecar's roles,
+/// or its tags.
 ///
-/// Empty and unset are the same thing here: a sidecar with no tags, which is
-/// the ordinary case. v1 read this from the environment too, and a null value
+/// Empty and unset are the same thing here: a sidecar with no tags is the
+/// ordinary case, and one with no roles is a plugin admitted with no topics
+/// (decisions/020). v1 read this from the environment too, and a null value
 /// there meant a plugin that registered and then had every publish denied, so
 /// the sidecar logs what it was launched with rather than leaving an operator
 /// to infer it from refusals.
-pub fn tags_from(raw: Option<String>) -> Vec<String> {
+pub fn names_from(raw: Option<String>) -> Vec<String> {
     raw.unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|tag| !tag.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-/// The grant table, or an empty one.
-///
-/// Absent, nothing is granted and every registration is refused, which is the
-/// right default for a file that decides access: a deployment that forgot to
-/// mount it should admit nobody rather than everybody.
-pub fn grants_at(path: &str) -> Result<GrantTable, String> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => {
-            let table = GrantTable::from_json(&raw)
-                .map_err(|failed| format!("the grants at {path} could not be read: {failed}"))?;
-            tracing::info!(path, roles = table.roles.len(), "loaded grants");
-            Ok(table)
-        }
-        // Absent is a deployment that admits no plugins, which is a state an
-        // operator may well intend. Present and unreadable is a mounted file
-        // with the wrong permissions, and starting anyway would turn a fixable
-        // mistake into a deployment where nothing registers and the logs say
-        // only that nothing was granted.
-        Err(failed) if failed.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                path,
-                "no grant table; every plugin registration will be refused"
-            );
-            Ok(GrantTable::default())
-        }
-        Err(failed) => Err(format!("the grants at {path} could not be read: {failed}")),
-    }
 }
 
 /// The key at this path, generating and writing one if there is none.

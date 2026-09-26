@@ -216,7 +216,7 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT plugin_instance_id, role, tags, last_reported_at_ns
+                "SELECT plugin_instance_id, roles, tags, last_reported_at_ns
                    FROM config_known_plugin ORDER BY plugin_instance_id",
                 &[],
             )
@@ -224,7 +224,7 @@ impl Store for PostgresStore {
         {
             snapshot.plugins.push(KnownPlugin {
                 plugin_instance_id: row.get(0),
-                role: row.get(1),
+                roles: row.get(1),
                 tags: row.get(2),
                 last_reported_at_ns: row.get(3),
             });
@@ -440,14 +440,14 @@ impl Store for PostgresStore {
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()> {
         self.conn()?
             .execute(
-                "INSERT INTO config_known_plugin (plugin_instance_id, role, tags, last_reported_at_ns)
+                "INSERT INTO config_known_plugin (plugin_instance_id, roles, tags, last_reported_at_ns)
                  VALUES ($1, $2, $3, $4)
                  ON CONFLICT (plugin_instance_id) DO UPDATE
-                    SET role = excluded.role, tags = excluded.tags,
+                    SET roles = excluded.roles, tags = excluded.tags,
                         last_reported_at_ns = excluded.last_reported_at_ns",
                 &[
                     &plugin.plugin_instance_id,
-                    &plugin.role,
+                    &plugin.roles,
                     &plugin.tags,
                     &plugin.last_reported_at_ns,
                 ],

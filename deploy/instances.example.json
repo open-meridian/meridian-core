@@ -1,10 +1,9 @@
 {
-  "_note": "Who this deployment runs, and as what. A sidecar is launched with an instance identifier, a role and any tags, per decision 007: a plugin that named its own would be choosing its own privileges. This file is that launch configuration, and it is what turns the grant table's role permissions into one credential per instance. An instance absent here has no credential and therefore no bus.",
+  "_note": "Who this deployment runs, and as what (decisions/020). A plugin's sidecar is launched with an instance identifier and its roles, never chosen by the plugin; what those roles may do is the contract's, compiled into the runtime. A component holding its own credential under an instance name -- the dashboard -- is listed as that component. An instance absent here has no credential and therefore no bus.",
   "instances": [
     {
       "instance_id": "dashboard-1",
-      "role": "admin",
-      "tags": []
+      "component": "dashboard"
     }
   ]
 }

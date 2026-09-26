@@ -17,8 +17,9 @@ RUN apt-get update \
 WORKDIR /w
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-# The runtime's wiring test asserts against the grant table the deployment
-# actually ships, rather than a copy of it that drifts in silence.
+# The contract the sidecar and the broker grant from, compiled in
+# (decisions/020), and what the tests assert against: the one the deployment
+# actually runs, rather than a copy of it that drifts in silence.
 COPY deploy/ deploy/
 
 FROM base AS check

@@ -220,7 +220,7 @@ broker:
   # A broker this deployment already has, holding a credential per component
   # under the keys below. Empty means this chart brings one, makes the
   # credentials once and keeps them, and generates its permissions from the
-  # grant table at start -- which is what leaves an install with no Secret for
+  # contract at start -- which is what leaves an install with no Secret for
   # anybody to write by hand.
   existingSecret: ""
 
@@ -252,7 +252,14 @@ firstRun:
 #
 # sidecars:
 #   - instanceId: <the identifier you launch this plugin as>
-#     role: <the role it is launched with, from your grant table>
+#     # One or more roles from the contract's fixed list (decisions/020): ccm,
+#     # compliance, custody, dgm, ems, match, oms, operations, portfolio,
+#     # reporting, servicing, settlement, signal. What they may do is the
+#     # contract's, compiled into the runtime; none is a plugin admitted with
+#     # no topics. A name that is not a role stops the broker from starting.
+#     roles: []
+#     # Its parts, for people: what access groups grant, at read or write.
+#     # They grant nothing on the bus.
 #     tags: []
 #     # The plugin, as a second container in this sidecar's pod. Optional: a
 #     # sidecar with no plugin runs alone. Adding or removing an entry here is
@@ -300,24 +307,6 @@ sidecar:
   # Changing the host here opens the boundary to anything that can route to the
   # pod. The runtime warns when it is not loopback.
   address: 127.0.0.1:9191
-
-  # Who this sidecar serves. Assigned here, at launch, never declared by the
-  # plugin: a plugin that named its own role would be choosing its own
-  # privileges. Together with the grant table these decide its topic access.
-  #
-  # Left empty, the plugin's registration is refused for having no grants, which
-  # is the right way for an unconfigured deployment to fail.
-  plugin:
-    instanceId: ""
-    role: ""
-    tags: []
-
-grants:
-  # A ConfigMap holding the grant table: which roles this deployment admits and
-  # what each may publish and subscribe to. Absent, nothing registers, which is
-  # the right default for a file that decides access.
-  existingConfigMap: ""
-  key: grants.json
 
 nameOverride: ""
 fullnameOverride: ""

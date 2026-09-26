@@ -9,11 +9,11 @@
   instance (spec/installation-and-first-run, and decisions/010).
 
   So the chart makes the passwords, once, and keeps them; and the broker
-  generates its own permissions at start, from the grant table this deployment
-  was given and the instances it was configured with, using the same binary
-  the repository generates the committed file with. A chart that computed the
-  same thing in templates would be the second policy the generator exists to
-  avoid.
+  generates its own permissions at start, from the instances it was
+  configured with and the contract compiled into the runtime image
+  (decisions/020), using the same binary the repository generates the
+  committed file with. A chart that computed the same thing in templates
+  would be the second policy the generator exists to avoid.
 
   An administrator who runs their own broker names it in broker.existingSecret
   and none of this renders.
@@ -93,8 +93,8 @@ data:
 {{- end }}
 ---
 # Which instances this deployment launched, for the generator to make a
-# credential for. The grant table decides what each may do; this says who
-# exists.
+# credential for. The contract decides what each may do, by its roles; this
+# says who exists. The dashboard is a component, with its own credential.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -107,31 +107,16 @@ data:
       "instances": [
         {{- $entries := list }}
         {{- if .Values.dashboard.enabled }}
-        {{- $entries = append $entries (dict "instance_id" (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) "role" "admin" "tags" list) }}
+        {{- $entries = append $entries (dict "instance_id" (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) "component" "dashboard") }}
         {{- end }}
         {{- range .Values.sidecars }}
-        {{- $entries = append $entries (dict "instance_id" .instanceId "role" .role "tags" (.tags | default list)) }}
+        {{- $entries = append $entries (dict "instance_id" .instanceId "roles" (.roles | default list)) }}
         {{- end }}
         {{- range $i, $entry := $entries }}{{ if $i }},{{ end }}
         {{ toJson $entry }}
         {{- end }}
       ]
     }
----
-# The registry's publisher and subscriber columns, vendored from
-# meridian-design and shipped with this chart, because the generator reads
-# them and a cluster cannot.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ $name }}-topics
-  labels:
-    {{- include "meridian-runtime.labels" . | nindent 4 }}
-data:
-  topics.tsv: |
-{{ .Files.Get "files/topics.tsv" | indent 4 }}
-  grants.core.json: |
-{{ .Files.Get "files/grants.core.json" | indent 4 }}
 ---
 apiVersion: v1
 kind: Service
@@ -173,8 +158,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       initContainers:
-        # The permissions, from the grant table and the registry, by the same
-        # binary this repository generates its committed copy with. Written to
+        # The permissions, from the contract compiled into this image and the
+        # instances above, by the same binary this repository generates its
+        # committed copy with. Written to
         # a volume that lives and dies with the pod: nothing stores a policy
         # that can be recomputed.
         - name: permissions
@@ -182,12 +168,6 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - meridian-broker-config
-            - --topics
-            - /etc/meridian/registry/topics.tsv
-            - --core-grants
-            - /etc/meridian/registry/grants.core.json
-            - --grants
-            - {{ if .Values.grants.existingConfigMap }}/etc/meridian/grants/{{ .Values.grants.key }}{{ else }}/etc/meridian/registry/none.json{{ end }}
             - --instances
             - /etc/meridian/instances/instances.json
             - --out
@@ -200,16 +180,8 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/nats
-            {{- if .Values.grants.existingConfigMap }}
-            - name: grants
-              mountPath: /etc/meridian/grants
-              readOnly: true
-            {{- end }}
             - name: instances
               mountPath: /etc/meridian/instances
-              readOnly: true
-            - name: topics
-              mountPath: /etc/meridian/registry
               readOnly: true
       containers:
         - name: broker
@@ -231,17 +203,9 @@ spec:
       volumes:
         - name: config
           emptyDir: {}
-        {{- if .Values.grants.existingConfigMap }}
-        - name: grants
-          configMap:
-            name: {{ .Values.grants.existingConfigMap }}
-        {{- end }}
         - name: instances
           configMap:
             name: {{ $name }}-instances
-        - name: topics
-          configMap:
-            name: {{ $name }}-topics
 ---
 # Reached by this deployment's own components and by nothing else. A broker a
 # plugin could reach directly is a bus with its enforcement bypassed

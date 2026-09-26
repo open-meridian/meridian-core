@@ -595,7 +595,9 @@ message RestoreOrganisationOwnerRequest {
 // never carry an account.
 message PluginReport {
   string plugin_instance_id = 1;
-  string role = 2;
+  // What it was launched as: a set of roles from the fixed list
+  // (decisions/020), and its tags, which are for people.
+  repeated string roles = 12;
   repeated string tags = 3;
 
   bool registered = 4;
@@ -614,6 +616,10 @@ message PluginReport {
   string last_refusal_reason = 10;
 
   int64 reported_at_ns = 11;
+
+  // A single role, before a plugin could hold several.
+  reserved 2;
+  reserved "role";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

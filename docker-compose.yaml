@@ -44,13 +44,14 @@ services:
       # Development passwords, and obviously so. A deployment's come from a
       # secret, one per identity, mounted into that container alone.
       MERIDIAN_NATS_RUNTIME: runtime-dev-only
-      MERIDIAN_NATS_CUSTODY_1: custody-1-dev-only
-      MERIDIAN_NATS_CUSTODY_2: custody-2-dev-only
+      MERIDIAN_NATS_REFERENCE_1: reference-1-dev-only
+      MERIDIAN_NATS_CUSTODY_TEST_1: custody-test-1-dev-only
+      MERIDIAN_NATS_CUSTODY_TEST_2: custody-test-2-dev-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-dev-only
       MERIDIAN_NATS_FIRST_RUN: first-run-dev-only
       MERIDIAN_NATS_TESTS: tests-dev-only
     volumes:
-      # Generated from the grant table, never edited: the grant table is the
+      # Generated from the contract, never edited: the contract is the
       # policy and this is the broker saying the same thing.
       - ./deploy/nats:/etc/nats:ro
     ports:
@@ -188,17 +189,15 @@ services:
         condition: service_started
     environment:
       MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
-      MERIDIAN_BROKER_URL: nats://custody-1:custody-1-dev-only@nats:4222
-      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-1}
-      MERIDIAN_PLUGIN_ROLE: ${MERIDIAN_PLUGIN_ROLE:-custody}
+      # A test instance holding custody, whose topics W2 names: the SDK's
+      # interop suite records a statement through it. What custody may do is
+      # the contract's, compiled into the image (decisions/020).
+      MERIDIAN_BROKER_URL: nats://custody-test-1:custody-test-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-test-1}
+      MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_PLUGIN_ROLES:-custody}
       MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
-      MERIDIAN_INSTANCE_ID: sidecar-custody-1
+      MERIDIAN_INSTANCE_ID: sidecar-custody-test-1
       RUST_LOG: ${RUST_LOG:-info}
-    volumes:
-      # The harness's own grants: the role it launches a plugin as belongs to
-      # that plugin, not to core, and core ships only the roles it launches
-      # itself.
-      - ./deploy/nats/dev-grants.json:/etc/meridian/grants.json:ro
     networks: [meridian]
 
   # The Python SDK against a sidecar, which is the only check that the two
@@ -243,10 +242,13 @@ services:
       MERIDIAN_TEST_BROKER_URL_RUNTIME: nats://runtime:runtime-dev-only@nats:4222
       # A plugin's sidecar, with only what the custody role may do. The tests
       # that matter most use this one and expect to be refused.
-      MERIDIAN_TEST_BROKER_URL_CUSTODY: nats://custody-1:custody-1-dev-only@nats:4222
+      MERIDIAN_TEST_BROKER_URL_CUSTODY: nats://custody-test-1:custody-test-1-dev-only@nats:4222
       # A second instance of the same role, which is what per-instance
       # credentials are for: the two may not speak as each other.
-      MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO: nats://custody-2:custody-2-dev-only@nats:4222
+      MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO: nats://custody-test-2:custody-test-2-dev-only@nats:4222
+      # The reference plugin's, holding no role: its sidecar's own traffic
+      # and nothing else.
+      MERIDIAN_TEST_BROKER_URL_REFERENCE: nats://reference-1:reference-1-dev-only@nats:4222
       MERIDIAN_TEST_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
       MERIDIAN_TEST_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
       # Read-only, and the same key the runtime generated. The end-to-end test

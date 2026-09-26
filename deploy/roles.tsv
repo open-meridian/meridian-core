@@ -1,0 +1,26 @@
+# Generated from meridian-design's matrix/roles.tsv. Do not edit.
+#
+# Which names are roles a plugin may hold and which are the deployment's own
+# components (decisions/020). A role's grants are the rows in topics.tsv that
+# name it. Regenerate from meridian-design with `make component-topics`.
+name	kind
+ccm	role
+compliance	role
+conductor	component
+custody	role
+dashboard	component
+dgm	role
+ems	role
+first-run	component
+instrument	component
+launcher	component
+match	role
+oms	role
+operations	role
+portfolio	role
+reporting	role
+servicing	role
+settlement	role
+sidecar	component
+signal	role
+street	component

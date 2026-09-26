@@ -318,7 +318,7 @@ async fn a_local_handler_answers_without_the_broker() {
     assert_eq!(payload_type, "local");
 }
 
-// ── The broker enforces the grant table ─────────────────────────────────────
+// ── The broker enforces the contract's grants ───────────────────────────────
 //
 // The sidecar resolves grants locally so a plugin fails at startup. These are
 // about the second check, which is what holds when a sidecar is not ours:
@@ -328,7 +328,7 @@ async fn a_local_handler_answers_without_the_broker() {
 /// Did this exact message arrive, within a window?
 ///
 /// By identity rather than by silence, because these tests share real topic
-/// names — permissions are written against the topics the grant table names,
+/// names — permissions are written against the topics the contract names,
 /// so they cannot be randomised — and they run concurrently. A subscriber
 /// asserting that nothing at all arrives will eventually see a message another
 /// test legitimately published, and fail for a reason that has nothing to do
@@ -402,15 +402,17 @@ async fn the_broker_refuses_a_topic_the_role_does_not_hold() {
 
 #[tokio::test]
 async fn the_broker_refuses_a_subscription_the_role_does_not_hold() {
-    // custody subscribes to instrument-applied and nothing else. A sidecar
-    // that asked for more would be told nothing, rather than quietly receiving
-    // another plugin's traffic.
+    // The contract gives custody no subscription of its own; its credential
+    // hears only what every sidecar hears, such as being told its
+    // configuration changed (decisions/020). A sidecar that asked for more
+    // would be told nothing, rather than quietly receiving another plugin's
+    // traffic.
     let custody = as_custody().await;
     let publisher = backend().await;
 
     let forbidden = "platform.street.event.custodial-position-updated";
     let mut refused = custody.subscribe(forbidden);
-    let granted = "platform.reference.event.instrument-applied";
+    let granted = "platform.config.event.plugin-configuration-changed";
     let mut allowed = custody.subscribe(granted);
     settle().await;
 
@@ -426,6 +428,38 @@ async fn the_broker_refuses_a_subscription_the_role_does_not_hold() {
     assert!(
         !arrived(&mut refused, &withheld).await,
         "the broker delivered on a subscription the role's grants do not allow"
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_holding_no_role_speaks_only_its_sidecars_own_traffic() {
+    // The reference plugin: admitted, with no topics but the ones every
+    // sidecar has for itself (decisions/020).
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL_REFERENCE")
+        .expect("MERIDIAN_TEST_BROKER_URL_REFERENCE is not set; run `make test-broker`.");
+    let reference = NatsBackend::connect(&url)
+        .await
+        .expect("could not reach the test broker as the reference plugin");
+    let listening = backend().await;
+
+    let its_sidecars = "platform.deployment.event.plugin-report";
+    let a_roles = "platform.street.command.record-holding";
+    let mut allowed = listening.subscribe(its_sidecars);
+    let mut refused = listening.subscribe(a_roles);
+    settle().await;
+
+    let report = mark("reference-report");
+    let holding = mark("reference-holding");
+    reference.publish(its_sidecars, envelope(&report)).unwrap();
+    reference.publish(a_roles, envelope(&holding)).unwrap();
+
+    assert!(
+        arrived(&mut allowed, &report).await,
+        "a sidecar with no role was refused its own report"
+    );
+    assert!(
+        !arrived(&mut refused, &holding).await,
+        "a plugin holding no role published a role's topic"
     );
 }
 
@@ -450,7 +484,7 @@ async fn a_caller_with_no_credential_is_refused_the_broker_entirely() {
 // ── One credential per instance ─────────────────────────────────────────────
 //
 // A role-wide credential carries the right to speak as every instance of that
-// role, because the grant table writes the instance segment as a wildcard. The
+// role, because the contract writes the instance segment as a wildcard. The
 // launch identity decision — a plugin is told who it is and never says so —
 // means nothing at the broker unless the credential says it too.
 
@@ -467,7 +501,7 @@ async fn an_instance_may_publish_under_its_own_identifier() {
     let custody = as_custody().await;
     let listening = backend().await;
 
-    let own = "platform.custody.custody-1.event.sync-status";
+    let own = "platform.custody.custody-test-1.event.sync-status";
     let mut subscription = listening.subscribe(own);
     settle().await;
 
@@ -487,7 +521,7 @@ async fn an_instance_cannot_publish_as_another_instance_of_its_role() {
     let custody_one = as_custody().await;
     let listening = backend().await;
 
-    let somebody_else = "platform.custody.custody-2.event.sync-status";
+    let somebody_else = "platform.custody.custody-test-2.event.sync-status";
     let mut subscription = listening.subscribe(somebody_else);
     settle().await;
 

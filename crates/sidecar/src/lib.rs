@@ -17,7 +17,7 @@ pub mod grants;
 mod service;
 
 pub use contract::{admit_within, CONTRACT_CURRENT, CONTRACT_FLOOR};
-pub use grants::{GrantTable, Grants};
+pub use grants::{Contract, Grants};
 pub use service::{Identity, Registration, Sidecar};
 
 /// The address a plugin expects its sidecar on.

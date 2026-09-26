@@ -6,7 +6,7 @@
 //! compiled, passed 55 tests, and was reachable from nothing.
 //!
 //! So what is under test is the assembly, and it is driven the way a plugin
-//! drives it — through the sidecar's gRPC surface, against the grant table the
+//! drives it — through the sidecar's gRPC surface, against the contract the
 //! deployment actually ships. Calling the bus directly would prove the handlers
 //! registered and skip the half that decides whether a connector gets in.
 
@@ -20,30 +20,9 @@ use meridian_domain::v1::{
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{CallRequest, RegisterRequest};
-use meridian_sidecar::{GrantTable, Identity, Sidecar};
+use meridian_sidecar::{Contract, Identity, Sidecar};
 use prost::Message;
 use tonic::Request;
-
-/// What core ships: the roles it launches itself, which is one.
-const CORE_GRANTS: &str = include_str!("../../../deploy/grants.example.json");
-
-/// What this harness launches a plugin as. A plugin's role is that plugin's
-/// vocabulary, and a fresh install has no plugin, so the two are separate
-/// files and a deployment's table is the first merged with the second.
-const PLUGIN_GRANTS: &str = include_str!("../../../deploy/nats/dev-grants.json");
-
-/// A deployment that has installed this harness's plugin, which is what a
-/// grant table looks like once there is something to grant.
-fn grants() -> String {
-    let core: serde_json::Value = serde_json::from_str(CORE_GRANTS).expect("core's grants parse");
-    let plugin: serde_json::Value =
-        serde_json::from_str(PLUGIN_GRANTS).expect("the plugin's grants parse");
-    let mut roles = core["roles"].as_object().cloned().unwrap_or_default();
-    for (name, table) in plugin["roles"].as_object().cloned().unwrap_or_default() {
-        roles.insert(name, table);
-    }
-    serde_json::json!({ "roles": roles }).to_string()
-}
 
 const NOW: i64 = 1_757_376_000_000_000_000;
 
@@ -62,12 +41,12 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
         Arc::new(meridian_instrument::MemoryStore::new()),
     );
 
+    // Its grants are the contract's, compiled in: no table to load.
     let sidecar = Sidecar::new(
         bus.clone(),
         "DEP-test",
-        Identity::new("custody-snaptrade-1", "custody"),
+        Identity::new("custody-snaptrade-1", vec!["custody".to_string()]),
     );
-    sidecar.load_grants(GrantTable::from_json(&grants()).expect("the shipped grants parse"));
 
     (bus, sidecar)
 }
@@ -86,10 +65,10 @@ async fn admitted(sidecar: &Sidecar, expected_role: &str) {
         .into_inner();
     assert!(
         reply.admitted,
-        "the shipped grants refuse the {expected_role} role: {}",
+        "the contract refuses the {expected_role} role: {}",
         reply.refusal_reason
     );
-    assert_eq!(reply.role, expected_role);
+    assert_eq!(reply.roles, vec![expected_role.to_string()]);
 }
 
 /// Call a topic the way a plugin does, and fail loudly rather than decoding
@@ -174,41 +153,40 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     .await;
     assert!(recorded.resolved);
 
-    // A different plugin, a different role, reading what the first one wrote.
-    // One store behind one bus, rather than two of each.
-    //
-    // It needs a second Sidecar because one holds a single registration, so a
-    // shared endpoint admits one plugin. That is the deployment shape today and
-    // not the one that is wanted; sdk-contract/sidecar-needs-a-bus-across-a-process-boundary is
-    // where it changes, and this line is what should stop being necessary.
-    let dashboard = Sidecar::new(bus, "DEP-test", Identity::new("dashboard-1", "admin"));
-    dashboard.load_grants(GrantTable::from_json(&grants()).unwrap());
-    admitted(&dashboard, "admin").await;
-
-    let listed: ListCustodialPositionsReply = call(
-        &dashboard,
-        meridian_street::service::LIST_CUSTODIAL_POSITIONS,
-        "meridian.v1.ListCustodialPositionsRequest",
-        ListCustodialPositionsRequest {
-            account_id: "ACC-1".into(),
-            include_unresolved: true,
-            page_size: 100,
-            cursor: String::new(),
-        },
-    )
-    .await;
+    // The dashboard reading what the connector wrote. One store behind one
+    // bus, rather than two of each. The dashboard is a component and asks
+    // the bus itself, as it does in a deployment (decisions/020).
+    let (_, reply) = bus
+        .call(
+            meridian_street::service::LIST_CUSTODIAL_POSITIONS,
+            "meridian.v1.ListCustodialPositionsRequest",
+            ListCustodialPositionsRequest {
+                account_id: "ACC-1".into(),
+                include_unresolved: true,
+                page_size: 100,
+                cursor: String::new(),
+            }
+            .encode_to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("the street store answers");
+    let listed = ListCustodialPositionsReply::decode(&reply[..]).expect("the reply decodes");
 
     assert_eq!(listed.positions.len(), 1);
     assert_eq!(listed.positions[0].quantity_scaled_1e8, 1_250_000_000);
 }
 
-/// The grant table is configuration, so a typo in it is a deployment where a
-/// plugin is admitted and then refused on its first useful call.
+/// The contract is what grants, so a revision of it that took away what a
+/// role's work needs is a plugin admitted and then refused on its first useful
+/// call. Held here against the contract this runtime was built with.
 #[test]
-fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
-    let table = GrantTable::from_json(&grants()).expect("the shipped grants parse");
+fn the_contract_admits_each_role_to_exactly_its_own_work() {
+    let contract = Contract::embedded();
+    let roles = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
 
-    let custody = table.resolve("custody", &[]);
+    let custody = contract.grants_for(&roles(&["custody"])).unwrap();
     assert!(custody.may_publish(meridian_street::service::RECORD_STATEMENT));
     assert!(custody.may_publish(meridian_street::service::RECORD_HOLDING));
     assert!(custody.may_publish("platform.custody.custody-snaptrade-1.event.sync-status"));
@@ -216,28 +194,22 @@ fn the_shipped_grants_admit_each_role_to_exactly_its_own_work() {
     // moved. That is the street store's to say.
     assert!(!custody.may_publish(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 
-    let dashboard = table.resolve("admin", &[]);
+    // The dashboard is a component, and reads; nothing it does writes to the
+    // street store.
+    let dashboard = contract.component("dashboard");
     assert!(dashboard.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
     assert!(dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
-    // Read-only means read-only: nothing a dashboard does writes to the street store.
     assert!(!dashboard.may_publish(meridian_street::service::RECORD_HOLDING));
 
-    // A plugin carries a role and any number of tags, and gets the union. A
-    // connector that also reads positions asks for the tag rather than having a
-    // bespoke role minted for the combination.
-    let both = table.resolve("custody", &["reporting".to_string()]);
-    assert!(both.may_publish(meridian_street::service::RECORD_HOLDING));
-    assert!(both.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
-    assert!(both.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
+    // Several roles hold the union; a role the contract gives nothing holds
+    // nothing, and adds nothing to another.
+    let with_oms = contract.grants_for(&roles(&["custody", "oms"])).unwrap();
+    assert_eq!(with_oms, custody);
 
-    // A tag adds and never subtracts, so the role alone is the smaller set.
-    assert!(!custody.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
-
-    // Denial is by absence, so an unknown role gets nothing rather than
-    // everything.
-    let stranger = table.resolve("not-a-role", &[]);
-    assert!(!stranger.may_publish(meridian_street::service::RECORD_HOLDING));
-    assert!(!stranger.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
+    // Denial is by refusal for a name that is not a role, never by granting it
+    // nothing and letting it register.
+    assert!(contract.grants_for(&roles(&["not-a-role"])).is_err());
+    assert!(contract.grants_for(&roles(&["street"])).is_err());
 }
 
 // ── W5.20: components say what they run, inward ─────────────────────────────
