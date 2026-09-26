@@ -199,14 +199,20 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     {
         body.push_str("<p>Nobody administers this deployment yet. <a href=\"/claim\">Claim it</a> with a code from open-meridian.com.</p>");
     }
-    if access.plugins.is_empty() {
+    // A deployment admin opens any plugin's page (ruling 19), so their list
+    // is every plugin launched as well as those they hold access on.
+    let mut listed: std::collections::BTreeSet<String> = access.plugins.keys().cloned().collect();
+    if access.deployment_admin && app.plugins.is_some() {
+        listed.extend(crate::catalogue::launched(&app).await);
+    }
+    if listed.is_empty() {
         body.push_str("<p>You hold no access to any plugin.</p>");
     } else {
         body.push_str("<h2>Plugins</h2><ul>");
-        for plugin in access.plugins.keys() {
+        for plugin in &listed {
             // Linked when it can be opened: access to no account yet is
             // listed, and would be refused at the door.
-            let openable = !access.on_plugin(plugin).is_empty();
+            let openable = crate::plugins::opening(&access, plugin).is_some();
             if app.plugins.is_some() && openable && crate::plugins::is_instance(plugin) {
                 body.push_str(&format!(
                     "<li><a href=\"/plugins/{0}\">{0}</a></li>",

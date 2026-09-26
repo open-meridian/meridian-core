@@ -33,7 +33,7 @@ use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use meridian_pb::v1::CallerClaims;
+use meridian_pb::v1::{CallerClaims, TagAccess};
 use prost::Message;
 
 use crate::clock::SECOND_NS;
@@ -331,9 +331,8 @@ pub(crate) async fn open(
         );
     }
     let access =
-        meridian_access::person_access(&records, &session.subject, &session.directory_groups)
-            .on_plugin(&instance);
-    if access.is_empty() {
+        meridian_access::person_access(&records, &session.subject, &session.directory_groups);
+    if opening(&access, &instance).is_none() {
         return said(
             StatusCode::FORBIDDEN,
             "No access",
@@ -352,6 +351,16 @@ pub(crate) async fn open(
         "{}{ENTER_PATH}?code={code}",
         plugins.origin(&instance)
     ))
+}
+
+/// What a person carries onto a plugin's page, if they may open it: their
+/// access on it; or, for a deployment admin, who opens any plugin's page,
+/// whatever they hold there, which may be nothing. Opening is not access, so
+/// an admin is asserted with nothing they do not hold
+/// (spec/deployment-dashboard-and-access, ruling 19).
+pub(crate) fn opening(access: &meridian_access::Access, instance: &str) -> Option<Vec<TagAccess>> {
+    let held = access.on_plugin(instance);
+    (access.deployment_admin || !held.is_empty()).then_some(held)
 }
 
 /// Every request, before the dashboard's routes: one for a plugin's host is
@@ -409,15 +418,14 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
     // Evaluated now, from the records as they are now: access withdrawn a
     // moment ago is withdrawn here.
     let access =
-        meridian_access::person_access(&records, &session.subject, &session.directory_groups)
-            .on_plugin(instance);
-    if access.is_empty() {
+        meridian_access::person_access(&records, &session.subject, &session.directory_groups);
+    let Some(access) = opening(&access, instance) else {
         return said(
             StatusCode::FORBIDDEN,
             "No access",
             &format!("You hold no access on {instance}."),
         );
-    }
+    };
     let claims = CallerClaims {
         subject: session.subject.clone(),
         display_name: session.display_name.clone(),

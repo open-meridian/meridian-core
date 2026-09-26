@@ -302,6 +302,28 @@ async fn has_manifest(registry: &Registry, name: &str, digest: &str) -> Result<b
 // ── The catalogue ───────────────────────────────────────────────────────────
 
 async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
+    catalogue_within(app, Duration::from_secs(10)).await
+}
+
+/// The instances launched and not stopped, for a deployment admin's home:
+/// none, said in the log, when the catalogue cannot be read in time, since
+/// a home page that waits on the conductor is a home page that hangs.
+pub(crate) async fn launched(app: &App) -> Vec<String> {
+    match catalogue_within(app, Duration::from_secs(3)).await {
+        Ok(held) => held
+            .launches
+            .into_iter()
+            .filter(|launch| launch.state == PluginLaunchState::Launched as i32)
+            .map(|launch| launch.instance_id)
+            .collect(),
+        Err(failed) => {
+            tracing::warn!("the launched plugins could not be read for home: {failed}");
+            Vec::new()
+        }
+    }
+}
+
+async fn catalogue_within(app: &App, within: Duration) -> Result<PluginCatalogue, String> {
     let (_, bytes) = app
         .bus
         .call(
@@ -309,7 +331,7 @@ async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
             "meridian.v1.PluginCatalogueRequest",
             PluginCatalogueRequest {}.encode_to_vec(),
             None,
-            Some(Duration::from_secs(10)),
+            Some(within),
         )
         .await
         .map_err(|failed| failed.to_string())?;

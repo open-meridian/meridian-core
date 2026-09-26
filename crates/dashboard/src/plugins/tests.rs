@@ -666,3 +666,138 @@ async fn a_request_leaves_the_dashboard_carrying_the_assertion_and_nothing_it_ar
     assert_ne!(headers[HOST], PLUGIN_HOST);
     assert_eq!(headers["x-requested-with"], "the-page");
 }
+
+/// Ada as a deployment admin, holding no access entry on any plugin.
+fn admin_records() -> AccessRecords {
+    let mut held = records(&[]);
+    held.permissions.push(Permission {
+        permission_id: "P-admin".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: String::new(),
+        access_group_id: meridian_access::DEPLOYMENT_ADMIN.into(),
+    });
+    held
+}
+
+fn claims_reaching(h: &Harness) -> CallerClaims {
+    let reached = h.reached.lock().unwrap();
+    let (headers, _) = reached.last().expect("a request reached the plugin");
+    let assertion = CallerAssertion::decode(
+        URL_SAFE_NO_PAD
+            .decode(headers[CALLER].to_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    CallerClaims::decode(assertion.claims.as_slice()).unwrap()
+}
+
+#[tokio::test]
+async fn a_deployment_admin_opens_any_plugin_asserted_with_only_what_they_hold() {
+    // Ruling 19: a plugin with nothing to grant is still opened by the
+    // people who administer the deployment, and opening is not access.
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let plugin_session = entered(&h).await;
+    let answer = get(
+        &h.app,
+        PLUGIN_HOST,
+        "/",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    let claims = claims_reaching(&h);
+    assert_eq!(claims.subject, ADA);
+    assert!(claims.access.is_empty(), "{:?}", claims.access);
+}
+
+#[tokio::test]
+async fn an_admin_asserted_with_what_they_hold_where_they_hold_something() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    h.app.records.store(held, h.app.clock.now_ns());
+    let plugin_session = entered(&h).await;
+    get(
+        &h.app,
+        PLUGIN_HOST,
+        "/",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    let claims = claims_reaching(&h);
+    assert_eq!(claims.access.len(), 1);
+    assert_eq!(claims.access[0].read_account_ids, vec!["ACC-1".to_string()]);
+    assert!(claims.access[0].write_account_ids.is_empty());
+}
+
+#[tokio::test]
+async fn an_admin_who_stops_being_one_is_refused_on_the_next_request() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let plugin_session = entered(&h).await;
+    h.app.records.store(records(&[]), h.app.clock.now_ns());
+    let answer = get(
+        &h.app,
+        PLUGIN_HOST,
+        "/",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN);
+    assert!(h.reached.lock().unwrap().is_empty());
+}
+
+/// A conductor whose catalogue has snaptrade-1 launched and stopped-1 not.
+fn serving_launched(h: &Harness) {
+    h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        let launch = |instance: &str, state: meridian_domain::v1::PluginLaunchState| {
+            meridian_domain::v1::PluginLaunch {
+                instance_id: instance.into(),
+                name: "snaptrade".into(),
+                version: "0.1.0".into(),
+                state: state as i32,
+                ..Default::default()
+            }
+        };
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: vec![],
+                launches: vec![
+                    launch(INSTANCE, meridian_domain::v1::PluginLaunchState::Launched),
+                    launch("stopped-1", meridian_domain::v1::PluginLaunchState::Stopped),
+                ],
+            }
+            .encode_to_vec(),
+        ))
+    });
+}
+
+#[tokio::test]
+async fn an_admins_home_links_every_plugin_launched() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    serving_launched(&h);
+    let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
+    assert!(
+        home.body
+            .contains("<a href=\"/plugins/snaptrade-1\">snaptrade-1</a>"),
+        "{}",
+        home.body
+    );
+    assert!(!home.body.contains("stopped-1"), "{}", home.body);
+}
+
+#[tokio::test]
+async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
+    let h = harness(&[]).await;
+    serving_launched(&h);
+    let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
+    assert!(
+        home.body.contains("You hold no access to any plugin."),
+        "{}",
+        home.body
+    );
+}
