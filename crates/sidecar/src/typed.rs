@@ -19,6 +19,7 @@ use std::sync::Arc;
 use meridian_bus::BusError;
 use meridian_domain::v1::{PluginConfiguration, PluginConfigurationRequest};
 use meridian_pb::plugin::v1 as plugin;
+use meridian_pb::v1::CallerAssertion;
 use prost::Message;
 use tokio::sync::Mutex;
 use tonic::{Response, Status};
@@ -120,6 +121,84 @@ impl Sidecar {
             })
     }
 
+    /// A command: checked against the grant, against the plugin's write scope
+    /// for the account it names, and -- when it is sent for a person (W4.9) --
+    /// against what the dashboard vouched that person may write; then asked,
+    /// with the person stamped on the envelope.
+    pub(crate) async fn command_typed<D: Message, R: Message + Default>(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        message: D,
+        account: Option<String>,
+        acting_for: Option<CallerAssertion>,
+    ) -> Result<Response<R>, Status> {
+        let topic = self.own_topic(topic);
+        self.granted(&topic)?;
+        let now = now_ns();
+        if let Some(account) = &account {
+            if !self.write_scope(now).await?.contains(account) {
+                let refusal = format!(
+                    "account {account} is outside this plugin's write scope: nobody may write \
+                     it through this plugin"
+                );
+                self.note_refusal(&refusal);
+                return Err(Status::permission_denied(refusal));
+            }
+        }
+        let subject = match acting_for {
+            None => String::new(),
+            Some(assertion) => self.vouched_writer(&assertion, account.as_deref(), now)?,
+        };
+        let (_, payload) = self
+            .bus
+            .call_for(
+                &topic,
+                payload_type,
+                message.encode_to_vec(),
+                None,
+                None,
+                &subject,
+            )
+            .await
+            .map_err(refused)?;
+        R::decode(payload.as_slice())
+            .map(Response::new)
+            .map_err(|failed| {
+                Status::internal(format!("the reply did not read as its mirror: {failed}"))
+            })
+    }
+
+    /// The person an assertion vouches for, if they may write `account`
+    /// through this plugin -- or, for a command naming none, anything at all
+    /// through it. Their access is what the dashboard signed, under a minute
+    /// ago; a person narrows what a plugin may do and never widens it.
+    fn vouched_writer(
+        &self,
+        assertion: &CallerAssertion,
+        account: Option<&str>,
+        now_ns: i64,
+    ) -> Result<String, Status> {
+        let verifier = self.verifier.as_ref().ok_or_else(|| {
+            Status::unauthenticated(
+                "this sidecar holds none of the dashboard's keys, so it can vouch for nobody",
+            )
+        })?;
+        let claims = verifier
+            .vouched(assertion, now_ns)
+            .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        let may_write = crate::scope::writes(&claims.access);
+        match account {
+            Some(account) if !may_write.contains(account) => Err(Status::permission_denied(
+                format!("the person may not write account {account} through this plugin"),
+            )),
+            None if may_write.is_empty() => Err(Status::permission_denied(
+                "the person may write nothing through this plugin",
+            )),
+            _ => Ok(claims.subject),
+        }
+    }
+
     /// The account an external account is linked to (W6.4), or the refusal
     /// that names what to do: a row for an unlinked account is refused, not
     /// guessed at, and recorded once somebody links it.
@@ -194,6 +273,13 @@ impl Sidecar {
             }
         });
     }
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn refused(failed: BusError) -> Status {

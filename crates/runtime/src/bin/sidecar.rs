@@ -63,6 +63,16 @@ fn run() -> Result<(), String> {
         );
     }
 
+    // The dashboard's public keys, one file per key id, read when an id is
+    // first met. The front door verifies each page request with them, and a
+    // command sent for a person (W4.9) is verified with the same ones.
+    let verifier = Some(identity.instance_id.clone())
+        .filter(|id| !id.is_empty())
+        .map(|instance| {
+            let keys = var("MERIDIAN_DASHBOARD_KEYS_DIR").unwrap_or_else(|| DASHBOARD_KEYS.into());
+            Arc::new(Verifier::new(instance, keys))
+        });
+
     // The front door (decisions/014, 021): where the dashboard sends a
     // person's requests for this plugin's page. Off loopback by necessity,
     // since the dashboard is another pod, and closed to everything else by the
@@ -70,18 +80,17 @@ fn run() -> Result<(), String> {
     let front = match var("MERIDIAN_FRONT_DOOR_ADDRESS") {
         None => None,
         Some(address) => {
-            if identity.instance_id.is_empty() {
+            let Some(verifier) = verifier.clone() else {
                 return Err(
                     "a front door needs MERIDIAN_PLUGIN_INSTANCE_ID: it admits only \
                      assertions for this instance"
                         .into(),
                 );
-            }
+            };
             let at: std::net::SocketAddr = address
                 .parse()
                 .map_err(|failed| format!("{address} is not an address: {failed}"))?;
-            let keys = var("MERIDIAN_DASHBOARD_KEYS_DIR").unwrap_or_else(|| DASHBOARD_KEYS.into());
-            Some((at, Verifier::new(identity.instance_id.clone(), keys)))
+            Some((at, verifier))
         }
     };
 
@@ -101,7 +110,11 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
-            let sidecar = Arc::new(Sidecar::new(bus, &deployment_id, identity));
+            let mut sidecar = Sidecar::new(bus, &deployment_id, identity);
+            if let Some(verifier) = verifier {
+                sidecar = sidecar.with_verifier(verifier);
+            }
+            let sidecar = Arc::new(sidecar);
 
             tracing::info!(instance_id, %listening, "the sidecar is serving");
 

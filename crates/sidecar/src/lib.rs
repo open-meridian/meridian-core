@@ -19,6 +19,7 @@ pub mod grants;
 #[rustfmt::skip]
 mod operations;
 pub mod report;
+mod scope;
 mod service;
 mod typed;
 

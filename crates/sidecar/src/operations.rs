@@ -28,8 +28,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::RecordHoldingsStatementParams>,
     ) -> Result<Response<plugin::RecordHoldingsStatementResult>, Status> {
-        let message: domain::RecordHoldingsStatementRequest = self.as_domain(request.into_inner())?;
-        self.call_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message).await
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordHoldingsStatementRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message, account, acting_for).await
     }
 
     /// W2.3: `platform.street.command.record-holding`.
@@ -37,9 +40,12 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::RecordHoldingParams>,
     ) -> Result<Response<plugin::RecordHoldingResult>, Status> {
-        let mut message: domain::RecordHoldingRequest = self.as_domain(request.into_inner())?;
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordHoldingRequest = self.as_domain(params)?;
         message.account_id = self.linked_account(&message.external_account_id).await?;
-        self.call_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message).await
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
     }
 
     /// W3.1: `platform.reference.query.resolve-identifier`.

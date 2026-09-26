@@ -96,6 +96,13 @@ pub struct Sidecar {
     /// Woken when registration changes, so a report goes out at once rather
     /// than at the next interval.
     pub(crate) changed: Arc<tokio::sync::Notify>,
+
+    /// The dashboard's keys, to verify the person a command is sent for
+    /// (W4.9). None where the sidecar was given none: such a command is
+    /// refused, since nobody can be vouched for.
+    pub(crate) verifier: Option<Arc<crate::front_door::Verifier>>,
+    /// The plugin's write scope, as the conductor last said it.
+    pub(crate) scope: crate::scope::Scope,
 }
 
 impl Sidecar {
@@ -127,7 +134,16 @@ impl Sidecar {
             links: crate::typed::Links::default(),
             refusals: Arc::default(),
             changed: Arc::default(),
+            verifier: None,
+            scope: crate::scope::Scope::default(),
         }
+    }
+
+    /// Verifying the person a command is sent for with the dashboard's keys,
+    /// the same ones the front door holds.
+    pub fn with_verifier(mut self, verifier: Arc<crate::front_door::Verifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     pub fn registration(&self) -> Option<Registration> {

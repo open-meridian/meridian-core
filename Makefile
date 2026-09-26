@@ -611,18 +611,19 @@ e2e-plugin-page: network
 	@: >.e2e-plugin-page.log
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1 || true
 	@set -e; \
-	$(E2E_PLUGIN_PAGE) build dashboard conductor sidecar >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) build dashboard conductor sidecar street >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) up -d postgres nats fake-platform >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-keys >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T conductor meridian-conductor migrate >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) run --rm -T street meridian-street migrate >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T dashboard meridian-dashboard migrate >>.e2e-plugin-page.log 2>&1; \
-	$(E2E_PLUGIN_PAGE) up -d conductor dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) up -d conductor street dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 	status=0; $(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner || status=$$?; \
 	if [ $$status -ne 0 ]; then $(E2E_PLUGIN_PAGE) logs dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 		echo "e2e-plugin-page FAILED; the components' logs are in .e2e-plugin-page.log" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, and the plugin is told who they are by its sidecar alone"
+	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, and it writes for them only what they may write"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

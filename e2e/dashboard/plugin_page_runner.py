@@ -63,6 +63,22 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def post_on_plugin_host(browser, path):
+    request = urllib.request.Request(dash(path), data=b"", method="POST",
+                                     headers={"Host": PLUGIN_HOST})
+    request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in browser.cookies.items()))
+    try:
+        response = urllib.request.build_opener(NoRedirect).open(request)
+        return response.status, response.read().decode()
+    except urllib.error.HTTPError as refused:
+        return refused.code, refused.read().decode()
+
+
+def write(plugin):
+    status, body = post_on_plugin_host(plugin, "/write")
+    return json.loads(body) if status == 200 else {"ok": False, "detail": f"{status} {body[:200]}"}
+
+
 def front_door(header=None):
     request = urllib.request.Request(FRONT_DOOR + "/")
     if header is not None:
@@ -170,7 +186,24 @@ def main():
     check(front_door() == 401, "with no assertion, refused")
     check(front_door(seen.get("raw") or "x") == 403, "an assertion already used, refused")
 
-    say("G: signing out of the dashboard ends the plugin's session")
+    say("G: the plugin writes for her only what she may write (W4.9)")
+    administer(ada, "/admin/links", {"plugin_instance_id": INSTANCE,
+                                     "external_account_id": "ext-e2e", "account_id": account})
+    refused = write(plugin)
+    check(not refused.get("ok") and refused.get("code") == "PERMISSION_DENIED",
+          f"while she only reads, the sidecar refuses: {refused}")
+    administer(ada, "/admin/access-groups",
+               {"access_group_id": access_group, "name": "Plugin page readers",
+                "entries": f"{INSTANCE} custody write"})
+    # The sidecar reads the plugin's write scope again within 30 seconds.
+    deadline = time.monotonic() + 45
+    written = write(plugin)
+    while not written.get("ok") and time.monotonic() < deadline:
+        time.sleep(3)
+        written = write(plugin)
+    check(written.get("ok"), f"once she writes, it is recorded: {written}")
+
+    say("H: signing out of the dashboard ends the plugin's session")
     home = ada.get(dash("/"))
     ada.post(dash("/sign-out"), {"form_token": form_token(home)})
     status, _, location, _ = on_plugin_host(plugin, "/")

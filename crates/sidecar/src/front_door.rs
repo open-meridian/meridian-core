@@ -78,7 +78,7 @@ impl Refusal {
         }
     }
 
-    fn said(&self) -> String {
+    pub fn said(&self) -> String {
         match self {
             Refusal::Missing => "no Meridian-Caller: open this plugin from the dashboard".into(),
             Refusal::Malformed(why) => format!("the Meridian-Caller does not read: {why}"),
@@ -160,7 +160,8 @@ impl Verifier {
         Ok(key)
     }
 
-    /// The claims a header carries, if every check holds.
+    /// The claims a header carries, if every check holds: the assertion's
+    /// own, and that it has not reached this door before.
     pub fn verify(&self, header: Option<&str>, now_ns: i64) -> Result<CallerClaims, Refusal> {
         let header = header.ok_or(Refusal::Missing)?;
         let bytes = URL_SAFE_NO_PAD
@@ -168,6 +169,28 @@ impl Verifier {
             .map_err(|failed| Refusal::Malformed(failed.to_string()))?;
         let assertion = CallerAssertion::decode(bytes.as_slice())
             .map_err(|failed| Refusal::Malformed(failed.to_string()))?;
+        let claims = self.vouched(&assertion, now_ns)?;
+        let mut seen = self.seen.lock().expect("seen lock poisoned");
+        seen.retain(|_, forget_at| *forget_at >= now_ns);
+        if seen
+            .insert(claims.assertion_id.clone(), claims.expires_at_ns + SKEW_NS)
+            .is_some()
+        {
+            return Err(Refusal::Replayed);
+        }
+        Ok(claims)
+    }
+
+    /// The claims an assertion carries, if it is the dashboard's, for this
+    /// instance, in date and short-lived -- without the replay rule. A command
+    /// sent for a person (W4.9) carries the assertion the plugin was handed at
+    /// this door, which has therefore been seen once already; and only the
+    /// plugin can reach the surface that carries it.
+    pub fn vouched(
+        &self,
+        assertion: &CallerAssertion,
+        now_ns: i64,
+    ) -> Result<CallerClaims, Refusal> {
         let key = self.key(&assertion.key_id)?;
         let signature =
             Signature::from_slice(&assertion.signature).map_err(|_| Refusal::BadSignature)?;
@@ -187,14 +210,6 @@ impl Verifier {
         }
         if claims.assertion_id.is_empty() {
             return Err(Refusal::Malformed("the assertion carries no id".into()));
-        }
-        let mut seen = self.seen.lock().expect("seen lock poisoned");
-        seen.retain(|_, forget_at| *forget_at >= now_ns);
-        if seen
-            .insert(claims.assertion_id.clone(), claims.expires_at_ns + SKEW_NS)
-            .is_some()
-        {
-            return Err(Refusal::Replayed);
         }
         Ok(claims)
     }
@@ -236,10 +251,13 @@ fn kept(headers: &HeaderMap, dropped: &[&[&str]]) -> HeaderMap {
 }
 
 impl FrontDoor {
-    pub fn new(sidecar: Arc<Sidecar>, verifier: Verifier) -> Result<FrontDoor, String> {
+    pub fn new(
+        sidecar: Arc<Sidecar>,
+        verifier: impl Into<Arc<Verifier>>,
+    ) -> Result<FrontDoor, String> {
         Ok(FrontDoor {
             sidecar,
-            verifier: Arc::new(verifier),
+            verifier: verifier.into(),
             client: FrontDoor::client()?,
         })
     }
