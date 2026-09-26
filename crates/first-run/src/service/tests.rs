@@ -931,3 +931,51 @@ fn start_tls_on_an_address_already_encrypted_is_refused_before_dialling() {
     );
     assert!(handed.lock().unwrap().is_empty(), "nothing was dialled");
 }
+
+#[test]
+fn a_database_with_no_host_is_said_once_and_dials_nothing() {
+    // It used to be two connection failures to `@:5432/`, an address nobody
+    // typed; and the probe was asked to dial it.
+    let run = first_run(
+        Box::new(Remembering::default()),
+        vec!["the probe was asked".into()],
+    );
+    let mut answer = database(&run);
+    for login in [&mut answer.serving, &mut answer.migrating] {
+        login.as_mut().unwrap().host = "  ".into();
+    }
+    let reply = run.check(&FirstRunCheckRequest {
+        answer: Some(Answer::RuntimeDatabase(answer)),
+    });
+    assert_eq!(
+        reply.findings,
+        vec!["no host for the database: where your Postgres is".to_string()]
+    );
+}
+
+#[test]
+fn an_account_with_no_login_is_said_as_the_account() {
+    let findings = check_administrator(&AdministratorAnswer {
+        named: Some(Named::LocalAccountLogin(" ".into())),
+    });
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0].contains("the account has no login name"),
+        "{findings:?}"
+    );
+    assert!(!findings[0].contains("group"), "{findings:?}");
+    assert!(check_administrator(&AdministratorAnswer {
+        named: Some(Named::LocalAccountLogin("ada".into())),
+    })
+    .is_empty());
+}
+
+#[test]
+fn a_missing_dashboard_address_says_what_it_is_for_whatever_the_way_in() {
+    let findings = check_addresses(&AddressesAnswer {
+        dashboard_url: String::new(),
+    });
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].contains("plugin's page"), "{findings:?}");
+    assert!(!findings[0].contains("directory"), "{findings:?}");
+}

@@ -221,6 +221,16 @@ impl FirstRun {
             };
         }
 
+        // Said once, plainly, rather than as two connection failures to an
+        // address nobody typed.
+        let hosts = [&database.serving, &database.migrating];
+        if hosts.iter().any(|login| {
+            login
+                .as_ref()
+                .is_some_and(|login| login.host.trim().is_empty())
+        }) {
+            return vec!["no host for the database: where your Postgres is".into()];
+        }
         let mut findings = Vec::new();
         for (login, may_create, what) in [
             (&database.serving, false, "serving"),
@@ -892,7 +902,14 @@ fn check_administrator(administrator: &AdministratorAnswer) -> Vec<String> {
 
     match &administrator.named {
         Some(Named::DirectoryGroup(group)) => named("directory group", group),
-        Some(Named::LocalAccountLogin(login)) => named("login", login),
+        Some(Named::LocalAccountLogin(login)) => match login.trim().is_empty() {
+            true => vec![
+                "the account has no login name, and it is the account that administers \
+                 this deployment"
+                    .into(),
+            ],
+            false => Vec::new(),
+        },
         None => vec![
             "nobody is named to administer this deployment. Name a directory group whose \
              members administer it, or the local account being created."
@@ -904,7 +921,11 @@ fn check_administrator(administrator: &AdministratorAnswer) -> Vec<String> {
 fn check_addresses(addresses: &AddressesAnswer) -> Vec<String> {
     let mut findings = Vec::new();
     if addresses.dashboard_url.trim().is_empty() {
-        findings.push("no address for the dashboard: the directory sends people back to it".into());
+        findings.push(
+            "no address for the dashboard: people are sent back to it after signing in, and \
+             each plugin's page is served on a name below it"
+                .into(),
+        );
     }
     findings
 }

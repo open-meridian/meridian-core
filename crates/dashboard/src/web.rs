@@ -173,6 +173,17 @@ pub(crate) fn redirect(to: &str) -> Response {
 }
 
 async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    // Before first run there is nobody to sign in and nothing to sign in
+    // with: what there is to do is the wizard.
+    if app.first_run {
+        return Html(page(
+            "Not set up yet",
+            "<h1>Meridian</h1><p>This deployment is not set up yet.</p>\
+             <p><a href=\"/first-run\">Set it up</a> with the first-run code from the \
+             platform.</p>",
+        ))
+        .into_response();
+    }
     let records = match app.records.current(app.clock.now_ns()) {
         Ok(records) => records,
         Err(stale) => return refused(&stale.to_string()),
@@ -180,7 +191,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let Some(session) = session_of(&app, &headers) else {
         return Html(page(
             "Sign in",
-            "<h1>Meridian</h1><p><a href=\"/sign-in\">Sign in</a> with your firm's directory.</p>",
+            "<h1>Meridian</h1><p><a href=\"/sign-in\">Sign in</a> to this deployment.</p>",
         ))
         .into_response();
     };

@@ -571,7 +571,7 @@ fn a_page_shown_again_keeps_what_was_chosen() {
     .into_iter()
     .collect();
 
-    let page = open_page(&fields, &["a finding".to_string()], "");
+    let page = open_page(&fields, &[(Step::Database, "a finding".to_string())], "");
 
     assert!(page.contains("<option value=\"ldap\" selected>"), "{page}");
     assert!(
@@ -613,4 +613,139 @@ fn the_page_asks_three_ways_and_names_nothing_the_firm_did_not_choose() {
         !lower.contains("zitadel") && !lower.contains("bundled"),
         "{page}"
     );
+}
+
+/// Every field the form has had, by name: what `meridian up --params` and
+/// the runners read it by. Hidden by a choice is still in the form.
+const EVERY_FIELD: [&str; 25] = [
+    "db_route",
+    "db_host",
+    "db_port",
+    "db_name",
+    "db_sslmode",
+    "db_serving_role",
+    "db_serving_password",
+    "db_migrating_role",
+    "db_migrating_password",
+    "backend",
+    "admin_login",
+    "admin_email",
+    "admin_given_name",
+    "admin_family_name",
+    "admin_password",
+    "ldap_servers",
+    "ldap_start_tls",
+    "ldap_base_dn",
+    "ldap_bind_dn",
+    "ldap_bind_password",
+    "ldap_user_filter",
+    "oidc_issuer",
+    "oidc_client_id",
+    "oidc_client_secret",
+    "oidc_groups_claim",
+];
+
+#[test]
+fn a_first_visit_starts_a_trial_and_every_field_stays_in_the_form() {
+    let page = open_page(&Fields::default(), &[], "");
+    // Ruling 9: the database started in the cluster, and an account here.
+    assert!(
+        page.contains("<option value=\"brought\" selected>"),
+        "{page}"
+    );
+    assert!(page.contains("<option value=\"local\" selected>"), "{page}");
+    for field in
+        EVERY_FIELD
+            .iter()
+            .chain(&["oidc_trusted_audiences", "admin_group", "dashboard_url"])
+    {
+        assert!(page.contains(&format!("name=\"{field}\"")), "{field}");
+    }
+    // Without the script, the steps' navigation is not offered.
+    assert!(page.contains("<nav class=\"steps\" hidden>"), "{page}");
+}
+
+#[test]
+fn a_finding_is_shown_once_at_its_own_step_and_the_way_back_to_it_at_the_review() {
+    let findings = [
+        (Step::Database, "no host for the database".to_string()),
+        (Step::Database, "no host for the database".to_string()),
+        (Step::Address, "no address for the dashboard".to_string()),
+    ];
+    let page = open_page(&Fields::default(), &findings, "");
+    let at = |id: &str| {
+        let open = page
+            .find(&format!("<section class=\"step\" id=\"{id}\">"))
+            .unwrap();
+        let close = open + page[open..].find("</section>").unwrap();
+        &page[open..close]
+    };
+    assert!(
+        at("database").contains("<li>no host for the database</li>"),
+        "{page}"
+    );
+    assert_eq!(page.matches("<li>no host for the database</li>").count(), 1);
+    assert!(at("address").contains("<li>no address for the dashboard</li>"));
+    assert!(!at("signing-in").contains("<li>"));
+    // What reads the page reads a finding as a bare `<li>`, and nothing else
+    // is one.
+    assert_eq!(page.matches("<li>").count(), 2, "{page}");
+    let review = at("apply");
+    assert!(
+        review.contains("data-go=\"database\">Database</a>"),
+        "{review}"
+    );
+    assert!(
+        review.contains("data-go=\"address\">Address</a>"),
+        "{review}"
+    );
+    assert!(!review.contains("class=\"passed\""));
+}
+
+#[test]
+fn a_test_that_passes_says_so_where_it_is_applied() {
+    let page = open_page(
+        &Fields::default(),
+        &[],
+        "Everything answered so far passes.",
+    );
+    assert!(page.contains("<p class=\"passed\">Everything answered so far passes.</p>"));
+    assert!(!page.contains("<li>"));
+}
+
+#[test]
+fn the_local_account_is_the_administrator_even_before_its_login_is_typed() {
+    // An empty login on the local route used to fall through to the
+    // directory group, and the wizard said the *group* was empty to somebody
+    // who had been told to leave it so.
+    let fields: Fields = [
+        ("backend".to_string(), "local".to_string()),
+        ("admin_login".to_string(), "  ".to_string()),
+        ("admin_group".to_string(), "".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        administrator(&fields).named,
+        Some(Named::LocalAccountLogin(String::new()))
+    );
+    let fields: Fields = [
+        ("backend".to_string(), "ldap".to_string()),
+        ("admin_group".to_string(), "meridian-admins".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        administrator(&fields).named,
+        Some(Named::DirectoryGroup("meridian-admins".into()))
+    );
+}
+
+#[tokio::test]
+async fn home_before_setup_points_at_the_wizard_rather_than_a_sign_in() {
+    let (status, body) = get(wizard_app(), "/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("not set up yet"), "{body}");
+    assert!(body.contains("href=\"/first-run\""), "{body}");
+    assert!(!body.contains("/sign-in"), "{body}");
 }

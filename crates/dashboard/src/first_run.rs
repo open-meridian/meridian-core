@@ -354,7 +354,9 @@ async fn check(
     };
 
     let requests = match answers(&app, &fields).await {
-        Err(refusal) => return Html(open_page(&fields, &[refusal], "")).into_response(),
+        Err(refusal) => {
+            return Html(open_page(&fields, &[(Step::Apply, refusal)], "")).into_response()
+        }
         Ok(answers) => answers.to_check(),
     };
 
@@ -362,8 +364,22 @@ async fn check(
     // Until 2026-09-25 this sent the database alone, so a wrong directory
     // password read "passes" here and was refused only by Apply -- which
     // re-checks all four, and is where the cluster run found it.
+    // In the order `to_check` asks them, each shown at its own step.
+    let asked = [
+        Step::Database,
+        Step::SigningIn,
+        Step::Address,
+        Step::Administrators,
+    ];
+    // On the local route the account is the administrator and there is no
+    // step of that name: what is wrong with it is shown where it is typed.
+    let local = fields.get("backend").map(String::as_str) == Some("local");
     let mut findings = Vec::new();
-    for request in requests {
+    for (step, request) in asked.into_iter().zip(requests) {
+        let step = match step {
+            Step::Administrators if local => Step::SigningIn,
+            other => other,
+        };
         match ask(
             &app,
             CHECK_ANSWER,
@@ -373,11 +389,11 @@ async fn check(
         )
         .await
         {
-            Err(failed) => findings.push(failed),
+            Err(failed) => findings.push((Step::Apply, failed)),
             Ok(payload) => {
                 let reply = FirstRunCheckReply::decode(&payload[..]).unwrap_or_default();
                 if !reply.passed {
-                    findings.extend(reply.findings);
+                    findings.extend(reply.findings.into_iter().map(|finding| (step, finding)));
                 }
             }
         }
@@ -402,7 +418,9 @@ async fn apply(
     };
 
     let configuration = match answers(&app, &fields).await {
-        Err(refusal) => return Html(open_page(&fields, &[refusal], "")).into_response(),
+        Err(refusal) => {
+            return Html(open_page(&fields, &[(Step::Apply, refusal)], "")).into_response()
+        }
         Ok(answers) => answers.to_configuration(),
     };
 
@@ -415,7 +433,9 @@ async fn apply(
     )
     .await
     {
-        Err(failed) => return Html(open_page(&fields, &[failed], "")).into_response(),
+        Err(failed) => {
+            return Html(open_page(&fields, &[(Step::Apply, failed)], "")).into_response()
+        }
         Ok(payload) => FirstRunApplied::decode(&payload[..]).unwrap_or_default(),
     };
 
@@ -430,6 +450,10 @@ async fn apply(
                 applied.steps.join(", ")
             ));
         }
+        let findings: Vec<(Step, String)> = findings
+            .into_iter()
+            .map(|finding| (Step::Apply, finding))
+            .collect();
         return Html(open_page(&fields, &findings, "")).into_response();
     }
 
@@ -734,8 +758,12 @@ fn administrator(fields: &Fields) -> AdministratorAnswer {
     // The local account route names itself. The wizard is already asking for
     // that login and password on this page, and asking again for the same
     // fact is how two answers come to disagree.
-    let named = match (field("backend"), field("admin_login")) {
-        ("local", login) if !login.is_empty() => Named::LocalAccountLogin(login.to_string()),
+    // Named by the way people sign in, never by which field was filled: an
+    // empty login on the local route used to fall through to the directory
+    // group, and the wizard reported an empty *group* to somebody who had
+    // been told to leave it empty.
+    let named = match field("backend") {
+        "local" => Named::LocalAccountLogin(field("admin_login").to_string()),
         _ => Named::DirectoryGroup(field("admin_group").to_string()),
     };
 
@@ -751,32 +779,93 @@ fn split(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// The wizard itself: one form, tested and then applied.
+/// Which step of the wizard a finding is about, so that it is shown there
+/// rather than in a list at the top that the person has to match up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    Database,
+    SigningIn,
+    Administrators,
+    Address,
+    Apply,
+}
+
+impl Step {
+    const ALL: [Step; 5] = [
+        Step::Database,
+        Step::SigningIn,
+        Step::Administrators,
+        Step::Address,
+        Step::Apply,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Step::Database => "database",
+            Step::SigningIn => "signing-in",
+            Step::Administrators => "administrators",
+            Step::Address => "address",
+            Step::Apply => "apply",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Step::Database => "Database",
+            Step::SigningIn => "Signing in",
+            Step::Administrators => "Administrators",
+            Step::Address => "Address",
+            Step::Apply => "Review and apply",
+        }
+    }
+}
+
+/// The wizard itself: one form, shown a step at a time, tested and then
+/// applied (spec/installation-and-first-run, ruling 9).
 ///
-/// One page rather than a sequence of them, because the browser is what holds
-/// the answers between the test and the apply. Nothing is kept here, and a
-/// password typed in is sealed on its way out and forgotten.
-fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
-    let value = |name: &str| escape(fields.get(name).map(String::as_str).unwrap_or_default());
-    let text = |name: &str, label: &str, placeholder: &str| {
+/// One form rather than a page per step, because the browser is what holds
+/// the answers between the steps, the test and the apply. Nothing is kept
+/// here, and a password typed in is sealed on its way out and forgotten.
+/// The steps are the page's script showing one section at a time; without
+/// it every section shows, as the whole form. Fields a choice makes
+/// irrelevant are hidden, never removed: the form keeps every field under
+/// its name, which is what `meridian up --params` reads it by.
+///
+/// What else reads this page: each finding as a bare `<li>`, and nothing
+/// else in one; `class="passed"` when a test passes. Both are kept.
+fn open_page(fields: &Fields, findings: &[(Step, String)], passed: &str) -> String {
+    // A first visit gets the defaults; a page re-rendered after a test keeps
+    // exactly what was sent, even a field somebody emptied.
+    let fresh = fields.is_empty();
+    let given = |name: &str, default: &str| -> String {
+        match fields.get(name) {
+            Some(value) => value.clone(),
+            None if fresh => default.to_string(),
+            None => String::new(),
+        }
+    };
+    let required = |yes: bool| if yes { " data-required" } else { "" };
+    let text = |name: &str, label: &str, placeholder: &str, default: &str, needed: bool| {
         format!(
-            "<label>{label}<input name=\"{name}\" value=\"{}\" placeholder=\"{}\"></label>",
-            value(name),
-            escape(placeholder)
+            "<label>{label}<input name=\"{name}\" value=\"{}\" placeholder=\"{}\"{}></label>",
+            escape(&given(name, default)),
+            escape(placeholder),
+            required(needed)
         )
     };
     // A password is never rendered back: what the browser holds, it re-posts.
-    let secret = |name: &str, label: &str| {
+    let secret = |name: &str, label: &str, needed: bool| {
         format!(
-            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"off\"></label>"
+            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"off\"{}></label>",
+            required(needed)
         )
     };
     // A choice keeps what was chosen. A page re-rendered after a failed test
     // used to show every select at its first option, so correcting a typo
     // and testing again quietly switched the database route or the way
     // people sign in back to the default.
-    let choice = |name: &str, label: &str, options: &[(&str, &str)]| {
-        let chosen = fields.get(name).map(String::as_str).unwrap_or_default();
+    let choice = |name: &str, label: &str, default: &str, options: &[(&str, &str)]| {
+        let chosen = given(name, default);
         format!(
             "<label>{label}<select name=\"{name}\">{}</select></label>",
             options
@@ -799,159 +888,466 @@ fn open_page(fields: &Fields, findings: &[String], passed: &str) -> String {
             }
         )
     };
+    // Shown only while `field` is (or is not) `value`.
+    let when = |field: &str, value: &str, inner: String| {
+        format!("<div data-when=\"{field}\" data-is=\"{value}\">{inner}</div>")
+    };
+    let unless = |field: &str, value: &str, inner: String| {
+        format!("<div data-when=\"{field}\" data-not=\"{value}\">{inner}</div>")
+    };
 
-    let told = if findings.is_empty() {
-        if passed.is_empty() {
+    // Once each: the two database logins fail alike when the host is wrong.
+    let mut said: Vec<(Step, String)> = Vec::new();
+    for (step, finding) in findings {
+        if !said.iter().any(|(_, already)| already == finding) {
+            said.push((*step, finding.clone()));
+        }
+    }
+    let found_in = |step: Step| -> String {
+        let mine: String = said
+            .iter()
+            .filter(|(at, _)| *at == step)
+            .map(|(_, finding)| format!("<li>{}</li>", escape(finding)))
+            .collect();
+        if mine.is_empty() {
             String::new()
         } else {
-            format!("<p class=\"passed\">{}</p>", escape(passed))
+            format!("<ul class=\"refusal\">{mine}</ul>")
         }
-    } else {
+    };
+    let next = "<button type=\"button\" class=\"primary\" data-next>Next</button>";
+    let back = "<button type=\"button\" data-back>Back</button>";
+    let section = |step: Step, number: usize, inner: String, buttons: String| {
         format!(
-            "<ul class=\"refusal\">{}</ul>",
-            findings
-                .iter()
-                .map(|finding| format!("<li>{}</li>", escape(finding)))
-                .collect::<String>()
+            "<section class=\"step\" id=\"{id}\"><h2 data-title=\"{title}\">{number}. {title}</h2>\
+             {found}{inner}<div>{buttons}</div></section>",
+            id = step.id(),
+            title = step.title(),
+            found = found_in(step),
         )
     };
 
     let database = [
         choice(
             "db_route",
-            "Database",
+            "Where its database is",
+            "brought",
             &[
-                ("external", "Use a database you already run"),
                 ("brought", "Start one inside this cluster"),
+                ("external", "Use a database you already run"),
             ],
         ),
-        "<p><strong>Inside this cluster</strong> is for trying the product and for \
-         development. Nothing is asked of you: it is started here, and its roles and \
-         passwords are made here. It keeps its data if Meridian is removed and installed \
-         again. It loses everything if this cluster is deleted. Nobody backs it up.</p>\
-         <p><strong>A database you already run</strong> -- your own Postgres, one in \
-         Docker, a managed one from your cloud -- is what anything you depend on should \
-         use. It needs two roles: the migrating role may create a table and the serving \
-         role must not. Both are tested before anything is written.</p>"
-            .to_string(),
-        text("db_host", "Host", "postgres.firm.internal"),
-        text("db_port", "Port", "5432"),
-        text("db_name", "Database", "meridian"),
-        text("db_sslmode", "TLS mode", "verify-full"),
-        text("db_serving_role", "Serving role", "meridian_app"),
-        secret("db_serving_password", "Serving password"),
-        text("db_migrating_role", "Migrating role", "meridian_migrate"),
-        secret("db_migrating_password", "Migrating password"),
+        when(
+            "db_route",
+            "brought",
+            "<p class=\"hint\">For trying Meridian and for development. Nothing is \
+             asked of you: it is started here, and its roles and passwords are made \
+             here. It keeps its data if Meridian is removed and installed again. It \
+             loses everything if this cluster is deleted. Nobody backs it up.</p>"
+                .to_string(),
+        ),
+        when(
+            "db_route",
+            "external",
+            [
+                "<p class=\"hint\">Your own Postgres, one in Docker, or a managed one \
+                 from your cloud: what anything you depend on should use. It needs two \
+                 roles: the migrating role may create a table and the serving role must \
+                 not. Both are tested before anything is written.</p>"
+                    .to_string(),
+                text("db_host", "Host", "postgres.firm.internal", "", true),
+                text("db_port", "Port", "5432", "5432", false),
+                text("db_name", "Database", "meridian", "meridian", true),
+                text("db_sslmode", "TLS mode", "verify-full", "", false),
+                text(
+                    "db_serving_role",
+                    "Serving role",
+                    "meridian_app",
+                    "meridian_app",
+                    true,
+                ),
+                secret("db_serving_password", "Serving role's password", true),
+                text(
+                    "db_migrating_role",
+                    "Migrating role",
+                    "meridian_migrate",
+                    "meridian_migrate",
+                    true,
+                ),
+                secret("db_migrating_password", "Migrating role's password", true),
+            ]
+            .concat(),
+        ),
     ]
     .concat();
 
     // One question, three answers, and each asks only about what the firm
     // has. Nothing here names software the firm did not choose.
     let signing_in = [
-        "<p>Connect what your firm already has, or, if it has nothing, let this \
-         deployment hold an account for you. Answer only the part you choose.</p>"
+        "<p class=\"hint\">Connect what your firm already has, or, if it has nothing, \
+         let this deployment hold an account for you.</p>"
             .to_string(),
         choice(
             "backend",
             "How people sign in",
+            "local",
             &[
                 ("local", "We have no directory: make me an account"),
                 ("ldap", "Our LDAP or Active Directory"),
                 ("oidc", "Our own OpenID Connect provider"),
             ],
         ),
-        "<h3>An account here</h3>".to_string(),
-        text("admin_login", "Your login name", ""),
-        text("admin_email", "Your email", ""),
-        text("admin_given_name", "Given name", ""),
-        text("admin_family_name", "Family name", ""),
-        secret("admin_password", "Your password"),
-        "<h3>Your LDAP</h3>".to_string(),
-        text(
-            "ldap_servers",
-            "Servers, in order",
-            "ldaps://ldap.firm.internal:636",
+        when(
+            "backend",
+            "local",
+            [
+                "<p class=\"hint\">This account is the deployment's administrator.</p>".to_string(),
+                text("admin_login", "Your login name", "", "", true),
+                text("admin_email", "Your email", "", "", false),
+                text("admin_given_name", "Given name", "", "", false),
+                text("admin_family_name", "Family name", "", "", false),
+                secret("admin_password", "Your password", true),
+            ]
+            .concat(),
         ),
-        flag(
-            "ldap_start_tls",
-            "Use StartTLS (for an ldap:// address; an ldaps:// one is already encrypted)",
+        when(
+            "backend",
+            "ldap",
+            [
+                text(
+                    "ldap_servers",
+                    "Servers, in order",
+                    "ldaps://ldap.firm.internal:636",
+                    "",
+                    true,
+                ),
+                flag(
+                    "ldap_start_tls",
+                    "Use StartTLS (for an ldap:// address; an ldaps:// one is already encrypted)",
+                ),
+                text(
+                    "ldap_base_dn",
+                    "Where people are",
+                    "ou=people,dc=firm,dc=internal",
+                    "",
+                    true,
+                ),
+                text(
+                    "ldap_bind_dn",
+                    "Account this deployment searches as",
+                    "",
+                    "",
+                    false,
+                ),
+                secret("ldap_bind_password", "Its password", false),
+                text(
+                    "ldap_user_filter",
+                    "How a person is found ({} is the name typed)",
+                    "(uid={})",
+                    "",
+                    false,
+                ),
+            ]
+            .concat(),
         ),
-        text(
-            "ldap_base_dn",
-            "Where people are",
-            "ou=people,dc=firm,dc=internal",
-        ),
-        text("ldap_bind_dn", "Account this deployment searches as", ""),
-        secret("ldap_bind_password", "Its password"),
-        text(
-            "ldap_user_filter",
-            "How a person is found ({} is the name typed)",
-            "(uid={})",
-        ),
-        "<h3>Your OpenID Connect provider</h3>".to_string(),
-        text(
-            "oidc_issuer",
-            "Issuer, exactly as the provider states it",
-            "https://login.firm.example",
-        ),
-        text("oidc_client_id", "Client id", ""),
-        secret(
-            "oidc_client_secret",
-            "Client secret (none for a public client)",
-        ),
-        text("oidc_groups_claim", "Groups claim", "groups"),
-        text(
-            "oidc_trusted_audiences",
-            "Other audiences a token may name, comma-separated (most providers need none)",
-            "",
+        when(
+            "backend",
+            "oidc",
+            [
+                text(
+                    "oidc_issuer",
+                    "Issuer, exactly as the provider states it",
+                    "https://login.firm.example",
+                    "",
+                    true,
+                ),
+                text("oidc_client_id", "Client id", "", "", true),
+                secret(
+                    "oidc_client_secret",
+                    "Client secret (none for a public client)",
+                    false,
+                ),
+                text("oidc_groups_claim", "Groups claim", "groups", "", false),
+                text(
+                    "oidc_trusted_audiences",
+                    "Other audiences a token may name, comma-separated (most providers need none)",
+                    "",
+                    "",
+                    false,
+                ),
+            ]
+            .concat(),
         ),
     ]
     .concat();
 
+    let administrators = [
+        when(
+            "backend",
+            "local",
+            "<p class=\"hint\">The account made in the step before administers this \
+             deployment: nothing to name here.</p>"
+                .to_string(),
+        ),
+        unless(
+            "backend",
+            "local",
+            [
+                "<p class=\"hint\">Name a group in your directory: its members hold \
+                 deployment admin, and adding somebody later is a change in your \
+                 directory rather than here.</p>\
+                 <p class=\"warn\"><strong>The group is not checked.</strong> A directory \
+                 states a person's groups when they sign in; it is not asked to list them. \
+                 Spell it carefully: a group that does not exist is a deployment nobody \
+                 can administer, and getting back in then means a claim code from the \
+                 platform.</p>"
+                    .to_string(),
+                text(
+                    "admin_group",
+                    "Administrators' directory group",
+                    "meridian-admins",
+                    "",
+                    true,
+                ),
+            ]
+            .concat(),
+        ),
+    ]
+    .concat();
+
+    let address = [
+        "<p class=\"hint\">Where a browser reaches this dashboard. People are sent back \
+         to it after signing in, and each plugin's page is served on a name below it.</p>"
+            .to_string(),
+        text(
+            "dashboard_url",
+            "This dashboard",
+            "https://meridian.firm.example",
+            "",
+            true,
+        ),
+        "<p class=\"warn\" id=\"address-warning\" hidden>That is an IP address, and an \
+         address has no names below it, so this deployment could serve no plugin pages. \
+         Give it a name: on one machine, <code>http://localhost</code> with the same \
+         port.</p>"
+            .to_string(),
+    ]
+    .concat();
+
+    // What Test found in the other steps, with the way back to each.
+    let elsewhere: Vec<String> = Step::ALL
+        .iter()
+        .filter(|step| **step != Step::Apply && said.iter().any(|(at, _)| at == *step))
+        .map(|step| {
+            format!(
+                "<a href=\"#{id}\" data-go=\"{id}\">{title}</a>",
+                id = step.id(),
+                title = step.title()
+            )
+        })
+        .collect();
+    let told = if !elsewhere.is_empty() {
+        format!(
+            "<p class=\"refused\">Test found something to fix in {}.</p>",
+            elsewhere.join(", ")
+        )
+    } else if said.is_empty() && !passed.is_empty() {
+        format!("<p class=\"passed\">{}</p>", escape(passed))
+    } else {
+        String::new()
+    };
+    let apply = format!(
+        "{told}<div class=\"panel\" id=\"review\"><p class=\"hint\">Your answers, \
+         without their passwords, show here.</p></div>\
+         <p class=\"hint\">Test as often as you like: nothing is written until you \
+         apply. Applying writes it all at once and restarts what changed. When it is \
+         done, the administrator signs in the way you chose; nothing else is \
+         redeemed.</p>"
+    );
+
+    let nav: String = Step::ALL
+        .iter()
+        .enumerate()
+        .map(|(at, step)| {
+            format!(
+                "<a href=\"#{id}\" data-go=\"{id}\" data-title=\"{title}\">{n}. {title}</a>",
+                id = step.id(),
+                title = step.title(),
+                n = at + 1
+            )
+        })
+        .collect();
+
     page(
         "Set up this deployment",
         &format!(
-            "<h1>Set up this deployment</h1>{told}\
-             <form method=\"post\">\
-             <h2>Database</h2>{database}\
-             <h2>Signing in</h2>{signing_in}\
-             <h2>Administrators</h2>\
-             <p>Who runs this deployment once it is set up. With LDAP or a \
-             provider, name a group: its members hold deployment admin, and \
-             adding somebody later is a change in your directory rather than \
-             here. With an account here, that account is the administrator and \
-             this is left empty.</p>\
-             <p><strong>The group is not checked.</strong> A directory states a \
-             person's groups when they sign in; it is not asked to list them. \
-             Spell it carefully: a group that does not exist is a deployment \
-             nobody can administer, and getting back in then means a claim code \
-             from the platform.</p>\
-             {}\
-             <h2>Addresses</h2>\
-             <p>Where a browser reaches this deployment. A firm's own provider \
-             sends people back to it.</p>\
-             {}\
-             <h2>Apply</h2>\
-             <p>Test as often as you like: nothing is written until you apply. \
-             Applying writes it all at once and restarts what changed. When it \
-             is done, the administrators named above sign in the way you chose; \
-             nothing else is redeemed.</p>\
-             <button type=\"submit\" formaction=\"/first-run/check\">Test</button>\
-             <button type=\"submit\" formaction=\"/first-run/apply\">Apply</button>\
-             </form>",
-            text(
-                "admin_group",
-                "Administrators' directory group",
-                "meridian-admins"
+            "<h1>Set up this deployment</h1>\
+             <p class=\"hint\">A few short steps. Nothing is written until you apply.</p>\
+             <nav class=\"steps\" hidden>{nav}</nav>\
+             <form method=\"post\" id=\"wizard\">{}{}{}{}{}</form>\
+             <script>{WIZARD_SCRIPT}</script>",
+            section(Step::Database, 1, database, next.to_string()),
+            section(Step::SigningIn, 2, signing_in, format!("{back}{next}")),
+            section(
+                Step::Administrators,
+                3,
+                administrators,
+                format!("{back}{next}")
             ),
-            text(
-                "dashboard_url",
-                "This dashboard",
-                "https://meridian.firm.example"
+            section(Step::Address, 4, address, format!("{back}{next}")),
+            section(
+                Step::Apply,
+                5,
+                apply,
+                format!(
+                    "{back}<button type=\"submit\" formaction=\"/first-run/check\">Test</button>\
+                     <button type=\"submit\" class=\"primary\" formaction=\"/first-run/apply\" \
+                     data-apply>Apply</button>"
+                ),
             ),
         ),
     )
 }
+
+/// The wizard's steps, in the browser. Static: nothing from a request is in
+/// it. Without it the form is one page and every field shows.
+const WIZARD_SCRIPT: &str = r#"(function () {
+  var form = document.getElementById("wizard");
+  if (!form) return;
+  form.classList.add("js");
+  var nav = document.querySelector("nav.steps");
+  nav.hidden = false;
+  var steps = Array.prototype.slice.call(form.querySelectorAll("section.step"));
+  var current = null;
+
+  function val(name) {
+    var field = form.elements[name];
+    if (!field) return "";
+    if (field.type === "checkbox") return field.checked ? "on" : "";
+    return (field.value || "").trim();
+  }
+  function branches() {
+    form.querySelectorAll("[data-when]").forEach(function (part) {
+      var value = val(part.dataset.when);
+      var on = part.dataset.is !== undefined ? value === part.dataset.is : value !== part.dataset.not;
+      part.classList.toggle("off", !on);
+    });
+  }
+  // With an account here, that account is the administrator: no step.
+  function skipped(step) { return step.id === "administrators" && val("backend") === "local"; }
+  function shown() { return steps.filter(function (step) { return !skipped(step); }); }
+
+  function show(id) {
+    branches();
+    var list = shown();
+    var at = list.findIndex(function (step) { return step.id === id; });
+    current = list[at < 0 ? 0 : at];
+    steps.forEach(function (step) { step.classList.toggle("current", step === current); });
+    list.forEach(function (step, i) {
+      var heading = step.querySelector("h2");
+      heading.textContent = (i + 1) + ". " + heading.dataset.title;
+    });
+    nav.querySelectorAll("a").forEach(function (link) {
+      var step = document.getElementById(link.dataset.go);
+      link.classList.toggle("off", skipped(step));
+      link.classList.toggle("here", step === current);
+      link.textContent = (list.indexOf(step) + 1) + ". " + link.dataset.title;
+    });
+    if (current.id === "apply") review();
+    window.scrollTo(0, 0);
+  }
+
+  // A step's own required answers, checked in the browser before moving on.
+  // Only while checking: a required field in a hidden step would stop Test.
+  function complete(step) {
+    var fine = true;
+    step.querySelectorAll("[data-required]").forEach(function (field) {
+      if (!fine || field.closest(".off")) return;
+      field.required = true;
+      if (!field.reportValidity()) fine = false;
+      field.required = false;
+    });
+    return fine;
+  }
+
+  function review() {
+    var panel = document.getElementById("review");
+    panel.textContent = "";
+    function line(name, said) {
+      var p = document.createElement("p");
+      var strong = document.createElement("strong");
+      strong.textContent = name + ": ";
+      p.appendChild(strong);
+      p.appendChild(document.createTextNode(said));
+      panel.appendChild(p);
+    }
+    line("Database", val("db_route") === "brought"
+      ? "started inside this cluster"
+      : val("db_host") + ":" + (val("db_port") || "5432") + "/" + val("db_name") +
+        ", as " + val("db_serving_role") + " and " + val("db_migrating_role"));
+    var backend = val("backend");
+    line("Signing in", backend === "local" ? "an account here, " + val("admin_login")
+      : backend === "ldap" ? "your LDAP, " + val("ldap_servers")
+      : "your OpenID Connect provider, " + val("oidc_issuer"));
+    line("Administrators", backend === "local" ? val("admin_login") + ", the account above"
+      : "members of " + val("admin_group"));
+    line("This dashboard", val("dashboard_url"));
+  }
+
+  // Apply once a test has passed, and not after an answer has changed since.
+  var apply = form.querySelector("[data-apply]");
+  var passed = document.querySelector(".passed");
+  apply.disabled = !passed;
+  function stale() {
+    apply.disabled = true;
+    if (passed) passed.hidden = true;
+  }
+
+  // The dashboard's address, suggested from the one this page was opened
+  // at, with `localhost` for a loopback address, since plugin pages need a
+  // name to sit below.
+  var address = form.elements["dashboard_url"];
+  var warning = document.getElementById("address-warning");
+  if (address && !address.value) {
+    var host = location.hostname;
+    if (host === "127.0.0.1" || host === "[::1]" || host === "::1") host = "localhost";
+    address.value = location.protocol + "//" + host + (location.port ? ":" + location.port : "");
+  }
+  function checkAddress() {
+    var ip = false;
+    try {
+      var named = new URL(address.value).hostname;
+      ip = /^\d+\.\d+\.\d+\.\d+$/.test(named) || named.indexOf(":") >= 0 || named.charAt(0) === "[";
+    } catch (e) { ip = false; }
+    warning.hidden = !ip;
+  }
+
+  form.addEventListener("click", function (event) {
+    var list = shown();
+    if (event.target.matches("[data-next]")) {
+      event.preventDefault();
+      if (complete(current)) show(list[list.indexOf(current) + 1].id);
+    } else if (event.target.matches("[data-back]")) {
+      event.preventDefault();
+      show(list[Math.max(0, list.indexOf(current) - 1)].id);
+    }
+  });
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest("[data-go]");
+    if (link) { event.preventDefault(); show(link.dataset.go); }
+  });
+  form.addEventListener("change", function () { branches(); stale(); });
+  form.addEventListener("input", function (event) {
+    stale();
+    if (event.target === address) checkAddress();
+  });
+
+  checkAddress();
+  // Where to start: at the first step Test found something in, at the
+  // review after a test, or at the beginning.
+  var troubled = steps.filter(function (step) { return step.querySelector("ul.refusal"); });
+  show(troubled.length ? troubled[0].id : passed ? "apply" : steps[0].id);
+})();"#;
 
 #[cfg(test)]
 #[path = "first_run/tests.rs"]
