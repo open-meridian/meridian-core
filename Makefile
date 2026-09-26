@@ -904,6 +904,16 @@ chart-check:
 	[ -n "$$broker" ] && ! echo "$$broker" | grep -q '"create"\|"delete"\|"update"' \
 		&& [ "$$(echo "$$broker" | grep -A1 'resources: \["secrets"\]' | grep -c 'resourceNames: \["check-meridian-runtime-broker-launched"\]')" = 1 ] \
 		|| { echo "chart-check FAILED: the broker's process may do more than read Deployments and write its launched plugins' credentials:" >&2; echo "$$broker" >&2; exit 1; }; \
+	launcher="$$(doc Role check-meridian-runtime-launcher)"; \
+	[ -n "$$launcher" ] && [ "$$(echo "$$launcher" | grep -c 'resources:')" = 1 ] \
+		&& echo "$$launcher" | grep -q 'resources: \["deployments"\]' \
+		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019):" >&2; echo "$$launcher" >&2; exit 1; }; \
+	template="$$(doc ConfigMap check-meridian-runtime-launcher-template)"; \
+	echo "$$template" | grep -q 'meridian.dev/launched' && echo "$$template" | grep -q 'check-meridian-runtime-broker-launched' \
+		|| { echo "chart-check FAILED: the launcher's template does not mark its workloads, or takes their credential from anywhere but the launched plugins' Secret" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null | grep -q '^kind: ValidatingAdmissionPolicyBinding$$' \
+		|| { echo "chart-check FAILED: on a cluster with ValidatingAdmissionPolicy, nothing holds the launcher to its own Deployments" >&2; exit 1; }; \
 	doc Deployment check-meridian-runtime-sidecar-check-1 | grep -q '^    type: Recreate$$' \
 		|| { echo "chart-check FAILED: a plugin's Deployment rolls, so two copies of one instance would run under one name" >&2; exit 1; }; \
 	echo "$$policy" | grep -q 'meridian.dev/component: sidecar' \

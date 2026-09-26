@@ -38,6 +38,10 @@ path = "src/bin/broker_config.rs"
 name = "meridian-first-run"
 path = "src/bin/first_run.rs"
 
+[[bin]]
+name = "meridian-launcher"
+path = "src/bin/launcher.rs"
+
 
 [dependencies]
 meridian-bus = { path = "../bus" }

@@ -168,6 +168,58 @@ impl ApiServer {
         .await
     }
 
+    /// Create a Deployment in this namespace; its name, as the API has it.
+    pub async fn create_deployment(
+        &self,
+        manifest: &serde_json::Value,
+    ) -> Result<String, ClusterError> {
+        let path = format!("/apis/apps/v1/namespaces/{}/deployments", self.namespace);
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .body(manifest.to_string())
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("POST {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(ClusterError(format!("POST {path} -> {status}: {body}")));
+        }
+        let made: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|failed| ClusterError(format!("POST {path}: {failed}")))?;
+        Ok(made["metadata"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Delete a Deployment in this namespace; false when it was not there.
+    pub async fn delete_deployment(&self, name: &str) -> Result<bool, ClusterError> {
+        let path = format!(
+            "/apis/apps/v1/namespaces/{}/deployments/{name}",
+            self.namespace
+        );
+        let response = self
+            .http
+            .delete(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("DELETE {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(false);
+        }
+        if !(200..300).contains(&status) {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ClusterError(format!("DELETE {path} -> {status}: {detail}")));
+        }
+        Ok(true)
+    }
+
     /// A Secret's data, decoded. Keys whose value is not text are left out.
     pub async fn secret_text(&self, name: &str) -> Result<BTreeMap<String, String>, ClusterError> {
         use base64::Engine;

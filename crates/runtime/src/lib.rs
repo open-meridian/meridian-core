@@ -12,6 +12,7 @@
 
 pub mod broker;
 pub mod launched;
+pub mod launcher;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

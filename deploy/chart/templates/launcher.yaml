@@ -1,0 +1,187 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if and .Values.launcher.enabled .Values.registry.enabled (not .Values.broker.existingSecret) }}
+{{/*
+  The launcher: the one long-running component that may change the cluster,
+  and only this much (decisions/019, amending 016). It answers the conductor
+  alone -- the broker admits nobody else to its two topics -- and creates a
+  plugin's Deployment in the chart's own plugin shape, from the deployment's
+  own registry by digest, and removes only what it made. It holds no key, no
+  database, and no right to anything but Deployments in this namespace.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-launcher" $full }}
+{{- $broker := include "meridian-runtime.brokerSecret" . }}
+{{/*
+  The shape a launched plugin runs in: the same definition sidecar.yaml
+  renders the chart's own plugins with, its instance, image, roles and tags
+  left as placeholders the launcher fills in once it has checked them. So a
+  launched plugin and a configured one cannot drift apart.
+*/}}
+{{- $shape := include "meridian-runtime.plugin" (dict
+      "top" .
+      "name" (printf "%s-plugin-__INSTANCE__" $full)
+      "instance" "__INSTANCE__"
+      "roles" "__ROLES__"
+      "tags" "__TAGS__"
+      "brokerSecret" (printf "%s-launched" $broker)
+      "brokerKey" "__INSTANCE__.url"
+      "plugin" (dict "image" "__IMAGE__")
+      "imageTag" ""
+      "launched" true) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-template
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  plugin.json: {{ $shape | fromYaml | toJson | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# Deployments in this namespace, and nothing else: no Secret, no Service, no
+# NetworkPolicy, no Role. RBAC cannot narrow `create` to a name, so the
+# launcher narrows itself -- it creates only from the template above and
+# deletes only what carries its label -- and where the cluster has
+# ValidatingAdmissionPolicy, the cluster holds it to that too (below).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/component: launcher
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: launcher
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: launcher
+      annotations:
+        # A new template is a new launcher, so it never fills in an old one.
+        checksum/template: {{ $shape | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: launcher
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-launcher"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ .Values.launcher.instanceId | quote }}
+            - name: MERIDIAN_LAUNCHER_TEMPLATE
+              value: /etc/meridian/launcher/plugin.json
+            # The only registry a launched plugin's image may come from.
+            - name: MERIDIAN_REGISTRY_ADDRESS
+              value: {{ printf "localhost:%v" .Values.registry.hostPort | quote }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $broker }}
+                  key: {{ .Values.launcher.instanceId }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          volumeMounts:
+            - name: template
+              mountPath: /etc/meridian/launcher
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: template
+          configMap:
+            name: {{ $name }}-template
+{{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+---
+# Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
+# the launcher's account does to a Deployment, it is one the launcher made.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: the-launcher
+      expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}"
+  validations:
+    - expression: >-
+        request.operation == "DELETE"
+        ? has(oldObject.metadata.labels) &&
+          oldObject.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
+        : has(object.metadata.labels) &&
+          object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
+      message: the launcher touches only the Deployments it launched
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

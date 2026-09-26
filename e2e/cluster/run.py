@@ -810,6 +810,26 @@ spec:
         f"the node pulled localhost:{REGISTRY_PORT}/e2e/busybox:1 from the registry",
     )
 
+    print("L: the launcher, and the broker learning what it launches", flush=True)
+    # decisions/019 and the registry spec's decision 3. The launcher serving
+    # means it read its template, reached the cluster's API as its own
+    # account, and joined the bus with its own credential; the broker's own
+    # process watching means it read the Deployments and its Secret. Launching
+    # through them is section P, once uploads arrive (W8.1).
+    launcher = f"deployment/{RELEASE}-meridian-runtime-launcher"
+    wait_for(
+        "the launcher serving",
+        lambda: "the launcher is serving" in kubectl("logs", launcher),
+        seconds=300,
+    )
+    s.check(True, "the launcher reached the cluster's API and the bus as itself")
+    broker_log = kubectl("logs", f"deployment/{RELEASE}-meridian-runtime-broker")
+    s.check(
+        "the broker is running" in broker_log
+        and "launched plugins could not be read" not in broker_log,
+        "the broker runs as its own process's child, and reads the Deployments and its Secret",
+    )
+
     print(flush=True)
     if s.failures:
         print(f"e2e-cluster FAILED: {len(s.failures)}", flush=True)

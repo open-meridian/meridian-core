@@ -27,6 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
        target/release/meridian-conductor target/release/meridian-sidecar \
        target/release/meridian-dashboard \
        target/release/meridian-first-run target/release/meridian-broker-config \
+       target/release/meridian-launcher \
        /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
@@ -51,6 +52,7 @@ COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sideca
 COPY --from=build /usr/local/bin/meridian-dashboard /usr/local/bin/meridian-dashboard
 COPY --from=build /usr/local/bin/meridian-first-run /usr/local/bin/meridian-first-run
 COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-broker-config
+COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launcher
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.

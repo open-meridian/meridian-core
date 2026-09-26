@@ -33,6 +33,9 @@
 {{- $users = append $users (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) }}
 {{- $users = append $users .Values.firstRun.brokerKey }}
 {{- end }}
+{{- if and .Values.launcher.enabled .Values.registry.enabled }}
+{{- $users = append $users .Values.launcher.instanceId }}
+{{- end }}
 {{- range .Values.sidecars }}
 {{- $users = append $users .instanceId }}
 {{- end }}
@@ -108,6 +111,9 @@ data:
         {{- $entries := list }}
         {{- if .Values.dashboard.enabled }}
         {{- $entries = append $entries (dict "instance_id" (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) "component" "dashboard") }}
+        {{- end }}
+        {{- if and .Values.launcher.enabled .Values.registry.enabled }}
+        {{- $entries = append $entries (dict "instance_id" .Values.launcher.instanceId "component" "launcher") }}
         {{- end }}
         {{- range .Values.sidecars }}
         {{- $entries = append $entries (dict "instance_id" .instanceId "roles" (.roles | default list)) }}

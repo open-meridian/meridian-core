@@ -288,6 +288,14 @@ registry:
   # Unique on a cluster: two deployments on one cluster need two ports.
   hostPort: 5000
 
+# What launches the plugins a deployment admin uploads and approves (W8.3),
+# creating each a Deployment in the chart's plugin shape and nothing else
+# (decisions/019). On with the registry it launches from, and with the broker
+# this chart brings, which gives it a credential and learns what it launched.
+launcher:
+  enabled: true
+  instanceId: launcher-1
+
 
 resources:
   requests:
