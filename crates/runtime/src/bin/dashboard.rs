@@ -369,7 +369,9 @@ fn run() -> Result<(), String> {
 
             let app = router(Arc::new(App {
                 first_run,
-                wizard: Arc::new(WizardSession::default()),
+                wizard: Arc::new(WizardSession::suggesting(
+                    var("MERIDIAN_DASHBOARD_SUGGESTED_URL").unwrap_or_default(),
+                )),
                 records,
                 sessions,
                 terminals,

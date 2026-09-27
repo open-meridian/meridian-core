@@ -127,7 +127,6 @@ if SIGN_IN not in WAYS_IN:
     raise SystemExit(f"E2E_SIGN_IN is {SIGN_IN!r}; it is one of {sorted(WAYS_IN)}")
 WAY_IN = WAYS_IN[SIGN_IN]
 
-PORT = int(os.environ.get("E2E_PORT", "18480"))
 
 # Who installs the chart and answers the wizard: this runner (`runner`), or
 # `meridian up --params`, as a person does (`cli`), from E2E_CLI_IMAGE --
@@ -140,14 +139,32 @@ REGISTRY_PORT = int(os.environ.get("E2E_REGISTRY_PORT", "5000"))
 
 # Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
 BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
-WIZARD = f"http://127.0.0.1:{PORT}"
-# What the dashboard is told its address is: a name, because each plugin's
-# page is served on a name below it, and an IP address has none
-# (spec/deployment-dashboard-and-access, ruling 19; decisions/021). A browser
-# sends `localhost` and every name under it to loopback by itself. This
-# runner's own requests go to WIZARD, the same port-forward, since the
-# dashboard answers whatever it is called there.
-DASHBOARD_URL = f"http://localhost:{PORT}"
+# Reached through the chart's Ingress and the cluster's own controller -- on
+# Rancher Desktop, Traefik on this machine's port 80 -- by a name under
+# `.localhost`, which this machine resolves to itself, as every browser does
+# (spec/live-plugin-development, ruling 1). The dashboard is told the same
+# name as its address, so each plugin's page is `<instance>.plugins.<HOST>`,
+# through the same controller. No port-forward anywhere.
+HOST = os.environ.get("E2E_HOST", f"{NAMESPACE}.localhost")
+INGRESS_CLASS = os.environ.get("E2E_INGRESS_CLASS", "traefik")
+# The controller, from inside the cluster: a pod's browser reaches the
+# deployment through it by name, as this machine does.
+INGRESS_UPSTREAM = os.environ.get(
+    "E2E_INGRESS_UPSTREAM", "traefik.kube-system.svc.cluster.local:80"
+)
+DASHBOARD_URL = f"http://{HOST}"
+WIZARD = DASHBOARD_URL
+# What an ingress controller answers when the dashboard behind it is not
+# there, and how long to keep asking: the dashboard restarts twice after
+# apply, once for the Secrets and once more with the conductor.
+GATEWAY = (502, 503, 504)
+GATEWAY_RETRIES = 60
+# A pod has no resolver for `.localhost`, so it is told: the deployment's name
+# is its own loopback, where its forwarder takes the controller's place.
+HOST_ALIASES = f"""
+  hostAliases:
+    - ip: "127.0.0.1"
+      hostnames: ["{HOST}"]"""
 # The plugins section P launches, by the names their pages are found under:
 # the reference plugin as `meridian plugin new` makes it, declaring nothing,
 # and a copy of it declaring `custody`, which is what recording a statement
@@ -249,11 +266,19 @@ def post(path, fields, cookies):
             return None
 
     opener = urllib.request.build_opener(NoRedirects)
-    try:
-        answered = opener.open(request)
-        status, body, headers = answered.status, answered.read().decode(), answered.headers
-    except urllib.error.HTTPError as refused:
-        status, body, headers = refused.code, refused.read().decode(), refused.headers
+    # Through the Ingress, a gateway's 502, 503 or 504 is the controller
+    # saying the dashboard was not there -- it restarts twice after apply --
+    # never the dashboard's answer, so it is asked again. Anything the
+    # dashboard itself says is returned as it is.
+    for _ in range(GATEWAY_RETRIES):
+        try:
+            answered = opener.open(request)
+            status, body, headers = answered.status, answered.read().decode(), answered.headers
+        except urllib.error.HTTPError as refused:
+            status, body, headers = refused.code, refused.read().decode(), refused.headers
+        if status not in GATEWAY:
+            break
+        time.sleep(2)
     for value in headers.get_all("Set-Cookie") or []:
         name, _, rest = value.partition("=")
         cookies[name] = rest.split(";")[0]
@@ -263,10 +288,14 @@ def post(path, fields, cookies):
 def get(path, cookies):
     request = urllib.request.Request(f"{WIZARD}{path}")
     request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
-    try:
-        return urllib.request.urlopen(request).read().decode()
-    except urllib.error.HTTPError as refused:
-        return refused.read().decode()
+    for _ in range(GATEWAY_RETRIES):
+        try:
+            return urllib.request.urlopen(request).read().decode()
+        except urllib.error.HTTPError as refused:
+            if refused.code not in GATEWAY:
+                return refused.read().decode()
+        time.sleep(2)
+    return ""
 
 
 def fetch(method, url, cookies, fields=None):
@@ -295,10 +324,15 @@ def fetch(method, url, cookies, fields=None):
         def redirect_request(self, *_a, **_k):
             return None
 
-    try:
-        answered = urllib.request.build_opener(NoRedirects).open(request)
-    except urllib.error.HTTPError as refused:
-        answered = refused
+    # A gateway's 502 to 504 is the dashboard not being there yet, as in post.
+    for _ in range(GATEWAY_RETRIES):
+        try:
+            answered = urllib.request.build_opener(NoRedirects).open(request)
+        except urllib.error.HTTPError as refused:
+            answered = refused
+        if getattr(answered, "status", None) not in GATEWAY and getattr(answered, "code", None) not in GATEWAY:
+            break
+        time.sleep(2)
     for value in answered.headers.get_all("Set-Cookie") or []:
         name, _, rest = value.partition("=")
         cookies[name] = rest.split(";")[0]
@@ -363,7 +397,8 @@ def by_cli(s, deployment_id, enrolment_code):
     the chart installed and the wizard answered by the CLI rather than by this
     runner's own HTTP calls. It runs in a container holding the binary and the
     helm and kubectl it drives, on this machine's network, so its kubeconfig
-    and its port-forward are this machine's.
+    is this machine's, and it finds the cluster's ingress controller and
+    installs through it by `--host`, as a person's `meridian up` does.
 
     `--no-doctor`: the doctor asks the registry whether the image exists, and
     this image is the working tree's, built here and in no registry. Every
@@ -394,6 +429,9 @@ def by_cli(s, deployment_id, enrolment_code):
     command = [
         "docker", "run", "--rm", "--network", "host",
         "--add-host", "host.docker.internal:host-gateway",
+        # This machine's `.localhost` is the VM's here, where the controller
+        # listens too; the container has no resolver for it.
+        "--add-host", f"{HOST}:127.0.0.1",
         "-v", f"{kubeconfig}:/kube/config:ro", "-e", "KUBECONFIG=/kube/config",
         "-v", f"{os.path.abspath(CHART)}:/chart:ro",
         "-v", f"{params.name}:/params.yaml:ro",
@@ -402,7 +440,7 @@ def by_cli(s, deployment_id, enrolment_code):
         "--namespace", NAMESPACE, "--release", RELEASE, "--chart", "/chart",
         "--id", deployment_id, "--platform", PLATFORM_FROM_POD,
         *(["--image", IMAGE] if IMAGE else []),
-        "--params", "/params.yaml", "--port", str(PORT), "--no-doctor",
+        "--params", "/params.yaml", "--host", HOST, "--no-doctor",
     ]
     done = subprocess.run(
         command, capture_output=True, text=True, env={**os.environ, **environment}
@@ -475,6 +513,11 @@ def main():
         if IMAGE:
             repository, _, tag = IMAGE.rpartition(":")
             values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
+        values += [
+            "--set", "ingress.enabled=true",
+            "--set", f"ingress.host={HOST}",
+            "--set", f"ingress.className={INGRESS_CLASS}",
+        ]
         run("helm", "upgrade", "--install", RELEASE, CHART, "--namespace", NAMESPACE, *values)
 
         wait_for(
@@ -483,89 +526,83 @@ def main():
         )
         s.check(True, "the dashboard is up")
 
-        forward = subprocess.Popen(
-            ["kubectl", "--namespace", NAMESPACE, "port-forward",
-             f"svc/{RELEASE}-meridian-runtime-dashboard", f"{PORT}:80"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        # Through the Ingress: the controller takes a moment to read it.
+        wait_for(
+            "the dashboard through the Ingress",
+            lambda: urllib.request.urlopen(f"{WIZARD}/healthz").status == 200,
         )
-        try:
-            wait_for("the forward", lambda: urllib.request.urlopen(f"{WIZARD}/healthz").status == 200)
+        s.check(True, f"the dashboard answers at {WIZARD}, through the cluster's ingress controller")
 
-            print("C: the conductor enrolled its own key", flush=True)
-            wait_for(
-                "enrolment",
-                lambda: "not registered"
-                not in urllib.request.urlopen(f"{WIZARD}/first-run").read().decode(),
-                seconds=180,
+        print("C: the conductor enrolled its own key", flush=True)
+        wait_for(
+            "enrolment",
+            lambda: "not registered"
+            not in urllib.request.urlopen(f"{WIZARD}/first-run").read().decode(),
+            seconds=180,
+        )
+        page = urllib.request.urlopen(f"{WIZARD}/first-run").read().decode()
+        # Requirement 8, and the reason it exists: an administrator comparing
+        # the two is how a code somebody else spent is noticed. Both sides are
+        # asked here, which no other test does -- the stand-in platform simply
+        # returns a fingerprint the runner already knows.
+        held = platform_psql(
+            f"select fingerprint from domain_deploymentkey "
+            f"where deployment_id = '{deployment_id}'"
+        )
+        s.note(f"the platform holds {held}")
+        s.check(bool(held), "the platform holds a key nobody handled")
+        s.check(held in page, "and the wizard shows that same fingerprint")
+
+        print("D: the wizard, opened with a first-run code", flush=True)
+        first_run_code = platform(
+            "issue_claim_code", "--deployment", deployment_id, "--purpose", "first-run"
+        ).splitlines()[-1]
+        cookies = {}
+        status, page = post("/first-run/claim", {"code": first_run_code}, cookies)
+        # Redeeming is a signed call through the conductor, so a yes here is
+        # the platform verifying a signature against the key it registered.
+        # Nothing else in this run proves enrolment as directly.
+        s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
+
+        print(
+            f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
+            f"signing people in with {dict(local='an account it holds', ldap='the firm LDAP', oidc='the firm provider')[SIGN_IN]}",
+            flush=True,
+        )
+        answers = the_answers()
+        passes = "Everything answered so far passes"
+        if SIGN_IN == "ldap":
+            # The check binds to the directory from the Job, in the cluster,
+            # as the dashboard will. Until 2026-09-25 it dialled nothing and
+            # passed this; a wrong password was found by the first sign-in.
+            wrong = {**answers, "ldap_bind_password": "not-the-bind-password"}
+            status, page = post("/first-run/check", wrong, cookies)
+            s.check(
+                passes not in page and "could not sign in to the directory" in page,
+                "a wrong bind password is refused before anything is written",
             )
-            page = urllib.request.urlopen(f"{WIZARD}/first-run").read().decode()
-            # Requirement 8, and the reason it exists: an administrator comparing
-            # the two is how a code somebody else spent is noticed. Both sides are
-            # asked here, which no other test does -- the stand-in platform simply
-            # returns a fingerprint the runner already knows.
-            held = platform_psql(
-                f"select fingerprint from domain_deploymentkey "
-                f"where deployment_id = '{deployment_id}'"
+        if SIGN_IN == "oidc":
+            # Read from the pod, as the dashboard will: the discovery
+            # document names its issuer, and one character off is another.
+            wrong = {**answers, "oidc_issuer": IDP_ISSUER + "/"}
+            status, page = post("/first-run/check", wrong, cookies)
+            import re
+
+            # The findings, not the page: the form itself has an issuer field.
+            findings = re.findall(r"<li>([^<]*)</li>", page)
+            s.note(f"findings: {findings}")
+            s.check(
+                passes not in page and any("issuer" in f for f in findings),
+                "an issuer the provider does not call itself is refused before anything is written",
             )
-            s.note(f"the platform holds {held}")
-            s.check(bool(held), "the platform holds a key nobody handled")
-            s.check(held in page, "and the wizard shows that same fingerprint")
+        status, page = post("/first-run/check", answers, cookies)
+        s.check(passes in page, "the answers pass")
+        status, page = post("/first-run/apply", answers, cookies)
+        if "administers this deployment" not in page:
+            import re as _re
 
-            print("D: the wizard, opened with a first-run code", flush=True)
-            first_run_code = platform(
-                "issue_claim_code", "--deployment", deployment_id, "--purpose", "first-run"
-            ).splitlines()[-1]
-            cookies = {}
-            status, page = post("/first-run/claim", {"code": first_run_code}, cookies)
-            # Redeeming is a signed call through the conductor, so a yes here is
-            # the platform verifying a signature against the key it registered.
-            # Nothing else in this run proves enrolment as directly.
-            s.check(status == 303, f"the code is redeemed, so the signature held: {status}")
-
-            print(
-                f"E: applied, on a database it {'brings' if ROUTE == 'brought' else 'was pointed at'}, "
-                f"signing people in with {dict(local='an account it holds', ldap='the firm LDAP', oidc='the firm provider')[SIGN_IN]}",
-                flush=True,
-            )
-            answers = the_answers()
-            passes = "Everything answered so far passes"
-            if SIGN_IN == "ldap":
-                # The check binds to the directory from the Job, in the cluster,
-                # as the dashboard will. Until 2026-09-25 it dialled nothing and
-                # passed this; a wrong password was found by the first sign-in.
-                wrong = {**answers, "ldap_bind_password": "not-the-bind-password"}
-                status, page = post("/first-run/check", wrong, cookies)
-                s.check(
-                    passes not in page and "could not sign in to the directory" in page,
-                    "a wrong bind password is refused before anything is written",
-                )
-            if SIGN_IN == "oidc":
-                # Read from the pod, as the dashboard will: the discovery
-                # document names its issuer, and one character off is another.
-                wrong = {**answers, "oidc_issuer": IDP_ISSUER + "/"}
-                status, page = post("/first-run/check", wrong, cookies)
-                import re
-
-                # The findings, not the page: the form itself has an issuer field.
-                findings = re.findall(r"<li>([^<]*)</li>", page)
-                s.note(f"findings: {findings}")
-                s.check(
-                    passes not in page and any("issuer" in f for f in findings),
-                    "an issuer the provider does not call itself is refused before anything is written",
-                )
-            status, page = post("/first-run/check", answers, cookies)
-            s.check(passes in page, "the answers pass")
-            status, page = post("/first-run/apply", answers, cookies)
-            if "administers this deployment" not in page:
-                import re as _re
-
-                s.note(f"page: {_re.sub(r'<[^>]*>', ' ', page)[:400]}")
-            s.check("administers this deployment" in page, "applied, and it names who administers it")
-        finally:
-            forward.terminate()
-            # Gone before H binds the same port again.
-            forward.wait()
+            s.note(f"page: {_re.sub(r'<[^>]*>', ' ', page)[:400]}")
+        s.check("administers this deployment" in page, "applied, and it names who administers it")
 
     print("F: the database", flush=True)
     if ROUTE == "brought":
@@ -613,23 +650,11 @@ def main():
     # account it named did not exist, so nobody could have used it. This is
     # the dashboard in its target configuration, on this cluster, checking a
     # password against the hash the Job wrote and the store the chart gave it.
-    # A new forward, because the one above went to a container apply
-    # restarted -- and started again whenever it dies, since the dashboard
-    # restarts once more when the conductor it reads from does, and a forward
-    # to a restarted container exits rather than reconnecting. Waiting on a
-    # dead one was 300 seconds of asking a closed port.
-    forward = None
+    # Through the Ingress, which reaches whichever dashboard pod is running:
+    # a port-forward to one that apply restarted used to exit, and waiting on
+    # it was 300 seconds of asking a closed port.
 
     def signing_in():
-        nonlocal forward
-        if forward is None or forward.poll() is not None:
-            forward = subprocess.Popen(
-                ["kubectl", "--namespace", NAMESPACE, "port-forward",
-                 f"svc/{RELEASE}-meridian-runtime-dashboard", f"{PORT}:80"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(2)
         # Out of first run, which looks different by the way in: a form for
         # a password, or a redirect to the provider.
         status, away, page = fetch("GET", f"{WIZARD}/sign-in", {})
@@ -637,38 +662,33 @@ def main():
             return 'name="password"' in page
         return status in (302, 303) and (away or "").startswith(IDP_ISSUER)
 
-    try:
-        wait_for("the dashboard, out of first run", signing_in, seconds=300)
-        def signed_in(name, password):
-            if WAY_IN["by"] == "redirect":
-                return sign_in_at_provider(name)
-            session = {}
-            status, _ = post("/sign-in", {"name": name, "password": password}, session)
-            return status, session
+    wait_for("the dashboard, out of first run", signing_in, seconds=300)
+    def signed_in(name, password):
+        if WAY_IN["by"] == "redirect":
+            return sign_in_at_provider(name)
+        session = {}
+        status, _ = post("/sign-in", {"name": name, "password": password}, session)
+        return status, session
 
-        name, password = WAY_IN["administrator"]
-        who = name or "the provider's person"
-        if WAY_IN["by"] == "password":
-            status, _ = post("/sign-in", {"name": name, "password": "not-the-password"}, {})
-            s.check(status == 401, f"a wrong password for {name} is refused: {status}")
+    name, password = WAY_IN["administrator"]
+    who = name or "the provider's person"
+    if WAY_IN["by"] == "password":
+        status, _ = post("/sign-in", {"name": name, "password": "not-the-password"}, {})
+        s.check(status == 401, f"a wrong password for {name} is refused: {status}")
+    status, session = signed_in(name, password)
+    s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
+    s.check("You are a deployment admin" in get("/", session), f"and home says {who} administers it")
+    if WAY_IN["somebody_else"]:
+        # In the directory, so in; not in the group, so not an
+        # administrator. Without this, a permission granted to everybody
+        # who signs in passes every check above.
+        name, password = WAY_IN["somebody_else"]
         status, session = signed_in(name, password)
-        s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
-        s.check("You are a deployment admin" in get("/", session), f"and home says {who} administers it")
-        if WAY_IN["somebody_else"]:
-            # In the directory, so in; not in the group, so not an
-            # administrator. Without this, a permission granted to everybody
-            # who signs in passes every check above.
-            name, password = WAY_IN["somebody_else"]
-            status, session = signed_in(name, password)
-            s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
-            s.check(
-                "You are a deployment admin" not in get("/", session),
-                f"and is not an administrator, being outside the group the wizard named",
-            )
-    finally:
-        if forward is not None:
-            forward.terminate()
-            forward.wait()
+        s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
+        s.check(
+            "You are a deployment admin" not in get("/", session),
+            f"and is not an administrator, being outside the group the wizard named",
+        )
 
     if WAY_IN["by"] == "password":
         print("I: and in a real browser", flush=True)
@@ -729,7 +749,7 @@ apiVersion: v1
 kind: Pod
 metadata: {{name: e2e-terminal}}
 spec:
-  restartPolicy: Never
+  restartPolicy: Never{HOST_ALIASES}
   volumes: [{{name: shared, emptyDir: {{}}}}]
   containers:
     - name: browser
@@ -738,8 +758,8 @@ spec:
       command: [python, /e2e/terminal.py]
       volumeMounts: [{{name: shared, mountPath: /shared}}]
       env:
-        - {{name: E2E_DASHBOARD, value: "http://{RELEASE}-meridian-runtime-dashboard"}}
-        - {{name: E2E_PORT, value: "{PORT}"}}
+        - {{name: E2E_DASHBOARD, value: "http://{INGRESS_UPSTREAM}"}}
+        - {{name: E2E_HOST, value: "{HOST}"}}
         - {{name: E2E_BY, value: "{WAY_IN['by']}"}}
         - {{name: E2E_NAME, value: "{name}"}}
         - {{name: E2E_PASSWORD, value: "{password or ''}"}}
@@ -883,7 +903,7 @@ apiVersion: v1
 kind: Pod
 metadata: {{name: e2e-plugin}}
 spec:
-  restartPolicy: Never
+  restartPolicy: Never{HOST_ALIASES}
   volumes:
     - {{name: shared, emptyDir: {{}}}}
     - {{name: docker, hostPath: {{path: /var/run/docker.sock, type: Socket}}}}
@@ -894,8 +914,8 @@ spec:
       command: [python, /e2e/plugin.py]
       volumeMounts: [{{name: shared, mountPath: /shared}}]
       env:
-        - {{name: E2E_DASHBOARD, value: "http://{RELEASE}-meridian-runtime-dashboard"}}
-        - {{name: E2E_PORT, value: "{PORT}"}}
+        - {{name: E2E_DASHBOARD, value: "http://{INGRESS_UPSTREAM}"}}
+        - {{name: E2E_HOST, value: "{HOST}"}}
         - {{name: E2E_BY, value: "{WAY_IN['by']}"}}
         - {{name: E2E_NAME, value: "{name}"}}
         - {{name: E2E_PASSWORD, value: "{password or ''}"}}

@@ -571,7 +571,12 @@ fn a_page_shown_again_keeps_what_was_chosen() {
     .into_iter()
     .collect();
 
-    let page = open_page(&fields, &[(Step::Database, "a finding".to_string())], "");
+    let page = open_page(
+        &fields,
+        &[(Step::Database, "a finding".to_string())],
+        "",
+        "",
+    );
 
     assert!(page.contains("<option value=\"ldap\" selected>"), "{page}");
     assert!(
@@ -590,7 +595,7 @@ fn a_page_shown_again_keeps_what_was_chosen() {
 
 #[test]
 fn the_page_asks_three_ways_and_names_nothing_the_firm_did_not_choose() {
-    let page = open_page(&Fields::default(), &[], "");
+    let page = open_page(&Fields::default(), &[], "", "");
     for option in ["local", "ldap", "oidc"] {
         assert!(
             page.contains(&format!("<option value=\"{option}\"")),
@@ -647,7 +652,7 @@ const EVERY_FIELD: [&str; 25] = [
 
 #[test]
 fn a_first_visit_starts_a_trial_and_every_field_stays_in_the_form() {
-    let page = open_page(&Fields::default(), &[], "");
+    let page = open_page(&Fields::default(), &[], "", "");
     // Ruling 9: the database started in the cluster, and an account here.
     assert!(
         page.contains("<option value=\"brought\" selected>"),
@@ -672,7 +677,7 @@ fn a_finding_is_shown_once_at_its_own_step_and_the_way_back_to_it_at_the_review(
         (Step::Database, "no host for the database".to_string()),
         (Step::Address, "no address for the dashboard".to_string()),
     ];
-    let page = open_page(&Fields::default(), &findings, "");
+    let page = open_page(&Fields::default(), &findings, "", "");
     let at = |id: &str| {
         let open = page
             .find(&format!("<section class=\"step\" id=\"{id}\">"))
@@ -708,6 +713,7 @@ fn a_test_that_passes_says_so_where_it_is_applied() {
         &Fields::default(),
         &[],
         "Everything answered so far passes.",
+        "",
     );
     assert!(page.contains("<p class=\"passed\">Everything answered so far passes.</p>"));
     assert!(!page.contains("<li>"));
@@ -748,4 +754,20 @@ async fn home_before_setup_points_at_the_wizard_rather_than_a_sign_in() {
     assert!(body.contains("not set up yet"), "{body}");
     assert!(body.contains("href=\"/first-run\""), "{body}");
     assert!(!body.contains("/sign-in"), "{body}");
+}
+
+#[test]
+fn the_ingress_address_is_offered_and_what_was_sent_is_kept() {
+    // Offered on a first visit: the chart's Ingress knows the name.
+    let page = open_page(&Fields::default(), &[], "", "https://meridian.firm.example");
+    assert!(
+        page.contains("name=\"dashboard_url\" value=\"https://meridian.firm.example\""),
+        "{page}"
+    );
+    // After a test, what the person sent stands, even an empty field.
+    let fields: Fields = [("dashboard_url".to_string(), String::new())]
+        .into_iter()
+        .collect();
+    let page = open_page(&fields, &[], "", "https://meridian.firm.example");
+    assert!(page.contains("name=\"dashboard_url\" value=\"\""), "{page}");
 }

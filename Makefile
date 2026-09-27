@@ -925,7 +925,33 @@ chart-check:
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
-	echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, and its front door open to the dashboard alone"
+	true
+	@# The Ingress (spec/live-plugin-development, ruling 1): none unless asked
+	@# for; asked for, two names to the dashboard's one port, the plugins' a
+	@# wildcard below the host; TLS for both; the address offered to the
+	@# wizard; and a host that is an address, or none, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	[ "$$($(HELM) template check deploy/chart $$base 2>/dev/null | grep -c '^kind: Ingress$$')" = 0 ] \
+		|| { echo "chart-check FAILED: an Ingress is rendered though none was asked for" >&2; exit 1; }; \
+	on="$$($(HELM) template check deploy/chart $$base --set ingress.enabled=true --set ingress.host=meridian.firm.example \
+		--set ingress.tls.secretName=dash-tls --set ingress.tls.pluginsSecretName=plugins-tls 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render with its Ingress on" >&2; exit 1; }; \
+	ingress="$$(echo "$$on" | awk '/^---/{p=0} /^kind: Ingress$$/{p=1} p')"; \
+	echo "$$ingress" | grep -q '^    - host: "meridian.firm.example"$$' \
+		&& echo "$$ingress" | grep -q '^    - host: "\*.plugins.meridian.firm.example"$$' \
+		&& [ "$$(echo "$$ingress" | grep -c 'name: check-meridian-runtime-dashboard$$')" = 3 ] \
+		|| { echo "chart-check FAILED: the Ingress does not route the host and the plugins' wildcard to the dashboard:" >&2; echo "$$ingress" >&2; exit 1; }; \
+	echo "$$ingress" | grep -q 'secretName: "dash-tls"' && echo "$$ingress" | grep -q 'secretName: "plugins-tls"' \
+		|| { echo "chart-check FAILED: the Ingress's TLS does not cover both names" >&2; exit 1; }; \
+	echo "$$ingress" | grep -q 'proxy-body-size: "0"' \
+		|| { echo "chart-check FAILED: the Ingress would refuse an upload over nginx-ingress's default megabyte" >&2; exit 1; }; \
+	echo "$$on" | grep -A1 'MERIDIAN_DASHBOARD_SUGGESTED_URL' | grep -q '"https://meridian.firm.example"' \
+		|| { echo "chart-check FAILED: the wizard is not offered the address the Ingress serves" >&2; exit 1; }; \
+	for bad in "--set ingress.host=10.0.0.7" "--set ingress.host="; do \
+		! $(HELM) template check deploy/chart $$base --set ingress.enabled=true $$bad >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: an Ingress rendered with $$bad, where plugin pages cannot have names below it" >&2; exit 1; }; \
+	done
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, and an Ingress only when asked for"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

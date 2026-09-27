@@ -48,10 +48,11 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 UPSTREAM = os.environ["E2E_DASHBOARD"].removeprefix("http://").rstrip("/")
-PORT = int(os.environ["E2E_PORT"])
+HOST = os.environ["E2E_HOST"]
+PORT = 80
 # The dashboard's own address, as it was told it: a provider sends the
 # browser back there, and a browser keeps one host's cookies for that host.
-DASHBOARD = f"http://localhost:{PORT}"
+DASHBOARD = f"http://{HOST}"
 BY = os.environ["E2E_BY"]  # password or redirect
 NAME = os.environ.get("E2E_NAME", "")
 PASSWORD = os.environ.get("E2E_PASSWORD", "")
@@ -239,7 +240,7 @@ class RealCli:
                 time.sleep(1)
             for line in text.splitlines():
                 print(f"  | {line}", flush=True)
-            held = f"{SHARED}/config/meridian/sessions/localhost_{PORT}.json"
+            held = f"{SHARED}/config/meridian/sessions/{HOST}.json"
             if "exit=0" not in text or not os.path.exists(held):
                 return None
             mode = os.stat(held).st_mode & 0o777

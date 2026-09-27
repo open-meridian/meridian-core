@@ -63,6 +63,12 @@ spec:
             - name: MERIDIAN_DASHBOARD_LISTEN
               value: "0.0.0.0:8080"
             {{- $addresses := .Values.firstRun.addressesSecretName }}
+            {{- if and .Values.ingress.enabled .Values.ingress.host }}
+            # The address the Ingress serves, which the wizard offers rather
+            # than asks for. What the wizard is told is still what is used.
+            - name: MERIDIAN_DASHBOARD_SUGGESTED_URL
+              value: {{ printf "%s://%s" (ternary "https" "http" (not (empty .Values.ingress.tls.secretName))) .Values.ingress.host | quote }}
+            {{- end }}
             {{- if .Values.dashboard.url }}
             - name: MERIDIAN_DASHBOARD_URL
               value: {{ .Values.dashboard.url | quote }}

@@ -66,16 +66,29 @@ pub struct Wizard {
 }
 
 #[derive(Default)]
-pub struct WizardSession(Mutex<Option<Wizard>>);
+pub struct WizardSession {
+    held: Mutex<Option<Wizard>>,
+    /// The address the chart's Ingress serves, which the wizard offers for
+    /// this dashboard rather than asking for (spec/live-plugin-development,
+    /// requirement 2). Empty where there is none.
+    suggested_url: String,
+}
 
 impl WizardSession {
+    pub fn suggesting(url: impl Into<String>) -> WizardSession {
+        WizardSession {
+            held: Mutex::default(),
+            suggested_url: url.into(),
+        }
+    }
+
     pub fn start(&self, now_ns: i64) -> String {
         let wizard = Wizard {
             token: token(),
             started_at_ns: now_ns,
         };
         let key = wizard.token.clone();
-        if let Ok(mut held) = self.0.lock() {
+        if let Ok(mut held) = self.held.lock() {
             *held = Some(wizard);
         }
         key
@@ -85,7 +98,7 @@ impl WizardSession {
     /// signed-in person's, because a wizard left open in an office is the same
     /// exposure as a session left open (decisions/015).
     pub fn of(&self, presented: Option<&str>, now_ns: i64) -> Option<Wizard> {
-        let held = self.0.lock().ok()?;
+        let held = self.held.lock().ok()?;
         let wizard = held.as_ref()?;
         if presented? != wizard.token {
             return None;
@@ -100,7 +113,7 @@ impl WizardSession {
     /// configuration the Job wrote: the dashboard restarts into a directory
     /// and never serves these pages again.
     pub fn end(&self) {
-        if let Ok(mut held) = self.0.lock() {
+        if let Ok(mut held) = self.held.lock() {
             *held = None;
         }
     }
@@ -129,7 +142,13 @@ async fn first_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     let enrolment = enrolment_state(&app).await;
     match held {
         None => Html(closed_page(&enrolment, "")).into_response(),
-        Some(_) => Html(open_page(&Fields::new(), &[], "")).into_response(),
+        Some(_) => Html(open_page(
+            &Fields::new(),
+            &[],
+            "",
+            &app.wizard.suggested_url,
+        ))
+        .into_response(),
     }
 }
 
@@ -355,7 +374,13 @@ async fn check(
 
     let requests = match answers(&app, &fields).await {
         Err(refusal) => {
-            return Html(open_page(&fields, &[(Step::Apply, refusal)], "")).into_response()
+            return Html(open_page(
+                &fields,
+                &[(Step::Apply, refusal)],
+                "",
+                &app.wizard.suggested_url,
+            ))
+            .into_response()
         }
         Ok(answers) => answers.to_check(),
     };
@@ -404,7 +429,13 @@ async fn check(
     } else {
         ""
     };
-    Html(open_page(&fields, &findings, passed)).into_response()
+    Html(open_page(
+        &fields,
+        &findings,
+        passed,
+        &app.wizard.suggested_url,
+    ))
+    .into_response()
 }
 
 /// W7.5. Apply everything at once, and show the first administrator's code.
@@ -419,7 +450,13 @@ async fn apply(
 
     let configuration = match answers(&app, &fields).await {
         Err(refusal) => {
-            return Html(open_page(&fields, &[(Step::Apply, refusal)], "")).into_response()
+            return Html(open_page(
+                &fields,
+                &[(Step::Apply, refusal)],
+                "",
+                &app.wizard.suggested_url,
+            ))
+            .into_response()
         }
         Ok(answers) => answers.to_configuration(),
     };
@@ -434,7 +471,13 @@ async fn apply(
     .await
     {
         Err(failed) => {
-            return Html(open_page(&fields, &[(Step::Apply, failed)], "")).into_response()
+            return Html(open_page(
+                &fields,
+                &[(Step::Apply, failed)],
+                "",
+                &app.wizard.suggested_url,
+            ))
+            .into_response()
         }
         Ok(payload) => FirstRunApplied::decode(&payload[..]).unwrap_or_default(),
     };
@@ -454,7 +497,7 @@ async fn apply(
             .into_iter()
             .map(|finding| (Step::Apply, finding))
             .collect();
-        return Html(open_page(&fields, &findings, "")).into_response();
+        return Html(open_page(&fields, &findings, "", &app.wizard.suggested_url)).into_response();
     }
 
     app.wizard.end();
@@ -833,7 +876,12 @@ impl Step {
 ///
 /// What else reads this page: each finding as a bare `<li>`, and nothing
 /// else in one; `class="passed"` when a test passes. Both are kept.
-fn open_page(fields: &Fields, findings: &[(Step, String)], passed: &str) -> String {
+fn open_page(
+    fields: &Fields,
+    findings: &[(Step, String)],
+    passed: &str,
+    suggested_url: &str,
+) -> String {
     // A first visit gets the defaults; a page re-rendered after a test keeps
     // exactly what was sent, even a field somebody emptied.
     let fresh = fields.is_empty();
@@ -1123,7 +1171,7 @@ fn open_page(fields: &Fields, findings: &[(Step, String)], passed: &str) -> Stri
             "dashboard_url",
             "This dashboard",
             "https://meridian.firm.example",
-            "",
+            suggested_url,
             true,
         ),
         "<p class=\"warn\" id=\"address-warning\" hidden>That is an IP address, and an \

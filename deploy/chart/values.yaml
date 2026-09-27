@@ -176,6 +176,27 @@ street:
     existingSecret: ""
     key: ""
 
+# How people and the CLI reach this deployment from outside the cluster: a
+# standard Ingress, off by default (templates/ingress.yaml). The listing turns
+# it on from the buyer's domain; `meridian up` as `meridian.localhost` where the
+# cluster has an ingress controller, and port-forwards where it has none.
+ingress:
+  enabled: false
+  # The IngressClass to use; empty for the cluster's default.
+  className: ""
+  # The name people use, e.g. meridian.firm.example. Each plugin's page is on
+  # a name below it, `<instance>.plugins.<host>`, so it cannot be an address.
+  host: ""
+  # Passed through, and merged over the upload limits set for nginx-ingress.
+  annotations: {}
+  tls:
+    # A Secret holding the certificate for `host`; empty serves plain HTTP,
+    # which only a local install should.
+    secretName: ""
+    # One for `*.plugins.<host>`, a wildcard; empty uses secretName's, which
+    # then has to cover both.
+    pluginsSecretName: ""
+
 # The dashboard: the one address staff use. Signs people in through the firm's
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
 # One replica: sessions live in memory.

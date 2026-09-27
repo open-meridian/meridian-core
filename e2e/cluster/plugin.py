@@ -42,8 +42,9 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 UPSTREAM = os.environ["E2E_DASHBOARD"].removeprefix("http://").rstrip("/")
-PORT = int(os.environ["E2E_PORT"])
-DASHBOARD = f"http://localhost:{PORT}"
+HOST = os.environ["E2E_HOST"]
+PORT = 80
+DASHBOARD = f"http://{HOST}"
 BY = os.environ["E2E_BY"]  # password or redirect
 NAME = os.environ.get("E2E_NAME", "")
 PASSWORD = os.environ.get("E2E_PASSWORD", "")
@@ -172,7 +173,7 @@ def administer(context, action, fields, patience=0):
 
 def statement(page, instance):
     """Press the page's one button: what the plugin says came of it."""
-    page.goto(f"http://{instance}.plugins.localhost:{PORT}/")
+    page.goto(f"http://{instance}.plugins.{HOST}/")
     page.wait_for_load_state()
     page.click("button:has-text('Open an empty statement for me')")
     page.wait_for_load_state()
@@ -281,7 +282,7 @@ with sync_playwright() as playwright:
             page.wait_for_load_state()
         at = page.url
         check(
-            at.startswith(f"http://{INSTANCE}.plugins.localhost:{PORT}/"),
+            at.startswith(f"http://{INSTANCE}.plugins.{HOST}/"),
             f"the page is on the plugin's own host: {at}",
         )
         content = page.content()
@@ -330,7 +331,7 @@ with sync_playwright() as playwright:
     page.goto(f"{DASHBOARD}/plugins/{CUSTODY}")
     page.wait_for_load_state()
     check(
-        page.url.startswith(f"http://{CUSTODY}.plugins.localhost:{PORT}/")
+        page.url.startswith(f"http://{CUSTODY}.plugins.{HOST}/")
         and "<td>custody</td>" in page.content(),
         f"{CUSTODY}'s page shows what she may see through it: {page.url}",
     )

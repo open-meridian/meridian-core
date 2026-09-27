@@ -1,0 +1,65 @@
+{{- /*
+  How a browser and the CLI reach this deployment from outside the cluster
+  (spec/live-plugin-development, ruling 1; first-run ruling 7 as amended).
+  Off by default, because the chart knows neither the name people will use
+  nor whether the cluster has a controller to read this: the listing turns it
+  on from the buyer's domain, and `meridian up` as `meridian.localhost` where
+  a controller exists.
+
+  Two names, one port. The dashboard's own, and every plugin's page on a name
+  below it (decisions/021). Everything else -- the terminal's paths, image
+  uploads -- is the dashboard's port too, told apart by path and credential.
+  No certificate, DNS record or load balancer is made here: those are the
+  cloud's or the operator's, and the plugins' name is a wildcard, which a
+  certificate authority issues only on proof of the DNS zone.
+*/}}
+{{- if .Values.ingress.enabled }}
+{{- $host := .Values.ingress.host | required "ingress.host is required: each plugin's page is served on a name below it" }}
+{{- if regexMatch "^[0-9.]+$|:" $host }}
+{{- fail (printf "ingress.host is %s, an IP address, and an address has no names below it for plugin pages: give it a name" $host) }}
+{{- end }}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $plugins := printf "*.plugins.%s" $host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $full }}-dashboard
+  labels:
+    meridian.dev/component: dashboard
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    {{- /*
+      An upload is the one large request: a plugin's base layer is a hundred
+      megabytes and more, sent in one PUT. nginx-ingress refuses anything over
+      a megabyte by default. Other controllers read none of these, and name
+      their own settings in the chart's notes.
+    */}}
+    {{- $defaults := dict "nginx.ingress.kubernetes.io/proxy-body-size" "0" "nginx.ingress.kubernetes.io/proxy-read-timeout" "900" "nginx.ingress.kubernetes.io/proxy-send-timeout" "900" }}
+    {{- range $name, $value := merge (.Values.ingress.annotations | default dict) $defaults }}
+    {{ $name }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.ingress.tls.secretName }}
+  tls:
+    - hosts: [{{ $host | quote }}]
+      secretName: {{ . | quote }}
+    - hosts: [{{ $plugins | quote }}]
+      secretName: {{ $.Values.ingress.tls.pluginsSecretName | default . | quote }}
+  {{- end }}
+  rules:
+    {{- range list $host $plugins }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $full }}-dashboard
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

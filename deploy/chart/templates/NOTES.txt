@@ -9,14 +9,36 @@ when the platform returns. Nothing here needs restarting for that.
 
 {{ if .Values.dashboard.enabled }}Set it up. It has no database and no directory yet, and the components that
 need them are waiting rather than failing. Everything they wait for is
-answered in the wizard:
+answered in the wizard.
+{{- if .Values.ingress.enabled }}
+{{- $scheme := ternary "https" "http" (not (empty .Values.ingress.tls.secretName)) }}
+
+It is reached through the cluster's ingress controller:
+
+  {{ $scheme }}://{{ .Values.ingress.host }}/first-run
+
+It asks for a first-run code, which a deployment administrator issues on the
+platform, and offers {{ $scheme }}://{{ .Values.ingress.host }} as this dashboard's address.
+Each plugin's page is on a name below it, *.plugins.{{ .Values.ingress.host }}:
+{{- if hasSuffix ".localhost" .Values.ingress.host }} a browser
+sends every name under .localhost to this machine, so there is nothing to set up.
+{{- else }} give that
+name a DNS record to the same load balancer, and a certificate -- a wildcard,
+which a certificate authority issues only on proof of the DNS zone.
+{{- end }}
+An upload of a plugin is one large request: the Ingress lifts nginx-ingress's
+limit, and another controller needs its own body-size and timeout settings
+raised to match.
+{{- else }}
 
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "meridian-runtime.fullname" . }}-dashboard 8443:80
 
 then open http://127.0.0.1:8443/first-run. It asks for a first-run code,
-which a deployment administrator issues on the platform. A forward rather
-than an address of its own: a deployment that has not been set up should not
-be reachable from anywhere but here.
+which a deployment administrator issues on the platform. Give the dashboard's
+address as http://localhost:8443, a name: each plugin's page is on a name
+below it, which an IP address cannot have. The chart's Ingress
+(ingress.enabled) gives it an address of its own.
+{{- end }}
 
 {{ end }}Watch it:
 
