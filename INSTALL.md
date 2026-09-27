@@ -404,7 +404,7 @@ This uninstalls what Helm installed (by hand, `helm uninstall meridian
 database the deployment brought, because Helm never created that claim —
 Kubernetes did, and Kubernetes keeps it — and the deployment's key. Installing
 again picks both back up, with the data. To be rid of them,
-`meridian down --delete-namespace`, which asks first and says what goes.
+`meridian down --delete-namespace`. Neither asks: saying it is the decision.
 
 Retiring the deployment on the platform is a separate act, and the one that
 revokes its keys and stops its codes working. Uninstalling the chart leaves the
