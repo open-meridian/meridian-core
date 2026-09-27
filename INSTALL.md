@@ -20,6 +20,13 @@ Budget half an hour.
 - A Kubernetes cluster, and `kubectl` already pointing at it. A laptop cluster
   (k3s, Rancher Desktop, kind, Docker Desktop) is fine for trying this.
 - `helm`, version 3.8 or newer. Older ones cannot install from a registry.
+- The `meridian` CLI, on macOS or Linux:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/open-meridian/meridian-cli/main/install.sh | sh
+  ```
+
+  It drives your own `helm` and `kubectl`, and prints each command it runs.
 - An account on the platform, in an organisation, holding **owner** or
   **admin**. If you have neither, whoever owns the organisation can give you
   one; nothing else on this page will work without it.
@@ -28,11 +35,19 @@ You do **not** need to prepare a key or create a Secret. The deployment makes
 its own key, and the set-up wizard writes its own Secrets. If an older
 instruction told you to generate a key, ignore it.
 
-**On a laptop, the CLI does steps 3 and 6 for you.** `meridian up` installs
-the chart, reaches it as `http://meridian.localhost` through the cluster's
-ingress controller (Rancher Desktop's Traefik, say), and opens the wizard; see
-the `meridian` CLI's README. What follows is the same install by hand, which
-is also what a cluster of your firm's looks like.
+Check the cluster before anything else:
+
+```bash
+meridian doctor
+```
+
+It answers whether this machine and this cluster can run a deployment, and
+names the fix for anything that would stop the install: the cluster and your
+rights in it, Helm's version, a storage class, the image, the platform, and
+this machine's clock.
+
+**Without the CLI** everything here is still possible: the steps say what
+each command does by hand. Nothing about a deployment depends on the CLI.
 
 ### Three decisions, made now
 
@@ -63,10 +78,11 @@ do not have to get the grants exactly right here.
 **How people reach it.** Through the chart's Ingress, by a name, or not from
 outside the cluster at all until you arrange it.
 
-| | Use this when | What you set at install |
+| | Use this when | What you pass to `meridian up` |
 |---|---|---|
-| **The chart's Ingress** | Your cluster has an ingress controller, which almost every one does | `ingress.enabled=true` and `ingress.host`, the name people use. With HTTPS, the Secret holding its certificate, and one for `*.plugins.<host>` |
-| **A port-forward** | Trying it, with nothing in front of the cluster | Nothing. Step 6 forwards a local port to the dashboard |
+| **The chart's Ingress, by your name** | Your firm's cluster, with an ingress controller, which almost every one has | `--host meridian.firm.example`, and a values file naming the Secrets that hold its certificates: one for the name, one for `*.plugins.<the name>` |
+| **The chart's Ingress, on a laptop** | Trying it on Rancher Desktop, Docker Desktop or k3s | Nothing: it is `http://meridian.localhost` |
+| **A port-forward** | A cluster with no ingress controller | Nothing: `meridian up` forwards a port when it finds no controller, and holds it while you answer the wizard. `--no-ingress` asks for it anyway |
 
 **It must be a name, not an address.** Each plugin's page is served on its own
 name below the dashboard's, `<instance>.plugins.<host>`, so that one plugin's
@@ -116,45 +132,52 @@ service first.
 
 ## 3. Install the chart
 
-Make a namespace and install. Substitute your identifier and your code:
+Put the enrolment code in the environment rather than on the command line,
+where your shell's history would keep it, and install with your identifier:
 
 ```bash
-kubectl create namespace meridian
+export MERIDIAN_ENROLMENT_CODE=ENR-XXXX-XXXX-XXXX
+meridian up --id DEP-XXXX-XXXX --host meridian.firm.example -f ingress.yaml
 ```
 
-```bash
-helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
-  --namespace meridian \
-  --set deployment.id=DEP-XXXX-XXXX \
-  --set deployment.enrolmentCode=ENR-XXXX-XXXX-XXXX
+`ingress.yaml` names the Secrets holding the certificates. Leave
+`pluginsSecretName` out when the first certificate covers both names:
+
+```yaml
+ingress:
+  tls:
+    secretName: meridian-tls
+    pluginsSecretName: meridian-plugins-tls
 ```
 
-That is the whole command, on every branch. How people sign in is answered in
-the wizard, not here.
+On a laptop, `meridian up --id DEP-XXXX-XXXX` is the whole command: it is
+reached as `http://meridian.localhost`, which needs no certificate and no DNS.
+Where the cluster has no ingress controller, it forwards a local port
+instead, and `--no-ingress` asks for that anyway.
 
-To reach it through the chart's Ingress, add the name, and for HTTPS the
-Secrets holding the certificates (one for the name, one for the wildcard
-below it; leave the second empty when the first covers both):
+That is all an install is given, on every branch. How people sign in is
+answered in the wizard, not here. The namespace is `meridian` (`-n` for
+another), and you do not tell it where the platform is.
 
-```bash
-  --set ingress.enabled=true \
-  --set ingress.host=meridian.firm.example \
-  --set ingress.tls.secretName=meridian-tls \
-  --set ingress.tls.pluginsSecretName=meridian-plugins-tls
-```
-
-On a laptop, `--set ingress.enabled=true --set ingress.host=meridian.localhost`
-needs no certificate and no DNS.
-
-**A sandbox for writing plugins** adds `--set development=true`. It may then run
-plugin code as it is being written, which nobody has reviewed, and every page
-says so. Never on a deployment your firm depends on: it is set at install and
+**A sandbox for writing plugins** adds `--development`. It may then run plugin
+code as it is being written, which nobody has reviewed, and every page says
+so. Never on a deployment your firm depends on: it is set at install and
 nowhere else, and turning it off stops every plugin running that way.
 
-You do not tell it where the platform is. Leave `platform.address` alone unless
-somebody has asked you to test against a staging platform.
+`meridian up` runs `meridian doctor` first, then prints the Helm command it
+runs, installs, waits for the dashboard, and prints the wizard's address.
+**By hand**, the command it prints is the install:
 
-Now wait for the pods:
+```bash
+helm upgrade --install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
+  --namespace meridian --create-namespace \
+  --set deployment.id=DEP-XXXX-XXXX \
+  --set deployment.enrolmentCode="$MERIDIAN_ENROLMENT_CODE" \
+  --set ingress.enabled=true --set ingress.host=meridian.firm.example \
+  -f ingress.yaml
+```
+
+Now look at the pods:
 
 ```bash
 kubectl --namespace meridian get pods --watch
@@ -206,17 +229,18 @@ person proving they are allowed to set it up.
 
 ## 6. Open the wizard
 
-**Through the Ingress,** open `https://<host>/first-run` (`http://` for a
-`.localhost` name). Nothing about the wizard is open to whoever finds it: it
-asks for the first-run code before anything else, and it is gone once applied.
+Open the address `meridian up` printed: `https://<your name>/first-run`, or
+`http://meridian.localhost/first-run` on a laptop. Nothing about the wizard is
+open to whoever finds it: it asks for the first-run code before anything else,
+and it is gone once applied.
 
-**Without one,** reach it through a forward:
+With `--no-ingress`, it printed `http://127.0.0.1:8443/first-run` and holds a
+port-forward open there until you press Ctrl-C, which you do once the wizard
+says it is done. **By hand**, that forward is:
 
 ```bash
 kubectl --namespace meridian port-forward svc/meridian-meridian-runtime-dashboard 8443:80
 ```
-
-Leave that running, and open <http://127.0.0.1:8443/first-run>.
 
 **Compare the fingerprints now.** The page shows this deployment's identifier
 and its key's fingerprint before it asks for anything. It must match what the
@@ -310,12 +334,21 @@ gave it, and sign in through the directory you configured. The administrators yo
 deployment admin from their first sign-in; nothing else needs redeeming, and
 there is no code to type.
 
-That is the install finished.
+That is the install finished. To work with it from a terminal, bringing
+plugins in and developing them, sign the CLI in as yourself:
+
+```bash
+meridian connect https://meridian.firm.example
+```
+
+It opens the deployment's own sign-in in your browser and never takes a
+password; the `meridian` CLI's README goes on from there.
 
 ## When something is not right
 
 | What you see | What it means | What to do |
 |---|---|---|
+| `meridian doctor` or `meridian up` stops before installing | Something it checked would stop the install | Do what it names, and run it again. Nothing was installed |
 | The wizard asks for an enrolment code, not a first-run code | The conductor could not enrol — usually a code already spent or expired | Issue a fresh enrolment code and enter it on that page. Nothing needs reinstalling |
 | The fingerprints differ | Somebody else spent your enrolment code | Revoke that key on the platform, issue a new code, re-enrol. Do not continue |
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there. Codes are refused while it is retired |
