@@ -598,6 +598,11 @@ def main():
                 "an issuer the provider does not call itself is refused before anything is written",
             )
         status, page = post("/first-run/check", answers, cookies)
+        if passes not in page:
+            import re
+
+            # What the check found, or the run says only that it failed.
+            s.note(f"findings: {re.findall(r'<li>([^<]*)</li>', page)} ({status})")
         s.check(passes in page, "the answers pass")
         status, page = post("/first-run/apply", answers, cookies)
         if "administers this deployment" not in page:
@@ -679,7 +684,12 @@ def main():
         s.check(status == 401, f"a wrong password for {name} is refused: {status}")
     status, session = signed_in(name, password)
     s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
-    s.check("You are a deployment admin" in get("/", session), f"and home says {who} administers it")
+    home = get("/", session)
+    if "You are a deployment admin" not in home:
+        import re
+
+        s.note(f"home: {re.sub(r'<[^>]*>', ' ', home.split('</style>')[-1])[:300]}")
+    s.check("You are a deployment admin" in home, f"and home says {who} administers it")
     if WAY_IN["somebody_else"]:
         # In the directory, so in; not in the group, so not an
         # administrator. Without this, a permission granted to everybody

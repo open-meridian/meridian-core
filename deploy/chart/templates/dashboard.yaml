@@ -25,6 +25,14 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Recreate, for the reason replicaCount is 1: a rolling update starts the
+  # new pod beside the old one, and for as long as both serve, the Ingress
+  # sends a request to either -- a person signed in on one is nobody on the
+  # other. The cluster run found it the moment after the wizard's apply
+  # restarts the dashboard: signed in, then home said nothing about it.
+  # Sessions end with a restart either way; this ends them once, cleanly.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
