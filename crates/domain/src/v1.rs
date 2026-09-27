@@ -916,6 +916,11 @@ pub enum ClaimCodePurpose {
     /// Opens the deployment's first-run wizard (W7.3). Honouring one also issues
     /// the first administrator's code, in the same act.
     FirstRun = 2,
+    /// Sets a new password for a local account holding deployment admin, named
+    /// when it is redeemed on the sign-in page (W6.16). Redeemed by nobody signed
+    /// in, since whoever holds one cannot sign in; the platform proves who may
+    /// ask, and never sees the password.
+    ResetLocalAdmin = 3,
 }
 impl ClaimCodePurpose {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -927,6 +932,7 @@ impl ClaimCodePurpose {
             Self::Unspecified => "CLAIM_CODE_PURPOSE_UNSPECIFIED",
             Self::FirstAdmin => "CLAIM_CODE_PURPOSE_FIRST_ADMIN",
             Self::FirstRun => "CLAIM_CODE_PURPOSE_FIRST_RUN",
+            Self::ResetLocalAdmin => "CLAIM_CODE_PURPOSE_RESET_LOCAL_ADMIN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -935,6 +941,7 @@ impl ClaimCodePurpose {
             "CLAIM_CODE_PURPOSE_UNSPECIFIED" => Some(Self::Unspecified),
             "CLAIM_CODE_PURPOSE_FIRST_ADMIN" => Some(Self::FirstAdmin),
             "CLAIM_CODE_PURPOSE_FIRST_RUN" => Some(Self::FirstRun),
+            "CLAIM_CODE_PURPOSE_RESET_LOCAL_ADMIN" => Some(Self::ResetLocalAdmin),
             _ => None,
         }
     }

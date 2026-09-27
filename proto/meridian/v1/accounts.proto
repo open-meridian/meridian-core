@@ -650,6 +650,12 @@ enum ClaimCodePurpose {
   // Opens the deployment's first-run wizard (W7.3). Honouring one also issues
   // the first administrator's code, in the same act.
   CLAIM_CODE_PURPOSE_FIRST_RUN = 2;
+
+  // Sets a new password for a local account holding deployment admin, named
+  // when it is redeemed on the sign-in page (W6.16). Redeemed by nobody signed
+  // in, since whoever holds one cannot sign in; the platform proves who may
+  // ask, and never sees the password.
+  CLAIM_CODE_PURPOSE_RESET_LOCAL_ADMIN = 3;
 }
 
 message IssueClaimCodeRequest {
