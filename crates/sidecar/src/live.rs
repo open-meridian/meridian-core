@@ -186,12 +186,13 @@ impl Live {
             .collect()
     }
 
-    /// What the plugin printed after a revision.
-    pub fn output_since(&self, since: u64) -> serde_json::Value {
+    /// What the plugin printed after a revision, or all of it kept when no
+    /// revision is named -- the first run is revision 0, which nothing is after.
+    pub fn output_since(&self, since: Option<u64>) -> serde_json::Value {
         let lines: Vec<serde_json::Value> = self
             .lines("output.jsonl")
             .into_iter()
-            .filter(|entry| entry["revision"].as_u64().unwrap_or(0) > since)
+            .filter(|entry| after(entry, since))
             .map(|entry| entry["line"].clone())
             .collect();
         serde_json::json!({ "revision": self.revision(), "lines": lines })
@@ -199,12 +200,12 @@ impl Live {
 
     /// The runner's events and this sidecar's, after a revision, in the
     /// order they happened.
-    pub fn events_since(&self, since: u64) -> serde_json::Value {
+    pub fn events_since(&self, since: Option<u64>) -> serde_json::Value {
         let mut events: Vec<serde_json::Value> = self
             .lines("runner-events.jsonl")
             .into_iter()
             .chain(self.lines("sidecar-events.jsonl"))
-            .filter(|entry| entry["revision"].as_u64().unwrap_or(0) > since)
+            .filter(|entry| after(entry, since))
             .collect();
         events.sort_by(|a, b| {
             let at = |e: &serde_json::Value| e["at"].as_f64().unwrap_or(0.0);
@@ -214,14 +215,17 @@ impl Live {
     }
 }
 
+fn after(entry: &serde_json::Value, since: Option<u64>) -> bool {
+    since.is_none_or(|since| entry["revision"].as_u64().unwrap_or(0) > since)
+}
+
 /// Answer a development path, `what` being what follows the prefix.
 pub async fn answer(live: &Live, what: &str, request: Request) -> Response {
     let (endpoint, query) = what.split_once('?').unwrap_or((what, ""));
     let since = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("since="))
-        .and_then(|held| held.parse().ok())
-        .unwrap_or(0);
+        .and_then(|held| held.parse().ok());
     let json =
         |status: StatusCode, body: serde_json::Value| (status, axum::Json(body)).into_response();
     match (request.method().clone(), endpoint) {

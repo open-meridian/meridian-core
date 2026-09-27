@@ -107,9 +107,12 @@ fn output_and_events_are_what_came_after_a_revision_in_order() {
     )
     .unwrap();
     live.record(1, "synced", serde_json::json!({}));
-    let output = live.output_since(0);
+    let output = live.output_since(Some(0));
     assert_eq!(output["lines"], serde_json::json!(["new"]));
-    let events = live.events_since(0)["events"].as_array().unwrap().clone();
+    let events = live.events_since(Some(0))["events"]
+        .as_array()
+        .unwrap()
+        .clone();
     let named: Vec<&str> = events
         .iter()
         .map(|e| e["event"].as_str().unwrap())
@@ -119,7 +122,7 @@ fn output_and_events_are_what_came_after_a_revision_in_order() {
         ["restarted", "ready", "synced"],
         "by when they happened"
     );
-    assert!(live.events_since(1)["events"]
+    assert!(live.events_since(Some(1))["events"]
         .as_array()
         .unwrap()
         .is_empty());
@@ -134,7 +137,10 @@ fn a_refusal_is_recorded_against_the_revision_running() {
     live.refused(
         "no grant for platform.street.command.record-statement: this plugin holds no role",
     );
-    let events = live.events_since(0)["events"].as_array().unwrap().clone();
+    let events = live.events_since(Some(0))["events"]
+        .as_array()
+        .unwrap()
+        .clone();
     let refused = events.iter().find(|e| e["event"] == "refused").unwrap();
     assert_eq!(refused["revision"], 1);
     assert!(refused["reason"].as_str().unwrap().contains("no grant"));
@@ -147,4 +153,20 @@ fn only_both_make_an_endpoint() {
     assert!(Live::from_env(Some("/plugin/live".into()), false).is_none());
     assert!(Live::from_env(None, true).is_none());
     assert!(Live::from_env(Some(String::new()), true).is_none());
+}
+
+#[test]
+fn asked_for_nothing_in_particular_it_is_everything_kept() {
+    let dir = folder("all");
+    let live = Live::new(&dir);
+    live.record(0, "restarted", serde_json::json!({}));
+    assert_eq!(
+        live.events_since(None)["events"].as_array().unwrap().len(),
+        1
+    );
+    assert!(live.events_since(Some(0))["events"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }
