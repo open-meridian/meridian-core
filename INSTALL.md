@@ -24,14 +24,19 @@ Budget half an hour.
   **admin**. If you have neither, whoever owns the organisation can give you
   one; nothing else on this page will work without it.
 
-You do **not** need to prepare a key, create a Secret, obtain a certificate, or
-give the deployment a public address. The deployment makes its own key, and the
-set-up wizard writes its own Secrets. If an older instruction told you to
-generate a key, ignore it.
+You do **not** need to prepare a key or create a Secret. The deployment makes
+its own key, and the set-up wizard writes its own Secrets. If an older
+instruction told you to generate a key, ignore it.
 
-### The two decisions, made now
+**On a laptop, the CLI does steps 3 and 6 for you.** `meridian up` installs
+the chart, reaches it as `http://meridian.localhost` through the cluster's
+ingress controller (Rancher Desktop's Traefik, say), and opens the wizard; see
+the `meridian` CLI's README. What follows is the same install by hand, which
+is also what a cluster of your firm's looks like.
 
-Both are easier to make before you install than after.
+### Three decisions, made now
+
+Each is easier to make before you install than after.
 
 **Where the database lives.**
 
@@ -54,6 +59,22 @@ GRANT ALL ON DATABASE meridian TO meridian_migrate;
 
 The wizard tests both and names the statement that fixes what it finds, so you
 do not have to get the grants exactly right here.
+
+**How people reach it.** Through the chart's Ingress, by a name, or not from
+outside the cluster at all until you arrange it.
+
+| | Use this when | What you set at install |
+|---|---|---|
+| **The chart's Ingress** | Your cluster has an ingress controller, which almost every one does | `ingress.enabled=true` and `ingress.host`, the name people use. With HTTPS, the Secret holding its certificate, and one for `*.plugins.<host>` |
+| **A port-forward** | Trying it, with nothing in front of the cluster | Nothing. Step 6 forwards a local port to the dashboard |
+
+**It must be a name, not an address.** Each plugin's page is served on its own
+name below the dashboard's, `<instance>.plugins.<host>`, so that one plugin's
+page can never act as the person on the dashboard or on another plugin. An IP
+address has no names below it, so the chart refuses one as the host. You need
+DNS for the name and a wildcard below it, `*.plugins.<host>`, both pointing at
+the ingress controller. On a laptop, any name ending `.localhost` needs
+neither: every browser sends it to the machine it is on.
 
 **How people sign in.** One of three, and unlike the database this one you
 can leave until the wizard — nothing about it is passed at install.
@@ -111,6 +132,25 @@ helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
 That is the whole command, on every branch. How people sign in is answered in
 the wizard, not here.
 
+To reach it through the chart's Ingress, add the name, and for HTTPS the
+Secrets holding the certificates (one for the name, one for the wildcard
+below it; leave the second empty when the first covers both):
+
+```bash
+  --set ingress.enabled=true \
+  --set ingress.host=meridian.firm.example \
+  --set ingress.tls.secretName=meridian-tls \
+  --set ingress.tls.pluginsSecretName=meridian-plugins-tls
+```
+
+On a laptop, `--set ingress.enabled=true --set ingress.host=meridian.localhost`
+needs no certificate and no DNS.
+
+**A sandbox for writing plugins** adds `--set development=true`. It may then run
+plugin code as it is being written, which nobody has reviewed, and every page
+says so. Never on a deployment your firm depends on: it is set at install and
+nowhere else, and turning it off stops every plugin running that way.
+
 You do not tell it where the platform is. Leave `platform.address` alone unless
 somebody has asked you to test against a staging platform.
 
@@ -166,8 +206,11 @@ person proving they are allowed to set it up.
 
 ## 6. Open the wizard
 
-The wizard is not given a public address and should not have one. Reach it
-through a forward:
+**Through the Ingress,** open `https://<host>/first-run` (`http://` for a
+`.localhost` name). Nothing about the wizard is open to whoever finds it: it
+asks for the first-run code before anything else, and it is gone once applied.
+
+**Without one,** reach it through a forward:
 
 ```bash
 kubectl --namespace meridian port-forward svc/meridian-meridian-runtime-dashboard 8443:80
@@ -185,8 +228,10 @@ Then enter the first-run code and continue.
 
 ## 7. Answer the wizard
 
-Four sections. Nothing is written until you press **Apply**, and **Test** may
-be pressed as often as you like.
+Five steps, one at a time: **Database**, **Signing in**, **Administrators**,
+**Address**, and **Review and apply**. Nothing is written until you press
+**Apply**, and **Test** may be pressed as often as you like; what it finds is
+shown at the step it is about.
 
 **Database.** Choose the route you decided on. *Start one inside this cluster*
 asks you for nothing further. *Use a database you already run* wants the host,
@@ -245,10 +290,10 @@ states a person's groups when they sign in, and it is not asked to list them.
 A group that does not exist is a deployment nobody can administer, and getting back in then
 means a claim code from the platform.
 
-**Addresses.** Where a browser reaches this deployment. One address: nothing
-of ours redirects a browser anywhere else, so there is no second host to
-arrange. This is the address your staff will use, not the `127.0.0.1` forward
-you are reading this through.
+**Address.** Where a browser reaches this deployment: the Ingress's name,
+which the wizard offers when there is one. This is the address your staff will
+use, not a `127.0.0.1` forward you may be reading this through, and it must be
+a name for plugins' pages to have names below it.
 
 Press **Test**. It checks every answer the way Apply will: the database roles,
 your provider or directory (by connecting to it, from inside the cluster), the
@@ -260,8 +305,8 @@ minutes. The Job that writes gives its rights up when it finishes.
 
 ## 8. Sign in
 
-Stop the port-forward. Open the dashboard at the address you gave it, and sign
-in through the directory you configured. The administrators you named hold
+Stop the port-forward if you used one. Open the dashboard at the address you
+gave it, and sign in through the directory you configured. The administrators you named hold
 deployment admin from their first sign-in; nothing else needs redeeming, and
 there is no code to type.
 
