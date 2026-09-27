@@ -36,6 +36,12 @@ impl Sidecar {
         let mut refusals = self.refusals.lock().expect("refusal lock poisoned");
         refusals.0 += 1;
         refusals.1 = reason.to_string();
+        drop(refusals);
+        // And in a live instance's events, where whoever is developing it is
+        // watching for exactly this.
+        if let Some(live) = self.live.get() {
+            live.refused(reason);
+        }
     }
 
     /// The report, with the plugin unhealthy while a required setting it

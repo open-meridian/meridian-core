@@ -86,6 +86,11 @@ struct Harness {
 /// A plugin behind its real sidecar and front door on loopback, a dashboard
 /// holding the key the sidecar trusts, and Ada signed in to it.
 async fn harness(instances: &[&str]) -> Harness {
+    harness_with(instances, None).await
+}
+
+/// The same, the sidecar live on a development deployment when given a folder.
+async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> Harness {
     let reached: Reached = Arc::default();
     let recorded = Arc::clone(&reached);
     let plugin = Router::new().fallback(move |request: axum::extract::Request| {
@@ -135,6 +140,9 @@ async fn harness(instances: &[&str]) -> Harness {
         .unwrap()
         .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
+    if let Some(dir) = live {
+        sidecar.go_live(Arc::new(meridian_sidecar::live::Live::new(dir)));
+    }
     let door = front_door::router(
         FrontDoor::new(
             sidecar,
@@ -825,4 +833,138 @@ async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
         "{}",
         home.body
     );
+}
+
+/// A terminal session for Ada, as `meridian connect` gets one.
+fn terminal(app: &Arc<App>) -> String {
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const BACK: &str = "http://127.0.0.1:53682/callback";
+    let now = app.clock.now_ns();
+    let terminals = &app.terminals;
+    let id = terminals.open(
+        crate::terminal::check(BACK, CHALLENGE, "S256", "st").unwrap(),
+        now,
+    );
+    let person = crate::terminal::Person {
+        subject: ADA.into(),
+        display_name: "Ada".into(),
+        directory_groups: vec![],
+        signed_in_at_ns: now,
+    };
+    let confirm = terminals.signed_in(&id, person, now).unwrap();
+    let (_, code) = terminals.decide(&id, &confirm, true, now).unwrap();
+    terminals
+        .exchange(&code.unwrap(), VERIFIER, BACK, now)
+        .unwrap()
+        .session
+}
+
+async fn develop(app: &Arc<App>, method: Method, path: &str, bearer: &str, body: &str) -> Answer {
+    let response = router(Arc::clone(app))
+        .oneshot(
+            HttpRequest::builder()
+                .method(method)
+                .uri(path)
+                .header(HOST, DASHBOARD)
+                .header(AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+#[tokio::test]
+async fn a_deployment_admin_sends_a_live_plugin_a_change_from_the_terminal() {
+    let dir = std::env::temp_dir().join(format!("meridian-dash-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let h = harness_with(&[], Some(dir.clone())).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let session = terminal(&h.app);
+    let change = r#"{"files":{"src/page.py":"cHJpbnQoMSk="}}"#;
+
+    let sent = develop(
+        &h.app,
+        Method::PUT,
+        &format!("/terminal/plugins/{INSTANCE}/dev/files"),
+        &session,
+        change,
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+    assert!(sent.body.contains(r#""revision":1"#), "{}", sent.body);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/page.py")).unwrap(),
+        "print(1)"
+    );
+    let events = develop(
+        &h.app,
+        Method::GET,
+        &format!("/terminal/plugins/{INSTANCE}/dev/events?since=0"),
+        &session,
+        "",
+    )
+    .await;
+    assert!(
+        events.body.contains(r#""event":"synced""#),
+        "{}",
+        events.body
+    );
+    assert!(
+        h.reached.lock().unwrap().is_empty(),
+        "nothing reached the plugin"
+    );
+
+    // Not a deployment admin: refused here, before the sidecar is asked.
+    h.app
+        .records
+        .store(records(&[INSTANCE]), h.app.clock.now_ns());
+    let refused = develop(
+        &h.app,
+        Method::PUT,
+        &format!("/terminal/plugins/{INSTANCE}/dev/files"),
+        &session,
+        change,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    // A path that is not one of the three.
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let other = develop(
+        &h.app,
+        Method::GET,
+        &format!("/terminal/plugins/{INSTANCE}/dev/secrets"),
+        &session,
+        "",
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_instance_that_is_not_live_has_no_development_path() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let session = terminal(&h.app);
+    let answer = develop(
+        &h.app,
+        Method::PUT,
+        &format!("/terminal/plugins/{INSTANCE}/dev/files"),
+        &session,
+        "{}",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
+    assert!(h.reached.lock().unwrap().is_empty());
 }

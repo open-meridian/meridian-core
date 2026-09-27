@@ -957,7 +957,21 @@ chart-check:
 		|| { echo "chart-check FAILED: a deployment nobody installed for development is told it is one" >&2; exit 1; }; \
 	$(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep -A1 MERIDIAN_DEVELOPMENT | grep -q '"true"' \
 		|| { echo "chart-check FAILED: a deployment installed for development does not tell its dashboard" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, and development only when asked for"
+	@# The live shape (spec/live-plugin-development): the launcher's second
+	@# template on a development deployment alone, with the shared folder, the
+	@# shared group and the dev runner; the plugin shape unchanged by it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'plugin-live.json' \
+		|| { echo "chart-check FAILED: a deployment not for development renders the live shape" >&2; exit 1; }; \
+	live="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin-live.json:')"; \
+	for said in 'meridian-dev' 'fsGroup' '/plugin/live' 'MERIDIAN_LIVE_DIR' 'meridian.dev/live' 'meridian.dev/launched'; do \
+		echo "$$live" | grep -q "$$said" \
+			|| { echo "chart-check FAILED: the live shape does not carry $$said" >&2; exit 1; }; \
+	done; \
+	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
+	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup' \
+		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, and the live shape there alone"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

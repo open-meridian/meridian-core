@@ -294,6 +294,15 @@ fn contract() -> Contract {
 /// A sidecar whose plugin registered, declaring `port` for its page, and its
 /// front door listening; the door's address comes back.
 async fn front_door(key: &SigningKey, port: Option<u32>) -> String {
+    front_door_live(key, port, None).await
+}
+
+/// The same, live on a development deployment when given a folder.
+async fn front_door_live(
+    key: &SigningKey,
+    port: Option<u32>,
+    live: Option<std::path::PathBuf>,
+) -> String {
     let bus = Arc::new(Bus::single(INSTANCE, Arc::new(MemoryBackend::new())));
     let sidecar = Arc::new(Sidecar::under(
         &contract(),
@@ -314,6 +323,9 @@ async fn front_door(key: &SigningKey, port: Option<u32>) -> String {
         .unwrap()
         .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
+    if let Some(dir) = live {
+        sidecar.go_live(Arc::new(crate::live::Live::new(dir)));
+    }
 
     let door = router(
         FrontDoor::new(
@@ -484,4 +496,67 @@ async fn an_interface_on_a_port_that_is_not_one_is_refused_at_registration() {
             reply.refusal_reason
         );
     }
+}
+
+#[tokio::test]
+async fn a_development_path_is_answered_here_and_never_reaches_the_plugin() {
+    let key = key();
+    let (port, reached) = plugin().await;
+    let client = reqwest::Client::new();
+    let change = serde_json::json!({ "files": { "src/page.py": "cHJpbnQoMSk=" } }).to_string();
+
+    // Not live: no such endpoint, answered here, whoever asks.
+    let ordinary = front_door(&key, Some(port.into())).await;
+    let answer = client
+        .put(format!("{ordinary}/.meridian/dev/files"))
+        .header(HEADER, fresh(&key, "d-1"))
+        .body(change.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 404);
+    assert!(reached.lock().unwrap().is_empty());
+
+    // Live, with no page declared -- a plugin that crashed has none -- and
+    // the assertion still required.
+    let dir = scratch("live-door");
+    let live = front_door_live(&key, None, Some(dir.clone())).await;
+    let unvouched = client
+        .put(format!("{live}/.meridian/dev/files"))
+        .body(change.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unvouched.status(), 401);
+    let written = client
+        .put(format!("{live}/.meridian/dev/files"))
+        .header(HEADER, fresh(&key, "d-2"))
+        .body(change)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(written.status(), 200);
+    let said: serde_json::Value = serde_json::from_str(&written.text().await.unwrap()).unwrap();
+    assert_eq!(said["revision"], 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/page.py")).unwrap(),
+        "print(1)"
+    );
+    let events: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{live}/.meridian/dev/events?since=0"))
+            .header(HEADER, fresh(&key, "d-3"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(events["events"][0]["event"], "synced");
+    assert!(
+        reached.lock().unwrap().is_empty(),
+        "nothing reached the plugin"
+    );
 }

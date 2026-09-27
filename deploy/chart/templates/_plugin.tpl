@@ -8,8 +8,11 @@
   Takes a dict: top (the chart), name (the Deployment's), instance, roles and
   tags (comma-joined), brokerSecret and brokerKey (where the sidecar's broker
   credential is), plugin (image, pullPolicy, args, env, existingSecret,
-  resources, imagePullSecret; absent for a sidecar alone), imageTag, and
-  launched, which marks what the launcher made and alone may remove.
+  resources, imagePullSecret; absent for a sidecar alone), imageTag,
+  launched, which marks what the launcher made and alone may remove, and
+  live: the live shape of a development deployment
+  (spec/live-plugin-development), where the plugin runs the files sent to it
+  since its image, from a folder it shares with its sidecar.
 
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -30,6 +33,9 @@ metadata:
     meridian.dev/instance: {{ .instance | quote }}
     {{- if .launched }}
     meridian.dev/launched: "true"
+    {{- end }}
+    {{- if .live }}
+    meridian.dev/live: "true"
     {{- end }}
     {{- include "meridian-runtime.labels" $top | nindent 4 }}
   {{- if .launched }}
@@ -60,6 +66,9 @@ spec:
         {{- if .launched }}
         meridian.dev/launched: "true"
         {{- end }}
+        {{- if .live }}
+        meridian.dev/live: "true"
+        {{- end }}
     spec:
       {{- /*
         Named for its instance under the one Service every plugin shares
@@ -69,7 +78,16 @@ spec:
       */}}
       hostname: {{ .instance }}
       subdomain: {{ include "meridian-runtime.fullname" $top }}-sidecars
-      {{- with $top.Values.podSecurityContext }}
+      {{- /*
+        Live: the plugin (65532) and its sidecar share the live folder, each
+        replacing what the other wrote, so the pod shares a group they both
+        write it as.
+      */}}
+      {{- $podSecurity := $top.Values.podSecurityContext | default dict }}
+      {{- if .live }}
+      {{- $podSecurity = merge (dict "fsGroup" 65532) $podSecurity }}
+      {{- end }}
+      {{- with $podSecurity }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -129,14 +147,32 @@ spec:
                 secretKeyRef:
                   name: {{ .brokerSecret }}
                   key: {{ .brokerKey | quote }}
+            {{- if .live }}
+            {{/*
+              The live folder, and that this is a development deployment:
+              both, or the sidecar answers no development request.
+            */}}
+            - name: MERIDIAN_LIVE_DIR
+              value: /plugin/live
+            - name: MERIDIAN_DEVELOPMENT
+              value: "true"
+            {{- end }}
           {{- if $top.Values.dashboard.enabled }}
           ports:
             - name: front-door
               containerPort: {{ $top.Values.sidecar.frontDoorPort }}
+          {{- end }}
+          {{- if or $top.Values.dashboard.enabled .live }}
           volumeMounts:
+            {{- if $top.Values.dashboard.enabled }}
             - name: dashboard-keys
               mountPath: /etc/meridian/dashboard-keys
               readOnly: true
+            {{- end }}
+            {{- if .live }}
+            - name: live
+              mountPath: /plugin/live
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml $top.Values.resources | nindent 12 }}
@@ -159,9 +195,17 @@ spec:
         - name: plugin
           image: {{ required "a plugin needs its image" .image | quote }}
           imagePullPolicy: {{ .pullPolicy | default "IfNotPresent" }}
+          {{- if $.live }}
+          {{- /*
+            Live: the SDK's dev runner, which runs the plugin's own entry
+            point from the live folder and restarts it on each change.
+          */}}
+          command: ["meridian-dev", "run"]
+          {{- else }}
           {{- with .args }}
           args:
             {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -171,6 +215,10 @@ spec:
           env:
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ $top.Values.sidecar.address | quote }}
+            {{- if $.live }}
+            - name: MERIDIAN_LIVE_DIR
+              value: /plugin/live
+            {{- end }}
             {{- range $name, $value := .env }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -193,6 +241,10 @@ spec:
             */}}
             - name: plugin-tmp
               mountPath: /tmp
+            {{- if $.live }}
+            - name: live
+              mountPath: /plugin/live
+            {{- end }}
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
@@ -201,6 +253,11 @@ spec:
         {{- if .plugin }}
         - name: plugin-tmp
           emptyDir: {}
+        {{- end }}
+        {{- if .live }}
+        - name: live
+          emptyDir:
+            sizeLimit: 256Mi
         {{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- /*

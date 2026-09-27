@@ -67,6 +67,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/terminal/plugins", get(list).post(upload))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
+        .route(
+            "/terminal/plugins/{instance}/dev/{what}",
+            get(develop).put(develop),
+        )
 }
 
 fn json(status: StatusCode, body: serde_json::Value) -> Response {
@@ -296,6 +300,53 @@ fn mounts_from_a_plugin(query: Option<&str>) -> bool {
         let from = from.replace("%2F", "/").replace("%2f", "/");
         from.strip_prefix("plugins/").is_some_and(is_name)
     })
+}
+
+/// W8.5 and W8.6: a live instance's files, output and events, for a deployment
+/// admin's terminal, relayed to the instance's sidecar as them. The sidecar
+/// answers whether the instance is live on a development deployment; this
+/// holds the request to one of the three paths and the size of a change.
+async fn develop(
+    State(app): State<Arc<App>>,
+    Path((instance, what)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let person = match admin(&app, request.headers()) {
+        Ok(person) => person,
+        Err(refusal) => return *refusal,
+    };
+    let Some(plugins) = app.plugins.clone() else {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this dashboard reaches no plugin's sidecar: it needs its own address",
+        );
+    };
+    if !crate::plugins::is_instance(&instance)
+        || !matches!(what.as_str(), "files" | "output" | "events")
+    {
+        return refused(StatusCode::NOT_FOUND, "not a development path");
+    }
+    let method = request.method().clone();
+    let query = request.uri().query().map(String::from);
+    // A change's limit, and a little for the JSON around it.
+    let body = match axum::body::to_bytes(request.into_body(), (16 << 20) + (64 << 10)).await {
+        Ok(body) => body,
+        Err(_) => {
+            return refused(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "a change is at most 16 MB: a plugin's source, not its dependencies",
+            )
+        }
+    };
+    let asked = crate::plugins::Development {
+        method,
+        what,
+        query,
+        body,
+    };
+    plugins
+        .develop(&instance, &person, asked, app.clock.now_ns())
+        .await
 }
 
 /// Whether the registry holds this manifest in plugins/{name}.

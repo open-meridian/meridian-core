@@ -60,6 +60,9 @@ pub enum Refusal {
     Replayed,
     NoInterface,
     PluginUnreachable(String),
+    /// A development path on an instance that is not live, or a deployment
+    /// not installed for development: there is no such endpoint.
+    NotLive,
 }
 
 impl Refusal {
@@ -73,7 +76,7 @@ impl Refusal {
             | Refusal::OutOfDate
             | Refusal::LivesTooLong
             | Refusal::Replayed => StatusCode::FORBIDDEN,
-            Refusal::NoInterface => StatusCode::NOT_FOUND,
+            Refusal::NoInterface | Refusal::NotLive => StatusCode::NOT_FOUND,
             Refusal::PluginUnreachable(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -94,6 +97,7 @@ impl Refusal {
             Refusal::Replayed => "the assertion has been presented already".into(),
             Refusal::NoInterface => "this plugin serves no page".into(),
             Refusal::PluginUnreachable(why) => format!("the plugin did not answer: {why}"),
+            Refusal::NotLive => "this plugin is not live on a development deployment".into(),
         }
     }
 }
@@ -310,6 +314,19 @@ async fn through(
         .transpose()?;
     front_door.verifier.verify(text, now_ns)?;
     let verified = header.expect("verified above");
+
+    // A development path is answered here and never reaches the plugin; and
+    // before the page's port is asked for, since a plugin that crashed has
+    // none, which is when its output matters most.
+    let asked = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    if let Some(what) = asked.strip_prefix(crate::live::DEV_PREFIX) {
+        let live = front_door.sidecar.live().ok_or(Refusal::NotLive)?;
+        return Ok(crate::live::answer(live, what, request).await);
+    }
 
     let port = front_door
         .sidecar

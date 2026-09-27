@@ -209,6 +209,68 @@ impl Plugins {
         self.front_door.replace("{instance}", instance)
     }
 
+    /// A live instance's development path (W8.5, W8.6), for a person who may
+    /// launch plugins, relayed from their terminal: signed as them, for this
+    /// instance alone, as a page request is, and passed to the sidecar's
+    /// development endpoint. The sidecar decides whether there is one.
+    pub(crate) async fn develop(
+        &self,
+        instance: &str,
+        person: &crate::terminal::Person,
+        asked: Development,
+        now: i64,
+    ) -> Response {
+        let Development {
+            method,
+            what,
+            query,
+            body,
+        } = asked;
+        let claims = CallerClaims {
+            subject: person.subject.clone(),
+            display_name: person.display_name.clone(),
+            audience_instance_id: instance.to_string(),
+            access: Vec::new(),
+            issued_at_ns: now,
+            expires_at_ns: now + ASSERTION_NS,
+            assertion_id: token(),
+        };
+        let assertion = match self.signer.sign(&claims) {
+            Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
+            Err(failed) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("the dashboard cannot vouch for anybody yet: {failed}"),
+                )
+                    .into_response()
+            }
+        };
+        let url = match query.as_deref() {
+            Some(query) => format!("{}/.meridian/dev/{what}?{query}", self.front_door(instance)),
+            None => format!("{}/.meridian/dev/{what}", self.front_door(instance)),
+        };
+        let answer = self
+            .client
+            .request(method, url)
+            .header(CALLER, assertion)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match answer {
+            Ok(answer) => {
+                let status = answer.status();
+                let body = answer.bytes().await.unwrap_or_default();
+                (status, [("content-type", "application/json")], body).into_response()
+            }
+            Err(failed) => (
+                StatusCode::BAD_GATEWAY,
+                format!("{instance}'s sidecar did not answer: {failed}"),
+            )
+                .into_response(),
+        }
+    }
+
     /// Whether an instance runs here: whether its front door has an address.
     /// A Service exists for every sidecar the deployment runs and for nothing
     /// else, so this needs no list of its own to fall behind.
@@ -381,6 +443,15 @@ pub fn pages_possible(public_url: &str) -> Result<(), String> {
 pub(crate) fn opening(access: &meridian_access::Access, instance: &str) -> Option<Vec<TagAccess>> {
     let held = access.on_plugin(instance);
     (access.deployment_admin || !held.is_empty()).then_some(held)
+}
+
+/// A development request as the terminal made it: which path, how, and what
+/// it carried.
+pub(crate) struct Development {
+    pub method: Method,
+    pub what: String,
+    pub query: Option<String>,
+    pub body: axum::body::Bytes,
 }
 
 /// Every request, before the dashboard's routes: one for a plugin's host is

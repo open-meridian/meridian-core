@@ -129,6 +129,35 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            // Not, or no longer, a development deployment: nothing it made live
+            // stays (spec/live-plugin-development, ruling 2). The launcher
+            // restarts when the chart changes, so this is the next moment
+            // after `development` is turned off. The catalogue keeps each
+            // launch until an administrator stops it, which then succeeds with
+            // nothing to remove.
+            if !launcher.development {
+                let live = launcher
+                    .api
+                    .deployments(&format!("{LAUNCHED_SELECTOR},meridian.dev/live=true"))
+                    .await
+                    .map_err(|failed| failed.0)?;
+                for workload in live["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["metadata"]["name"].as_str())
+                {
+                    launcher
+                        .api
+                        .delete_deployment(workload)
+                        .await
+                        .map_err(|failed| failed.0)?;
+                    tracing::warn!(
+                        workload,
+                        "a live plugin removed: this deployment is not for development"
+                    );
+                }
+            }
             let bus = bus_from_env(&instance_id).await?;
             let creating = Arc::clone(&launcher);
             bus.serve(CREATE_PLUGIN, move |envelope| {

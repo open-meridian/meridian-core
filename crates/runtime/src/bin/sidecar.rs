@@ -116,6 +116,17 @@ fn run() -> Result<(), String> {
             }
             let sidecar = Arc::new(sidecar);
 
+            // A live instance of a development deployment: the development
+            // endpoint behind the front door (spec/live-plugin-development).
+            // Both told, or none.
+            if let Some(live) = meridian_sidecar::live::Live::from_env(
+                var("MERIDIAN_LIVE_DIR"),
+                var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true"),
+            ) {
+                sidecar.go_live(Arc::new(live));
+                tracing::info!("live: the development endpoint is on");
+            }
+
             tracing::info!(instance_id, %listening, "the sidecar is serving");
 
             // What it knows of its plugin, for the conductor and the

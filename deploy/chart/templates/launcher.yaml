@@ -36,6 +36,27 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 data:
   plugin.json: {{ $shape | fromYaml | toJson | quote }}
+  {{- if .Values.development }}
+  {{- /*
+    The live shape (spec/live-plugin-development), on a development
+    deployment alone: the same definition, with the live folder, the dev
+    runner and the sidecar's development endpoint. Not rendered anywhere
+    else, so no launcher elsewhere has it to make.
+  */}}
+  {{- $live := include "meridian-runtime.plugin" (dict
+        "top" .
+        "name" (printf "%s-plugin-__INSTANCE__" $full)
+        "instance" "__INSTANCE__"
+        "roles" "__ROLES__"
+        "tags" "__TAGS__"
+        "brokerSecret" (printf "%s-launched" $broker)
+        "brokerKey" "__INSTANCE__.url"
+        "plugin" (dict "image" "__IMAGE__")
+        "imageTag" ""
+        "launched" true
+        "live" true) }}
+  plugin-live.json: {{ $live | fromYaml | toJson | quote }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -124,6 +145,8 @@ spec:
             # (spec/live-plugin-development).
             - name: MERIDIAN_DEVELOPMENT
               value: "true"
+            - name: MERIDIAN_LAUNCHER_LIVE_TEMPLATE
+              value: /etc/meridian/launcher/plugin-live.json
             {{- end }}
             # The only registry a launched plugin's image may come from.
             - name: MERIDIAN_REGISTRY_ADDRESS

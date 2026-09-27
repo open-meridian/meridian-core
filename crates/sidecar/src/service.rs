@@ -114,9 +114,22 @@ pub struct Sidecar {
     /// (W4.9). None where the sidecar was given none: such a command is
     /// refused, since nobody can be vouched for.
     pub(crate) verifier: Option<Arc<crate::front_door::Verifier>>,
+
+    /// The development endpoint, on a live instance of a development
+    /// deployment alone (spec/live-plugin-development). Set once, at start.
+    pub(crate) live: Arc<std::sync::OnceLock<Arc<crate::live::Live>>>,
 }
 
 impl Sidecar {
+    /// Serve the development endpoint, and record refusals for it.
+    pub fn go_live(&self, live: Arc<crate::live::Live>) {
+        let _ = self.live.set(live);
+    }
+
+    pub fn live(&self) -> Option<&Arc<crate::live::Live>> {
+        self.live.get()
+    }
+
     pub fn new(bus: Arc<Bus>, deployment_id: impl Into<String>, identity: Identity) -> Self {
         Self::under(Contract::embedded(), bus, deployment_id, identity)
     }
@@ -149,6 +162,7 @@ impl Sidecar {
             configuration,
             refusals: Arc::default(),
             unlinked: Arc::default(),
+            live: Arc::default(),
             changed: Arc::default(),
             verifier: None,
         }
