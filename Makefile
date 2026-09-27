@@ -524,6 +524,11 @@ E2E_LDAP := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake
 	$(COMPOSE) --profile e2e
 LDAP_DIR = -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
 
+# The directory image configures its admin against a slapd it has just
+# started in the background, and on a busy machine that sometimes exits 255
+# with nothing said -- twice in a pre-push on 2026-09-27, straight after the
+# OIDC branch, never alone. A container that exits before "slapd starting" is
+# replaced by a fresh one rather than failing the gate on the image's race.
 e2e-dashboard-ldap: network
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
@@ -533,7 +538,15 @@ e2e-dashboard-ldap: network
 	@set -e; \
 	$(E2E_LDAP) build dashboard conductor >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) up -d postgres nats ldap fake-platform >>.e2e-dashboard-ldap.log 2>&1; \
-	for i in $$(seq 1 60); do $(E2E_LDAP) logs ldap 2>&1 | grep -q "slapd starting" && break; sleep 1; done; \
+	for i in $$(seq 1 60); do \
+	  $(E2E_LDAP) logs ldap 2>&1 | grep -q "slapd starting" && break; \
+	  if [ -z "$$($(E2E_LDAP) ps -q --status running ldap)" ]; then \
+	    echo "the directory exited in its own setup; a fresh one" >>.e2e-dashboard-ldap.log; \
+	    $(E2E_LDAP) rm -fsv ldap >>.e2e-dashboard-ldap.log 2>&1; \
+	    $(E2E_LDAP) up -d ldap >>.e2e-dashboard-ldap.log 2>&1; \
+	  fi; \
+	  sleep 1; \
+	done; \
 	$(E2E_LDAP) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'; \
 	$(E2E_LDAP) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// <e2e/dashboard/ldap/01-memberof.ldif >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) exec -T ldap ldapadd $(LDAP_DIR) <e2e/dashboard/ldap/02-tree.ldif >>.e2e-dashboard-ldap.log 2>&1; \
