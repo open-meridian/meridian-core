@@ -34,6 +34,7 @@ use crate::session::{Session, Sessions, ABSOLUTE_NS};
 use crate::terminal::Terminals;
 
 mod terminal;
+pub(crate) use terminal::bearer;
 pub use terminal::terminal_session_of;
 
 pub const SESSION_COOKIE: &str = "meridian_session";

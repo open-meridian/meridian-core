@@ -298,7 +298,7 @@ pub fn terminal_session_of(app: &App, headers: &HeaderMap) -> Result<Person, Box
     })
 }
 
-fn bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     let token = token.trim();

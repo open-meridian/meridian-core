@@ -71,6 +71,14 @@ pub fn routes() -> Router<Arc<App>> {
             "/terminal/plugins/{instance}/dev/{what}",
             get(develop).put(develop),
         )
+        .route(
+            "/terminal/plugins/{instance}/open",
+            post(crate::plugins::open_from_terminal),
+        )
+        .route(
+            "/terminal/plugins/{instance}/page",
+            get(crate::plugins::page_from_terminal),
+        )
 }
 
 fn json(status: StatusCode, body: serde_json::Value) -> Response {
@@ -534,7 +542,7 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             serde_json::json!({
                 "instance_id": launch.instance_id, "name": launch.name,
                 "version": launch.version, "state": state_name(launch.state),
-                "failure": launch.failure,
+                "failure": launch.failure, "live": launch.live,
             })
         })
         .collect();

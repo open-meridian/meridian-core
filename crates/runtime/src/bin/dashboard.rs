@@ -330,7 +330,7 @@ fn run() -> Result<(), String> {
                     sweeping.sweep(now_ns());
                     sweeping_terminals.sweep(now_ns());
                     if let Some(plugins) = &sweeping_plugins {
-                        plugins.sweep(&sweeping, now_ns());
+                        plugins.sweep(&sweeping, &sweeping_terminals, now_ns());
                     }
                 }
             });

@@ -377,7 +377,7 @@ async fn a_code_is_redeemed_once_on_its_own_host_within_its_minute() {
 
     let plugins = h.app.plugins.as_ref().unwrap();
     let now = h.app.clock.now_ns();
-    let code = plugins.mint(&h.session, INSTANCE, now);
+    let code = plugins.mint(Came::Browser(h.session.clone()), INSTANCE, now);
     assert_eq!(
         plugins.redeem(&code, INSTANCE, now + CODE_NS + 1),
         None,
@@ -633,9 +633,9 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     let plugins = h.app.plugins.as_ref().unwrap();
     let now = h.app.clock.now_ns();
     entered(&h).await;
-    let kept = plugins.mint(&h.session, INSTANCE, now);
+    let kept = plugins.mint(Came::Browser(h.session.clone()), INSTANCE, now);
 
-    plugins.sweep(&h.app.sessions, now);
+    plugins.sweep(&h.app.sessions, &h.app.terminals, now);
     assert_eq!(
         plugins.entered.lock().unwrap().len(),
         1,
@@ -644,7 +644,7 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     assert!(plugins.codes.lock().unwrap().contains_key(&kept));
 
     h.app.sessions.end(&h.session);
-    plugins.sweep(&h.app.sessions, now + CODE_NS + 1);
+    plugins.sweep(&h.app.sessions, &h.app.terminals, now + CODE_NS + 1);
     assert!(plugins.entered.lock().unwrap().is_empty());
     assert!(plugins.codes.lock().unwrap().is_empty());
 }
@@ -967,4 +967,152 @@ async fn an_instance_that_is_not_live_has_no_development_path() {
     .await;
     assert_eq!(answer.status, StatusCode::NOT_FOUND, "{}", answer.body);
     assert!(h.reached.lock().unwrap().is_empty());
+}
+
+// ── W6.15: from a terminal ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_terminal_link_enters_the_plugins_host_once_and_ends_with_the_terminal_session() {
+    let h = harness(&[INSTANCE]).await;
+    let session = terminal(&h.app);
+    let opened = develop(
+        &h.app,
+        Method::POST,
+        &format!("/terminal/plugins/{INSTANCE}/open"),
+        &session,
+        "",
+    )
+    .await;
+    assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
+    let said: serde_json::Value = serde_json::from_str(&opened.body).unwrap();
+    let url = said["url"].as_str().unwrap();
+    let prefix = format!("https://{INSTANCE}.plugins.{DASHBOARD}");
+    assert!(
+        url.starts_with(&format!("{prefix}{ENTER_PATH}?code=")),
+        "{url}"
+    );
+    let path = &url[prefix.len()..];
+
+    // Any browser: no dashboard cookie is needed, or sent.
+    let entered = get(&h.app, PLUGIN_HOST, path, &[]).await;
+    assert_eq!(entered.status, StatusCode::SEE_OTHER, "{}", entered.body);
+    let cookie = entered.headers[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = get(&h.app, PLUGIN_HOST, "/", std::slice::from_ref(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert_eq!(page.body, "the page");
+    // Once.
+    assert_eq!(
+        get(&h.app, PLUGIN_HOST, path, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // It never reaches the dashboard's own pages.
+    let home = get(&h.app, DASHBOARD, "/", std::slice::from_ref(&cookie)).await;
+    assert!(!home.body.contains("Ada"), "{}", home.body);
+
+    // The terminal session ends, and the host's with it.
+    h.app.terminals.end(&session);
+    let after = get(&h.app, PLUGIN_HOST, "/", &[cookie]).await;
+    assert_eq!(
+        after.status,
+        StatusCode::SEE_OTHER,
+        "sent back to the dashboard"
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_reads_the_page_as_the_person_is_served_it() {
+    let h = harness(&[INSTANCE]).await;
+    let session = terminal(&h.app);
+    let read = develop(
+        &h.app,
+        Method::GET,
+        &format!("/terminal/plugins/{INSTANCE}/page?path=%2Fholdings%3Fpage%3D2"),
+        &session,
+        "",
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    let said: serde_json::Value = serde_json::from_str(&read.body).unwrap();
+    assert_eq!(said["status"], 200);
+    assert_eq!(said["body"], "the page");
+    let reached = h.reached.lock().unwrap();
+    assert_eq!(reached.len(), 1);
+    assert_eq!(reached[0].1, "/holdings?page=2");
+}
+
+#[tokio::test]
+async fn a_terminal_is_held_to_what_opening_the_page_is_held_to() {
+    let h = harness(&["another-plugin"]).await;
+    let session = terminal(&h.app);
+    for (method, path) in [
+        (Method::POST, format!("/terminal/plugins/{INSTANCE}/open")),
+        (Method::GET, format!("/terminal/plugins/{INSTANCE}/page")),
+    ] {
+        let refused = develop(&h.app, method.clone(), &path, &session, "").await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{path}: {}",
+            refused.body
+        );
+        let nobody = develop(&h.app, method, &path, "not-a-session", "").await;
+        assert_eq!(nobody.status, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    assert!(h
+        .app
+        .plugins
+        .as_ref()
+        .unwrap()
+        .codes
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert!(h.reached.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_browser_cookie_is_no_terminal_session_for_these_paths() {
+    let h = harness(&[INSTANCE]).await;
+    let answer = send(
+        &h.app,
+        DASHBOARD,
+        Method::POST,
+        &format!("/terminal/plugins/{INSTANCE}/open"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn a_page_path_is_a_path_on_the_plugins_host_and_nothing_else() {
+    for path in [
+        "/",
+        "/holdings",
+        "/holdings?page=2",
+        "/a/b.css",
+        "/.well-known/x",
+    ] {
+        assert_eq!(page_path(path), Ok(()), "{path}");
+    }
+    for path in [
+        "",
+        "holdings",
+        "//elsewhere.example/x",
+        "https://elsewhere.example/",
+        "/.meridian/dev/files",
+        "/.meridian",
+        "/.meridian?x",
+        "/a b",
+        "/a#b",
+        "/a\\b",
+    ] {
+        assert!(page_path(path).is_err(), "{path}");
+    }
 }

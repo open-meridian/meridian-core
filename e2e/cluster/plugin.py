@@ -27,13 +27,21 @@ what it takes, the browser's cookie in its place is refused, and once her
 permission is withdrawn her terminal session -- still live -- is refused as
 somebody who may not, rather than as nobody.
 
+Then the live loop (spec/live-plugin-development), by the real CLI on this
+development deployment: `meridian plugin dev` in the background on a copy of
+the scaffold, saves made to it and seen running, crashing and mended; the
+page read back with `open --print` and opened by `open`'s one-time link in a
+browser signed in nowhere; `logs` and `events`; `dev --release` putting the
+code in the catalogue as a version; and the instance made live again for
+the run's check that turning development off removes it.
+
 Prints one line per check and exits non-zero if any failed.
 """
 
-import base64
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -187,38 +195,63 @@ def statement(page, instance):
     return notice.last.inner_text() if notice.count() else page.content()[:300]
 
 
-# ── The terminal, as the CLI would ask ────────────────────────────────────
-# The live loop's CLI commands are the next task's; until then this asks the
-# dashboard's terminal paths itself, on the session `meridian connect` kept.
+# ── The terminal: the real CLI, in the pod's other container ────────────
 
 
-def terminal_session():
-    with open(f"{SHARED}/config/meridian/sessions/{HOST}.json") as held:
-        return json.load(held)["session"]
+ASKED = [0]
 
 
-def terminal(method, path, body=None):
-    request = urllib.request.Request(
-        f"{DASHBOARD}{path}",
-        data=None if body is None else json.dumps(body).encode(),
-        method=method,
-        headers={"Authorization": f"Bearer {terminal_session()}", "Content-Type": "application/json"},
-    )
+def cli(command, seconds=300):
+    """Run a command in the CLI's container, on the session `meridian
+    connect` kept there; what it said, ending with its exit."""
+    ASKED[0] += 1
+    at = f"{SHARED}/ask/{ASKED[0]}"
+    os.makedirs(f"{SHARED}/ask", exist_ok=True)
+    with open(f"{at}.writing", "w") as asking:
+        asking.write(command + "\n")
+    os.rename(f"{at}.writing", f"{at}.sh")
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if os.path.exists(f"{at}.out"):
+            with open(f"{at}.out") as said:
+                return said.read()
+        time.sleep(0.1)
+    return f"(no answer within {seconds}s)"
+
+
+def said_json(text):
+    """The JSON object a `--json` command printed, from among its lines."""
+    for line in text.splitlines():
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                pass
+    return {}
+
+
+def dev_events(name):
+    """What `meridian plugin dev --json` has printed so far: one event a line."""
     try:
-        with urllib.request.urlopen(request, timeout=60) as answered:
-            return answered.status, json.loads(answered.read() or b"{}")
-    except urllib.error.HTTPError as refused:
-        text = refused.read().decode(errors="replace")
+        with open(f"{SHARED}/{name}") as printed:
+            lines = printed.read().splitlines()
+    except FileNotFoundError:
+        return []
+    events = []
+    for line in lines:
         try:
-            return refused.code, json.loads(text)
+            events.append(json.loads(line))
         except ValueError:
-            return refused.code, {"said": text}
+            pass
+    return events
 
 
-def events(since=None):
-    query = "" if since is None else f"?since={since}"
-    _, said = terminal("GET", f"/terminal/plugins/{LIVE}/dev/events{query}")
-    return said.get("events", [])
+def dev_said(name):
+    try:
+        with open(f"{SHARED}/{name}") as said:
+            return said.read()
+    except FileNotFoundError:
+        return ""
 
 
 def waited(check, seconds):
@@ -227,14 +260,13 @@ def waited(check, seconds):
         found = check()
         if found:
             return found
-        time.sleep(0.25)
+        time.sleep(0.1)
     return None
 
 
-def send(files, deleted=()):
-    body = {"files": {path: base64.b64encode(text.encode()).decode() for path, text in files.items()},
-            "deleted": list(deleted)}
-    return terminal("PUT", f"/terminal/plugins/{LIVE}/dev/files", body)
+def first(events, event, revision=None, after=0):
+    return [e for e in events if e.get("event") == event
+            and (e.get("revision") == revision if revision is not None else e.get("revision", 0) > after)]
 
 
 # ── The person ────────────────────────────────────────────────────────────
@@ -418,66 +450,110 @@ with sync_playwright() as playwright:
         said = statement(page, CUSTODY)
     check(said.startswith("Opened statement"), f"once she writes, it is recorded for her: {said}")
 
-    # The live shape (spec/live-plugin-development), on this development
-    # deployment: the reference plugin launched live, changed while it runs,
-    # broken and mended, and the sidecar's own record of what it refused.
-    status, said = terminal("POST", "/terminal/plugins/launch", {
-        "name": "reference-plugin", "version": "0.1.0", "instance_id": LIVE,
-        "approved_roles": [], "approved_tags": [], "live": True,
-    })
-    check(status == 201, f"the reference plugin launched live as {LIVE}: {status} {said}")
-    ready = waited(lambda: [e for e in events() if e.get("event") == "ready"], 300)
-    check(bool(ready), f"{LIVE} is ready at its first revision, run by the SDK's dev runner")
+    # The live loop (spec/live-plugin-development, requirements 10 to 14),
+    # by the real CLI on this development deployment: `plugin dev` in the
+    # background on a copy of the scaffold, saves made to that copy as an
+    # editor makes them, and what the person or an agent reads back with
+    # `open --print`, `logs` and `events`.
+    work = f"{SHARED}/live-plugin"
+    shutil.copytree(f"{SHARED}/reference-plugin", work)
+    cli(f"meridian plugin dev --dir {work} --instance {LIVE} --yes --json"
+        f" > {SHARED}/dev.out 2> {SHARED}/dev.err & echo $! > {SHARED}/dev.pid")
+    ready = waited(lambda: first(dev_events("dev.out"), "ready"), 300)
+    check(bool(ready), f"`meridian plugin dev` launched {LIVE} live, sent it the directory, and it is"
+          f" ready: {ready or sentence(dev_said('dev.err'))}")
+    at = max((e.get("revision", 0) for e in ready or []), default=0)
 
-    scaffold = "/shared/reference-plugin/src/reference_plugin"
+    scaffold = f"{work}/src/reference_plugin"
     page_py = open(f"{scaffold}/page.py").read()
     main_py = open(f"{scaffold}/__main__.py").read()
     changed = page_py.replace('TITLE = "Reference plugin"', 'TITLE = "Reference plugin, changed live"')
     check(changed != page_py, "the page's title is there to change")
-    sent_at = time.monotonic()
-    status, said = send({"src/reference_plugin/page.py": changed})
-    revision = said.get("revision", -1)
-    check(status == 200 and revision >= 1, f"a change sent to it is revision {revision}: {status} {said}")
-    live_again = waited(
-        lambda: [e for e in events(revision - 1) if e.get("event") == "ready" and e.get("revision") == revision],
-        60,
-    )
-    took = time.monotonic() - sent_at
-    check(bool(live_again), f"and running within {took:.1f}s, the pod and its sidecar as they were")
+
+    def saved(path, text):
+        """A save, and the revision it was sent as."""
+        with open(path, "w") as out:
+            out.write(text)
+        sent = waited(lambda: first(dev_events("dev.out"), "sent", after=at), 30)
+        return max((e["revision"] for e in sent), default=-1) if sent else -1
+
+    saved_at = time.monotonic()
+    revision = saved(f"{scaffold}/page.py", changed)
+    running = waited(lambda: first(dev_events("dev.out"), "ready", revision), 60)
+    took = time.monotonic() - saved_at
+    check(bool(running), f"a save is sent as revision {revision}, and running within {took:.1f}s,"
+          " the pod and its sidecar as they were")
+    check(took < 3, f"under three seconds from saving to running (ruling 9): {took:.2f}s")
     print(f"  save to ready: {took:.2f}s", flush=True)
+    at = revision
 
-    page.goto(f"{DASHBOARD}/plugins/{LIVE}")
-    page.wait_for_load_state()
-    for _ in range(10):
-        if "changed live" in page.content():
-            break
-        time.sleep(2)
-        page.goto(f"{DASHBOARD}/plugins/{LIVE}")
-        page.wait_for_load_state()
-    check("<h1>Reference plugin, changed live</h1>" in page.content(),
-          f"its page is the changed one, on its own host: {page.url}")
+    printed = cli(f"meridian plugin open --instance {LIVE} --print /")
+    check("exit=0" in printed and "<h1>Reference plugin, changed live</h1>" in printed,
+          f"`plugin open --print /` shows the changed page as she is served it: {sentence(printed)}")
 
-    status, said = send({"src/reference_plugin/__main__.py": "raise RuntimeError('broken on purpose')\n" + main_py})
-    broken = said.get("revision", -1)
-    crashed = waited(
-        lambda: [e for e in events(broken - 1) if e.get("event") == "crashed" and e.get("revision") == broken],
-        60,
-    )
+    linked = said_json(cli(f"meridian plugin open --instance {LIVE} --json"))
+    url = linked.get("url", "")
+    elsewhere = browser.new_context()
+    other = elsewhere.new_page()
+    other.goto(url or "about:blank")
+    other.wait_for_load_state()
+    check(other.url.startswith(f"http://{LIVE}.plugins.{HOST}/")
+          and "changed live" in other.content(),
+          f"`plugin open` gives a link another browser, signed in nowhere, opens the page by: {other.url}")
+    other.goto(url or "about:blank")
+    check("has been used" in other.content(), "once")
+    elsewhere.close()
+
+    revision = saved(f"{scaffold}/__main__.py", "raise RuntimeError('broken on purpose')\n" + main_py)
+    crashed = waited(lambda: first(dev_events("dev.out"), "crashed", revision), 60)
     check(bool(crashed) and "broken on purpose" in (crashed or [{}])[0].get("traceback", ""),
-          "a start that fails is reported as crashed, with its traceback")
+          "a save that fails to start is reported as crashed, with its traceback")
+    at = revision
 
-    status, said = send({"src/reference_plugin/__main__.py": main_py})
-    mended = said.get("revision", -1)
-    check(bool(waited(lambda: [e for e in events(mended - 1)
-                               if e.get("event") == "ready" and e.get("revision") == mended], 60)),
-          "and mended by the next change, without anybody restarting anything")
+    mended = saved(f"{scaffold}/__main__.py", main_py)
+    check(bool(waited(lambda: first(dev_events("dev.out"), "ready", mended), 60)),
+          "and mended by the next save, without anybody restarting anything")
     page.goto(f"http://{LIVE}.plugins.{HOST}/")
     page.wait_for_load_state()
     page.click("button:has-text('Open an empty statement for me')")
     page.wait_for_load_state()
-    refused = waited(lambda: [e for e in events(mended - 1) if e.get("event") == "refused"], 30)
+    refused = waited(lambda: [e for e in said_json(cli(
+        f"meridian plugin events --instance {LIVE} --since {mended - 1} --json")).get("events", [])
+        if e.get("event") == "refused"], 30)
     check(bool(refused) and "no grant" in (refused or [{}])[0].get("reason", ""),
-          "what the sidecar refused it is in its events, where whoever is developing it looks")
+          "`plugin events` has what the sidecar refused it, where whoever is developing it looks")
+    logs = cli(f"meridian plugin logs --instance {LIVE} --since {mended - 1}")
+    check("exit=0" in logs and "serving its page" in logs,
+          f"`plugin logs` has what it printed since: {sentence(logs)}")
+    lapsed = cli(f"meridian plugin logs --instance {LIVE} --deployment http://nowhere.localhost")
+    check("exit=3" in lapsed, f"and with no session, it says so and exits 3: {sentence(lapsed)}")
+
+    # Released: the directory as it is, a version, run in place of the live
+    # code. A version is never replaced, so it is a new one.
+    pyproject = f"{work}/pyproject.toml"
+    with open(pyproject) as held:
+        declared = held.read()
+    with open(pyproject, "w") as out:
+        out.write(declared.replace('version = "0.1.0"', 'version = "0.1.1"'))
+    released = cli(f"meridian plugin dev --release --dir {work} --instance {LIVE} --yes", 900)
+    check("exit=0" in released and "Released reference-plugin 0.1.1" in released,
+          f"`plugin dev --release` uploads it as 0.1.1 and runs that: {sentence(released)}")
+    listed = cli("meridian plugin list")
+    check(re.search(rf"{LIVE}\s+reference-plugin 0\.1\.1\s+launched", listed) is not None,
+          "the catalogue holds 0.1.1, launched in the live instance's place")
+    served = waited(lambda: "changed live" in cli(f"meridian plugin open --instance {LIVE} --print /"), 180)
+    check(bool(served), "and the released version serves what was live")
+
+    # Live again, for the run's last check: stopped, and developed again from
+    # the version now recorded, with the directory sent over it.
+    cli(f"kill -INT $(cat {SHARED}/dev.pid)")
+    cli(f"meridian plugin stop {LIVE}")
+    cli(f"meridian plugin dev --dir {work} --instance {LIVE} --yes --json"
+        f" > {SHARED}/dev-again.out 2> {SHARED}/dev-again.err & echo $! > {SHARED}/dev.pid")
+    again = waited(lambda: first(dev_events("dev-again.out"), "ready"), 300)
+    check(bool(again) and "uploaded already" in dev_said("dev-again.err"),
+          f"stopped and developed again, the recorded 0.1.1 runs live with the directory sent over it:"
+          f" {sentence(dev_said('dev-again.err'))}")
     open(f"{SHARED}/live-done", "w").close()
 
     # The terminal's paths take the terminal's session, and nothing else: the

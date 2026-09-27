@@ -896,8 +896,19 @@ spec:
             step("launch-custody",
                  f"meridian plugin launch reference-custody 0.1.0 --instance {CUSTODY_INSTANCE} --yes"),
             step("list", "meridian plugin list"),
-            # Once the browser has withdrawn her permission: the same session.
-            "          until [ -f /shared/list-again ]; do sleep 1; done",
+            # Until the browser has withdrawn her permission, whatever it asks
+            # the CLI to run: the live loop's commands, each written as
+            # /shared/ask/<n>.sh and answered in <n>.out with its exit.
+            "          mkdir -p /shared/ask",
+            "          until [ -f /shared/list-again ]; do",
+            "            for asked in /shared/ask/*.sh; do",
+            "              [ -e \"$asked\" ] || continue",
+            "              sh \"$asked\" > \"${asked%.sh}.tmp\" 2>&1; echo \"exit=$?\" >> \"${asked%.sh}.tmp\"",
+            "              mv \"${asked%.sh}.tmp\" \"${asked%.sh}.out\"; rm \"$asked\"",
+            "            done",
+            "            sleep 0.2",
+            "          done",
+            # Then: the same session.
             step("list-again", "meridian plugin list"),
         ])
         apply(f"""

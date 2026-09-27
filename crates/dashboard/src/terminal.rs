@@ -171,7 +171,8 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-fn hashed(token: &str) -> String {
+/// A terminal session's key in this store.
+pub fn hashed(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
@@ -375,7 +376,23 @@ impl Terminals {
 
     /// The person behind a session, touched; or why not.
     pub fn find(&self, session: &str, now_ns: i64) -> Result<Person, Refusal> {
-        let key = hashed(session);
+        self.find_hashed(&hashed(session), now_ns)
+    }
+
+    /// Whether a session is live, by its hash, without touching it: for a
+    /// sweep, which is not somebody using it.
+    pub fn is_live_hashed(&self, key: &str, now_ns: i64) -> bool {
+        self.lock().sessions.get(key).is_some_and(|held| {
+            now_ns - held.last_seen_at_ns <= IDLE_NS
+                && now_ns - held.person.signed_in_at_ns <= ABSOLUTE_NS
+        })
+    }
+
+    /// As `find`, by the hash this store keys a session by: what a plugin
+    /// host's session opened from a terminal holds of it (W6.15), so the
+    /// token itself is still kept nowhere.
+    pub fn find_hashed(&self, key: &str, now_ns: i64) -> Result<Person, Refusal> {
+        let key = key.to_string();
         let mut inner = self.lock();
         if let Some(held) = inner.sessions.get_mut(&key) {
             let idle = now_ns - held.last_seen_at_ns > IDLE_NS;
