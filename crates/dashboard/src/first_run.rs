@@ -1011,6 +1011,10 @@ fn open_page(
     let unless = |field: &str, value: &str, inner: String| {
         format!("<div data-when=\"{field}\" data-not=\"{value}\">{inner}</div>")
     };
+    // Fields side by side, so a step is short; one column on a narrow screen.
+    let row = |class: &str, fields: &[String]| {
+        format!("<div class=\"{class}\">{}</div>", fields.concat())
+    };
 
     // Once each: the two database logins fail alike when the host is wrong.
     let mut said: Vec<(Step, String)> = Vec::new();
@@ -1046,11 +1050,11 @@ fn open_page(
     let database = [
         choice(
             "db_route",
-            "Where its database is",
+            "Where its Postgres is",
             "brought",
             &[
                 ("brought", "Start one inside this cluster"),
-                ("external", "Use a database you already run"),
+                ("external", "Use a Postgres you already run"),
             ],
         ),
         when(
@@ -1071,26 +1075,63 @@ fn open_page(
                  roles: the migrating role may create a table and the serving role must \
                  not. Both are tested before anything is written.</p>"
                     .to_string(),
-                text("db_host", "Host", "postgres.firm.internal", "", true),
-                text("db_port", "Port", "5432", "5432", false),
-                text("db_name", "Database", "meridian", "meridian", true),
-                text("db_sslmode", "TLS mode", "verify-full", "", false),
-                text(
-                    "db_serving_role",
-                    "Serving role",
-                    "meridian_app",
-                    "meridian_app",
-                    true,
+                row(
+                    "grid-wide",
+                    &[
+                        text("db_host", "Host", "postgres.firm.internal", "", true),
+                        format!(
+                            "<label>Port<input type=\"number\" name=\"db_port\" min=\"1\" \
+                             max=\"65535\" value=\"{}\"></label>",
+                            escape(&given("db_port", "5432"))
+                        ),
+                    ],
                 ),
-                secret("db_serving_password", "Serving role's password", true),
-                text(
-                    "db_migrating_role",
-                    "Migrating role",
-                    "meridian_migrate",
-                    "meridian_migrate",
-                    true,
+                row(
+                    "grid-2",
+                    &[
+                        text("db_name", "Database", "meridian", "meridian", true),
+                        // Postgres's own sslmode values. Verify-full by default,
+                        // as the first-run service assumes when none is given.
+                        choice(
+                            "db_sslmode",
+                            "TLS",
+                            "verify-full",
+                            &[
+                                ("verify-full", "Verify certificate and name"),
+                                ("verify-ca", "Verify certificate"),
+                                ("require", "Encrypt, without verifying"),
+                                ("prefer", "Encrypt if offered"),
+                                ("disable", "Do not encrypt"),
+                            ],
+                        ),
+                    ],
                 ),
-                secret("db_migrating_password", "Migrating role's password", true),
+                row(
+                    "grid-2",
+                    &[
+                        text(
+                            "db_serving_role",
+                            "Serving role",
+                            "meridian_app",
+                            "meridian_app",
+                            true,
+                        ),
+                        secret("db_serving_password", "Its password", true),
+                    ],
+                ),
+                row(
+                    "grid-2",
+                    &[
+                        text(
+                            "db_migrating_role",
+                            "Migrating role",
+                            "meridian_migrate",
+                            "meridian_migrate",
+                            true,
+                        ),
+                        secret("db_migrating_password", "Its password", true),
+                    ],
+                ),
             ]
             .concat(),
         ),
@@ -1118,12 +1159,27 @@ fn open_page(
             "local",
             [
                 "<p class=\"hint\">This account is the deployment's administrator.</p>".to_string(),
-                own_login("admin_login", "Your login name"),
-                text("admin_email", "Your email", "", "", false),
-                text("admin_given_name", "Given name", "", "", false),
-                text("admin_family_name", "Family name", "", "", false),
-                own_password("admin_password", "Your password"),
-                own_password("admin_password_again", "Your password, again"),
+                row(
+                    "grid-2",
+                    &[
+                        own_login("admin_login", "Your login name"),
+                        text("admin_email", "Your email", "", "", false),
+                    ],
+                ),
+                row(
+                    "grid-2",
+                    &[
+                        text("admin_given_name", "Given name", "", "", false),
+                        text("admin_family_name", "Family name", "", "", false),
+                    ],
+                ),
+                row(
+                    "grid-2",
+                    &[
+                        own_password("admin_password", "Your password"),
+                        own_password("admin_password_again", "Your password, again"),
+                    ],
+                ),
                 format!(
                     "<p class=\"hint\">At least {ACCOUNT_PASSWORD_MIN} characters, and the \
                      same twice. It is the one you sign in with, here and from the CLI.</p>"
@@ -1153,14 +1209,19 @@ fn open_page(
                     "",
                     true,
                 ),
-                text(
-                    "ldap_bind_dn",
-                    "Account this deployment searches as",
-                    "",
-                    "",
-                    false,
+                row(
+                    "grid-2",
+                    &[
+                        text(
+                            "ldap_bind_dn",
+                            "Account this deployment searches as",
+                            "",
+                            "",
+                            false,
+                        ),
+                        secret("ldap_bind_password", "Its password", false),
+                    ],
                 ),
-                secret("ldap_bind_password", "Its password", false),
                 text(
                     "ldap_user_filter",
                     "How a person is found ({} is the name typed)",
@@ -1182,11 +1243,16 @@ fn open_page(
                     "",
                     true,
                 ),
-                text("oidc_client_id", "Client id", "", "", true),
-                secret(
-                    "oidc_client_secret",
-                    "Client secret (none for a public client)",
-                    false,
+                row(
+                    "grid-2",
+                    &[
+                        text("oidc_client_id", "Client id", "", "", true),
+                        secret(
+                            "oidc_client_secret",
+                            "Client secret (none if public)",
+                            false,
+                        ),
+                    ],
                 ),
                 text("oidc_groups_claim", "Groups claim", "groups", "", false),
                 text(

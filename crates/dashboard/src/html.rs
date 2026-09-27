@@ -23,40 +23,63 @@ pub fn escape(text: &str) -> String {
 /// fetched a font or a script from outside it would be a request nobody
 /// asked for. Light and dark follow the browser.
 const STYLE: &str = "\
-:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d8dee4;--panel:#f6f8fa;\
---accent:#0b5cad;--accent-fg:#fff;--bad:#b3261e;--bad-bg:#fdecea;--good:#1a7f37;--good-bg:#e9f7ee;\
---warn:#8a5a00;--warn-bg:#fff4d6}\
-@media (prefers-color-scheme:dark){:root{--bg:#0f1419;--fg:#e6edf3;--muted:#9aa5b1;--line:#30363d;\
---panel:#161b22;--accent:#4c9be8;--accent-fg:#0f1419;--bad:#ff8a80;--bad-bg:#3a1714;--good:#6fdd8b;\
---good-bg:#10301b;--warn:#f2c14e;--warn-bg:#33270a}}\
-*{box-sizing:border-box}\
-body{font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);background:var(--bg);\
-max-width:46rem;margin:0 auto;padding:2rem 1rem 4rem}\
-h1{font-size:1.6rem;margin:0 0 1rem}h2{font-size:1.2rem;margin:2rem 0 .5rem}h3{font-size:1rem;margin:1.25rem 0 .25rem}\
-p{margin:.5rem 0}a{color:var(--accent)}code{font-size:.9em}\
-table{border-collapse:collapse;width:100%}td,th{padding:.35rem .6rem;border-bottom:1px solid var(--line);text-align:left}\
-label{display:block;margin:.75rem 0 0;font-weight:500}\
-label>input:not([type=checkbox]),label>select,label>textarea{display:block;width:100%;margin-top:.25rem;\
-padding:.5rem .6rem;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px}\
-label:has(>input[type=checkbox]){font-weight:400}\
-input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:1px}\
-button{font:inherit;padding:.45rem 1rem;border-radius:6px;border:1px solid var(--line);background:var(--panel);\
-color:var(--fg);cursor:pointer;margin:.75rem .5rem 0 0}\
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}\
-.hint{color:var(--muted);font-size:.9rem;margin:.25rem 0 0}\
-button.reveal{margin:.3rem 0 0;padding:.15rem .6rem;font-size:.85rem;font-weight:400}\
-.refused,.warn{padding:.6rem .8rem;border-radius:6px}\
-.refused{color:var(--bad);background:var(--bad-bg)}.warn{color:var(--warn);background:var(--warn-bg)}\
-ul.refusal{color:var(--bad);background:var(--bad-bg);border-radius:6px;padding:.6rem .8rem .6rem 2rem;margin:.75rem 0}\
-.passed{color:var(--good);background:var(--good-bg);padding:.6rem .8rem;border-radius:6px}\
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.75rem 1rem;margin:.75rem 0}\
-nav.steps{display:flex;flex-wrap:wrap;gap:.25rem 1.25rem;margin:0 0 1.5rem;font-size:.9rem}\
-nav.steps a{color:var(--muted);text-decoration:none}nav.steps a.here{color:var(--fg);font-weight:600}\
-section.step{border-top:1px solid var(--line);margin-top:1.5rem}form.js section.step{display:none;border:0;margin:0}\
-form.js section.step.current{display:block}form:not(.js) [data-next],form:not(.js) [data-back]{display:none}\
-.off{display:none}button:disabled{opacity:.5;cursor:not-allowed}\
-.development{color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn);border-radius:6px;\
-padding:.5rem .8rem;margin:0 0 1.5rem}";
+:root{--ink:#16191d;--ink-soft:#5b646e;--ink-faint:#8b949e;--page:#f6f7f9;--card:#fff;--line:#e2e5e9;\
+--line-soft:#eef0f3;--hover:#eef0f3;--accent:#1f5fa8;--accent-wash:#e8f0fa;--accent-ink:#fff;\
+--danger:#b3261e;--danger-wash:#fdecea;--good:#1f7a4d;--good-wash:#e8f5ee;--warn-ink:#8a5a10;\
+--warn-wash:#fdf3e0;--radius:8px}\
+@media (prefers-color-scheme:dark){:root{--ink:#e8eaed;--ink-soft:#a2abb5;--ink-faint:#79828c;\
+--page:#14171a;--card:#1c2024;--line:#2c3237;--line-soft:#23282d;--hover:#262b31;--accent:#6ba4e8;\
+--accent-wash:#1a2a3d;--accent-ink:#10141a;--danger:#ef8a82;--danger-wash:#3a201f;--good:#6cc48a;\
+--good-wash:#17301f;--warn-ink:#e0b874;--warn-wash:#33291a}}\
+*{box-sizing:border-box}[hidden]{display:none!important}\
+body{margin:0;font:14.5px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;\
+color:var(--ink);background:var(--page)}\
+main.sheet{max-width:44rem;margin:2.5rem auto 4rem;padding:1.75rem 2rem;background:var(--card);\
+border:1px solid var(--line);border-radius:var(--radius)}\
+@media (max-width:44rem){main.sheet{margin:0;border:0;border-radius:0;padding:1.25rem 1rem}}\
+h1{font-size:1.45rem;letter-spacing:-.02em;margin:0 0 .35rem;font-weight:600}\
+h2{font-size:1.05rem;margin:0 0 .75rem;font-weight:600}h3{font-size:.95rem;margin:1.25rem 0 .25rem;font-weight:600}\
+p{margin:.5rem 0}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em}\
+table{border-collapse:collapse;width:100%;font-size:.93rem}\
+td,th{padding:.5rem .6rem;border-bottom:1px solid var(--line-soft);text-align:left}\
+th{font-size:.8rem;color:var(--ink-soft);font-weight:550}\
+label{display:block;margin:0 0 .9rem;font-size:.84rem;font-weight:550}\
+input:not([type=checkbox]):not([type=radio]):not([type=hidden]),select,textarea{padding:.5rem .65rem;\
+font:inherit;font-size:14.5px;font-weight:400;color:var(--ink);background:var(--card);\
+border:1px solid var(--line);border-radius:var(--radius);max-width:100%}\
+label>input:not([type=checkbox]),label>select,label>textarea{display:block;width:100%;margin-top:.3rem}\
+label:has(>input[type=checkbox]){display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.9rem}\
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}\
+input::placeholder{color:var(--ink-faint)}\
+.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 .75rem}\
+.grid-wide{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,1fr);gap:0 .75rem}\
+@media (max-width:36rem){.grid-2,.grid-wide{grid-template-columns:minmax(0,1fr)}}\
+button{display:inline-flex;align-items:center;gap:.4rem;font:inherit;font-weight:550;padding:.48rem .9rem;\
+border-radius:var(--radius);border:1px solid var(--line);background:var(--card);color:var(--ink);\
+cursor:pointer;margin:.5rem .5rem 0 0}\
+button:hover{background:var(--hover)}\
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}\
+button.primary:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:not-allowed}\
+button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
+.hint{color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
+.refused,.warn,.passed,ul.refusal{border-radius:var(--radius);padding:.65rem .9rem;margin:.75rem 0;font-size:.93rem}\
+.refused,ul.refusal{color:var(--danger);background:var(--danger-wash);border:1px solid var(--danger)}\
+ul.refusal{padding-left:2rem}\
+.warn{color:var(--warn-ink);background:var(--warn-wash)}.passed{color:var(--good);background:var(--good-wash)}\
+.panel{background:var(--page);border:1px solid var(--line);border-radius:var(--radius);padding:.75rem 1rem;margin:.75rem 0}\
+nav.steps{display:flex;flex-wrap:wrap;gap:.4rem;margin:1rem 0 1.5rem;font-size:.84rem}\
+nav.steps a{padding:.25rem .75rem;border-radius:99px;background:var(--line-soft);color:var(--ink-soft);font-weight:550}\
+nav.steps a:hover{text-decoration:none;filter:brightness(1.05)}\
+nav.steps a.here{background:var(--accent);color:var(--accent-ink)}\
+section.step{border-top:1px solid var(--line);margin-top:1.5rem;padding-top:1rem}\
+form.js section.step{display:none;border:0;margin:0;padding:0}form.js section.step.current{display:block}\
+section.step>div:last-child{display:flex;justify-content:flex-end;gap:.5rem;margin-top:1.25rem;\
+padding-top:1rem;border-top:1px solid var(--line-soft)}\
+section.step>div:last-child button{margin:0}\
+form:not(.js) [data-next],form:not(.js) [data-back]{display:none}.off{display:none}\
+.development{color:var(--warn-ink);background:var(--warn-wash);border:1px solid var(--warn-ink);\
+border-radius:var(--radius);padding:.5rem .8rem;margin:0 0 1.25rem;font-size:.9rem}";
 
 /// Whether this deployment was installed for development
 /// (spec/live-plugin-development, ruling 2). Process-wide, set once at start
@@ -91,7 +114,8 @@ fn page_for(title: &str, body: &str, development: bool) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Meridian</title><style>{STYLE}</style></head><body>\n{}\n</body></html>\n",
+         <title>{} · Meridian</title><style>{STYLE}</style></head><body>\n\
+         <main class=\"sheet\">\n{}\n</main>\n</body></html>\n",
         escape(title),
         body
     )
