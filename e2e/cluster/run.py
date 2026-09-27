@@ -440,7 +440,7 @@ def by_cli(s, deployment_id, enrolment_code):
         "--namespace", NAMESPACE, "--release", RELEASE, "--chart", "/chart",
         "--id", deployment_id, "--platform", PLATFORM_FROM_POD,
         *(["--image", IMAGE] if IMAGE else []),
-        "--params", "/params.yaml", "--host", HOST, "--no-doctor",
+        "--params", "/params.yaml", "--host", HOST, "--development", "--no-doctor",
     ]
     done = subprocess.run(
         command, capture_output=True, text=True, env={**os.environ, **environment}
@@ -514,6 +514,8 @@ def main():
             repository, _, tag = IMAGE.rpartition(":")
             values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
         values += [
+            # For development: the live shape is part of what this run proves.
+            "--set", "development=true",
             "--set", "ingress.enabled=true",
             "--set", f"ingress.host={HOST}",
             "--set", f"ingress.className={INGRESS_CLASS}",
@@ -967,6 +969,29 @@ spec:
             f"the reference plugin and its custody copy were made, uploaded, launched and "
             f"opened, acting-for decided, and the terminal's session held to its permission: "
             f"{phase or 'it never ran'}",
+        )
+        # And turned off: the launcher, restarted by the upgrade, removes what
+        # it made live, and the chart no longer renders the live shape for it
+        # (spec/live-plugin-development, ruling 2). Last, since the upgrade
+        # restarts the dashboard and every session with it.
+        live_deployment = f"{RELEASE}-meridian-runtime-plugin-reference-live"
+        was_live = kubectl("get", "deployment", live_deployment, "--ignore-not-found", "-o", "name")
+        s.check(bool(was_live), f"{live_deployment} ran while the deployment was for development")
+        run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE,
+            "--reuse-values", "--set", "development=false")
+        gone = False
+        for _ in range(300):
+            if not kubectl("get", "deployment", live_deployment, "--ignore-not-found", "-o", "name"):
+                gone = True
+                break
+            time.sleep(1)
+        s.check(gone, "turned off, the live instance is removed by the restarted launcher")
+        template = kubectl("get", "configmap", f"{RELEASE}-meridian-runtime-launcher-template", "-o", "json")
+        s.check("plugin-live.json" not in template, "and the launcher holds no live shape to make")
+        s.check(
+            kubectl("get", "deployment", f"{RELEASE}-meridian-runtime-plugin-{instance}",
+                    "--ignore-not-found", "-o", "name") != "",
+            "while the plugins launched as versions keep running",
         )
         if phase != "Succeeded" or not up:
             # For reading, and never the reason the run stops: the plugin

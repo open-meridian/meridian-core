@@ -30,6 +30,8 @@ somebody who may not, rather than as nobody.
 Prints one line per check and exits non-zero if any failed.
 """
 
+import base64
+import json
 import os
 import re
 import socket
@@ -50,6 +52,7 @@ NAME = os.environ.get("E2E_NAME", "")
 PASSWORD = os.environ.get("E2E_PASSWORD", "")
 INSTANCE = os.environ["E2E_INSTANCE"]
 CUSTODY = os.environ["E2E_CUSTODY_INSTANCE"]
+LIVE = os.environ.get("E2E_LIVE_INSTANCE", "reference-live")
 SHARED = "/shared"
 
 failures = []
@@ -175,10 +178,63 @@ def statement(page, instance):
     """Press the page's one button: what the plugin says came of it."""
     page.goto(f"http://{instance}.plugins.{HOST}/")
     page.wait_for_load_state()
-    page.click("button:has-text('Open an empty statement for me')")
+    button = page.locator("button:has-text('Open an empty statement for me')")
+    if not button.count():
+        return f"no statement button: {sentence(page.inner_text('body'))}"
+    button.click()
     page.wait_for_load_state()
     notice = page.locator("p > strong")
     return notice.last.inner_text() if notice.count() else page.content()[:300]
+
+
+# ── The terminal, as the CLI would ask ────────────────────────────────────
+# The live loop's CLI commands are the next task's; until then this asks the
+# dashboard's terminal paths itself, on the session `meridian connect` kept.
+
+
+def terminal_session():
+    with open(f"{SHARED}/config/meridian/sessions/{HOST}.json") as held:
+        return json.load(held)["session"]
+
+
+def terminal(method, path, body=None):
+    request = urllib.request.Request(
+        f"{DASHBOARD}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Authorization": f"Bearer {terminal_session()}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as answered:
+            return answered.status, json.loads(answered.read() or b"{}")
+    except urllib.error.HTTPError as refused:
+        text = refused.read().decode(errors="replace")
+        try:
+            return refused.code, json.loads(text)
+        except ValueError:
+            return refused.code, {"said": text}
+
+
+def events(since=None):
+    query = "" if since is None else f"?since={since}"
+    _, said = terminal("GET", f"/terminal/plugins/{LIVE}/dev/events{query}")
+    return said.get("events", [])
+
+
+def waited(check, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = check()
+        if found:
+            return found
+        time.sleep(0.25)
+    return None
+
+
+def send(files, deleted=()):
+    body = {"files": {path: base64.b64encode(text.encode()).decode() for path, text in files.items()},
+            "deleted": list(deleted)}
+    return terminal("PUT", f"/terminal/plugins/{LIVE}/dev/files", body)
 
 
 # ── The person ────────────────────────────────────────────────────────────
@@ -328,12 +384,20 @@ with sync_playwright() as playwright:
              "access_group_id": access_group or ""},
         )
 
-    page.goto(f"{DASHBOARD}/plugins/{CUSTODY}")
-    page.wait_for_load_state()
+    # The permission reaches the plugin's sidecar after the dashboard says it
+    # was granted, not with it: looked for again until it has.
+    deadline = time.monotonic() + 60
+    while True:
+        page.goto(f"{DASHBOARD}/plugins/{CUSTODY}")
+        page.wait_for_load_state()
+        shown = "<td>custody</td>" in page.content()
+        if shown or time.monotonic() > deadline:
+            break
+        time.sleep(2)
     check(
-        page.url.startswith(f"http://{CUSTODY}.plugins.{HOST}/")
-        and "<td>custody</td>" in page.content(),
-        f"{CUSTODY}'s page shows what she may see through it: {page.url}",
+        page.url.startswith(f"http://{CUSTODY}.plugins.{HOST}/") and shown,
+        f"{CUSTODY}'s page shows what she may see through it: {page.url}"
+        + ("" if shown else f" {sentence(page.inner_text('body'))}"),
     )
     said = statement(page, CUSTODY)
     check(
@@ -353,6 +417,68 @@ with sync_playwright() as playwright:
         time.sleep(5)
         said = statement(page, CUSTODY)
     check(said.startswith("Opened statement"), f"once she writes, it is recorded for her: {said}")
+
+    # The live shape (spec/live-plugin-development), on this development
+    # deployment: the reference plugin launched live, changed while it runs,
+    # broken and mended, and the sidecar's own record of what it refused.
+    status, said = terminal("POST", "/terminal/plugins/launch", {
+        "name": "reference-plugin", "version": "0.1.0", "instance_id": LIVE,
+        "approved_roles": [], "approved_tags": [], "live": True,
+    })
+    check(status == 201, f"the reference plugin launched live as {LIVE}: {status} {said}")
+    ready = waited(lambda: [e for e in events() if e.get("event") == "ready"], 300)
+    check(bool(ready), f"{LIVE} is ready at its first revision, run by the SDK's dev runner")
+
+    scaffold = "/shared/reference-plugin/src/reference_plugin"
+    page_py = open(f"{scaffold}/page.py").read()
+    main_py = open(f"{scaffold}/__main__.py").read()
+    changed = page_py.replace('TITLE = "Reference plugin"', 'TITLE = "Reference plugin, changed live"')
+    check(changed != page_py, "the page's title is there to change")
+    sent_at = time.monotonic()
+    status, said = send({"src/reference_plugin/page.py": changed})
+    revision = said.get("revision", -1)
+    check(status == 200 and revision >= 1, f"a change sent to it is revision {revision}: {status} {said}")
+    live_again = waited(
+        lambda: [e for e in events(revision - 1) if e.get("event") == "ready" and e.get("revision") == revision],
+        60,
+    )
+    took = time.monotonic() - sent_at
+    check(bool(live_again), f"and running within {took:.1f}s, the pod and its sidecar as they were")
+    print(f"  save to ready: {took:.2f}s", flush=True)
+
+    page.goto(f"{DASHBOARD}/plugins/{LIVE}")
+    page.wait_for_load_state()
+    for _ in range(10):
+        if "changed live" in page.content():
+            break
+        time.sleep(2)
+        page.goto(f"{DASHBOARD}/plugins/{LIVE}")
+        page.wait_for_load_state()
+    check("<h1>Reference plugin, changed live</h1>" in page.content(),
+          f"its page is the changed one, on its own host: {page.url}")
+
+    status, said = send({"src/reference_plugin/__main__.py": "raise RuntimeError('broken on purpose')\n" + main_py})
+    broken = said.get("revision", -1)
+    crashed = waited(
+        lambda: [e for e in events(broken - 1) if e.get("event") == "crashed" and e.get("revision") == broken],
+        60,
+    )
+    check(bool(crashed) and "broken on purpose" in (crashed or [{}])[0].get("traceback", ""),
+          "a start that fails is reported as crashed, with its traceback")
+
+    status, said = send({"src/reference_plugin/__main__.py": main_py})
+    mended = said.get("revision", -1)
+    check(bool(waited(lambda: [e for e in events(mended - 1)
+                               if e.get("event") == "ready" and e.get("revision") == mended], 60)),
+          "and mended by the next change, without anybody restarting anything")
+    page.goto(f"http://{LIVE}.plugins.{HOST}/")
+    page.wait_for_load_state()
+    page.click("button:has-text('Open an empty statement for me')")
+    page.wait_for_load_state()
+    refused = waited(lambda: [e for e in events(mended - 1) if e.get("event") == "refused"], 30)
+    check(bool(refused) and "no grant" in (refused or [{}])[0].get("reason", ""),
+          "what the sidecar refused it is in its events, where whoever is developing it looks")
+    open(f"{SHARED}/live-done", "w").close()
 
     # The terminal's paths take the terminal's session, and nothing else: the
     # browser's cookie, which the CLI's upload and list above did without, is

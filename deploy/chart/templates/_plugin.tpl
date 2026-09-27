@@ -95,6 +95,41 @@ spec:
       imagePullSecrets:
         - name: {{ . }}
       {{- end }}{{- end }}
+      {{- if and .live .plugin }}
+      {{- /*
+        Live: the plugin's files copied from its image into the shared live
+        folder before anything starts, group-writable, so its sidecar -- which
+        holds no capability, root or not -- can replace them with the files
+        it is sent. The dev runner finds the folder seeded and runs it.
+      */}}
+      initContainers:
+        - name: seed
+          image: {{ .plugin.image | quote }}
+          imagePullPolicy: {{ .plugin.pullPolicy | default "IfNotPresent" }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cd /plugin
+              for part in * .[!.]*; do
+                [ -e "$part" ] || continue
+                [ "$part" = live ] && continue
+                cp -R "$part" live/
+              done
+              # What was copied, not the folder: that is the volume's, and
+              # not this user's to change.
+              find live -mindepth 1 -exec chmod g+rwX {} +
+              find live -mindepth 1 -type d -exec chmod g+s {} +
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: live
+              mountPath: /plugin/live
+      {{- end }}
       containers:
         - name: sidecar
           image: "{{ $top.Values.image.repository }}:{{ .imageTag | default $top.Values.image.tag }}"
