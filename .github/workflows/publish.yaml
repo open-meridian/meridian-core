@@ -199,8 +199,12 @@ jobs:
           SHA: ${{ steps.version.outputs.sha }}
         run: |
           set -euo pipefail
-          helm template check deploy/chart --set deployment.id=publish-check \
-            | grep -q "image: \"$IMAGE:$SHA\""
+          # Rendered whole first. Piped into `grep -q`, which stops at its
+          # first match, helm was still writing and died of SIGPIPE, and
+          # pipefail made that the step's failure (exit 141) whenever the
+          # match came early enough -- more often as the chart grew.
+          rendered="$(helm template check deploy/chart --set deployment.id=publish-check)"
+          grep -q "image: \"$IMAGE:$SHA\"" <<<"$rendered"
 
       - name: Package and push
         env:
