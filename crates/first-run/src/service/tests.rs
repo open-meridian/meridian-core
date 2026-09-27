@@ -771,6 +771,26 @@ fn an_ldap_answer_missing_half_of_itself_is_told_so_without_dialling() {
     assert!(handed.lock().unwrap().is_empty(), "nothing was dialled");
 }
 
+fn local_account(run: &FirstRun, password: Option<&[u8]>) -> LoginBackendAnswer {
+    LoginBackendAnswer {
+        backend: Some(Backend::LocalAccount(
+            meridian_domain::v1::LocalAccountAnswer {
+                login_name: "ada".into(),
+                initial_password: password.map(|password| {
+                    seal(
+                        &run.key.public_key(),
+                        &run.key.key_id,
+                        "local_account.initial_password",
+                        password,
+                    )
+                    .unwrap()
+                }),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
 #[test]
 fn a_local_account_answer_dials_nothing() {
     let directories = Directories::default();
@@ -778,15 +798,64 @@ fn a_local_account_answer_dials_nothing() {
     let mut run = first_run(Box::new(Remembering::default()), vec![]);
     run.directory_probe = Box::new(directories);
 
-    let reply = check_backend_with(
-        &run,
-        LoginBackendAnswer {
-            backend: Some(Backend::LocalAccount(Default::default())),
-        },
-    );
+    let reply = check_backend_with(&run, local_account(&run, Some(b"correct horse battery")));
 
     assert!(reply.passed, "{:?}", reply.findings);
     assert!(handed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_local_account_with_no_password_is_refused_at_test_and_at_apply() {
+    // On 2026-09-27 the first real install on the local-account route applied
+    // an empty password: the wizard's Test had reloaded its page, which sends
+    // no password back, and nothing here asked whether there was one. Its
+    // administrator was refused with the password they had typed, twice.
+    let run = first_run(Box::new(Remembering::default()), vec![]);
+    let short = check_backend_with(&run, local_account(&run, Some(b"elevenchars")));
+    assert!(!short.passed);
+    assert!(
+        short
+            .findings
+            .iter()
+            .any(|f| f.contains("11 characters") && f.contains("at least 12")),
+        "{:?}",
+        short.findings
+    );
+    for password in [None, Some(&b""[..])] {
+        let reply = check_backend_with(&run, local_account(&run, password));
+        assert!(!reply.passed, "{password:?}");
+        assert!(
+            reply
+                .findings
+                .iter()
+                .any(|f| f.contains("no password for your account")),
+            "{:?}",
+            reply.findings
+        );
+    }
+
+    let (cluster, done) = watched();
+    let run = first_run(Box::new(cluster), vec![]);
+    let configuration = FirstRunConfiguration {
+        administrator: Some(AdministratorAnswer {
+            named: Some(Named::LocalAccountLogin("ada".into())),
+        }),
+        runtime_database: Some(database(&run)),
+        login_backend: Some(local_account(&run, Some(b""))),
+        addresses: Some(AddressesAnswer {
+            dashboard_url: "https://meridian.firm.example".into(),
+        }),
+    };
+    let applied = run.apply(&configuration).await;
+    assert!(!applied.applied);
+    assert!(
+        applied
+            .refusal_reason
+            .contains("no password for your account"),
+        "{}",
+        applied.refusal_reason
+    );
+    assert!(done.lock().unwrap().is_empty(), "nothing was written");
 }
 
 fn provider_answer(issuer: &str) -> LoginBackendAnswer {

@@ -44,6 +44,7 @@ button{font:inherit;padding:.45rem 1rem;border-radius:6px;border:1px solid var(-
 color:var(--fg);cursor:pointer;margin:.75rem .5rem 0 0}\
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}\
 .hint{color:var(--muted);font-size:.9rem;margin:.25rem 0 0}\
+button.reveal{margin:.3rem 0 0;padding:.15rem .6rem;font-size:.85rem;font-weight:400}\
 .refused,.warn{padding:.6rem .8rem;border-radius:6px}\
 .refused{color:var(--bad);background:var(--bad-bg)}.warn{color:var(--warn);background:var(--warn-bg)}\
 ul.refusal{color:var(--bad);background:var(--bad-bg);border-radius:6px;padding:.6rem .8rem .6rem 2rem;margin:.75rem 0}\

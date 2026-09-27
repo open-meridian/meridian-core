@@ -671,6 +671,71 @@ fn a_first_visit_starts_a_trial_and_every_field_stays_in_the_form() {
 }
 
 #[test]
+fn the_accounts_password_is_given_and_the_same_twice_before_anything_is_sealed() {
+    let fields = |pairs: &[(&str, &str)]| -> Fields {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let local = [("backend", "local"), ("admin_login", "ada")];
+
+    let none = account_findings(&fields(&[
+        local[0],
+        local[1],
+        ("admin_password", ""),
+        ("admin_password_again", ""),
+    ]));
+    assert_eq!(none.len(), 1, "{none:?}");
+    assert_eq!(none[0].0, Step::SigningIn);
+    assert!(none[0].1.contains("type a password"));
+
+    let differ = account_findings(&fields(&[
+        local[0],
+        local[1],
+        ("admin_password", "correct horse battery"),
+        ("admin_password_again", "correct horse batery"),
+    ]));
+    assert_eq!(differ.len(), 1, "{differ:?}");
+    assert!(differ[0].1.contains("differ"));
+
+    let same = account_findings(&fields(&[
+        local[0],
+        local[1],
+        ("admin_password", "correct horse battery"),
+        ("admin_password_again", "correct horse battery"),
+    ]));
+    assert!(same.is_empty(), "{same:?}");
+
+    // Answered from a file, it is posted once, and the service holds the rest.
+    let once = account_findings(&fields(&[
+        local[0],
+        local[1],
+        ("admin_password", "correct horse battery"),
+    ]));
+    assert!(once.is_empty(), "{once:?}");
+    // Not the local route: nothing of the account's is asked.
+    assert!(account_findings(&fields(&[("backend", "ldap")])).is_empty());
+}
+
+#[test]
+fn the_accounts_password_is_asked_twice_with_its_length_and_every_password_can_be_shown() {
+    let page = open_page(&Fields::default(), &[], "", "");
+    for name in ["admin_password", "admin_password_again"] {
+        let at = page.find(&format!("name=\"{name}\"")).unwrap();
+        let end = at + page[at..].find('>').unwrap();
+        assert!(
+            page[at..end].contains(&format!("minlength=\"{ACCOUNT_PASSWORD_MIN}\"")),
+            "{name}"
+        );
+    }
+    let passwords = page.matches("type=\"password\"").count();
+    let shows = page.matches("data-reveal hidden>Show</button>").count();
+    assert_eq!(passwords, shows, "every password field has its Show button");
+    assert!(passwords >= 6, "{passwords}");
+}
+
+#[test]
 fn a_password_manager_is_offered_the_administrators_login_and_nothing_else() {
     let page = open_page(&Fields::default(), &[], "", "");
     let input = |name: &str| -> String {

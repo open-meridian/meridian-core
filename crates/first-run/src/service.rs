@@ -258,8 +258,12 @@ impl FirstRun {
             // Where the firm has no directory at all, this deployment holds
             // the account (decisions/018) and there is nothing to connect to:
             // the Job hashes the password, and the dashboard makes the
-            // account.
-            Some(Backend::LocalAccount(_)) => Vec::new(),
+            // account. So what is checked is that there is a password to
+            // hash. Until 2026-09-27 nothing was: a wizard whose Test had
+            // reloaded the page -- which sends no password back -- applied an
+            // empty one, and its administrator could not sign in with the
+            // password they had typed, twice, on the first real install.
+            Some(Backend::LocalAccount(account)) => self.check_local_account(account),
             Some(Backend::Oidc(oidc)) => {
                 let mut findings = Vec::new();
                 if oidc.issuer.trim().is_empty() {
@@ -326,6 +330,34 @@ impl FirstRun {
         match self.key.open(sealed, "ldap.bind_password") {
             Err(refusal) => vec![refusal],
             Ok(password) => self.directory_probe.check(ldap, &password),
+        }
+    }
+
+    fn check_local_account(
+        &self,
+        account: &meridian_domain::v1::LocalAccountAnswer,
+    ) -> Vec<String> {
+        const FIELD: &str = "local_account.initial_password";
+        let empty = "no password for your account: type the one you will sign in with".to_string();
+        match &account.initial_password {
+            None => vec![empty],
+            Some(sealed) => match self.key.open(sealed, FIELD) {
+                Ok(password) if password.is_empty() => vec![empty],
+                Ok(password) => {
+                    let long = String::from_utf8_lossy(&password).chars().count();
+                    if long < ACCOUNT_PASSWORD_MIN {
+                        vec![format!(
+                            "your account's password is {long} characters: it needs at least \
+                             {ACCOUNT_PASSWORD_MIN}"
+                        )]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(failed) => vec![format!(
+                    "your account's password could not be read: {failed}"
+                )],
+            },
         }
     }
 
@@ -940,6 +972,11 @@ mod tests;
 /// opened: the Job holds the only key that can read what the wizard sealed,
 /// and the hash is what leaves. Verified in the dashboard, which is where the
 /// accounts are kept (decisions/018).
+/// The fewest characters the first administrator's password may have. The
+/// wizard says so as it is typed (`crates/dashboard`, `ACCOUNT_PASSWORD_MIN`);
+/// this is what refuses fewer, whoever answered.
+pub const ACCOUNT_PASSWORD_MIN: usize = 12;
+
 fn hash_password(password: &str) -> Result<String, String> {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     let salt = SaltString::generate(&mut OsRng);

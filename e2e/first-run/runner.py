@@ -56,7 +56,7 @@ ANSWERS = {
     "db_sslmode": "disable",
     "db_serving_role": "firstrun_app", "db_serving_password": DATABASE_PASSWORD,
     "db_migrating_role": "firstrun_migrate", "db_migrating_password": DATABASE_PASSWORD,
-    "backend": "local", "admin_login": "ada", "admin_password": "Password1!",
+    "backend": "local", "admin_login": "ada", "admin_password": "Password1!-e2e",
     "admin_given_name": "Ada", "admin_family_name": "Park",
     "dashboard_url": "http://dashboard-first-run:8080",
     # W7.5: who administers this deployment once it is configured. The local

@@ -362,6 +362,41 @@ fn closed_page(state: &EnrolmentState, refusal: &str) -> String {
     )
 }
 
+/// The fewest characters the first administrator's password may have. The
+/// first-run service refuses fewer (`crates/first-run`, `check_local_account`);
+/// this is the page saying so first.
+pub const ACCOUNT_PASSWORD_MIN: usize = 12;
+
+/// What is wrong with the local account's password before anything is
+/// sealed, shown where it is typed: none given, or two that differ. The second
+/// only where the page asked for it twice -- a script answering the wizard
+/// from a file posts it once, and the length is the service's to refuse.
+fn account_findings(fields: &Fields) -> Vec<(Step, String)> {
+    if fields.get("backend").map(String::as_str) != Some("local") {
+        return Vec::new();
+    }
+    let password = fields
+        .get("admin_password")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let mut findings = Vec::new();
+    if password.is_empty() {
+        findings.push((
+            Step::SigningIn,
+            "type a password for your account: it is the one you will sign in with".to_string(),
+        ));
+    }
+    if let Some(again) = fields.get("admin_password_again") {
+        if again != password {
+            findings.push((
+                Step::SigningIn,
+                "the two passwords differ: type the same one twice".to_string(),
+            ));
+        }
+    }
+    findings
+}
+
 /// W7.4. Test what has been filled in, and write nothing.
 async fn check(
     State(app): State<Arc<App>>,
@@ -371,6 +406,11 @@ async fn check(
     let Some(_) = live(&app, &headers) else {
         return closed(&app, "").await;
     };
+
+    let account = account_findings(&fields);
+    if !account.is_empty() {
+        return Html(open_page(&fields, &account, "", &app.wizard.suggested_url)).into_response();
+    }
 
     let requests = match answers(&app, &fields).await {
         Err(refusal) => {
@@ -447,6 +487,11 @@ async fn apply(
     let Some(wizard) = live(&app, &headers) else {
         return closed(&app, "").await;
     };
+
+    let account = account_findings(&fields);
+    if !account.is_empty() {
+        return Html(open_page(&fields, &account, "", &app.wizard.suggested_url)).into_response();
+    }
 
     let configuration = match answers(&app, &fields).await {
         Err(refusal) => {
@@ -902,9 +947,12 @@ fn open_page(
         )
     };
     // A password is never rendered back: what the browser holds, it re-posts.
+    // Each has a Show button, for making sure of what was typed; hidden until
+    // the script is there to work it.
+    let reveal = "<button type=\"button\" class=\"reveal\" data-reveal hidden>Show</button>";
     let secret = |name: &str, label: &str, needed: bool| {
         format!(
-            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"off\"{}></label>",
+            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"off\"{}>{reveal}</label>",
             required(needed)
         )
     };
@@ -919,9 +967,12 @@ fn open_page(
             required(true)
         )
     };
+    // At least ACCOUNT_PASSWORD_MIN characters: the first-run service
+    // refuses fewer, and this says so before Test does.
     let own_password = |name: &str, label: &str| {
         format!(
-            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"new-password\"{}></label>",
+            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"new-password\" \
+             minlength=\"{ACCOUNT_PASSWORD_MIN}\"{}>{reveal}</label>",
             required(true)
         )
     };
@@ -1072,6 +1123,11 @@ fn open_page(
                 text("admin_given_name", "Given name", "", "", false),
                 text("admin_family_name", "Family name", "", "", false),
                 own_password("admin_password", "Your password"),
+                own_password("admin_password_again", "Your password, again"),
+                format!(
+                    "<p class=\"hint\">At least {ACCOUNT_PASSWORD_MIN} characters, and the \
+                     same twice. It is the one you sign in with, here and from the CLI.</p>"
+                ),
             ]
             .concat(),
         ),
@@ -1408,6 +1464,69 @@ const WIZARD_SCRIPT: &str = r#"(function () {
   });
 
   checkAddress();
+
+  // Show: a password field as text, to be sure of what was typed, and back.
+  form.querySelectorAll("[data-reveal]").forEach(function (button) {
+    button.hidden = false;
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      var field = button.previousElementSibling;
+      var showing = field.type === "text";
+      field.type = showing ? "password" : "text";
+      button.textContent = showing ? "Show" : "Hide";
+    });
+  });
+
+  // The account's password, the same twice: said at the second field, and
+  // Next does not go on while they differ.
+  var password = form.elements["admin_password"];
+  var again = form.elements["admin_password_again"];
+  function matching() {
+    if (password && again) {
+      again.setCustomValidity(again.value && again.value !== password.value
+        ? "The two passwords differ." : "");
+    }
+  }
+  if (password && again) {
+    password.addEventListener("input", matching);
+    again.addEventListener("input", matching);
+  }
+
+  // Test in the page, so that what was typed stays typed. A reloaded page
+  // holds no password -- none is ever sent back -- and a Test that reloaded
+  // it once sent an empty one to Apply. Without this script the page is
+  // posted and comes back, and the server refuses a password that is not
+  // there.
+  var test = form.querySelector("button[formaction='/first-run/check']");
+  if (test && window.fetch && window.DOMParser) {
+    test.addEventListener("click", function (event) {
+      event.preventDefault();
+      var body = new URLSearchParams(new FormData(form));
+      fetch("/first-run/check", { method: "POST", body: body, credentials: "same-origin" })
+        .then(function (answer) { return answer.text(); })
+        .then(function (text) {
+          var tested = new DOMParser().parseFromString(text, "text/html");
+          steps.forEach(function (step) {
+            step.querySelectorAll(":scope > ul.refusal, :scope > p.refused, :scope > p.passed")
+              .forEach(function (said) { said.remove(); });
+            var there = tested.getElementById(step.id);
+            if (!there) return;
+            var heading = step.querySelector("h2");
+            Array.prototype.slice.call(
+              there.querySelectorAll(":scope > ul.refusal, :scope > p.refused, :scope > p.passed")
+            ).reverse().forEach(function (said) {
+              heading.insertAdjacentElement("afterend", document.importNode(said, true));
+            });
+          });
+          passed = document.querySelector(".passed");
+          apply.disabled = !passed;
+          var found = steps.filter(function (step) { return step.querySelector("ul.refusal"); });
+          show(found.length ? found[0].id : "apply");
+        })
+        .catch(function () { form.requestSubmit(test); });
+    });
+  }
+
   // Where to start: at the first step Test found something in, at the
   // review after a test, or at the beginning.
   var troubled = steps.filter(function (step) { return step.querySelector("ul.refusal"); });
