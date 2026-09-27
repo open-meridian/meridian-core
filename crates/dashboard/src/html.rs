@@ -21,36 +21,48 @@ pub fn escape(text: &str) -> String {
 /// How every page looks: one stylesheet, inline, loading nothing from
 /// anywhere -- a deployment runs inside a firm's network, and a page that
 /// fetched a font or a script from outside it would be a request nobody
-/// asked for. Light and dark follow the browser.
+/// asked for. Light and dark follow the browser. The palette is the
+/// platform's public page's, so a deployment reads as the same product as
+/// the site it was set up from: cool greys, an indigo accent, a navy bar.
 const STYLE: &str = "\
-:root{--ink:#16191d;--ink-soft:#5b646e;--ink-faint:#8b949e;--page:#f6f7f9;--card:#fff;--line:#e2e5e9;\
---line-soft:#eef0f3;--hover:#eef0f3;--accent:#1f5fa8;--accent-wash:#e8f0fa;--accent-ink:#fff;\
---danger:#b3261e;--danger-wash:#fdecea;--good:#1f7a4d;--good-wash:#e8f5ee;--warn-ink:#8a5a10;\
---warn-wash:#fdf3e0;--radius:8px}\
-@media (prefers-color-scheme:dark){:root{--ink:#e8eaed;--ink-soft:#a2abb5;--ink-faint:#79828c;\
---page:#14171a;--card:#1c2024;--line:#2c3237;--line-soft:#23282d;--hover:#262b31;--accent:#6ba4e8;\
---accent-wash:#1a2a3d;--accent-ink:#10141a;--danger:#ef8a82;--danger-wash:#3a201f;--good:#6cc48a;\
---good-wash:#17301f;--warn-ink:#e0b874;--warn-wash:#33291a}}\
+:root{--ink:#0e1330;--ink-soft:#4a5277;--ink-faint:#8a90ad;--page:#f5f6fb;--card:#fff;--line:#e3e6f0;\
+--line-soft:#eef0f6;--hover:#eef0fa;--accent:#4353f0;--accent-wash:#eceeff;--accent-ink:#fff;\
+--danger:#d23345;--danger-wash:#fdecee;--good:#13805f;--good-wash:#e3f6ef;--warn-ink:#8a5a10;\
+--warn-wash:#fdf3e0;--radius:10px;--shadow:0 1px 2px rgba(14,19,48,.04),0 8px 24px rgba(14,19,48,.06);\
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--navy-900:#070b24;--navy-800:#0b1233;\
+--navy-line:rgba(160,176,255,.14);--navy-ink:#e9ecff;--navy-soft:#a9b1d9;--mark:#9aa6ff}\
+@media (prefers-color-scheme:dark){:root{--ink:#e9ecff;--ink-soft:#a9b1d9;--ink-faint:#6f78a8;\
+--page:#0a0f2c;--card:#10173d;--line:#222c5a;--line-soft:#1a2350;--hover:#18214d;--accent:#8f9bff;\
+--accent-wash:#1c2562;--accent-ink:#0a0f2c;--danger:#ff8a95;--danger-wash:#3a1a26;--good:#5fdcb0;\
+--good-wash:#12352c;--warn-ink:#f2c46b;--warn-wash:#33291a;--shadow:none}}\
 *{box-sizing:border-box}[hidden]{display:none!important}\
-body{margin:0;font:14.5px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;\
-color:var(--ink);background:var(--page)}\
-main.sheet{max-width:44rem;margin:2.5rem auto 4rem;padding:1.75rem 2rem;background:var(--card);\
-border:1px solid var(--line);border-radius:var(--radius)}\
+body{margin:0;font:14.5px/1.55 Inter,-apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;\
+color:var(--ink);background:var(--page);-webkit-font-smoothing:antialiased}\
+header.bar{display:flex;align-items:center;gap:.6rem;height:56px;padding:0 1.25rem;color:var(--navy-ink);\
+background:radial-gradient(420px 120px at 12% 0%,rgba(91,108,255,.3),transparent 70%),\
+linear-gradient(180deg,var(--navy-900),var(--navy-800));border-bottom:1px solid var(--navy-line)}\
+header.bar a{display:inline-flex;align-items:center;gap:.55rem;color:inherit;font-weight:650;\
+letter-spacing:-.01em;text-decoration:none}\
+header.bar svg{width:24px;height:24px;color:var(--mark)}\
+header.bar .where{margin-left:auto;font:600 .7rem var(--mono);letter-spacing:.1em;text-transform:uppercase;\
+color:var(--navy-soft)}\
+main.sheet{max-width:44rem;margin:2.5rem auto 4rem;padding:1.9rem 2.1rem;background:var(--card);\
+border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}\
 @media (max-width:44rem){main.sheet{margin:0;border:0;border-radius:0;padding:1.25rem 1rem}}\
-h1{font-size:1.45rem;letter-spacing:-.02em;margin:0 0 .35rem;font-weight:600}\
+h1{font-size:1.6rem;letter-spacing:-.025em;margin:0 0 .35rem;font-weight:700}\
 h2{font-size:1.05rem;margin:0 0 .75rem;font-weight:600}h3{font-size:.95rem;margin:1.25rem 0 .25rem;font-weight:600}\
 p{margin:.5rem 0}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em}\
+code{font-family:var(--mono);font-size:.86em}\
 table{border-collapse:collapse;width:100%;font-size:.93rem}\
 td,th{padding:.5rem .6rem;border-bottom:1px solid var(--line-soft);text-align:left}\
-th{font-size:.8rem;color:var(--ink-soft);font-weight:550}\
+th{font:600 .68rem var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint)}\
 label{display:block;margin:0 0 .9rem;font-size:.84rem;font-weight:550}\
 input:not([type=checkbox]):not([type=radio]):not([type=hidden]),select,textarea{padding:.5rem .65rem;\
 font:inherit;font-size:14.5px;font-weight:400;color:var(--ink);background:var(--card);\
 border:1px solid var(--line);border-radius:var(--radius);max-width:100%}\
 label>input:not([type=checkbox]),label>select,label>textarea{display:block;width:100%;margin-top:.3rem}\
 label:has(>input[type=checkbox]){display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.9rem}\
-input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}\
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-wash)}\
 input::placeholder{color:var(--ink-faint)}\
 .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 .75rem}\
 .grid-wide{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,1fr);gap:0 .75rem}\
@@ -60,7 +72,8 @@ border-radius:var(--radius);border:1px solid var(--line);background:var(--card);
 cursor:pointer;margin:.5rem .5rem 0 0}\
 button:hover{background:var(--hover)}\
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}\
-button.primary:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:not-allowed}\
+button.primary:hover{filter:brightness(1.1)}\
+@media (prefers-color-scheme:dark){button.primary{background:#5b6cff;border-color:#5b6cff;color:#fff}}button:disabled{opacity:.5;cursor:not-allowed}\
 button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
 .hint{color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
 .refused,.warn,.passed,ul.refusal{border-radius:var(--radius);padding:.65rem .9rem;margin:.75rem 0;font-size:.93rem}\
@@ -86,7 +99,7 @@ nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;padding-bo
 border-bottom:1px solid var(--line);font-size:.88rem}\
 nav.tabs a{padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
 nav.tabs a:hover{text-decoration:none;background:var(--hover)}\
-nav.tabs a.here{background:var(--accent-wash);color:var(--accent)}\
+nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
 .admin:not(.js) nav.tabs{display:none}\
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
@@ -125,6 +138,12 @@ pub fn is_development() -> bool {
     DEVELOPMENT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The mark, as on the platform's pages. It takes the colour it is set in.
+const MARK: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><rect x=\"1\" y=\"1\" width=\"30\" \
+     height=\"30\" rx=\"8\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M16 5v22M8 9c3 2 \
+     5 4.5 5 7s-2 5-5 7M24 9c-3 2-5 4.5-5 7s2 5 5 7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" \
+     stroke-linecap=\"round\"/></svg>";
+
 const DEVELOPMENT_BANNER: &str = "<p class=\"development\"><strong>Development \
      deployment.</strong> It runs plugin code as it is being written, which nobody \
      has reviewed. Nothing here is for real use.</p>";
@@ -144,7 +163,9 @@ fn page_for(title: &str, body: &str, development: bool) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Meridian</title><style>{STYLE}</style></head><body>\n\
+         <title>{} · Open Meridian</title><style>{STYLE}</style></head><body>\n\
+         <header class=\"bar\"><a href=\"/\">{MARK}<span>Open Meridian</span></a>\
+         <span class=\"where\">Deployment</span></header>\n\
          <main class=\"sheet\">\n{}\n</main>\n</body></html>\n",
         escape(title),
         body
@@ -173,6 +194,6 @@ mod tests {
 
     #[test]
     fn a_title_cannot_inject_markup() {
-        assert!(page("<b>", "").contains("<title>&lt;b&gt; · Meridian</title>"));
+        assert!(page("<b>", "").contains("<title>&lt;b&gt; · Open Meridian</title>"));
     }
 }

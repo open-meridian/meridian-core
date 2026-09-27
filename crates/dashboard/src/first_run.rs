@@ -1060,7 +1060,7 @@ fn open_page(
         when(
             "db_route",
             "brought",
-            "<p class=\"hint\">For trying Meridian and for development. Nothing is \
+            "<p class=\"hint\">For trying Open Meridian and for development. Nothing is \
              asked of you: it is started here, and its roles and passwords are made \
              here. It keeps its data if Meridian is removed and installed again. It \
              loses everything if this cluster is deleted. Nobody backs it up.</p>"

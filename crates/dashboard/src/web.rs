@@ -188,7 +188,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if app.first_run {
         return Html(page(
             "Not set up yet",
-            "<h1>Meridian</h1><p>This deployment is not set up yet.</p>\
+            "<h1>Open Meridian</h1><p>This deployment is not set up yet.</p>\
              <p><a href=\"/first-run\">Set it up</a> with the first-run code from the \
              platform.</p>",
         ))
@@ -201,7 +201,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let Some(session) = session_of(&app, &headers) else {
         return Html(page(
             "Sign in",
-            "<h1>Meridian</h1><p><a href=\"/sign-in\">Sign in</a> to this deployment.</p>",
+            "<h1>Open Meridian</h1><p><a href=\"/sign-in\">Sign in</a> to this deployment.</p>",
         ))
         .into_response();
     };
@@ -209,7 +209,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
     let mut body = format!(
-        "<h1>Meridian</h1><p>Signed in as <strong>{}</strong>.</p>",
+        "<h1>Open Meridian</h1><p>Signed in as <strong>{}</strong>.</p>",
         escape(&session.display_name)
     );
     if access.deployment_admin {
