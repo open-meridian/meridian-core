@@ -176,6 +176,13 @@ street:
     existingSecret: ""
     key: ""
 
+# Installed for development (spec/live-plugin-development, ruling 2): it may
+# run plugin code as it is being written, which nobody has reviewed, and every
+# dashboard page says so. Set at install -- `meridian up --development`, or a
+# sandbox's own values -- never by a customer's listing, and never switched on
+# from the dashboard.
+development: false
+
 # How people and the CLI reach this deployment from outside the cluster: a
 # standard Ingress, off by default (templates/ingress.yaml). The listing turns
 # it on from the buyer's domain; `meridian up` as `meridian.localhost` where the

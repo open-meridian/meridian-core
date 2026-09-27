@@ -53,10 +53,39 @@ nav.steps{display:flex;flex-wrap:wrap;gap:.25rem 1.25rem;margin:0 0 1.5rem;font-
 nav.steps a{color:var(--muted);text-decoration:none}nav.steps a.here{color:var(--fg);font-weight:600}\
 section.step{border-top:1px solid var(--line);margin-top:1.5rem}form.js section.step{display:none;border:0;margin:0}\
 form.js section.step.current{display:block}form:not(.js) [data-next],form:not(.js) [data-back]{display:none}\
-.off{display:none}button:disabled{opacity:.5;cursor:not-allowed}";
+.off{display:none}button:disabled{opacity:.5;cursor:not-allowed}\
+.development{color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn);border-radius:6px;\
+padding:.5rem .8rem;margin:0 0 1.5rem}";
+
+/// Whether this deployment was installed for development
+/// (spec/live-plugin-development, ruling 2). Process-wide, set once at start
+/// from the chart, and said on every page, since it is the one thing about a
+/// deployment nobody should have to find out.
+static DEVELOPMENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn mark_development() {
+    DEVELOPMENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_development() -> bool {
+    DEVELOPMENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+const DEVELOPMENT_BANNER: &str = "<p class=\"development\"><strong>Development \
+     deployment.</strong> It runs plugin code as it is being written, which nobody \
+     has reviewed. Nothing here is for real use.</p>";
 
 /// A whole page. `body` is already HTML; `title` is text.
 pub fn page(title: &str, body: &str) -> String {
+    page_for(title, body, is_development())
+}
+
+fn page_for(title: &str, body: &str, development: bool) -> String {
+    let body = if development {
+        format!("{DEVELOPMENT_BANNER}\n{body}")
+    } else {
+        body.to_string()
+    };
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -77,6 +106,14 @@ mod tests {
             escape(r#"<script>"x" & 'y'</script>"#),
             "&lt;script&gt;&quot;x&quot; &amp; &#39;y&#39;&lt;/script&gt;"
         );
+    }
+
+    #[test]
+    fn a_development_deployment_says_so_on_every_page_and_another_never_does() {
+        let marked = page_for("Home", "<h1>Meridian</h1>", true);
+        assert!(marked.contains("class=\"development\""), "{marked}");
+        assert!(marked.find("Development").unwrap() < marked.find("<h1>").unwrap());
+        assert!(!page_for("Home", "<h1>Meridian</h1>", false).contains("class=\"development\""));
     }
 
     #[test]

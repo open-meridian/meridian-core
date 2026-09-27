@@ -124,6 +124,12 @@ fn run() -> Result<(), String> {
                 .into(),
         );
     }
+    // Installed for development (spec/live-plugin-development, ruling 2):
+    // every page says so from the first.
+    if var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true") {
+        meridian_dashboard::html::mark_development();
+        tracing::info!("a development deployment: every page says so");
+    }
     // Plugins' pages, each on a host of its own below this dashboard's
     // (decisions/021), so both its address and where each instance's sidecar
     // listens are needed; the second names `{instance}`. Without either, the

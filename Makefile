@@ -951,7 +951,13 @@ chart-check:
 		! $(HELM) template check deploy/chart $$base --set ingress.enabled=true $$bad >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: an Ingress rendered with $$bad, where plugin pages cannot have names below it" >&2; exit 1; }; \
 	done
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, and an Ingress only when asked for"
+	@# Development (spec/live-plugin-development, ruling 2): only when asked.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q MERIDIAN_DEVELOPMENT \
+		|| { echo "chart-check FAILED: a deployment nobody installed for development is told it is one" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep -A1 MERIDIAN_DEVELOPMENT | grep -q '"true"' \
+		|| { echo "chart-check FAILED: a deployment installed for development does not tell its dashboard" >&2; exit 1; }
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, and development only when asked for"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

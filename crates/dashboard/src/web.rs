@@ -105,6 +105,10 @@ pub fn router(app: Arc<App>) -> Router {
 /// takes a stale dashboard out rather than sending people to a refusal.
 async fn healthz(State(app): State<Arc<App>>) -> Response {
     match app.records.current(app.clock.now_ns()) {
+        // Said in health too, where whoever watches deployments looks.
+        Ok(_) if crate::html::is_development() => {
+            (StatusCode::OK, "serving, for development\n").into_response()
+        }
         Ok(_) => (StatusCode::OK, "serving\n").into_response(),
         Err(stale) => (StatusCode::SERVICE_UNAVAILABLE, format!("{stale}\n")).into_response(),
     }

@@ -63,6 +63,10 @@ spec:
             - name: MERIDIAN_DASHBOARD_LISTEN
               value: "0.0.0.0:8080"
             {{- $addresses := .Values.firstRun.addressesSecretName }}
+            {{- if .Values.development }}
+            - name: MERIDIAN_DEVELOPMENT
+              value: "true"
+            {{- end }}
             {{- if and .Values.ingress.enabled .Values.ingress.host }}
             # The address the Ingress serves, which the wizard offers rather
             # than asks for. What the wizard is told is still what is used.
