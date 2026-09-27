@@ -379,6 +379,13 @@ e2e-cluster-oidc:
 # pointed at that gateway in the nodes and in CoreDNS, and the host's published
 # ports answer there. Nothing the runs assert changes.
 #
+# The run reaches the deployment through the chart's Ingress and the cluster's
+# own controller, as a laptop's Rancher Desktop does (spec/live-plugin-
+# development, ruling 1): so k3s keeps the Traefik it ships, the cluster's port
+# 80 is this machine's, where `<namespace>.localhost` resolves, and the run
+# starts once Traefik is serving. Port 80 is a runner's to give; on a laptop
+# whose own cluster holds it, run the four there instead.
+#
 # CoreDNS is restarted once it is made. k3d adds the name after CoreDNS has
 # started, and CoreDNS reads that file through a mount that never updates:
 # without the restart the name resolves to nothing on a runner, and to the
@@ -401,10 +408,15 @@ e2e-cluster-k3d:
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET)"
 	@$(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
-		--api-port $(E2E_K3D_API) --k3s-arg "--disable=traefik@server:0" --wait >/dev/null
+		--api-port $(E2E_K3D_API) -p "80:80@loadbalancer" --wait >/dev/null
 	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout restart deploy/coredns >/dev/null
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout status deploy/coredns --timeout=120s >/dev/null
+	@for i in $$(seq 1 120); do \
+		KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system get deploy/traefik >/dev/null 2>&1 && break; sleep 2; \
+	done; \
+	KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout status deploy/traefik --timeout=300s >/dev/null \
+		|| { echo "e2e-cluster-k3d: k3s's Traefik did not come up, and the run reaches the deployment through it" >&2; exit 1; }
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
 		E2E_IMAGE_LOAD="$(K3D) image import -c $(E2E_K3D_CLUSTER)"; \
 	  held=$$?; \
