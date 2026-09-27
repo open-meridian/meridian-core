@@ -62,6 +62,35 @@ pub fn checked(request: &CreatePluginRequest, registry: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Which of the chart's templates a request is made from: the plugin shape,
+/// or the live shape (spec/live-plugin-development, rulings 2 and 4). A live
+/// request is refused on a deployment not installed for development, and on
+/// one whose chart rendered no live shape; nothing else is ever made in its
+/// place.
+pub fn template_for<'a>(
+    request: &CreatePluginRequest,
+    development: bool,
+    plain: &'a str,
+    live: Option<&'a str>,
+) -> Result<&'a str, String> {
+    if !request.live {
+        return Ok(plain);
+    }
+    if !development {
+        return Err(format!(
+            "{} was asked for live, and this deployment is not installed for development: \
+             only a recorded version runs here",
+            request.instance_id
+        ));
+    }
+    live.ok_or_else(|| {
+        format!(
+            "{} was asked for live, and this deployment's chart renders no live shape",
+            request.instance_id
+        )
+    })
+}
+
 /// The template, filled in for a checked request, as the Deployment to
 /// create. Nothing placed in it can carry a quote, since each part was held
 /// to a name or to the registry's form above.

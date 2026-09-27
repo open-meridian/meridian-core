@@ -118,6 +118,13 @@ spec:
               value: {{ .Values.launcher.instanceId | quote }}
             - name: MERIDIAN_LAUNCHER_TEMPLATE
               value: /etc/meridian/launcher/plugin.json
+            {{- if .Values.development }}
+            # A development deployment: the launcher makes the live shape
+            # when asked, and refuses it anywhere else
+            # (spec/live-plugin-development).
+            - name: MERIDIAN_DEVELOPMENT
+              value: "true"
+            {{- end }}
             # The only registry a launched plugin's image may come from.
             - name: MERIDIAN_REGISTRY_ADDRESS
               value: {{ printf "localhost:%v" .Values.registry.hostPort | quote }}

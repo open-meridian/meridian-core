@@ -277,6 +277,7 @@ impl Plugins {
             launched_by: subject(envelope),
             launched_at_ns: self.clock.now_ns(),
             state: PluginLaunchState::Launched as i32,
+            live: request.live,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
@@ -300,6 +301,9 @@ impl Plugins {
             roles: metadata.roles.clone(),
             tags: metadata.tags.clone(),
             interface: metadata.interface,
+            // Whether the deployment is for development is the launcher's to
+            // know and to refuse on (spec/live-plugin-development, ruling 2).
+            live: request.live,
         };
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,

@@ -502,6 +502,10 @@ struct Launch {
     approved_roles: Vec<String>,
     #[serde(default)]
     approved_tags: Vec<String>,
+    /// In the live shape; the launcher refuses it on a deployment not
+    /// installed for development (W8.3).
+    #[serde(default)]
+    live: bool,
 }
 
 async fn launch(
@@ -519,6 +523,7 @@ async fn launch(
         instance_id: asked.instance_id,
         approved_roles: asked.approved_roles,
         approved_tags: asked.approved_tags,
+        live: asked.live,
     };
     // Longer than the conductor gives the launcher, so its answer arrives.
     let launched: Result<PluginLaunch, String> = ask(

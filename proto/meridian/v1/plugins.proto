@@ -88,6 +88,10 @@ message LaunchPluginRequest {
   string instance_id = 3;
   repeated string approved_roles = 4;
   repeated string approved_tags = 5;
+  // In the live shape, on a development deployment alone: the plugin runs
+  // the files sent to it since, and the launcher refuses this anywhere else
+  // (W8.3, spec/live-plugin-development).
+  bool live = 6;
 }
 
 enum PluginLaunchState {
@@ -114,6 +118,8 @@ message PluginLaunch {
   string stopped_by = 10;
   int64 stopped_at_ns = 11;
   string failure = 12;
+  // Launched in the live shape (W8.3).
+  bool live = 13;
 }
 
 // The conductor to the launcher: create this plugin, in the chart's plugin
@@ -126,6 +132,9 @@ message CreatePluginRequest {
   repeated string roles = 3;
   repeated string tags = 4;
   bool interface = 5;
+  // The chart's live shape rather than its plugin shape; refused by a
+  // launcher on a deployment not installed for development.
+  bool live = 6;
 }
 
 message CreatePluginReply {

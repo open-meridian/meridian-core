@@ -14,7 +14,7 @@ use meridian_domain::v1::{
 };
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{INSTANCE_LABEL, LAUNCHED_SELECTOR};
-use meridian_runtime::launcher::{checked, manifest, CREATE_PLUGIN, REMOVE_PLUGIN};
+use meridian_runtime::launcher::{checked, manifest, template_for, CREATE_PLUGIN, REMOVE_PLUGIN};
 use meridian_runtime::{bus_from_env, required, shutdown, var};
 use prost::Message;
 
@@ -33,6 +33,9 @@ fn main() {
 struct Launcher {
     api: ApiServer,
     template: String,
+    /// The chart's live shape, rendered only on a development deployment.
+    live_template: Option<String>,
+    development: bool,
     registry: String,
 }
 
@@ -63,7 +66,13 @@ impl Launcher {
                 request.instance_id
             ));
         }
-        let made = manifest(&self.template, &request)?;
+        let template = template_for(
+            &request,
+            self.development,
+            &self.template,
+            self.live_template.as_deref(),
+        )?;
+        let made = manifest(template, &request)?;
         let workload = tokio::runtime::Handle::current()
             .block_on(self.api.create_deployment(&made))
             .map_err(|failed| failed.0)?;
@@ -71,6 +80,7 @@ impl Launcher {
             instance = request.instance_id,
             workload,
             image = request.image,
+            live = request.live,
             "a plugin created"
         );
         Ok(CreatePluginReply { workload })
@@ -94,11 +104,23 @@ fn run() -> Result<(), String> {
     let template = std::fs::read_to_string(&template_path)
         .map_err(|failed| format!("{template_path} could not be read: {failed}"))?;
     let registry = required("MERIDIAN_REGISTRY_ADDRESS")?;
+    // A deployment installed for development, and the chart's live shape,
+    // which it renders there alone (spec/live-plugin-development).
+    let development = var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true");
+    let live_template = match var("MERIDIAN_LAUNCHER_LIVE_TEMPLATE") {
+        Some(path) => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|failed| format!("{path} could not be read: {failed}"))?,
+        ),
+        None => None,
+    };
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "launcher-1".into());
     let api = ApiServer::in_cluster().map_err(|failed| failed.0)?;
     let launcher = Arc::new(Launcher {
         api,
         template,
+        live_template,
+        development,
         registry,
     });
 

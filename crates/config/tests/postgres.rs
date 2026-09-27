@@ -364,3 +364,27 @@ fn two_launches_of_one_instance_at_once_admit_one() {
         .count();
     assert_eq!(admitted, 1);
 }
+
+#[test]
+fn a_live_launch_is_read_back_as_live() {
+    let store = store("live");
+    assert!(store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap());
+    let live = PluginLaunch {
+        live: true,
+        ..launch("snaptrade-1")
+    };
+    assert!(store.begin_launch(&live).unwrap());
+    assert!(store.begin_launch(&launch("snaptrade-2")).unwrap());
+    let launches = store.snapshot().unwrap().catalogue.launches;
+    let read = |instance: &str| {
+        launches
+            .iter()
+            .find(|l| l.instance_id == instance)
+            .unwrap()
+            .live
+    };
+    assert!(read("snaptrade-1"));
+    assert!(!read("snaptrade-2"));
+}

@@ -2257,6 +2257,11 @@ pub struct LaunchPluginRequest {
     pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "5")]
     pub approved_tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// In the live shape, on a development deployment alone: the plugin runs
+    /// the files sent to it since, and the launcher refuses this anywhere else
+    /// (W8.3, spec/live-plugin-development).
+    #[prost(bool, tag = "6")]
+    pub live: bool,
 }
 /// A launch, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2285,6 +2290,9 @@ pub struct PluginLaunch {
     pub stopped_at_ns: i64,
     #[prost(string, tag = "12")]
     pub failure: ::prost::alloc::string::String,
+    /// Launched in the live shape (W8.3).
+    #[prost(bool, tag = "13")]
+    pub live: bool,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -2302,6 +2310,10 @@ pub struct CreatePluginRequest {
     pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "5")]
     pub interface: bool,
+    /// The chart's live shape rather than its plugin shape; refused by a
+    /// launcher on a deployment not installed for development.
+    #[prost(bool, tag = "6")]
+    pub live: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreatePluginReply {

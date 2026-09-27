@@ -9,6 +9,7 @@ fn request() -> CreatePluginRequest {
         roles: vec!["custody".into()],
         tags: vec!["holdings".into()],
         interface: true,
+        ..Default::default()
     }
 }
 
@@ -111,4 +112,25 @@ fn a_placeholder_this_launcher_does_not_know_is_refused_rather_than_left_in() {
         manifest(TEMPLATE, &request()).is_ok(),
         "a __x in a value is not one"
     );
+}
+
+#[test]
+fn a_live_request_is_made_live_on_a_development_deployment_and_nowhere_else() {
+    let plain = "plain";
+    let live = Some("live");
+    let ordinary = request();
+    let asked_live = CreatePluginRequest {
+        live: true,
+        ..request()
+    };
+    assert_eq!(template_for(&ordinary, false, plain, live), Ok("plain"));
+    assert_eq!(template_for(&ordinary, true, plain, live), Ok("plain"));
+    assert_eq!(template_for(&asked_live, true, plain, live), Ok("live"));
+    let refused = template_for(&asked_live, false, plain, live).unwrap_err();
+    assert!(
+        refused.contains("not installed for development"),
+        "{refused}"
+    );
+    let refused = template_for(&asked_live, true, plain, None).unwrap_err();
+    assert!(refused.contains("renders no live shape"), "{refused}");
 }

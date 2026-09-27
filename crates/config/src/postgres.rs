@@ -522,8 +522,8 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_plugin_launch
                         (instance_id, name, version, image_digest, roles, tags, launched_by,
-                         launched_at_ns, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+                         launched_at_ns, state, live)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -534,6 +534,7 @@ impl Store for PostgresStore {
                     &launch.tags,
                     &launch.launched_by,
                     &launch.launched_at_ns,
+                    &launch.live,
                 ],
             )
             .map_err(unavailable)?;
@@ -565,7 +566,7 @@ impl Store for PostgresStore {
 }
 
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, tags, \
-     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure";
+     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live";
 
 fn launch_from(row: &postgres::Row) -> PluginLaunch {
     PluginLaunch {
@@ -581,6 +582,7 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_by: row.get(9),
         stopped_at_ns: row.get(10),
         failure: row.get(11),
+        live: row.get(12),
     }
 }
 

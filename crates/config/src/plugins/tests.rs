@@ -110,6 +110,7 @@ fn launching(instance: &str, roles: &[&str], tags: &[&str]) -> LaunchPluginReque
         instance_id: instance.into(),
         approved_roles: roles.iter().map(|r| r.to_string()).collect(),
         approved_tags: tags.iter().map(|t| t.to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -360,4 +361,27 @@ fn a_name_is_a_host_label_a_letter_first() {
     ] {
         assert!(!is_name(bad), "{bad}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_launch_is_recorded_as_live_and_asked_of_the_launcher_as_live() {
+    let (bus, launcher) = harness();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    let mut request = launching("snaptrade-1", &["custody"], &["holdings"]);
+    request.live = true;
+    let launched = launch(&bus, request).await.unwrap();
+    assert!(launched.live);
+    assert!(launcher.created.lock().unwrap()[0].live);
+    let held = catalogue(&bus).await;
+    assert!(held
+        .launches
+        .iter()
+        .any(|l| l.instance_id == "snaptrade-1" && l.live));
+
+    // And an ordinary launch is not.
+    upload(&bus, snaptrade("0.2.0")).await.unwrap();
+    let mut request = launching("snaptrade-2", &["custody"], &["holdings"]);
+    request.version = "0.2.0".into();
+    assert!(!launch(&bus, request).await.unwrap().live);
+    assert!(!launcher.created.lock().unwrap()[1].live);
 }
