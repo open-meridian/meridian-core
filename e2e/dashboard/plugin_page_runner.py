@@ -92,7 +92,7 @@ def front_door(header=None):
 def row_id(page, section, name):
     """The identifier the conductor gave the row named `name` in a table."""
     table = page.body.split(f"<h2>{section}</h2>", 1)[-1].split("</table>", 1)[0]
-    found = re.search(r"<tr><td>([^<]+)</td><td>" + re.escape(name) + "</td>", table)
+    found = re.search(r'<tr data-id="([^"]+)" data-name="' + re.escape(name) + '"', table)
     return found.group(1) if found else None
 
 
@@ -155,7 +155,7 @@ def main():
     access_group = row_id(page, "Access groups", "Plugin page readers")
     # The user group the claim made her deployment admin through: the one
     # permission there is before hers.
-    admins = re.search(r"<h2>Permissions</h2>.*?<tr><td>[^<]+</td><td>([^<]+)</td>", page.body, re.S)
+    admins = re.search(r'<tr data-id="[^"]+" data-user-group="([^"]+)"', page.body)
     check(None not in (account_group, access_group, admins),
           f"groups listed: {account_group} {access_group} {admins and admins.group(1)}")
     administer(ada, "/admin/permissions",

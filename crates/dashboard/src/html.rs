@@ -79,7 +79,37 @@ padding-top:1rem;border-top:1px solid var(--line-soft)}\
 section.step>div:last-child button{margin:0}\
 form:not(.js) [data-next],form:not(.js) [data-back]{display:none}.off{display:none}\
 .development{color:var(--warn-ink);background:var(--warn-wash);border:1px solid var(--warn-ink);\
-border-radius:var(--radius);padding:.5rem .8rem;margin:0 0 1.25rem;font-size:.9rem}";
+border-radius:var(--radius);padding:.5rem .8rem;margin:0 0 1.25rem;font-size:.9rem}\
+main.sheet:has(.admin){max-width:68rem}\
+.page-head{display:flex;justify-content:space-between;align-items:baseline;gap:1rem}\
+nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;padding-bottom:.75rem;\
+border-bottom:1px solid var(--line);font-size:.88rem}\
+nav.tabs a{padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
+nav.tabs a:hover{text-decoration:none;background:var(--hover)}\
+nav.tabs a.here{background:var(--accent-wash);color:var(--accent)}\
+.admin:not(.js) nav.tabs{display:none}\
+section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
+.admin.js section.admin-section.current{display:block}\
+.section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:.5rem}\
+.section-head h2{margin:0 0 .15rem}.section-head .hint{margin:0}.section-head button{margin:0;flex-shrink:0}\
+.scroll{overflow-x:auto}table.list td{vertical-align:middle}\
+@media (max-width:36rem){.section-head{flex-direction:column}td.actions{white-space:normal}}table.list tbody tr:hover{background:var(--line-soft)}\
+table.list .name{font-weight:550}\
+table.list .id{display:block;font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink-faint)}\
+td.actions{text-align:right;white-space:nowrap}td.actions form{display:inline}\
+td.actions button{margin:0 0 0 .35rem;padding:.3rem .7rem;font-size:.84rem}\
+.pill{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.76rem;font-weight:550;\
+background:var(--line-soft);color:var(--ink-soft)}.pill.good{background:var(--good-wash);color:var(--good)}\
+.empty{color:var(--ink-soft);padding:1.5rem;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}\
+dialog{width:min(32rem,calc(100vw - 2rem));padding:0;border:1px solid var(--line);border-radius:var(--radius);\
+background:var(--card);color:var(--ink);box-shadow:0 12px 40px rgba(0,0,0,.25)}\
+dialog::backdrop{background:rgba(10,14,18,.45)}\
+.dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
+.dialog-foot{display:flex;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
+.dialog-foot button{margin:0}\
+fieldset.checks{border:1px solid var(--line);border-radius:var(--radius);padding:.5rem .75rem;margin:0 0 .9rem;\
+max-height:14rem;overflow:auto}fieldset.checks legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\
+fieldset.checks label{margin:.25rem 0}";
 
 /// Whether this deployment was installed for development
 /// (spec/live-plugin-development, ruling 2). Process-wide, set once at start

@@ -158,7 +158,7 @@ def sentence(body):
 def row_id(body, section, name):
     """The identifier the conductor gave the row named `name` in a table."""
     table = body.split(f"<h2>{section}</h2>", 1)[-1].split("</table>", 1)[0]
-    found = re.search(r"<tr><td>([^<]+)</td><td>" + re.escape(name) + "</td>", table)
+    found = re.search(r'<tr data-id="([^"]+)" data-name="' + re.escape(name) + '"', table)
     return found.group(1) if found else None
 
 
@@ -403,7 +403,7 @@ with sync_playwright() as playwright:
     access_group = row_id(admin, "Access groups", "Custody copy users")
     # The user group the wizard made her deployment admin through: the one
     # permission there is before hers.
-    admins = re.search(r"<h2>Permissions</h2>.*?<tr><td>[^<]+</td><td>([^<]+)</td>", admin, re.S)
+    admins = re.search(r'<tr data-id="[^"]+" data-user-group="([^"]+)"', admin)
     check(
         None not in (account, account_group, access_group, admins),
         f"read on one account through {CUSTODY}, for her own user group: "
@@ -578,8 +578,8 @@ with sync_playwright() as playwright:
         {"user_group_id": stand_in or "", "account_group_id": "", "access_group_id": "deployment-admin"},
     )
     hers = admins and re.search(
-        r"<tr><td>([^<]+)</td><td>" + re.escape(admins.group(1))
-        + r"</td><td>every account</td><td>deployment-admin</td>",
+        r'<tr data-id="([^"]+)" data-user-group="' + re.escape(admins.group(1))
+        + r'" data-account-group="" data-access-group="deployment-admin">',
         admin,
     )
     check(bool(hers), f"her permission to deployment admin is listed: {hers and hers.group(1)}")

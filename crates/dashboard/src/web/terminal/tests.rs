@@ -381,7 +381,10 @@ async fn an_admin_ends_all_of_a_persons_terminal_sessions_and_leaves_their_brows
     .await;
     let page = body_of(listed).await;
     assert!(page.contains("Terminal sessions"), "{page}");
-    assert!(page.contains("local|ada</td><td>2</td>"), "{page}");
+    assert!(
+        page.contains("<span class=\"id\">local|ada</span></td><td>2</td>"),
+        "{page}"
+    );
 
     let ended = ending(
         &app,

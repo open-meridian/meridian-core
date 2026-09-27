@@ -24,11 +24,11 @@ use axum::Router;
 use meridian_access::{person_access, DEPLOYMENT_ADMIN};
 use meridian_bus::BusError;
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, AccountState,
-    ClaimCodePurpose, CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest,
-    DefineAccountRequest, DefineUserGroupRequest, GrantPermissionRequest,
-    LinkExternalAccountRequest, RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup,
-    WithdrawPermissionReply, WithdrawPermissionRequest,
+    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, ClaimCodePurpose,
+    CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
+    DefineUserGroupRequest, GrantPermissionRequest, LinkExternalAccountRequest,
+    RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup, WithdrawPermissionReply,
+    WithdrawPermissionRequest,
 };
 use prost::Message;
 
@@ -182,7 +182,20 @@ fn after(outcome: Result<(), String>) -> Response {
             [(axum::http::header::LOCATION, "/admin")],
         )
             .into_response(),
-        Err(sentence) => status_page(StatusCode::BAD_REQUEST, "Not done", &sentence),
+        // Back, not to /admin: the browser's back returns to the tab the form
+        // was on, with what was typed into it.
+        Err(sentence) => (
+            StatusCode::BAD_REQUEST,
+            Html(page(
+                "Not done",
+                &format!(
+                    "<h1>Not done</h1><p class=\"refused\">{}</p>\
+                     <p><a href=\"/admin\" onclick=\"history.back();return false\">Back</a></p>",
+                    escape(&sentence)
+                ),
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -291,13 +304,7 @@ fn token_input(session: &Session) -> String {
 
 // ── The overview ────────────────────────────────────────────────────────────
 
-fn level_name(level: i32) -> &'static str {
-    if level == AccessLevel::Write as i32 {
-        "write"
-    } else {
-        "read"
-    }
-}
+mod overview;
 
 async fn admin_page(
     State(app): State<Arc<App>>,
@@ -308,155 +315,16 @@ async fn admin_page(
         Ok(gated) => gated,
         Err(response) => return *response,
     };
-    let token = token_input(&session);
-    let mut body = String::from("<h1>Administer this deployment</h1><p><a href=\"/\">Home</a></p>");
     // What the last form did, where it has something to say.
-    if let Ok(ended) = field(&query, "terminal_sessions_ended").parse::<usize>() {
-        body.push_str(&format!(
-            "<p class=\"done\">Ended {ended} terminal session{}.</p>",
+    let notice = match field(&query, "terminal_sessions_ended").parse::<usize>() {
+        Ok(ended) => format!(
+            "Ended {ended} terminal session{}.",
             if ended == 1 { "" } else { "s" }
-        ));
-    }
-
-    body.push_str(
-        "<h2>Accounts</h2><table><tr><th>Account</th><th>Name</th><th>State</th><th></th></tr>",
-    );
-    for account in &records.accounts {
-        let closed = account.state == AccountState::Closed as i32;
-        body.push_str(&format!(
-            "<tr><td>{id}</td><td>{name}</td><td>{state}</td><td>{close}</td></tr>",
-            id = escape(&account.account_id),
-            name = escape(&account.name),
-            state = if closed { "closed" } else { "open" },
-            close = if closed {
-                String::new()
-            } else {
-                format!(
-                    "<form method=\"post\" action=\"/admin/accounts/close\">{token}\
-                     <input type=\"hidden\" name=\"account_id\" value=\"{}\"><button>Close</button></form>",
-                    escape(&account.account_id)
-                )
-            },
-        ));
-    }
-    body.push_str(&format!(
-        "</table><form method=\"post\" action=\"/admin/accounts\">{token}\
-         <label>Account to rename (empty creates) <input name=\"account_id\"></label> \
-         <label>Name <input name=\"name\" required></label> <button>Save account</button></form>"
-    ));
-
-    body.push_str("<h2>User groups</h2><table><tr><th>Group</th><th>Name</th><th>Directory groups</th><th>Logins</th></tr>");
-    for group in &records.user_groups {
-        body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(&group.user_group_id),
-            escape(&group.name),
-            escape(&group.directory_groups.join("; ")),
-            escape(&group.logins.join(", "))
-        ));
-    }
-    body.push_str(&format!(
-        "</table><form method=\"post\" action=\"/admin/user-groups\">{token}\
-         <label>Group to change (empty creates) <input name=\"user_group_id\"></label> \
-         <label>Name <input name=\"name\" required></label> \
-         <label>Directory groups, one per line <textarea name=\"directory_groups\"></textarea></label> \
-         <label>Logins <input name=\"logins\"></label> <button>Save user group</button></form>"
-    ));
-
-    body.push_str(
-        "<h2>Account groups</h2><table><tr><th>Group</th><th>Name</th><th>Accounts</th></tr>",
-    );
-    for group in &records.account_groups {
-        body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(&group.account_group_id),
-            escape(&group.name),
-            escape(&group.account_ids.join(", "))
-        ));
-    }
-    body.push_str(&format!(
-        "</table><form method=\"post\" action=\"/admin/account-groups\">{token}\
-         <label>Group to change (empty creates) <input name=\"account_group_id\"></label> \
-         <label>Name <input name=\"name\" required></label> \
-         <label>Accounts <input name=\"account_ids\"></label> <button>Save account group</button></form>"
-    ));
-
-    body.push_str(
-        "<h2>Access groups</h2><table><tr><th>Group</th><th>Name</th><th>Entries</th></tr>",
-    );
-    for group in &records.access_groups {
-        let entries = if group.built_in {
-            "the dashboard, and every account".to_string()
-        } else {
-            group
-                .entries
-                .iter()
-                .map(|e| format!("{} {} {}", e.plugin_instance_id, e.tag, level_name(e.level)))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(&group.access_group_id),
-            escape(&group.name),
-            escape(&entries)
-        ));
-    }
-    body.push_str(&format!(
-        "</table><form method=\"post\" action=\"/admin/access-groups\">{token}\
-         <label>Group to change (empty creates) <input name=\"access_group_id\"></label> \
-         <label>Name <input name=\"name\" required></label> \
-         <label>Entries, one per line: plugin tag read|write <textarea name=\"entries\"></textarea></label> \
-         <button>Save access group</button></form>"
-    ));
-
-    body.push_str("<h2>Permissions</h2><table><tr><th>Permission</th><th>User group</th><th>Account group</th><th>Access group</th><th></th></tr>");
-    for permission in &records.permissions {
-        body.push_str(&format!(
-            "<tr><td>{id}</td><td>{}</td><td>{}</td><td>{}</td><td>\
-             <form method=\"post\" action=\"/admin/permissions/withdraw\">{token}\
-             <input type=\"hidden\" name=\"permission_id\" value=\"{id}\"><button>Withdraw</button></form></td></tr>",
-            escape(&permission.user_group_id),
-            escape(if permission.account_group_id.is_empty() { "every account" } else { &permission.account_group_id }),
-            escape(&permission.access_group_id),
-            id = escape(&permission.permission_id),
-        ));
-    }
-    body.push_str(&format!(
-        "</table><form method=\"post\" action=\"/admin/permissions\">{token}\
-         <label>User group <input name=\"user_group_id\" required></label> \
-         <label>Account group (empty for deployment admin) <input name=\"account_group_id\"></label> \
-         <label>Access group <input name=\"access_group_id\" required></label> <button>Grant</button></form>"
-    ));
-
-    body.push_str(&format!(
-        "<h2>External accounts</h2><form method=\"post\" action=\"/admin/links\">{token}\
-         <label>Plugin <input name=\"plugin_instance_id\" required></label> \
-         <label>External account <input name=\"external_account_id\" required></label> \
-         <label>Account (empty unlinks) <input name=\"account_id\"></label> <button>Link</button></form>"
-    ));
-
-    // W6.14. Per person: what is being ended is their access from a
-    // terminal, so there is no choosing among their sessions to offer.
-    body.push_str("<h2>Terminal sessions</h2>");
+        ),
+        Err(_) => String::new(),
+    };
     let holders = app.terminals.holders(app.clock.now_ns());
-    if holders.is_empty() {
-        body.push_str("<p>Nobody holds a terminal session.</p>");
-    } else {
-        body.push_str("<table><tr><th>Person</th><th>Login</th><th>Sessions</th><th></th></tr>");
-        for (login, name, count) in &holders {
-            body.push_str(&format!(
-                "<tr><td>{name}</td><td>{login}</td><td>{count}</td><td>\
-                 <form method=\"post\" action=\"/admin/end-terminal-sessions\">{token}\
-                 <input type=\"hidden\" name=\"login\" value=\"{login}\">\
-                 <button>End them</button></form></td></tr>",
-                name = escape(name),
-                login = escape(login),
-            ));
-        }
-        body.push_str("</table>");
-    }
-
+    let body = overview::render(&records, &holders, &token_input(&session), &notice);
     Html(page("Administer", &body)).into_response()
 }
 
@@ -568,11 +436,26 @@ async fn define_user_group(
     })
 }
 
+/// The page sends one `account_ids` per box ticked, and a `Fields` keeps only
+/// the last of a repeated name, so they are gathered here into the one list
+/// the older form typed.
 async fn define_account_group(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Form(fields): Form<Fields>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let mut fields = Fields::new();
+    for (name, value) in pairs {
+        match fields.get_mut(&name) {
+            Some(held) if name == "account_ids" => {
+                held.push(',');
+                held.push_str(&value);
+            }
+            _ => {
+                fields.insert(name, value);
+            }
+        }
+    }
     admin_form!(app, headers, fields, session, {
         let request = DefineAccountGroupRequest {
             account_group: Some(AccountGroup {

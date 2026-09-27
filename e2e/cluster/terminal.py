@@ -313,7 +313,7 @@ def admin_page(browser):
     page.goto(f"{DASHBOARD}/sign-in")
     if BY == "password":
         signed_in_at_the_form(page)
-    page.goto(f"{DASHBOARD}/admin")
+    page.goto(f"{DASHBOARD}/admin#terminal-sessions")
     return context, page
 
 
@@ -322,8 +322,8 @@ def terminal_sessions(page):
     page.reload()
     if "Nobody holds a terminal session" in page.content():
         return 0
-    rows = page.locator("h2:has-text('Terminal sessions') + table tr")
-    return sum(int(rows.nth(i).locator("td").nth(2).inner_text()) for i in range(1, rows.count()))
+    rows = page.locator("#terminal-sessions tr[data-id]")
+    return sum(int(rows.nth(i).locator("td").nth(1).inner_text()) for i in range(rows.count()))
 
 
 with sync_playwright() as playwright:
@@ -351,6 +351,8 @@ with sync_playwright() as playwright:
 
     connect(browser, "second")
     check(terminal_sessions(page) == 1, "a second connection is listed")
+    # The page asks before it ends them.
+    page.once("dialog", lambda asked: asked.accept())
     page.click("button:has-text('End them')")
     page.wait_for_load_state()
     check("Ended 1 terminal session" in page.content(), "the administrator ends that person's terminal sessions")

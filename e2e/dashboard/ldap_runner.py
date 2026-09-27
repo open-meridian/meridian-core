@@ -211,7 +211,7 @@ def main_phase():
 
     admin = alice.get(dash("/admin"))
     group_id = ""
-    for row in re.findall(r"<tr><td>([^<]*)</td><td>([^<]*)</td>", admin.body):
+    for row in re.findall(r'<tr data-id="([^"]*)" data-name="([^"]*)"', admin.body):
         if row[1] == "LDAP group B":
             group_id = row[0]
     check(bool(group_id), f"the group has an identifier: {group_id!r}")
