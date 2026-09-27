@@ -301,6 +301,18 @@ message ReopenOrganisationRequest {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// W5.25 — renaming a deployment
+// ─────────────────────────────────────────────────────────────────────────────
+
+message RenameDeploymentRequest {
+  // The name is a label for telling one deployment from another on a screen.
+  // What identifies it -- to its keys, its codes and every assertion it signs
+  // -- is the identifier, which a rename leaves as it was.
+  string deployment_id = 1;
+  string name = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W5.11, W5.12, W5.13 — taking a deployment out of service
 // ─────────────────────────────────────────────────────────────────────────────
 

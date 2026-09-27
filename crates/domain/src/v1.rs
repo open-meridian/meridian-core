@@ -208,6 +208,16 @@ pub struct ReopenOrganisationRequest {
     pub reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenameDeploymentRequest {
+    /// The name is a label for telling one deployment from another on a screen.
+    /// What identifies it -- to its keys, its codes and every assertion it signs
+    /// -- is the identifier, which a rename leaves as it was.
+    #[prost(string, tag = "1")]
+    pub deployment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RetireDeploymentRequest {
     #[prost(string, tag = "1")]
     pub deployment_id: ::prost::alloc::string::String,
