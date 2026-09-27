@@ -908,6 +908,23 @@ fn open_page(
             required(needed)
         )
     };
+    // The administrator's own login and password, which are this site's: a
+    // password manager is told they are a new account's, so it offers to keep
+    // them for the sign-in page. Every other secret here is somebody else's
+    // -- a database's, a directory's -- and stays `off`.
+    let own_login = |name: &str, label: &str| {
+        format!(
+            "<label>{label}<input name=\"{name}\" value=\"{}\" autocomplete=\"username\"{}></label>",
+            escape(&given(name, "")),
+            required(true)
+        )
+    };
+    let own_password = |name: &str, label: &str| {
+        format!(
+            "<label>{label}<input type=\"password\" name=\"{name}\" autocomplete=\"new-password\"{}></label>",
+            required(true)
+        )
+    };
     // A choice keeps what was chosen. A page re-rendered after a failed test
     // used to show every select at its first option, so correcting a typo
     // and testing again quietly switched the database route or the way
@@ -1050,11 +1067,11 @@ fn open_page(
             "local",
             [
                 "<p class=\"hint\">This account is the deployment's administrator.</p>".to_string(),
-                text("admin_login", "Your login name", "", "", true),
+                own_login("admin_login", "Your login name"),
                 text("admin_email", "Your email", "", "", false),
                 text("admin_given_name", "Given name", "", "", false),
                 text("admin_family_name", "Family name", "", "", false),
-                secret("admin_password", "Your password", true),
+                own_password("admin_password", "Your password"),
             ]
             .concat(),
         ),

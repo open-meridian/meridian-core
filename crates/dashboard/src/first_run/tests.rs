@@ -671,6 +671,33 @@ fn a_first_visit_starts_a_trial_and_every_field_stays_in_the_form() {
 }
 
 #[test]
+fn a_password_manager_is_offered_the_administrators_login_and_nothing_else() {
+    let page = open_page(&Fields::default(), &[], "", "");
+    let input = |name: &str| -> String {
+        let at = page
+            .find(&format!("name=\"{name}\""))
+            .unwrap_or_else(|| panic!("{name} is on the page"));
+        let start = page[..at].rfind("<input").unwrap();
+        let end = at + page[at..].find('>').unwrap();
+        page[start..=end].to_string()
+    };
+    assert!(input("admin_login").contains("autocomplete=\"username\""));
+    assert!(input("admin_password").contains("autocomplete=\"new-password\""));
+    for somebody_elses in [
+        "db_serving_password",
+        "db_migrating_password",
+        "ldap_bind_password",
+        "oidc_client_secret",
+    ] {
+        let field = input(somebody_elses);
+        assert!(
+            field.contains("autocomplete=\"off\""),
+            "{somebody_elses}: {field}"
+        );
+    }
+}
+
+#[test]
 fn a_finding_is_shown_once_at_its_own_step_and_the_way_back_to_it_at_the_review() {
     let findings = [
         (Step::Database, "no host for the database".to_string()),
