@@ -133,11 +133,12 @@ service first.
 ## 3. Install the chart
 
 Put the enrolment code in the environment rather than on the command line,
-where your shell's history would keep it, and install with your identifier:
+where your shell's history would keep it, and install with your identifier,
+copied exactly as the platform shows it, `DEP-` included:
 
 ```bash
 export MERIDIAN_ENROLMENT_CODE=ENR-XXXX-XXXX-XXXX
-meridian up --id DEP-XXXX-XXXX --host meridian.firm.example -f ingress.yaml
+meridian up --id DEP-01M3GZ8K4Q7T2V9W6X5Y3R1N0P --host meridian.firm.example -f ingress.yaml
 ```
 
 `ingress.yaml` names the Secrets holding the certificates. Leave
@@ -150,7 +151,7 @@ ingress:
     pluginsSecretName: meridian-plugins-tls
 ```
 
-On a laptop, `meridian up --id DEP-XXXX-XXXX` is the whole command: it is
+On a laptop, `meridian up --id DEP-01M3GZ8K4Q7T2V9W6X5Y3R1N0P` is the whole command: it is
 reached as `http://meridian.localhost`, which needs no certificate and no DNS.
 Where the cluster has no ingress controller, it forwards a local port
 instead, and `--no-ingress` asks for that anyway.
@@ -171,7 +172,7 @@ runs, installs, waits for the dashboard, and prints the wizard's address.
 ```bash
 helm upgrade --install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
   --namespace meridian --create-namespace \
-  --set deployment.id=DEP-XXXX-XXXX \
+  --set deployment.id=DEP-01M3GZ8K4Q7T2V9W6X5Y3R1N0P \
   --set deployment.enrolmentCode="$MERIDIAN_ENROLMENT_CODE" \
   --set ingress.enabled=true --set ingress.host=meridian.firm.example \
   -f ingress.yaml
@@ -360,7 +361,7 @@ password; the `meridian` CLI's README goes on from there.
 
 ## Starting over
 
-If you delete the namespace to begin again — reasonable while you are learning
+If you delete the namespace to begin again (`meridian down --delete-namespace`) — reasonable while you are learning
 the shape of this — **the deployment's private key goes with it.** It lived
 only in that cluster, which is the point of it: nobody ever handled it, and
 there is no copy anywhere to restore.
@@ -395,13 +396,15 @@ trade for a trial and the wrong one for anything you depend on.
 ## Removing it
 
 ```bash
-helm uninstall meridian --namespace meridian
+meridian down
 ```
 
-This removes what Helm installed. It does **not** remove the disk of a database
-the deployment brought, because Helm never created that claim — Kubernetes
-did, and Kubernetes keeps it. Installing again picks the same disk back up,
-with its data. To be rid of it, delete the namespace.
+This uninstalls what Helm installed (by hand, `helm uninstall meridian
+--namespace meridian`). It keeps the namespace, and with it the disk of a
+database the deployment brought, because Helm never created that claim —
+Kubernetes did, and Kubernetes keeps it — and the deployment's key. Installing
+again picks both back up, with the data. To be rid of them,
+`meridian down --delete-namespace`, which asks first and says what goes.
 
 Retiring the deployment on the platform is a separate act, and the one that
 revokes its keys and stops its codes working. Uninstalling the chart leaves the
@@ -410,7 +413,6 @@ platform still believing the deployment exists.
 ---
 
 For what each chart value does, see [deploy/chart/README.md](deploy/chart/README.md).
-Where you have a terminal and would rather not click,
-[meridian-cli](https://github.com/open-meridian/meridian-cli) performs steps 3
-to 7 in that order and can answer the wizard from a file. No install depends
-on it.
+The CLI is [meridian-cli](https://github.com/open-meridian/meridian-cli); its
+README covers answering the wizard from a file, and bringing plugins in. No
+install depends on it.
