@@ -1026,6 +1026,41 @@ spec:
                 for line in said.splitlines():
                     print(f"      {line}", flush=True)
 
+    if SIGN_IN == "local":
+        # W6.16, last, because every stage above signs in with the password
+        # the wizard was given. The only administrator's password is lost,
+        # and a code from the platform is the way back: nothing is learned
+        # from the cluster and no namespace is deleted.
+        print("Z: a lost password, and a code from the platform the way back", flush=True)
+        name, password = WAY_IN["administrator"]
+        status, before = signed_in(name, password)
+        s.check(status == 303 and bool(before), f"{name} holds a session before the reset: {status}")
+        reset_code = platform(
+            "issue_claim_code", "--deployment", deployment_id, "--purpose", "reset-local-admin"
+        ).splitlines()[-1]
+        renewed = "Renewed-e2e-password"
+        status, _ = post(
+            "/sign-in/reset",
+            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
+            {},
+        )
+        s.check(status == 303, f"the code is redeemed and the password set: {status}")
+        status, _ = post("/sign-in", {"name": name, "password": password}, {})
+        s.check(status == 401, f"the lost password is refused now: {status}")
+        status, after = signed_in(name, renewed)
+        s.check(status == 303 and bool(after), f"the new one signs {name} in: {status}")
+        s.check("You are a deployment admin" in get("/", after), "still a deployment admin")
+        s.check(
+            "You are a deployment admin" not in get("/", before),
+            "and the session held before the reset has ended",
+        )
+        status, _ = post(
+            "/sign-in/reset",
+            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
+            {},
+        )
+        s.check(status != 303, f"and the code, once spent, is refused: {status}")
+
     print(flush=True)
     if s.failures:
         print(f"e2e-cluster FAILED: {len(s.failures)}", flush=True)
