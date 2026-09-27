@@ -125,7 +125,7 @@ async fn authorize(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> R
     let id = app.terminals.open(request, now);
 
     if app.directory.is_some() || app.accounts.is_some() {
-        return Html(password_page("", Some(&id))).into_response();
+        return Html(password_page(&app, "", Some(&id), "")).into_response();
     }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");

@@ -33,6 +33,7 @@ use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
 use crate::terminal::Terminals;
 
+mod reset;
 mod terminal;
 pub(crate) use terminal::bearer;
 pub use terminal::terminal_session_of;
@@ -66,6 +67,9 @@ pub struct App {
     /// signing people in through a provider or through LDAP holding nothing
     /// but its sessions.
     pub accounts: Option<Arc<dyn Accounts>>,
+    /// Failed password sign-ins by the name typed, for the warning before the
+    /// lock (W6.16).
+    pub sign_in_failures: Arc<accounts::Failures>,
     /// Whether cookies carry `Secure`: true whenever this dashboard is served
     /// over HTTPS, which is always outside a developer's machine.
     pub secure_cookies: bool,
@@ -86,6 +90,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
         .merge(terminal::routes())
+        .merge(reset::routes())
         .merge(crate::catalogue::routes())
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
@@ -251,7 +256,10 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     Html(page("Home", &body)).into_response()
 }
 
-async fn sign_in(State(app): State<Arc<App>>) -> Response {
+async fn sign_in(
+    State(app): State<Arc<App>>,
+    Query(asked): Query<HashMap<String, String>>,
+) -> Response {
     let now = app.clock.now_ns();
     if let Err(stale) = app.records.current(now) {
         return refused(&stale.to_string());
@@ -268,7 +276,12 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
     // is the point of 018: no redirect means no second address, and no issuer
     // whose URL has to resolve from a pod and a browser at once.
     if app.directory.is_some() || app.accounts.is_some() {
-        return Html(password_page("", None)).into_response();
+        let notice = if asked.get("reset").map(String::as_str) == Some("done") {
+            "Your password is set. Sign in with it."
+        } else {
+            ""
+        };
+        return Html(password_page(&app, "", None, notice)).into_response();
     }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
@@ -291,11 +304,29 @@ async fn sign_in(State(app): State<Arc<App>>) -> Response {
 /// The same form signs somebody in for a terminal (W6.13), carrying the
 /// terminal's request so the sign-in ends in a confirmation rather than a
 /// browser session.
-fn password_page(refusal: &str, terminal: Option<&str>) -> String {
+pub(crate) fn password_page(
+    app: &App,
+    refusal: &str,
+    terminal: Option<&str>,
+    notice: &str,
+) -> String {
     let told = if refusal.is_empty() {
         String::new()
     } else {
-        format!("<p class=\"refusal\">{}</p>", escape(refusal))
+        format!("<p class=\"refused\">{}</p>", escape(refusal))
+    };
+    let told = if notice.is_empty() {
+        told
+    } else {
+        format!("<p class=\"passed\">{}</p>{told}", escape(notice))
+    };
+    // Where this deployment holds the accounts: the way back in for an
+    // administrator who lost their password (W6.16). A directory's password
+    // is the directory's to reset.
+    let lost = if app.accounts.is_some() && app.directory.is_none() {
+        "<p class=\"hint\"><a href=\"/sign-in/reset\">Lost your password?</a></p>"
+    } else {
+        ""
     };
     let (heading, carried) = match terminal {
         Some(id) => (
@@ -312,13 +343,12 @@ fn password_page(refusal: &str, terminal: Option<&str>) -> String {
         &format!(
             "<h1>{heading}</h1>{told}\
              <form method=\"post\" action=\"/sign-in\">{carried}\
-             <label for=\"name\">Username</label>\
-             <input id=\"name\" name=\"name\" autocomplete=\"username\" required>\
-             <label for=\"password\">Password</label>\
-             <input id=\"password\" name=\"password\" type=\"password\" \
-             autocomplete=\"current-password\" required>\
-             <button type=\"submit\">Sign in</button>\
-             </form>"
+             <label>Username<input id=\"name\" name=\"name\" autocomplete=\"username\" \
+             required></label>\
+             <label>Password<input id=\"password\" name=\"password\" type=\"password\" \
+             autocomplete=\"current-password\" required></label>\
+             <button type=\"submit\" class=\"primary\">Sign in</button>\
+             </form>{lost}"
         ),
     )
 }
@@ -344,7 +374,7 @@ async fn sign_in_with_password(
     let terminal = Some(credentials.terminal.as_str()).filter(|id| !id.is_empty());
     // The same sentence for both halves, wherever the refusal came from.
     let no = |reason: &str, status: StatusCode| {
-        let mut response = Html(password_page(reason, terminal)).into_response();
+        let mut response = Html(password_page(&app, reason, terminal, "")).into_response();
         *response.status_mut() = status;
         response
     };
@@ -414,11 +444,22 @@ async fn sign_in_with_password(
             subject,
             display_name,
             groups,
-        } => match terminal {
-            Some(id) => terminal::signed_in(&app, id, &subject, &display_name, groups, now),
-            None => began(&app, &subject, &display_name, groups, now).await,
-        },
-        accounts::Outcome::Refused => refused_them(),
+        } => {
+            app.sign_in_failures.clear(&credentials.name);
+            match terminal {
+                Some(id) => terminal::signed_in(&app, id, &subject, &display_name, groups, now),
+                None => began(&app, &subject, &display_name, groups, now).await,
+            }
+        }
+        // With how many attempts are left once there have been three, by the
+        // name typed, so the page reads the same whether or not it is one.
+        accounts::Outcome::Refused => no(
+            &format!(
+                "That username and password were not accepted.{}",
+                accounts::warning(app.sign_in_failures.failed(&credentials.name, now))
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
         // Said plainly, and not as a refusal: somebody locked out and not
         // told keeps trying and cannot tell it from a wrong password.
         accounts::Outcome::Locked => no(

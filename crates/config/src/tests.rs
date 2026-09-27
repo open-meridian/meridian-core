@@ -6,7 +6,7 @@ use std::time::Duration;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccessRecordsRequest, AccountGroup,
-    AccountRecord, AccountState, CloseAccountRequest, DefineAccessGroupRequest,
+    AccountRecord, AccountState, ClaimCodePurpose, CloseAccountRequest, DefineAccessGroupRequest,
     DefineAccountGroupRequest, DefineAccountRequest, DefineUserGroupRequest, DiagnosticBundle,
     DiagnosticBundleReceipt, ExternalAccountLink, GrantPermissionRequest,
     LinkExternalAccountRequest, Permission, PluginConfiguration, PluginConfigurationChangedEvent,
@@ -436,6 +436,35 @@ async fn a_refused_or_anonymous_claim_installs_nobody() {
     let anonymous = redeem(&h, "").await;
     assert!(!anonymous.redeemed);
     assert!(records(&h).await.permissions.is_empty());
+}
+
+#[tokio::test]
+async fn a_reset_code_is_honoured_with_nobody_signed_in_and_makes_nobody_anything() {
+    // W6.16: whoever holds one cannot sign in. The platform's answer goes
+    // back; what it resets is the dashboard's to do.
+    let h = harness("dashboard-1");
+    *h.platform.redeem.lock().unwrap() = true;
+    let (_, bytes) = h
+        .bus
+        .call_for(
+            REDEEM_CLAIM_CODE,
+            "meridian.v1.RedeemClaimCodeRequest",
+            RedeemClaimCodeRequest {
+                code: "7KQ2-MX4P-9RTD".into(),
+                purpose: ClaimCodePurpose::ResetLocalAdmin as i32,
+            }
+            .encode_to_vec(),
+            None,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+    assert!(RedeemClaimCodeReply::decode(&bytes[..]).unwrap().redeemed);
+    assert!(
+        records(&h).await.permissions.is_empty(),
+        "nobody was made anything"
+    );
 }
 
 #[tokio::test]

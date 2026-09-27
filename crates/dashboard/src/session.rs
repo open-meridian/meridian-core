@@ -108,6 +108,15 @@ impl Sessions {
         self.live.lock().expect("session lock poisoned").remove(key);
     }
 
+    /// End every browser session a person holds, and say how many: a
+    /// password reset (W6.16) ends what the old password opened.
+    pub fn end_person(&self, subject: &str) -> usize {
+        let mut live = self.live.lock().expect("session lock poisoned");
+        let before = live.len();
+        live.retain(|_, s| s.subject != subject);
+        before - live.len()
+    }
+
     /// Forget every expired session, so memory tracks the people signed in
     /// rather than everyone who ever was.
     pub fn sweep(&self, now_ns: i64) {

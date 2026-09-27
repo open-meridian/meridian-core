@@ -66,6 +66,47 @@ pub trait Accounts: Send + Sync {
     fn count_attempt(&self, name: &str, succeeded: bool, now_ns: i64) -> Result<(), String>;
 }
 
+/// Failed sign-ins by the name typed, whether or not an account has it, so the
+/// warning before the lock reads the same for every name: an account that
+/// exists is said to only by the lock, as it always was (W6.16). Advisory and
+/// in memory; the account's own count is what locks.
+#[derive(Default)]
+pub struct Failures {
+    by_name: Mutex<HashMap<String, (i32, i64)>>,
+}
+
+impl Failures {
+    /// One more failure for this name; how many there have been within the
+    /// lock's span.
+    pub fn failed(&self, name: &str, now_ns: i64) -> i32 {
+        let mut held = self.by_name.lock().expect("failures lock poisoned");
+        held.retain(|_, (_, last)| now_ns - *last <= LOCK_FOR_NS);
+        let entry = held.entry(keyed(name)).or_insert((0, now_ns));
+        entry.0 += 1;
+        entry.1 = now_ns;
+        entry.0
+    }
+
+    pub fn clear(&self, name: &str) {
+        self.by_name
+            .lock()
+            .expect("failures lock poisoned")
+            .remove(&keyed(name));
+    }
+}
+
+/// What the sign-in page adds after a failure: nothing until the third, then
+/// how many attempts are left before the lock.
+pub fn warning(failures: i32) -> String {
+    let left = LOCK_AFTER - failures;
+    match left {
+        l if l >= LOCK_AFTER - 2 => String::new(),
+        1 => " One more attempt locks this username for 15 minutes.".to_string(),
+        l if l > 1 => format!(" {l} more attempts before this username is locked for 15 minutes."),
+        _ => String::new(),
+    }
+}
+
 /// The name as it is stored and matched, so one person is one login.
 fn keyed(name: &str) -> String {
     name.trim().to_lowercase()

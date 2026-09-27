@@ -386,6 +386,7 @@ fn run() -> Result<(), String> {
                 oidc,
                 directory: directory.map(Arc::new),
                 accounts,
+                sign_in_failures: Default::default(),
                 secure_cookies,
                 plugins,
                 registry,

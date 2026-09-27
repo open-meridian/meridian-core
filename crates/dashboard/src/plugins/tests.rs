@@ -194,6 +194,7 @@ fn dashboard(
         oidc: None,
         directory: None,
         accounts: None,
+        sign_in_failures: Default::default(),
         secure_cookies: true,
         plugins: Some(Arc::new(plugins)),
         registry: None,

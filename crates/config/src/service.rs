@@ -583,10 +583,14 @@ pub fn serve(
             // in. It makes no administrator here; the code it brings back does
             // that later, at a real sign-in (W7.3, W7.7).
             let first_run = request.purpose == ClaimCodePurpose::FirstRun as i32;
-            if redeemer.is_empty() && !first_run {
+            // And a password-reset code (W6.16): whoever holds one cannot sign
+            // in, which is why they hold one. It makes nobody anything here;
+            // the dashboard sets the password once the platform honours it.
+            let reset = request.purpose == ClaimCodePurpose::ResetLocalAdmin as i32;
+            if redeemer.is_empty() && !first_run && !reset {
                 return Ok(refused("a claim code is redeemed by somebody signed in"));
             }
-            if first_run {
+            if first_run || reset {
                 return cx
                     .upstream
                     .honour_claim_code(&request.code, request.purpose);

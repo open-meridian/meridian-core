@@ -160,6 +160,7 @@ fn app_with(
         oidc: None,
         directory: None,
         accounts: None,
+        sign_in_failures: Default::default(),
         secure_cookies: true,
         plugins: None,
         registry: None,
