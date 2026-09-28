@@ -4,7 +4,11 @@ use axum::body::{to_bytes, Body};
 use axum::http::header::COOKIE;
 use axum::http::Request;
 use meridian_bus::{Bus, MemoryBackend};
-use meridian_domain::v1::{AccountRecord, Permission, RedeemClaimCodeReply};
+use meridian_domain::v1::{
+    AccountRecord, AccountState, ExternalAccount, ExternalAccountLink, ExternalAccountsEvent,
+    Permission, RedeemClaimCodeReply, SyncState, SyncStatusEvent, UnlinkedExternalAccount,
+    UnlinkedExternalAccountsEvent,
+};
 use tower::ServiceExt;
 
 use super::*;
@@ -110,6 +114,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         secure_cookies: true,
         plugins: None,
         registry: None,
+        custody: Arc::default(),
     });
     Harness {
         app,
@@ -174,6 +179,148 @@ async fn the_admin_pages_are_for_deployment_admins_only() {
         send(&admin, get(&admin, "/admin", true)).await.0,
         StatusCode::OK
     );
+}
+
+/// The table in `body` whose class list includes `class`.
+fn table<'a>(body: &'a str, class: &str) -> &'a str {
+    body.split(&format!("<table class=\"list {class}\">"))
+        .nth(1)
+        .and_then(|rest| rest.split("</table>").next())
+        .unwrap_or_else(|| panic!("no {class} table in the page"))
+}
+
+#[tokio::test]
+async fn reported_accounts_wait_beside_the_link_action_until_one_is_made() {
+    // W2.8 and W6.4: SNAP-1 is linked, SNAP-2 is not, and st-9902 was only
+    // ever refused. The two without a link wait, each with its own link.
+    let mut records = admin_records();
+    records.accounts = vec![AccountRecord {
+        account_id: "ACC-1".into(),
+        name: "Growth".into(),
+        state: AccountState::Open as i32,
+        created_at_ns: T0,
+    }];
+    records.links = vec![ExternalAccountLink {
+        plugin_instance_id: "snaptrade-1".into(),
+        external_account_id: "SNAP-1".into(),
+        account_id: "ACC-1".into(),
+    }];
+    let h = harness(records, None);
+    h.app.custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: vec![
+                ExternalAccount {
+                    external_account_id: "SNAP-1".into(),
+                    name: "Individual Brokerage 1234".into(),
+                    venue_account_type: "Individual".into(),
+                },
+                ExternalAccount {
+                    external_account_id: "SNAP-2".into(),
+                    name: "Roth IRA 5678".into(),
+                    venue_account_type: "Roth IRA".into(),
+                },
+            ],
+        },
+    );
+    h.app.custody.hear_refused(UnlinkedExternalAccountsEvent {
+        plugin_instance_id: "snaptrade-1".into(),
+        accounts: vec![UnlinkedExternalAccount {
+            external_account_id: "st-9902".into(),
+            refused_rows: 12,
+            ..Default::default()
+        }],
+    });
+
+    let (status, body) = send(&h, get(&h, "/admin", true)).await;
+    assert_eq!(status, StatusCode::OK);
+    let waiting = table(&body, "unlinked");
+    assert!(waiting.contains("data-id=\"SNAP-2\""), "{waiting}");
+    assert!(waiting.contains("Roth IRA 5678") && waiting.contains(">Roth IRA<"));
+    assert!(waiting.contains("data-id=\"st-9902\"") && waiting.contains("12 rows refused"));
+    assert!(
+        !waiting.contains("data-id=\"SNAP-1\""),
+        "a linked account is not waiting"
+    );
+    // Its own link, which posts what W6.4 always took.
+    assert!(body.contains("<input type=\"hidden\" name=\"external_account_id\" value=\"SNAP-2\">"));
+    assert!(table(&body, "linked").contains("data-account=\"ACC-1\""));
+}
+
+#[tokio::test]
+async fn an_unlinked_accounts_sync_state_is_shown_beside_it() {
+    // Ruled 2026-09-28: sync status describes the connection, not recorded
+    // data, so it arrives before a link and says whether one is worth making.
+    let h = harness(admin_records(), None);
+    h.app.custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: vec![ExternalAccount {
+                external_account_id: "SNAP-9".into(),
+                name: "Hidden Brokerage".into(),
+                venue_account_type: "Individual".into(),
+            }],
+        },
+    );
+    h.app.custody.hear_sync(
+        "snaptrade-1",
+        SyncStatusEvent {
+            external_account_id: "SNAP-9".into(),
+            account_id: String::new(),
+            state: SyncState::HoldingsUnavailable as i32,
+            ..Default::default()
+        },
+    );
+
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    let waiting = table(&body, "unlinked");
+    assert!(waiting.contains("data-id=\"SNAP-9\""));
+    assert!(waiting.contains("Holdings unavailable"), "{waiting}");
+    assert!(waiting.contains("Connect the account another way"));
+    assert!(table(&body, "sync").contains("not linked"));
+}
+
+#[tokio::test]
+async fn a_sync_state_is_shown_with_what_to_do_about_it() {
+    let h = harness(admin_records(), None);
+    for (external, state) in [
+        ("SNAP-1", SyncState::NeedsSignIn),
+        ("SNAP-2", SyncState::Disabled),
+        ("SNAP-3", SyncState::Stale),
+        ("SNAP-4", SyncState::DelayedByDesign),
+        ("SNAP-5", SyncState::Current),
+        ("SNAP-6", SyncState::HoldingsUnavailable),
+    ] {
+        h.app.custody.hear_sync(
+            "snaptrade-1",
+            SyncStatusEvent {
+                external_account_id: external.into(),
+                account_id: "ACC-1".into(),
+                state: state as i32,
+                holdings_as_of_ns: 1_757_289_600_000_000_000,
+                ..Default::default()
+            },
+        );
+    }
+
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    let sync = table(&body, "sync");
+    for said in [
+        "Needs sign-in",
+        "Sign in again at the venue",
+        "Disabled",
+        "Re-enable the connection",
+        "Stale",
+        "Wait: the connection is serving what it last read",
+        "Delayed by design",
+        "Expected: this venue reports late",
+        "Current",
+        "Holdings unavailable",
+        "Connect the account another way, or through another venue",
+        "2025-09-08 00:00 UTC",
+    ] {
+        assert!(sync.contains(said), "{said} is not shown: {sync}");
+    }
 }
 
 #[tokio::test]

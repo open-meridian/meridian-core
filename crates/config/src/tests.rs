@@ -553,6 +553,13 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     );
     assert!(configured.write_account_ids.is_empty());
     assert_eq!(configured.links.len(), 1);
+
+    // And with the records the dashboard reads, so it can tell which of the
+    // accounts a connector reports have no link (W2.8, W6.4).
+    let read = records(&h).await;
+    assert_eq!(read.links.len(), 1);
+    assert_eq!(read.links[0].external_account_id, "st-4471");
+    assert_eq!(read.links[0].account_id, growth_account.account_id);
 }
 
 #[tokio::test]

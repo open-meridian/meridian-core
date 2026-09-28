@@ -198,6 +198,7 @@ fn dashboard(
         secure_cookies: true,
         plugins: Some(Arc::new(plugins)),
         registry: None,
+        custody: Arc::default(),
     });
     (app, session)
 }

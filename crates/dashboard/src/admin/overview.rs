@@ -15,8 +15,9 @@
 
 use std::collections::HashMap;
 
-use meridian_domain::v1::{AccessLevel, AccessRecords, AccountState};
+use meridian_domain::v1::{AccessLevel, AccessRecords, AccountState, SyncStatusEvent};
 
+use crate::custody::{quiet, remedy, utc, Heard};
 use crate::html::escape;
 
 /// The sections, in the order an administrator reaches for them: who may do
@@ -72,6 +73,16 @@ fn dialog(id: &str, title: &str, action: &str, token: &str, fields: &str, submit
     )
 }
 
+/// A sync state as a pill: quiet in green, anything asking something of
+/// somebody in amber.
+fn state_pill(status: &SyncStatusEvent) -> String {
+    format!(
+        "<span class=\"pill{}\">{}</span>",
+        if quiet(status) { " good" } else { " warn" },
+        escape(remedy(status).0)
+    )
+}
+
 fn options(chosen: &str, items: &[(String, String)]) -> String {
     items
         .iter()
@@ -89,6 +100,7 @@ fn options(chosen: &str, items: &[(String, String)]) -> String {
 pub fn render(
     records: &AccessRecords,
     holders: &[(String, String, usize)],
+    custody: &Heard,
     token: &str,
     notice: &str,
 ) -> String {
@@ -490,14 +502,18 @@ pub fn render(
     ));
 
     // ── External accounts ───────────────────────────────────────────────────
+    // W6.4, beside what makes it a choice rather than a guess: the accounts
+    // each connector reports it reaches (W2.8) and those its sidecar refused
+    // rows for (W4.8), while nothing links them; then the links; then each
+    // connection's sync state and what to do about it (W2.1).
+    let open_accounts: Vec<(String, String)> = records
+        .accounts
+        .iter()
+        .filter(|a| a.state != AccountState::Closed as i32)
+        .map(|a| (a.account_id.clone(), a.name.clone()))
+        .collect();
     let mut accounts = vec![(String::new(), "None (unlink)".to_string())];
-    accounts.extend(
-        records
-            .accounts
-            .iter()
-            .filter(|a| a.state != AccountState::Closed as i32)
-            .map(|a| (a.account_id.clone(), a.name.clone())),
-    );
+    accounts.extend(open_accounts.iter().cloned());
     let link = dialog(
         "new-link",
         "Link an external account",
@@ -513,12 +529,158 @@ pub fn render(
         ),
         "Link",
     );
+
+    let mut rows = String::new();
+    let mut dialogs = String::new();
+    for (n, unlinked) in custody.unlinked(&records.links).iter().enumerate() {
+        let open = format!("link-reported-{n}");
+        let shown = if unlinked.name.is_empty() {
+            &unlinked.external_account_id
+        } else {
+            &unlinked.name
+        };
+        // The connection's state beside the account, so an administrator can
+        // tell whether it is worth linking: one whose venue withholds holdings
+        // will record nothing however it is linked.
+        let sync = custody
+            .sync
+            .get(&(
+                unlinked.plugin_instance_id.clone(),
+                unlinked.external_account_id.clone(),
+            ))
+            .map(|status| {
+                format!(
+                    "{}<span class=\"hint\">{}</span>",
+                    state_pill(status),
+                    escape(remedy(status).1)
+                )
+            })
+            .unwrap_or_default();
+        let refused = if unlinked.refused_rows > 0 {
+            format!(
+                "<span class=\"pill warn\">{} row{} refused</span>",
+                unlinked.refused_rows,
+                if unlinked.refused_rows == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            "<tr data-id=\"{id}\" data-instance=\"{instance}\" data-name=\"{name}\"><td>{named}</td>\
+             <td>{instance}</td><td>{kind}</td><td class=\"sync\">{sync}</td><td>{refused}</td><td class=\"actions\">\
+             <button type=\"button\" class=\"primary\" data-dialog-open=\"{open}\">Link</button></td></tr>",
+            id = escape(&unlinked.external_account_id),
+            instance = escape(&unlinked.plugin_instance_id),
+            name = escape(shown),
+            named = named(shown, &unlinked.external_account_id),
+            kind = escape(&unlinked.venue_account_type),
+        ));
+        dialogs.push_str(&dialog(
+            &open,
+            &format!("Link {}", escape(shown)),
+            "/admin/links#external-accounts",
+            token,
+            &format!(
+                "<input type=\"hidden\" name=\"plugin_instance_id\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"external_account_id\" value=\"{}\">\
+                 <p>{} at {}{}</p>\
+                 <label>Account<select name=\"account_id\" required>{}</select></label>",
+                escape(&unlinked.plugin_instance_id),
+                escape(&unlinked.external_account_id),
+                escape(shown),
+                escape(&unlinked.plugin_instance_id),
+                if unlinked.venue_account_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", which the venue calls {}",
+                        escape(&unlinked.venue_account_type)
+                    )
+                },
+                options("", &open_accounts)
+            ),
+            "Link",
+        ));
+    }
+    let unlinked_table = if rows.is_empty() {
+        "<p class=\"empty\">No reported account is waiting for a link.</p>".to_string()
+    } else {
+        format!(
+            "<div class=\"scroll\"><table class=\"list unlinked\"><thead><tr><th>Reported account</th>\
+             <th>Plugin</th><th>The venue's type</th><th>Connection</th><th></th><th></th></tr></thead>\
+             <tbody>{rows}</tbody></table></div>"
+        )
+    };
+
+    let linked: String = records
+        .links
+        .iter()
+        .filter(|l| !l.account_id.is_empty())
+        .map(|l| {
+            format!(
+                "<tr data-id=\"{id}\" data-instance=\"{instance}\" data-account=\"{account_id}\">\
+                 <td>{id}</td><td>{instance}</td><td>{account}</td></tr>",
+                id = escape(&l.external_account_id),
+                instance = escape(&l.plugin_instance_id),
+                account_id = escape(&l.account_id),
+                account = named(&name_of(&account_names, &l.account_id), &l.account_id),
+            )
+        })
+        .collect();
+    let linked_table = if linked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h3>Linked</h3><div class=\"scroll\"><table class=\"list linked\"><thead><tr><th>External account</th>\
+             <th>Plugin</th><th>Account</th></tr></thead><tbody>{linked}</tbody></table></div>"
+        )
+    };
+
+    let statuses: String = custody
+        .sync
+        .iter()
+        .map(|((instance, external), status)| {
+            let (state, what_to_do) = remedy(status);
+            let account = if status.account_id.is_empty() {
+                "<span class=\"pill\">not linked</span>".to_string()
+            } else {
+                named(
+                    &name_of(&account_names, &status.account_id),
+                    &status.account_id,
+                )
+            };
+            format!(
+                "<tr data-id=\"{id}\" data-instance=\"{instance}\" data-state=\"{state}\">\
+                 <td>{id}</td><td>{instance}</td><td>{account}</td>\
+                 <td>{pill}</td><td class=\"remedy\">{what_to_do}</td>\
+                 <td>{holdings}</td><td>{history}</td><td>{detail}</td></tr>",
+                id = escape(external),
+                instance = escape(instance),
+                pill = state_pill(status),
+                holdings = escape(&utc(status.holdings_as_of_ns)),
+                history = escape(&utc(status.history_as_of_ns)),
+                detail = escape(&status.status_detail),
+            )
+        })
+        .collect();
+    let sync_table = if statuses.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h3>Sync status</h3><div class=\"scroll\"><table class=\"list sync\"><thead><tr>\
+             <th>External account</th><th>Plugin</th><th>Account</th><th>State</th><th>What to do</th>\
+             <th>Holdings as of</th><th>History as of</th><th>Detail</th></tr></thead>\
+             <tbody>{statuses}</tbody></table></div>"
+        )
+    };
+
     sections.push(section(
         "external-accounts",
         "External accounts",
-        "A plugin's name for an account, tied to one of the firm's.",
+        "A plugin's name for an account, tied to one of the firm's. The accounts a connector \
+         reports, and any refused for want of a link, wait here until one is made.",
         &new_button("new-link", "Link an external account"),
-        link,
+        format!("{unlinked_table}{linked_table}{sync_table}{link}{dialogs}"),
     ));
 
     // ── Terminal sessions ───────────────────────────────────────────────────

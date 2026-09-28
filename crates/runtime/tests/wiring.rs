@@ -20,7 +20,7 @@ use meridian_domain::v1::{
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Decimal, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
+    Decimal, HoldingSide, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
     ResolveIdentifierParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
@@ -124,7 +124,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
             expected_rows: 1,
-            acting_for: None,
+            ..Default::default()
         }))
         .await
         .expect("the statement is opened")
@@ -150,6 +150,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
                 currency_code: "USD".into(),
             }),
             external_account_id: "ext-1".into(),
+            side: HoldingSide::Long as i32,
             ..Default::default()
         }))
         .await
@@ -235,7 +236,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
             expected_rows: 1,
-            acting_for: None,
+            ..Default::default()
         }))
         .await
         .expect("the statement is opened")
@@ -254,6 +255,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
                 currency_code: "USD".into(),
             }),
             external_account_id: "ext-1".into(),
+            side: HoldingSide::Long as i32,
             ..Default::default()
         }))
         .await

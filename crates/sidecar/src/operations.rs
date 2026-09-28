@@ -13,13 +13,22 @@ use crate::service::Sidecar;
 
 #[tonic::async_trait]
 impl plugin::plugin_operations_server::PluginOperations for Sidecar {
+    /// W2.8: `platform.custody.{instance}.event.external-accounts`.
+    async fn report_external_accounts(
+        &self,
+        request: Request<plugin::ReportExternalAccountsParams>,
+    ) -> Result<Response<plugin::Published>, Status> {
+        let message: domain::ExternalAccountsEvent = self.as_domain(request.into_inner())?;
+        self.publish_typed("platform.custody.{instance}.event.external-accounts", "meridian.v1.ExternalAccountsEvent", message).await
+    }
+
     /// W2.1: `platform.custody.{instance}.event.sync-status`.
     async fn report_sync_status(
         &self,
         request: Request<plugin::ReportSyncStatusParams>,
     ) -> Result<Response<plugin::Published>, Status> {
         let mut message: domain::SyncStatusEvent = self.as_domain(request.into_inner())?;
-        message.account_id = self.linked_account(&message.external_account_id).await?;
+        message.account_id = self.linked_account_if_any(&message.external_account_id).await?;
         self.publish_typed("platform.custody.{instance}.event.sync-status", "meridian.v1.SyncStatusEvent", message).await
     }
 
@@ -31,6 +40,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let message: domain::RecordHoldingsStatementRequest = self.as_domain(params)?;
+        self.exact_money("buying_power", message.buying_power.as_ref())?;
+        self.exact_money("margin_requirement", message.margin_requirement.as_ref())?;
+        self.exact_money("maintenance_excess", message.maintenance_excess.as_ref())?;
         let account = None;
         self.command_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message, account, acting_for).await
     }
@@ -45,6 +57,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut message: domain::RecordHoldingRequest = self.as_domain(params)?;
         self.exact("quantity", message.quantity.as_ref())?;
         self.exact_money("market_value", message.market_value.as_ref())?;
+        self.exact("settle_date_quantity", message.settle_date_quantity.as_ref())?;
         message.account_id = self.linked_account(&message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await

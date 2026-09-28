@@ -29,6 +29,7 @@ platform.config.query.first-run-sealing-key	query	dashboard	first-run
 platform.config.query.plugin-access	query	sidecar	conductor
 platform.config.query.plugin-catalogue	query	dashboard	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor
+platform.custody.*.event.external-accounts	event	custody	dashboard
 platform.custody.*.event.sync-status	event	custody	dashboard
 platform.deployment.command.create-plugin	command	conductor	launcher
 platform.deployment.command.remove-plugin	command	conductor	launcher

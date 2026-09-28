@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use meridian_street::amounts::{Exact, Money, Quantity};
 use meridian_street::store::{
-    Completion, Counts, Holding, Identifier, Opened, Settled, Statement, Store,
+    Completion, Counts, Figures, Holding, Identifier, Opened, Settled, Side, Statement, Store,
 };
 use meridian_street::PostgresStore;
 
@@ -58,6 +58,7 @@ fn opened(store: &PostgresStore) -> Statement {
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
         expected_rows: 1_000,
+        figures: Figures::default(),
     };
     store.open(statement).unwrap().0
 }
@@ -69,8 +70,12 @@ fn resolved(statement: &Statement, instrument_id: &str) -> Holding {
         account_id: unique("ACC"),
         instrument_id: Some(instrument_id.to_string()),
         unresolved_identifiers: vec![],
+        side: Side::Long,
         quantity: units("12.5"),
-        market_value: usd("2812.50"),
+        settle_date_quantity: None,
+        market_value: Some(usd("2812.50")),
+        currency_assumed: false,
+        also_counted_in_cash: false,
         escalated: false,
     }
 }
@@ -85,6 +90,7 @@ fn a_statement_is_opened_once_and_recognised_after_that() {
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
         expected_rows: 1_000,
+        figures: Figures::default(),
     };
 
     let (first, opened, _) = store.open(statement.clone()).unwrap();
@@ -115,7 +121,7 @@ fn a_resolved_row_moves_a_position_and_says_what_it_was() {
     }
 
     let position = store
-        .custodial_position(&account, &instrument)
+        .custodial_position(&account, &instrument, Side::Long)
         .unwrap()
         .unwrap();
     assert_eq!(position.quantity.to_string(), "12.5");
@@ -149,7 +155,7 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
     }
 
     let held = store
-        .custodial_position(&account, &instrument)
+        .custodial_position(&account, &instrument, Side::Long)
         .unwrap()
         .unwrap();
     assert_eq!(held.quantity.to_string(), "20", "the rows were summed");
@@ -195,15 +201,15 @@ fn the_smallest_and_largest_holdings_read_back_exactly() {
         let mut row = resolved(&statement, &instrument);
         row.account_id = account.clone();
         row.quantity = units(quantity);
-        row.market_value = usd("41230.50");
+        row.market_value = Some(usd("41230.50"));
         store.record(row, NOW).unwrap();
 
         let held = store
-            .custodial_position(&account, &instrument)
+            .custodial_position(&account, &instrument, Side::Long)
             .unwrap()
             .unwrap();
         assert_eq!(held.quantity.to_string(), quantity);
-        assert_eq!(held.market_value.to_string(), "41230.50 USD");
+        assert_eq!(held.market_value.unwrap().to_string(), "41230.50 USD");
 
         // And the row itself, unresolved, through the other read.
         let mut unresolved = resolved(&statement, "unused");
@@ -250,18 +256,18 @@ fn a_restatement_at_another_scale_is_the_same_number_and_keeps_its_own_scale() {
     let mut restated = resolved(&second, &instrument);
     restated.account_id = account.clone();
     restated.quantity = units("12.50");
-    restated.market_value = usd("2812.5");
+    restated.market_value = Some(usd("2812.5"));
 
     assert!(matches!(
         store.record(restated, NOW + 1).unwrap().0,
         Settled::Unchanged { .. }
     ));
     let held = store
-        .custodial_position(&account, &instrument)
+        .custodial_position(&account, &instrument, Side::Long)
         .unwrap()
         .unwrap();
     assert_eq!(held.quantity.to_string(), "12.50");
-    assert_eq!(held.market_value.to_string(), "2812.5 USD");
+    assert_eq!(held.market_value.unwrap().to_string(), "2812.5 USD");
 }
 
 #[test]
@@ -279,9 +285,9 @@ fn the_database_refuses_a_number_the_wire_could_not_have_carried() {
         ),
     ] {
         let refused = client.execute(
-            "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id,
+            "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
                                   quantity, market_value, currency)
-             VALUES ($1, $2, 'ACC', 'INS', $3::text::numeric, 0, 'USD')",
+             VALUES ($1, $2, 'ACC', 'INS', 'long', $3::text::numeric, 0, 'USD')",
             &[&unique("HLD"), &statement.statement_id, &quantity],
         );
         assert!(refused.is_err(), "{why} was stored");
@@ -343,8 +349,12 @@ fn a_row_for_a_statement_nobody_opened_is_refused() {
         account_id: unique("ACC"),
         instrument_id: Some(unique("INS")),
         unresolved_identifiers: vec![],
+        side: Side::Long,
         quantity: units("1"),
-        market_value: usd("1"),
+        settle_date_quantity: None,
+        market_value: Some(usd("1")),
+        currency_assumed: false,
+        also_counted_in_cash: false,
         escalated: false,
     };
     assert!(store.record(orphan, NOW).is_err());
@@ -411,7 +421,339 @@ fn concurrent_rows_for_one_position_leave_one_row_and_no_lost_update() {
     assert_eq!(
         page.positions.len(),
         1,
-        "one account and one instrument is one position"
+        "one account, one instrument and one side is one position"
+    );
+}
+
+// ── The account side (spec/the-account-side-fits-every-venue) ───────────────
+
+#[test]
+fn long_and_short_of_one_instrument_are_two_positions_keyed_by_side() {
+    // Schwab's shape: the key was account and instrument, and the short row
+    // overwrote the long.
+    let store = store();
+    let statement = opened(&store);
+    let instrument = unique("INS");
+
+    let long = resolved(&statement, &instrument);
+    let account = long.account_id.clone();
+    let mut short = resolved(&statement, &instrument);
+    short.account_id = account.clone();
+    short.side = Side::Short;
+    short.quantity = units("-50");
+    store.record(long, NOW).unwrap();
+    store.record(short, NOW).unwrap();
+
+    let long = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    let short = store
+        .custodial_position(&account, &instrument, Side::Short)
+        .unwrap()
+        .unwrap();
+    assert_eq!(long.quantity.to_string(), "12.5");
+    assert_eq!(short.quantity.to_string(), "-50");
+    assert_eq!(
+        store
+            .page(&account, false, 100, "")
+            .unwrap()
+            .positions
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn what_the_venue_did_not_report_is_kept_absent_and_what_it_did_exactly() {
+    // A settle-date quantity where reported and NULL where not; a market
+    // value NULL where not reported, never zero; the assumed currency marked.
+    let store = store();
+    let statement = opened(&store);
+    let account = unique("ACC");
+
+    let mut cash = resolved(&statement, &unique("INS-CASH"));
+    cash.account_id = account.clone();
+    cash.quantity = units("1520.35");
+    cash.settle_date_quantity = Some(units("1020.35"));
+    cash.market_value = None;
+    cash.currency_assumed = true;
+    let cash_instrument = cash.instrument_id.clone().unwrap();
+    let holding_id = cash.holding_id.clone();
+    store.record(cash, NOW).unwrap();
+
+    let held = store
+        .custodial_position(&account, &cash_instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.settle_date_quantity.unwrap().to_string(), "1020.35");
+    assert_eq!(held.market_value, None);
+
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    let row = client
+        .query_one(
+            "SELECT side, settle_date_quantity::text, market_value::text, currency,
+                    currency_assumed
+               FROM holding WHERE holding_id = $1",
+            &[&holding_id],
+        )
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "long");
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("1020.35"));
+    assert_eq!(
+        row.get::<_, Option<String>>(2),
+        None,
+        "not reported is NULL"
+    );
+    assert_eq!(row.get::<_, Option<String>>(3), None);
+    assert!(row.get::<_, bool>(4));
+}
+
+#[test]
+fn a_fund_also_counted_in_cash_is_marked_on_its_row_and_its_position() {
+    let store = store();
+    let statement = opened(&store);
+    let mut fund = resolved(&statement, &unique("INS-SPAXX"));
+    fund.quantity = units("500");
+    fund.market_value = Some(usd("500.00"));
+    fund.also_counted_in_cash = true;
+    let (account, instrument) = (fund.account_id.clone(), fund.instrument_id.clone().unwrap());
+    let holding_id = fund.holding_id.clone();
+    store.record(fund, NOW).unwrap();
+
+    let held = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    assert!(held.also_counted_in_cash);
+    assert_eq!(held.quantity.to_string(), "500", "kept as reported");
+
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    let marked: bool = client
+        .query_one(
+            "SELECT also_counted_in_cash FROM holding WHERE holding_id = $1",
+            &[&holding_id],
+        )
+        .unwrap()
+        .get(0);
+    assert!(marked);
+}
+
+#[test]
+fn a_statements_figures_are_kept_as_reported_and_read_back() {
+    let store = store();
+    let statement = Statement {
+        statement_id: unique("STMT"),
+        source: "etrade".into(),
+        external_statement_id: unique("84001234"),
+        as_of_date: "2026-09-08".into(),
+        read_at_ns: NOW,
+        expected_rows: 1,
+        figures: Figures {
+            buying_power: Some(usd("41250.00")),
+            margin_requirement: Some(usd("18250.00")),
+            maintenance_excess: None,
+            currency_assumed: true,
+        },
+    };
+    let (opened, _, _) = store.open(statement.clone()).unwrap();
+    let read = store.statement(&opened.statement_id).unwrap().unwrap();
+    assert_eq!(read.figures, statement.figures);
+    assert_eq!(
+        read.figures.buying_power.unwrap().to_string(),
+        "41250.00 USD",
+        "at the scale it was stated with"
+    );
+
+    // And a redelivery hands back the figures first recorded.
+    let mut again = statement;
+    again.statement_id = unique("STMT");
+    let (redelivered, opened, _) = store.open(again).unwrap();
+    assert_eq!(opened, Opened::AlreadyRecorded);
+    assert_eq!(redelivered.figures.maintenance_excess, None);
+}
+
+#[test]
+fn the_database_refuses_a_side_its_quantity_contradicts_and_a_value_without_its_currency() {
+    let store = store();
+    let statement = opened(&store);
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    for (side, quantity, value, currency, why) in [
+        (
+            "short",
+            "5",
+            Some("1"),
+            Some("USD"),
+            "a short row stating a positive quantity",
+        ),
+        (
+            "long",
+            "-5",
+            Some("1"),
+            Some("USD"),
+            "a long row stating a negative quantity",
+        ),
+        (
+            "sideways",
+            "5",
+            Some("1"),
+            Some("USD"),
+            "a side that is neither",
+        ),
+        (
+            "long",
+            "5",
+            Some("1"),
+            None,
+            "an amount without its currency",
+        ),
+        (
+            "long",
+            "5",
+            None,
+            Some("USD"),
+            "a currency without an amount",
+        ),
+    ] {
+        let refused = client.execute(
+            "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
+                                  quantity, market_value, currency)
+             VALUES ($1, $2, 'ACC', 'INS', $3, $4::text::numeric, $5::text::numeric, $6)",
+            &[
+                &unique("HLD"),
+                &statement.statement_id,
+                &side,
+                &quantity,
+                &value,
+                &currency,
+            ],
+        );
+        assert!(refused.is_err(), "{why} was stored");
+    }
+}
+
+#[test]
+fn a_read_of_every_account_across_pages_sees_each_position_once() {
+    // kernel/position-paging-skips-rows. A schema of its own, since every
+    // account is every account in it.
+    let (url, _client) = own_schema("paging");
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+    store.migrate().expect("could not apply the schema");
+    let statement = opened(&store);
+
+    let rows = [
+        ("ACC-A", "INS-Z", Side::Long, "1"),
+        ("ACC-B", "INS-A", Side::Long, "2"),
+        ("ACC-B", "INS-M", Side::Long, "3"),
+        ("ACC-B", "INS-M", Side::Short, "-4"),
+        ("ACC-C", "INS-A", Side::Short, "-5"),
+    ];
+    for (account, instrument, side, held) in rows {
+        let mut row = resolved(&statement, instrument);
+        row.account_id = account.into();
+        row.side = side;
+        row.quantity = units(held);
+        store.record(row, NOW).unwrap();
+    }
+    let mut unresolved = resolved(&statement, "unused");
+    unresolved.account_id = "ACC-B".into();
+    unresolved.instrument_id = None;
+    unresolved.unresolved_identifiers = vec![Identifier {
+        scheme: "symbol".into(),
+        value: "ZZTOP".into(),
+        source: "snaptrade".into(),
+    }];
+    store.record(unresolved, NOW).unwrap();
+
+    for size in 1..=6 {
+        let mut keys = Vec::new();
+        let mut gaps = 0;
+        let mut cursor = String::new();
+        loop {
+            let page = store.page("", true, size, &cursor).unwrap();
+            keys.extend(
+                page.positions
+                    .iter()
+                    .map(|p| (p.account_id.clone(), p.instrument_id.clone(), p.side)),
+            );
+            gaps += page.unresolved.len();
+            if page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            keys, sorted,
+            "in key order and none twice, at {size} a page"
+        );
+        assert_eq!(keys.len(), 5, "none skipped, at {size} a page: {keys:?}");
+        assert_eq!(gaps, 1, "the unresolved row once, at {size} a page");
+    }
+}
+
+#[test]
+fn migration_four_reads_an_existing_rows_side_from_its_sign_and_its_silence_as_null() {
+    // A database at version 3: a long row, a short one told only by its sign,
+    // and a value never reported, kept then as a zero in no currency.
+    let (url, mut client) = own_schema("four");
+    client
+        .batch_execute(meridian_street::migrations::HISTORY)
+        .unwrap();
+    for migration in &meridian_street::migrations::MIGRATIONS[..3] {
+        client.batch_execute(migration.sql).unwrap();
+        client
+            .execute(
+                "INSERT INTO schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+                &[&migration.version, &migration.name],
+            )
+            .unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO statement (statement_id, source, external_statement_id, as_of_date,
+                                    read_at_ns, expected_rows)
+             VALUES ('STMT-3', 'snaptrade', 'st-3', '2026-09-08', 1, 2);
+             INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, quantity,
+                                  market_value, currency)
+             VALUES ('HLD-L', 'STMT-3', 'ACC', 'INS', 12.5, 2812.50, 'USD'),
+                    ('HLD-S', 'STMT-3', 'ACC', 'INS-2', -3, 0, '');
+             INSERT INTO custodial_position (account_id, instrument_id, quantity, market_value,
+                                             currency, last_statement_id, as_of_date,
+                                             updated_at_ns)
+             VALUES ('ACC', 'INS', 12.5, 2812.50, 'USD', 'STMT-3', '2026-09-08', 1),
+                    ('ACC', 'INS-2', -3, 0, '', 'STMT-3', '2026-09-08', 1);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+    store.migrate().expect("migration 4 did not apply");
+    store.verify().expect("and the database is current");
+
+    let long = store
+        .custodial_position("ACC", "INS", Side::Long)
+        .unwrap()
+        .expect("the long row is long");
+    assert_eq!(long.market_value.unwrap().to_string(), "2812.50 USD");
+    let short = store
+        .custodial_position("ACC", "INS-2", Side::Short)
+        .unwrap()
+        .expect("the negative row is short");
+    assert_eq!(short.quantity.to_string(), "-3");
+    assert_eq!(short.market_value, None, "never reported, so NULL");
+
+    // And the key is the three columns: the other side of INS is a second
+    // position, not a conflict.
+    let mut other_side = resolved(&opened(&store), "INS");
+    other_side.account_id = "ACC".into();
+    other_side.side = Side::Short;
+    other_side.quantity = units("-1");
+    store.record(other_side, NOW).unwrap();
+    assert_eq!(
+        store.page("ACC", false, 100, "").unwrap().positions.len(),
+        3
     );
 }
 
@@ -469,6 +811,7 @@ fn a_statement_completes_once_and_only_once_under_concurrency() {
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
         expected_rows: 8,
+        figures: Figures::default(),
     };
     let statement = store.open(statement).unwrap().0;
     let account = unique("ACC");
@@ -510,6 +853,7 @@ fn a_statement_promising_no_rows_completes_when_it_opens() {
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
             expected_rows: 0,
+            figures: Figures::default(),
         })
         .unwrap();
 
@@ -550,7 +894,7 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
     let store = PostgresStore::connect(&scoped, 1).unwrap();
     store.migrate().expect("the rename did not apply");
 
-    let carried = store.custodial_position("ACC", "INS").unwrap();
+    let carried = store.custodial_position("ACC", "INS", Side::Long).unwrap();
     let carried = carried.expect("the row was left behind under the old table name");
     // A bigint at 1e8 carried at the eight places it was stated with.
     assert_eq!(carried.quantity.to_string(), "0.00000001");
@@ -578,6 +922,7 @@ fn stated(
         as_of_date: as_of_date.into(),
         read_at_ns: NOW,
         expected_rows: 1_000,
+        figures: Figures::default(),
     };
     let statement = store.open(statement).unwrap().0;
 
@@ -614,12 +959,12 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
     }
 
     assert!(store
-        .custodial_position(&account, &placeholder)
+        .custodial_position(&account, &placeholder, Side::Long)
         .unwrap()
         .is_none());
     assert_eq!(
         store
-            .custodial_position(&account, &instrument)
+            .custodial_position(&account, &instrument, Side::Long)
             .unwrap()
             .unwrap()
             .as_of_date,
@@ -669,13 +1014,13 @@ fn where_both_are_held_a_later_placeholder_statement_stands() {
     }
 
     let standing = store
-        .custodial_position(&account, &instrument)
+        .custodial_position(&account, &instrument, Side::Long)
         .unwrap()
         .unwrap();
     assert_eq!(standing.quantity.to_string(), "5");
     assert_eq!(standing.as_of_date, "2026-09-09");
     assert!(store
-        .custodial_position(&account, &placeholder)
+        .custodial_position(&account, &placeholder, Side::Long)
         .unwrap()
         .is_none());
 }
@@ -695,12 +1040,12 @@ fn where_both_are_held_a_later_instrument_statement_stands() {
         .is_empty());
 
     let standing = store
-        .custodial_position(&account, &instrument)
+        .custodial_position(&account, &instrument, Side::Long)
         .unwrap()
         .unwrap();
     assert_eq!(standing.quantity.to_string(), "2");
     assert!(store
-        .custodial_position(&account, &placeholder)
+        .custodial_position(&account, &placeholder, Side::Long)
         .unwrap()
         .is_none());
 }

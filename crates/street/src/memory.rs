@@ -4,13 +4,13 @@
 //! a database. Postgres sits behind the same trait; the rules live in `Held`,
 //! which both implementations share, so neither can enforce a different set.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    Completion, Counts, CustodialPosition, Holding, Opened, Page, Result, Settled, Statement,
-    Store, StoreError,
+    Completion, Counts, CustodialPosition, Holding, Key, Opened, Page, Result, Settled, Side,
+    Statement, Store, StoreError,
 };
 
 #[derive(Debug, Default)]
@@ -60,20 +60,24 @@ impl Store for MemoryStore {
         limit: usize,
         cursor: &str,
     ) -> Result<Page> {
-        Ok(self
-            .read()?
-            .page(account_id, include_unresolved, limit, cursor))
+        self.read()?
+            .page(account_id, include_unresolved, limit, cursor)
     }
 
     fn custodial_position(
         &self,
         account_id: &str,
         instrument_id: &str,
+        side: Side,
     ) -> Result<Option<CustodialPosition>> {
         Ok(self
             .read()?
             .positions
-            .get(&(account_id.to_string(), instrument_id.to_string()))
+            .get(&Key {
+                account_id: account_id.to_string(),
+                instrument_id: instrument_id.to_string(),
+                side,
+            })
             .cloned())
     }
 
@@ -86,7 +90,7 @@ impl Store for MemoryStore {
         let mut placeholders: Vec<String> = held
             .positions
             .keys()
-            .map(|(_, instrument_id)| instrument_id)
+            .map(|key| &key.instrument_id)
             .filter(|instrument_id| instrument_id.starts_with(crate::ids::PLACEHOLDER_PREFIX))
             .cloned()
             .collect();
@@ -109,7 +113,9 @@ pub(crate) struct Held {
     pub(crate) by_external: HashMap<(String, String), String>,
 
     pub(crate) holdings: Vec<Holding>,
-    pub(crate) positions: HashMap<(String, String), CustodialPosition>,
+
+    /// Ordered by key, which is the order a read pages through them in.
+    pub(crate) positions: BTreeMap<Key, CustodialPosition>,
 
     /// Statements that have already announced themselves, so a row beyond the
     /// count does not announce a second time.
@@ -189,7 +195,11 @@ impl Held {
     /// the position is replaced rather than added to. Accumulating would double
     /// anything that appeared in two statements.
     fn settle(&mut self, holding: &Holding, instrument_id: String, now_ns: i64) -> Result<Settled> {
-        let key = (holding.account_id.clone(), instrument_id.clone());
+        let key = Key {
+            account_id: holding.account_id.clone(),
+            instrument_id: instrument_id.clone(),
+            side: holding.side,
+        };
         let statement = self
             .statements
             .get(&holding.statement_id)
@@ -204,8 +214,11 @@ impl Held {
         let position = CustodialPosition {
             account_id: holding.account_id.clone(),
             instrument_id,
+            side: holding.side,
             quantity: holding.quantity,
+            settle_date_quantity: holding.settle_date_quantity,
             market_value: holding.market_value.clone(),
+            also_counted_in_cash: holding.also_counted_in_cash,
             last_statement_id: holding.statement_id.clone(),
             as_of_date: statement.as_of_date.clone(),
             updated_at_ns: now_ns,
@@ -233,27 +246,24 @@ impl Held {
         replaced_id: &str,
         instrument_id: &str,
     ) -> Vec<Settled> {
-        let mut accounts: Vec<String> = self
+        // In key order, which is account then side.
+        let held: Vec<Key> = self
             .positions
             .keys()
-            .filter(|(_, held)| held == replaced_id)
-            .map(|(account_id, _)| account_id.clone())
+            .filter(|key| key.instrument_id == replaced_id)
+            .cloned()
             .collect();
-        accounts.sort();
 
         let mut settled = Vec::new();
-        for account_id in accounts {
-            let Some(placeholder) = self
-                .positions
-                .remove(&(account_id.clone(), replaced_id.to_string()))
-            else {
+        for placeholder_key in held {
+            let Some(placeholder) = self.positions.remove(&placeholder_key) else {
                 continue;
             };
             let moved = CustodialPosition {
                 instrument_id: instrument_id.to_string(),
                 ..placeholder
             };
-            let key = (account_id, instrument_id.to_string());
+            let key = moved.key();
 
             match self.positions.get(&key).cloned() {
                 None => {
@@ -309,34 +319,38 @@ impl Held {
         include_unresolved: bool,
         limit: usize,
         cursor: &str,
-    ) -> Page {
+    ) -> Result<Page> {
+        let after = if cursor.is_empty() {
+            None
+        } else {
+            Some(Key::from_cursor(cursor)?)
+        };
+
+        // The map is in key order already; after the cursor's key, whole, so
+        // a later account's rows are never skipped for sorting before it.
         let mut positions: Vec<CustodialPosition> = self
             .positions
-            .values()
+            .iter()
+            .filter(|(key, _)| after.as_ref().is_none_or(|after| *key > after))
+            .map(|(_, position)| position)
             .filter(|position| account_id.is_empty() || position.account_id == account_id)
-            .filter(|position| cursor.is_empty() || position.instrument_id.as_str() > cursor)
+            .take(limit + 1)
             .cloned()
             .collect();
-
-        positions.sort_by(|left, right| {
-            (&left.account_id, &left.instrument_id).cmp(&(&right.account_id, &right.instrument_id))
-        });
 
         let more = positions.len() > limit;
         positions.truncate(limit);
 
-        let next_cursor = if more {
-            positions
-                .last()
-                .map(|position| position.instrument_id.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
+        let next_cursor = match positions.last() {
+            Some(last) if more => last.key().cursor(),
+            _ => String::new(),
         };
 
-        // Only when asked. The reply's postcondition says so, and a reader who
-        // did not ask for gaps should not be handed them silently.
-        let unresolved = if include_unresolved {
+        // Only when asked, and only with the first page. The reply's
+        // postcondition says so, a reader who did not ask for gaps should not
+        // be handed them silently, and one reading page by page should see
+        // each once.
+        let unresolved = if include_unresolved && after.is_none() {
             let mut rows: Vec<Holding> = self
                 .holdings
                 .iter()
@@ -350,11 +364,11 @@ impl Held {
             Vec::new()
         };
 
-        Page {
+        Ok(Page {
             positions,
             unresolved,
             next_cursor,
-        }
+        })
     }
 }
 
@@ -376,6 +390,7 @@ mod tests {
                 as_of_date: "2026-09-08".into(),
                 read_at_ns: 1,
                 expected_rows: 1,
+                figures: Default::default(),
             })
             .unwrap();
         store
@@ -386,8 +401,12 @@ mod tests {
                     account_id: "ACC-1".into(),
                     instrument_id: Some("LCL-1".into()),
                     unresolved_identifiers: vec![],
+                    side: Side::Long,
                     quantity: "1".parse().unwrap(),
-                    market_value: Money::new("1".parse().unwrap(), "USD"),
+                    settle_date_quantity: None,
+                    market_value: Some(Money::new("1".parse().unwrap(), "USD")),
+                    currency_assumed: false,
+                    also_counted_in_cash: false,
                     escalated: false,
                 },
                 1,
@@ -398,8 +417,10 @@ mod tests {
 
         let held = store.read().unwrap();
         assert_eq!(held.holdings[0].instrument_id.as_deref(), Some("LCL-1"));
-        assert!(held
-            .positions
-            .contains_key(&("ACC-1".to_string(), "INS-1".to_string())));
+        assert!(held.positions.contains_key(&Key {
+            account_id: "ACC-1".into(),
+            instrument_id: "INS-1".into(),
+            side: Side::Long,
+        }));
     }
 }

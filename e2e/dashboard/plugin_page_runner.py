@@ -8,7 +8,10 @@ stand-in that says what reached it.
 
 Ada signs in with the account first run made, claims the deployment, and
 grants herself read on one account through the plugin -- what an
-administrator does -- and only then can she open it.
+administrator does -- and only then can she open it. The plugin says which
+accounts its connection reaches, and she links one from the list the
+dashboard shows beside the link action, where its sync state then says what
+to do about it (W2.8, W6.4, W2.1).
 """
 import json
 import os
@@ -72,6 +75,42 @@ def post_on_plugin_host(browser, path):
         return response.status, response.read().decode()
     except urllib.error.HTTPError as refused:
         return refused.code, refused.read().decode()
+
+
+def unlinked_on(page):
+    """The external accounts the admin page lists as waiting for a link."""
+    table = page.body.split('<table class="list unlinked">', 1)
+    if len(table) < 2:
+        return []
+    return re.findall(r'<tr data-id="([^"]+)"', table[1].split("</table>", 1)[0])
+
+
+def unlinked_table(page):
+    """The admin page's table of accounts waiting for a link, as text."""
+    table = page.body.split('<table class="list unlinked">', 1)
+    return table[1].split("</table>", 1)[0] if len(table) > 1 else ""
+
+
+def sync_on(page):
+    """The admin page's sync status table, as text."""
+    table = page.body.split('<table class="list sync">', 1)
+    return table[1].split("</table>", 1)[0] if len(table) > 1 else ""
+
+
+def admin_until(ada, holds, seconds=30):
+    """/admin, read again until `holds` of it or `seconds` pass: what a
+    plugin says reaches the dashboard over the bus, a moment later."""
+    deadline = time.monotonic() + seconds
+    page = ada.get(dash("/admin"))
+    while not holds(page) and time.monotonic() < deadline:
+        time.sleep(1)
+        page = ada.get(dash("/admin"))
+    return page
+
+
+def report(plugin):
+    status, body = post_on_plugin_host(plugin, "/report")
+    return json.loads(body) if status == 200 else {"failed": f"{status} {body[:200]}"}
 
 
 def write(plugin):
@@ -197,9 +236,46 @@ def main():
     check(front_door() == 401, "with no assertion, refused")
     check(front_door(seen.get("raw") or "x") == 403, "an assertion already used, refused")
 
-    say("G: the plugin writes for her only what she may write (W4.9)")
+    say("G: the accounts the plugin reaches wait beside the link action (W2.8, W6.4)")
+    said = report(plugin)
+    check(said.get("accounts") == "published", f"the accounts are published: {said}")
+    check(said.get("sync") == "published",
+          f"and its sync state, though nobody linked it, since it describes the connection: {said}")
+    page = admin_until(ada, lambda page: "ext-e2e-roth" in unlinked_on(page)
+                       and "Needs sign-in" in unlinked_table(page))
+    waiting = unlinked_on(page)
+    check(waiting[:2] == ["ext-e2e", "ext-e2e-roth"], f"both wait, in the plugin's order: {waiting}")
+    check("Roth IRA" in page.body and "E2E Brokerage" in page.body,
+          "with the custodian's name and the venue's own type")
+    check('name="external_account_id" value="ext-e2e"' in page.body,
+          "each with a link of its own")
+    check("Sign in again at the venue" in unlinked_table(page),
+          "and the connection's state beside the unlinked account, with what to do")
     administer(ada, "/admin/links", {"plugin_instance_id": INSTANCE,
                                      "external_account_id": "ext-e2e", "account_id": account})
+    waiting = unlinked_on(ada.get(dash("/admin")))
+    check("ext-e2e" not in waiting and "ext-e2e-roth" in waiting,
+          f"linked, it stops waiting, and the other does not: {waiting}")
+
+    say("H: linked, its sync state is shown against its account (W2.1)")
+    # The sidecar reads the plugin's links again within 30 seconds of a
+    # change, so the state is reported again until it arrives with the account.
+    deadline = time.monotonic() + 45
+    while True:
+        said = report(plugin)
+        time.sleep(1)
+        shown = sync_on(ada.get(dash("/admin")))
+        row = shown.split('data-id="ext-e2e"', 1)[-1].split("</tr>", 1)[0]
+        if ("Needs sign-in" in row and "not linked" not in row) or time.monotonic() > deadline:
+            break
+        time.sleep(2)
+    check(said.get("sync") == "published", f"the sync state is published: {said}")
+    check("not linked" not in row, f"now against the account it is linked to: {row[:300]}")
+    check("Needs sign-in" in shown, f"the state: {shown[:300]}")
+    check("Sign in again at the venue" in shown, f"and what to do: {shown[:300]}")
+    check("the daily sign-in has lapsed" in shown, "with the connector's own words")
+
+    say("I: the plugin writes for her only what she may write (W4.9)")
     refused = write(plugin)
     check(not refused.get("ok") and refused.get("code") == "PERMISSION_DENIED",
           f"while she only reads, the sidecar refuses: {refused}")
@@ -214,7 +290,7 @@ def main():
         written = write(plugin)
     check(written.get("ok"), f"once she writes, it is recorded: {written}")
 
-    say("H: signing out of the dashboard ends the plugin's session")
+    say("J: signing out of the dashboard ends the plugin's session")
     home = ada.get(dash("/"))
     ada.post(dash("/sign-out"), {"form_token": form_token(home)})
     status, _, location, _ = on_plugin_host(plugin, "/")

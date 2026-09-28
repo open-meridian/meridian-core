@@ -396,8 +396,9 @@ mod tests {
 
     use meridian_bus::{MemoryBackend, Subscription};
     use meridian_domain::v1::{
-        CustodialPositionUpdatedEvent, Identifier as PbIdentifier, ListCustodialPositionsReply,
-        RecordHoldingReply, RecordHoldingsStatementReply, StatementRecordedEvent,
+        CustodialPositionUpdatedEvent, HoldingSide, Identifier as PbIdentifier,
+        ListCustodialPositionsReply, RecordHoldingReply, RecordHoldingsStatementReply,
+        StatementRecordedEvent,
     };
 
     use super::*;
@@ -445,6 +446,7 @@ mod tests {
                     as_of_date: "2026-09-08".into(),
                     read_at_ns: NOW,
                     expected_rows: 4,
+                    ..Default::default()
                 }
                 .encode_to_vec(),
                 None,
@@ -463,10 +465,10 @@ mod tests {
             statement_id: statement_id.into(),
             account_id: "SNAP-ACC-1".into(),
             instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
-            unresolved_identifiers: vec![],
             quantity: quantity("12.5"),
             market_value: usd("2812.5"),
-            external_account_id: String::new(),
+            side: HoldingSide::Long as i32,
+            ..Default::default()
         }
     }
 
@@ -493,7 +495,11 @@ mod tests {
         assert!(reply.resolved);
 
         let position = store
-            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
+            .custodial_position(
+                "SNAP-ACC-1",
+                "INS-01J8XQ4M7K0000000000AAPL",
+                crate::Side::Long,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(position.quantity.to_string(), "12.5");
@@ -587,6 +593,7 @@ mod tests {
                     as_of_date: "2026-09-08".into(),
                     read_at_ns: NOW,
                     expected_rows: 0,
+                    ..Default::default()
                 }
                 .encode_to_vec(),
                 None,
@@ -672,7 +679,11 @@ mod tests {
         assert_eq!(event.statement_id, statement_id);
 
         assert!(store
-            .custodial_position("SNAP-ACC-1", "LCL-01J8XQ4M7K0000000000ZZTP")
+            .custodial_position(
+                "SNAP-ACC-1",
+                "LCL-01J8XQ4M7K0000000000ZZTP",
+                crate::Side::Long
+            )
             .unwrap()
             .is_none());
     }
@@ -729,7 +740,11 @@ mod tests {
         assert_eq!(position.instrument_id, "INS-01J8XQ4M7K0000000000ZZTP");
         assert_eq!(event.statement_id, statement_id);
         assert!(store
-            .custodial_position("SNAP-ACC-1", "LCL-01J8XQ4M7K0000000000ZZTP")
+            .custodial_position(
+                "SNAP-ACC-1",
+                "LCL-01J8XQ4M7K0000000000ZZTP",
+                crate::Side::Long
+            )
             .unwrap()
             .is_none());
 
@@ -768,7 +783,11 @@ mod tests {
             "only the placeholder is asked about"
         );
         assert!(store
-            .custodial_position("SNAP-ACC-1", "LCL-01J8XQ4M7K0000000000ZZTP")
+            .custodial_position(
+                "SNAP-ACC-1",
+                "LCL-01J8XQ4M7K0000000000ZZTP",
+                crate::Side::Long
+            )
             .unwrap()
             .is_some());
         let quiet =

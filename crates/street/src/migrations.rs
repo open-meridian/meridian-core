@@ -63,6 +63,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "numbers_carry_their_own_scale",
         sql: include_str!("../migrations/0003_numbers_carry_their_own_scale.sql"),
     },
+    Migration {
+        version: 4,
+        name: "the_account_side",
+        sql: include_str!("../migrations/0004_the_account_side.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

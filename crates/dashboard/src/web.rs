@@ -80,6 +80,9 @@ pub struct App {
     /// The deployment's own registry, which a plugin's image is pushed to
     /// through here (W8.1). None where the deployment runs none.
     pub registry: Option<Arc<crate::catalogue::Registry>>,
+    /// What custody connectors last said about their accounts and their
+    /// connections, heard on the bus (W2.1, W2.8, W4.8).
+    pub custody: Arc<crate::custody::Custody>,
 }
 
 pub fn router(app: Arc<App>) -> Router {

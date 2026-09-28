@@ -87,6 +87,7 @@ fn records() -> AccessRecords {
         ],
         people: vec![],
         read_at_ns: 0,
+        links: vec![],
     }
 }
 

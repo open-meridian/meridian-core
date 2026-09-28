@@ -8,16 +8,16 @@
 //! anything that could object.
 
 use meridian_domain::v1::{
-    CustodialPositionUpdatedEvent, Identifier as PbIdentifier, InstrumentReplacedEvent,
-    RecordHoldingReply, RecordHoldingRequest, RecordHoldingsStatementReply,
-    RecordHoldingsStatementRequest, StatementRecordedEvent,
+    CustodialPositionUpdatedEvent, HoldingSide, Identifier as PbIdentifier,
+    InstrumentReplacedEvent, RecordHoldingReply, RecordHoldingRequest,
+    RecordHoldingsStatementReply, RecordHoldingsStatementRequest, StatementRecordedEvent,
 };
 
 use crate::amounts::{Money, Quantity};
 use crate::ids;
 use crate::store::{
-    Completion, CustodialPosition, Holding, Identifier, Opened, Result, Settled, Statement, Store,
-    StoreError,
+    Completion, CustodialPosition, Figures, Holding, Identifier, Opened, Result, Settled, Side,
+    Statement, Store, StoreError,
 };
 
 /// What opening a statement produced.
@@ -47,6 +47,22 @@ pub fn open_statement(
         as_of_date: request.as_of_date.clone(),
         read_at_ns: request.read_at_ns,
         expected_rows: request.expected_rows.max(0) as u32,
+
+        // As the venue reported them, each absent where it reported none.
+        // Nothing here computes one from the rows: that would be our figure
+        // presented as the custodian's.
+        figures: Figures {
+            buying_power: Money::reported("buying_power", request.buying_power.as_ref())?,
+            margin_requirement: Money::reported(
+                "margin_requirement",
+                request.margin_requirement.as_ref(),
+            )?,
+            maintenance_excess: Money::reported(
+                "maintenance_excess",
+                request.maintenance_excess.as_ref(),
+            )?,
+            currency_assumed: request.currency_assumed,
+        },
     })?;
 
     Ok(Opening {
@@ -110,10 +126,23 @@ pub fn record_holding(
             .map(from_wire_identifier)
             .collect(),
 
+        side: side_from_wire(request.side)?,
+
         // Refused naming the field when the wire form does not allow it. The
-        // sidecar refused a plugin's already; this is every other sender.
-        quantity: Quantity::from_wire("quantity", request.quantity.as_ref())?,
-        market_value: Money::from_wire("market_value", request.market_value.as_ref())?,
+        // sidecar refused a plugin's already; this is every other sender. The
+        // trade-date quantity is required: unset would read as zero, and a
+        // holding of nothing is a thing a venue can say.
+        quantity: Quantity::from_wire(
+            "quantity",
+            Some(request.quantity.as_ref().ok_or(StoreError::NoQuantity)?),
+        )?,
+        settle_date_quantity: Quantity::reported(
+            "settle_date_quantity",
+            request.settle_date_quantity.as_ref(),
+        )?,
+        market_value: Money::reported("market_value", request.market_value.as_ref())?,
+        currency_assumed: request.currency_assumed,
+        also_counted_in_cash: request.also_counted_in_cash,
 
         // Nothing has asked the platform about these identifiers yet. W3.2 is
         // the connector's obligation and it happens before this.
@@ -204,6 +233,22 @@ pub fn move_positions(
         .collect())
 }
 
+/// A side as the wire states it, or the refusal for a row that states none.
+fn side_from_wire(side: i32) -> Result<Side> {
+    match HoldingSide::try_from(side) {
+        Ok(HoldingSide::Long) => Ok(Side::Long),
+        Ok(HoldingSide::Short) => Ok(Side::Short),
+        Ok(HoldingSide::Unspecified) | Err(_) => Err(StoreError::NoSide),
+    }
+}
+
+pub(crate) fn side_to_wire(side: Side) -> i32 {
+    match side {
+        Side::Long => HoldingSide::Long as i32,
+        Side::Short => HoldingSide::Short as i32,
+    }
+}
+
 pub(crate) fn from_wire_identifier(identifier: &PbIdentifier) -> Identifier {
     Identifier {
         scheme: identifier.scheme.clone(),
@@ -226,8 +271,13 @@ pub(crate) fn to_wire_position(
     meridian_domain::v1::CustodialPosition {
         account_id: position.account_id.clone(),
         instrument_id: position.instrument_id.clone(),
+        side: side_to_wire(position.side),
         quantity: position.quantity.to_wire(),
-        market_value: position.market_value.to_wire(),
+        settle_date_quantity: position
+            .settle_date_quantity
+            .and_then(|quantity| quantity.to_wire()),
+        market_value: position.market_value.as_ref().and_then(Money::to_wire),
+        also_counted_in_cash: position.also_counted_in_cash,
         last_statement_id: position.last_statement_id.clone(),
         as_of_date: position.as_of_date.clone(),
         updated_at_ns: position.updated_at_ns,
@@ -247,23 +297,25 @@ mod tests {
     fn statement_request() -> RecordHoldingsStatementRequest {
         RecordHoldingsStatementRequest {
             source: "snaptrade".into(),
-            external_statement_id: "st-2026-09-08-SNAP-ACC-1".into(),
+            external_statement_id: "SNAP-ACC-1/1757376000000000000".into(),
             as_of_date: "2026-09-08".into(),
             read_at_ns: NOW,
             expected_rows: 4,
+            buying_power: usd("25000.00"),
+            ..Default::default()
         }
     }
 
-    /// The fixture's resolved row: 12.5 shares worth 2812.50.
+    /// The fixture's resolved row: 12.5 shares worth 2812.50, long.
     fn holding_request(statement_id: &str) -> RecordHoldingRequest {
         RecordHoldingRequest {
             statement_id: statement_id.into(),
             account_id: "SNAP-ACC-1".into(),
             instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
-            unresolved_identifiers: vec![],
             quantity: quantity("12.5"),
             market_value: usd("2812.5"),
-            external_account_id: String::new(),
+            side: HoldingSide::Long as i32,
+            ..Default::default()
         }
     }
 
@@ -280,7 +332,8 @@ mod tests {
             }],
             quantity: quantity("5"),
             market_value: usd("0"),
-            external_account_id: String::new(),
+            side: HoldingSide::Long as i32,
+            ..Default::default()
         }
     }
 
@@ -431,7 +484,7 @@ mod tests {
         record_holding(&store, &holding_request(&first), NOW).unwrap();
 
         let mut later = statement_request();
-        later.external_statement_id = "st-2026-09-09-SNAP-ACC-1".into();
+        later.external_statement_id = "SNAP-ACC-1/1757462400000000000".into();
         later.as_of_date = "2026-09-09".into();
         let second = open_statement(&store, &later, NOW + 1)
             .unwrap()
@@ -440,7 +493,7 @@ mod tests {
         record_holding(&store, &holding_request(&second), NOW + 1).unwrap();
 
         let position = store
-            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL", Side::Long)
             .unwrap()
             .unwrap();
 
@@ -458,7 +511,7 @@ mod tests {
         record_holding(&store, &holding_request(&first), NOW).unwrap();
 
         let mut later = statement_request();
-        later.external_statement_id = "st-2026-09-09-SNAP-ACC-1".into();
+        later.external_statement_id = "SNAP-ACC-1/1757462400000000000".into();
         let second = open_statement(&store, &later, NOW + 1)
             .unwrap()
             .reply
@@ -481,7 +534,7 @@ mod tests {
         record_holding(&store, &holding_request(&first), NOW).unwrap();
 
         let mut again = statement_request();
-        again.external_statement_id = "st-2026-09-09-SNAP-ACC-1".into();
+        again.external_statement_id = "SNAP-ACC-1/1757462400000000000".into();
         let second = open_statement(&store, &again, NOW + 1)
             .unwrap()
             .reply
@@ -494,19 +547,250 @@ mod tests {
 
     #[test]
     fn a_short_position_is_a_position() {
-        // "A negative quantity is a short position, not an error."
+        // "A negative quantity is a short position, not an error", and its
+        // side says so.
         let store = MemoryStore::new();
         let statement_id = opened(&store);
 
         let mut short = holding_request(&statement_id);
         short.quantity = quantity("-5");
+        short.side = HoldingSide::Short as i32;
         let recorded = record_holding(&store, &short, NOW).unwrap();
 
         assert!(recorded.reply.resolved);
-        assert_eq!(
-            read(&recorded.event.unwrap().position.unwrap().quantity),
-            "-5"
+        let position = recorded.event.unwrap().position.unwrap();
+        assert_eq!(read(&position.quantity), "-5");
+        assert_eq!(position.side, HoldingSide::Short as i32);
+    }
+
+    #[test]
+    fn a_holding_that_says_no_side_is_refused() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut sideless = holding_request(&statement_id);
+        sideless.side = HoldingSide::Unspecified as i32;
+
+        assert!(matches!(
+            record_holding(&store, &sideless, NOW),
+            Err(StoreError::NoSide)
+        ));
+    }
+
+    #[test]
+    fn a_side_its_quantity_contradicts_is_refused_naming_both() {
+        // Neither is believed over the other: the connector got one of them
+        // wrong, and nothing here can tell which.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut contradicted = holding_request(&statement_id);
+        contradicted.side = HoldingSide::Short as i32;
+        let refused = record_holding(&store, &contradicted, NOW).unwrap_err();
+        assert!(matches!(refused, StoreError::SideContradictsSign { .. }));
+        assert!(
+            refused
+                .to_string()
+                .contains("short side states a quantity of 12.5"),
+            "{refused}"
         );
+
+        let mut negative_long = holding_request(&statement_id);
+        negative_long.quantity = quantity("-1");
+        assert!(matches!(
+            record_holding(&store, &negative_long, NOW),
+            Err(StoreError::SideContradictsSign { .. })
+        ));
+    }
+
+    #[test]
+    fn a_holding_that_states_no_quantity_is_refused_rather_than_read_as_zero() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut unstated = holding_request(&statement_id);
+        unstated.quantity = None;
+
+        assert!(matches!(
+            record_holding(&store, &unstated, NOW),
+            Err(StoreError::NoQuantity)
+        ));
+        assert_eq!(store.counts(&statement_id).unwrap().received, 0);
+    }
+
+    #[test]
+    fn a_venue_reporting_long_and_short_of_one_instrument_holds_two_positions() {
+        // Schwab's shape: separate long and short figures, two rows, never
+        // netted to one.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut long = holding_request(&statement_id);
+        long.quantity = quantity("200");
+        let mut short = holding_request(&statement_id);
+        short.side = HoldingSide::Short as i32;
+        short.quantity = quantity("-50");
+        record_holding(&store, &long, NOW).unwrap();
+        record_holding(&store, &short, NOW).unwrap();
+
+        let instrument = "INS-01J8XQ4M7K0000000000AAPL";
+        let held_long = store
+            .custodial_position("SNAP-ACC-1", instrument, Side::Long)
+            .unwrap()
+            .unwrap();
+        let held_short = store
+            .custodial_position("SNAP-ACC-1", instrument, Side::Short)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held_long.quantity.to_string(), "200");
+        assert_eq!(held_short.quantity.to_string(), "-50");
+    }
+
+    #[test]
+    fn a_kalshi_no_is_a_short_row_of_the_markets_one_contract() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut no = holding_request(&statement_id);
+        no.instrument_id = "INS-01J8XQ4M7K00000000KXRAIN".into();
+        no.side = HoldingSide::Short as i32;
+        no.quantity = quantity("-15.25");
+        no.market_value = None;
+        let recorded = record_holding(&store, &no, NOW).unwrap();
+
+        let position = recorded.event.unwrap().position.unwrap();
+        assert_eq!(read(&position.quantity), "-15.25");
+        assert_eq!(position.side, HoldingSide::Short as i32);
+        assert!(position.market_value.is_none(), "Kalshi reports none");
+    }
+
+    #[test]
+    fn what_the_venue_did_not_report_is_absent_and_never_zero() {
+        // SnapTrade reports no market value; the row and the position say so.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut unvalued = holding_request(&statement_id);
+        unvalued.market_value = None;
+        let recorded = record_holding(&store, &unvalued, NOW).unwrap();
+
+        let position = recorded.event.unwrap().position.unwrap();
+        assert!(position.market_value.is_none());
+        assert!(position.settle_date_quantity.is_none());
+        let held = store
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL", Side::Long)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.market_value, None);
+    }
+
+    #[test]
+    fn cash_is_a_holding_with_its_settled_part_and_an_assumed_currency_kept() {
+        // E*TRADE's shape: one cash figure and no currency, so the row names
+        // the USD cash instrument on the connector's stated assumption.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut cash = holding_request(&statement_id);
+        cash.instrument_id = "INS-01J8XQ4M7K00000000CASHUSD".into();
+        cash.quantity = quantity("1520.35");
+        cash.settle_date_quantity = quantity("1020.35");
+        cash.market_value = None;
+        cash.currency_assumed = true;
+        record_holding(&store, &cash, NOW).unwrap();
+
+        let held = store
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K00000000CASHUSD", Side::Long)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.quantity.to_string(), "1520.35");
+        assert_eq!(held.settle_date_quantity.unwrap().to_string(), "1020.35");
+    }
+
+    #[test]
+    fn a_fund_also_counted_in_cash_is_kept_as_reported_and_marked() {
+        // SnapTrade counts a money-market fund in cash and lists it as a
+        // position too. Both rows stand as reported; the position says so.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+
+        let mut cash = holding_request(&statement_id);
+        cash.instrument_id = "INS-01J8XQ4M7K00000000CASHUSD".into();
+        cash.quantity = quantity("1520.35");
+        cash.market_value = None;
+        record_holding(&store, &cash, NOW).unwrap();
+
+        let mut fund = holding_request(&statement_id);
+        fund.instrument_id = "INS-01J8XQ4M7K0000000000SPAXX".into();
+        fund.quantity = quantity("500");
+        fund.market_value = usd("500.00");
+        fund.also_counted_in_cash = true;
+        let recorded = record_holding(&store, &fund, NOW).unwrap();
+
+        assert!(
+            recorded
+                .event
+                .unwrap()
+                .position
+                .unwrap()
+                .also_counted_in_cash
+        );
+        let held_cash = store
+            .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K00000000CASHUSD", Side::Long)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held_cash.quantity.to_string(),
+            "1520.35",
+            "cash is not reduced here"
+        );
+        assert!(!held_cash.also_counted_in_cash);
+    }
+
+    #[test]
+    fn a_trade_settling_is_a_change_though_the_trade_date_quantity_is_not() {
+        let store = MemoryStore::new();
+        let first = opened(&store);
+        let mut unsettled = holding_request(&first);
+        unsettled.settle_date_quantity = quantity("10");
+        record_holding(&store, &unsettled, NOW).unwrap();
+
+        let mut later = statement_request();
+        later.external_statement_id = "SNAP-ACC-1/1757462400000000000".into();
+        let second = open_statement(&store, &later, NOW + 1)
+            .unwrap()
+            .reply
+            .statement_id;
+        let mut settled = holding_request(&second);
+        settled.settle_date_quantity = quantity("12.5");
+        let recorded = record_holding(&store, &settled, NOW + 1).unwrap();
+
+        let event = recorded.event.expect("settling moved the settled quantity");
+        assert_eq!(read(&event.previous_quantity), "12.5");
+        assert_eq!(read(&event.position.unwrap().settle_date_quantity), "12.5");
+    }
+
+    #[test]
+    fn a_statements_figures_are_kept_as_the_venue_reported_them() {
+        let store = MemoryStore::new();
+        let mut etrade = statement_request();
+        etrade.buying_power = usd("41250.00");
+        etrade.margin_requirement = usd("18250.00");
+        etrade.maintenance_excess = None;
+        etrade.currency_assumed = true;
+        let statement_id = open_statement(&store, &etrade, NOW)
+            .unwrap()
+            .reply
+            .statement_id;
+
+        let figures = store.statement(&statement_id).unwrap().unwrap().figures;
+        assert_eq!(figures.buying_power.unwrap().to_string(), "41250.00 USD");
+        assert_eq!(
+            figures.margin_requirement.unwrap().to_string(),
+            "18250.00 USD"
+        );
+        assert_eq!(figures.maintenance_excess, None, "not reported, not zero");
+        assert!(figures.currency_assumed);
     }
 
     #[test]
@@ -693,12 +977,12 @@ mod tests {
         assert_eq!(read(&events[0].previous_quantity), "0");
 
         assert!(store
-            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER, Side::Long)
             .unwrap()
             .is_none());
         assert_eq!(
             store
-                .custodial_position("SNAP-ACC-1", REPLACEMENT)
+                .custodial_position("SNAP-ACC-1", REPLACEMENT, Side::Long)
                 .unwrap()
                 .unwrap()
                 .quantity
@@ -718,13 +1002,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(read(&events[0].previous_quantity), "2");
         let standing = store
-            .custodial_position("SNAP-ACC-1", REPLACEMENT)
+            .custodial_position("SNAP-ACC-1", REPLACEMENT, Side::Long)
             .unwrap()
             .unwrap();
         assert_eq!(standing.quantity.to_string(), "5");
         assert_eq!(standing.as_of_date, "2026-09-09");
         assert!(store
-            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER, Side::Long)
             .unwrap()
             .is_none());
     }
@@ -742,12 +1026,12 @@ mod tests {
 
         assert!(events.is_empty(), "{events:?}");
         let standing = store
-            .custodial_position("SNAP-ACC-1", REPLACEMENT)
+            .custodial_position("SNAP-ACC-1", REPLACEMENT, Side::Long)
             .unwrap()
             .unwrap();
         assert_eq!(standing.quantity.to_string(), "2");
         assert!(store
-            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER, Side::Long)
             .unwrap()
             .is_none());
     }
@@ -771,7 +1055,7 @@ mod tests {
 
         assert!(move_positions(&store, &itself).unwrap().is_empty());
         assert!(store
-            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER, Side::Long)
             .unwrap()
             .is_some());
     }

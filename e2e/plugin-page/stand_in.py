@@ -10,6 +10,10 @@ A POST to /write records a holding for the person the request came from
 (W4.9): the header it was handed, handed back on the command, so the sidecar
 decides whether that person may write the account.
 
+A POST to /report says, as the plugin itself, which accounts its connection
+reaches (W2.8) and why the linked one is not current (W2.1), which is what the
+dashboard lists beside its link action and shows with what to do.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -28,6 +32,8 @@ from meridian.v1 import sidecar_pb2, sidecar_pb2_grpc
 PORT = 8000
 SIDECAR = os.environ.get("MERIDIAN_SIDECAR_ADDRESS", "127.0.0.1:9191")
 EXTERNAL_ACCOUNT = "ext-e2e"
+# Reached and never linked, so it stays on the dashboard's list.
+OTHER_ACCOUNT = "ext-e2e-roth"
 
 
 def register():
@@ -71,6 +77,7 @@ def write_for(header):
                 unresolved_identifiers=[operations_pb2.Identifier(
                     scheme="symbol", value="E2E", source="e2e")],
                 # One unit worth 1 USD: an integer and its scale (decisions/023).
+                side=operations_pb2.HOLDING_SIDE_LONG,
                 quantity=operations_pb2.Decimal(low=1),
                 market_value=operations_pb2.Money(
                     amount=operations_pb2.Decimal(low=1), currency_code="USD"),
@@ -79,6 +86,43 @@ def write_for(header):
     except grpc.RpcError as refused:
         return {"ok": False, "code": refused.code().name, "detail": refused.details()}
     return {"ok": True, "holding_id": held.holding_id}
+
+
+def report():
+    """The accounts the connection reaches, and the linked one's sync state.
+
+    Neither is refused for want of a link: saying which accounts there are is
+    how one gets linked, and a sync state describes the connection, not data
+    recorded against the account (ruled 2026-09-28)."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    said = {}
+    try:
+        ops.ReportExternalAccounts(
+            operations_pb2.ReportExternalAccountsParams(accounts=[
+                operations_pb2.ExternalAccount(
+                    external_account_id=EXTERNAL_ACCOUNT, name="E2E Brokerage",
+                    venue_account_type="Individual"),
+                operations_pb2.ExternalAccount(
+                    external_account_id=OTHER_ACCOUNT, name="E2E Roth",
+                    venue_account_type="Roth IRA"),
+            ]),
+            timeout=10)
+        said["accounts"] = "published"
+    except grpc.RpcError as refused:
+        said["accounts"] = f"{refused.code().name}: {refused.details()}"
+    try:
+        ops.ReportSyncStatus(
+            operations_pb2.ReportSyncStatusParams(
+                source="e2e", external_account_id=EXTERNAL_ACCOUNT,
+                state=operations_pb2.SYNC_STATE_NEEDS_SIGN_IN, connection_healthy=False,
+                status_detail="the daily sign-in has lapsed",
+                holdings_as_of_ns=1_790_380_800_000_000_000,
+                observed_at_ns=time.time_ns()),
+            timeout=10)
+        said["sync"] = "published"
+    except grpc.RpcError as refused:
+        said["sync"] = f"{refused.code().name}: {refused.details()}"
+    return said
 
 
 def decoded(header):
@@ -121,7 +165,10 @@ class Page(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         callers = self.headers.get_all("Meridian-Caller") or []
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        done = write_for(callers[0]) if callers else {"ok": False, "detail": "nobody"}
+        if self.path == "/report":
+            done = report()
+        else:
+            done = write_for(callers[0]) if callers else {"ok": False, "detail": "nobody"}
         body = json.dumps(done).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

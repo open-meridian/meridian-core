@@ -624,7 +624,10 @@ e2e-dashboard-accounts: network
 # A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
 # of their own: the account branch's dashboard, holding a key made as the
 # chart's Job makes it, a sidecar with its front door open, and a stand-in
-# plugin in the sidecar's namespace saying what reached it.
+# plugin in the sidecar's namespace saying what reached it. The stand-in also
+# reports the accounts its connection reaches and a sync state, which the
+# dashboard lists beside its link action and shows with what to do (W2.8,
+# W2.1, W6.4).
 E2E_PLUGIN_PAGE := MERIDIAN_PLUGIN_FRONT_DOOR='http://sidecar-{instance}:9292' \
 	MERIDIAN_FRONT_DOOR_ADDRESS=0.0.0.0:9292 \
 	$(E2E_ACCOUNTS)
@@ -652,7 +655,7 @@ e2e-plugin-page: network
 		echo "e2e-plugin-page FAILED; the components' logs are in .e2e-plugin-page.log" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, and it writes for them only what they may write"
+	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, links an account it reaches from the dashboard's list and sees its sync state with what to do, and it writes for them only what they may write"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1059,7 +1062,12 @@ down:
 # writable, which a deployment admin makes; e2e/interop/a-linked-account.sql
 # makes it here. What the store kept is then read back from Postgres and held
 # to e2e/interop/positions.expected, character for character: the numbers the
-# SDK sent, at the scale they were stated with (decisions/023).
+# SDK sent, at the scale they were stated with (decisions/023); each position's
+# side, and a settle-date quantity or a market value only where one was sent;
+# the rows whose currency was the connector's assumption; the positions the
+# venue also counts in cash; and each venue shape's statement figures as sent
+# (spec/the-account-side-fits-every-venue).
+# Ordered bytewise, so the file does not depend on the database's collation.
 SDK ?= ../meridian-python
 
 interop: network
@@ -1088,9 +1096,24 @@ interop: network
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
-		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -c \
-			"SELECT instrument_id || '|' || quantity::text || '|' || market_value::text || '|' || currency \
-			   FROM custodial_position WHERE account_id = 'ACC-INTEROP' ORDER BY instrument_id" \
+		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At \
+			-c "SELECT instrument_id || '|' || side || '|' || quantity::text || '|' \
+			          || coalesce(settle_date_quantity::text, '') || '|' \
+			          || coalesce(market_value::text || ' ' || currency, '') \
+			      FROM custodial_position WHERE account_id = 'ACC-INTEROP' \
+			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
+			-c "SELECT 'assumed|' || instrument_id || '|' || side FROM holding \
+			     WHERE account_id = 'ACC-INTEROP' AND currency_assumed \
+			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
+			-c "SELECT 'in-cash|' || instrument_id || '|' || side FROM custodial_position \
+			     WHERE account_id = 'ACC-INTEROP' AND also_counted_in_cash \
+			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
+			-c "SELECT 'statement|' || source || '|' \
+			          || coalesce(buying_power::text || ' ' || buying_power_currency, '') || '|' \
+			          || coalesce(margin_requirement::text || ' ' || margin_requirement_currency, '') || '|' \
+			          || coalesce(maintenance_excess::text || ' ' || maintenance_excess_currency, '') || '|' \
+			          || currency_assumed::text \
+			      FROM statement WHERE source LIKE 'interop-%' ORDER BY source COLLATE \"C\"" \
 			>.interop.positions 2>&1; \
 		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \

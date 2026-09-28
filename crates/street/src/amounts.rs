@@ -75,6 +75,13 @@ impl Quantity {
         }
     }
 
+    /// From the wire, where unset means the venue did not report one: absent,
+    /// and never zero.
+    pub fn reported(field: &'static str, wire: Option<&Decimal>) -> Result<Option<Self>, Refused> {
+        wire.map(|wire| Self::from_wire(field, Some(wire)))
+            .transpose()
+    }
+
     pub fn to_wire(self) -> Option<Decimal> {
         Some(self.0.to_wire())
     }
@@ -102,8 +109,9 @@ impl fmt::Display for Quantity {
 pub struct Money {
     pub amount: Exact,
 
-    /// ISO 4217. Empty where the rail stated no value, which is recorded as a
-    /// zero in no currency rather than invented.
+    /// ISO 4217, or a crypto asset's code where that is the currency. Whether
+    /// the venue said it or the connector assumed it is recorded beside the
+    /// amount, not here.
     pub currency: String,
 }
 
@@ -126,6 +134,16 @@ impl Money {
             Some(amount) => Exact::from_wire(amount).map_err(|why| Refused { field, why })?,
         };
         Ok(Self::new(amount, wire.currency_code.clone()))
+    }
+
+    /// From the wire, where unset means the venue reported no amount: absent,
+    /// and never a zero in no currency.
+    pub fn reported(
+        field: &'static str,
+        wire: Option<&WireMoney>,
+    ) -> Result<Option<Self>, Refused> {
+        wire.map(|wire| Self::from_wire(field, Some(wire)))
+            .transpose()
     }
 
     pub fn to_wire(&self) -> Option<WireMoney> {
@@ -245,6 +263,22 @@ mod tests {
         };
         let refused = Money::from_wire("market_value", Some(&wide)).unwrap_err();
         assert_eq!(refused.why, OutOfRange::Digits);
+    }
+
+    #[test]
+    fn a_value_the_venue_did_not_report_is_absent_and_not_zero() {
+        assert_eq!(
+            Quantity::reported("settle_date_quantity", None).unwrap(),
+            None
+        );
+        assert_eq!(Money::reported("market_value", None).unwrap(), None);
+
+        let zero = Money::new(Exact::ZERO, "USD");
+        assert_eq!(
+            Money::reported("market_value", zero.to_wire().as_ref()).unwrap(),
+            Some(zero),
+            "a zero the venue did say is kept"
+        );
     }
 
     #[test]

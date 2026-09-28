@@ -314,8 +314,13 @@ pub fn serve(
             "meridian.v1.AccessRecords",
         ),
         |cx, _: AccessRecordsRequest, _| {
-            let mut records = cx.snapshot()?.records;
+            let snapshot = cx.snapshot()?;
+            let mut records = snapshot.records;
             records.read_at_ns = cx.clock.now_ns();
+            // With the links, so the dashboard can tell which of the accounts
+            // a connector reports have none (W2.8, W6.4). Only the dashboard
+            // asks this, and it may already see every account.
+            records.links = snapshot.links;
             Ok(records)
         },
     );

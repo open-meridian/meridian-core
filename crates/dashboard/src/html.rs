@@ -113,6 +113,7 @@ td.actions{text-align:right;white-space:nowrap}td.actions form{display:inline}\
 td.actions button{margin:0 0 0 .35rem;padding:.3rem .7rem;font-size:.84rem}\
 .pill{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.76rem;font-weight:550;\
 background:var(--line-soft);color:var(--ink-soft)}.pill.good{background:var(--good-wash);color:var(--good)}\
+.pill.warn{background:var(--warn-wash);color:var(--warn-ink)}\
 .empty{color:var(--ink-soft);padding:1.5rem;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}\
 dialog{width:min(32rem,calc(100vw - 2rem));padding:0;border:1px solid var(--line);border-radius:var(--radius);\
 background:var(--card);color:var(--ink);box-shadow:0 12px 40px rgba(0,0,0,.25)}\

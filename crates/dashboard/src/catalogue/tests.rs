@@ -232,6 +232,7 @@ async fn harness() -> Harness {
         secure_cookies: true,
         plugins: None,
         registry: Some(Arc::new(Registry::new(base).unwrap())),
+        custody: Arc::default(),
     });
     Harness {
         app,

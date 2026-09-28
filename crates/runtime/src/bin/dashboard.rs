@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_dashboard::accounts::{Accounts as _, InPostgres};
+use meridian_dashboard::custody::Custody;
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::plugins::Plugins;
@@ -320,6 +321,12 @@ fn run() -> Result<(), String> {
             }
             tokio::spawn(refresh_forever(Arc::clone(&bus), Arc::clone(&records), clock.clone()));
 
+            // What custody connectors say about their accounts and connections,
+            // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything
+            // else is started, since what is said before then is not heard.
+            let custody = Arc::new(Custody::default());
+            meridian_dashboard::custody::listen(&bus, Arc::clone(&custody));
+
             let sweeping = Arc::clone(&sessions);
             let sweeping_terminals = Arc::clone(&terminals);
             let sweeping_plugins = plugins.clone();
@@ -390,6 +397,7 @@ fn run() -> Result<(), String> {
                 secure_cookies,
                 plugins,
                 registry,
+                custody,
             }));
             let listener = tokio::net::TcpListener::bind(listen)
                 .await

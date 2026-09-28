@@ -37,6 +37,7 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         secure_cookies: true,
         plugins: None,
         registry: None,
+        custody: Arc::default(),
     })
 }
 

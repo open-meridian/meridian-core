@@ -153,6 +153,30 @@ impl Sidecar {
         self.configuration.current(now_ns).await
     }
 
+    /// The account an external account is linked to, or empty when nobody has
+    /// linked it; never a refusal. For a message about the connection rather
+    /// than data recorded against the account -- a sync status -- which the
+    /// dashboard shows beside an unlinked account so an administrator can
+    /// tell whether it is worth linking (ruled 2026-09-28). Nothing was
+    /// refused, so nothing is counted in the plugin's report.
+    pub(crate) async fn linked_account_if_any(
+        &self,
+        external_account_id: &str,
+    ) -> Result<String, Status> {
+        if external_account_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "external_account_id is required: the account as the rail knows it",
+            ));
+        }
+        let configuration = self.configuration(crate::typed::now_ns()).await?;
+        Ok(configuration
+            .links
+            .iter()
+            .find(|link| link.external_account_id == external_account_id)
+            .map(|link| link.account_id.clone())
+            .unwrap_or_default())
+    }
+
     /// The account an external account is linked to (W6.4), or the refusal
     /// that names what to do: a row for an unlinked account is refused, not
     /// guessed at, and recorded once somebody links it.

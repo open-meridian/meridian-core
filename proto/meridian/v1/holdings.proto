@@ -14,6 +14,12 @@
 // break, and a break costs more to investigate than the discipline costs to
 // keep.
 //
+// What a venue says is carried as it said it, and nothing it did not say is
+// made up here (spec/the-account-side-fits-every-venue): a value it did not
+// report is unset rather than zero, a currency it did not state is marked as
+// the connector's assumption, and a short is a short row rather than a sign
+// somebody has to remember the meaning of.
+//
 // Until 2026-09-28 they were int64s at a fixed scale of 1e8, named
 // `*_scaled_1e8`, with the currency beside the amount. Those fields are
 // reserved below, their numbers and names never reused: a reader built
@@ -32,8 +38,12 @@ import "meridian/v1/reference.proto";
 
 // How fresh a connected account's data is, as reported by the rail.
 //
-// Published so an operator can tell stale data from absent data. Those look
-// identical on a holdings screen and mean completely different things.
+// And why, when it is not current. Published so an operator can tell stale
+// data from absent data, which look identical on a holdings screen and mean
+// completely different things. And "unhealthy" alone cannot say whose fix it
+// is: a connection that needs a person to sign in again, one somebody
+// disabled, and one that is a day late by design look the same as a flag and
+// ask for three different things.
 message SyncStatusEvent {
   string source = 1;
 
@@ -42,14 +52,16 @@ message SyncStatusEvent {
   string account_id = 2;
 
   // When the rail last successfully synced this account from the institution.
+  // Not when the data is as of: a venue a day late by design syncs today what
+  // was true yesterday, which the two fields below say.
   int64 last_synced_at_ns = 3;
 
   // Whether the rail currently considers the connection healthy. A false here
   // with a recent last_synced_at_ns means the data is good but the connection
-  // has since broken.
+  // has since broken. `state` says why.
   bool connection_healthy = 4;
 
-  // Rail-supplied text when the connection is unhealthy. Diagnostic only;
+  // Rail-supplied text, for whatever `state` does not say. Diagnostic only;
   // nothing branches on it.
   string status_detail = 5;
 
@@ -57,13 +69,66 @@ message SyncStatusEvent {
 
   // The account as the rail knows it, which the sidecar translates.
   string external_account_id = 7;
+
+  // Whether the data is current, and if not, why: which is also whose fix it
+  // is and what the dashboard tells a deployment admin to do.
+  SyncState state = 8;
+
+  // When the holdings the rail serves are as of, and when the history
+  // (transactions) is. Separately, because venues keep them apart and a
+  // connection can have one current and the other not: SnapTrade reports
+  // holdings to the minute and transactions by the day. Zero where the rail
+  // does not say.
+  int64 holdings_as_of_ns = 9;
+  int64 history_as_of_ns = 10;
+}
+
+// Why a connection's data is, or is not, current.
+//
+// The venues surveyed fail in exactly these ways (reference/broker-apis.md),
+// and each asks something different of a person, which is the point of
+// naming them rather than leaving them to a flag and free text.
+enum SyncState {
+  // Not said: a connector written before this was. Shown as what
+  // connection_healthy says.
+  SYNC_STATE_UNSPECIFIED = 0;
+
+  // Current. Nothing to do.
+  SYNC_STATE_CURRENT = 1;
+
+  // Still serving, but older than it should be: holdings_as_of_ns says since
+  // when. Usually the rail's to recover; nothing to do but wait.
+  SYNC_STATE_STALE = 2;
+
+  // A person must sign in again at the venue before it serves anything new:
+  // E*TRADE and Interactive Brokers daily, Schwab weekly, Interactive Brokers
+  // also when connected but signed out.
+  SYNC_STATE_NEEDS_SIGN_IN = 3;
+
+  // The connection is disabled and serves only what it last read, as
+  // SnapTrade does. Somebody re-enables it.
+  SYNC_STATE_DISABLED = 4;
+
+  // Late on purpose, as Interactive Brokers through SnapTrade is by a business
+  // day. Expected; nothing to do.
+  SYNC_STATE_DELAYED_BY_DESIGN = 5;
+
+  // The venue does not provide holdings through this connection, as some
+  // brokerages hide them from SnapTrade (its `holdings_unavailable`). Waiting
+  // changes nothing: holdings will not arrive this way, so the account is
+  // connected another way or through another venue.
+  SYNC_STATE_HOLDINGS_UNAVAILABLE = 6;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W2.2 — the statement envelope
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Open one statement: one read of one rail, at one moment.
+// Open one statement: the connector's snapshot of one account, at one moment.
+//
+// A statement is the connector's, not the venue's: none of the eight venues
+// surveyed has a statement of its own, and every one gives a live snapshot.
+// So the connector reads an account, and what it read is a statement.
 //
 // Two dates, and they are not the same thing. `as_of_date` is the date the
 // positions reflect. `read_at_ns` is when the connector fetched them. A
@@ -73,8 +138,9 @@ message RecordHoldingsStatementRequest {
   // The rail namespace, e.g. "snaptrade".
   string source = 1;
 
-  // The rail's own identifier for this statement, where it has one. Used to
-  // recognise a redelivery of the same statement.
+  // The connector's identifier for this snapshot, made from the account it
+  // read and the time it read it, so the same read sent twice has the same
+  // one. Used to recognise a redelivery of the same statement.
   string external_statement_id = 2;
 
   // ISO 8601 date the positions are as of.
@@ -93,6 +159,19 @@ message RecordHoldingsStatementRequest {
   // The connector holds the whole list before it publishes any of it, so it
   // knows this without reading anything twice.
   int32 expected_rows = 5;
+
+  // The account's buying power and margin figures, as the venue reported
+  // them, and unset where it reported none. Never derived: a figure computed
+  // here from the holdings would be ours presented as the custodian's, and
+  // margin is where that difference costs money.
+  optional Money buying_power = 6;
+  optional Money margin_requirement = 7;
+  optional Money maintenance_excess = 8;
+
+  // True when the venue stated no currency for these figures and the
+  // connector's is its own stated assumption (E*TRADE's balances carry none),
+  // rather than something the venue said.
+  bool currency_assumed = 9;
 }
 
 message RecordHoldingsStatementReply {
@@ -108,7 +187,7 @@ message RecordHoldingsStatementReply {
 // W2.3 — the rows
 // ─────────────────────────────────────────────────────────────────────────────
 
-// One holding, for one account, at one instrument.
+// One holding, for one account, at one instrument, on one side.
 //
 // Either `instrument_id` is set, meaning the connector resolved it (to an
 // instrument, or to the deployment's LCL- placeholder when nothing matched),
@@ -116,6 +195,11 @@ message RecordHoldingsStatementReply {
 // both, and never neither. A row that could not be resolved is still recorded, because a
 // dropped holding is invisible and an operator comparing against their
 // brokerage would find a silent discrepancy with nothing to investigate.
+//
+// Cash is a holding like any other: of the currency's cash instrument, which
+// the identifier scheme `iso4217` names ({scheme: iso4217, value: USD}), its
+// quantity the cash the venue reports in that currency. A crypto asset held as
+// cash, such as USDC at Coinbase, is a holding of that asset's instrument.
 message RecordHoldingRequest {
   string statement_id = 1;
   string account_id = 2;
@@ -127,13 +211,16 @@ message RecordHoldingRequest {
   // exactly what could not be accounted for.
   repeated Identifier unresolved_identifiers = 4;
 
-  // Signed: negative is a short position.
+  // The trade-date quantity: what is held counting every trade executed,
+  // settled or not. Required. Signed to match `side`: negative is short.
   Decimal quantity = 9;
 
   // The rail's valuation of the holding, in its currency. Recorded as
   // reported, not recomputed: this is the custodian's belief, and rederiving it
-  // would discard the thing that makes a later comparison meaningful.
-  Money market_value = 10;
+  // would discard the thing that makes a later comparison meaningful. Unset
+  // where the venue reported none (SnapTrade and Kalshi do not), which is not
+  // a value of zero.
+  optional Money market_value = 10;
 
   // The account as the rail knows it. The connector sets this and leaves
   // `account_id` empty; the sidecar sets `account_id` from the link in the
@@ -142,10 +229,48 @@ message RecordHoldingRequest {
   // unlinked, and the next statement after it is linked records it (W2).
   string external_account_id = 8;
 
+  // Long or short, stated rather than read off the sign, and the quantity's
+  // sign matches it. A venue that reports an account's long and short of one
+  // instrument apart (Schwab) sends two rows, one on each side; one that
+  // reports a signed number (E*TRADE, Kalshi) sends the side its sign means.
+  // A Kalshi NO position is a short row of the market's one contract.
+  HoldingSide side = 11;
+
+  // The settle-date quantity: what is held counting only settled trades,
+  // where the venue reports it, and unset where it does not. For cash, the
+  // settled cash.
+  optional Decimal settle_date_quantity = 12;
+
+  // True when the venue stated no currency and the one here is the
+  // connector's stated assumption (E*TRADE, Schwab and Public state none),
+  // rather than something the venue said: the market value's currency, and
+  // for cash the currency whose cash instrument the row names. A
+  // pseudo-currency such as Interactive Brokers' BASE is never one.
+  bool currency_assumed = 13;
+
+  // This position's value is also included in the account's cash holding as
+  // the venue reports it: SnapTrade counts a money-market fund in cash and
+  // lists it as a position too. The street store keeps both as reported; a
+  // reader counting the account once counts the fund as a position and
+  // deducts it from cash.
+  bool also_counted_in_cash = 14;
+
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
   reserved 5, 6, 7;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// Which side of an instrument a holding or a custodial position is on.
+//
+// A side of its own rather than the sign alone, because a venue can report
+// both sides of one instrument at once, and two rows keyed by account and
+// instrument alone would overwrite each other.
+enum HoldingSide {
+  // Not said. Refused by the street store: a holding says which side it is on.
+  HOLDING_SIDE_UNSPECIFIED = 0;
+  HOLDING_SIDE_LONG = 1;
+  HOLDING_SIDE_SHORT = 2;
 }
 
 message RecordHoldingReply {
@@ -192,7 +317,9 @@ message CustodialPositionUpdatedEvent {
   reserved "previous_quantity_scaled_1e8";
 }
 
-// What the custodian says an account holds of an instrument, right now.
+// What the custodian says an account holds of an instrument, on one side,
+// right now. Keyed by all three: an account may hold an instrument long and
+// short at once, as a venue reporting them apart says.
 //
 // Custodial, and named so deliberately. This is the custodian's belief, arrived
 // at by reading their statements; it is not what the deployment calculates from
@@ -208,7 +335,11 @@ message CustodialPosition {
   // An instrument, or the deployment's LCL- placeholder awaiting identity,
   // which the INS- ID replaces when it arrives (W3.9).
   string instrument_id = 2;
+
+  // The trade-date quantity, signed to match `side`.
   Decimal quantity = 9;
+
+  // Unset where the custodian reported no value, which is not zero.
   Money market_value = 10;
 
   // The statement this was last stated by, and when. One not restated recently
@@ -216,6 +347,15 @@ message CustodialPosition {
   string last_statement_id = 6;
   string as_of_date = 7;
   int64 updated_at_ns = 8;
+
+  HoldingSide side = 11;
+
+  // The settle-date quantity, where the custodian reported one.
+  Decimal settle_date_quantity = 12;
+
+  // This position's value is also included in the account's cash holding as
+  // the custodian reports it; both are kept as reported.
+  bool also_counted_in_cash = 13;
 
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
@@ -237,6 +377,10 @@ message ListCustodialPositionsRequest {
   bool include_unresolved = 2;
 
   int32 page_size = 3;
+
+  // Opaque: the previous reply's `next_cursor`, or empty for the first page.
+  // Unresolved holdings come with the first page only, so a read across
+  // pages sees each once.
   string cursor = 4;
 }
 
@@ -254,7 +398,11 @@ message UnresolvedHolding {
   string holding_id = 1;
   string account_id = 2;
   repeated Identifier identifiers = 3;
+
+  // Signed, as the row stated it: negative is a short row.
   Decimal quantity = 10;
+
+  // Unset where the custodian reported no value.
   Money market_value = 11;
   string source = 7;
   string as_of_date = 8;
@@ -268,4 +416,39 @@ message UnresolvedHolding {
   // inside it (decisions/023).
   reserved 4, 5, 6;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.8 — the accounts a connection reaches
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Every external account a connection reaches, as the connector sees it now.
+//
+// Published before anything is recorded against any of them, so linking one
+// (W6.4) is a choice among the accounts on offer rather than a guess made
+// after a statement was refused for want of a link: one SnapTrade connection
+// can reach several brokerage accounts, and an administrator links the ones
+// they mean. The whole list each time, so an account missing from it is one
+// the connection no longer reaches.
+message ExternalAccountsEvent {
+  repeated ExternalAccount accounts = 1;
+}
+
+// One account a connection reaches, as the custodian presents it.
+message ExternalAccount {
+  // Stable: the connector makes it so where the venue does not, and it is the
+  // `external_account_id` the account's rows name. SnapTrade's changes on
+  // reconnect unless its `institution_account_id` is used; Kalshi's is a
+  // subaccount and a matching engine joined. A handle the venue wants on each
+  // call (E*TRADE's accountIdKey, Schwab's hash) stays inside the plugin.
+  string external_account_id = 1;
+
+  // The custodian's own name for it, as a person there would recognise it.
+  string name = 2;
+
+  // The venue's own word for the kind of account, verbatim and for display
+  // only. Nothing reads meaning into it: what an account may do is the
+  // platform's restriction set, in the platform's words, which each plugin
+  // maps its venue's types onto when that set is ruled.
+  string venue_account_type = 3;
 }

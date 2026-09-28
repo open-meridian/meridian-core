@@ -52,6 +52,11 @@ message AccessRecords {
 
   // When the store answered. The dashboard refuses once this is 10 minutes old.
   int64 read_at_ns = 7;
+
+  // Every external account linked to an account (W6.4), so the dashboard can
+  // show the links and tell which of the accounts a connector reports have
+  // none. Only the conductor and each plugin's own sidecar knew them before.
+  repeated ExternalAccountLink links = 8;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

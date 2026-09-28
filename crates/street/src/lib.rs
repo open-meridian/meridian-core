@@ -1,8 +1,8 @@
 //! The deployment's street store: statements, holdings and positions.
 //!
 //! W2's street half. A connector reads a brokerage, opens a statement, and
-//! publishes one row per account and instrument; this records them, moves the
-//! positions behind them, and answers what is held.
+//! publishes one row per account, instrument and side; this records them,
+//! moves the positions behind them, and answers what is held.
 //!
 //! # The idea the whole workflow rests on
 //!
@@ -32,7 +32,7 @@
 //! rule. What happens is that somebody adds a dependency for convenience and
 //! nothing objects.
 //!
-//! # Four rules that are easy to get quietly wrong
+//! # Five rules that are easy to get quietly wrong
 //!
 //! **A position is replaced, not accumulated.** A holding row states a quantity
 //! as of a date; it is not a change to one. Adding rows up would double
@@ -48,6 +48,11 @@
 //! the only evidence that something was held. Guessing at the instrument would
 //! be worse. So it is kept, it updates no position, and [`positions`] hands it
 //! back beside the positions so the gap is visible where the holdings are.
+//!
+//! **What was not reported stays unreported.** A market value, a settle-date
+//! quantity or a margin figure the venue did not give is absent, never zero:
+//! zero is a thing a venue can say, and a store that wrote it for silence
+//! would put words in the custodian's mouth.
 //!
 //! **No floating point, anywhere.** A quantity is an integer with its own scale
 //! on the wire and a `numeric` in the store, and an amount is that with its
@@ -86,5 +91,6 @@ pub use positions::list_positions;
 pub use postgres::PostgresStore;
 pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
-    Completion, Counts, CustodialPosition, Holding, Opened, Settled, Statement, Store, StoreError,
+    Completion, Counts, CustodialPosition, Figures, Holding, Key, Opened, Settled, Side, Statement,
+    Store, StoreError,
 };

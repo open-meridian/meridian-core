@@ -8,13 +8,15 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    ExternalAccountLink, MissingInstrumentDetectedEvent, PluginConfiguration,
-    PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest, SyncStatusEvent,
+    ExternalAccountLink, ExternalAccountsEvent, MissingInstrumentDetectedEvent,
+    PluginConfiguration, PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest,
+    SyncState, SyncStatusEvent,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Decimal, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
-    ReportMissingInstrumentParams, ReportSyncStatusParams,
+    Decimal, ExternalAccount, HoldingSide, Identifier, Money, RecordHoldingParams,
+    RecordHoldingsStatementParams, ReportExternalAccountsParams, ReportMissingInstrumentParams,
+    ReportSyncStatusParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{CallerAssertion, CallerClaims, RegisterRequest, TagAccess};
@@ -34,6 +36,7 @@ fn contract() -> Contract {
          platform.street.command.record-holding\tcommand\tcustody\tstreet\n\
          platform.reference.event.instrument-missing\tevent\tcustody\tinstrument\n\
          platform.custody.*.event.sync-status\tevent\tcustody\tdashboard\n\
+         platform.custody.*.event.external-accounts\tevent\tcustody\tdashboard\n\
          platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n\
          platform.street.command.record-statement\tcommand\tcustody\tstreet\n",
         "name\tkind\ncustody\trole\nstreet\tcomponent\nsidecar\tcomponent\n",
@@ -156,6 +159,10 @@ fn holding(external: &str) -> RecordHoldingParams {
             currency_code: "USD".into(),
         }),
         external_account_id: external.into(),
+        side: HoldingSide::Long as i32,
+        settle_date_quantity: None,
+        currency_assumed: false,
+        also_counted_in_cash: false,
         acting_for: None,
     }
 }
@@ -339,6 +346,144 @@ async fn a_sync_status_is_published_as_this_instance_and_its_account() {
     let delivery = delivered(&mut listening).await;
     let event = SyncStatusEvent::decode(&delivery.envelope.payload[..]).unwrap();
     assert_eq!(event.account_id, "ACC-1");
+}
+
+#[tokio::test]
+async fn an_unlinked_accounts_sync_status_is_published_and_its_holdings_are_still_refused() {
+    // Ruled 2026-09-28: a sync status describes the connection, not data
+    // recorded against the account, so it reaches the dashboard before a
+    // link, with no account. Nothing is recorded against the account, and a
+    // holding from it is refused exactly as before.
+    let (sidecar, bus, recorded) = registered(&["custody"]).await;
+    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.sync-status");
+    sidecar
+        .report_sync_status(Request::new(ReportSyncStatusParams {
+            source: "snaptrade".into(),
+            external_account_id: "ext-nobody-linked".into(),
+            state: SyncState::HoldingsUnavailable as i32,
+            ..Default::default()
+        }))
+        .await
+        .expect("published though nobody linked it");
+    let event =
+        SyncStatusEvent::decode(&delivered(&mut listening).await.envelope.payload[..]).unwrap();
+    assert_eq!(event.account_id, "", "attributed to no account");
+    assert_eq!(event.external_account_id, "ext-nobody-linked");
+    assert_eq!(event.state, SyncState::HoldingsUnavailable as i32);
+    assert!(
+        sidecar.unlinked_now().is_none(),
+        "a sync status refused nothing, so nothing is counted"
+    );
+
+    let refused = sidecar
+        .record_holding(Request::new(holding("ext-nobody-linked")))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_sync_status_carries_why_and_how_fresh_as_the_plugin_said() {
+    let (sidecar, bus, _) = registered(&["custody"]).await;
+    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.sync-status");
+    sidecar
+        .report_sync_status(Request::new(ReportSyncStatusParams {
+            source: "snaptrade".into(),
+            external_account_id: "ext-1".into(),
+            state: SyncState::NeedsSignIn as i32,
+            holdings_as_of_ns: 1_757_289_600_000_000_000,
+            history_as_of_ns: 1_757_203_200_000_000_000,
+            ..Default::default()
+        }))
+        .await
+        .expect("published");
+    let event =
+        SyncStatusEvent::decode(&delivered(&mut listening).await.envelope.payload[..]).unwrap();
+    assert_eq!(event.state, SyncState::NeedsSignIn as i32);
+    assert_eq!(event.holdings_as_of_ns, 1_757_289_600_000_000_000);
+    assert_eq!(event.history_as_of_ns, 1_757_203_200_000_000_000);
+}
+
+#[tokio::test]
+async fn the_accounts_a_connection_reaches_are_published_as_this_instance_unlinked_or_not() {
+    // W2.8: before anything is recorded, so nothing is refused for want of a
+    // link. The instance is the topic's, which is the one a link names.
+    let (sidecar, bus, _) = registered(&["custody"]).await;
+    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.external-accounts");
+    sidecar
+        .report_external_accounts(Request::new(ReportExternalAccountsParams {
+            accounts: vec![
+                ExternalAccount {
+                    external_account_id: "ext-1".into(),
+                    name: "Individual Brokerage 1234".into(),
+                    venue_account_type: "Individual".into(),
+                },
+                ExternalAccount {
+                    external_account_id: "ext-nobody-linked".into(),
+                    name: "Roth IRA 5678".into(),
+                    venue_account_type: "Roth IRA".into(),
+                },
+            ],
+        }))
+        .await
+        .expect("published, though one of them has no link");
+    let event =
+        ExternalAccountsEvent::decode(&delivered(&mut listening).await.envelope.payload[..])
+            .unwrap();
+    let reported: Vec<&str> = event
+        .accounts
+        .iter()
+        .map(|account| account.external_account_id.as_str())
+        .collect();
+    assert_eq!(reported, ["ext-1", "ext-nobody-linked"]);
+    assert_eq!(event.accounts[1].venue_account_type, "Roth IRA");
+    assert!(
+        sidecar.unlinked_now().is_none(),
+        "reporting an account is not bringing data for it"
+    );
+}
+
+#[tokio::test]
+async fn a_settle_date_quantity_past_the_wire_is_refused_naming_it() {
+    let (sidecar, _, recorded) = registered(&["custody"]).await;
+    let mut too_fine = holding("ext-1");
+    too_fine.settle_date_quantity = Some(Decimal {
+        high: 0,
+        low: 1,
+        scale: 19,
+    });
+    let refused = sidecar
+        .record_holding(Request::new(too_fine))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .starts_with("settle_date_quantity has 19 decimal places"),
+        "{}",
+        refused.message()
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_holding_with_no_market_value_reaches_the_street_store_without_one() {
+    // SnapTrade and Kalshi report none; unset is carried as unset, never as
+    // a zero in some currency.
+    let (sidecar, _, recorded) = registered(&["custody"]).await;
+    let mut unvalued = holding("ext-1");
+    unvalued.market_value = None;
+    unvalued.side = HoldingSide::Short as i32;
+    unvalued.quantity = Some(wire("-15.25"));
+    sidecar
+        .record_holding(Request::new(unvalued))
+        .await
+        .expect("recorded");
+    let rows = recorded.lock().unwrap();
+    assert!(rows[0].market_value.is_none());
+    assert_eq!(rows[0].side, HoldingSide::Short as i32);
 }
 
 #[tokio::test]

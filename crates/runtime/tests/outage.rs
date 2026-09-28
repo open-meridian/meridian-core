@@ -13,7 +13,7 @@ use meridian_domain::v1::{
 };
 use meridian_instrument::{apply, resolve_identifier, PostgresStore};
 use meridian_street::amounts::{Money, Quantity};
-use meridian_street::store::{Holding, Settled, Statement, Store as _};
+use meridian_street::store::{Holding, Settled, Side, Statement, Store as _};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {
@@ -150,6 +150,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
             as_of_date: "2026-09-28".into(),
             read_at_ns: stamp,
             expected_rows: 1,
+            figures: Default::default(),
         })
         .unwrap();
 
@@ -162,8 +163,12 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
                 account_id: account.clone(),
                 instrument_id: Some(placeholder.clone()),
                 unresolved_identifiers: vec![],
+                side: Side::Long,
                 quantity: "5".parse::<Quantity>().unwrap(),
-                market_value: Money::new(Default::default(), "USD"),
+                settle_date_quantity: None,
+                market_value: Some(Money::new(Default::default(), "USD")),
+                currency_assumed: false,
+                also_counted_in_cash: false,
                 escalated: false,
             },
             now_ns(),
@@ -172,7 +177,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
 
     assert!(matches!(settled, Settled::Changed { .. }), "{settled:?}");
     assert!(street
-        .custodial_position(&account, &placeholder)
+        .custodial_position(&account, &placeholder, Side::Long)
         .unwrap()
         .is_some());
 }

@@ -324,7 +324,14 @@ async fn admin_page(
         Err(_) => String::new(),
     };
     let holders = app.terminals.holders(app.clock.now_ns());
-    let body = overview::render(&records, &holders, &token_input(&session), &notice);
+    let custody = app.custody.view();
+    let body = overview::render(
+        &records,
+        &holders,
+        &custody,
+        &token_input(&session),
+        &notice,
+    );
     Html(page("Administer", &body)).into_response()
 }
 

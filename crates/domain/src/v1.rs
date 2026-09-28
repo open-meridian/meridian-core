@@ -1108,6 +1108,11 @@ pub struct AccessRecords {
     /// When the store answered. The dashboard refuses once this is 10 minutes old.
     #[prost(int64, tag = "7")]
     pub read_at_ns: i64,
+    /// Every external account linked to an account (W6.4), so the dashboard can
+    /// show the links and tell which of the accounts a connector reports have
+    /// none. Only the conductor and each plugin's own sidecar knew them before.
+    #[prost(message, repeated, tag = "8")]
+    pub links: ::prost::alloc::vec::Vec<ExternalAccountLink>,
 }
 /// The only thing holdings are recorded against. A plugin never creates one.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2425,8 +2430,12 @@ impl MissReason {
 }
 /// How fresh a connected account's data is, as reported by the rail.
 ///
-/// Published so an operator can tell stale data from absent data. Those look
-/// identical on a holdings screen and mean completely different things.
+/// And why, when it is not current. Published so an operator can tell stale
+/// data from absent data, which look identical on a holdings screen and mean
+/// completely different things. And "unhealthy" alone cannot say whose fix it
+/// is: a connection that needs a person to sign in again, one somebody
+/// disabled, and one that is a day late by design look the same as a flag and
+/// ask for three different things.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SyncStatusEvent {
     #[prost(string, tag = "1")]
@@ -2436,14 +2445,16 @@ pub struct SyncStatusEvent {
     #[prost(string, tag = "2")]
     pub account_id: ::prost::alloc::string::String,
     /// When the rail last successfully synced this account from the institution.
+    /// Not when the data is as of: a venue a day late by design syncs today what
+    /// was true yesterday, which the two fields below say.
     #[prost(int64, tag = "3")]
     pub last_synced_at_ns: i64,
     /// Whether the rail currently considers the connection healthy. A false here
     /// with a recent last_synced_at_ns means the data is good but the connection
-    /// has since broken.
+    /// has since broken. `state` says why.
     #[prost(bool, tag = "4")]
     pub connection_healthy: bool,
-    /// Rail-supplied text when the connection is unhealthy. Diagnostic only;
+    /// Rail-supplied text, for whatever `state` does not say. Diagnostic only;
     /// nothing branches on it.
     #[prost(string, tag = "5")]
     pub status_detail: ::prost::alloc::string::String,
@@ -2452,8 +2463,25 @@ pub struct SyncStatusEvent {
     /// The account as the rail knows it, which the sidecar translates.
     #[prost(string, tag = "7")]
     pub external_account_id: ::prost::alloc::string::String,
+    /// Whether the data is current, and if not, why: which is also whose fix it
+    /// is and what the dashboard tells a deployment admin to do.
+    #[prost(enumeration = "SyncState", tag = "8")]
+    pub state: i32,
+    /// When the holdings the rail serves are as of, and when the history
+    /// (transactions) is. Separately, because venues keep them apart and a
+    /// connection can have one current and the other not: SnapTrade reports
+    /// holdings to the minute and transactions by the day. Zero where the rail
+    /// does not say.
+    #[prost(int64, tag = "9")]
+    pub holdings_as_of_ns: i64,
+    #[prost(int64, tag = "10")]
+    pub history_as_of_ns: i64,
 }
-/// Open one statement: one read of one rail, at one moment.
+/// Open one statement: the connector's snapshot of one account, at one moment.
+///
+/// A statement is the connector's, not the venue's: none of the eight venues
+/// surveyed has a statement of its own, and every one gives a live snapshot.
+/// So the connector reads an account, and what it read is a statement.
 ///
 /// Two dates, and they are not the same thing. `as_of_date` is the date the
 /// positions reflect. `read_at_ns` is when the connector fetched them. A
@@ -2464,8 +2492,9 @@ pub struct RecordHoldingsStatementRequest {
     /// The rail namespace, e.g. "snaptrade".
     #[prost(string, tag = "1")]
     pub source: ::prost::alloc::string::String,
-    /// The rail's own identifier for this statement, where it has one. Used to
-    /// recognise a redelivery of the same statement.
+    /// The connector's identifier for this snapshot, made from the account it
+    /// read and the time it read it, so the same read sent twice has the same
+    /// one. Used to recognise a redelivery of the same statement.
     #[prost(string, tag = "2")]
     pub external_statement_id: ::prost::alloc::string::String,
     /// ISO 8601 date the positions are as of.
@@ -2485,6 +2514,21 @@ pub struct RecordHoldingsStatementRequest {
     /// knows this without reading anything twice.
     #[prost(int32, tag = "5")]
     pub expected_rows: i32,
+    /// The account's buying power and margin figures, as the venue reported
+    /// them, and unset where it reported none. Never derived: a figure computed
+    /// here from the holdings would be ours presented as the custodian's, and
+    /// margin is where that difference costs money.
+    #[prost(message, optional, tag = "6")]
+    pub buying_power: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "7")]
+    pub margin_requirement: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "8")]
+    pub maintenance_excess: ::core::option::Option<Money>,
+    /// True when the venue stated no currency for these figures and the
+    /// connector's is its own stated assumption (E*TRADE's balances carry none),
+    /// rather than something the venue said.
+    #[prost(bool, tag = "9")]
+    pub currency_assumed: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordHoldingsStatementReply {
@@ -2496,7 +2540,7 @@ pub struct RecordHoldingsStatementReply {
     #[prost(bool, tag = "2")]
     pub already_recorded: bool,
 }
-/// One holding, for one account, at one instrument.
+/// One holding, for one account, at one instrument, on one side.
 ///
 /// Either `instrument_id` is set, meaning the connector resolved it (to an
 /// instrument, or to the deployment's LCL- placeholder when nothing matched),
@@ -2504,6 +2548,11 @@ pub struct RecordHoldingsStatementReply {
 /// both, and never neither. A row that could not be resolved is still recorded, because a
 /// dropped holding is invisible and an operator comparing against their
 /// brokerage would find a silent discrepancy with nothing to investigate.
+///
+/// Cash is a holding like any other: of the currency's cash instrument, which
+/// the identifier scheme `iso4217` names ({scheme: iso4217, value: USD}), its
+/// quantity the cash the venue reports in that currency. A crypto asset held as
+/// cash, such as USDC at Coinbase, is a holding of that asset's instrument.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordHoldingRequest {
     #[prost(string, tag = "1")]
@@ -2517,12 +2566,15 @@ pub struct RecordHoldingRequest {
     /// exactly what could not be accounted for.
     #[prost(message, repeated, tag = "4")]
     pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
-    /// Signed: negative is a short position.
+    /// The trade-date quantity: what is held counting every trade executed,
+    /// settled or not. Required. Signed to match `side`: negative is short.
     #[prost(message, optional, tag = "9")]
     pub quantity: ::core::option::Option<Decimal>,
     /// The rail's valuation of the holding, in its currency. Recorded as
     /// reported, not recomputed: this is the custodian's belief, and rederiving it
-    /// would discard the thing that makes a later comparison meaningful.
+    /// would discard the thing that makes a later comparison meaningful. Unset
+    /// where the venue reported none (SnapTrade and Kalshi do not), which is not
+    /// a value of zero.
     #[prost(message, optional, tag = "10")]
     pub market_value: ::core::option::Option<Money>,
     /// The account as the rail knows it. The connector sets this and leaves
@@ -2532,6 +2584,32 @@ pub struct RecordHoldingRequest {
     /// unlinked, and the next statement after it is linked records it (W2).
     #[prost(string, tag = "8")]
     pub external_account_id: ::prost::alloc::string::String,
+    /// Long or short, stated rather than read off the sign, and the quantity's
+    /// sign matches it. A venue that reports an account's long and short of one
+    /// instrument apart (Schwab) sends two rows, one on each side; one that
+    /// reports a signed number (E*TRADE, Kalshi) sends the side its sign means.
+    /// A Kalshi NO position is a short row of the market's one contract.
+    #[prost(enumeration = "HoldingSide", tag = "11")]
+    pub side: i32,
+    /// The settle-date quantity: what is held counting only settled trades,
+    /// where the venue reports it, and unset where it does not. For cash, the
+    /// settled cash.
+    #[prost(message, optional, tag = "12")]
+    pub settle_date_quantity: ::core::option::Option<Decimal>,
+    /// True when the venue stated no currency and the one here is the
+    /// connector's stated assumption (E*TRADE, Schwab and Public state none),
+    /// rather than something the venue said: the market value's currency, and
+    /// for cash the currency whose cash instrument the row names. A
+    /// pseudo-currency such as Interactive Brokers' BASE is never one.
+    #[prost(bool, tag = "13")]
+    pub currency_assumed: bool,
+    /// This position's value is also included in the account's cash holding as
+    /// the venue reports it: SnapTrade counts a money-market fund in cash and
+    /// lists it as a position too. The street store keeps both as reported; a
+    /// reader counting the account once counts the fund as a position and
+    /// deducts it from cash.
+    #[prost(bool, tag = "14")]
+    pub also_counted_in_cash: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordHoldingReply {
@@ -2578,7 +2656,9 @@ pub struct CustodialPositionUpdatedEvent {
     #[prost(message, optional, tag = "4")]
     pub previous_quantity: ::core::option::Option<Decimal>,
 }
-/// What the custodian says an account holds of an instrument, right now.
+/// What the custodian says an account holds of an instrument, on one side,
+/// right now. Keyed by all three: an account may hold an instrument long and
+/// short at once, as a venue reporting them apart says.
 ///
 /// Custodial, and named so deliberately. This is the custodian's belief, arrived
 /// at by reading their statements; it is not what the deployment calculates from
@@ -2596,8 +2676,10 @@ pub struct CustodialPosition {
     /// which the INS- ID replaces when it arrives (W3.9).
     #[prost(string, tag = "2")]
     pub instrument_id: ::prost::alloc::string::String,
+    /// The trade-date quantity, signed to match `side`.
     #[prost(message, optional, tag = "9")]
     pub quantity: ::core::option::Option<Decimal>,
+    /// Unset where the custodian reported no value, which is not zero.
     #[prost(message, optional, tag = "10")]
     pub market_value: ::core::option::Option<Money>,
     /// The statement this was last stated by, and when. One not restated recently
@@ -2608,6 +2690,15 @@ pub struct CustodialPosition {
     pub as_of_date: ::prost::alloc::string::String,
     #[prost(int64, tag = "8")]
     pub updated_at_ns: i64,
+    #[prost(enumeration = "HoldingSide", tag = "11")]
+    pub side: i32,
+    /// The settle-date quantity, where the custodian reported one.
+    #[prost(message, optional, tag = "12")]
+    pub settle_date_quantity: ::core::option::Option<Decimal>,
+    /// This position's value is also included in the account's cash holding as
+    /// the custodian reports it; both are kept as reported.
+    #[prost(bool, tag = "13")]
+    pub also_counted_in_cash: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListCustodialPositionsRequest {
@@ -2621,6 +2712,9 @@ pub struct ListCustodialPositionsRequest {
     pub include_unresolved: bool,
     #[prost(int32, tag = "3")]
     pub page_size: i32,
+    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
+    /// Unresolved holdings come with the first page only, so a read across
+    /// pages sees each once.
     #[prost(string, tag = "4")]
     pub cursor: ::prost::alloc::string::String,
 }
@@ -2643,8 +2737,10 @@ pub struct UnresolvedHolding {
     pub account_id: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]
     pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// Signed, as the row stated it: negative is a short row.
     #[prost(message, optional, tag = "10")]
     pub quantity: ::core::option::Option<Decimal>,
+    /// Unset where the custodian reported no value.
     #[prost(message, optional, tag = "11")]
     pub market_value: ::core::option::Option<Money>,
     #[prost(string, tag = "7")]
@@ -2656,6 +2752,136 @@ pub struct UnresolvedHolding {
     /// administrator".
     #[prost(bool, tag = "9")]
     pub escalated: bool,
+}
+/// Every external account a connection reaches, as the connector sees it now.
+///
+/// Published before anything is recorded against any of them, so linking one
+/// (W6.4) is a choice among the accounts on offer rather than a guess made
+/// after a statement was refused for want of a link: one SnapTrade connection
+/// can reach several brokerage accounts, and an administrator links the ones
+/// they mean. The whole list each time, so an account missing from it is one
+/// the connection no longer reaches.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalAccountsEvent {
+    #[prost(message, repeated, tag = "1")]
+    pub accounts: ::prost::alloc::vec::Vec<ExternalAccount>,
+}
+/// One account a connection reaches, as the custodian presents it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalAccount {
+    /// Stable: the connector makes it so where the venue does not, and it is the
+    /// `external_account_id` the account's rows name. SnapTrade's changes on
+    /// reconnect unless its `institution_account_id` is used; Kalshi's is a
+    /// subaccount and a matching engine joined. A handle the venue wants on each
+    /// call (E*TRADE's accountIdKey, Schwab's hash) stays inside the plugin.
+    #[prost(string, tag = "1")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// The custodian's own name for it, as a person there would recognise it.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// The venue's own word for the kind of account, verbatim and for display
+    /// only. Nothing reads meaning into it: what an account may do is the
+    /// platform's restriction set, in the platform's words, which each plugin
+    /// maps its venue's types onto when that set is ruled.
+    #[prost(string, tag = "3")]
+    pub venue_account_type: ::prost::alloc::string::String,
+}
+/// Why a connection's data is, or is not, current.
+///
+/// The venues surveyed fail in exactly these ways (reference/broker-apis.md),
+/// and each asks something different of a person, which is the point of
+/// naming them rather than leaving them to a flag and free text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SyncState {
+    /// Not said: a connector written before this was. Shown as what
+    /// connection_healthy says.
+    Unspecified = 0,
+    /// Current. Nothing to do.
+    Current = 1,
+    /// Still serving, but older than it should be: holdings_as_of_ns says since
+    /// when. Usually the rail's to recover; nothing to do but wait.
+    Stale = 2,
+    /// A person must sign in again at the venue before it serves anything new:
+    /// E*TRADE and Interactive Brokers daily, Schwab weekly, Interactive Brokers
+    /// also when connected but signed out.
+    NeedsSignIn = 3,
+    /// The connection is disabled and serves only what it last read, as
+    /// SnapTrade does. Somebody re-enables it.
+    Disabled = 4,
+    /// Late on purpose, as Interactive Brokers through SnapTrade is by a business
+    /// day. Expected; nothing to do.
+    DelayedByDesign = 5,
+    /// The venue does not provide holdings through this connection, as some
+    /// brokerages hide them from SnapTrade (its `holdings_unavailable`). Waiting
+    /// changes nothing: holdings will not arrive this way, so the account is
+    /// connected another way or through another venue.
+    HoldingsUnavailable = 6,
+}
+impl SyncState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SYNC_STATE_UNSPECIFIED",
+            Self::Current => "SYNC_STATE_CURRENT",
+            Self::Stale => "SYNC_STATE_STALE",
+            Self::NeedsSignIn => "SYNC_STATE_NEEDS_SIGN_IN",
+            Self::Disabled => "SYNC_STATE_DISABLED",
+            Self::DelayedByDesign => "SYNC_STATE_DELAYED_BY_DESIGN",
+            Self::HoldingsUnavailable => "SYNC_STATE_HOLDINGS_UNAVAILABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SYNC_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SYNC_STATE_CURRENT" => Some(Self::Current),
+            "SYNC_STATE_STALE" => Some(Self::Stale),
+            "SYNC_STATE_NEEDS_SIGN_IN" => Some(Self::NeedsSignIn),
+            "SYNC_STATE_DISABLED" => Some(Self::Disabled),
+            "SYNC_STATE_DELAYED_BY_DESIGN" => Some(Self::DelayedByDesign),
+            "SYNC_STATE_HOLDINGS_UNAVAILABLE" => Some(Self::HoldingsUnavailable),
+            _ => None,
+        }
+    }
+}
+/// Which side of an instrument a holding or a custodial position is on.
+///
+/// A side of its own rather than the sign alone, because a venue can report
+/// both sides of one instrument at once, and two rows keyed by account and
+/// instrument alone would overwrite each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HoldingSide {
+    /// Not said. Refused by the street store: a holding says which side it is on.
+    Unspecified = 0,
+    Long = 1,
+    Short = 2,
+}
+impl HoldingSide {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HOLDING_SIDE_UNSPECIFIED",
+            Self::Long => "HOLDING_SIDE_LONG",
+            Self::Short => "HOLDING_SIDE_SHORT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HOLDING_SIDE_UNSPECIFIED" => Some(Self::Unspecified),
+            "HOLDING_SIDE_LONG" => Some(Self::Long),
+            "HOLDING_SIDE_SHORT" => Some(Self::Short),
+            _ => None,
+        }
+    }
 }
 /// What a plugin says about itself, from `\[tool.meridian\]` in its
 /// pyproject.toml. Declarations for an administrator to approve, not grants.

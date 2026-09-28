@@ -1,3 +1,17 @@
-INS-interop-eighteen-decimals|100000000000.000000000000000001|41230.50|USD
-INS-interop-hundred-billion|100000000000|41230.50|USD
-INS-interop-ninth-decimal|0.000000001|41230.50|USD
+INS-interop-cash-cad|long|250.00||
+INS-interop-cash-usd|long|1520.35|1020.35|
+INS-interop-eighteen-decimals|long|100000000000.000000000000000001||41230.50 USD
+INS-interop-etrade-tsla|short|-100||-18250.00 USD
+INS-interop-hundred-billion|long|100000000000||41230.50 USD
+INS-interop-kalshi-rain|short|-15.25||
+INS-interop-ninth-decimal|long|0.000000001||41230.50 USD
+INS-interop-schwab-msft|long|200|200|84000.00 USD
+INS-interop-schwab-msft|short|-50|-50|-21000.00 USD
+INS-interop-snaptrade-spaxx|long|500||500.00 USD
+INS-interop-snaptrade-vti|long|12.5|10|
+assumed|INS-interop-etrade-tsla|short
+in-cash|INS-interop-snaptrade-spaxx|long
+statement|interop-etrade|41250.00 USD|18250.00 USD|23000.00 USD|true
+statement|interop-kalshi||||false
+statement|interop-schwab||||false
+statement|interop-snaptrade|25000.00 USD|||false

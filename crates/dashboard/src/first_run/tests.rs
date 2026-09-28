@@ -164,6 +164,7 @@ fn app_with(
         secure_cookies: true,
         plugins: None,
         registry: None,
+        custody: Arc::default(),
     })
 }
 
