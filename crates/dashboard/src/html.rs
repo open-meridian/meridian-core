@@ -25,13 +25,13 @@ pub fn escape(text: &str) -> String {
 /// platform's public page's, so a deployment reads as the same product as
 /// the site it was set up from: cool greys, an indigo accent, a navy bar.
 const STYLE: &str = "\
-:root{--ink:#0e1330;--ink-soft:#4a5277;--ink-faint:#8a90ad;--page:#f5f6fb;--card:#fff;--line:#e3e6f0;\
+:root{--ink:#0e1330;--ink-soft:#4a5277;--ink-faint:#676e93;--page:#f5f6fb;--card:#fff;--line:#e3e6f0;\
 --line-soft:#eef0f6;--hover:#eef0fa;--accent:#4353f0;--accent-wash:#eceeff;--accent-ink:#fff;\
---danger:#d23345;--danger-wash:#fdecee;--good:#13805f;--good-wash:#e3f6ef;--warn-ink:#8a5a10;\
+--danger:#cb2d3f;--danger-wash:#fdecee;--good:#127c5c;--good-wash:#e3f6ef;--warn-ink:#8a5a10;\
 --warn-wash:#fdf3e0;--radius:10px;--shadow:0 1px 2px rgba(14,19,48,.04),0 8px 24px rgba(14,19,48,.06);\
 --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--navy-900:#070b24;--navy-800:#0b1233;\
 --navy-line:rgba(160,176,255,.14);--navy-ink:#e9ecff;--navy-soft:#a9b1d9;--mark:#9aa6ff}\
-@media (prefers-color-scheme:dark){:root{--ink:#e9ecff;--ink-soft:#a9b1d9;--ink-faint:#6f78a8;\
+@media (prefers-color-scheme:dark){:root{--ink:#e9ecff;--ink-soft:#a9b1d9;--ink-faint:#7a82af;\
 --page:#0a0f2c;--card:#10173d;--line:#222c5a;--line-soft:#1a2350;--hover:#18214d;--accent:#8f9bff;\
 --accent-wash:#1c2562;--accent-ink:#0a0f2c;--danger:#ff8a95;--danger-wash:#3a1a26;--good:#5fdcb0;\
 --good-wash:#12352c;--warn-ink:#f2c46b;--warn-wash:#33291a;--shadow:none}}\
@@ -73,7 +73,7 @@ cursor:pointer;margin:.5rem .5rem 0 0}\
 button:hover{background:var(--hover)}\
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}\
 button.primary:hover{filter:brightness(1.1)}\
-@media (prefers-color-scheme:dark){button.primary{background:#5b6cff;border-color:#5b6cff;color:#fff}}button:disabled{opacity:.5;cursor:not-allowed}\
+@media (prefers-color-scheme:dark){button.primary{background:#4e61ff;border-color:#4e61ff;color:#fff}}button:disabled{opacity:.5;cursor:not-allowed}\
 button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
 .hint{color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
 .refused,.warn,.passed,ul.refusal{border-radius:var(--radius);padding:.65rem .9rem;margin:.75rem 0;font-size:.93rem}\
