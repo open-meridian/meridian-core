@@ -1,6 +1,6 @@
 # Installing a deployment
 
-Follow this from top to bottom. It ends with a running Meridian deployment
+Follow this from top to bottom. It ends with a running Open Meridian deployment
 that your firm's people sign in to, and it assumes you have not installed one
 before.
 
@@ -19,7 +19,7 @@ Budget half an hour.
 
 - A Kubernetes cluster, and `kubectl` already pointing at it. A laptop cluster
   (k3s, Rancher Desktop, kind, Docker Desktop) is fine for trying this.
-- `helm`, version 3.8 or newer. Older ones cannot install from a registry.
+- `helm`, version 3.12 or newer; `meridian doctor` checks.
 - The `meridian` CLI, on macOS or Linux:
 
   ```bash
@@ -27,9 +27,10 @@ Budget half an hour.
   ```
 
   It drives your own `helm` and `kubectl`, and prints each command it runs.
-- An account on the platform, in an organisation, holding **owner** or
-  **admin**. If you have neither, whoever owns the organisation can give you
-  one; nothing else on this page will work without it.
+- An account on the platform, in a project, holding **owner** or **admin**.
+  Signing up and creating a project is free and needs no company; in somebody
+  else's project, whoever owns it can make you an admin. Nothing else on this
+  page will work without it.
 
 You do **not** need to prepare a key or create a Secret. The deployment makes
 its own key, and the set-up wizard writes its own Secrets. If an older
@@ -57,7 +58,7 @@ Each is easier to make before you install than after.
 
 | | Use this when | What you are agreeing to |
 |---|---|---|
-| **One this deployment brings** | Trying the product, or developing against it | It is started in your cluster, and its roles and passwords are made for you. It survives Meridian being removed and installed again. It is lost with the cluster, and **nobody backs it up** |
+| **One this deployment brings** | Trying the product, or developing against it | It is started in your cluster, and its roles and passwords are made for you. It survives Open Meridian being removed and installed again. It is lost with the cluster, and **nobody backs it up** |
 | **One you already run** | Anything you depend on | Your own Postgres, one in Docker, or a managed one from your cloud. You create two roles first — see below — and both are tested before anything is written |
 
 If you are pointing at a database you run, make it two roles before you go on.
@@ -101,12 +102,12 @@ can leave until the wizard — nothing about it is passed at install.
 | **Your LDAP** | The deployment binds to it directly: it forwards a password once, stores none, and reads each person's groups from your directory |
 | **Neither** | The deployment holds the accounts itself, with hashed passwords and a lockout. For a firm with no directory of its own |
 
-Nothing of Meridian's signs people in as a separate service, so there is no
+Nothing of Open Meridian's signs people in as a separate service, so there is no
 identity server to size, version, back up or upgrade.
 
 ## 1. Register the deployment
 
-On the platform: sign in, open your organisation, then **Deployments**, then
+On the platform: sign in, open your project, then **Deployments**, then
 **Register deployment**. Give it a name you will recognise a year from now —
 `production`, `uat` — and register it.
 
@@ -222,7 +223,9 @@ enrolled with a code that reached them.
 
 ## 5. Issue a first-run code
 
-On the platform, on the same deployment: **Issue first-run code**.
+On the platform, on the same deployment: **Issue first-run code**. It is
+offered once the deployment shows **Connected**, which the enrolment in step 4
+brings about.
 
 Single use, one day. It is what opens the wizard. It is separate from the
 enrolment code because enrolling is a machine proving what it is, and this is a
@@ -259,7 +262,7 @@ Five steps, one at a time: **Database**, **Signing in**, **Administrators**,
 shown at the step it is about.
 
 **Database.** Choose the route you decided on. *Start one inside this cluster*
-asks you for nothing further. *Use a database you already run* wants the host,
+asks you for nothing further. *Use a Postgres you already run* wants the host,
 port, database name, TLS mode, and the two roles with their passwords.
 
 **Signing in.** Choose one of the three, and answer only that part.
@@ -282,11 +285,11 @@ port, database name, TLS mode, and the two roles with their passwords.
   and password of the one account this deployment then holds.
 
 **If you are using your own provider, it must return `auth_time`.** This is
-the one thing about your provider that Meridian requires and that not every
+the one thing about your provider that Open Meridian requires and that not every
 provider does by default. It is what makes withdrawn access actually go away:
 a provider with its own session can hand out a token without asking the person
 anything, carrying groups your directory has since removed, and `auth_time` is
-the only thing that says when they really authenticated. Meridian asks for it
+the only thing that says when they really authenticated. Open Meridian asks for it
 correctly, with `max_age=0` and `prompt=login`, which obliges a provider to
 answer under the OpenID Connect specification.
 
@@ -296,7 +299,7 @@ reads like a problem with your directory:
 | Provider | What you need to do |
 |---|---|
 | **Microsoft Entra ID** | **Add `auth_time` as an optional claim** on the app registration — Token configuration, add optional claim, ID token, `auth_time`. Entra does not send it otherwise |
-| **Okta** | Nothing. It is sent automatically when `prompt=login` or `max_age=0` is asked for, which Meridian does |
+| **Okta** | Nothing. It is sent automatically when `prompt=login` or `max_age=0` is asked for, which Open Meridian does |
 | **Ping** | Check. Their documentation does not say either way; sign in once and look at the token |
 | **dex** | Not usable. It does not implement `auth_time`, and the request to add it has been open since 2017 |
 
@@ -313,7 +316,8 @@ empty.
 **Spell the group exactly.** It is not checked and cannot be: a directory
 states a person's groups when they sign in, and it is not asked to list them.
 A group that does not exist is a deployment nobody can administer, and getting back in then
-means a claim code from the platform.
+means a first-admin code from the platform (**Issue first-admin code**),
+redeemed at the dashboard's `/claim` by somebody signed in.
 
 **Address.** Where a browser reaches this deployment: the Ingress's name,
 which the wizard offers when there is one. This is the address your staff will
@@ -353,8 +357,8 @@ password; the `meridian` CLI's README goes on from there.
 | The wizard asks for an enrolment code, not a first-run code | The conductor could not enrol — usually a code already spent or expired | Issue a fresh enrolment code and enter it on that page. Nothing needs reinstalling |
 | The fingerprints differ | Somebody else spent your enrolment code | Revoke that key on the platform, issue a new code, re-enrol. Do not continue |
 | "this deployment is retired" | It was taken out of service on the platform | Return it to service there. Codes are refused while it is retired |
-| "already enrolled" when issuing an enrolment code | It holds a key already | If the cluster still has it, register the new key signed in through the deployment's keys. If you deleted the namespace, see **Starting over** below |
-| "this deployment is retired" | It was taken out of service on the platform | Return it to service there |
+| "already enrolled" when issuing an enrolment code | It holds a key already | If the cluster still has it, it is enrolled and needs no code; to give it another key, use **Add a key** on the deployment, signed in. If you deleted the namespace, see **Starting over** below |
+| The only administrator of an account-holding deployment lost their password | Nobody else can sign in to reset it | On the platform, an owner or admin of the project uses **Issue password-reset code**. At the deployment's sign-in page, **Lost your password?** takes the code, the login and a new password |
 | The wizard's database test names a missing grant | Your roles need it | Run the statement it names, then test again |
 | "the directory did not say when this person authenticated" | Your provider returned no `auth_time` | See the table in step 7. On Entra, add it as an optional claim on the app registration; nothing in the deployment needs changing |
 | `street`, `instrument` or `migrate` still in error **after** applying | They may not have retried yet | Give them two minutes. If they persist, read the message: a key named there that is still missing means the apply did not write the database Secret |
