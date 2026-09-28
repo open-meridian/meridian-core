@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://open-meridian.dev
+    about: How to install Open Meridian, build a plugin, and the API reference.

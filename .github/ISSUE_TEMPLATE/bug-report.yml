@@ -1,0 +1,28 @@
+name: Report a bug
+description: Something does not work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The steps, and any command output or error. Please describe rather than paste code.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "`meridian --version`, and the chart or SDK version if you know it."
+  - type: checkboxes
+    id: licence
+    attributes:
+      label: Your suggestion
+      options:
+        - label: I give Societal Lab Inc. a perpetual, irrevocable, worldwide, royalty-free licence to use what I've written here for any purpose, as CONTRIBUTING.md says.
+          required: true

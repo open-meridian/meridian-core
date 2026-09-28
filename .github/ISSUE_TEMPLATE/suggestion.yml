@@ -1,0 +1,23 @@
+name: Suggest an improvement
+description: An idea, a missing feature, or something that could be better.
+labels: [suggestion]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would solve it
+      description: How you'd like it to work. Please describe rather than paste code.
+  - type: checkboxes
+    id: licence
+    attributes:
+      label: Your suggestion
+      options:
+        - label: I give Societal Lab Inc. a perpetual, irrevocable, worldwide, royalty-free licence to use what I've written here for any purpose, as CONTRIBUTING.md says.
+          required: true

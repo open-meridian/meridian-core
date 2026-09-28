@@ -1,0 +1,29 @@
+# Open Meridian is built by its team, and takes outside ideas as issues
+# (CONTRIBUTING.md). A pull request from outside the organisation is thanked,
+# pointed at issues, and closed, so nobody's work waits on a review that will
+# not come. Its code is never checked out or run here.
+
+name: outside-pull-requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: >-
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Thank, point at issues, and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" --body "Thank you for this. Open Meridian is built by its team, so we don't merge pull requests from outside it. Please open an issue describing the problem or the idea instead -- we build every change ourselves, from your description. See CONTRIBUTING.md."
+          gh pr close "$PR" --repo "$REPO"
