@@ -76,6 +76,24 @@ impl Store for MemoryStore {
             .get(&(account_id.to_string(), instrument_id.to_string()))
             .cloned())
     }
+
+    fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>> {
+        Ok(self.write()?.move_positions(replaced_id, instrument_id))
+    }
+
+    fn placeholder_instruments(&self) -> Result<Vec<String>> {
+        let held = self.read()?;
+        let mut placeholders: Vec<String> = held
+            .positions
+            .keys()
+            .map(|(_, instrument_id)| instrument_id)
+            .filter(|instrument_id| instrument_id.starts_with(crate::ids::PLACEHOLDER_PREFIX))
+            .cloned()
+            .collect();
+        placeholders.sort();
+        placeholders.dedup();
+        Ok(placeholders)
+    }
 }
 
 /// The street store's contents, and every rule about them.
@@ -215,6 +233,60 @@ impl Held {
         })
     }
 
+    pub(crate) fn move_positions(
+        &mut self,
+        replaced_id: &str,
+        instrument_id: &str,
+    ) -> Vec<Settled> {
+        let mut accounts: Vec<String> = self
+            .positions
+            .keys()
+            .filter(|(_, held)| held == replaced_id)
+            .map(|(account_id, _)| account_id.clone())
+            .collect();
+        accounts.sort();
+
+        let mut settled = Vec::new();
+        for account_id in accounts {
+            let Some(placeholder) = self
+                .positions
+                .remove(&(account_id.clone(), replaced_id.to_string()))
+            else {
+                continue;
+            };
+            let moved = CustodialPosition {
+                instrument_id: instrument_id.to_string(),
+                ..placeholder
+            };
+            let key = (account_id, instrument_id.to_string());
+
+            match self.positions.get(&key).cloned() {
+                None => {
+                    self.positions.insert(key, moved.clone());
+                    settled.push(Settled::Changed {
+                        position: moved,
+                        previous_quantity: Quantity::ZERO,
+                    });
+                }
+                Some(standing) if moved.stated_later_than(&standing) => {
+                    self.positions.insert(key, moved.clone());
+                    settled.push(if moved.differs_from(&standing) {
+                        Settled::Changed {
+                            position: moved,
+                            previous_quantity: standing.quantity,
+                        }
+                    } else {
+                        Settled::Unchanged { position: moved }
+                    });
+                }
+                // The one already under the instrument was stated later, so it
+                // stands and the placeholder's is gone.
+                Some(_) => {}
+            }
+        }
+        settled
+    }
+
     pub(crate) fn counts(&self, statement_id: &str) -> Result<Counts> {
         if !self.statements.contains_key(statement_id) {
             return Err(StoreError::UnknownStatement(statement_id.to_string()));
@@ -288,5 +360,52 @@ impl Held {
             unresolved,
             next_cursor,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::amounts::Money;
+
+    #[test]
+    fn a_placeholders_holding_rows_keep_the_placeholder_when_its_positions_move() {
+        // The rows record what was reported, and what was reported named the
+        // placeholder.
+        let store = MemoryStore::new();
+        let (statement, _, _) = store
+            .open(Statement {
+                statement_id: "STMT-1".into(),
+                source: "snaptrade".into(),
+                external_statement_id: "st-1".into(),
+                as_of_date: "2026-09-08".into(),
+                read_at_ns: 1,
+                expected_rows: 1,
+            })
+            .unwrap();
+        store
+            .record(
+                Holding {
+                    holding_id: "HLD-1".into(),
+                    statement_id: statement.statement_id,
+                    account_id: "ACC-1".into(),
+                    instrument_id: Some("LCL-1".into()),
+                    unresolved_identifiers: vec![],
+                    quantity: Quantity::from_scaled(1),
+                    market_value: Money::from_scaled(1),
+                    currency: "USD".into(),
+                    escalated: false,
+                },
+                1,
+            )
+            .unwrap();
+
+        store.move_positions("LCL-1", "INS-1").unwrap();
+
+        let held = store.read().unwrap();
+        assert_eq!(held.holdings[0].instrument_id.as_deref(), Some("LCL-1"));
+        assert!(held
+            .positions
+            .contains_key(&("ACC-1".to_string(), "INS-1".to_string())));
     }
 }

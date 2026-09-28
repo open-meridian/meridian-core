@@ -445,6 +445,151 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
         .unwrap();
 }
 
+// ── A placeholder replaced (W3.9) ──────────────────────────────────────────
+
+/// A statement as of `as_of_date`, holding `quantity` of `instrument_id` in
+/// `account`.
+fn stated(
+    store: &PostgresStore,
+    account: &str,
+    as_of_date: &str,
+    instrument_id: &str,
+    quantity: i64,
+) -> Holding {
+    let statement = Statement {
+        statement_id: unique("STMT"),
+        source: "snaptrade".into(),
+        external_statement_id: unique("st"),
+        as_of_date: as_of_date.into(),
+        read_at_ns: NOW,
+        expected_rows: 1_000,
+    };
+    let statement = store.open(statement).unwrap().0;
+
+    let mut holding = resolved(&statement, instrument_id);
+    holding.account_id = account.to_string();
+    holding.quantity = Quantity::from_scaled(quantity);
+    store.record(holding.clone(), NOW).unwrap();
+    holding
+}
+
+#[test]
+fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
+    let store = store();
+    let account = unique("ACC");
+    let placeholder = format!("LCL-{}", unique("p"));
+    let instrument = unique("INS");
+    let holding = stated(&store, &account, "2026-09-08", &placeholder, 500_000_000);
+    assert!(store
+        .placeholder_instruments()
+        .unwrap()
+        .contains(&placeholder));
+
+    let settled = store.move_positions(&placeholder, &instrument).unwrap();
+    match settled.as_slice() {
+        [Settled::Changed {
+            position,
+            previous_quantity,
+        }] => {
+            assert_eq!(position.instrument_id, instrument);
+            assert_eq!(position.quantity.scaled(), 500_000_000);
+            assert_eq!(*previous_quantity, Quantity::ZERO);
+        }
+        other => panic!("expected one moved position, got {other:?}"),
+    }
+
+    assert!(store
+        .custodial_position(&account, &placeholder)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .custodial_position(&account, &instrument)
+            .unwrap()
+            .unwrap()
+            .as_of_date,
+        "2026-09-08"
+    );
+
+    // The row records what was reported, and what was reported named the
+    // placeholder.
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    let recorded: Option<String> = client
+        .query_one(
+            "SELECT instrument_id FROM holding WHERE holding_id = $1",
+            &[&holding.holding_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded.as_deref(), Some(placeholder.as_str()));
+
+    // Nothing is left for the sweep to ask about.
+    assert!(!store
+        .placeholder_instruments()
+        .unwrap()
+        .contains(&placeholder));
+
+    // And hearing it again moves nothing.
+    assert!(store
+        .move_positions(&placeholder, &instrument)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn where_both_are_held_a_later_placeholder_statement_stands() {
+    let store = store();
+    let account = unique("ACC");
+    let placeholder = format!("LCL-{}", unique("p"));
+    let instrument = unique("INS");
+    stated(&store, &account, "2026-09-08", &instrument, 200_000_000);
+    stated(&store, &account, "2026-09-09", &placeholder, 500_000_000);
+
+    let settled = store.move_positions(&placeholder, &instrument).unwrap();
+    match settled.as_slice() {
+        [Settled::Changed {
+            previous_quantity, ..
+        }] => assert_eq!(previous_quantity.scaled(), 200_000_000),
+        other => panic!("expected the placeholder's to stand, got {other:?}"),
+    }
+
+    let standing = store
+        .custodial_position(&account, &instrument)
+        .unwrap()
+        .unwrap();
+    assert_eq!(standing.quantity.scaled(), 500_000_000);
+    assert_eq!(standing.as_of_date, "2026-09-09");
+    assert!(store
+        .custodial_position(&account, &placeholder)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn where_both_are_held_a_later_instrument_statement_stands() {
+    let store = store();
+    let account = unique("ACC");
+    let placeholder = format!("LCL-{}", unique("p"));
+    let instrument = unique("INS");
+    stated(&store, &account, "2026-09-08", &placeholder, 500_000_000);
+    stated(&store, &account, "2026-09-09", &instrument, 200_000_000);
+
+    assert!(store
+        .move_positions(&placeholder, &instrument)
+        .unwrap()
+        .is_empty());
+
+    let standing = store
+        .custodial_position(&account, &instrument)
+        .unwrap()
+        .unwrap();
+    assert_eq!(standing.quantity.scaled(), 200_000_000);
+    assert!(store
+        .custodial_position(&account, &placeholder)
+        .unwrap()
+        .is_none());
+}
+
 // ── The migration history ───────────────────────────────────────────────────
 //
 // Each of these owns a schema of its own, because they are about the state of

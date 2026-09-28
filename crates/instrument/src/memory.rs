@@ -1,13 +1,17 @@
 //! The in-process store.
 //!
-//! Not a placeholder for a first milestone. A deployment watching one brokerage
+//! Not a stand-in for a first milestone. A deployment watching one brokerage
 //! account holds a handful of instruments, and the instrument store is rebuilt from the
 //! platform on demand, so durability buys less here than it does in the street store.
-//! Postgres arrives behind the same trait when compose does.
+//! Its placeholders are the exception, being the deployment's own (see
+//! `migrations/0002_placeholder.sql`), which is one reason a deployment runs
+//! Postgres behind the same trait rather than this.
 
 use std::sync::RwLock;
 
-use crate::store::{Applied, Held, Instrument, Result, Store, StoreError};
+use crate::store::{
+    Applied, Held, Instrument, Placeholder, Replaced, Result, Stood, Store, StoreError,
+};
 
 /// The instrument store, held in memory.
 #[derive(Debug, Default)]
@@ -63,11 +67,40 @@ impl Store for MemoryStore {
     fn count(&self) -> Result<usize> {
         Ok(self.read()?.by_id.len())
     }
+
+    fn stand_in(&self, candidate: Placeholder) -> Result<(Placeholder, Stood)> {
+        Ok(self.write()?.stand_in(candidate))
+    }
+
+    fn placeholder(&self, placeholder_id: &str) -> Result<Option<Placeholder>> {
+        Ok(self.read()?.placeholders.get(placeholder_id).cloned())
+    }
+
+    fn outstanding(&self) -> Result<Vec<Placeholder>> {
+        Ok(self.read()?.outstanding())
+    }
+
+    fn legacy_outstanding(&self) -> Result<Vec<Instrument>> {
+        Ok(self.read()?.legacy_outstanding())
+    }
+
+    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced> {
+        Ok(self.write()?.replace(replaced_id, replaced_by, now_ns))
+    }
+
+    fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .read()?
+            .replacements
+            .get(instrument_id)
+            .map(|(replaced_by, _)| replaced_by.clone()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Asked, IdentifierSet};
 
     fn instrument(version: i64) -> Instrument {
         Instrument {
@@ -179,6 +212,110 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn asked(scheme: &str, value: &str, source: &str) -> Asked {
+        Asked {
+            scheme: scheme.into(),
+            value: value.into(),
+            source: source.into(),
+        }
+    }
+
+    fn candidate(identifiers: Vec<Asked>) -> Placeholder {
+        Placeholder {
+            placeholder_id: crate::ids::placeholder(100),
+            identifiers: IdentifierSet::new(identifiers),
+            source: "snaptrade".into(),
+            asset_class: String::new(),
+            as_of_ns: 100,
+            minted_at_ns: 100,
+        }
+    }
+
+    #[test]
+    fn one_set_in_any_order_is_one_placeholder() {
+        // A connector describing one holding in a different order is still
+        // describing one holding, and two placeholders for it would be two
+        // positions for one security.
+        let store = MemoryStore::new();
+        let (first, stood) = store
+            .stand_in(candidate(vec![
+                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("figi", "BBG000ZZTOP1", ""),
+            ]))
+            .unwrap();
+        assert_eq!(stood, Stood::Minted);
+
+        let (again, stood) = store
+            .stand_in(candidate(vec![
+                asked("figi", "BBG000ZZTOP1", ""),
+                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("figi", "BBG000ZZTOP1", ""),
+            ]))
+            .unwrap();
+        assert_eq!(stood, Stood::AlreadyHeld);
+        assert_eq!(again.placeholder_id, first.placeholder_id);
+        assert_eq!(store.outstanding().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_replaced_placeholder_is_no_longer_outstanding_and_is_kept() {
+        let store = MemoryStore::new();
+        let (held, _) = store
+            .stand_in(candidate(vec![asked("symbol", "ZZTOP", "snaptrade")]))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .replace(&held.placeholder_id, "INS-ZZTOP", 200)
+                .unwrap(),
+            Replaced::Recorded
+        );
+        assert!(store.outstanding().unwrap().is_empty());
+
+        // Never deleted: what a holding was recorded against stays readable.
+        assert!(store.placeholder(&held.placeholder_id).unwrap().is_some());
+        assert_eq!(
+            store
+                .replacement_of(&held.placeholder_id)
+                .unwrap()
+                .as_deref(),
+            Some("INS-ZZTOP")
+        );
+    }
+
+    #[test]
+    fn a_second_replacement_changes_nothing() {
+        let store = MemoryStore::new();
+        store.replace("LCL-1", "INS-1", 200).unwrap();
+
+        assert_eq!(
+            store.replace("LCL-1", "INS-2", 300).unwrap(),
+            Replaced::AlreadyRecorded {
+                replaced_by: "INS-1".into()
+            }
+        );
+        assert_eq!(
+            store.replacement_of("LCL-1").unwrap().as_deref(),
+            Some("INS-1")
+        );
+    }
+
+    #[test]
+    fn a_legacy_lcl_instrument_is_outstanding_until_replaced() {
+        let store = MemoryStore::new();
+        let mut legacy = instrument(1);
+        legacy.instrument_id = "LCL-LEGACY".into();
+        store.apply(legacy).unwrap();
+        store.apply(instrument(1)).unwrap();
+
+        let outstanding = store.legacy_outstanding().unwrap();
+        assert_eq!(outstanding.len(), 1, "an INS- instrument is not legacy");
+        assert_eq!(outstanding[0].instrument_id, "LCL-LEGACY");
+
+        store.replace("LCL-LEGACY", "INS-1", 200).unwrap();
+        assert!(store.legacy_outstanding().unwrap().is_empty());
     }
 
     #[test]

@@ -1,9 +1,23 @@
 //! Answering instrument questions from what the instrument store holds.
 //!
-//! Three steps live here. W3.1 turns a set of identifiers into one instrument
-//! or into a miss. W3.6 turns an instrument identifier into its record, so a
-//! holding can be shown with a name. W3.2 turns a miss into a fact published on
-//! the bus, which is where this crate's obligation ends.
+//! Three steps live here. W3.1 turns a set of identifiers into one instrument,
+//! into the deployment's placeholder for the set, or into a miss. W3.6 turns an
+//! instrument identifier into its record, so a holding can be shown with a
+//! name. W3.2 turns a miss into a fact published on the bus, which is where
+//! this crate's obligation ends.
+//!
+//! # Nothing matched is answered; more than one is not
+//!
+//! A set that matched nothing is answered with its placeholder (W3.7), minted
+//! the first time the set is asked about and the same one every time after, so
+//! the holding can be recorded and counted at once. An ambiguous set is not: a
+//! placeholder would have to stand for one of the matches, which is the pick
+//! ambiguity refuses. See [`crate::placeholder`].
+//!
+//! Every answer is what the ID has become. A placeholder since replaced
+//! answers its `INS-` ID, and so does a legacy `LCL-` instrument, which is
+//! also why a resolve that matches both a replaced ID and its replacement
+//! meets one instrument and not two.
 //!
 //! # Identity is the answer; a ticker is an attribute
 //!
@@ -48,13 +62,36 @@ use meridian_domain::v1::{
 use meridian_symbology::rank;
 
 use crate::apply::to_wire;
-use crate::store::{Instrument, Result, Store};
+use crate::ids;
+use crate::placeholder::{current, record_of};
+use crate::store::{Asked, IdentifierSet, Instrument, Placeholder, Result, Stood, Store};
 
-/// W3.1 — which instrument this identifier set meant, on that date.
+/// What a resolve answered, and what it minted to answer it.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub reply: ResolveIdentifierReply,
+
+    /// The placeholder this resolve minted, which the caller announces (W3.7).
+    /// `None` when it answered an instrument, a placeholder already held, or a
+    /// miss, so a placeholder is announced as minted once and only once.
+    pub minted: Option<Placeholder>,
+}
+
+/// W3.1 — which instrument this identifier set meant, on that date; or, when
+/// nothing did, the deployment's placeholder for the set (W3.7).
+///
+/// `now_ns` is when a placeholder minted here is minted, passed in so a test
+/// controls time.
 pub fn resolve_identifier(
     store: &dyn Store,
     request: &ResolveIdentifierRequest,
-) -> Result<ResolveIdentifierReply> {
+    now_ns: i64,
+) -> Result<Resolution> {
+    let answered = |reply| Resolution {
+        reply,
+        minted: None,
+    };
+
     let mut tiers: Vec<usize> = request.identifiers.iter().map(rank).collect();
     tiers.sort_unstable();
     tiers.dedup();
@@ -74,24 +111,87 @@ pub fn resolve_identifier(
                 if !qualifies(&instrument, identifier, request) {
                     continue;
                 }
+                // What it has become, before counting. A legacy LCL- record and
+                // the INS- record that replaced it both carry the identifiers,
+                // and they are one instrument.
+                let instrument_id = current(store, &instrument.instrument_id)?;
+
                 // Two identifiers reaching the same instrument agree; they do
                 // not compete. That holds only because an instrument identifier
                 // is never reused, so equality of the key is equality of the
                 // thing.
-                if !candidates.contains(&instrument.instrument_id) {
-                    candidates.push(instrument.instrument_id);
+                if !candidates.contains(&instrument_id) {
+                    candidates.push(instrument_id);
                 }
             }
         }
 
         match candidates.len() {
             0 => continue,
-            1 => return Ok(resolved(candidates.remove(0))),
-            _ => return Ok(missed(MissReason::Ambiguous)),
+            1 => return Ok(answered(resolved(candidates.remove(0)))),
+            _ => return Ok(answered(missed(MissReason::Ambiguous))),
         }
     }
 
-    Ok(missed(MissReason::NotFound))
+    stand_in(store, request, now_ns)
+}
+
+/// W3.7 — nothing matched, so answer the set's placeholder, minting it if this
+/// is the first time the set has been asked about.
+///
+/// An empty request is still a miss. A placeholder for no identifiers would
+/// stand for nothing, and every empty request would meet it.
+fn stand_in(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    now_ns: i64,
+) -> Result<Resolution> {
+    let identifiers = IdentifierSet::new(request.identifiers.iter().map(|identifier| Asked {
+        scheme: identifier.scheme.clone(),
+        value: identifier.value.clone(),
+        source: identifier.source.clone(),
+    }));
+    if identifiers.is_empty() {
+        return Ok(Resolution {
+            reply: missed(MissReason::NotFound),
+            minted: None,
+        });
+    }
+
+    let (placeholder, stood) = store.stand_in(Placeholder {
+        placeholder_id: ids::placeholder(now_ns),
+        identifiers,
+        source: source_of(request).to_string(),
+        asset_class: String::new(),
+        as_of_ns: request.as_of_ns,
+        minted_at_ns: now_ns,
+    })?;
+
+    // Replaced, so the set has an identity now even though nothing held
+    // carries these identifiers: the platform may have paired the placeholder
+    // with an instrument it knows by others.
+    if stood == Stood::AlreadyHeld {
+        let became = current(store, &placeholder.placeholder_id)?;
+        if became != placeholder.placeholder_id {
+            return Ok(Resolution {
+                reply: resolved(became),
+                minted: None,
+            });
+        }
+    }
+
+    Ok(Resolution {
+        reply: ResolveIdentifierReply {
+            found: true,
+            instrument_id: placeholder.placeholder_id.clone(),
+            miss_reason: MissReason::Unspecified as i32,
+            placeholder: true,
+        },
+        minted: match stood {
+            Stood::Minted => Some(placeholder),
+            Stood::AlreadyHeld => None,
+        },
+    })
 }
 
 /// W3.6 — the record behind an instrument identifier.
@@ -101,15 +201,25 @@ pub fn resolve_identifier(
 /// true then, and the instrument store holds one version, so the answer here is the
 /// version held whatever the as-of. Stale attributes on a stable identity, and
 /// the same gap `design/replica-holds-one-version` covers.
+///
+/// A replaced ID answers its replacement's record, whose `instrument_id` is
+/// not the one asked about: that difference is how a reader holding a
+/// placeholder learns what it became. A placeholder not yet replaced answers a
+/// record for itself, in DEFINE at version 0 (see [`record_of`]).
 pub fn resolve_instrument(
     store: &dyn Store,
     request: &ResolveInstrumentRequest,
 ) -> Result<ResolveInstrumentReply> {
-    let held = store.by_id(&request.instrument_id)?;
+    let became = current(store, &request.instrument_id)?;
+
+    let record = match store.by_id(&became)? {
+        Some(held) => Some(to_wire(&held)),
+        None => store.placeholder(&became)?.as_ref().map(record_of),
+    };
 
     Ok(ResolveInstrumentReply {
-        found: held.is_some(),
-        instrument: held.as_ref().map(to_wire),
+        found: record.is_some(),
+        instrument: record,
     })
 }
 
@@ -210,6 +320,17 @@ mod tests {
     /// Long before it, so a mapping is comfortably in force.
     const EFFECTIVE: i64 = 1_700_000_000_000_000_000;
 
+    /// When a placeholder minted by these tests is minted.
+    const NOW: i64 = 1_757_376_000_000_000_000;
+
+    /// W3.1's answer alone, for the tests that are about the answer.
+    fn resolve(
+        store: &dyn Store,
+        request: &ResolveIdentifierRequest,
+    ) -> Result<ResolveIdentifierReply> {
+        resolve_identifier(store, request, NOW).map(|resolution| resolution.reply)
+    }
+
     fn held(scheme: &str, value: &str, source: &str, valid_from_ns: i64) -> Identifier {
         Identifier {
             scheme: scheme.into(),
@@ -267,7 +388,7 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
@@ -298,7 +419,7 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![
                 asked("symbol", "AAPL", "snaptrade"),
@@ -320,7 +441,7 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
@@ -333,18 +454,143 @@ mod tests {
     }
 
     #[test]
-    fn nothing_matched_is_a_miss_that_says_so() {
+    fn nothing_matched_is_answered_with_a_placeholder_minted_once() {
+        // The fixture's first case. The holding has a name at once, and the
+        // same name every time the set is asked about.
+        let store = MemoryStore::new();
+        let asking = request(vec![asked("symbol", "ZZTOP", "snaptrade")]);
+
+        let first = resolve_identifier(&store, &asking, NOW).unwrap();
+        assert!(first.reply.found);
+        assert!(first.reply.placeholder);
+        assert!(first.reply.instrument_id.starts_with("LCL-"));
+        let minted = first.minted.expect("the first resolve mints");
+        assert_eq!(minted.placeholder_id, first.reply.instrument_id);
+        assert_eq!(minted.source, "snaptrade");
+        assert_eq!(minted.as_of_ns, AS_OF);
+
+        let again = resolve_identifier(&store, &asking, NOW + 1).unwrap();
+        assert_eq!(again.reply.instrument_id, first.reply.instrument_id);
+        assert!(again.reply.placeholder);
+        assert!(again.minted.is_none(), "announced as minted twice");
+    }
+
+    #[test]
+    fn the_same_set_in_another_order_meets_the_same_placeholder() {
         let store = MemoryStore::new();
 
-        let reply = resolve_identifier(
+        let first = resolve(
+            &store,
+            &request(vec![
+                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("figi", "BBG000ZZTOP1", ""),
+            ]),
+        )
+        .unwrap();
+        let reordered = resolve(
+            &store,
+            &request(vec![
+                asked("figi", "BBG000ZZTOP1", ""),
+                asked("symbol", "ZZTOP", "snaptrade"),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(reordered.instrument_id, first.instrument_id);
+        assert_eq!(store.outstanding().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_different_set_is_a_different_placeholder() {
+        let store = MemoryStore::new();
+
+        let one = resolve(
             &store,
             &request(vec![asked("symbol", "ZZTOP", "snaptrade")]),
         )
         .unwrap();
+        let other = resolve(
+            &store,
+            &request(vec![
+                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("figi", "BBG000ZZTOP1", ""),
+            ]),
+        )
+        .unwrap();
 
-        assert!(!reply.found);
-        assert!(reply.instrument_id.is_empty());
-        assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
+        assert_ne!(one.instrument_id, other.instrument_id);
+    }
+
+    #[test]
+    fn ambiguity_mints_no_placeholder() {
+        // A placeholder would have to stand for one of the matches, which is
+        // the pick ambiguity refuses.
+        let store = MemoryStore::new();
+        for instrument_id in ["INS-ONE", "INS-TWO"] {
+            store
+                .apply(instrument(
+                    instrument_id,
+                    vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
+                ))
+                .unwrap();
+        }
+
+        let resolution = resolve_identifier(
+            &store,
+            &request(vec![asked("symbol", "AAPL", "snaptrade")]),
+            NOW,
+        )
+        .unwrap();
+
+        assert!(!resolution.reply.found);
+        assert!(!resolution.reply.placeholder);
+        assert!(resolution.minted.is_none());
+        assert!(store.outstanding().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_replaced_placeholder_answers_its_instrument() {
+        // The platform paired it with an instrument it knows by other
+        // identifiers, so nothing held carries these. The set answers the INS-
+        // ID all the same, and says it is not a placeholder.
+        let store = MemoryStore::new();
+        let asking = request(vec![asked("symbol", "ZZTOP", "snaptrade")]);
+        let placeholder = resolve(&store, &asking).unwrap().instrument_id;
+
+        store
+            .apply(instrument(
+                "INS-ZZTOP",
+                vec![held("figi", "BBG000ZZTOP1", "", EFFECTIVE)],
+            ))
+            .unwrap();
+        store.replace(&placeholder, "INS-ZZTOP", NOW).unwrap();
+
+        let reply = resolve(&store, &asking).unwrap();
+        assert!(reply.found);
+        assert!(!reply.placeholder);
+        assert_eq!(reply.instrument_id, "INS-ZZTOP");
+    }
+
+    #[test]
+    fn a_legacy_record_and_its_replacement_are_one_match_and_not_two() {
+        // The legacy path. The platform minted LCL- before it minted only INS-,
+        // and moved it to INS- keeping the identifiers, so both rows carry
+        // them. Counted as two, the set would turn ambiguous the moment its
+        // identity arrived.
+        let store = MemoryStore::new();
+        for instrument_id in ["LCL-LEGACY", "INS-MOVED"] {
+            store
+                .apply(instrument(
+                    instrument_id,
+                    vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
+                ))
+                .unwrap();
+        }
+        store.replace("LCL-LEGACY", "INS-MOVED", NOW).unwrap();
+
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
+        assert!(reply.found);
+        assert_eq!(reply.instrument_id, "INS-MOVED");
     }
 
     #[test]
@@ -360,9 +606,7 @@ mod tests {
                 .unwrap();
         }
 
-        let reply =
-            resolve_identifier(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")]))
-                .unwrap();
+        let reply = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")])).unwrap();
 
         assert!(!reply.found);
         assert!(reply.instrument_id.is_empty());
@@ -390,7 +634,7 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
@@ -418,7 +662,7 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
@@ -449,9 +693,7 @@ mod tests {
         elsewhere.currency = "EUR".into();
         store.apply(elsewhere).unwrap();
 
-        let reply =
-            resolve_identifier(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")]))
-                .unwrap();
+        let reply = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")])).unwrap();
 
         assert_eq!(reply.instrument_id, "INS-NASDAQ");
     }
@@ -468,8 +710,7 @@ mod tests {
         listed_elsewhere.exchange_mic = "XETR".into();
         store.apply(listed_elsewhere).unwrap();
 
-        let reply =
-            resolve_identifier(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
 
         assert_eq!(reply.instrument_id, "INS-XETRA");
     }
@@ -484,10 +725,11 @@ mod tests {
             ))
             .unwrap();
 
-        let reply =
-            resolve_identifier(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
 
-        assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
+        // Nothing matched then, so the set's placeholder, and not INS-ONE.
+        assert!(reply.placeholder, "{reply:?}");
+        assert_ne!(reply.instrument_id, "INS-ONE");
     }
 
     #[test]
@@ -497,8 +739,9 @@ mod tests {
         // holds the ticker now.
         //
         // The instrument store keeps one version, so the earlier mapping is simply gone
-        // and the honest answer is a miss. Recorded, with the alternatives, in
-        // design/replica-holds-one-version.
+        // and the honest answer is that nothing matched: the set's placeholder,
+        // which the platform can pair with the right instrument. Recorded, with
+        // the alternatives, in design/replica-holds-one-version.
         let store = MemoryStore::new();
         store
             .apply(instrument(
@@ -507,21 +750,20 @@ mod tests {
             ))
             .unwrap();
 
-        let reply = resolve_identifier(
+        let reply = resolve(
             &store,
             &request(vec![asked("symbol", "ZZTOP", "snaptrade")]),
         )
         .unwrap();
 
-        assert!(!reply.found);
+        assert!(reply.placeholder, "{reply:?}");
         assert_ne!(reply.instrument_id, "INS-NEW-HOLDER");
-        assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
     }
 
     #[test]
     fn a_request_carrying_no_identifiers_is_a_miss() {
         let store = MemoryStore::new();
-        let reply = resolve_identifier(&store, &request(vec![])).unwrap();
+        let reply = resolve(&store, &request(vec![])).unwrap();
 
         assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
     }
@@ -579,6 +821,75 @@ mod tests {
 
         assert!(reply.found);
         assert_eq!(reply.instrument.unwrap().instrument_id, "INS-ONE");
+    }
+
+    #[test]
+    fn a_placeholder_resolves_to_a_record_for_itself_until_it_is_replaced() {
+        let store = MemoryStore::new();
+        let placeholder = resolve(
+            &store,
+            &request(vec![
+                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("figi", "BBG000ZZTOP1", ""),
+            ]),
+        )
+        .unwrap()
+        .instrument_id;
+
+        let asking = ResolveInstrumentRequest {
+            instrument_id: placeholder.clone(),
+            as_of_ns: AS_OF,
+        };
+
+        let before = resolve_instrument(&store, &asking).unwrap();
+        assert!(before.found);
+        let record = before.instrument.unwrap();
+        assert_eq!(record.instrument_id, placeholder);
+        assert_eq!(record.identifiers.len(), 2);
+        assert_eq!(
+            record.lifecycle_state,
+            meridian_domain::v1::InstrumentLifecycleState::Define as i32
+        );
+        assert_eq!(record.version, 0);
+
+        // Then its identity arrives. Resolving the placeholder answers the
+        // replacement's record, which is how a reader holding it learns what
+        // it became.
+        store
+            .apply(instrument(
+                "INS-ZZTOP",
+                vec![held("figi", "BBG000ZZTOP1", "", EFFECTIVE)],
+            ))
+            .unwrap();
+        store.replace(&placeholder, "INS-ZZTOP", NOW).unwrap();
+
+        let after = resolve_instrument(&store, &asking).unwrap();
+        assert!(after.found);
+        assert_eq!(after.instrument.unwrap().instrument_id, "INS-ZZTOP");
+    }
+
+    #[test]
+    fn a_replaced_legacy_record_resolves_to_its_replacement() {
+        let store = MemoryStore::new();
+        for instrument_id in ["LCL-LEGACY", "INS-MOVED"] {
+            store
+                .apply(instrument(
+                    instrument_id,
+                    vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
+                ))
+                .unwrap();
+        }
+        store.replace("LCL-LEGACY", "INS-MOVED", NOW).unwrap();
+
+        let reply = resolve_instrument(
+            &store,
+            &ResolveInstrumentRequest {
+                instrument_id: "LCL-LEGACY".into(),
+                as_of_ns: AS_OF,
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-MOVED");
     }
 
     #[test]

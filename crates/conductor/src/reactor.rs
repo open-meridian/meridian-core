@@ -282,6 +282,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_published_record_names_the_placeholder_it_replaces() {
+        // W3.7 to W3.8: the instrument store announced a placeholder, and the
+        // record that answers it has to say which one, or nothing replaces it.
+        let bus = bus();
+        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
+
+        let mut announced = miss_event();
+        announced.placeholder_instrument_id = "LCL-01J8XQ4M7K0000000000ZZTP".into();
+        announced.publisher_instance_id = "instrument-1".into();
+
+        conductor(Arc::clone(&bus), transport)
+            .carry(delivery(
+                "meridian.v1.MissingInstrumentDetectedEvent",
+                announced.encode_to_vec(),
+            ))
+            .await;
+
+        let reply =
+            PullInstrumentReply::decode(&next(&mut pulled).await.envelope.payload[..]).unwrap();
+        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-ZZTOP");
+        assert_eq!(reply.replaces_instrument_id, "LCL-01J8XQ4M7K0000000000ZZTP");
+    }
+
+    #[tokio::test]
+    async fn a_miss_with_no_placeholder_replaces_nothing() {
+        let bus = bus();
+        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ZZTOP")))]);
+
+        conductor(Arc::clone(&bus), transport)
+            .carry(delivery(
+                "meridian.v1.MissingInstrumentDetectedEvent",
+                miss_event().encode_to_vec(),
+            ))
+            .await;
+
+        let reply =
+            PullInstrumentReply::decode(&next(&mut pulled).await.envelope.payload[..]).unwrap();
+        assert!(reply.replaces_instrument_id.is_empty());
+    }
+
+    #[tokio::test]
     async fn the_published_record_carries_the_miss_that_caused_it() {
         // Three processes, one chain. Without this the resolve that missed, the
         // pull that answered it and the apply that followed are three unrelated

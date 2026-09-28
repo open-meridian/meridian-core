@@ -32,11 +32,17 @@
 //! rule. What happens is that somebody adds a dependency for convenience and
 //! nothing objects.
 //!
-//! # Three rules that are easy to get quietly wrong
+//! # Four rules that are easy to get quietly wrong
 //!
 //! **A position is replaced, not accumulated.** A holding row states a quantity
 //! as of a date; it is not a change to one. Adding rows up would double
 //! anything that appeared in two statements, and the result looks plausible.
+//!
+//! **A placeholder's positions move; its rows do not.** A row may name the
+//! deployment's `LCL-` placeholder for identifiers nothing matched, and it is
+//! recorded resolved and moves a position like any other. When the platform's
+//! `INS-` ID replaces the placeholder, the positions move onto it (W3.9) and the
+//! rows keep the placeholder, because they record what was reported.
 //!
 //! **An unresolved row is recorded and moves nothing.** Dropping it would lose
 //! the only evidence that something was held. Guessing at the instrument would
@@ -76,7 +82,7 @@ pub use amounts::{Money, Quantity};
 pub use memory::MemoryStore;
 pub use positions::list_positions;
 pub use postgres::PostgresStore;
-pub use record::{open_statement, record_holding, Recorded};
+pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
     Completion, Counts, CustodialPosition, Holding, Opened, Settled, Statement, Store, StoreError,
 };

@@ -1,20 +1,24 @@
-//! Identifiers the street store mints.
+//! Identifiers the instrument store mints: placeholders, and nothing else.
 //!
 //! The same shape the platform mints: a prefix, forty-eight bits of
 //! milliseconds and eighty of randomness, in Crockford's base32. Written here
 //! in thirty lines rather than shared, because the alphabet and the layout are
 //! the whole of it and a shared crate between a public runtime and a private
-//! control plane is a dependency in the wrong direction.
+//! control plane is a dependency in the wrong direction. The street store
+//! keeps its own copy for the same reason.
 //!
 //! Time first, so identifiers sort by creation. A page of them reads in order
 //! and an index on them stays well behaved.
+//!
+//! Only `LCL-`. Identity is the platform's and is `INS-`; what this store may
+//! mint is a stand-in for an identifier set nothing matched (W3.7), and the
+//! prefix is what lets anybody reading one know it is waiting to be replaced.
 
 use rand::RngCore;
 
-/// What a placeholder's instrument ID begins with. Not minted here: the
-/// instrument store mints them, and a row may carry one until the platform's
-/// `INS-` ID replaces it (W3.7 to W3.9). Known here so the sweep can find the
-/// positions still held under one.
+/// What every placeholder begins with, and what an instrument ID the platform
+/// minted before it minted only `INS-` began with too. See
+/// [`crate::placeholder`] for why both are treated alike.
 pub const PLACEHOLDER_PREFIX: &str = "LCL-";
 
 /// No I, L, O or U, so an identifier read aloud or copied off a screen cannot
@@ -30,7 +34,7 @@ fn encode(mut value: u128, length: usize) -> String {
     String::from_utf8(out).expect("the alphabet is ascii")
 }
 
-pub fn mint(prefix: &str, now_ms: u64) -> String {
+fn mint(prefix: &str, now_ms: u64) -> String {
     let mut random = [0u8; 10];
     rand::rngs::OsRng.fill_bytes(&mut random);
 
@@ -44,12 +48,8 @@ pub fn mint(prefix: &str, now_ms: u64) -> String {
     )
 }
 
-pub fn statement(now_ns: i64) -> String {
-    mint("STMT", millis(now_ns))
-}
-
-pub fn holding(now_ns: i64) -> String {
-    mint("HLD", millis(now_ns))
+pub fn placeholder(now_ns: i64) -> String {
+    mint("LCL", millis(now_ns))
 }
 
 fn millis(now_ns: i64) -> u64 {
@@ -61,31 +61,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_identifier_has_the_shape_the_fixture_shows() {
-        let minted = statement(1_757_376_000_000_000_000);
-        assert!(minted.starts_with("STMT-"));
-        assert_eq!(minted.len(), "STMT-".len() + 26);
-        assert!(minted[5..].bytes().all(|b| ALPHABET.contains(&b)));
+    fn a_placeholder_has_the_shape_every_minted_identifier_has() {
+        // The prefix, then ten characters of time and sixteen of randomness.
+        // The fixtures' IDs are shorter and are illustrations, not mints.
+        let minted = placeholder(1_757_376_000_000_000_000);
+        assert!(minted.starts_with(PLACEHOLDER_PREFIX));
+        assert_eq!(minted.len(), PLACEHOLDER_PREFIX.len() + 26);
+        assert!(minted[4..].bytes().all(|b| ALPHABET.contains(&b)));
     }
 
     #[test]
-    fn identifiers_sort_by_when_they_were_minted() {
-        // A page of them reads in order, and an index on them stays tidy.
-        let earlier = statement(1_757_376_000_000_000_000);
-        let later = statement(1_757_376_001_000_000_000);
+    fn placeholders_sort_by_when_they_were_minted() {
+        let earlier = placeholder(1_757_376_000_000_000_000);
+        let later = placeholder(1_757_376_001_000_000_000);
         assert!(earlier < later);
     }
 
     #[test]
     fn two_minted_in_the_same_millisecond_are_still_different() {
         let now = 1_757_376_000_000_000_000;
-        assert_ne!(holding(now), holding(now));
-    }
-
-    #[test]
-    fn the_alphabet_excludes_what_a_person_would_misread() {
-        for confusable in [b'I', b'L', b'O', b'U'] {
-            assert!(!ALPHABET.contains(&confusable));
-        }
+        assert_ne!(placeholder(now), placeholder(now));
     }
 }

@@ -27,13 +27,26 @@ use postgres::types::ToSql;
 use postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
 
-use crate::store::{Applied, Identifier, Instrument, Result, Store, StoreError};
+use crate::store::{
+    Applied, Asked, Identifier, IdentifierSet, Instrument, Placeholder, Replaced, Result, Stood,
+    Store, StoreError,
+};
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 
-/// Applied on start. See the file for why there is no migration history.
-const SCHEMA: &str = include_str!("../migrations/0001_instrument.sql");
+/// Applied by `migrate`, in order. See the first file for why there is no
+/// migration history, and the second for why that stops being true of what it
+/// adds.
+const SCHEMA: &[&str] = &[
+    include_str!("../migrations/0001_instrument.sql"),
+    include_str!("../migrations/0002_placeholder.sql"),
+];
+
+/// A table the newest file makes. A database that has it has them all, so a
+/// start can check for this one and refuse a database an older release
+/// migrated, rather than failing later on the first placeholder.
+const NEWEST_TABLE: &str = "instrument_replacement";
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -59,9 +72,9 @@ impl PostgresStore {
 
     /// Create the schema if it is not there.
     ///
-    /// Idempotent, and safe to run from every instance on every start: a
-    /// instrument store holds nothing the platform cannot send again, so there is no
-    /// history to preserve and nothing to lose to a re-run.
+    /// Idempotent, and safe to run from every instance on every start: every
+    /// file is additions under `IF NOT EXISTS`, so a re-run finds nothing to
+    /// do and loses nothing.
     ///
     /// Under an advisory lock, because `IF NOT EXISTS` is not the concurrency
     /// answer it reads as. Two connections running this at the same moment race
@@ -87,8 +100,8 @@ impl PostgresStore {
         let present = conn
             .query_opt(
                 "SELECT 1 FROM information_schema.tables
-                  WHERE table_schema = current_schema() AND table_name = 'instrument'",
-                &[],
+                  WHERE table_schema = current_schema() AND table_name = $1",
+                &[&NEWEST_TABLE],
             )
             .map_err(unavailable)?
             .is_some();
@@ -97,8 +110,8 @@ impl PostgresStore {
             return Ok(());
         }
         Err(StoreError::Unavailable(
-            "the instrument store's database has no schema. Run `meridian-instrument migrate` \
-             before starting."
+            "the instrument store's database has no schema, or only what an older release \
+             made. Run `meridian-instrument migrate` before starting."
                 .into(),
         ))
     }
@@ -109,7 +122,9 @@ impl PostgresStore {
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
 
-        let created = conn.batch_execute(SCHEMA).map_err(unavailable);
+        let created = SCHEMA
+            .iter()
+            .try_for_each(|file| conn.batch_execute(file).map_err(unavailable));
 
         // Released whether or not the schema went in, so a failure does not
         // leave every other instance waiting on a lock nobody holds usefully.
@@ -183,6 +198,75 @@ impl PostgresStore {
         }
 
         Ok(instruments)
+    }
+
+    /// The placeholders with these IDs, in two queries, ordered by ID.
+    fn load_placeholders(conn: &mut Connection, ids: &[String]) -> Result<Vec<Placeholder>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = conn
+            .query(
+                "SELECT placeholder_id, source, asset_class, as_of_ns, minted_at_ns
+                   FROM instrument_placeholder
+                  WHERE placeholder_id = ANY($1)
+                  ORDER BY placeholder_id",
+                &[&ids],
+            )
+            .map_err(unavailable)?;
+
+        let members = conn
+            .query(
+                "SELECT placeholder_id, scheme, value, source
+                   FROM instrument_placeholder_identifier
+                  WHERE placeholder_id = ANY($1)",
+                &[&ids],
+            )
+            .map_err(unavailable)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let placeholder_id: String = row.get(0);
+                // Put back in canonical order by the set itself, rather than by
+                // an ORDER BY whose collation is the database's and may not be
+                // the byte order the key was written in.
+                let identifiers = IdentifierSet::new(
+                    members
+                        .iter()
+                        .filter(|member| member.get::<_, String>(0) == placeholder_id)
+                        .map(|member| Asked {
+                            scheme: member.get(1),
+                            value: member.get(2),
+                            source: member.get(3),
+                        }),
+                );
+                Placeholder {
+                    placeholder_id,
+                    identifiers,
+                    source: row.get(1),
+                    asset_class: row.get(2),
+                    as_of_ns: row.get(3),
+                    minted_at_ns: row.get(4),
+                }
+            })
+            .collect())
+    }
+
+    fn placeholder_by_key(conn: &mut Connection, key: &str) -> Result<Option<Placeholder>> {
+        let id: Option<String> = conn
+            .query_opt(
+                "SELECT placeholder_id FROM instrument_placeholder WHERE identifier_key = $1",
+                &[&key],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+
+        match id {
+            Some(id) => Ok(Self::load_placeholders(conn, &[id])?.into_iter().next()),
+            None => Ok(None),
+        }
     }
 }
 
@@ -316,6 +400,159 @@ impl Store for PostgresStore {
 
         let counted: i64 = row.get(0);
         Ok(counted.max(0) as usize)
+    }
+
+    fn stand_in(&self, candidate: Placeholder) -> Result<(Placeholder, Stood)> {
+        let mut conn = self.conn()?;
+        let key = candidate.identifiers.key();
+
+        // Read first, because the common case is a set asked about on every
+        // statement until its identity arrives, and that should be one read
+        // rather than a write that conflicts.
+        if let Some(held) = Self::placeholder_by_key(&mut conn, &key)? {
+            return Ok((held, Stood::AlreadyHeld));
+        }
+
+        let mut tx = conn.transaction().map_err(unavailable)?;
+
+        // The decision is the unique index's. Two resolves of one set racing
+        // here both reach this insert; the second waits on the first's key and
+        // then does nothing, and reads back what the first stored.
+        let inserted = tx
+            .execute(
+                "INSERT INTO instrument_placeholder
+                        (placeholder_id, identifier_key, source, asset_class, as_of_ns,
+                         minted_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (identifier_key) DO NOTHING",
+                &[
+                    &candidate.placeholder_id,
+                    &key,
+                    &candidate.source,
+                    &candidate.asset_class,
+                    &candidate.as_of_ns,
+                    &candidate.minted_at_ns,
+                ],
+            )
+            .map_err(unavailable)?
+            == 1;
+
+        if inserted {
+            // In the same transaction, so nobody reads a placeholder without
+            // the identifiers it stands for.
+            for member in candidate.identifiers.members() {
+                tx.execute(
+                    "INSERT INTO instrument_placeholder_identifier
+                            (placeholder_id, scheme, value, source)
+                     VALUES ($1, $2, $3, $4)",
+                    &[
+                        &candidate.placeholder_id,
+                        &member.scheme,
+                        &member.value,
+                        &member.source,
+                    ],
+                )
+                .map_err(unavailable)?;
+            }
+        }
+        tx.commit().map_err(unavailable)?;
+
+        if inserted {
+            return Ok((candidate, Stood::Minted));
+        }
+
+        let held = Self::placeholder_by_key(&mut conn, &key)?.ok_or_else(|| {
+            StoreError::Unavailable(
+                "a placeholder conflicted on its identifier set and then could not be read".into(),
+            )
+        })?;
+        Ok((held, Stood::AlreadyHeld))
+    }
+
+    fn placeholder(&self, placeholder_id: &str) -> Result<Option<Placeholder>> {
+        let mut conn = self.conn()?;
+        Ok(
+            Self::load_placeholders(&mut conn, &[placeholder_id.to_string()])?
+                .into_iter()
+                .next(),
+        )
+    }
+
+    fn outstanding(&self) -> Result<Vec<Placeholder>> {
+        let mut conn = self.conn()?;
+        let ids: Vec<String> = conn
+            .query(
+                "SELECT placeholder_id FROM instrument_placeholder placeholder
+                  WHERE NOT EXISTS (SELECT 1 FROM instrument_replacement replacement
+                                     WHERE replacement.replaced_id = placeholder.placeholder_id)",
+                &[],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+
+        Self::load_placeholders(&mut conn, &ids)
+    }
+
+    fn legacy_outstanding(&self) -> Result<Vec<Instrument>> {
+        let mut conn = self.conn()?;
+        let pattern = format!("{}%", crate::ids::PLACEHOLDER_PREFIX);
+        let ids: Vec<String> = conn
+            .query(
+                "SELECT instrument_id FROM instrument
+                  WHERE instrument_id LIKE $1
+                    AND NOT EXISTS (SELECT 1 FROM instrument_replacement replacement
+                                     WHERE replacement.replaced_id = instrument.instrument_id)",
+                &[&pattern],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+
+        Self::load(&mut conn, &ids)
+    }
+
+    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced> {
+        let mut conn = self.conn()?;
+
+        // Conditional, so a redelivery and a race both land on the first
+        // pairing: one statement, decided under the primary key.
+        let recorded = conn
+            .execute(
+                "INSERT INTO instrument_replacement (replaced_id, replaced_by, replaced_at_ns)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (replaced_id) DO NOTHING",
+                &[&replaced_id, &replaced_by, &now_ns],
+            )
+            .map_err(unavailable)?
+            == 1;
+
+        if recorded {
+            return Ok(Replaced::Recorded);
+        }
+
+        let held: String = conn
+            .query_one(
+                "SELECT replaced_by FROM instrument_replacement WHERE replaced_id = $1",
+                &[&replaced_id],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        Ok(Replaced::AlreadyRecorded { replaced_by: held })
+    }
+
+    fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT replaced_by FROM instrument_replacement WHERE replaced_id = $1",
+                &[&instrument_id],
+            )
+            .map_err(unavailable)?;
+
+        Ok(row.map(|row| row.get(0)))
     }
 }
 

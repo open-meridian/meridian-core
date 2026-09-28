@@ -12,6 +12,8 @@ use meridian_domain::v1::{
     Identifier as PbIdentifier, InstrumentRecord as PbInstrument, ResolveIdentifierRequest,
 };
 use meridian_instrument::{apply, resolve_identifier, PostgresStore};
+use meridian_street::amounts::{Money, Quantity};
+use meridian_street::store::{Holding, Settled, Statement, Store as _};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {
@@ -91,12 +93,87 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
             exchange_mic: String::new(),
             currency: String::new(),
         },
+        now_ns(),
     )
-    .unwrap();
+    .unwrap()
+    .reply;
 
     assert!(
         reply.found,
         "the instrument store stopped answering for what it holds"
     );
     assert_eq!(reply.instrument_id, instrument_id);
+}
+
+#[test]
+fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platform_is_away() {
+    // W3.7's reason for being: the holding has a name at once, platform or no
+    // platform, and a position under it that every book can use until the
+    // INS- ID arrives.
+    let url = required("MERIDIAN_TEST_DATABASE_URL");
+    let instruments = PostgresStore::connect(&url, 4).unwrap();
+    instruments.migrate().unwrap();
+
+    let stamp = now_ns();
+    let resolution = resolve_identifier(
+        &instruments,
+        &ResolveIdentifierRequest {
+            identifiers: vec![PbIdentifier {
+                scheme: "symbol".into(),
+                value: format!("ZZ{stamp}"),
+                source: "snaptrade".into(),
+            }],
+            as_of_ns: stamp,
+            exchange_mic: String::new(),
+            currency: String::new(),
+        },
+        now_ns(),
+    )
+    .unwrap();
+
+    assert!(resolution.reply.found);
+    assert!(resolution.reply.placeholder);
+    assert!(
+        resolution.minted.is_some(),
+        "the placeholder was not minted here"
+    );
+    let placeholder = resolution.reply.instrument_id;
+    assert!(placeholder.starts_with("LCL-"), "{placeholder}");
+
+    let street = meridian_street::PostgresStore::connect(&url, 2).unwrap();
+    street.migrate().unwrap();
+    let (statement, _, _) = street
+        .open(Statement {
+            statement_id: format!("STMT-outage-{stamp}"),
+            source: "snaptrade".into(),
+            external_statement_id: format!("st-outage-{stamp}"),
+            as_of_date: "2026-09-28".into(),
+            read_at_ns: stamp,
+            expected_rows: 1,
+        })
+        .unwrap();
+
+    let account = format!("ACC-outage-{stamp}");
+    let (settled, _) = street
+        .record(
+            Holding {
+                holding_id: format!("HLD-outage-{stamp}"),
+                statement_id: statement.statement_id,
+                account_id: account.clone(),
+                instrument_id: Some(placeholder.clone()),
+                unresolved_identifiers: vec![],
+                quantity: Quantity::from_scaled(500_000_000),
+                market_value: Money::from_scaled(0),
+                currency: "USD".into(),
+                escalated: false,
+            },
+            now_ns(),
+        )
+        .unwrap();
+
+    assert!(matches!(settled, Settled::Changed { .. }), "{settled:?}");
+    assert!(street
+        .custodial_position(&account, &placeholder)
+        .unwrap()
+        .is_some());
 }

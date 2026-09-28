@@ -1,4 +1,5 @@
-//! Opening a statement and recording its rows. W2.2, W2.3 and W2.4.
+//! Opening a statement and recording its rows. W2.2, W2.3 and W2.4; and
+//! moving the positions they made off a placeholder once it is replaced, W3.9.
 //!
 //! The wire's shapes translated into the street store's, and back. A deliberate
 //! translation rather than storing the generated types: the store's shape is
@@ -7,9 +8,9 @@
 //! anything that could object.
 
 use meridian_domain::v1::{
-    CustodialPositionUpdatedEvent, Identifier as PbIdentifier, RecordHoldingReply,
-    RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
-    StatementRecordedEvent,
+    CustodialPositionUpdatedEvent, Identifier as PbIdentifier, InstrumentReplacedEvent,
+    RecordHoldingReply, RecordHoldingRequest, RecordHoldingsStatementReply,
+    RecordHoldingsStatementRequest, StatementRecordedEvent,
 };
 
 use crate::amounts::{Money, Quantity};
@@ -159,6 +160,47 @@ pub fn record_holding(
         },
         completed,
     })
+}
+
+/// W3.9. Move what a replaced placeholder held onto the instrument that
+/// replaced it, and produce the W2.6 events for what now stands under it.
+///
+/// An event with no placeholder, no instrument, or an instrument naming the
+/// placeholder itself moves nothing: moving a position onto its own key would
+/// only delete it.
+///
+/// Each event names the statement that stated the position, which is still
+/// what the custodian said; the move changed its name and not its content.
+pub fn move_positions(
+    store: &dyn Store,
+    event: &InstrumentReplacedEvent,
+) -> Result<Vec<CustodialPositionUpdatedEvent>> {
+    let replaced_id = event.replaced_instrument_id.as_str();
+    let instrument_id = event
+        .instrument
+        .as_ref()
+        .map(|instrument| instrument.instrument_id.as_str())
+        .unwrap_or_default();
+
+    if replaced_id.is_empty() || instrument_id.is_empty() || replaced_id == instrument_id {
+        return Ok(Vec::new());
+    }
+
+    Ok(store
+        .move_positions(replaced_id, instrument_id)?
+        .into_iter()
+        .filter_map(|settled| match settled {
+            Settled::Changed {
+                position,
+                previous_quantity,
+            } => Some(CustodialPositionUpdatedEvent {
+                statement_id: position.last_statement_id.clone(),
+                position: Some(to_wire_position(&position)),
+                previous_quantity_scaled_1e8: previous_quantity.scaled(),
+            }),
+            Settled::Unchanged { .. } | Settled::Unresolved => None,
+        })
+        .collect())
 }
 
 pub(crate) fn from_wire_identifier(identifier: &PbIdentifier) -> Identifier {
@@ -606,5 +648,137 @@ mod tests {
             }
         );
         assert!(counts.consistent());
+    }
+
+    const PLACEHOLDER: &str = "LCL-01J8XQ4M7K0000000000ZZTP";
+    const REPLACEMENT: &str = "INS-01J8XQ4M7K0000000000ZZTP";
+
+    /// A statement as of `as_of_date`, holding `quantity` of `instrument_id`
+    /// in the fixture's account.
+    fn stated(store: &MemoryStore, as_of_date: &str, instrument_id: &str, quantity: i64) {
+        let mut statement = statement_request();
+        statement.external_statement_id = format!("st-{as_of_date}-{instrument_id}");
+        statement.as_of_date = as_of_date.into();
+        let statement_id = open_statement(store, &statement, NOW)
+            .unwrap()
+            .reply
+            .statement_id;
+
+        let mut row = holding_request(&statement_id);
+        row.instrument_id = instrument_id.into();
+        row.quantity_scaled_1e8 = quantity;
+        record_holding(store, &row, NOW).unwrap();
+    }
+
+    /// The fixture's replacement.
+    fn replaced() -> InstrumentReplacedEvent {
+        InstrumentReplacedEvent {
+            replaced_instrument_id: PLACEHOLDER.into(),
+            instrument: Some(meridian_domain::v1::InstrumentRecord {
+                instrument_id: REPLACEMENT.into(),
+                ..Default::default()
+            }),
+            replaced_at_ns: NOW,
+        }
+    }
+
+    #[test]
+    fn a_placeholders_position_moves_onto_its_instrument() {
+        let store = MemoryStore::new();
+        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+
+        let events = move_positions(&store, &replaced()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        let position = events[0].position.as_ref().unwrap();
+        assert_eq!(position.instrument_id, REPLACEMENT);
+        assert_eq!(position.quantity_scaled_1e8, 500_000_000);
+        assert_eq!(position.as_of_date, "2026-09-08");
+        assert_eq!(events[0].statement_id, position.last_statement_id);
+        // New under its instrument, so changed from nothing.
+        assert_eq!(events[0].previous_quantity_scaled_1e8, 0);
+
+        assert!(store
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .custodial_position("SNAP-ACC-1", REPLACEMENT)
+                .unwrap()
+                .unwrap()
+                .quantity
+                .scaled(),
+            500_000_000
+        );
+    }
+
+    #[test]
+    fn where_both_are_held_a_later_placeholder_statement_stands() {
+        let store = MemoryStore::new();
+        stated(&store, "2026-09-08", REPLACEMENT, 200_000_000);
+        stated(&store, "2026-09-09", PLACEHOLDER, 500_000_000);
+
+        let events = move_positions(&store, &replaced()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].previous_quantity_scaled_1e8, 200_000_000);
+        let standing = store
+            .custodial_position("SNAP-ACC-1", REPLACEMENT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(standing.quantity.scaled(), 500_000_000);
+        assert_eq!(standing.as_of_date, "2026-09-09");
+        assert!(store
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn where_both_are_held_a_later_instrument_statement_stands() {
+        // The connector's next statement already resolved to the INS- ID
+        // before the replacement was heard. What it said is newer, so it
+        // stands, and nothing under the instrument changed to announce.
+        let store = MemoryStore::new();
+        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+        stated(&store, "2026-09-09", REPLACEMENT, 200_000_000);
+
+        let events = move_positions(&store, &replaced()).unwrap();
+
+        assert!(events.is_empty(), "{events:?}");
+        let standing = store
+            .custodial_position("SNAP-ACC-1", REPLACEMENT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(standing.quantity.scaled(), 200_000_000);
+        assert!(store
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_second_hearing_of_one_replacement_moves_nothing() {
+        let store = MemoryStore::new();
+        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+
+        move_positions(&store, &replaced()).unwrap();
+        assert!(move_positions(&store, &replaced()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_replacement_naming_itself_moves_nothing() {
+        let store = MemoryStore::new();
+        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+
+        let mut itself = replaced();
+        itself.instrument.as_mut().unwrap().instrument_id = PLACEHOLDER.into();
+
+        assert!(move_positions(&store, &itself).unwrap().is_empty());
+        assert!(store
+            .custodial_position("SNAP-ACC-1", PLACEHOLDER)
+            .unwrap()
+            .is_some());
     }
 }

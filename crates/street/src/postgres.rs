@@ -384,6 +384,147 @@ impl Store for PostgresStore {
             updated_at_ns: row.get(7),
         }))
     }
+
+    fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+
+        // Locked, so a row recorded against the placeholder while this runs
+        // waits for it rather than landing beside a position already moved.
+        let placeholders: Vec<CustodialPosition> = tx
+            .query(
+                "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                        last_statement_id, as_of_date, updated_at_ns
+                   FROM custodial_position WHERE instrument_id = $1
+                  ORDER BY account_id
+                    FOR UPDATE",
+                &[&replaced_id],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| CustodialPosition {
+                account_id: row.get(0),
+                instrument_id: instrument_id.to_string(),
+                quantity: Quantity::from_scaled(row.get(2)),
+                market_value: Money::from_scaled(row.get(3)),
+                currency: row.get(4),
+                last_statement_id: row.get(5),
+                as_of_date: row.get(6),
+                updated_at_ns: row.get(7),
+            })
+            .collect();
+
+        let mut settled = Vec::new();
+        for moved in placeholders {
+            // Inserted first and conditionally, as `settle` does, so whether
+            // the account already holds the instrument is Postgres' decision
+            // under the key rather than ours across a read and a write.
+            let fresh = tx
+                .execute(
+                    "INSERT INTO custodial_position
+                            (account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                             last_statement_id, as_of_date, updated_at_ns)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (account_id, instrument_id) DO NOTHING",
+                    &[
+                        &moved.account_id,
+                        &moved.instrument_id,
+                        &moved.quantity.scaled(),
+                        &moved.market_value.scaled(),
+                        &moved.currency,
+                        &moved.last_statement_id,
+                        &moved.as_of_date,
+                        &moved.updated_at_ns,
+                    ],
+                )
+                .map_err(unavailable)?
+                == 1;
+
+            if fresh {
+                settled.push(Settled::Changed {
+                    position: moved.clone(),
+                    previous_quantity: Quantity::ZERO,
+                });
+            } else {
+                let row = tx
+                    .query_one(
+                        "SELECT quantity_scaled, value_scaled, currency, last_statement_id,
+                                as_of_date, updated_at_ns
+                           FROM custodial_position WHERE account_id = $1 AND instrument_id = $2
+                            FOR UPDATE",
+                        &[&moved.account_id, &moved.instrument_id],
+                    )
+                    .map_err(unavailable)?;
+                let standing = CustodialPosition {
+                    account_id: moved.account_id.clone(),
+                    instrument_id: moved.instrument_id.clone(),
+                    quantity: Quantity::from_scaled(row.get(0)),
+                    market_value: Money::from_scaled(row.get(1)),
+                    currency: row.get(2),
+                    last_statement_id: row.get(3),
+                    as_of_date: row.get(4),
+                    updated_at_ns: row.get(5),
+                };
+
+                if moved.stated_later_than(&standing) {
+                    let parameters: [&(dyn ToSql + Sync); 8] = [
+                        &moved.quantity.scaled(),
+                        &moved.market_value.scaled(),
+                        &moved.currency,
+                        &moved.last_statement_id,
+                        &moved.as_of_date,
+                        &moved.updated_at_ns,
+                        &moved.account_id,
+                        &moved.instrument_id,
+                    ];
+                    tx.execute(
+                        "UPDATE custodial_position
+                            SET quantity_scaled = $1, value_scaled = $2, currency = $3,
+                                last_statement_id = $4, as_of_date = $5, updated_at_ns = $6
+                          WHERE account_id = $7 AND instrument_id = $8",
+                        &parameters,
+                    )
+                    .map_err(unavailable)?;
+
+                    settled.push(if moved.differs_from(&standing) {
+                        Settled::Changed {
+                            position: moved.clone(),
+                            previous_quantity: standing.quantity,
+                        }
+                    } else {
+                        Settled::Unchanged {
+                            position: moved.clone(),
+                        }
+                    });
+                }
+            }
+
+            tx.execute(
+                "DELETE FROM custodial_position WHERE account_id = $1 AND instrument_id = $2",
+                &[&moved.account_id, &replaced_id],
+            )
+            .map_err(unavailable)?;
+        }
+
+        tx.commit().map_err(unavailable)?;
+        Ok(settled)
+    }
+
+    fn placeholder_instruments(&self) -> Result<Vec<String>> {
+        let pattern = format!("{}%", crate::ids::PLACEHOLDER_PREFIX);
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT DISTINCT instrument_id FROM custodial_position
+                  WHERE instrument_id LIKE $1
+                  ORDER BY instrument_id",
+                &[&pattern],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
 }
 
 /// Replace the position, and say what it was.

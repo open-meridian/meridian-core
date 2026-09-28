@@ -72,7 +72,24 @@ fn run() -> Result<(), String> {
             // Registered before anything can call them. A component that
             // announces itself and then cannot answer is worse than one that
             // has not arrived.
-            meridian_street::service::serve(bus.clone(), Arc::new(store), Arc::new(SystemClock));
+            let store: Arc<dyn meridian_street::Store> = Arc::new(store);
+            meridian_street::service::serve(bus.clone(), store.clone(), Arc::new(SystemClock));
+
+            // W3.9. Subscribed before this returns, like the handlers above;
+            // only the moving is spawned.
+            tokio::spawn(meridian_street::service::follow_replacements(
+                bus.clone(),
+                store.clone(),
+            ));
+
+            // And asked about, for a replacement said while this process was
+            // not listening.
+            tokio::spawn(meridian_street::service::sweep_forever(
+                bus.clone(),
+                store,
+                Arc::new(SystemClock),
+                meridian_street::service::SWEEP_EVERY,
+            ));
 
             // W5.20. Said on the bus, for the instrument store to carry outward: this
             // process holds no key, and giving it one so it could report

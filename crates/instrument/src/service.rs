@@ -1,8 +1,10 @@
 //! Where the instrument store meets the bus.
 //!
 //! Two questions answered from what is held, and one event reacted to. That is
-//! the whole surface: W3.1 and W3.6 are calls, W3.2 arrives as an event, and
-//! W3.5 leaves as one.
+//! the whole surface: W3.1 and W3.6 are calls, the conductor's pulled record
+//! arrives as an event, and W3.5 leaves as one. Around them, W3.7 and W3.8
+//! leave as events too: a placeholder announced when a resolve mints it and
+//! again until it is replaced, and its replacement once.
 //!
 //! # The two halves behave differently on purpose
 //!
@@ -35,6 +37,7 @@
 //! the version number.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use meridian_bus::{Bus, Delivery};
 use meridian_domain::v1::{
@@ -44,6 +47,7 @@ use meridian_domain::v1::{
 use prost::Message;
 
 use crate::apply::apply;
+use crate::placeholder::{self, announcement};
 use crate::resolve::{resolve_identifier, resolve_instrument};
 use crate::store::{Applied, Store};
 
@@ -53,7 +57,9 @@ pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifie
 /// W3.6. The street store asking for a record so a holding can be shown with a name.
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 
-/// W3.2. A connector reporting that a resolution missed.
+/// W3.2 and W3.7. A connector reporting that a resolution was ambiguous, and
+/// this store announcing a placeholder, on one topic: the conductor reacts to
+/// both the same way.
 pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missing";
 
 /// W3.3 and W3.4. What the conductor got from the platform, for applying.
@@ -66,6 +72,19 @@ pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled"
 
 /// W3.5. The instrument store announcing what it did with a record.
 pub const INSTRUMENT_APPLIED: &str = "platform.reference.event.instrument-applied";
+
+/// W3.8. A placeholder's `INS-` ID arrived, for the stores keyed by instrument
+/// to move onto it (W3.9).
+pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
+
+/// How often every outstanding placeholder is announced again. W3.7.
+///
+/// Long beside the conductor's five-minute throttle, so each announcement
+/// reaches the platform rather than being skipped, and short beside how long
+/// a holding can reasonably wait for its identity after an outage ends. A
+/// placeholder announced when it was minted normally needs no second
+/// announcement: the interval is the recovery path, not the delivery path.
+pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// Where the time comes from.
 ///
@@ -92,8 +111,9 @@ impl Clock for SystemClock {
 ///
 /// Answered from the store alone. Nothing here reaches the platform, which is
 /// the property that keeps a resolve working while the platform is away.
-pub fn serve_queries(bus: &Bus, store: Arc<dyn Store>) {
+pub fn serve_queries(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     let by_identifier = store.clone();
+    let announcing = Arc::clone(bus);
     bus.serve(RESOLVE_IDENTIFIER, move |envelope| {
         expect(
             &envelope.payload_type,
@@ -103,12 +123,37 @@ pub fn serve_queries(bus: &Bus, store: Arc<dyn Store>) {
         let request = ResolveIdentifierRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable resolve request: {failed}"))?;
 
-        let reply = resolve_identifier(by_identifier.as_ref(), &request)
+        let now_ns = clock.now_ns();
+        let resolution = resolve_identifier(by_identifier.as_ref(), &request, now_ns)
             .map_err(|failed| failed.to_string())?;
+
+        // W3.7. Minted by this resolve, so announced by it, in the resolve's
+        // own chain: the holding recorded against the placeholder, the
+        // escalation, and the replacement read as one arc.
+        //
+        // A failure to announce does not fail the resolve. The placeholder is
+        // stored and the answer is right; what did not happen is the
+        // announcement, and the interval makes it again.
+        if let Some(minted) = resolution.minted {
+            let meta = envelope.meta.as_ref();
+            if let Err(failed) = announcing.publish(
+                INSTRUMENT_MISSING,
+                "meridian.v1.MissingInstrumentDetectedEvent",
+                announcement(&minted, announcing.instance_id(), now_ns).encode_to_vec(),
+                meta.map(|meta| meta.correlation_id.as_str()),
+                meta.map(|meta| meta.message_id.as_str()),
+            ) {
+                tracing::warn!(
+                    %failed,
+                    placeholder = minted.placeholder_id,
+                    "a minted placeholder could not be announced; it will be again"
+                );
+            }
+        }
 
         Ok((
             "meridian.v1.ResolveIdentifierReply".to_string(),
-            reply.encode_to_vec(),
+            resolution.reply.encode_to_vec(),
         ))
     });
 
@@ -132,6 +177,63 @@ pub fn serve_queries(bus: &Bus, store: Arc<dyn Store>) {
     });
 }
 
+/// W3.7, again. Announce every placeholder not yet replaced, and the legacy
+/// path's `LCL-` instruments with them, and say how many.
+///
+/// Each in a chain of its own: nothing caused it but the time.
+pub async fn announce_outstanding(
+    bus: &Bus,
+    store: Arc<dyn Store>,
+    clock: &dyn Clock,
+) -> Result<usize, String> {
+    let publisher = bus.instance_id().to_string();
+    let now_ns = clock.now_ns();
+
+    // Off the runtime, for the reason `apply_and_announce` gives.
+    let events = tokio::task::spawn_blocking(move || {
+        placeholder::outstanding(store.as_ref(), &publisher, now_ns)
+    })
+    .await
+    .map_err(|failed| format!("the announcing task failed: {failed}"))?
+    .map_err(|failed| failed.to_string())?;
+
+    for event in &events {
+        bus.publish(
+            INSTRUMENT_MISSING,
+            "meridian.v1.MissingInstrumentDetectedEvent",
+            event.encode_to_vec(),
+            None,
+            None,
+        )
+        .map_err(|failed| failed.to_string())?;
+    }
+    Ok(events.len())
+}
+
+/// Announce what is outstanding now, and then every `every`, for as long as
+/// the process runs.
+///
+/// At start because a restart, a restore and an outage all leave placeholders
+/// nobody is asking about, and a start is the first moment anything can.
+/// Never returns and never gives up: a failed round is logged and the next one
+/// tries again.
+pub async fn announce_forever(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    every: Duration,
+) {
+    loop {
+        match announce_outstanding(&bus, store.clone(), clock.as_ref()).await {
+            Ok(count) => tracing::debug!(count, "announced the outstanding placeholders"),
+            Err(failed) => {
+                tracing::warn!(failed, "could not announce the outstanding placeholders")
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
 /// What one delivery came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Handled {
@@ -145,6 +247,15 @@ pub enum Handled {
 
     /// A record was applied, or was an equal-or-older version and was not.
     Applied(Applied),
+
+    /// As [`Handled::Applied`], and the placeholder the record names is now
+    /// recorded as replaced by it and announced so (W3.8).
+    Replaced(Applied),
+
+    /// As [`Handled::Applied`], and the placeholder the record names could not
+    /// be recorded as replaced. It stays outstanding, so its next
+    /// announcement brings the same pairing back and this is tried again.
+    NotReplaced(Applied, String),
 }
 
 /// Consumes pulled records and applies them. W3.3 and W3.4 in; W3.5 out.
@@ -180,6 +291,17 @@ impl Reactor {
             match self.react(delivery).await {
                 Handled::Ignored(why) => tracing::warn!(why, "ignored a delivery"),
                 Handled::Applied(applied) => tracing::debug!(?applied, "applied a pulled record"),
+                Handled::Replaced(applied) => {
+                    tracing::info!(
+                        ?applied,
+                        "applied a pulled record that replaced a placeholder"
+                    )
+                }
+                Handled::NotReplaced(applied, why) => tracing::warn!(
+                    ?applied,
+                    why,
+                    "applied a pulled record, and could not record the placeholder it replaced"
+                ),
             }
         }
     }
@@ -208,9 +330,28 @@ impl Reactor {
         };
 
         let now_ns = self.clock.now_ns();
-        match self.apply_and_announce(record, &envelope, now_ns).await {
-            Ok(applied) => Handled::Applied(applied),
-            Err(failed) => Handled::Ignored(failed),
+        let applied = match self
+            .apply_and_announce(record.clone(), &envelope, now_ns)
+            .await
+        {
+            Ok(applied) => applied,
+            Err(failed) => return Handled::Ignored(failed),
+        };
+
+        if reply.replaces_instrument_id.is_empty() {
+            return Handled::Applied(applied);
+        }
+
+        // Whether or not the apply changed anything: an equal version is the
+        // platform pairing the placeholder with an instrument already held,
+        // and the pairing is news even when the record is not.
+        match self
+            .replace_and_announce(reply.replaces_instrument_id, record, &envelope, now_ns)
+            .await
+        {
+            Ok(true) => Handled::Replaced(applied),
+            Ok(false) => Handled::Applied(applied),
+            Err(failed) => Handled::NotReplaced(applied, failed),
         }
     }
 
@@ -250,6 +391,58 @@ impl Reactor {
 
         Ok(outcome.applied)
     }
+
+    /// W3.8. Announce the replacement if it is new, then record it. `true`
+    /// when it was announced.
+    ///
+    /// Announced first and recorded second; [`placeholder::replacement`] says
+    /// why that order. In the pulled record's chain, like the apply, so the
+    /// placeholder's announcement, the escalation, the apply and the
+    /// replacement read as one.
+    async fn replace_and_announce(
+        &self,
+        replaced_id: String,
+        record: PbInstrument,
+        caused_by: &meridian_bus::Envelope,
+        now_ns: i64,
+    ) -> Result<bool, String> {
+        let store = self.store.clone();
+        let asking = replaced_id.clone();
+        let event = tokio::task::spawn_blocking(move || {
+            placeholder::replacement(store.as_ref(), &asking, &record, now_ns)
+        })
+        .await
+        .map_err(|failed| format!("the replace task failed: {failed}"))?
+        .map_err(|failed| failed.to_string())?;
+
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        let replaced_by = event
+            .instrument
+            .as_ref()
+            .map(|instrument| instrument.instrument_id.clone())
+            .unwrap_or_default();
+
+        let meta = caused_by.meta.as_ref();
+        self.bus
+            .publish(
+                INSTRUMENT_REPLACED,
+                "meridian.v1.InstrumentReplacedEvent",
+                event.encode_to_vec(),
+                meta.map(|meta| meta.correlation_id.as_str()),
+                meta.map(|meta| meta.message_id.as_str()),
+            )
+            .map_err(|failed| failed.to_string())?;
+
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.replace(&replaced_id, &replaced_by, now_ns))
+            .await
+            .map_err(|failed| format!("the replace task failed: {failed}"))?
+            .map_err(|failed| failed.to_string())?;
+
+        Ok(true)
+    }
 }
 
 /// Refuse a payload arriving under a type name that is not the one served.
@@ -267,6 +460,7 @@ mod tests {
     use meridian_bus::{Envelope, MemoryBackend, MessageMeta};
     use meridian_domain::v1::{
         Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentLifecycleState,
+        InstrumentReplacedEvent, MissReason, MissingInstrumentDetectedEvent,
         ResolveIdentifierReply, ResolveIdentifierRequest as PbResolveIdentifierRequest,
         ResolveInstrumentReply,
     };
@@ -377,6 +571,58 @@ mod tests {
         Reactor::new(bus, store, clock)
     }
 
+    /// A set nothing held matches: the fixture's ZZTOP.
+    fn unknown() -> PbResolveIdentifierRequest {
+        PbResolveIdentifierRequest {
+            identifiers: vec![
+                PbIdentifier {
+                    scheme: "symbol".into(),
+                    value: "ZZTOP".into(),
+                    source: "snaptrade".into(),
+                },
+                PbIdentifier {
+                    scheme: "figi".into(),
+                    value: "BBG000ZZTOP1".into(),
+                    source: String::new(),
+                },
+            ],
+            as_of_ns: AS_OF,
+            exchange_mic: String::new(),
+            currency: String::new(),
+        }
+    }
+
+    async fn resolve_over(
+        bus: &Bus,
+        request: &PbResolveIdentifierRequest,
+    ) -> ResolveIdentifierReply {
+        let (_, payload) = bus
+            .call(
+                RESOLVE_IDENTIFIER,
+                "meridian.v1.ResolveIdentifierRequest",
+                request.encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        ResolveIdentifierReply::decode(&payload[..]).unwrap()
+    }
+
+    /// Nothing more within a moment. Silence is the assertion.
+    async fn quiet(subscription: &mut meridian_bus::Subscription) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(100), subscription.recv())
+            .await
+            .is_err()
+    }
+
+    /// The conductor's pulled record, naming the placeholder it replaces.
+    fn pairing(instrument_id: &str, replaces: &str) -> PullInstrumentReply {
+        let mut reply = pulled(instrument_id, 1);
+        reply.replaces_instrument_id = replaces.into();
+        reply
+    }
+
     #[tokio::test]
     async fn a_resolve_is_answered_from_the_store() {
         // No platform anywhere in this test, and there is no longer one to
@@ -386,7 +632,7 @@ mod tests {
         store.apply(held()).unwrap();
 
         let bus = bus();
-        serve_queries(&bus, store);
+        serve_queries(&bus, store, Stopped::at(NOW));
 
         let (payload_type, payload) = bus
             .call(
@@ -421,7 +667,7 @@ mod tests {
         store.apply(held()).unwrap();
 
         let bus = bus();
-        serve_queries(&bus, store);
+        serve_queries(&bus, store, Stopped::at(NOW));
 
         let (_, payload) = bus
             .call(
@@ -441,6 +687,221 @@ mod tests {
         let reply = ResolveInstrumentReply::decode(&payload[..]).unwrap();
         assert!(reply.found);
         assert_eq!(reply.instrument.unwrap().instrument_id, "INS-HELD");
+    }
+
+    #[tokio::test]
+    async fn a_minted_placeholder_is_announced_once() {
+        // W3.7. The set is asked about on every statement until its identity
+        // arrives, and only the first ask mints.
+        let store = Arc::new(MemoryStore::new());
+        let bus = bus();
+        let mut missing = bus.subscribe(INSTRUMENT_MISSING);
+        serve_queries(&bus, store, Stopped::at(NOW));
+
+        let reply = resolve_over(&bus, &unknown()).await;
+        assert!(reply.found);
+        assert!(reply.placeholder);
+
+        let delivered = next(&mut missing).await;
+        assert_eq!(
+            delivered.envelope.payload_type,
+            "meridian.v1.MissingInstrumentDetectedEvent"
+        );
+        let event =
+            MissingInstrumentDetectedEvent::decode(&delivered.envelope.payload[..]).unwrap();
+        assert_eq!(event.placeholder_instrument_id, reply.instrument_id);
+        assert_eq!(event.reason, MissReason::NotFound as i32);
+        assert_eq!(event.publisher_instance_id, "reference-1");
+        assert_eq!(event.source, "snaptrade");
+        assert_eq!(event.identifiers.len(), 2);
+        assert_eq!(event.as_of_ns, AS_OF);
+        assert_eq!(event.observed_at_ns, NOW);
+
+        let again = resolve_over(&bus, &unknown()).await;
+        assert_eq!(again.instrument_id, reply.instrument_id);
+        assert!(quiet(&mut missing).await, "announced as minted twice");
+    }
+
+    #[tokio::test]
+    async fn only_placeholders_not_yet_replaced_are_announced_again() {
+        let store = Arc::new(MemoryStore::new());
+        let outstanding = crate::resolve_identifier(store.as_ref(), &unknown(), NOW)
+            .unwrap()
+            .reply
+            .instrument_id;
+
+        let mut other = unknown();
+        other.identifiers.truncate(1);
+        other.identifiers[0].value = "GONE".into();
+        let gone = crate::resolve_identifier(store.as_ref(), &other, NOW)
+            .unwrap()
+            .reply
+            .instrument_id;
+        store.replace(&gone, "INS-GONE", NOW).unwrap();
+
+        let bus = bus();
+        let mut missing = bus.subscribe(INSTRUMENT_MISSING);
+
+        let announced = announce_outstanding(&bus, store, Stopped::at(NOW).as_ref())
+            .await
+            .unwrap();
+        assert_eq!(announced, 1);
+
+        let event =
+            MissingInstrumentDetectedEvent::decode(&next(&mut missing).await.envelope.payload[..])
+                .unwrap();
+        assert_eq!(event.placeholder_instrument_id, outstanding);
+        assert!(
+            quiet(&mut missing).await,
+            "a replaced placeholder was announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_started_service_announces_what_is_outstanding() {
+        // A restart, a restore and an outage all leave placeholders nobody is
+        // asking about, and a start is the first moment anything can.
+        let store = Arc::new(MemoryStore::new());
+        let placeholder = crate::resolve_identifier(store.as_ref(), &unknown(), NOW)
+            .unwrap()
+            .reply
+            .instrument_id;
+
+        let bus = bus();
+        let mut missing = bus.subscribe(INSTRUMENT_MISSING);
+        tokio::spawn(
+            crate::InstrumentService::new(Arc::clone(&bus), store, Stopped::at(NOW)).start(),
+        );
+
+        let event =
+            MissingInstrumentDetectedEvent::decode(&next(&mut missing).await.envelope.payload[..])
+                .unwrap();
+        assert_eq!(event.placeholder_instrument_id, placeholder);
+    }
+
+    #[tokio::test]
+    async fn a_record_that_replaces_a_placeholder_is_announced_once() {
+        // W3.8. The pairing arrives, and arrives again when the re-announced
+        // placeholder is escalated a second time before the first answer lands.
+        let store = Arc::new(MemoryStore::new());
+        let placeholder = crate::resolve_identifier(store.as_ref(), &unknown(), NOW)
+            .unwrap()
+            .reply
+            .instrument_id;
+
+        let bus = bus();
+        let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
+        let reactor = reactor(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
+
+        let handled = reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pairing("INS-ZZTOP", &placeholder).encode_to_vec(),
+                "CORR-1",
+            ))
+            .await;
+        assert_eq!(handled, Handled::Replaced(Applied::Stored));
+
+        let delivered = next(&mut replaced).await;
+        assert_eq!(
+            delivered.envelope.payload_type,
+            "meridian.v1.InstrumentReplacedEvent"
+        );
+        let meta = delivered.envelope.meta.clone().unwrap();
+        assert_eq!(meta.correlation_id, "CORR-1");
+        assert_eq!(meta.causation_id, "MSG-PULLED");
+        let event = InstrumentReplacedEvent::decode(&delivered.envelope.payload[..]).unwrap();
+        assert_eq!(event.replaced_instrument_id, placeholder);
+        assert_eq!(event.instrument.unwrap().instrument_id, "INS-ZZTOP");
+        assert_eq!(event.replaced_at_ns, NOW);
+
+        // Resolving the set now answers the instrument.
+        let reply = crate::resolve_identifier(store.as_ref(), &unknown(), NOW)
+            .unwrap()
+            .reply;
+        assert_eq!(reply.instrument_id, "INS-ZZTOP");
+        assert!(!reply.placeholder);
+
+        let redelivered = reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pairing("INS-ZZTOP", &placeholder).encode_to_vec(),
+                "CORR-2",
+            ))
+            .await;
+        assert_eq!(redelivered, Handled::Applied(Applied::AlreadyCurrent));
+        assert!(
+            quiet(&mut replaced).await,
+            "a replacement was announced twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_lcl_record_is_replaced_the_same_way() {
+        // The legacy path: an LCL- instrument the platform minted before it
+        // minted only INS-, announced, paired, and replaced.
+        let store = Arc::new(MemoryStore::new());
+        let bus = bus();
+        let mut missing = bus.subscribe(INSTRUMENT_MISSING);
+        let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
+        let reactor = reactor(Arc::clone(&bus), store.clone(), Stopped::at(NOW));
+
+        reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pulled("LCL-LEGACY", 1).encode_to_vec(),
+                "CORR-1",
+            ))
+            .await;
+
+        announce_outstanding(&bus, store.clone(), Stopped::at(NOW).as_ref())
+            .await
+            .unwrap();
+        let event =
+            MissingInstrumentDetectedEvent::decode(&next(&mut missing).await.envelope.payload[..])
+                .unwrap();
+        assert_eq!(event.placeholder_instrument_id, "LCL-LEGACY");
+        assert_eq!(event.identifiers[0].value, "BBG000ZZTOP1");
+
+        let handled = reactor
+            .react(delivery(
+                "meridian.v1.PullInstrumentReply",
+                pairing("INS-MOVED", "LCL-LEGACY").encode_to_vec(),
+                "CORR-2",
+            ))
+            .await;
+        assert_eq!(handled, Handled::Replaced(Applied::Stored));
+        let event =
+            InstrumentReplacedEvent::decode(&next(&mut replaced).await.envelope.payload[..])
+                .unwrap();
+        assert_eq!(event.replaced_instrument_id, "LCL-LEGACY");
+
+        // Both rows carry the FIGI; the set answers one instrument, the new one.
+        let reply = crate::resolve_identifier(
+            store.as_ref(),
+            &PbResolveIdentifierRequest {
+                identifiers: vec![PbIdentifier {
+                    scheme: "figi".into(),
+                    value: "BBG000ZZTOP1".into(),
+                    source: String::new(),
+                }],
+                as_of_ns: AS_OF,
+                exchange_mic: String::new(),
+                currency: String::new(),
+            },
+            NOW,
+        )
+        .unwrap()
+        .reply;
+        assert_eq!(reply.instrument_id, "INS-MOVED");
+
+        // And it is no longer announced.
+        assert_eq!(
+            announce_outstanding(&bus, store, Stopped::at(NOW).as_ref())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

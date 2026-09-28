@@ -186,7 +186,10 @@ pub enum Reaction {
     /// The master already knew it. W3.3, and most misses are this.
     Pulled(Box<PbInstrument>),
 
-    /// Neither side knew it, so the platform minted a stub. W3.4.
+    /// Nobody knew it by a global identifier, so it was escalated, and the
+    /// platform answered with an instrument: a stub it minted, or one it
+    /// already held and paired the placeholder with (`minted: false`). W3.4.
+    /// Applied alike, so one variant.
     Minted(Box<PbInstrument>),
 
     /// The miss was ambiguous, so nothing was minted.
@@ -196,7 +199,9 @@ pub enum Reaction {
     /// duplication problem by adding a duplicate.
     AmbiguityNotMinted,
 
-    /// The platform neither knew it nor minted one. Its decision, not ours.
+    /// The platform neither knew it nor minted one, or found the identifiers
+    /// pointing at more than one instrument and left the conflict for staff.
+    /// Its decision, not ours.
     Declined,
 }
 
@@ -1560,7 +1565,7 @@ pub(crate) mod tests {
                 &serde_json::json!({
                     "minted": true,
                     "instrument": {
-                        "instrument_id": "LCL-01J8",
+                        "instrument_id": "INS-01J8",
                         "asset_class": "EQUITY",
                         "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
                         "version": 1,
@@ -1577,7 +1582,7 @@ pub(crate) mod tests {
 
         match reaction {
             Reaction::Minted(record) => {
-                assert_eq!(record.instrument_id, "LCL-01J8");
+                assert_eq!(record.instrument_id, "INS-01J8");
                 assert_eq!(
                     record.lifecycle_state,
                     meridian_domain::v1::InstrumentLifecycleState::Define as i32
@@ -1623,6 +1628,87 @@ pub(crate) mod tests {
 
         let reaction = platform(transport)
             .react_to_miss(&miss(MissReason::NotFound), NOW)
+            .await
+            .unwrap();
+
+        assert_eq!(reaction, Reaction::Declined);
+    }
+
+    /// A placeholder's miss, as the instrument store announces it (W3.7).
+    fn placeholder_miss() -> MissingInstrumentDetectedEvent {
+        let mut event = miss(MissReason::NotFound);
+        event.placeholder_instrument_id = "LCL-01J8XQ4M7K0000000000ZZTP".into();
+        event
+    }
+
+    #[tokio::test]
+    async fn an_escalation_carries_the_placeholder_it_asks_to_pair() {
+        let transport = Fake::new(vec![
+            Ok(reply(404, "{\"found\": false}")),
+            Ok(reply(201, &record_json("INS-01J8XQ4M7K0000000000ZZTP"))),
+        ]);
+
+        platform(transport.clone())
+            .react_to_miss(&placeholder_miss(), NOW)
+            .await
+            .unwrap();
+
+        let body = transport.seen.lock().unwrap()[1].body.clone().unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            sent["placeholder_instrument_id"],
+            "LCL-01J8XQ4M7K0000000000ZZTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pairing_with_an_instrument_already_held_is_applied_like_a_mint() {
+        // The fixture's first case: another deployment escalated it first, so
+        // the platform pairs this placeholder with what it minted then.
+        let transport = Fake::new(vec![
+            Ok(reply(404, "{\"found\": false}")),
+            Ok(reply(
+                200,
+                &serde_json::json!({
+                    "minted": false,
+                    "instrument": {
+                        "instrument_id": "INS-01J8XQ4M7K0000000000ZZTP",
+                        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
+                        "version": 1,
+                    },
+                    "replaces_instrument_id": "LCL-01J8XQ4M7K0000000000ZZTP",
+                })
+                .to_string(),
+            )),
+        ]);
+
+        let reaction = platform(transport)
+            .react_to_miss(&placeholder_miss(), NOW)
+            .await
+            .unwrap();
+
+        match reaction {
+            Reaction::Minted(record) => {
+                assert_eq!(record.instrument_id, "INS-01J8XQ4M7K0000000000ZZTP")
+            }
+            other => panic!("expected the pairing to be applied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conflict_pairs_nothing_and_is_declined() {
+        // The identifiers point at two instruments. Staff decide, and the
+        // placeholder stays in use until they do.
+        let transport = Fake::new(vec![
+            Ok(reply(404, "{\"found\": false}")),
+            Ok(reply(
+                200,
+                "{\"minted\": false, \"conflict\": true, \"instrument\": null}",
+            )),
+        ]);
+
+        let reaction = platform(transport)
+            .react_to_miss(&placeholder_miss(), NOW)
             .await
             .unwrap();
 

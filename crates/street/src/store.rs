@@ -138,6 +138,34 @@ pub struct CustodialPosition {
     pub updated_at_ns: i64,
 }
 
+impl CustodialPosition {
+    /// Whether this was stated by a later statement than `standing`. W3.9.
+    ///
+    /// Where an account holds a position under a placeholder and another under
+    /// the instrument that replaced it, one of them goes, and the later
+    /// statement's stands. Later means the date the positions reflect first,
+    /// because that is what a custodian states and what W2.2 keeps apart from
+    /// when we read it; an ISO date compares correctly as text. On the same
+    /// date, the one recorded later, since the custodian restated it. On both,
+    /// the one already under the instrument, so moving changes nothing that
+    /// cannot be told apart.
+    ///
+    /// The statement's own read time would be a finer tiebreak and is not on
+    /// the position; the recording time is, and a statement is recorded when
+    /// it is read.
+    pub fn stated_later_than(&self, standing: &CustodialPosition) -> bool {
+        (&self.as_of_date, self.updated_at_ns) > (&standing.as_of_date, standing.updated_at_ns)
+    }
+
+    /// Whether this says something different from `other` about what is held,
+    /// which is what W2.6 announces. Which statement said it is not a change.
+    pub fn differs_from(&self, other: &CustodialPosition) -> bool {
+        self.quantity != other.quantity
+            || self.market_value != other.market_value
+            || self.currency != other.currency
+    }
+}
+
 /// What recording a statement did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opened {
@@ -250,4 +278,26 @@ pub trait Store: Send + Sync {
         account_id: &str,
         instrument_id: &str,
     ) -> Result<Option<CustodialPosition>>;
+
+    /// Move every custodial position held under `replaced_id` onto
+    /// `instrument_id`. W3.9.
+    ///
+    /// Where the account already holds `instrument_id`, the position stated
+    /// later stands ([`CustodialPosition::stated_later_than`]) and the other
+    /// is removed. Returns what now stands under `instrument_id` because of
+    /// the move, as W2.6 would announce it: a moved position is new under its
+    /// instrument, so changed from nothing; one that displaced another is
+    /// changed or not by what it states. One that lost to the position already
+    /// there returns nothing, because nothing under the instrument changed.
+    ///
+    /// Holding rows are not touched. They are what a statement said, and they
+    /// keep the placeholder they were recorded with.
+    ///
+    /// One transaction, so no reader sees an account holding a security twice
+    /// or not at all.
+    fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>>;
+
+    /// Every instrument ID a custodial position is held under that is a
+    /// placeholder (`LCL-`), each once, in order. What the sweep asks about.
+    fn placeholder_instruments(&self) -> Result<Vec<String>>;
 }

@@ -19,7 +19,7 @@ use meridian_domain::v1::{
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    RecordHoldingParams, RecordHoldingsStatementParams, ResolveIdentifierParams,
+    Identifier, RecordHoldingParams, RecordHoldingsStatementParams, ResolveIdentifierParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::RegisterRequest;
@@ -42,6 +42,7 @@ fn runtime() -> (Arc<Bus>, Sidecar) {
     meridian_instrument::service::serve_queries(
         &bus,
         Arc::new(meridian_instrument::MemoryStore::new()),
+        Arc::new(meridian_instrument::SystemClock),
     );
     // The conductor's part, stood in for: this plugin's external account
     // `ext-1` is linked to ACC-1, which somebody may write through it.
@@ -166,6 +167,92 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 
     assert_eq!(listed.positions.len(), 1);
     assert_eq!(listed.positions[0].quantity_scaled_1e8, 1_250_000_000);
+}
+
+/// W3.7 as a plugin sees it. A set nothing matches is answered with the
+/// deployment's placeholder, said to be one, the same one each time; and a
+/// holding recorded against it is a resolved row.
+#[tokio::test]
+async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder() {
+    let (bus, sidecar) = runtime();
+    admitted(&sidecar, "custody").await;
+
+    let unknown = ResolveIdentifierParams {
+        identifiers: vec![Identifier {
+            scheme: "symbol".into(),
+            value: "ZZTOP".into(),
+            source: "snaptrade".into(),
+        }],
+        as_of_ns: NOW,
+        ..Default::default()
+    };
+    let resolved = sidecar
+        .resolve_identifier(Request::new(unknown.clone()))
+        .await
+        .expect("resolve is served")
+        .into_inner();
+
+    assert!(resolved.found);
+    assert!(
+        resolved.placeholder,
+        "the plugin's mirror dropped the placeholder flag"
+    );
+    assert!(resolved.instrument_id.starts_with("LCL-"));
+
+    let again = sidecar
+        .resolve_identifier(Request::new(unknown))
+        .await
+        .expect("resolve is served")
+        .into_inner();
+    assert_eq!(again.instrument_id, resolved.instrument_id);
+
+    let opened = sidecar
+        .record_holdings_statement(Request::new(RecordHoldingsStatementParams {
+            source: "snaptrade".into(),
+            external_statement_id: "st-placeholder".into(),
+            as_of_date: "2026-09-08".into(),
+            read_at_ns: NOW,
+            expected_rows: 1,
+            acting_for: None,
+        }))
+        .await
+        .expect("the statement is opened")
+        .into_inner();
+    let recorded = sidecar
+        .record_holding(Request::new(RecordHoldingParams {
+            statement_id: opened.statement_id,
+            instrument_id: resolved.instrument_id.clone(),
+            quantity_scaled_1e8: 500_000_000,
+            market_value_scaled_1e8: 0,
+            currency: "USD".into(),
+            external_account_id: "ext-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("the row is recorded")
+        .into_inner();
+    assert!(recorded.resolved, "a placeholder row is a resolved row");
+
+    let (_, reply) = bus
+        .call(
+            meridian_street::service::LIST_CUSTODIAL_POSITIONS,
+            "meridian.v1.ListCustodialPositionsRequest",
+            ListCustodialPositionsRequest {
+                account_id: "ACC-1".into(),
+                include_unresolved: true,
+                page_size: 100,
+                cursor: String::new(),
+            }
+            .encode_to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("the street store answers");
+    let listed = ListCustodialPositionsReply::decode(&reply[..]).expect("the reply decodes");
+    assert_eq!(listed.positions.len(), 1);
+    assert_eq!(listed.positions[0].instrument_id, resolved.instrument_id);
+    assert!(listed.unresolved.is_empty());
 }
 
 /// The contract is what grants, so a revision of it that took away what a

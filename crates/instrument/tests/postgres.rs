@@ -14,7 +14,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_instrument::store::{Applied, Identifier, Instrument, Store};
+use meridian_instrument::store::{
+    Applied, Asked, Identifier, IdentifierSet, Instrument, Placeholder, Replaced, Stood, Store,
+};
 use meridian_instrument::PostgresStore;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -250,6 +252,167 @@ fn the_store_can_say_how_much_it_holds() {
         .unwrap();
 
     assert!(store.count().unwrap() >= 1);
+}
+
+fn asked(scheme: &str, value: &str, source: &str) -> Asked {
+    Asked {
+        scheme: scheme.into(),
+        value: value.into(),
+        source: source.into(),
+    }
+}
+
+fn candidate(identifiers: Vec<Asked>) -> Placeholder {
+    Placeholder {
+        placeholder_id: meridian_instrument::ids::placeholder(100),
+        identifiers: IdentifierSet::new(identifiers),
+        source: "snaptrade".into(),
+        asset_class: String::new(),
+        as_of_ns: 100,
+        minted_at_ns: 200,
+    }
+}
+
+#[test]
+fn one_set_in_any_order_is_one_placeholder_and_comes_back_whole() {
+    let store = store();
+    let symbol = unique("SYM");
+    let figi = unique("BBG");
+
+    let (first, stood) = store
+        .stand_in(candidate(vec![
+            asked("symbol", &symbol, "snaptrade"),
+            asked("figi", &figi, ""),
+        ]))
+        .unwrap();
+    assert_eq!(stood, Stood::Minted);
+    assert!(first.placeholder_id.starts_with("LCL-"));
+
+    let (again, stood) = store
+        .stand_in(candidate(vec![
+            asked("figi", &figi, ""),
+            asked("symbol", &symbol, "snaptrade"),
+        ]))
+        .unwrap();
+    assert_eq!(stood, Stood::AlreadyHeld);
+    assert_eq!(
+        again, first,
+        "the set, its date and its source survive the round trip"
+    );
+
+    let held = store.placeholder(&first.placeholder_id).unwrap().unwrap();
+    assert_eq!(held.identifiers.members().len(), 2);
+    assert_eq!(held.as_of_ns, 100);
+    assert_eq!(held.minted_at_ns, 200);
+}
+
+#[test]
+fn concurrent_resolves_of_one_set_meet_one_placeholder() {
+    // The reason the decision is the unique index's. Two resolves of one set
+    // on two statements at once must not mint two placeholders, or one
+    // security becomes two positions.
+    let store = Arc::new(store());
+    let symbol = unique("SYM");
+
+    let mut racing = Vec::new();
+    for _ in 0..16 {
+        let store = store.clone();
+        let symbol = symbol.clone();
+        racing.push(std::thread::spawn(move || {
+            store
+                .stand_in(candidate(vec![asked("symbol", &symbol, "snaptrade")]))
+                .unwrap()
+        }));
+    }
+    let answers: Vec<(Placeholder, Stood)> = racing
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+
+    let minted = answers
+        .iter()
+        .filter(|(_, stood)| *stood == Stood::Minted)
+        .count();
+    assert_eq!(minted, 1);
+    assert!(answers
+        .iter()
+        .all(|(placeholder, _)| placeholder.placeholder_id == answers[0].0.placeholder_id));
+}
+
+#[test]
+fn a_replaced_placeholder_is_kept_and_no_longer_outstanding() {
+    let store = store();
+    let (held, _) = store
+        .stand_in(candidate(vec![asked(
+            "symbol",
+            &unique("SYM"),
+            "snaptrade",
+        )]))
+        .unwrap();
+    let outstanding = |store: &PostgresStore| {
+        store
+            .outstanding()
+            .unwrap()
+            .into_iter()
+            .any(|placeholder| placeholder.placeholder_id == held.placeholder_id)
+    };
+    assert!(outstanding(&store));
+
+    let replacement = unique("INS");
+    assert_eq!(
+        store
+            .replace(&held.placeholder_id, &replacement, 300)
+            .unwrap(),
+        Replaced::Recorded
+    );
+    assert!(!outstanding(&store));
+    assert!(store.placeholder(&held.placeholder_id).unwrap().is_some());
+    assert_eq!(
+        store.replacement_of(&held.placeholder_id).unwrap(),
+        Some(replacement.clone())
+    );
+
+    // The first pairing stands.
+    assert_eq!(
+        store
+            .replace(&held.placeholder_id, &unique("INS"), 400)
+            .unwrap(),
+        Replaced::AlreadyRecorded {
+            replaced_by: replacement
+        }
+    );
+}
+
+#[test]
+fn a_legacy_lcl_instrument_is_outstanding_until_replaced() {
+    let store = store();
+    let legacy = format!("LCL-{}", unique("legacy"));
+    let current = unique("INS");
+    for id in [&legacy, &current] {
+        store
+            .apply(instrument(
+                id,
+                vec![identifier("figi", &unique("BBG"), "", 100)],
+                1,
+            ))
+            .unwrap();
+    }
+
+    let listed = |store: &PostgresStore, id: &str| {
+        store
+            .legacy_outstanding()
+            .unwrap()
+            .into_iter()
+            .any(|instrument| instrument.instrument_id == id)
+    };
+    assert!(listed(&store, &legacy));
+    assert!(
+        !listed(&store, &current),
+        "an INS- instrument is not legacy"
+    );
+
+    store.replace(&legacy, &current, 300).unwrap();
+    assert!(!listed(&store, &legacy));
 }
 
 #[test]

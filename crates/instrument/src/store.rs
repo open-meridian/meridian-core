@@ -73,6 +73,125 @@ pub struct Instrument {
     pub record_time_ns: i64,
 }
 
+/// An identifier as a resolve asked it: undated, because the set is what one
+/// holding was said to be on one date, and the date travels beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Asked {
+    pub scheme: String,
+    pub value: String,
+
+    /// Empty for a global scheme.
+    pub source: String,
+}
+
+/// The identifiers a resolve carried, in one order whatever order they came
+/// in, each once.
+///
+/// A placeholder stands in for a set rather than for an identifier, and the
+/// same set asked twice must meet the same placeholder. A connector that lists
+/// a FIGI before a symbol on Monday and after it on Tuesday is describing one
+/// holding, and two placeholders for it would be two positions for one
+/// security.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentifierSet {
+    members: Vec<Asked>,
+}
+
+impl IdentifierSet {
+    /// Sorted by scheme, then source, then value, and deduplicated.
+    pub fn new(members: impl IntoIterator<Item = Asked>) -> Self {
+        let mut members: Vec<Asked> = members.into_iter().collect();
+        members.sort_by(|left, right| {
+            (&left.scheme, &left.source, &left.value).cmp(&(
+                &right.scheme,
+                &right.source,
+                &right.value,
+            ))
+        });
+        members.dedup();
+        Self { members }
+    }
+
+    pub fn members(&self) -> &[Asked] {
+        &self.members
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// One string per set, and a different string for a different set.
+    ///
+    /// Each field is written with its length in bytes ahead of it, so no value
+    /// can be read as a separator: a symbol with a colon in it, or a source
+    /// that happens to end the way a scheme begins, cannot make two sets
+    /// collide. A store holds this under a unique index, which is what makes
+    /// minting one placeholder per set a property of the table rather than of
+    /// whichever caller got there first.
+    pub fn key(&self) -> String {
+        let mut key = String::new();
+        for member in &self.members {
+            for field in [&member.scheme, &member.source, &member.value] {
+                key.push_str(&field.len().to_string());
+                key.push(':');
+                key.push_str(field);
+            }
+        }
+        key
+    }
+}
+
+/// The deployment's stand-in for an identifier set nothing matched. W3.7.
+///
+/// Not an instrument, and deliberately kept apart from them: it carries no
+/// version because no authority has said anything about it, and holding it in
+/// the instrument table would let it match a later resolve as though it were
+/// one. It is what a holding is recorded against until the platform's `INS-`
+/// ID replaces it, and it is never deleted, because records made with it keep
+/// it and a reader holding one must still learn what it became.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placeholder {
+    /// `LCL-`, minted here.
+    pub placeholder_id: String,
+    pub identifiers: IdentifierSet,
+
+    /// The namespace the identifiers were asked in, for the platform's sake.
+    pub source: String,
+
+    /// Empty today: a resolve carries no asset class. Kept so the store does
+    /// not have to change shape the day one does.
+    pub asset_class: String,
+
+    /// The date the resolve that minted it asked about. An escalation targets
+    /// the mapping effective then, not the one effective when it is sent.
+    pub as_of_ns: i64,
+
+    pub minted_at_ns: i64,
+}
+
+/// What asking for a set's placeholder did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stood {
+    /// None was held for the set, so this one was, and it wants announcing.
+    Minted,
+
+    /// The set already had one, which is the answer. The candidate is
+    /// discarded, never stored.
+    AlreadyHeld,
+}
+
+/// What recording a replacement did. W3.8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// New, and so announced once.
+    Recorded,
+
+    /// Recorded before, by this ID or another. Nothing changes: the first
+    /// pairing the platform gave stands, and a re-announced placeholder's
+    /// second answer is the same pairing anyway.
+    AlreadyRecorded { replaced_by: String },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("the instrument store is unavailable: {0}")]
@@ -135,12 +254,52 @@ pub trait Store: Send + Sync {
 
     /// How many instruments are held. For a dashboard and for tests.
     fn count(&self) -> Result<usize>;
+
+    /// The placeholder for the candidate's identifier set, holding the
+    /// candidate if the set has none. W3.7.
+    ///
+    /// The candidate arrives already minted, because an ID is the caller's to
+    /// make and whether it is kept is the store's to decide. One decision, so
+    /// two resolves of one set racing each other meet one placeholder: the
+    /// in-memory store decides under its lock, and Postgres under the unique
+    /// index on the set's key.
+    fn stand_in(&self, candidate: Placeholder) -> Result<(Placeholder, Stood)>;
+
+    /// The placeholder with this ID, if this store minted it.
+    fn placeholder(&self, placeholder_id: &str) -> Result<Option<Placeholder>>;
+
+    /// Every placeholder not yet replaced, ordered by ID. What W3.7 announces
+    /// again at start and on an interval.
+    fn outstanding(&self) -> Result<Vec<Placeholder>>;
+
+    /// Every held instrument whose ID is `LCL-` and has not been replaced,
+    /// ordered by ID. The legacy path: see [`crate::placeholder`].
+    fn legacy_outstanding(&self) -> Result<Vec<Instrument>>;
+
+    /// Record that `replaced_id` is now `replaced_by`. W3.8.
+    ///
+    /// For any ID, not only a placeholder this store minted: a legacy `LCL-`
+    /// instrument is replaced the same way, and so is a placeholder whose row
+    /// a restore from an older backup lost, because the street store may
+    /// still hold positions under it.
+    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced>;
+
+    /// What `instrument_id` was replaced by, if it was.
+    fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>>;
 }
 
 /// A store's contents, for an implementation to reuse.
 #[derive(Debug, Default)]
 pub(crate) struct Held {
     pub(crate) by_id: HashMap<String, Instrument>,
+
+    pub(crate) placeholders: HashMap<String, Placeholder>,
+
+    /// A set's key to its placeholder's ID. The in-memory unique index.
+    pub(crate) placeholder_by_set: HashMap<String, String>,
+
+    /// Replaced ID to what replaced it, and when.
+    pub(crate) replacements: HashMap<String, (String, i64)>,
 }
 
 impl Held {
@@ -181,5 +340,65 @@ impl Held {
         // an incident nobody can reproduce.
         found.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
         found
+    }
+
+    pub(crate) fn stand_in(&mut self, candidate: Placeholder) -> (Placeholder, Stood) {
+        let key = candidate.identifiers.key();
+        if let Some(held) = self
+            .placeholder_by_set
+            .get(&key)
+            .and_then(|placeholder_id| self.placeholders.get(placeholder_id))
+        {
+            return (held.clone(), Stood::AlreadyHeld);
+        }
+
+        self.placeholder_by_set
+            .insert(key, candidate.placeholder_id.clone());
+        self.placeholders
+            .insert(candidate.placeholder_id.clone(), candidate.clone());
+        (candidate, Stood::Minted)
+    }
+
+    pub(crate) fn outstanding(&self) -> Vec<Placeholder> {
+        let mut outstanding: Vec<Placeholder> = self
+            .placeholders
+            .values()
+            .filter(|placeholder| !self.replacements.contains_key(&placeholder.placeholder_id))
+            .cloned()
+            .collect();
+        outstanding.sort_by(|left, right| left.placeholder_id.cmp(&right.placeholder_id));
+        outstanding
+    }
+
+    pub(crate) fn legacy_outstanding(&self) -> Vec<Instrument> {
+        let mut legacy: Vec<Instrument> = self
+            .by_id
+            .values()
+            .filter(|instrument| {
+                instrument
+                    .instrument_id
+                    .starts_with(crate::ids::PLACEHOLDER_PREFIX)
+                    && !self.replacements.contains_key(&instrument.instrument_id)
+            })
+            .cloned()
+            .collect();
+        legacy.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+        legacy
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        replaced_id: &str,
+        replaced_by: &str,
+        now_ns: i64,
+    ) -> Replaced {
+        if let Some((held, _)) = self.replacements.get(replaced_id) {
+            return Replaced::AlreadyRecorded {
+                replaced_by: held.clone(),
+            };
+        }
+        self.replacements
+            .insert(replaced_id.to_string(), (replaced_by.to_string(), now_ns));
+        Replaced::Recorded
     }
 }
