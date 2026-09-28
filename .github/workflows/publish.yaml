@@ -186,10 +186,13 @@ jobs:
       - name: Pin the image this chart was published beside
         env:
           SHA: ${{ steps.version.outputs.sha }}
+        # Quoted, because a short sha can be all digits: unquoted, YAML reads
+        # `tag: 1896148` as a number and Helm renders the image as
+        # `meridian-runtime:1.896148e+06`. Found when 1896148 was published.
         run: |
           set -euo pipefail
-          sed -i "s|^  tag: latest$|  tag: $SHA|" deploy/chart/values.yaml
-          grep -qx "  tag: $SHA" deploy/chart/values.yaml
+          sed -i "s|^  tag: latest$|  tag: \"$SHA\"|" deploy/chart/values.yaml
+          grep -qx "  tag: \"$SHA\"" deploy/chart/values.yaml
 
       # Asserted by rendering rather than by trusting the edit above: a sed
       # that matches nothing exits 0, and the failure would be a published
