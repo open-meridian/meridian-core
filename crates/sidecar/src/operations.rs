@@ -63,6 +63,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ReportMissingInstrumentParams>,
     ) -> Result<Response<plugin::Published>, Status> {
         let mut message: domain::MissingInstrumentDetectedEvent = self.as_domain(request.into_inner())?;
+        message.placeholder_instrument_id = Default::default();
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
     }

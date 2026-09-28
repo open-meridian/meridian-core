@@ -563,8 +563,10 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
     let its_own = "platform.reference.event.instrument-applied";
     let mut allowed = listening.subscribe(its_own);
 
-    // And says custody publishes this one. A component is not a connector.
-    let a_plugins = "platform.reference.event.instrument-missing";
+    // And says only custody publishes this one. A component is not a
+    // connector. (Not instrument-missing, which the instrument store now
+    // publishes too, for its placeholders: W3.7.)
+    let a_plugins = "platform.street.command.record-holding";
     let mut refused = listening.subscribe(a_plugins);
     settle().await;
 

@@ -114,6 +114,7 @@ fn a_miss_the_platform_does_not_know_is_minted_applied_and_resolvable() {
         publisher_instance_id: "end-to-end".into(),
         reason: MissReason::NotFound as i32,
         observed_at_ns: as_of,
+        placeholder_instrument_id: String::new(),
     };
 
     let reaction = runtime()
@@ -181,6 +182,7 @@ fn applying_the_same_record_twice_changes_nothing() {
         publisher_instance_id: "end-to-end".into(),
         reason: MissReason::NotFound as i32,
         observed_at_ns: now_ns(),
+        placeholder_instrument_id: String::new(),
     };
 
     let record = match runtime()

@@ -378,6 +378,7 @@ impl Platform {
             identifiers: event.identifiers.clone(),
             as_of_ns: event.as_of_ns,
             requesting_deployment_id: self.config.deployment_id.clone(),
+            placeholder_instrument_id: event.placeholder_instrument_id.clone(),
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
@@ -394,6 +395,7 @@ impl Platform {
                 .collect::<Vec<_>>(),
             "as_of_ns": request.as_of_ns,
             "requesting_deployment_id": request.requesting_deployment_id,
+            "placeholder_instrument_id": request.placeholder_instrument_id,
         }))
         .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
 
@@ -410,7 +412,11 @@ impl Platform {
             return Ok(None);
         }
         let reply: WireReply = read(&response)?;
-        if !reply.minted.unwrap_or(true) {
+        // A conflict pairs nothing: staff decide, and the placeholder stays in
+        // use. `minted: false` with a record is a pairing with an instrument
+        // the platform already held, applied exactly as a minted one is
+        // (EscalateInstrumentReply). Without a record it is a decline.
+        if reply.conflict.unwrap_or(false) {
             return Ok(None);
         }
         reply.instrument.map(into_record).transpose()
@@ -695,7 +701,9 @@ impl Platform {
 #[derive(Debug, Deserialize)]
 struct WireReply {
     found: Option<bool>,
+    #[allow(dead_code)]
     minted: Option<bool>,
+    conflict: Option<bool>,
     instrument: Option<WireRecord>,
 }
 
@@ -1314,6 +1322,7 @@ pub(crate) mod tests {
             publisher_instance_id: "custody-snaptrade-1".into(),
             reason: reason as i32,
             observed_at_ns: NOW,
+            placeholder_instrument_id: String::new(),
         }
     }
 

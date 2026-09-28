@@ -337,6 +337,7 @@ mod tests {
                 valid_from_ns: AS_OF - 1,
                 ..Default::default()
             }),
+            replaces_instrument_id: String::new(),
         }
     }
 
@@ -560,6 +561,7 @@ mod tests {
                 PullInstrumentReply {
                     found: false,
                     instrument: None,
+                    replaces_instrument_id: String::new(),
                 }
                 .encode_to_vec(),
                 "CORR-1",

@@ -143,6 +143,9 @@ impl Conductor {
         let reply = PullInstrumentReply {
             found: true,
             instrument: Some(record),
+            // The placeholder the miss carried, if any, so the instrument
+            // store can replace it (W3.8).
+            replaces_instrument_id: event.placeholder_instrument_id.clone(),
         };
 
         // The miss's correlation travels with it, so the whole arc -- the
@@ -214,6 +217,7 @@ mod tests {
             publisher_instance_id: "custody-snaptrade-1".into(),
             reason: MissReason::NotFound as i32,
             observed_at_ns: NOW,
+            placeholder_instrument_id: String::new(),
         }
     }
 

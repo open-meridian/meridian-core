@@ -1727,8 +1727,13 @@ pub struct Identifier {
 /// effective time, not on when it happened to learn the mapping.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentRecord {
-    /// Canonical identifier. "LCL-{uuid}" for a locally minted instrument,
-    /// "INS-{uuid}" for one minted by the central authority.
+    /// Canonical identifier, "INS-..." and minted only by the central authority.
+    ///
+    /// A deployment's stores may also hold its own placeholder, "LCL-...", which
+    /// its instrument store mints for an identifier set nothing matched (W3.7)
+    /// and which the INS- ID replaces in everything live when it arrives (W3.8).
+    /// A placeholder is never minted by the authority and never leaves the
+    /// deployment except on its own escalation.
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
     /// The full identifier set. An amend replaces this authoritatively.
@@ -2091,6 +2096,12 @@ pub struct ResolveIdentifierReply {
     /// Set only when found is false.
     #[prost(enumeration = "MissReason", tag = "3")]
     pub miss_reason: i32,
+    /// True when nothing matched and instrument_id is the deployment's LCL-
+    /// placeholder for the set (W3.7), which a holding may be recorded against
+    /// until its INS- ID replaces it. found is true alongside it. An ambiguous
+    /// resolve never answers a placeholder.
+    #[prost(bool, tag = "4")]
+    pub placeholder: bool,
 }
 /// Forward resolution: an instrument identifier to its record.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2134,6 +2145,11 @@ pub struct MissingInstrumentDetectedEvent {
     pub reason: i32,
     #[prost(int64, tag = "7")]
     pub observed_at_ns: i64,
+    /// The deployment's LCL- placeholder for these identifiers, when its
+    /// instrument store minted or re-announced one (W3.7). Empty for an
+    /// ambiguous miss, which has no placeholder.
+    #[prost(string, tag = "8")]
+    pub placeholder_instrument_id: ::prost::alloc::string::String,
 }
 /// Reply to a pull of one instrument from the central authority.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2142,6 +2158,11 @@ pub struct PullInstrumentReply {
     pub found: bool,
     #[prost(message, optional, tag = "2")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
+    /// On the instrument-pulled event: the deployment's placeholder this record
+    /// replaces (W3.3, W3.4), so the instrument store can replace it (W3.8).
+    /// Empty when the record replaces nothing.
+    #[prost(string, tag = "3")]
+    pub replaces_instrument_id: ::prost::alloc::string::String,
 }
 /// Reply to a pull resolving identifiers against the central authority.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2153,8 +2174,10 @@ pub struct PullIdentifierReply {
     #[prost(enumeration = "MissReason", tag = "3")]
     pub miss_reason: i32,
 }
-/// Ask the central authority to mint an identity for something neither side
-/// knows. The identifiers become the stub an administrator completes.
+/// Ask the central authority to pair a deployment's placeholder with an
+/// instrument (W3.4): one sharing an identifier in force on the date, or a stub
+/// minted from these identifiers for an administrator to complete. Idempotent
+/// per placeholder: asking again answers the same pairing.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EscalateInstrumentRequest {
     #[prost(string, tag = "1")]
@@ -2167,15 +2190,28 @@ pub struct EscalateInstrumentRequest {
     pub as_of_ns: i64,
     #[prost(string, tag = "5")]
     pub requesting_deployment_id: ::prost::alloc::string::String,
+    /// The deployment's LCL- placeholder for these identifiers.
+    #[prost(string, tag = "6")]
+    pub placeholder_instrument_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EscalateInstrumentReply {
     #[prost(message, optional, tag = "1")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
-    /// False when the authority already held a match and returned it instead of
-    /// minting. The caller treats both alike; this is for the operator.
+    /// False when the authority paired the placeholder with an instrument it
+    /// already held rather than minting one. The caller applies the record
+    /// either way; this is for the operator.
     #[prost(bool, tag = "2")]
     pub minted: bool,
+    /// The placeholder the instrument replaces, echoed from the request.
+    #[prost(string, tag = "3")]
+    pub replaces_instrument_id: ::prost::alloc::string::String,
+    /// True when the identifiers point at more than one instrument, or agree on
+    /// one identifier and contradict another of the same scheme. Nothing is
+    /// paired or minted, instrument is empty, and staff decide; the placeholder
+    /// stays in use until they have.
+    #[prost(bool, tag = "4")]
+    pub conflict: bool,
 }
 /// A record reached the local replica, by pull or by mint.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2188,6 +2224,20 @@ pub struct InstrumentAppliedEvent {
     pub applied: bool,
     #[prost(int64, tag = "3")]
     pub applied_at_ns: i64,
+}
+/// A deployment's placeholder was replaced by the instrument that it stood for
+/// (W3.8). Stores keyed by instrument move what they hold under the placeholder
+/// onto the instrument (W3.9); records of what was reported keep it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentReplacedEvent {
+    /// The LCL- placeholder.
+    #[prost(string, tag = "1")]
+    pub replaced_instrument_id: ::prost::alloc::string::String,
+    /// What replaces it.
+    #[prost(message, optional, tag = "2")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+    #[prost(int64, tag = "3")]
+    pub replaced_at_ns: i64,
 }
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2408,9 +2458,10 @@ pub struct RecordHoldingsStatementReply {
 }
 /// One holding, for one account, at one instrument.
 ///
-/// Either `instrument_id` is set, meaning the connector resolved it, or
-/// `unresolved_identifiers` is set, meaning it could not. Never both, and never
-/// neither. A row that could not be resolved is still recorded, because a
+/// Either `instrument_id` is set, meaning the connector resolved it (to an
+/// instrument, or to the deployment's LCL- placeholder when nothing matched),
+/// or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
+/// both, and never neither. A row that could not be resolved is still recorded, because a
 /// dropped holding is invisible and an operator comparing against their
 /// brokerage would find a silent discrepancy with nothing to investigate.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2504,6 +2555,8 @@ pub struct CustodialPositionUpdatedEvent {
 pub struct CustodialPosition {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
+    /// An instrument, or the deployment's LCL- placeholder awaiting identity,
+    /// which the INS- ID replaces when it arrives (W3.9).
     #[prost(string, tag = "2")]
     pub instrument_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "3")]

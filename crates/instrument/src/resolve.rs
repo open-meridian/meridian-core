@@ -144,6 +144,7 @@ pub fn missing_instrument(
         publisher_instance_id: publisher_instance_id.to_string(),
         reason: reply.miss_reason,
         observed_at_ns,
+        placeholder_instrument_id: String::new(),
     })
 }
 
@@ -184,6 +185,7 @@ fn resolved(instrument_id: String) -> ResolveIdentifierReply {
         found: true,
         instrument_id,
         miss_reason: MissReason::Unspecified as i32,
+        placeholder: false,
     }
 }
 
@@ -192,6 +194,7 @@ fn missed(reason: MissReason) -> ResolveIdentifierReply {
         found: false,
         instrument_id: String::new(),
         miss_reason: reason as i32,
+        placeholder: false,
     }
 }
 

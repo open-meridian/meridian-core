@@ -35,8 +35,9 @@ platform.deployment.command.remove-plugin	command	conductor	launcher
 platform.deployment.event.component-report	event	street	conductor
 platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
 platform.reference.event.instrument-applied	event	instrument	dashboard
-platform.reference.event.instrument-missing	event	custody	instrument
+platform.reference.event.instrument-missing	event	custody,instrument	conductor
 platform.reference.event.instrument-pulled	event	conductor	instrument
+platform.reference.event.instrument-replaced	event	instrument	street
 platform.reference.query.resolve-identifier	query	custody	instrument
 platform.reference.query.resolve-instrument	query	street	instrument
 platform.street.command.record-holding	command	custody	street

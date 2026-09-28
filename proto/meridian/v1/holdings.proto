@@ -109,9 +109,10 @@ message RecordHoldingsStatementReply {
 
 // One holding, for one account, at one instrument.
 //
-// Either `instrument_id` is set, meaning the connector resolved it, or
-// `unresolved_identifiers` is set, meaning it could not. Never both, and never
-// neither. A row that could not be resolved is still recorded, because a
+// Either `instrument_id` is set, meaning the connector resolved it (to an
+// instrument, or to the deployment's LCL- placeholder when nothing matched),
+// or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
+// both, and never neither. A row that could not be resolved is still recorded, because a
 // dropped holding is invisible and an operator comparing against their
 // brokerage would find a silent discrepancy with nothing to investigate.
 message RecordHoldingRequest {
@@ -196,6 +197,9 @@ message CustodialPositionUpdatedEvent {
 // own name, and no reader of this one silently changes meaning.
 message CustodialPosition {
   string account_id = 1;
+
+  // An instrument, or the deployment's LCL- placeholder awaiting identity,
+  // which the INS- ID replaces when it arrives (W3.9).
   string instrument_id = 2;
   int64 quantity_scaled_1e8 = 3;
   int64 market_value_scaled_1e8 = 4;
