@@ -109,6 +109,13 @@ message DefineInstrumentRequest {
 
   // When the mapping becomes effective. Zero means now.
   int64 valid_from_ns = 6;
+
+  // Where the writer found what it wrote, and its change note: an agent
+  // documents its research here (what it looked for, where, what it found,
+  // why). Required from an agent, optional from a person. W1; spec
+  // agents-keep-the-security-master, requirements 27 and 28.
+  string source = 7;
+  string note = 8;
 }
 
 // Authoritative replace of the identifier set and attributes. Not a delta: an
@@ -123,15 +130,26 @@ message AmendInstrumentRequest {
   string exchange_mic = 5;
   string description = 6;
   int64 valid_from_ns = 7;
+
+  // Where the writer found what it wrote, and its change note: an agent
+  // documents its research here (what it looked for, where, what it found,
+  // why). Required from an agent, optional from a person. W1; spec
+  // agents-keep-the-security-master, requirements 27 and 28.
+  string source = 8;
+  string note = 9;
 }
 
 // The verb is the transition, so the request carries only the subject.
 message DecommissionInstrumentRequest {
   string instrument_id = 1;
+  string source = 2;
+  string note = 3;
 }
 
 message ReactivateInstrumentRequest {
   string instrument_id = 1;
+  string source = 2;
+  string note = 3;
 }
 
 message ListInstrumentsRequest {
@@ -145,6 +163,166 @@ message ListInstrumentsRequest {
 message ListInstrumentsReply {
   repeated InstrumentRecord instruments = 1;
   // Empty when the listing is exhausted.
+  string next_cursor = 2;
+}
+
+// W1.6. Any identifier value, of any scheme, or a name; resolved as of a date.
+message SearchInstrumentsRequest {
+  string query = 1;
+  // Zero means now.
+  int64 as_of_ns = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+// Who made a change: a person, or an agent acting for one on a delegation.
+message ChangeActor {
+  string person_id = 1;
+  // Empty when a person acted in their own name.
+  string agent_client_id = 2;
+  string delegation_id = 3;
+}
+
+// W1.7. One entry per change, append-only, record time stamped by the store.
+message ChangelogEntry {
+  string entry_id = 1;
+  string instrument_id = 2;
+  int64 version = 3;
+  // The step that made it: define, amend, activate, decommission,
+  // reactivate, map, mint.
+  string operation = 4;
+  repeated Identifier identifiers_before = 5;
+  repeated Identifier identifiers_after = 6;
+  ChangeActor actor = 7;
+  string source = 8;
+  string note = 9;
+  // Set when the change was an accepted proposal.
+  string proposal_id = 10;
+  // The person who accepted it, when it was.
+  string accepted_by_person_id = 11;
+  int64 record_time_ns = 12;
+}
+
+message InstrumentChangelogRequest {
+  string instrument_id = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message InstrumentChangelogReply {
+  // Newest first.
+  repeated ChangelogEntry entries = 1;
+  string next_cursor = 2;
+}
+
+// W1.8. DEFINE to ACTIVE: completing a defined instrument, a stub included.
+message ActivateInstrumentRequest {
+  string instrument_id = 1;
+  string source = 2;
+  string note = 3;
+}
+
+enum ProposalOperation {
+  PROPOSAL_OPERATION_UNSPECIFIED = 0;
+  // Changing or ending an identifier an active instrument already has.
+  PROPOSAL_OPERATION_AMEND = 1;
+  PROPOSAL_OPERATION_DECOMMISSION = 2;
+  PROPOSAL_OPERATION_REACTIVATE = 3;
+  PROPOSAL_OPERATION_MAP_STUB = 4;
+}
+
+enum ProposalState {
+  PROPOSAL_STATE_UNSPECIFIED = 0;
+  PROPOSAL_STATE_PENDING = 1;
+  PROPOSAL_STATE_ACCEPTED = 2;
+  PROPOSAL_STATE_REJECTED = 3;
+  // The instrument moved past the version the proposal was made against.
+  PROPOSAL_STATE_SUPERSEDED = 4;
+}
+
+// W1.9. What an agent asks for when it may not make the change itself. It
+// never blocks the agent's run; staff decide later (W1.10).
+message ProposeChangeRequest {
+  string instrument_id = 1;
+  int64 against_version = 2;
+  ProposalOperation operation = 3;
+  // The full amend, for PROPOSAL_OPERATION_AMEND.
+  AmendInstrumentRequest amend = 4;
+  // The existing instrument a stub is the same as, for MAP_STUB.
+  string map_onto_instrument_id = 5;
+  string source = 6;
+  // Required: the agent's research, for the person who reviews it.
+  string note = 7;
+}
+
+message ProposalRecord {
+  string proposal_id = 1;
+  string instrument_id = 2;
+  int64 against_version = 3;
+  ProposalOperation operation = 4;
+  AmendInstrumentRequest amend = 5;
+  string map_onto_instrument_id = 6;
+  string source = 7;
+  string note = 8;
+  ChangeActor proposed_by = 9;
+  int64 proposed_at_ns = 10;
+  ProposalState state = 11;
+  string decided_by_person_id = 12;
+  int64 decided_at_ns = 13;
+  string decision_note = 14;
+}
+
+// W1.10.
+message ListProposalsRequest {
+  // Zero means pending.
+  ProposalState state = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message ListProposalsReply {
+  repeated ProposalRecord proposals = 1;
+  string next_cursor = 2;
+}
+
+message DecideProposalRequest {
+  string proposal_id = 1;
+  bool accept = 2;
+  string note = 3;
+}
+
+// W1.11. A stub minted from a miss is the same as an instrument the master
+// already holds: its identifiers move onto that one, and the stub is retired.
+message MapStubRequest {
+  string stub_instrument_id = 1;
+  string onto_instrument_id = 2;
+  string source = 3;
+  string note = 4;
+}
+
+// W1.13. What deployments asked for and the master did not hold, gathered by
+// identifier set (W3.3 and W3.4 record each miss).
+message MissEntry {
+  string miss_id = 1;
+  repeated Identifier identifiers = 2;
+  string asset_class = 3;
+  int64 count = 4;
+  int32 deployment_count = 5;
+  int64 first_seen_ns = 6;
+  int64 last_seen_ns = 7;
+  // The stub it minted or found, if it was escalated.
+  string stub_instrument_id = 8;
+}
+
+message ListMissesRequest {
+  string asset_class = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message ListMissesReply {
+  // Most wanted first.
+  repeated MissEntry misses = 1;
   string next_cursor = 2;
 }
 

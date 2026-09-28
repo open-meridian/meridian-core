@@ -616,6 +616,72 @@ pub struct ReadDiagnosticBundleRequest {
     #[prost(string, tag = "1")]
     pub bundle_id: ::prost::alloc::string::String,
 }
+/// The kinds of security an agent researches and populates. Empty means
+/// nothing: an agent with no scope works on nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResearchScope {
+    #[prost(string, repeated, tag = "1")]
+    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Optional narrowing, by listing venue and by identifier scheme.
+    #[prost(string, repeated, tag = "2")]
+    pub venue_mics: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "3")]
+    pub schemes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A record the platform owns; every authorisation of an agent reads it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DelegationRecord {
+    #[prost(string, tag = "1")]
+    pub delegation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub person_id: ::prost::alloc::string::String,
+    /// The agent client that registered, and the name it gave.
+    #[prost(string, tag = "3")]
+    pub agent_client_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub agent_name: ::prost::alloc::string::String,
+    #[prost(enumeration = "StaffCapability", tag = "5")]
+    pub capability: i32,
+    #[prost(int64, tag = "6")]
+    pub created_at_ns: i64,
+    /// At most 90 days after it was made.
+    #[prost(int64, tag = "7")]
+    pub expires_at_ns: i64,
+    /// Zero while it stands.
+    #[prost(int64, tag = "8")]
+    pub revoked_at_ns: i64,
+    #[prost(int64, tag = "9")]
+    pub last_used_at_ns: i64,
+    #[prost(message, optional, tag = "10")]
+    pub scope: ::core::option::Option<ResearchScope>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDelegationsRequest {
+    #[prost(int32, tag = "1")]
+    pub page_size: i32,
+    #[prost(string, tag = "2")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDelegationsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub delegations: ::prost::alloc::vec::Vec<DelegationRecord>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RevokeDelegationRequest {
+    #[prost(string, tag = "1")]
+    pub delegation_id: ::prost::alloc::string::String,
+}
+/// W1.12.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetResearchScopeRequest {
+    #[prost(string, tag = "1")]
+    pub delegation_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub scope: ::core::option::Option<ResearchScope>,
+}
 /// What a person may do inside one organisation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1708,6 +1774,14 @@ pub struct DefineInstrumentRequest {
     /// When the mapping becomes effective. Zero means now.
     #[prost(int64, tag = "6")]
     pub valid_from_ns: i64,
+    /// Where the writer found what it wrote, and its change note: an agent
+    /// documents its research here (what it looked for, where, what it found,
+    /// why). Required from an agent, optional from a person. W1; spec
+    /// agents-keep-the-security-master, requirements 27 and 28.
+    #[prost(string, tag = "7")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
 }
 /// Authoritative replace of the identifier set and attributes. Not a delta: an
 /// identifier absent here is removed, and its validity window closes as of
@@ -1729,17 +1803,33 @@ pub struct AmendInstrumentRequest {
     pub description: ::prost::alloc::string::String,
     #[prost(int64, tag = "7")]
     pub valid_from_ns: i64,
+    /// Where the writer found what it wrote, and its change note: an agent
+    /// documents its research here (what it looked for, where, what it found,
+    /// why). Required from an agent, optional from a person. W1; spec
+    /// agents-keep-the-security-master, requirements 27 and 28.
+    #[prost(string, tag = "8")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub note: ::prost::alloc::string::String,
 }
 /// The verb is the transition, so the request carries only the subject.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DecommissionInstrumentRequest {
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReactivateInstrumentRequest {
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListInstrumentsRequest {
@@ -1758,6 +1848,221 @@ pub struct ListInstrumentsReply {
     #[prost(message, repeated, tag = "1")]
     pub instruments: ::prost::alloc::vec::Vec<InstrumentRecord>,
     /// Empty when the listing is exhausted.
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// W1.6. Any identifier value, of any scheme, or a name; resolved as of a date.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchInstrumentsRequest {
+    #[prost(string, tag = "1")]
+    pub query: ::prost::alloc::string::String,
+    /// Zero means now.
+    #[prost(int64, tag = "2")]
+    pub as_of_ns: i64,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+/// Who made a change: a person, or an agent acting for one on a delegation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChangeActor {
+    #[prost(string, tag = "1")]
+    pub person_id: ::prost::alloc::string::String,
+    /// Empty when a person acted in their own name.
+    #[prost(string, tag = "2")]
+    pub agent_client_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub delegation_id: ::prost::alloc::string::String,
+}
+/// W1.7. One entry per change, append-only, record time stamped by the store.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChangelogEntry {
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub version: i64,
+    /// The step that made it: define, amend, activate, decommission,
+    /// reactivate, map, mint.
+    #[prost(string, tag = "4")]
+    pub operation: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub identifiers_before: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(message, repeated, tag = "6")]
+    pub identifiers_after: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(message, optional, tag = "7")]
+    pub actor: ::core::option::Option<ChangeActor>,
+    #[prost(string, tag = "8")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub note: ::prost::alloc::string::String,
+    /// Set when the change was an accepted proposal.
+    #[prost(string, tag = "10")]
+    pub proposal_id: ::prost::alloc::string::String,
+    /// The person who accepted it, when it was.
+    #[prost(string, tag = "11")]
+    pub accepted_by_person_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "12")]
+    pub record_time_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentChangelogRequest {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentChangelogReply {
+    /// Newest first.
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<ChangelogEntry>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// W1.8. DEFINE to ACTIVE: completing a defined instrument, a stub included.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActivateInstrumentRequest {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W1.9. What an agent asks for when it may not make the change itself. It
+/// never blocks the agent's run; staff decide later (W1.10).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProposeChangeRequest {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub against_version: i64,
+    #[prost(enumeration = "ProposalOperation", tag = "3")]
+    pub operation: i32,
+    /// The full amend, for PROPOSAL_OPERATION_AMEND.
+    #[prost(message, optional, tag = "4")]
+    pub amend: ::core::option::Option<AmendInstrumentRequest>,
+    /// The existing instrument a stub is the same as, for MAP_STUB.
+    #[prost(string, tag = "5")]
+    pub map_onto_instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub source: ::prost::alloc::string::String,
+    /// Required: the agent's research, for the person who reviews it.
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProposalRecord {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub against_version: i64,
+    #[prost(enumeration = "ProposalOperation", tag = "4")]
+    pub operation: i32,
+    #[prost(message, optional, tag = "5")]
+    pub amend: ::core::option::Option<AmendInstrumentRequest>,
+    #[prost(string, tag = "6")]
+    pub map_onto_instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub proposed_by: ::core::option::Option<ChangeActor>,
+    #[prost(int64, tag = "10")]
+    pub proposed_at_ns: i64,
+    #[prost(enumeration = "ProposalState", tag = "11")]
+    pub state: i32,
+    #[prost(string, tag = "12")]
+    pub decided_by_person_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "13")]
+    pub decided_at_ns: i64,
+    #[prost(string, tag = "14")]
+    pub decision_note: ::prost::alloc::string::String,
+}
+/// W1.10.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListProposalsRequest {
+    /// Zero means pending.
+    #[prost(enumeration = "ProposalState", tag = "1")]
+    pub state: i32,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListProposalsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub proposals: ::prost::alloc::vec::Vec<ProposalRecord>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecideProposalRequest {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub accept: bool,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W1.11. A stub minted from a miss is the same as an instrument the master
+/// already holds: its identifiers move onto that one, and the stub is retired.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MapStubRequest {
+    #[prost(string, tag = "1")]
+    pub stub_instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub onto_instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W1.13. What deployments asked for and the master did not hold, gathered by
+/// identifier set (W3.3 and W3.4 record each miss).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MissEntry {
+    #[prost(string, tag = "1")]
+    pub miss_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(string, tag = "3")]
+    pub asset_class: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub count: i64,
+    #[prost(int32, tag = "5")]
+    pub deployment_count: i32,
+    #[prost(int64, tag = "6")]
+    pub first_seen_ns: i64,
+    #[prost(int64, tag = "7")]
+    pub last_seen_ns: i64,
+    /// The stub it minted or found, if it was escalated.
+    #[prost(string, tag = "8")]
+    pub stub_instrument_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListMissesRequest {
+    #[prost(string, tag = "1")]
+    pub asset_class: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListMissesReply {
+    /// Most wanted first.
+    #[prost(message, repeated, tag = "1")]
+    pub misses: ::prost::alloc::vec::Vec<MissEntry>,
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -1919,6 +2224,78 @@ impl InstrumentLifecycleState {
             "INSTRUMENT_LIFECYCLE_STATE_DEFINE" => Some(Self::Define),
             "INSTRUMENT_LIFECYCLE_STATE_ACTIVE" => Some(Self::Active),
             "INSTRUMENT_LIFECYCLE_STATE_DECOMMISSIONED" => Some(Self::Decommissioned),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProposalOperation {
+    Unspecified = 0,
+    /// Changing or ending an identifier an active instrument already has.
+    Amend = 1,
+    Decommission = 2,
+    Reactivate = 3,
+    MapStub = 4,
+}
+impl ProposalOperation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROPOSAL_OPERATION_UNSPECIFIED",
+            Self::Amend => "PROPOSAL_OPERATION_AMEND",
+            Self::Decommission => "PROPOSAL_OPERATION_DECOMMISSION",
+            Self::Reactivate => "PROPOSAL_OPERATION_REACTIVATE",
+            Self::MapStub => "PROPOSAL_OPERATION_MAP_STUB",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROPOSAL_OPERATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROPOSAL_OPERATION_AMEND" => Some(Self::Amend),
+            "PROPOSAL_OPERATION_DECOMMISSION" => Some(Self::Decommission),
+            "PROPOSAL_OPERATION_REACTIVATE" => Some(Self::Reactivate),
+            "PROPOSAL_OPERATION_MAP_STUB" => Some(Self::MapStub),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProposalState {
+    Unspecified = 0,
+    Pending = 1,
+    Accepted = 2,
+    Rejected = 3,
+    /// The instrument moved past the version the proposal was made against.
+    Superseded = 4,
+}
+impl ProposalState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROPOSAL_STATE_UNSPECIFIED",
+            Self::Pending => "PROPOSAL_STATE_PENDING",
+            Self::Accepted => "PROPOSAL_STATE_ACCEPTED",
+            Self::Rejected => "PROPOSAL_STATE_REJECTED",
+            Self::Superseded => "PROPOSAL_STATE_SUPERSEDED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROPOSAL_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROPOSAL_STATE_PENDING" => Some(Self::Pending),
+            "PROPOSAL_STATE_ACCEPTED" => Some(Self::Accepted),
+            "PROPOSAL_STATE_REJECTED" => Some(Self::Rejected),
+            "PROPOSAL_STATE_SUPERSEDED" => Some(Self::Superseded),
             _ => None,
         }
     }

@@ -744,3 +744,54 @@ message DiagnosticBundleSummary {
 message ReadDiagnosticBundleRequest {
   string bundle_id = 1;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agents: a person delegates a capability they hold (W5.26, W5.27, W1.12)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The kinds of security an agent researches and populates. Empty means
+// nothing: an agent with no scope works on nothing.
+message ResearchScope {
+  repeated string asset_classes = 1;
+  // Optional narrowing, by listing venue and by identifier scheme.
+  repeated string venue_mics = 2;
+  repeated string schemes = 3;
+}
+
+// A record the platform owns; every authorisation of an agent reads it.
+message DelegationRecord {
+  string delegation_id = 1;
+  string person_id = 2;
+  // The agent client that registered, and the name it gave.
+  string agent_client_id = 3;
+  string agent_name = 4;
+  StaffCapability capability = 5;
+  int64 created_at_ns = 6;
+  // At most 90 days after it was made.
+  int64 expires_at_ns = 7;
+  // Zero while it stands.
+  int64 revoked_at_ns = 8;
+  int64 last_used_at_ns = 9;
+  ResearchScope scope = 10;
+}
+
+message ListDelegationsRequest {
+  int32 page_size = 1;
+  string cursor = 2;
+}
+
+message ListDelegationsReply {
+  repeated DelegationRecord delegations = 1;
+  string next_cursor = 2;
+}
+
+message RevokeDelegationRequest {
+  string delegation_id = 1;
+}
+
+// W1.12.
+message SetResearchScopeRequest {
+  string delegation_id = 1;
+  ResearchScope scope = 2;
+}
+
