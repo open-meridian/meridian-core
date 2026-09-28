@@ -2,6 +2,12 @@ name: Suggest an improvement
 description: An idea, a missing feature, or something that could be better.
 labels: [suggestion]
 body:
+  - type: markdown
+    attributes:
+      value: >
+        This is public, and whatever we build from it goes into the open
+        platform for everyone. Share only what you're happy to see public:
+        nothing confidential about your firm, its strategies or its clients.
   - type: textarea
     id: problem
     attributes:
