@@ -166,27 +166,13 @@ code as it is being written, which nobody has reviewed, and every page says
 so. Never on a deployment your firm depends on: it is set at install and
 nowhere else, and turning it off stops every plugin running that way.
 
-`meridian up` runs `meridian doctor` first, then prints the Helm command it
-runs, installs, waits for the dashboard, and prints the wizard's address.
-**By hand**, the command it prints is the install:
+`meridian up` runs `meridian doctor` first, then installs, waits for the
+dashboard, and prints the wizard's address. It prints the Helm command it ran,
+so you can see exactly what it did.
 
-```bash
-helm upgrade --install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
-  --namespace meridian --create-namespace \
-  --set deployment.id=DEP-01M3GZ8K4Q7T2V9W6X5Y3R1N0P \
-  --set deployment.enrolmentCode="$MERIDIAN_ENROLMENT_CODE" \
-  --set ingress.enabled=true --set ingress.host=meridian.firm.example \
-  -f ingress.yaml
-```
-
-Now look at the pods:
-
-```bash
-kubectl --namespace meridian get pods --watch
-```
-
-**Some of them will sit in an error, and that is what a correct install looks
-like at this point.** Expect this:
+If you watch the pods while it comes up (`kubectl --namespace meridian get
+pods`), **some of them will sit in an error, and that is what a correct install
+looks like at this point.** Expect this:
 
 | | |
 |---|---|
@@ -209,13 +195,9 @@ count for those three. Ignore it until after step 7.
 
 ## 4. Check the deployment enrolled, and that the key is yours
 
-The conductor enrols by itself while the pods come up. Confirm it:
-
-```bash
-kubectl --namespace meridian logs -l meridian.dev/component=conductor --tail=40
-```
-
-Back on the platform, the deployment now lists a key with a **fingerprint**.
+The conductor enrols by itself while the pods come up. Confirm it on the
+platform: the deployment now shows **Connected**, and lists a key with a
+**fingerprint**.
 You will compare it against the deployment's own in the next step. Do not skip
 that comparison: it is the one check that tells you the key registered against
 your deployment is the one your cluster made, rather than one somebody else
@@ -240,11 +222,7 @@ and it is gone once applied.
 
 With `--no-ingress`, it printed `http://127.0.0.1:8443/first-run` and holds a
 port-forward open there until you press Ctrl-C, which you do once the wizard
-says it is done. **By hand**, that forward is:
-
-```bash
-kubectl --namespace meridian port-forward svc/meridian-meridian-runtime-dashboard 8443:80
-```
+says it is done.
 
 **Compare the fingerprints now.** The page shows this deployment's identifier
 and its key's fingerprint before it asks for anything. It must match what the
@@ -403,8 +381,7 @@ trade for a trial and the wrong one for anything you depend on.
 meridian down
 ```
 
-This uninstalls what Helm installed (by hand, `helm uninstall meridian
---namespace meridian`). It keeps the namespace, and with it the disk of a
+This uninstalls the deployment. It keeps the namespace, and with it the disk of a
 database the deployment brought, because Helm never created that claim —
 Kubernetes did, and Kubernetes keeps it — and the deployment's key. Installing
 again picks both back up, with the data. To be rid of them,

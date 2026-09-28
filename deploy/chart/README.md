@@ -1,6 +1,6 @@
 # meridian-runtime
 
-A Meridian deployment, for a Kubernetes
+An Open Meridian deployment, for a Kubernetes
 cluster. On a laptop or at a provider; the chart does not care which.
 
 If you do not have a cluster, use the compose file in the repository root
@@ -43,11 +43,18 @@ one of two answers:
 
 ## Installing
 
+Install it with the command line; [INSTALL.md](../../INSTALL.md) walks the
+whole path:
+
 ```bash
-helm install meridian oci://ghcr.io/open-meridian/charts/meridian-runtime \
-  --set deployment.id=DEP-... \
-  --set deployment.enrolmentCode=ENROL-...
+export MERIDIAN_ENROLMENT_CODE=ENR-...
+meridian up --id DEP-...
 ```
+
+`meridian up` checks the machine and the cluster first (`meridian doctor`),
+installs this chart, waits for the dashboard and prints the wizard's address.
+`-f <file>` passes any of the values below; `--params <file>` answers the
+wizard from a file, so a teardown and relaunch is scriptable.
 
 You do not tell it where the platform is. `platform.address` is empty by
 default and the chart resolves it, so nothing ordinary carries that address
@@ -55,25 +62,13 @@ around. Set it only to reach a different one -- a staging platform, while
 somebody is testing a change to the platform itself.
 
 Every published chart pins the image built from the same commit, so a chart and
-the runtime it runs are one build. Installing from a checkout instead
-(`./deploy/chart`) uses `image.tag: latest`, which moves -- pin it to a commit
-in anything you care about.
+the runtime it runs are one build. `meridian up --chart ./deploy/chart`
+installs from a checkout instead, with `image.tag: latest`, which moves -- pin
+it with `--image` in anything you care about.
 
-Then open the wizard. It is not given a public address and should not have one,
-so reach it through a forward:
-
-```bash
-kubectl port-forward svc/meridian-meridian-runtime-dashboard 8443:80
-```
-
-and go to `http://127.0.0.1:8443/first-run`. It asks for a first-run code,
-which a deployment administrator issues on the platform, and then for the
-database, the directory and the addresses. Nothing is written until you apply.
-
-Where you have a terminal,
-[meridian-cli](https://github.com/open-meridian/meridian-cli) does that order
-for you -- `meridian up --id DEP-...` -- and can answer the wizard from a file
-so a teardown and relaunch is scriptable. No install depends on it.
+The wizard asks for a first-run code, which a deployment administrator issues
+on the platform, and then for the database, how people sign in, and the
+addresses. Nothing is written until you apply.
 
 ## What it is configured with, and what it is not
 

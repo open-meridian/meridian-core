@@ -19,9 +19,10 @@ meridian connect http://meridian.localhost
 ```
 
 A laptop cluster is enough to try it (Rancher Desktop, k3s, kind or Docker
-Desktop). The chart is `oci://ghcr.io/open-meridian/charts/meridian-runtime`,
-and [deploy/chart/README.md](deploy/chart/README.md) says what each value
-does, for installing with `helm` by hand.
+Desktop). `meridian up` installs the chart,
+`oci://ghcr.io/open-meridian/charts/meridian-runtime`;
+[deploy/chart/README.md](deploy/chart/README.md) says what each of its values
+does, for the files `meridian up -f` takes.
 
 To write a plugin, `meridian plugin new` starts one from the Python SDK's
 reference plugin ([meridian-python](https://github.com/open-meridian/meridian-python)).
