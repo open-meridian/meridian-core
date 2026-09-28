@@ -11,12 +11,22 @@
 //! does a check constraint. The code is what gives a caller a sentence; the
 //! constraint is what makes the rule true of the table no matter which path
 //! wrote to it, including a person at a prompt.
+//!
+//! # Numbers
+//!
+//! A quantity and an amount are `numeric` with no fixed precision, which keeps
+//! a value exactly and at the scale it was stated with: 1.50 is stored as 1.50
+//! and read back as 1.50, and compares equal to 1.5. They cross the driver as
+//! text -- the one form both sides read exactly, and one that needs no
+//! dependency for a decimal type -- written from [`Exact`]'s formatting and
+//! parsed back by it. Check constraints refuse a value the wire could not have
+//! carried, 18 places and 38 digits, whoever writes it.
 
 use postgres::types::ToSql;
-use postgres::{NoTls, Transaction};
+use postgres::{NoTls, Row, Transaction};
 use r2d2_postgres::PostgresConnectionManager;
 
-use crate::amounts::{Money, Quantity};
+use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
     Completion, Counts, CustodialPosition, Holding, Identifier, Opened, Page, Result, Settled,
@@ -196,16 +206,17 @@ impl Store for PostgresStore {
         let identifiers = to_json(&holding.unresolved_identifiers);
         tx.execute(
             "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id,
-                                  quantity_scaled, value_scaled, currency, escalated, identifiers)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::jsonb)",
+                                  quantity, market_value, currency, escalated, identifiers)
+             VALUES ($1, $2, $3, $4, $5::text::numeric, $6::text::numeric, $7, $8,
+                     $9::text::jsonb)",
             &[
                 &holding.holding_id,
                 &holding.statement_id,
                 &holding.account_id,
                 &holding.instrument_id,
-                &holding.quantity.scaled(),
-                &holding.market_value.scaled(),
-                &holding.currency,
+                &holding.quantity.to_string(),
+                &holding.market_value.amount.to_string(),
+                &holding.market_value.currency,
                 &holding.escalated,
                 &identifiers,
             ],
@@ -288,7 +299,7 @@ impl Store for PostgresStore {
 
         let rows = conn
             .query(
-                "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                "SELECT account_id, instrument_id, quantity::text, market_value::text, currency,
                         last_statement_id, as_of_date, updated_at_ns
                    FROM custodial_position
                   WHERE ($1 = '' OR account_id = $1)
@@ -299,19 +310,8 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
 
-        let mut positions: Vec<CustodialPosition> = rows
-            .into_iter()
-            .map(|row| CustodialPosition {
-                account_id: row.get(0),
-                instrument_id: row.get(1),
-                quantity: Quantity::from_scaled(row.get(2)),
-                market_value: Money::from_scaled(row.get(3)),
-                currency: row.get(4),
-                last_statement_id: row.get(5),
-                as_of_date: row.get(6),
-                updated_at_ns: row.get(7),
-            })
-            .collect();
+        let mut positions: Vec<CustodialPosition> =
+            rows.iter().map(position_of).collect::<Result<_>>()?;
 
         let more = positions.len() > limit;
         positions.truncate(limit);
@@ -326,7 +326,7 @@ impl Store for PostgresStore {
 
         let unresolved = if include_unresolved {
             conn.query(
-                "SELECT holding_id, statement_id, account_id, quantity_scaled, value_scaled,
+                "SELECT holding_id, statement_id, account_id, quantity::text, market_value::text,
                         currency, escalated, identifiers::text
                    FROM holding
                   WHERE instrument_id IS NULL AND ($1 = '' OR account_id = $1)
@@ -334,19 +334,20 @@ impl Store for PostgresStore {
                 &[&account_id],
             )
             .map_err(unavailable)?
-            .into_iter()
-            .map(|row| Holding {
-                holding_id: row.get(0),
-                statement_id: row.get(1),
-                account_id: row.get(2),
-                instrument_id: None,
-                unresolved_identifiers: from_json(row.get(7)),
-                quantity: Quantity::from_scaled(row.get(3)),
-                market_value: Money::from_scaled(row.get(4)),
-                currency: row.get(5),
-                escalated: row.get(6),
+            .iter()
+            .map(|row| {
+                Ok(Holding {
+                    holding_id: row.get(0),
+                    statement_id: row.get(1),
+                    account_id: row.get(2),
+                    instrument_id: None,
+                    unresolved_identifiers: from_json(row.get(7)),
+                    quantity: quantity_of(row, 3)?,
+                    market_value: money_of(row, 4, 5)?,
+                    escalated: row.get(6),
+                })
             })
-            .collect()
+            .collect::<Result<_>>()?
         } else {
             Vec::new()
         };
@@ -366,23 +367,14 @@ impl Store for PostgresStore {
         let row = self
             .conn()?
             .query_opt(
-                "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                "SELECT account_id, instrument_id, quantity::text, market_value::text, currency,
                         last_statement_id, as_of_date, updated_at_ns
                    FROM custodial_position WHERE account_id = $1 AND instrument_id = $2",
                 &[&account_id, &instrument_id],
             )
             .map_err(unavailable)?;
 
-        Ok(row.map(|row| CustodialPosition {
-            account_id: row.get(0),
-            instrument_id: row.get(1),
-            quantity: Quantity::from_scaled(row.get(2)),
-            market_value: Money::from_scaled(row.get(3)),
-            currency: row.get(4),
-            last_statement_id: row.get(5),
-            as_of_date: row.get(6),
-            updated_at_ns: row.get(7),
-        }))
+        row.as_ref().map(position_of).transpose()
     }
 
     fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>> {
@@ -393,7 +385,7 @@ impl Store for PostgresStore {
         // waits for it rather than landing beside a position already moved.
         let placeholders: Vec<CustodialPosition> = tx
             .query(
-                "SELECT account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                "SELECT account_id, instrument_id, quantity::text, market_value::text, currency,
                         last_statement_id, as_of_date, updated_at_ns
                    FROM custodial_position WHERE instrument_id = $1
                   ORDER BY account_id
@@ -401,18 +393,14 @@ impl Store for PostgresStore {
                 &[&replaced_id],
             )
             .map_err(unavailable)?
-            .into_iter()
-            .map(|row| CustodialPosition {
-                account_id: row.get(0),
-                instrument_id: instrument_id.to_string(),
-                quantity: Quantity::from_scaled(row.get(2)),
-                market_value: Money::from_scaled(row.get(3)),
-                currency: row.get(4),
-                last_statement_id: row.get(5),
-                as_of_date: row.get(6),
-                updated_at_ns: row.get(7),
+            .iter()
+            .map(|row| {
+                Ok(CustodialPosition {
+                    instrument_id: instrument_id.to_string(),
+                    ..position_of(row)?
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let mut settled = Vec::new();
         for moved in placeholders {
@@ -422,16 +410,16 @@ impl Store for PostgresStore {
             let fresh = tx
                 .execute(
                     "INSERT INTO custodial_position
-                            (account_id, instrument_id, quantity_scaled, value_scaled, currency,
+                            (account_id, instrument_id, quantity, market_value, currency,
                              last_statement_id, as_of_date, updated_at_ns)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     VALUES ($1, $2, $3::text::numeric, $4::text::numeric, $5, $6, $7, $8)
                      ON CONFLICT (account_id, instrument_id) DO NOTHING",
                     &[
                         &moved.account_id,
                         &moved.instrument_id,
-                        &moved.quantity.scaled(),
-                        &moved.market_value.scaled(),
-                        &moved.currency,
+                        &moved.quantity.to_string(),
+                        &moved.market_value.amount.to_string(),
+                        &moved.market_value.currency,
                         &moved.last_statement_id,
                         &moved.as_of_date,
                         &moved.updated_at_ns,
@@ -448,7 +436,7 @@ impl Store for PostgresStore {
             } else {
                 let row = tx
                     .query_one(
-                        "SELECT quantity_scaled, value_scaled, currency, last_statement_id,
+                        "SELECT quantity::text, market_value::text, currency, last_statement_id,
                                 as_of_date, updated_at_ns
                            FROM custodial_position WHERE account_id = $1 AND instrument_id = $2
                             FOR UPDATE",
@@ -458,9 +446,8 @@ impl Store for PostgresStore {
                 let standing = CustodialPosition {
                     account_id: moved.account_id.clone(),
                     instrument_id: moved.instrument_id.clone(),
-                    quantity: Quantity::from_scaled(row.get(0)),
-                    market_value: Money::from_scaled(row.get(1)),
-                    currency: row.get(2),
+                    quantity: quantity_of(&row, 0)?,
+                    market_value: money_of(&row, 1, 2)?,
                     last_statement_id: row.get(3),
                     as_of_date: row.get(4),
                     updated_at_ns: row.get(5),
@@ -468,9 +455,9 @@ impl Store for PostgresStore {
 
                 if moved.stated_later_than(&standing) {
                     let parameters: [&(dyn ToSql + Sync); 8] = [
-                        &moved.quantity.scaled(),
-                        &moved.market_value.scaled(),
-                        &moved.currency,
+                        &moved.quantity.to_string(),
+                        &moved.market_value.amount.to_string(),
+                        &moved.market_value.currency,
                         &moved.last_statement_id,
                         &moved.as_of_date,
                         &moved.updated_at_ns,
@@ -479,7 +466,8 @@ impl Store for PostgresStore {
                     ];
                     tx.execute(
                         "UPDATE custodial_position
-                            SET quantity_scaled = $1, value_scaled = $2, currency = $3,
+                            SET quantity = $1::text::numeric, market_value = $2::text::numeric,
+                                currency = $3,
                                 last_statement_id = $4, as_of_date = $5, updated_at_ns = $6
                           WHERE account_id = $7 AND instrument_id = $8",
                         &parameters,
@@ -543,16 +531,16 @@ fn settle(
 ) -> Result<Settled> {
     let fresh = tx
         .execute(
-            "INSERT INTO custodial_position (account_id, instrument_id, quantity_scaled, value_scaled,
+            "INSERT INTO custodial_position (account_id, instrument_id, quantity, market_value,
                                    currency, last_statement_id, as_of_date, updated_at_ns)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             VALUES ($1, $2, $3::text::numeric, $4::text::numeric, $5, $6, $7, $8)
              ON CONFLICT (account_id, instrument_id) DO NOTHING",
             &[
                 &holding.account_id,
                 &instrument_id,
-                &holding.quantity.scaled(),
-                &holding.market_value.scaled(),
-                &holding.currency,
+                &holding.quantity.to_string(),
+                &holding.market_value.amount.to_string(),
+                &holding.market_value.currency,
                 &holding.statement_id,
                 &as_of_date,
                 &now_ns,
@@ -565,8 +553,7 @@ fn settle(
         account_id: holding.account_id.clone(),
         instrument_id: instrument_id.clone(),
         quantity: holding.quantity,
-        market_value: holding.market_value,
-        currency: holding.currency.clone(),
+        market_value: holding.market_value.clone(),
         last_statement_id: holding.statement_id.clone(),
         as_of_date: as_of_date.to_string(),
         updated_at_ns: now_ns,
@@ -581,21 +568,20 @@ fn settle(
 
     let before = tx
         .query_one(
-            "SELECT quantity_scaled, value_scaled, currency
+            "SELECT quantity::text, market_value::text, currency
                FROM custodial_position WHERE account_id = $1 AND instrument_id = $2
                FOR UPDATE",
             &[&holding.account_id, &instrument_id],
         )
         .map_err(unavailable)?;
 
-    let previous_quantity = Quantity::from_scaled(before.get(0));
-    let previous_value = Money::from_scaled(before.get(1));
-    let previous_currency: String = before.get(2);
+    let previous_quantity = quantity_of(&before, 0)?;
+    let previous_value = money_of(&before, 1, 2)?;
 
     let parameters: [&(dyn ToSql + Sync); 8] = [
-        &holding.quantity.scaled(),
-        &holding.market_value.scaled(),
-        &holding.currency,
+        &holding.quantity.to_string(),
+        &holding.market_value.amount.to_string(),
+        &holding.market_value.currency,
         &holding.statement_id,
         &as_of_date,
         &now_ns,
@@ -604,16 +590,16 @@ fn settle(
     ];
     tx.execute(
         "UPDATE custodial_position
-            SET quantity_scaled = $1, value_scaled = $2, currency = $3,
+            SET quantity = $1::text::numeric, market_value = $2::text::numeric, currency = $3,
                 last_statement_id = $4, as_of_date = $5, updated_at_ns = $6
           WHERE account_id = $7 AND instrument_id = $8",
         &parameters,
     )
     .map_err(unavailable)?;
 
-    let moved = previous_quantity != holding.quantity
-        || previous_value != holding.market_value
-        || previous_currency != holding.currency;
+    // Compared as numbers, so a statement restating 12.5 as 12.50 announces no
+    // change; the row still takes the scale it was restated with.
+    let moved = previous_quantity != holding.quantity || previous_value != holding.market_value;
 
     Ok(if moved {
         Settled::Changed {
@@ -622,6 +608,43 @@ fn settle(
         }
     } else {
         Settled::Unchanged { position }
+    })
+}
+
+/// A custodial position from a row selected in the column order every query
+/// here uses for one.
+fn position_of(row: &Row) -> Result<CustodialPosition> {
+    Ok(CustodialPosition {
+        account_id: row.get(0),
+        instrument_id: row.get(1),
+        quantity: quantity_of(row, 2)?,
+        market_value: money_of(row, 3, 4)?,
+        last_statement_id: row.get(5),
+        as_of_date: row.get(6),
+        updated_at_ns: row.get(7),
+    })
+}
+
+fn quantity_of(row: &Row, column: usize) -> Result<Quantity> {
+    exact_of(row, column).map(Quantity::new)
+}
+
+fn money_of(row: &Row, amount: usize, currency: usize) -> Result<Money> {
+    Ok(Money::new(
+        exact_of(row, amount)?,
+        row.get::<_, String>(currency),
+    ))
+}
+
+/// A `numeric` read as the text Postgres writes for it. One that does not
+/// read is a column holding what no path here writes and the constraints
+/// refuse, so it is reported rather than defaulted.
+fn exact_of(row: &Row, column: usize) -> Result<Exact> {
+    let text: String = row.get(column);
+    text.parse().map_err(|why| {
+        StoreError::Unavailable(format!(
+            "a stored number, {text}, does not read back: {why}"
+        ))
     })
 }
 

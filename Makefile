@@ -1054,6 +1054,12 @@ down:
 # The SDK's image is handed this working tree's proto/ as its core-proto build
 # context, in place of the core commit the SDK pins, so the domain messages its
 # tests encode are the ones this runtime was built from.
+#
+# The suite's rows reach the street store only for an account linked and
+# writable, which a deployment admin makes; e2e/interop/a-linked-account.sql
+# makes it here. What the store kept is then read back from Postgres and held
+# to e2e/interop/positions.expected, character for character: the numbers the
+# SDK sent, at the scale they were stated with (decisions/023).
 SDK ?= ../meridian-python
 
 interop: network
@@ -1067,6 +1073,9 @@ interop: network
 	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
 	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
+	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+		<e2e/interop/a-linked-account.sql >/dev/null \
+		|| { echo "interop FAILED: the linked account could not be written" >&2; exit 1; }
 	@# All three components, because the surface under test is the sidecar's
 	@# and the answers come from the other two across a broker. Before the
 	@# split this was one process, and the test could not tell the difference.
@@ -1079,12 +1088,18 @@ interop: network
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
+		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -c \
+			"SELECT instrument_id || '|' || quantity::text || '|' || market_value::text || '|' || currency \
+			   FROM custodial_position WHERE account_id = 'ACC-INTEROP' ORDER BY instrument_id" \
+			>.interop.positions 2>&1; \
 		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \
 			echo "interop FAILED. The last 40 lines, and the whole of it in .interop.log:" >&2; \
 			tail -40 .interop.log >&2; exit 1; \
-		fi
-	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface"
+		fi; \
+		diff -u e2e/interop/positions.expected .interop.positions >&2 \
+			|| { echo "interop FAILED: the street store did not keep what the SDK sent" >&2; exit 1; }
+	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface, and the street store keeps its numbers exactly"
 
 # The end-to-end check, run rather than described.
 #

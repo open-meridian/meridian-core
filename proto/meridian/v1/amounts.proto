@@ -1,0 +1,56 @@
+// Numbers: every quantity, and every amount of currency.
+//
+// decisions/023, with spec/quantities-carry-their-own-scale. Reached from every
+// message that carries a quantity or an amount; W2's holdings are the first.
+//
+// One form everywhere, binary on the wire and never text or a float: an
+// integer and the count of decimal places it carries. The shape of FIX's binary
+// encoding and of Nasdaq's ITCH and OUCH, only wider, so a reader decodes a
+// fixed width and computes on the integer, and the same form serves a holding
+// today and a low-latency order path later. Logs, fixtures and pages show the
+// value as a decimal (`1.5`); only the wire is binary.
+//
+// Nothing is rounded anywhere. A value outside the range below is refused,
+// by the SDK before it is sent and by the sidecar and every store after.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// A number: a 128-bit two's-complement integer and its scale. The value is the
+// integer times 10^-scale, so 1.50 is 150 at scale 2 and stays 1.50.
+//
+// The scale travels with the value rather than being fixed for the contract,
+// because the venues disagree: Alpaca takes nine decimal places, a crypto
+// asset eighteen, and a cheap token's holding runs past what 64 bits hold at
+// any fixed scale that serves them both. The scale is the one the value was
+// stated with; nothing normalises it.
+//
+// The integer's magnitude is below 10^38, which is at most 38 significant
+// digits, and the scale is 0 to 18. The widest value the broker survey found,
+// 100 billion units at 18 decimals, is well inside it.
+message Decimal {
+  // The integer's upper 64 bits, signed: negative for a negative value.
+  sfixed64 high = 1;
+
+  // Its lower 64 bits, unsigned. The integer is high * 2^64 + low.
+  fixed64 low = 2;
+
+  // How many decimal places the integer carries, 0 to 18.
+  uint32 scale = 3;
+}
+
+// An amount of currency: a Decimal and the currency it is in.
+//
+// One message rather than an amount with its currency beside it, so a message
+// holding amounts in several currencies -- a USD price, a EUR commission --
+// cannot pair the wrong ones. An amount is never separated from its currency.
+//
+// In the currency's major unit, whatever the venue counted in: a plugin that
+// read cents converts before anything reaches the bus (decisions/023).
+message Money {
+  Decimal amount = 1;
+
+  // ISO 4217, e.g. "USD".
+  string currency_code = 2;
+}

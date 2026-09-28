@@ -401,6 +401,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::amounts::testing::{quantity, read, usd};
     use crate::MemoryStore;
 
     const NOW: i64 = 1_757_376_000_000_000_000;
@@ -463,9 +464,8 @@ mod tests {
             account_id: "SNAP-ACC-1".into(),
             instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
             unresolved_identifiers: vec![],
-            quantity_scaled_1e8: 1_250_000_000,
-            market_value_scaled_1e8: 281_250_000_000,
-            currency: "USD".into(),
+            quantity: quantity("12.5"),
+            market_value: usd("2812.5"),
             external_account_id: String::new(),
         }
     }
@@ -496,7 +496,7 @@ mod tests {
             .custodial_position("SNAP-ACC-1", "INS-01J8XQ4M7K0000000000AAPL")
             .unwrap()
             .unwrap();
-        assert_eq!(position.quantity.scaled(), 1_250_000_000);
+        assert_eq!(position.quantity.to_string(), "12.5");
     }
 
     #[tokio::test]
@@ -514,7 +514,7 @@ mod tests {
         );
         let event = CustodialPositionUpdatedEvent::decode(&delivered.envelope.payload[..]).unwrap();
         assert_eq!(event.statement_id, statement_id);
-        assert_eq!(event.previous_quantity_scaled_1e8, 0);
+        assert_eq!(read(&event.previous_quantity), "0");
     }
 
     #[tokio::test]
@@ -668,7 +668,7 @@ mod tests {
         let event = CustodialPositionUpdatedEvent::decode(&delivered.envelope.payload[..]).unwrap();
         let position = event.position.unwrap();
         assert_eq!(position.instrument_id, "INS-01J8XQ4M7K0000000000ZZTP");
-        assert_eq!(position.quantity_scaled_1e8, 1_250_000_000);
+        assert_eq!(read(&position.quantity), "12.5");
         assert_eq!(event.statement_id, statement_id);
 
         assert!(store

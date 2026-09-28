@@ -110,9 +110,10 @@ pub fn record_holding(
             .map(from_wire_identifier)
             .collect(),
 
-        quantity: Quantity::from_scaled(request.quantity_scaled_1e8),
-        market_value: Money::from_scaled(request.market_value_scaled_1e8),
-        currency: request.currency.clone(),
+        // Refused naming the field when the wire form does not allow it. The
+        // sidecar refused a plugin's already; this is every other sender.
+        quantity: Quantity::from_wire("quantity", request.quantity.as_ref())?,
+        market_value: Money::from_wire("market_value", request.market_value.as_ref())?,
 
         // Nothing has asked the platform about these identifiers yet. W3.2 is
         // the connector's obligation and it happens before this.
@@ -154,7 +155,7 @@ pub fn record_holding(
             } => Some(CustodialPositionUpdatedEvent {
                 position: Some(to_wire_position(&position)),
                 statement_id: request.statement_id.clone(),
-                previous_quantity_scaled_1e8: previous_quantity.scaled(),
+                previous_quantity: previous_quantity.to_wire(),
             }),
             Settled::Unchanged { .. } | Settled::Unresolved => None,
         },
@@ -196,7 +197,7 @@ pub fn move_positions(
             } => Some(CustodialPositionUpdatedEvent {
                 statement_id: position.last_statement_id.clone(),
                 position: Some(to_wire_position(&position)),
-                previous_quantity_scaled_1e8: previous_quantity.scaled(),
+                previous_quantity: previous_quantity.to_wire(),
             }),
             Settled::Unchanged { .. } | Settled::Unresolved => None,
         })
@@ -225,9 +226,8 @@ pub(crate) fn to_wire_position(
     meridian_domain::v1::CustodialPosition {
         account_id: position.account_id.clone(),
         instrument_id: position.instrument_id.clone(),
-        quantity_scaled_1e8: position.quantity.scaled(),
-        market_value_scaled_1e8: position.market_value.scaled(),
-        currency: position.currency.clone(),
+        quantity: position.quantity.to_wire(),
+        market_value: position.market_value.to_wire(),
         last_statement_id: position.last_statement_id.clone(),
         as_of_date: position.as_of_date.clone(),
         updated_at_ns: position.updated_at_ns,
@@ -237,6 +237,7 @@ pub(crate) fn to_wire_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::amounts::testing::{quantity, read, read_money, usd};
     use crate::store::{Counts, StoreError};
     use crate::MemoryStore;
 
@@ -260,9 +261,8 @@ mod tests {
             account_id: "SNAP-ACC-1".into(),
             instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
             unresolved_identifiers: vec![],
-            quantity_scaled_1e8: 1_250_000_000,
-            market_value_scaled_1e8: 281_250_000_000,
-            currency: "USD".into(),
+            quantity: quantity("12.5"),
+            market_value: usd("2812.5"),
             external_account_id: String::new(),
         }
     }
@@ -278,9 +278,8 @@ mod tests {
                 value: "ZZTOP".into(),
                 source: "snaptrade".into(),
             }],
-            quantity_scaled_1e8: 500_000_000,
-            market_value_scaled_1e8: 0,
-            currency: "USD".into(),
+            quantity: quantity("5"),
+            market_value: usd("0"),
             external_account_id: String::new(),
         }
     }
@@ -347,11 +346,11 @@ mod tests {
 
         let event = recorded.event.expect("a new position is a change");
         let position = event.position.unwrap();
-        assert_eq!(position.quantity_scaled_1e8, 1_250_000_000);
-        assert_eq!(position.market_value_scaled_1e8, 281_250_000_000);
+        assert_eq!(read(&position.quantity), "12.5");
+        assert_eq!(read_money(&position.market_value), "2812.5 USD");
         assert_eq!(position.as_of_date, "2026-09-08");
         assert_eq!(position.last_statement_id, statement_id);
-        assert_eq!(event.previous_quantity_scaled_1e8, 0);
+        assert_eq!(read(&event.previous_quantity), "0");
     }
 
     #[test]
@@ -445,7 +444,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(position.quantity.scaled(), 1_250_000_000);
+        assert_eq!(position.quantity.to_string(), "12.5");
         assert_eq!(position.as_of_date, "2026-09-09");
         assert_eq!(position.last_statement_id, second);
     }
@@ -466,12 +465,12 @@ mod tests {
             .statement_id;
 
         let mut grown = holding_request(&second);
-        grown.quantity_scaled_1e8 = 2_000_000_000;
+        grown.quantity = quantity("20");
         let recorded = record_holding(&store, &grown, NOW + 1).unwrap();
 
         let event = recorded.event.unwrap();
-        assert_eq!(event.previous_quantity_scaled_1e8, 1_250_000_000);
-        assert_eq!(event.position.unwrap().quantity_scaled_1e8, 2_000_000_000);
+        assert_eq!(read(&event.previous_quantity), "12.5");
+        assert_eq!(read(&event.position.unwrap().quantity), "20");
     }
 
     #[test]
@@ -500,18 +499,13 @@ mod tests {
         let statement_id = opened(&store);
 
         let mut short = holding_request(&statement_id);
-        short.quantity_scaled_1e8 = -500_000_000;
+        short.quantity = quantity("-5");
         let recorded = record_holding(&store, &short, NOW).unwrap();
 
         assert!(recorded.reply.resolved);
         assert_eq!(
-            recorded
-                .event
-                .unwrap()
-                .position
-                .unwrap()
-                .quantity_scaled_1e8,
-            -500_000_000
+            read(&recorded.event.unwrap().position.unwrap().quantity),
+            "-5"
         );
     }
 
@@ -655,7 +649,7 @@ mod tests {
 
     /// A statement as of `as_of_date`, holding `quantity` of `instrument_id`
     /// in the fixture's account.
-    fn stated(store: &MemoryStore, as_of_date: &str, instrument_id: &str, quantity: i64) {
+    fn stated(store: &MemoryStore, as_of_date: &str, instrument_id: &str, held: &str) {
         let mut statement = statement_request();
         statement.external_statement_id = format!("st-{as_of_date}-{instrument_id}");
         statement.as_of_date = as_of_date.into();
@@ -666,7 +660,7 @@ mod tests {
 
         let mut row = holding_request(&statement_id);
         row.instrument_id = instrument_id.into();
-        row.quantity_scaled_1e8 = quantity;
+        row.quantity = quantity(held);
         record_holding(store, &row, NOW).unwrap();
     }
 
@@ -685,18 +679,18 @@ mod tests {
     #[test]
     fn a_placeholders_position_moves_onto_its_instrument() {
         let store = MemoryStore::new();
-        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+        stated(&store, "2026-09-08", PLACEHOLDER, "5");
 
         let events = move_positions(&store, &replaced()).unwrap();
 
         assert_eq!(events.len(), 1);
         let position = events[0].position.as_ref().unwrap();
         assert_eq!(position.instrument_id, REPLACEMENT);
-        assert_eq!(position.quantity_scaled_1e8, 500_000_000);
+        assert_eq!(read(&position.quantity), "5");
         assert_eq!(position.as_of_date, "2026-09-08");
         assert_eq!(events[0].statement_id, position.last_statement_id);
         // New under its instrument, so changed from nothing.
-        assert_eq!(events[0].previous_quantity_scaled_1e8, 0);
+        assert_eq!(read(&events[0].previous_quantity), "0");
 
         assert!(store
             .custodial_position("SNAP-ACC-1", PLACEHOLDER)
@@ -708,26 +702,26 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .quantity
-                .scaled(),
-            500_000_000
+                .to_string(),
+            "5"
         );
     }
 
     #[test]
     fn where_both_are_held_a_later_placeholder_statement_stands() {
         let store = MemoryStore::new();
-        stated(&store, "2026-09-08", REPLACEMENT, 200_000_000);
-        stated(&store, "2026-09-09", PLACEHOLDER, 500_000_000);
+        stated(&store, "2026-09-08", REPLACEMENT, "2");
+        stated(&store, "2026-09-09", PLACEHOLDER, "5");
 
         let events = move_positions(&store, &replaced()).unwrap();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].previous_quantity_scaled_1e8, 200_000_000);
+        assert_eq!(read(&events[0].previous_quantity), "2");
         let standing = store
             .custodial_position("SNAP-ACC-1", REPLACEMENT)
             .unwrap()
             .unwrap();
-        assert_eq!(standing.quantity.scaled(), 500_000_000);
+        assert_eq!(standing.quantity.to_string(), "5");
         assert_eq!(standing.as_of_date, "2026-09-09");
         assert!(store
             .custodial_position("SNAP-ACC-1", PLACEHOLDER)
@@ -741,8 +735,8 @@ mod tests {
         // before the replacement was heard. What it said is newer, so it
         // stands, and nothing under the instrument changed to announce.
         let store = MemoryStore::new();
-        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
-        stated(&store, "2026-09-09", REPLACEMENT, 200_000_000);
+        stated(&store, "2026-09-08", PLACEHOLDER, "5");
+        stated(&store, "2026-09-09", REPLACEMENT, "2");
 
         let events = move_positions(&store, &replaced()).unwrap();
 
@@ -751,7 +745,7 @@ mod tests {
             .custodial_position("SNAP-ACC-1", REPLACEMENT)
             .unwrap()
             .unwrap();
-        assert_eq!(standing.quantity.scaled(), 200_000_000);
+        assert_eq!(standing.quantity.to_string(), "2");
         assert!(store
             .custodial_position("SNAP-ACC-1", PLACEHOLDER)
             .unwrap()
@@ -761,7 +755,7 @@ mod tests {
     #[test]
     fn a_second_hearing_of_one_replacement_moves_nothing() {
         let store = MemoryStore::new();
-        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+        stated(&store, "2026-09-08", PLACEHOLDER, "5");
 
         move_positions(&store, &replaced()).unwrap();
         assert!(move_positions(&store, &replaced()).unwrap().is_empty());
@@ -770,7 +764,7 @@ mod tests {
     #[test]
     fn a_replacement_naming_itself_moves_nothing() {
         let store = MemoryStore::new();
-        stated(&store, "2026-09-08", PLACEHOLDER, 500_000_000);
+        stated(&store, "2026-09-08", PLACEHOLDER, "5");
 
         let mut itself = replaced();
         itself.instrument.as_mut().unwrap().instrument_id = PLACEHOLDER.into();

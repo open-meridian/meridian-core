@@ -70,8 +70,11 @@ def write_for(header):
                 statement_id=opened.statement_id,
                 unresolved_identifiers=[operations_pb2.Identifier(
                     scheme="symbol", value="E2E", source="e2e")],
-                quantity_scaled_1e8=100_000_000, market_value_scaled_1e8=100_000_000,
-                currency="USD", external_account_id=EXTERNAL_ACCOUNT, acting_for=person),
+                # One unit worth 1 USD: an integer and its scale (decisions/023).
+                quantity=operations_pb2.Decimal(low=1),
+                market_value=operations_pb2.Money(
+                    amount=operations_pb2.Decimal(low=1), currency_code="USD"),
+                external_account_id=EXTERNAL_ACCOUNT, acting_for=person),
             timeout=10)
     except grpc.RpcError as refused:
         return {"ok": False, "code": refused.code().name, "detail": refused.details()}

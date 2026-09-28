@@ -13,13 +13,15 @@
 use std::sync::Arc;
 
 use meridian_bus::{Bus, MemoryBackend};
+use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     ExternalAccountLink, ListCustodialPositionsReply, ListCustodialPositionsRequest,
     PluginConfiguration,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Identifier, RecordHoldingParams, RecordHoldingsStatementParams, ResolveIdentifierParams,
+    Decimal, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
+    ResolveIdentifierParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::RegisterRequest;
@@ -133,9 +135,20 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
         .record_holding(Request::new(RecordHoldingParams {
             statement_id: opened.statement_id,
             instrument_id: "INS-1".into(),
-            quantity_scaled_1e8: 1_250_000_000,
-            market_value_scaled_1e8: 281_250_000_000,
-            currency: "USD".into(),
+            // 12.5, and 2812.50 USD: the integer and the scale it was stated at.
+            quantity: Some(Decimal {
+                high: 0,
+                low: 125,
+                scale: 1,
+            }),
+            market_value: Some(Money {
+                amount: Some(Decimal {
+                    high: 0,
+                    low: 281_250,
+                    scale: 2,
+                }),
+                currency_code: "USD".into(),
+            }),
             external_account_id: "ext-1".into(),
             ..Default::default()
         }))
@@ -166,7 +179,16 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     let listed = ListCustodialPositionsReply::decode(&reply[..]).expect("the reply decodes");
 
     assert_eq!(listed.positions.len(), 1);
-    assert_eq!(listed.positions[0].quantity_scaled_1e8, 1_250_000_000);
+    let position = &listed.positions[0];
+    let read = |wire: Option<&meridian_domain::v1::Decimal>| {
+        Exact::from_wire(wire.expect("a number"))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(read(position.quantity.as_ref()), "12.5");
+    let value = position.market_value.as_ref().expect("a market value");
+    assert_eq!(read(value.amount.as_ref()), "2812.50");
+    assert_eq!(value.currency_code, "USD");
 }
 
 /// W3.7 as a plugin sees it. A set nothing matches is answered with the
@@ -222,9 +244,15 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
         .record_holding(Request::new(RecordHoldingParams {
             statement_id: opened.statement_id,
             instrument_id: resolved.instrument_id.clone(),
-            quantity_scaled_1e8: 500_000_000,
-            market_value_scaled_1e8: 0,
-            currency: "USD".into(),
+            quantity: Some(Decimal {
+                high: 0,
+                low: 5,
+                scale: 0,
+            }),
+            market_value: Some(Money {
+                amount: Some(Decimal::default()),
+                currency_code: "USD".into(),
+            }),
             external_account_id: "ext-1".into(),
             ..Default::default()
         }))

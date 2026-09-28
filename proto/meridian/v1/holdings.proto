@@ -8,22 +8,23 @@
 // to do when the two disagree is a later slice and deliberately has no
 // vocabulary here yet.
 //
-// Every quantity and monetary amount is an int64 scaled by 1e8. No field below
-// is a float, at any layer, because a rounding error here becomes a position
+// Every quantity is a Decimal and every amount of currency a Money, an integer
+// that carries its own scale (amounts.proto, decisions/023). No field below is
+// a float, at any layer, because a rounding error here becomes a position
 // break, and a break costs more to investigate than the discipline costs to
 // keep.
+//
+// Until 2026-09-28 they were int64s at a fixed scale of 1e8, named
+// `*_scaled_1e8`, with the currency beside the amount. Those fields are
+// reserved below, their numbers and names never reused: a reader built
+// against them would read a new field's bytes as the old one's.
 
 syntax = "proto3";
 
 package meridian.v1;
 
+import "meridian/v1/amounts.proto";
 import "meridian/v1/reference.proto";
-
-// Scale factor for every *_scaled_1e8 field: the value is the real amount
-// multiplied by 100,000,000. A quantity of 1.5 shares is 150000000.
-//
-// Declared as a constant in one place so no implementation has to rediscover
-// it, and named in every field so a reader cannot miss it.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W2.1 — freshness
@@ -127,15 +128,12 @@ message RecordHoldingRequest {
   repeated Identifier unresolved_identifiers = 4;
 
   // Signed: negative is a short position.
-  int64 quantity_scaled_1e8 = 5;
+  Decimal quantity = 9;
 
-  // The rail's valuation of the holding. Recorded as reported, not recomputed:
-  // this is the custodian's belief, and rederiving it would discard the thing
-  // that makes a later comparison meaningful.
-  int64 market_value_scaled_1e8 = 6;
-
-  // ISO 4217 for market_value_scaled_1e8.
-  string currency = 7;
+  // The rail's valuation of the holding, in its currency. Recorded as
+  // reported, not recomputed: this is the custodian's belief, and rederiving it
+  // would discard the thing that makes a later comparison meaningful.
+  Money market_value = 10;
 
   // The account as the rail knows it. The connector sets this and leaves
   // `account_id` empty; the sidecar sets `account_id` from the link in the
@@ -143,6 +141,11 @@ message RecordHoldingRequest {
   // there is none. Refused is not dropped: the external account is reported
   // unlinked, and the next statement after it is linked records it (W2).
   string external_account_id = 8;
+
+  // The int64s at 1e8 and the currency that qualified the value, which is now
+  // inside it (decisions/023).
+  reserved 5, 6, 7;
+  reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
 }
 
 message RecordHoldingReply {
@@ -182,7 +185,11 @@ message CustodialPositionUpdatedEvent {
 
   // The previous quantity, so a subscriber can render a delta without holding
   // its own history.
-  int64 previous_quantity_scaled_1e8 = 3;
+  Decimal previous_quantity = 4;
+
+  // The int64 at 1e8 (decisions/023).
+  reserved 3;
+  reserved "previous_quantity_scaled_1e8";
 }
 
 // What the custodian says an account holds of an instrument, right now.
@@ -201,15 +208,19 @@ message CustodialPosition {
   // An instrument, or the deployment's LCL- placeholder awaiting identity,
   // which the INS- ID replaces when it arrives (W3.9).
   string instrument_id = 2;
-  int64 quantity_scaled_1e8 = 3;
-  int64 market_value_scaled_1e8 = 4;
-  string currency = 5;
+  Decimal quantity = 9;
+  Money market_value = 10;
 
   // The statement this was last stated by, and when. One not restated recently
   // is not wrong, but it is worth showing differently.
   string last_statement_id = 6;
   string as_of_date = 7;
   int64 updated_at_ns = 8;
+
+  // The int64s at 1e8 and the currency that qualified the value, which is now
+  // inside it (decisions/023).
+  reserved 3, 4, 5;
+  reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,9 +254,8 @@ message UnresolvedHolding {
   string holding_id = 1;
   string account_id = 2;
   repeated Identifier identifiers = 3;
-  int64 quantity_scaled_1e8 = 4;
-  int64 market_value_scaled_1e8 = 5;
-  string currency = 6;
+  Decimal quantity = 10;
+  Money market_value = 11;
   string source = 7;
   string as_of_date = 8;
 
@@ -253,4 +263,9 @@ message UnresolvedHolding {
   // view can separate "nobody has looked at this" from "this is with the
   // administrator".
   bool escalated = 9;
+
+  // The int64s at 1e8 and the currency that qualified the value, which is now
+  // inside it (decisions/023).
+  reserved 4, 5, 6;
+  reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
 }

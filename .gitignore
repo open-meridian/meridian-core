@@ -20,6 +20,7 @@ target/
 # Written by `make test-store` when it fails.
 .test-store.log
 .interop.log
+.interop.positions
 deploy/nats/dev.conf
 
 # Written and removed by `make check-codegen`.

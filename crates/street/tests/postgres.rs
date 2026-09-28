@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_street::amounts::{Money, Quantity};
+use meridian_street::amounts::{Exact, Money, Quantity};
 use meridian_street::store::{
     Completion, Counts, Holding, Identifier, Opened, Settled, Statement, Store,
 };
@@ -29,6 +29,15 @@ fn unique(tag: &str) -> String {
         .unwrap()
         .as_nanos();
     format!("{tag}-{now}-{seq}")
+}
+
+/// A quantity as a person writes one.
+fn units(text: &str) -> Quantity {
+    text.parse().unwrap()
+}
+
+fn usd(text: &str) -> Money {
+    Money::new(text.parse().unwrap(), "USD")
 }
 
 fn store() -> PostgresStore {
@@ -60,9 +69,8 @@ fn resolved(statement: &Statement, instrument_id: &str) -> Holding {
         account_id: unique("ACC"),
         instrument_id: Some(instrument_id.to_string()),
         unresolved_identifiers: vec![],
-        quantity: Quantity::from_scaled(1_250_000_000),
-        market_value: Money::from_scaled(281_250_000_000),
-        currency: "USD".into(),
+        quantity: units("12.5"),
+        market_value: usd("2812.50"),
         escalated: false,
     }
 }
@@ -110,7 +118,7 @@ fn a_resolved_row_moves_a_position_and_says_what_it_was() {
         .custodial_position(&account, &instrument)
         .unwrap()
         .unwrap();
-    assert_eq!(position.quantity.scaled(), 1_250_000_000);
+    assert_eq!(position.quantity.to_string(), "12.5");
     assert_eq!(position.as_of_date, "2026-09-08");
 }
 
@@ -127,15 +135,15 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
     let second = opened(&store);
     let mut grown = resolved(&second, &instrument);
     grown.account_id = account.clone();
-    grown.quantity = Quantity::from_scaled(2_000_000_000);
+    grown.quantity = units("20");
 
     match store.record(grown, NOW + 1).unwrap().0 {
         Settled::Changed {
             previous_quantity,
             position,
         } => {
-            assert_eq!(previous_quantity.scaled(), 1_250_000_000);
-            assert_eq!(position.quantity.scaled(), 2_000_000_000);
+            assert_eq!(previous_quantity.to_string(), "12.5");
+            assert_eq!(position.quantity.to_string(), "20");
         }
         other => panic!("expected a change, got {other:?}"),
     }
@@ -144,11 +152,7 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
         .custodial_position(&account, &instrument)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        held.quantity.scaled(),
-        2_000_000_000,
-        "the rows were summed"
-    );
+    assert_eq!(held.quantity.to_string(), "20", "the rows were summed");
 }
 
 #[test]
@@ -169,6 +173,119 @@ fn a_row_saying_what_the_position_already_held_is_not_a_change() {
         store.record(same, NOW + 1).unwrap().0,
         Settled::Unchanged { .. }
     ));
+}
+
+#[test]
+fn the_smallest_and_largest_holdings_read_back_exactly() {
+    // spec/quantities-carry-their-own-scale, requirement 7: Alpaca's ninth
+    // decimal, a hundred billion units, and those at eighteen decimals, each
+    // read back at the scale it was stated with.
+    let store = store();
+    let statement = opened(&store);
+    let account = unique("ACC");
+    for (n, quantity) in [
+        "0.000000001",
+        "100000000000",
+        "100000000000.000000000000000001",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let instrument = format!("INS-{n}");
+        let mut row = resolved(&statement, &instrument);
+        row.account_id = account.clone();
+        row.quantity = units(quantity);
+        row.market_value = usd("41230.50");
+        store.record(row, NOW).unwrap();
+
+        let held = store
+            .custodial_position(&account, &instrument)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.quantity.to_string(), quantity);
+        assert_eq!(held.market_value.to_string(), "41230.50 USD");
+
+        // And the row itself, unresolved, through the other read.
+        let mut unresolved = resolved(&statement, "unused");
+        unresolved.account_id = account.clone();
+        unresolved.instrument_id = None;
+        unresolved.unresolved_identifiers = vec![Identifier {
+            scheme: "symbol".into(),
+            value: format!("ZZ{n}"),
+            source: "snaptrade".into(),
+        }];
+        unresolved.quantity = units(quantity);
+        store.record(unresolved, NOW).unwrap();
+    }
+
+    let page = store.page(&account, true, 100, "").unwrap();
+    let rows: Vec<String> = page
+        .unresolved
+        .iter()
+        .map(|row| row.quantity.to_string())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "0.000000001",
+            "100000000000",
+            "100000000000.000000000000000001"
+        ]
+    );
+}
+
+#[test]
+fn a_restatement_at_another_scale_is_the_same_number_and_keeps_its_own_scale() {
+    // Compared as numbers, so 12.5 restated as 12.50 moves nothing to
+    // announce; stored as stated, so it reads back as 12.50.
+    let store = store();
+    let instrument = unique("INS");
+
+    let first = opened(&store);
+    let holding = resolved(&first, &instrument);
+    let account = holding.account_id.clone();
+    store.record(holding, NOW).unwrap();
+
+    let second = opened(&store);
+    let mut restated = resolved(&second, &instrument);
+    restated.account_id = account.clone();
+    restated.quantity = units("12.50");
+    restated.market_value = usd("2812.5");
+
+    assert!(matches!(
+        store.record(restated, NOW + 1).unwrap().0,
+        Settled::Unchanged { .. }
+    ));
+    let held = store
+        .custodial_position(&account, &instrument)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.quantity.to_string(), "12.50");
+    assert_eq!(held.market_value.to_string(), "2812.5 USD");
+}
+
+#[test]
+fn the_database_refuses_a_number_the_wire_could_not_have_carried() {
+    // The same range the code enforces, enforced again where it is true of
+    // the table whoever wrote to it.
+    let store = store();
+    let statement = opened(&store);
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    for (quantity, why) in [
+        ("0.0000000000000000001", "a nineteenth decimal place"),
+        (
+            "100000000000000000000000000000000000000",
+            "a thirty-ninth digit",
+        ),
+    ] {
+        let refused = client.execute(
+            "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id,
+                                  quantity, market_value, currency)
+             VALUES ($1, $2, 'ACC', 'INS', $3::text::numeric, 0, 'USD')",
+            &[&unique("HLD"), &statement.statement_id, &quantity],
+        );
+        assert!(refused.is_err(), "{why} was stored");
+    }
 }
 
 #[test]
@@ -226,9 +343,8 @@ fn a_row_for_a_statement_nobody_opened_is_refused() {
         account_id: unique("ACC"),
         instrument_id: Some(unique("INS")),
         unresolved_identifiers: vec![],
-        quantity: Quantity::from_scaled(1),
-        market_value: Money::from_scaled(1),
-        currency: "USD".into(),
+        quantity: units("1"),
+        market_value: usd("1"),
         escalated: false,
     };
     assert!(store.record(orphan, NOW).is_err());
@@ -283,7 +399,7 @@ fn concurrent_rows_for_one_position_leave_one_row_and_no_lost_update() {
             let statement = opened(&store);
             let mut row = resolved(&statement, &instrument);
             row.account_id = account;
-            row.quantity = Quantity::from_scaled(n * 100_000_000);
+            row.quantity = Quantity::new(Exact::new(n.into(), 0).unwrap());
             store.record(row, NOW + n).unwrap()
         }));
     }
@@ -435,10 +551,9 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
     store.migrate().expect("the rename did not apply");
 
     let carried = store.custodial_position("ACC", "INS").unwrap();
-    assert!(
-        carried.is_some(),
-        "the row was left behind under the old table name"
-    );
+    let carried = carried.expect("the row was left behind under the old table name");
+    // A bigint at 1e8 carried at the eight places it was stated with.
+    assert_eq!(carried.quantity.to_string(), "0.00000001");
 
     client
         .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
@@ -454,7 +569,7 @@ fn stated(
     account: &str,
     as_of_date: &str,
     instrument_id: &str,
-    quantity: i64,
+    quantity: &str,
 ) -> Holding {
     let statement = Statement {
         statement_id: unique("STMT"),
@@ -468,7 +583,7 @@ fn stated(
 
     let mut holding = resolved(&statement, instrument_id);
     holding.account_id = account.to_string();
-    holding.quantity = Quantity::from_scaled(quantity);
+    holding.quantity = units(quantity);
     store.record(holding.clone(), NOW).unwrap();
     holding
 }
@@ -479,7 +594,7 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
     let account = unique("ACC");
     let placeholder = format!("LCL-{}", unique("p"));
     let instrument = unique("INS");
-    let holding = stated(&store, &account, "2026-09-08", &placeholder, 500_000_000);
+    let holding = stated(&store, &account, "2026-09-08", &placeholder, "5");
     assert!(store
         .placeholder_instruments()
         .unwrap()
@@ -492,7 +607,7 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
             previous_quantity,
         }] => {
             assert_eq!(position.instrument_id, instrument);
-            assert_eq!(position.quantity.scaled(), 500_000_000);
+            assert_eq!(position.quantity.to_string(), "5");
             assert_eq!(*previous_quantity, Quantity::ZERO);
         }
         other => panic!("expected one moved position, got {other:?}"),
@@ -542,14 +657,14 @@ fn where_both_are_held_a_later_placeholder_statement_stands() {
     let account = unique("ACC");
     let placeholder = format!("LCL-{}", unique("p"));
     let instrument = unique("INS");
-    stated(&store, &account, "2026-09-08", &instrument, 200_000_000);
-    stated(&store, &account, "2026-09-09", &placeholder, 500_000_000);
+    stated(&store, &account, "2026-09-08", &instrument, "2");
+    stated(&store, &account, "2026-09-09", &placeholder, "5");
 
     let settled = store.move_positions(&placeholder, &instrument).unwrap();
     match settled.as_slice() {
         [Settled::Changed {
             previous_quantity, ..
-        }] => assert_eq!(previous_quantity.scaled(), 200_000_000),
+        }] => assert_eq!(previous_quantity.to_string(), "2"),
         other => panic!("expected the placeholder's to stand, got {other:?}"),
     }
 
@@ -557,7 +672,7 @@ fn where_both_are_held_a_later_placeholder_statement_stands() {
         .custodial_position(&account, &instrument)
         .unwrap()
         .unwrap();
-    assert_eq!(standing.quantity.scaled(), 500_000_000);
+    assert_eq!(standing.quantity.to_string(), "5");
     assert_eq!(standing.as_of_date, "2026-09-09");
     assert!(store
         .custodial_position(&account, &placeholder)
@@ -571,8 +686,8 @@ fn where_both_are_held_a_later_instrument_statement_stands() {
     let account = unique("ACC");
     let placeholder = format!("LCL-{}", unique("p"));
     let instrument = unique("INS");
-    stated(&store, &account, "2026-09-08", &placeholder, 500_000_000);
-    stated(&store, &account, "2026-09-09", &instrument, 200_000_000);
+    stated(&store, &account, "2026-09-08", &placeholder, "5");
+    stated(&store, &account, "2026-09-09", &instrument, "2");
 
     assert!(store
         .move_positions(&placeholder, &instrument)
@@ -583,7 +698,7 @@ fn where_both_are_held_a_later_instrument_statement_stands() {
         .custodial_position(&account, &instrument)
         .unwrap()
         .unwrap();
-    assert_eq!(standing.quantity.scaled(), 200_000_000);
+    assert_eq!(standing.quantity.to_string(), "2");
     assert!(store
         .custodial_position(&account, &placeholder)
         .unwrap()

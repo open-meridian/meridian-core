@@ -52,9 +52,8 @@ fn to_wire_unresolved(holding: &Holding) -> UnresolvedHolding {
             .iter()
             .map(to_wire_identifier)
             .collect(),
-        quantity_scaled_1e8: holding.quantity.scaled(),
-        market_value_scaled_1e8: holding.market_value.scaled(),
-        currency: holding.currency.clone(),
+        quantity: holding.quantity.to_wire(),
+        market_value: holding.market_value.to_wire(),
         source: String::new(),
         as_of_date: String::new(),
         escalated: holding.escalated,
@@ -68,6 +67,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::amounts::testing::{quantity, read, usd};
     use crate::record::{open_statement, record_holding};
     use crate::MemoryStore;
 
@@ -97,9 +97,8 @@ mod tests {
                 account_id: "SNAP-ACC-1".into(),
                 instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
                 unresolved_identifiers: vec![],
-                quantity_scaled_1e8: 1_250_000_000,
-                market_value_scaled_1e8: 281_250_000_000,
-                currency: "USD".into(),
+                quantity: quantity("12.5"),
+                market_value: usd("2812.5"),
                 external_account_id: String::new(),
             },
             NOW,
@@ -117,9 +116,8 @@ mod tests {
                     value: "ZZTOP".into(),
                     source: "snaptrade".into(),
                 }],
-                quantity_scaled_1e8: 500_000_000,
-                market_value_scaled_1e8: 0,
-                currency: "USD".into(),
+                quantity: quantity("5"),
+                market_value: usd("0"),
                 external_account_id: String::new(),
             },
             NOW,
@@ -144,11 +142,11 @@ mod tests {
         let reply = list_positions(&store, &asking(true)).unwrap();
 
         assert_eq!(reply.positions.len(), 1);
-        assert_eq!(reply.positions[0].quantity_scaled_1e8, 1_250_000_000);
+        assert_eq!(read(&reply.positions[0].quantity), "12.5");
 
         assert_eq!(reply.unresolved.len(), 1);
         assert_eq!(reply.unresolved[0].identifiers[0].value, "ZZTOP");
-        assert_eq!(reply.unresolved[0].quantity_scaled_1e8, 500_000_000);
+        assert_eq!(read(&reply.unresolved[0].quantity), "5");
         assert!(!reply.unresolved[0].escalated);
     }
 
@@ -173,9 +171,8 @@ mod tests {
                 account_id: "SNAP-ACC-2".into(),
                 instrument_id: "INS-OTHER".into(),
                 unresolved_identifiers: vec![],
-                quantity_scaled_1e8: 100,
-                market_value_scaled_1e8: 100,
-                currency: "USD".into(),
+                quantity: quantity("0.000001"),
+                market_value: usd("0.000001"),
                 external_account_id: String::new(),
             },
             NOW,
@@ -203,9 +200,8 @@ mod tests {
                     account_id: "SNAP-ACC-1".into(),
                     instrument_id: format!("INS-{n:03}"),
                     unresolved_identifiers: vec![],
-                    quantity_scaled_1e8: 100,
-                    market_value_scaled_1e8: 100,
-                    currency: "USD".into(),
+                    quantity: quantity("0.000001"),
+                    market_value: usd("0.000001"),
                     external_account_id: String::new(),
                 },
                 NOW,
@@ -234,9 +230,8 @@ mod tests {
                     account_id: "SNAP-ACC-1".into(),
                     instrument_id: format!("INS-{n:03}"),
                     unresolved_identifiers: vec![],
-                    quantity_scaled_1e8: 100,
-                    market_value_scaled_1e8: 100,
-                    currency: "USD".into(),
+                    quantity: quantity("0.000001"),
+                    market_value: usd("0.000001"),
                     external_account_id: String::new(),
                 },
                 NOW,

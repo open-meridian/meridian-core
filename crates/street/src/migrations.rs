@@ -58,6 +58,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "custodial_position_and_completion",
         sql: include_str!("../migrations/0002_custodial_position_and_completion.sql"),
     },
+    Migration {
+        version: 3,
+        name: "numbers_carry_their_own_scale",
+        sql: include_str!("../migrations/0003_numbers_carry_their_own_scale.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

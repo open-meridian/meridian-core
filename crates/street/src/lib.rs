@@ -49,9 +49,11 @@
 //! be worse. So it is kept, it updates no position, and [`positions`] hands it
 //! back beside the positions so the gap is visible where the holdings are.
 //!
-//! **No floating point, anywhere.** Quantities and money are integers scaled by
-//! 1e8 on the wire and in the store, so there is no conversion to get wrong.
-//! [`amounts`] has no constructor from a float and no conversion into one.
+//! **No floating point, anywhere.** A quantity is an integer with its own scale
+//! on the wire and a `numeric` in the store, and an amount is that with its
+//! currency (decisions/023); a value is kept at the scale it was stated with
+//! and compared as a number. [`amounts`] has no constructor from a float and
+//! no conversion into one.
 //!
 //! # How a statement ends
 //!

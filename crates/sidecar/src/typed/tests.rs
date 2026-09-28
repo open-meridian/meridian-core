@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use meridian_bus::{Bus, MemoryBackend};
+use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     ExternalAccountLink, MissingInstrumentDetectedEvent, PluginConfiguration,
     PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest, SyncStatusEvent,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Identifier, RecordHoldingParams, RecordHoldingsStatementParams, ReportMissingInstrumentParams,
-    ReportSyncStatusParams,
+    Decimal, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
+    ReportMissingInstrumentParams, ReportSyncStatusParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{CallerAssertion, CallerClaims, RegisterRequest, TagAccess};
@@ -129,6 +130,17 @@ async fn delivered(listening: &mut meridian_bus::Subscription) -> meridian_bus::
         .expect("the subscription closed")
 }
 
+/// A number as a plugin puts it on the wire, from the decimal a person reads.
+fn wire(text: &str) -> Decimal {
+    let exact: Exact = text.parse().unwrap();
+    let domain = exact.to_wire();
+    Decimal {
+        high: domain.high,
+        low: domain.low,
+        scale: domain.scale,
+    }
+}
+
 fn holding(external: &str) -> RecordHoldingParams {
     RecordHoldingParams {
         statement_id: "S-1".into(),
@@ -138,9 +150,11 @@ fn holding(external: &str) -> RecordHoldingParams {
             value: "AAPL".into(),
             source: "snaptrade".into(),
         }],
-        quantity_scaled_1e8: 1_250_000_000,
-        market_value_scaled_1e8: 2_000_000_000_000,
-        currency: "USD".into(),
+        quantity: Some(wire("12.5")),
+        market_value: Some(Money {
+            amount: Some(wire("20000.00")),
+            currency_code: "USD".into(),
+        }),
         external_account_id: external.into(),
         acting_for: None,
     }
@@ -160,8 +174,98 @@ async fn a_holding_is_recorded_against_the_account_its_external_account_is_linke
     let rows = recorded.lock().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].account_id, "ACC-1", "stamped from the link");
-    assert_eq!(rows[0].quantity_scaled_1e8, 1_250_000_000);
+    let quantity = Exact::from_wire(rows[0].quantity.as_ref().unwrap()).unwrap();
+    assert_eq!(quantity.to_string(), "12.5");
+    let value = rows[0].market_value.as_ref().unwrap();
+    assert_eq!(
+        Exact::from_wire(value.amount.as_ref().unwrap())
+            .unwrap()
+            .to_string(),
+        "20000.00"
+    );
+    assert_eq!(value.currency_code, "USD");
     assert_eq!(rows[0].unresolved_identifiers[0].value, "AAPL");
+}
+
+#[tokio::test]
+async fn the_smallest_and_largest_holdings_reach_the_street_store_as_they_were_sent() {
+    // spec/quantities-carry-their-own-scale, requirement 7: Alpaca's ninth
+    // decimal, a hundred billion units, and those at eighteen decimals.
+    let (sidecar, _, recorded) = registered(&["custody"]).await;
+    let sent = [
+        "0.000000001",
+        "100000000000",
+        "100000000000.000000000000000001",
+    ];
+    for quantity in sent {
+        let mut row = holding("ext-1");
+        row.quantity = Some(wire(quantity));
+        sidecar
+            .record_holding(Request::new(row))
+            .await
+            .expect("recorded");
+    }
+    let rows = recorded.lock().unwrap();
+    let arrived: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            Exact::from_wire(row.quantity.as_ref().unwrap())
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(arrived, sent);
+}
+
+#[tokio::test]
+async fn a_number_the_wire_does_not_carry_is_refused_naming_its_field() {
+    // Sent raw, past the SDK that would have refused it first. Refused before
+    // the link is asked about, so nothing reaches the street store.
+    let (sidecar, _, recorded) = registered(&["custody"]).await;
+
+    let mut nineteenth = holding("ext-1");
+    nineteenth.quantity = Some(Decimal {
+        high: 0,
+        low: 1,
+        scale: 19,
+    });
+    let refused = sidecar
+        .record_holding(Request::new(nineteenth))
+        .await
+        .expect_err("a nineteenth decimal place");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .starts_with("quantity has 19 decimal places"),
+        "{}",
+        refused.message()
+    );
+
+    // 10^38: a thirty-ninth digit, in an amount.
+    let mut too_wide = holding("ext-1");
+    too_wide.market_value = Some(Money {
+        amount: Some(Decimal {
+            high: 5_421_010_862_427_522_170,
+            low: 687_399_551_400_673_280,
+            scale: 0,
+        }),
+        currency_code: "USD".into(),
+    });
+    let refused = sidecar
+        .record_holding(Request::new(too_wide))
+        .await
+        .expect_err("a thirty-ninth digit");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .starts_with("market_value has more than 38 digits"),
+        "{}",
+        refused.message()
+    );
+
+    assert!(recorded.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

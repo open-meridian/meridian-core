@@ -1012,6 +1012,46 @@ impl ClaimCodePurpose {
         }
     }
 }
+/// A number: a 128-bit two's-complement integer and its scale. The value is the
+/// integer times 10^-scale, so 1.50 is 150 at scale 2 and stays 1.50.
+///
+/// The scale travels with the value rather than being fixed for the contract,
+/// because the venues disagree: Alpaca takes nine decimal places, a crypto
+/// asset eighteen, and a cheap token's holding runs past what 64 bits hold at
+/// any fixed scale that serves them both. The scale is the one the value was
+/// stated with; nothing normalises it.
+///
+/// The integer's magnitude is below 10^38, which is at most 38 significant
+/// digits, and the scale is 0 to 18. The widest value the broker survey found,
+/// 100 billion units at 18 decimals, is well inside it.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Decimal {
+    /// The integer's upper 64 bits, signed: negative for a negative value.
+    #[prost(sfixed64, tag = "1")]
+    pub high: i64,
+    /// Its lower 64 bits, unsigned. The integer is high * 2^64 + low.
+    #[prost(fixed64, tag = "2")]
+    pub low: u64,
+    /// How many decimal places the integer carries, 0 to 18.
+    #[prost(uint32, tag = "3")]
+    pub scale: u32,
+}
+/// An amount of currency: a Decimal and the currency it is in.
+///
+/// One message rather than an amount with its currency beside it, so a message
+/// holding amounts in several currencies -- a USD price, a EUR commission --
+/// cannot pair the wrong ones. An amount is never separated from its currency.
+///
+/// In the currency's major unit, whatever the venue counted in: a plugin that
+/// read cents converts before anything reaches the bus (decisions/023).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Money {
+    #[prost(message, optional, tag = "1")]
+    pub amount: ::core::option::Option<Decimal>,
+    /// ISO 4217, e.g. "USD".
+    #[prost(string, tag = "2")]
+    pub currency_code: ::prost::alloc::string::String,
+}
 /// Envelope wraps one payload.
 ///
 /// The payload is opaque bytes rather than a oneof over every message type. A
@@ -2478,16 +2518,13 @@ pub struct RecordHoldingRequest {
     #[prost(message, repeated, tag = "4")]
     pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
     /// Signed: negative is a short position.
-    #[prost(int64, tag = "5")]
-    pub quantity_scaled_1e8: i64,
-    /// The rail's valuation of the holding. Recorded as reported, not recomputed:
-    /// this is the custodian's belief, and rederiving it would discard the thing
-    /// that makes a later comparison meaningful.
-    #[prost(int64, tag = "6")]
-    pub market_value_scaled_1e8: i64,
-    /// ISO 4217 for market_value_scaled_1e8.
-    #[prost(string, tag = "7")]
-    pub currency: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub quantity: ::core::option::Option<Decimal>,
+    /// The rail's valuation of the holding, in its currency. Recorded as
+    /// reported, not recomputed: this is the custodian's belief, and rederiving it
+    /// would discard the thing that makes a later comparison meaningful.
+    #[prost(message, optional, tag = "10")]
+    pub market_value: ::core::option::Option<Money>,
     /// The account as the rail knows it. The connector sets this and leaves
     /// `account_id` empty; the sidecar sets `account_id` from the link in the
     /// connector's settings (W6.4), and refuses the row, with that reason, when
@@ -2538,8 +2575,8 @@ pub struct CustodialPositionUpdatedEvent {
     pub statement_id: ::prost::alloc::string::String,
     /// The previous quantity, so a subscriber can render a delta without holding
     /// its own history.
-    #[prost(int64, tag = "3")]
-    pub previous_quantity_scaled_1e8: i64,
+    #[prost(message, optional, tag = "4")]
+    pub previous_quantity: ::core::option::Option<Decimal>,
 }
 /// What the custodian says an account holds of an instrument, right now.
 ///
@@ -2559,12 +2596,10 @@ pub struct CustodialPosition {
     /// which the INS- ID replaces when it arrives (W3.9).
     #[prost(string, tag = "2")]
     pub instrument_id: ::prost::alloc::string::String,
-    #[prost(int64, tag = "3")]
-    pub quantity_scaled_1e8: i64,
-    #[prost(int64, tag = "4")]
-    pub market_value_scaled_1e8: i64,
-    #[prost(string, tag = "5")]
-    pub currency: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub quantity: ::core::option::Option<Decimal>,
+    #[prost(message, optional, tag = "10")]
+    pub market_value: ::core::option::Option<Money>,
     /// The statement this was last stated by, and when. One not restated recently
     /// is not wrong, but it is worth showing differently.
     #[prost(string, tag = "6")]
@@ -2608,12 +2643,10 @@ pub struct UnresolvedHolding {
     pub account_id: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]
     pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
-    #[prost(int64, tag = "4")]
-    pub quantity_scaled_1e8: i64,
-    #[prost(int64, tag = "5")]
-    pub market_value_scaled_1e8: i64,
-    #[prost(string, tag = "6")]
-    pub currency: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "10")]
+    pub quantity: ::core::option::Option<Decimal>,
+    #[prost(message, optional, tag = "11")]
+    pub market_value: ::core::option::Option<Money>,
     #[prost(string, tag = "7")]
     pub source: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]

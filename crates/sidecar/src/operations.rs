@@ -43,6 +43,8 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let mut message: domain::RecordHoldingRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("market_value", message.market_value.as_ref())?;
         message.account_id = self.linked_account(&message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await

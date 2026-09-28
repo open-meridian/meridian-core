@@ -205,8 +205,7 @@ impl Held {
             account_id: holding.account_id.clone(),
             instrument_id,
             quantity: holding.quantity,
-            market_value: holding.market_value,
-            currency: holding.currency.clone(),
+            market_value: holding.market_value.clone(),
             last_statement_id: holding.statement_id.clone(),
             as_of_date: statement.as_of_date.clone(),
             updated_at_ns: now_ns,
@@ -214,11 +213,7 @@ impl Held {
 
         let moved = match &previous {
             None => true,
-            Some(before) => {
-                before.quantity != position.quantity
-                    || before.market_value != position.market_value
-                    || before.currency != position.currency
-            }
+            Some(before) => position.differs_from(before),
         };
 
         self.positions.insert(key, position.clone());
@@ -391,9 +386,8 @@ mod tests {
                     account_id: "ACC-1".into(),
                     instrument_id: Some("LCL-1".into()),
                     unresolved_identifiers: vec![],
-                    quantity: Quantity::from_scaled(1),
-                    market_value: Money::from_scaled(1),
-                    currency: "USD".into(),
+                    quantity: "1".parse().unwrap(),
+                    market_value: Money::new("1".parse().unwrap(), "USD"),
                     escalated: false,
                 },
                 1,

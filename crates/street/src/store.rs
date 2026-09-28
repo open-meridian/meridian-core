@@ -17,7 +17,7 @@
 //! two reads. It is not our own book, which does not exist yet and will have its
 //! own name when it does.
 
-use crate::amounts::{Money, Overflow, Quantity};
+use crate::amounts::{Money, Quantity, Refused};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -35,8 +35,9 @@ pub enum StoreError {
     #[error("a holding names neither an instrument nor any identifier, so it describes nothing")]
     NeitherResolvedNorIdentified,
 
+    /// A quantity or an amount outside what the wire carries, named.
     #[error(transparent)]
-    Overflow(#[from] Overflow),
+    OutOfRange(#[from] Refused),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -81,7 +82,6 @@ pub struct Holding {
 
     pub quantity: Quantity,
     pub market_value: Money,
-    pub currency: String,
 
     /// Whether a reader has asked the platform about the identifiers yet. Only
     /// meaningful on an unresolved row.
@@ -128,7 +128,6 @@ pub struct CustodialPosition {
     pub instrument_id: String,
     pub quantity: Quantity,
     pub market_value: Money,
-    pub currency: String,
 
     /// Which statement last set this, and what that statement's positions
     /// reflected. Together they say how current this is without a reader
@@ -160,9 +159,7 @@ impl CustodialPosition {
     /// Whether this says something different from `other` about what is held,
     /// which is what W2.6 announces. Which statement said it is not a change.
     pub fn differs_from(&self, other: &CustodialPosition) -> bool {
-        self.quantity != other.quantity
-            || self.market_value != other.market_value
-            || self.currency != other.currency
+        self.quantity != other.quantity || self.market_value != other.market_value
     }
 }
 

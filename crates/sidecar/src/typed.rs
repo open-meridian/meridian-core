@@ -8,11 +8,14 @@
 //!
 //! A refusal is the call's gRPC status, chosen by what the caller should do
 //! about it: `permission_denied` for a topic none of the plugin's roles
-//! grants, `failed_precondition` for an external account nobody has linked,
+//! grants, `invalid_argument` for a number the wire does not carry,
+//! `failed_precondition` for an external account nobody has linked,
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
 //! did not answer in time, `aborted` when it answered with a refusal.
 
 use meridian_bus::BusError;
+use meridian_domain::exact::Exact;
+use meridian_domain::v1 as domain;
 use meridian_pb::plugin::v1 as plugin;
 use meridian_pb::v1::CallerAssertion;
 use prost::Message;
@@ -43,6 +46,34 @@ impl Sidecar {
                 "the params did not read as the domain message: {failed}"
             ))
         })
+    }
+
+    /// A number the plugin sent, refused naming its field when it is outside
+    /// what the wire carries: more than 18 decimal places, or 38 digits
+    /// (decisions/023). The generated SDKs refuse these before sending; this
+    /// is for a plugin that built its params by hand, and it runs before
+    /// anything is stamped, so a malformed row never reaches the conductor or
+    /// the street store. Nothing is rounded. An unset number is not checked
+    /// here: whether one is required is the receiving component's to say.
+    pub(crate) fn exact(&self, field: &str, value: Option<&domain::Decimal>) -> Result<(), Status> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        Exact::from_wire(value).map(|_| ()).map_err(|out_of_range| {
+            let refusal = format!("{field} {out_of_range}; it is refused rather than rounded");
+            self.note_refusal(&refusal);
+            Status::invalid_argument(refusal)
+        })
+    }
+
+    /// An amount, whose number is checked as any other is, under the name of
+    /// the field the plugin set.
+    pub(crate) fn exact_money(
+        &self,
+        field: &str,
+        value: Option<&domain::Money>,
+    ) -> Result<(), Status> {
+        self.exact(field, value.and_then(|money| money.amount.as_ref()))
     }
 
     /// The topic this instance sends on: its own identifier where the row
