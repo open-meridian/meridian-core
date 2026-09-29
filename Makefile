@@ -488,11 +488,15 @@ e2e-cluster-k3d:
 	  if [ $$held -ne 0 ]; then \
 	    echo "e2e-cluster-k3d: what the cluster said, in .e2e-cluster.log" >&2; \
 	    { KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl get pods -A -o wide; \
+	      KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get events --sort-by=.lastTimestamp; \
 	      for pod in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get pods -o name); do \
-	        echo "== $$pod"; \
-	        KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod --all-containers --tail=80; \
-	        echo "== $$pod, the container before, if it restarted"; \
-	        KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod --all-containers --previous --tail=80; \
+	        for c in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get $$pod \
+	            -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}'); do \
+	          echo "== $$pod, $$c"; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod -c $$c --tail=80; \
+	          echo "== $$pod, $$c before, if it restarted"; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod -c $$c --previous --tail=80; \
+	        done; \
 	      done; } > .e2e-cluster.log 2>&1; \
 	  fi; \
 	  if [ -n "$(E2E_K3D_KEEP)" ]; then \
