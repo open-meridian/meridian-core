@@ -832,6 +832,28 @@ chart-check:
 		|| { echo "chart-check FAILED: $$ports host ports and $$bound bound to 127.0.0.1; the registry's node proxy is the only one, on localhost only" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q 'REGISTRY_PROXY_REMOTEURL' \
 		|| { echo "chart-check FAILED: the node's registry is not a pull-through proxy, so it would accept pushes" >&2; exit 1; }
+	@# No version label on the pod template of what runs an image of its own.
+	@# A rollout compares the pod template, so the release's version there
+	@# restarts the pod on every upgrade: on 2026-09-29 the database restarted
+	@# under the migration Job, the Job failed, and the release never came up
+	@# (CI run 36631603926). The resources' own metadata keeps the label.
+	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	for component in database registry registry-node; do \
+		labels="$$(echo "$$rendered" | awk -v n="check-meridian-runtime-$$component" ' \
+			/^---/ { doc = 0; meta = 0; tmpl = 0; lab = 0 } \
+			/^metadata:/ { meta = 1; next } \
+			meta && /^  name: / { doc = ($$2 == n); meta = 0 } \
+			doc && /^  template:/ { tmpl = 1; next } \
+			tmpl && /^  [^ ]/ { tmpl = 0 } \
+			tmpl && /^      labels:/ { lab = 1; next } \
+			lab && /^        [^ ]/ { print; next } \
+			{ lab = 0 }')"; \
+		echo "$$labels" | grep -qx "        meridian.dev/component: $$component" \
+			|| { echo "chart-check FAILED: found no pod template for $$component, so the check below would prove nothing" >&2; exit 1; }; \
+		echo "$$labels" | grep -q 'app.kubernetes.io/version' \
+			&& { echo "chart-check FAILED: the $$component pod template carries the release's version, so every upgrade restarts it" >&2; \
+			     echo "  use meridian-runtime.unversionedLabels there; its image does not move with the release" >&2; exit 1; }; \
+	done; true
 	@# A sidecar on the broker this chart brings: it has a credential under its
 	@# instance, and the broker knows its role. Every other render here passes
 	@# broker.existingSecret, so for weeks the bundled broker read a sidecar's
