@@ -13,8 +13,8 @@ use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::RecordHoldingParams;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    PluginAccessReply, RegisterRequest, SettingType, UserGroupAccess, WatchAccountScopeRequest,
-    WatchSettingsRequest,
+    PluginAccessReply, RegisterRequest, SettingChoice, SettingCondition, SettingType,
+    UserGroupAccess, WatchAccountScopeRequest, WatchSettingsRequest,
 };
 use tokio_stream::StreamExt;
 use tonic::{Code, Request};
@@ -31,7 +31,7 @@ fn declared(name: &str, required: bool) -> SettingDeclaration {
         r#type: SettingType::String as i32,
         required,
         secret: required,
-        description: String::new(),
+        ..Default::default()
     }
 }
 
@@ -70,6 +70,69 @@ fn a_plugin_is_given_the_values_of_what_it_declared_and_told_what_is_missing() {
         }]
     );
     assert_eq!(delivered.missing_required, vec!["api_key", "client_id"]);
+}
+
+/// The fixture's declarations (set-plugin-settings): a key's type, a secret
+/// every key needs, and one only a commercial key does.
+fn keyed() -> Vec<SettingDeclaration> {
+    vec![
+        SettingDeclaration {
+            r#type: SettingType::Choice as i32,
+            choices: vec![
+                SettingChoice {
+                    value: "personal".into(),
+                    ..Default::default()
+                },
+                SettingChoice {
+                    value: "commercial".into(),
+                    ..Default::default()
+                },
+            ],
+            ..declared("key_type", true)
+        },
+        declared("api_key", true),
+        SettingDeclaration {
+            applies_when: Some(SettingCondition {
+                setting: "key_type".into(),
+                one_of: vec!["commercial".into()],
+            }),
+            ..declared("user_secret", true)
+        },
+    ]
+}
+
+#[test]
+fn a_required_setting_that_does_not_apply_to_the_choice_made_is_not_missing() {
+    let holding = |values: &[(&str, &str)]| PluginConfiguration {
+        settings: values.iter().map(|(n, v)| value(n, v)).collect(),
+        ..Default::default()
+    };
+    let personal = settings(
+        &keyed(),
+        &holding(&[("key_type", "personal"), ("api_key", "k")]),
+    );
+    assert!(
+        personal.missing_required.is_empty(),
+        "user_secret applies only to a commercial key: {:?}",
+        personal.missing_required
+    );
+
+    let commercial = settings(
+        &keyed(),
+        &holding(&[("key_type", "commercial"), ("api_key", "k")]),
+    );
+    assert_eq!(commercial.missing_required, vec!["user_secret"]);
+
+    // Nothing chosen yet: the choice is missing, and what hangs on it waits.
+    let nothing = settings(&keyed(), &holding(&[]));
+    assert_eq!(nothing.missing_required, vec!["key_type", "api_key"]);
+
+    // While the choice is unset, its declared default decides.
+    let mut defaulted = keyed();
+    defaulted[0].required = false;
+    defaulted[0].default_value = "commercial".into();
+    let by_default = settings(&defaulted, &holding(&[("api_key", "k")]));
+    assert_eq!(by_default.missing_required, vec!["user_secret"]);
 }
 
 /// A registered plugin declaring `api_key` as required, and a conductor

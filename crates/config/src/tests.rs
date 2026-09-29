@@ -14,7 +14,7 @@ use meridian_domain::v1::{
     RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest, SignInRecord,
     UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
-use meridian_pb::v1::{SettingDeclaration, SettingType};
+use meridian_pb::v1::{SettingChoice, SettingDeclaration, SettingType};
 use prost::Message;
 
 use crate::service::*;
@@ -788,12 +788,23 @@ fn declaration(name: &str, kind: SettingType, required: bool, secret: bool) -> S
         required,
         secret,
         description: format!("what {name} is"),
+        ..Default::default()
     }
 }
 
-/// What oms-1 declares: a required secret, a number and a switch.
+/// What oms-1 declares: a choice of key, a required secret, a number and a
+/// switch.
 fn declared() -> Vec<SettingDeclaration> {
+    let choice = |value: &str| SettingChoice {
+        value: value.into(),
+        label: format!("{value} key"),
+        ..Default::default()
+    };
     vec![
+        SettingDeclaration {
+            choices: vec![choice("personal"), choice("commercial")],
+            ..declaration("key_type", SettingType::Choice, true, false)
+        },
         declaration("api_key", SettingType::String, true, true),
         declaration("poll_minutes", SettingType::Integer, false, false),
         declaration("synthetic", SettingType::Boolean, false, false),
@@ -934,6 +945,13 @@ async fn a_setting_is_one_the_plugin_declared_in_a_form_its_type_reads() {
         ),
         (vec![("poll_minutes", "soon-ish")], vec![], "whole number"),
         (vec![("synthetic", "maybe-so")], vec![], "true or false"),
+        // The fixture's case: a choice not among the declared choices,
+        // refused naming the setting and the choices.
+        (
+            vec![("key_type", "trial")],
+            vec![],
+            "setting key_type is one of personal, commercial",
+        ),
         (vec![("poll_minutes", "")], vec![], "clear it instead"),
         (
             vec![("poll_minutes", "5"), ("poll_minutes", "6")],
@@ -954,7 +972,7 @@ async fn a_setting_is_one_the_plugin_declared_in_a_form_its_type_reads() {
         values.insert(0, ("api_key", SECRET));
         let refused = set(&h, "oms-1", &values, &cleared).await.unwrap_err();
         assert!(refused.contains(said), "{said}: {refused}");
-        for value in [SECRET, "soon-ish", "maybe-so"] {
+        for value in [SECRET, "soon-ish", "maybe-so", "trial"] {
             assert!(
                 !refused.contains(value),
                 "a refusal never repeats a value: {refused}"
@@ -970,7 +988,11 @@ async fn a_setting_is_one_the_plugin_declared_in_a_form_its_type_reads() {
     let record = set(
         &h,
         "oms-1",
-        &[("poll_minutes", " 15"), ("synthetic", "Yes")],
+        &[
+            ("key_type", "commercial "),
+            ("poll_minutes", " 15"),
+            ("synthetic", "Yes"),
+        ],
         &[],
     )
     .await
@@ -984,6 +1006,7 @@ async fn a_setting_is_one_the_plugin_declared_in_a_form_its_type_reads() {
     assert_eq!(
         values,
         [
+            ("key_type".to_string(), "commercial".to_string()),
             ("poll_minutes".to_string(), "15".to_string()),
             ("synthetic".to_string(), "true".to_string())
         ]

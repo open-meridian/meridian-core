@@ -20,6 +20,7 @@ use meridian_domain::v1::{
 };
 
 use meridian_pb::v1::SettingDeclaration;
+use prost::Message as _;
 
 use crate::migrations;
 use crate::store::{
@@ -237,24 +238,37 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT plugin_instance_id, name, type, required, secret, description
+                "SELECT plugin_instance_id, name, type, required, secret, description, declared
                    FROM config_plugin_setting_declaration
                   ORDER BY plugin_instance_id, position",
                 &[],
             )
             .map_err(unavailable)?
         {
+            // Whole where it was kept whole; from the columns for a row
+            // written before it was, which the plugin's next report replaces.
+            let whole = row
+                .get::<_, Option<Vec<u8>>>(6)
+                .map(|bytes| SettingDeclaration::decode(&bytes[..]))
+                .transpose()
+                .map_err(|failed| {
+                    StoreError::Unavailable(format!(
+                        "a setting declaration does not decode: {failed}"
+                    ))
+                })?;
+            let declaration = whole.unwrap_or_else(|| SettingDeclaration {
+                name: row.get(1),
+                r#type: i32::from(row.get::<_, i16>(2)),
+                required: row.get(3),
+                secret: row.get(4),
+                description: row.get(5),
+                ..Default::default()
+            });
             snapshot
                 .declared_settings
                 .entry(row.get(0))
                 .or_default()
-                .push(SettingDeclaration {
-                    name: row.get(1),
-                    r#type: i32::from(row.get::<_, i16>(2)),
-                    required: row.get(3),
-                    secret: row.get(4),
-                    description: row.get(5),
-                });
+                .push(declaration);
         }
 
         for row in tx
@@ -556,8 +570,9 @@ impl Store for PostgresStore {
         for (position, declaration) in declared.iter().enumerate() {
             tx.execute(
                 "INSERT INTO config_plugin_setting_declaration
-                        (plugin_instance_id, position, name, type, required, secret, description)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                        (plugin_instance_id, position, name, type, required, secret, description,
+                         declared)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &plugin_instance_id,
                     &(position as i32),
@@ -566,6 +581,7 @@ impl Store for PostgresStore {
                     &declaration.required,
                     &declaration.secret,
                     &declaration.description,
+                    &declaration.encode_to_vec(),
                 ],
             )
             .map_err(unavailable)?;

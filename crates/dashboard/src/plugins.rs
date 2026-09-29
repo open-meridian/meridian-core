@@ -20,6 +20,21 @@
 //! sidecar removes the same again. So a plugin sets no cookies either: one it
 //! set could never come back to it, and could only be somebody's attempt to
 //! plant one. Who is asking is the assertion, every time.
+//!
+//! **The frame** (spec/plugin-pages-share-one-kit.md, Q3). `/plugins/{instance}`
+//! is a dashboard page drawing the one header -- the plugin's name and the
+//! instance's, the way back, and the person -- around the plugin's page in a
+//! frame, which enters the plugin's host through `/plugins/{instance}/enter`.
+//! The person's theme reaches the page as meridian-ui reads it: on first load
+//! as `om-scheme`, `om-mode` and `om-direction` on the page's address, and on
+//! change, and on every load of the frame, as the `meridian:theme` message
+//! the header's script sends to the plugin's origin alone. A plugin's page
+//! may be framed by the dashboard and by nothing else, and the dashboard's
+//! own pages by nobody but the dashboard.
+//!
+//! **The kit** is served at `/.meridian/ui/<version>/` on every plugin host
+//! (Q2), on the plugin's own origin, to anybody: it is the same static files
+//! for everyone, and a page links it before anything else is asked.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -223,6 +238,15 @@ impl Plugins {
         )
     }
 
+    /// Whether a browser keeps a framed page's session: only where the
+    /// dashboard's host has a domain, so its plugins' hosts are the same site
+    /// as it. `x.plugins.localhost` is another site from `localhost`, and a
+    /// cookie set inside a frame from another site is refused; below
+    /// `meridian.localhost`, or a firm's own name, it is kept.
+    pub fn frames(&self) -> bool {
+        self.host.contains('.')
+    }
+
     fn dashboard_origin(&self) -> String {
         format!("{}://{}{}", self.scheme, self.host, self.port_suffix())
     }
@@ -280,6 +304,9 @@ impl Plugins {
             issued_at_ns: now,
             expires_at_ns: now + ASSERTION_NS,
             assertion_id: token(),
+            // Only a deployment admin's terminal reaches a development path
+            // (catalogue::admin), so this is said of every caller here.
+            deployment_admin: true,
         };
         let assertion = match self.signer.sign(&claims) {
             Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
@@ -398,6 +425,67 @@ impl Plugins {
     }
 }
 
+/// The person's theme, handed to a framed page on first load as meridian-ui
+/// reads it. Anything the kit would not take is dropped for its default, so
+/// nothing arbitrary is carried into a plugin's address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Theme {
+    scheme: String,
+    mode: String,
+    direction: String,
+}
+
+impl Theme {
+    /// The brand's default scheme (schemes of an admin's are
+    /// kernel/colour-schemes), the person's mode, green-up.
+    pub(crate) fn of_mode(mode: &str) -> Theme {
+        Theme::from_pairs(&HashMap::from([("om-mode".to_string(), mode.to_string())]))
+    }
+
+    fn from_pairs(asked: &HashMap<String, String>) -> Theme {
+        let given = |name: &str| asked.get(name).map(String::as_str).unwrap_or_default();
+        let scheme = given("om-scheme");
+        let scheme_ok = (1..=64).contains(&scheme.len())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        Theme {
+            scheme: if scheme_ok { scheme } else { "default" }.to_string(),
+            mode: match given("om-mode") {
+                mode @ ("light" | "dark") => mode,
+                _ => "system",
+            }
+            .to_string(),
+            direction: match given("om-direction") {
+                "red-up" => "red-up",
+                _ => "green-up",
+            }
+            .to_string(),
+        }
+    }
+
+    fn append_to(&self, url: &mut reqwest::Url) {
+        url.query_pairs_mut()
+            .append_pair("om-scheme", &self.scheme)
+            .append_pair("om-mode", &self.mode)
+            .append_pair("om-direction", &self.direction);
+    }
+}
+
+/// Where the frame enters an instance's page, at `path` on its host, with
+/// the person's theme: the dashboard's own route, which mints the code only
+/// once the frame asks for it.
+pub(crate) fn entrance(instance: &str, path: &str, theme: &Theme) -> String {
+    let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("a fixed address");
+    url.set_path(&format!("/plugins/{instance}/enter"));
+    url.query_pairs_mut().append_pair("path", path);
+    theme.append_to(&mut url);
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
 fn said(status: StatusCode, title: &str, sentence: &str) -> Response {
     (
         status,
@@ -409,57 +497,149 @@ fn said(status: StatusCode, title: &str, sentence: &str) -> Response {
         .into_response()
 }
 
-/// `GET /plugins/{instance}` on the dashboard: EnterPlugin.
-pub(crate) async fn open(
-    State(app): State<Arc<App>>,
-    Path(instance): Path<String>,
-    headers: HeaderMap,
-) -> Response {
+/// Who may open an instance's page from the dashboard, and the plugins that
+/// serve it; or the answer that refuses them. W6.9's checks, in its order.
+async fn may_open<'a>(
+    app: &'a App,
+    instance: &str,
+    headers: &HeaderMap,
+) -> Result<
+    (
+        String,
+        crate::session::Session,
+        meridian_access::Access,
+        &'a Plugins,
+    ),
+    Box<Response>,
+> {
     let now = app.clock.now_ns();
-    let records = match app.records.current(now) {
-        Ok(records) => records,
-        Err(stale) => return refused(&stale.to_string()),
-    };
+    let records = app
+        .records
+        .current(now)
+        .map_err(|stale| Box::new(refused(&stale.to_string())))?;
     let (Some(key), Some(session)) = (
-        cookie(&app, &headers, SESSION_COOKIE),
-        crate::web::session_of(&app, &headers),
+        cookie(app, headers, SESSION_COOKIE),
+        crate::web::session_of(app, headers),
     ) else {
-        return redirect("/sign-in");
+        return Err(Box::new(redirect("/sign-in")));
     };
-    let Some(plugins) = &app.plugins else {
-        return refused(
+    let Some(plugins) = app.plugins.as_deref() else {
+        return Err(Box::new(refused(
             "this dashboard serves no plugin pages: it needs its own address \
              (MERIDIAN_DASHBOARD_URL) and where plugins' sidecars are",
-        );
+        )));
     };
-    if !is_instance(&instance) {
-        return said(
+    if !is_instance(instance) {
+        return Err(Box::new(said(
             StatusCode::NOT_FOUND,
             "No such plugin",
             "That is not a plugin's name.",
-        );
+        )));
     }
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    if opening(&access, &instance).is_none() {
-        return said(
+    if opening(&access, instance).is_none() {
+        return Err(Box::new(said(
             StatusCode::FORBIDDEN,
             "No access",
             &format!("You hold no access on {instance}."),
-        );
+        )));
     }
-    if !plugins.runs(&instance).await {
-        return said(
+    if !plugins.runs(instance).await {
+        return Err(Box::new(said(
             StatusCode::NOT_FOUND,
             "No such plugin",
             &format!("No plugin {instance} runs in this deployment."),
-        );
+        )));
     }
-    let code = plugins.mint(Came::Browser(key), &instance, now);
-    redirect(&format!(
-        "{}{ENTER_PATH}?code={code}",
-        plugins.origin(&instance)
+    Ok((key, session, access, plugins))
+}
+
+/// `GET /plugins/{instance}` on the dashboard: the frame. The one header, and
+/// the plugin's page below it filling the window, at `path` on its host.
+pub(crate) async fn frame(
+    State(app): State<Arc<App>>,
+    Path(instance): Path<String>,
+    Query(asked): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, session, access, plugins) = match may_open(&app, &instance, &headers).await {
+        Ok(allowed) => allowed,
+        Err(refusal) => return *refusal,
+    };
+    let path = asked
+        .get("path")
+        .map(String::as_str)
+        .filter(|path| page_path(path).is_ok())
+        .unwrap_or("/");
+    let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
+    // Where no frame can hold the page's session, its window is its own.
+    if !plugins.frames() {
+        return redirect(&entrance(&instance, path, &theme));
+    }
+    let name = crate::catalogue::plugin_name(&app, &instance).await;
+    let crumbs = format!(
+        "<a href=\"/\">Plugins</a><span aria-hidden=\"true\">/</span>\
+         <span class=\"here\"><strong>{}</strong><code>{}</code></span>\
+         <a class=\"own-window\" href=\"{}\" target=\"_blank\" rel=\"noopener\" \
+         title=\"Open it in a window of its own\">&#8599;</a>",
+        escape(name.as_deref().unwrap_or(&instance)),
+        escape(&instance),
+        escape(&entrance(&instance, path, &theme)),
+    );
+    let body = format!(
+        "<iframe src=\"{src}\" title=\"{title}\" data-plugin-frame data-origin=\"{origin}\"></iframe>",
+        src = escape(&entrance(&instance, path, &theme)),
+        title = escape(&format!("{} ({instance})", name.as_deref().unwrap_or(&instance))),
+        origin = escape(&plugins.origin(&instance)),
+    );
+    Html(crate::html::page_with(
+        name.as_deref().unwrap_or(&instance),
+        &body,
+        &crate::html::Chrome {
+            viewer: Some(crate::html::Viewer {
+                display_name: &session.display_name,
+                form_token: &session.form_token,
+                admin: access.deployment_admin,
+            }),
+            crumbs,
+            main: "frame",
+            in_admin: false,
+        },
     ))
+    .into_response()
+}
+
+/// `GET /plugins/{instance}/enter` on the dashboard: EnterPlugin. A one-time
+/// code for the instance's host, carrying on to `path` there with the theme,
+/// which is what the frame loads; opened on its own, the page unframed.
+pub(crate) async fn open(
+    State(app): State<Arc<App>>,
+    Path(instance): Path<String>,
+    Query(asked): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let (key, _, _, plugins) = match may_open(&app, &instance, &headers).await {
+        Ok(allowed) => allowed,
+        Err(refusal) => return *refusal,
+    };
+    let path = asked.get("path").map(String::as_str).unwrap_or("/");
+    if let Err(why) = page_path(path) {
+        return said(StatusCode::BAD_REQUEST, "Not a page", &why);
+    }
+    let code = plugins.mint(Came::Browser(key), &instance, app.clock.now_ns());
+    let mut url = match reqwest::Url::parse(&format!("{}{ENTER_PATH}", plugins.origin(&instance))) {
+        Ok(url) => url,
+        Err(failed) => return refused(&format!("{instance}'s address is not one: {failed}")),
+    };
+    url.query_pairs_mut().append_pair("code", &code);
+    if path != "/" {
+        url.query_pairs_mut().append_pair("path", path);
+    }
+    if asked.keys().any(|name| name.starts_with("om-")) {
+        Theme::from_pairs(&asked).append_to(&mut url);
+    }
+    redirect(url.as_str())
 }
 
 /// Whether plugins' pages can be served below this dashboard's address: not
@@ -481,14 +661,43 @@ pub fn pages_possible(public_url: &str) -> Result<(), String> {
     }
 }
 
+/// What a person carries onto a plugin's page.
+pub(crate) struct Opening {
+    /// Their access on the plugin, tag by tag.
+    pub access: Vec<TagAccess>,
+    /// Whether they are a deployment admin, which the plugin serves its admin
+    /// page by (W6.9); asserted false for everybody else.
+    pub deployment_admin: bool,
+}
+
+impl Opening {
+    /// The assertion's claims, for this instance alone, for 60 seconds, once.
+    fn claims(self, who: &Who, instance: &str, now: i64) -> CallerClaims {
+        CallerClaims {
+            subject: who.subject.clone(),
+            display_name: who.display_name.clone(),
+            audience_instance_id: instance.to_string(),
+            access: self.access,
+            issued_at_ns: now,
+            expires_at_ns: now + ASSERTION_NS,
+            assertion_id: token(),
+            deployment_admin: self.deployment_admin,
+        }
+    }
+}
+
 /// What a person carries onto a plugin's page, if they may open it: their
 /// access on it; or, for a deployment admin, who opens any plugin's page,
 /// whatever they hold there, which may be nothing. Opening is not access, so
 /// an admin is asserted with nothing they do not hold
-/// (spec/deployment-dashboard-and-access, ruling 19).
-pub(crate) fn opening(access: &meridian_access::Access, instance: &str) -> Option<Vec<TagAccess>> {
+/// (spec/deployment-dashboard-and-access, ruling 19), and with the one claim
+/// that says they are an admin.
+pub(crate) fn opening(access: &meridian_access::Access, instance: &str) -> Option<Opening> {
     let held = access.on_plugin(instance);
-    (access.deployment_admin || !held.is_empty()).then_some(held)
+    (access.deployment_admin || !held.is_empty()).then_some(Opening {
+        access: held,
+        deployment_admin: access.deployment_admin,
+    })
 }
 
 // ── From a terminal (W6.15) ─────────────────────────────────────────────
@@ -509,7 +718,7 @@ fn from_terminal(
     headers: &HeaderMap,
     instance: &str,
     now: i64,
-) -> Result<(Who, Vec<TagAccess>, Came), Box<Response>> {
+) -> Result<(Who, Opening, Came), Box<Response>> {
     let person = crate::web::terminal_session_of(app, headers)?;
     let came = Came::Terminal(
         crate::web::bearer(headers)
@@ -528,7 +737,7 @@ fn from_terminal(
         .map_err(|stale| Box::new(declined(StatusCode::SERVICE_UNAVAILABLE, stale.to_string())))?;
     let access =
         meridian_access::person_access(&records, &person.subject, &person.directory_groups);
-    let Some(held) = opening(&access, instance) else {
+    let Some(opened) = opening(&access, instance) else {
         return Err(Box::new(declined(
             StatusCode::FORBIDDEN,
             format!("you hold no access on {instance}"),
@@ -539,7 +748,7 @@ fn from_terminal(
         display_name: person.display_name,
         directory_groups: person.directory_groups,
     };
-    Ok((who, held, came))
+    Ok((who, opened, came))
 }
 
 /// The plugins a terminal can reach, and that this one runs.
@@ -622,8 +831,8 @@ pub(crate) async fn page_from_terminal(
     headers: HeaderMap,
 ) -> Response {
     let now = app.clock.now_ns();
-    let (who, access) = match from_terminal(&app, &headers, &instance, now) {
-        Ok((who, access, _)) => (who, access),
+    let (who, opened) = match from_terminal(&app, &headers, &instance, now) {
+        Ok((who, opened, _)) => (who, opened),
         Err(refusal) => return *refusal,
     };
     let path = asked.get("path").map(String::as_str).unwrap_or("/");
@@ -634,15 +843,7 @@ pub(crate) async fn page_from_terminal(
         Ok(plugins) => plugins,
         Err(refusal) => return *refusal,
     };
-    let claims = CallerClaims {
-        subject: who.subject,
-        display_name: who.display_name,
-        audience_instance_id: instance.clone(),
-        access,
-        issued_at_ns: now,
-        expires_at_ns: now + ASSERTION_NS,
-        assertion_id: token(),
-    };
+    let claims = opened.claims(&who, &instance, now);
     let assertion = match plugins.signer.sign(&claims) {
         Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
         Err(failed) => {
@@ -744,6 +945,17 @@ pub(crate) async fn on_plugin_host(
 }
 
 async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -> Response {
+    // The kit, on the plugin's own origin, before anything about who asks.
+    if request.uri().path().starts_with(crate::kit::PATH) {
+        return match &app.kit {
+            Some(kit) => kit.serve(request.method(), request.uri().path()).await,
+            None => said(
+                StatusCode::NOT_FOUND,
+                "No kit",
+                "This dashboard carries no UI kit.",
+            ),
+        };
+    }
     let now = app.clock.now_ns();
     let records = match app.records.current(now) {
         Ok(records) => records,
@@ -765,29 +977,21 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
         if let Some(key) = &key {
             plugins.leave(key);
         }
-        return again(plugins, instance, request.method());
+        return again(plugins, instance, &request);
     };
 
     // Evaluated now, from the records as they are now: access withdrawn a
     // moment ago is withdrawn here.
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    let Some(access) = opening(&access, instance) else {
+    let Some(opened) = opening(&access, instance) else {
         return said(
             StatusCode::FORBIDDEN,
             "No access",
             &format!("You hold no access on {instance}."),
         );
     };
-    let claims = CallerClaims {
-        subject: session.subject.clone(),
-        display_name: session.display_name.clone(),
-        audience_instance_id: instance.to_string(),
-        access,
-        issued_at_ns: now,
-        expires_at_ns: now + ASSERTION_NS,
-        assertion_id: token(),
-    };
+    let claims = opened.claims(&session, instance, now);
     let assertion = match plugins.signer.sign(&claims) {
         Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
         Err(failed) => {
@@ -803,29 +1007,48 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
 /// Somebody on a plugin's host with no session there, or one whose dashboard
 /// session ended: a page is sent back through the dashboard, which asks them
 /// to sign in if they must; anything else is refused, since a script's
-/// request cannot follow a sign-in.
-fn again(plugins: &Plugins, instance: &str, method: &Method) -> Response {
-    if method == Method::GET || method == Method::HEAD {
-        return redirect(&format!(
-            "{}/plugins/{instance}",
-            plugins.dashboard_origin()
-        ));
+/// request cannot follow a sign-in. A page loaded in a window of its own goes
+/// back to the frame; one in the frame, to the frame's way in, so it comes
+/// back at the page it was on rather than the frame inside itself.
+fn again(plugins: &Plugins, instance: &str, request: &Request) -> Response {
+    let method = request.method();
+    if method != Method::GET && method != Method::HEAD {
+        return said(
+            StatusCode::UNAUTHORIZED,
+            "Signed out",
+            "Open this plugin from the dashboard again.",
+        );
     }
-    said(
-        StatusCode::UNAUTHORIZED,
-        "Signed out",
-        "Open this plugin from the dashboard again.",
-    )
+    let in_a_window = request
+        .headers()
+        .get("sec-fetch-dest")
+        .is_some_and(|dest| dest == "document");
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .filter(|path| page_path(path).is_ok())
+        .unwrap_or("/");
+    let back = if in_a_window {
+        format!("{}/plugins/{instance}", plugins.dashboard_origin())
+    } else {
+        format!("{}/plugins/{instance}/enter", plugins.dashboard_origin())
+    };
+    let mut url = match reqwest::Url::parse(&back) {
+        Ok(url) => url,
+        Err(_) => return redirect(&format!("/plugins/{instance}")),
+    };
+    if path != "/" {
+        url.query_pairs_mut().append_pair("path", path);
+    }
+    redirect(url.as_str())
 }
 
 fn enter(app: &App, plugins: &Plugins, instance: &str, request: &Request, now: i64) -> Response {
-    let code = request
-        .uri()
-        .query()
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("code="))
+    let asked = Query::<HashMap<String, String>>::try_from_uri(request.uri())
+        .map(|Query(asked)| asked)
         .unwrap_or_default();
+    let code = asked.get("code").map(String::as_str).unwrap_or_default();
     let came = plugins
         .redeem(code, instance, now)
         .filter(|came| came.is_live(&app.sessions, &app.terminals, now));
@@ -838,12 +1061,34 @@ fn enter(app: &App, plugins: &Plugins, instance: &str, request: &Request, now: i
         );
     };
     let key = plugins.enter(came, instance);
-    let mut response = redirect("/");
+    let mut response = redirect(&landing(&asked));
     response.headers_mut().insert(
         SET_COOKIE,
         set_cookie(app, PLUGIN_COOKIE, &key, "/", ABSOLUTE_NS / 1_000_000_000),
     );
     response
+}
+
+/// Where a redeemed code lands on the plugin's host: the page asked for, a
+/// path there and nowhere else, carrying the theme when the frame gave one.
+fn landing(asked: &HashMap<String, String>) -> String {
+    let path = asked
+        .get("path")
+        .map(String::as_str)
+        .filter(|path| page_path(path).is_ok())
+        .unwrap_or("/");
+    if !asked.keys().any(|name| name.starts_with("om-")) {
+        return path.to_string();
+    }
+    let mut url = reqwest::Url::parse("http://plugin.invalid/").expect("a fixed address");
+    let (only, query) = path.split_once('?').unwrap_or((path, ""));
+    url.set_path(only);
+    url.set_query((!query.is_empty()).then_some(query));
+    Theme::from_pairs(asked).append_to(&mut url);
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
 }
 
 /// Headers that describe one connection rather than the request.
@@ -907,6 +1152,12 @@ async fn forward(
         }
     };
     let mut response = Response::builder().status(answer.status());
+    // Framed by the dashboard, and by nothing else.
+    if let Ok(ancestors) =
+        HeaderValue::from_str(&format!("frame-ancestors {}", plugins.dashboard_origin()))
+    {
+        response = response.header(axum::http::header::CONTENT_SECURITY_POLICY, ancestors);
+    }
     for (name, value) in answer.headers() {
         if HOP_BY_HOP.contains(&name.as_str()) {
             continue;

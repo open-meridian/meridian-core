@@ -233,6 +233,8 @@ async fn harness() -> Harness {
         plugins: None,
         registry: Some(Arc::new(Registry::new(base).unwrap())),
         custody: Arc::default(),
+        health: Arc::default(),
+        kit: None,
     });
     Harness {
         app,

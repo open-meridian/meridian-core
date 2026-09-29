@@ -6,6 +6,20 @@
 # thing that runs; that one produces answers about it.
 
 ARG RUST_VERSION=1.90
+ARG NODE_VERSION=22.23.3
+# The plugin UI kit, meridian-ui, at a pinned commit of its public repository.
+# Moving the kit is moving this.
+ARG MERIDIAN_UI_REV=cd7ecf6b75c5c23b34596f9364f1c8d40be9ec45
+
+# The kit the dashboard serves at /.meridian/ui/<version>/ on every plugin host
+# and its own (spec/plugin-pages-share-one-kit.md, Q2), built from its source
+# as meridian-ui's own build does, never vendored here. Its build reads the
+# brand's tokens from the generated/ it commits, and needs nothing installed.
+FROM node:${NODE_VERSION}-alpine AS ui
+ARG MERIDIAN_UI_REV
+ADD https://github.com/open-meridian/meridian-ui.git#${MERIDIAN_UI_REV} /ui
+WORKDIR /ui
+RUN node tools/build.mjs
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 RUN apt-get update \
@@ -53,6 +67,8 @@ COPY --from=build /usr/local/bin/meridian-dashboard /usr/local/bin/meridian-dash
 COPY --from=build /usr/local/bin/meridian-first-run /usr/local/bin/meridian-first-run
 COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-broker-config
 COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launcher
+# One directory per version, where the dashboard looks (MERIDIAN_UI_DIR).
+COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.

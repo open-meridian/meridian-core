@@ -24,6 +24,9 @@ import time
 import urllib.error
 import urllib.request
 
+# What home's header shows a deployment admin and nobody else.
+ADMIN_HOME = 'href="/admin">Admin portal<'
+
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "trial")
 CHART = os.environ.get("E2E_CHART", "deploy/chart")
@@ -685,11 +688,11 @@ def main():
     status, session = signed_in(name, password)
     s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
     home = get("/", session)
-    if "You are a deployment admin" not in home:
+    if ADMIN_HOME not in home:
         import re
 
         s.note(f"home: {re.sub(r'<[^>]*>', ' ', home.split('</style>')[-1])[:300]}")
-    s.check("You are a deployment admin" in home, f"and home says {who} administers it")
+    s.check(ADMIN_HOME in home, f"and home says {who} administers it")
     if WAY_IN["somebody_else"]:
         # In the directory, so in; not in the group, so not an
         # administrator. Without this, a permission granted to everybody
@@ -698,7 +701,7 @@ def main():
         status, session = signed_in(name, password)
         s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
         s.check(
-            "You are a deployment admin" not in get("/", session),
+            ADMIN_HOME not in get("/", session),
             f"and is not an administrator, being outside the group the wizard named",
         )
 
@@ -1049,9 +1052,9 @@ spec:
         s.check(status == 401, f"the lost password is refused now: {status}")
         status, after = signed_in(name, renewed)
         s.check(status == 303 and bool(after), f"the new one signs {name} in: {status}")
-        s.check("You are a deployment admin" in get("/", after), "still a deployment admin")
+        s.check(ADMIN_HOME in get("/", after), "still a deployment admin")
         s.check(
-            "You are a deployment admin" not in get("/", before),
+            ADMIN_HOME not in get("/", before),
             "and the session held before the reset has ended",
         )
         status, _ = post(

@@ -68,9 +68,31 @@ where
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiving))
 }
 
+/// Whether a declared setting applies: always, unless it names another
+/// setting it applies under and that one holds none of the values named --
+/// its value, or while it has none, the default its plugin declared (W4.8).
+/// A setting that does not apply is not required, whatever it says.
+fn applies(
+    declaration: &SettingDeclaration,
+    declared: &[SettingDeclaration],
+    held: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(condition) = &declaration.applies_when else {
+        return true;
+    };
+    let value = held(&condition.setting).or_else(|| {
+        declared
+            .iter()
+            .find(|other| other.name == condition.setting)
+            .map(|other| other.default_value.clone())
+            .filter(|default| !default.is_empty())
+    });
+    value.is_some_and(|value| condition.one_of.contains(&value))
+}
+
 /// The values the deployment holds for the settings the plugin declared, and
-/// the required ones it holds none for. A value for a setting the plugin did
-/// not declare is not the plugin's to see.
+/// the required ones it holds none for, of those that apply. A value for a
+/// setting the plugin did not declare is not the plugin's to see.
 pub(crate) fn settings(
     declared: &[SettingDeclaration],
     configuration: &PluginConfiguration,
@@ -88,10 +110,17 @@ pub(crate) fn settings(
                 })
         })
         .collect();
+    let held = |name: &str| {
+        values
+            .iter()
+            .find(|value| value.name == name)
+            .map(|value| value.value.clone())
+    };
     let missing_required = declared
         .iter()
         .filter(|declaration| declaration.required)
-        .filter(|declaration| !values.iter().any(|value| value.name == declaration.name))
+        .filter(|declaration| applies(declaration, declared, held))
+        .filter(|declaration| held(&declaration.name).is_none())
         .map(|declaration| declaration.name.clone())
         .collect();
     SettingsDelivery {

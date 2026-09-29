@@ -120,10 +120,10 @@ def signed_in_as(page):
 
 
 def is_admin_home(page):
-    # What home says, which is not what /admin's heading says. Copying the
-    # wrong string made bob look unprivileged on a page that had just let him
-    # into /admin.
-    return "You are a deployment admin" in page.body
+    # What home's header shows a deployment admin, which is not what /admin's
+    # heading says. Copying the wrong string made bob look unprivileged on a
+    # page that had just let him into /admin.
+    return 'href="/admin">Admin portal<' in page.body
 
 
 def wait_dashboard():

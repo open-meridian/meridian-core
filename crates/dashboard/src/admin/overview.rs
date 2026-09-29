@@ -20,16 +20,18 @@ use meridian_domain::v1::{AccessLevel, AccessRecords, AccountState, SyncStatusEv
 use crate::custody::{quiet, remedy, utc, Heard};
 use crate::html::escape;
 
+use super::view::{self, Line};
+
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
 const TABS: [(&str, &str); 8] = [
+    ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
     ("account-groups", "Account groups"),
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
     ("external-accounts", "External accounts"),
-    ("plugin-settings", "Plugin settings"),
     ("terminal-sessions", "Terminal sessions"),
 ];
 
@@ -102,6 +104,7 @@ pub fn render(
     records: &AccessRecords,
     holders: &[(String, String, usize)],
     custody: &Heard,
+    plugins: &[Line],
     token: &str,
     notice: &str,
 ) -> String {
@@ -133,6 +136,53 @@ pub fn render(
     };
 
     let mut sections = Vec::new();
+
+    // ── Plugins ─────────────────────────────────────────────────────────────
+    // W6.10, and the way to each instance's admin view: its health, what its
+    // settings still need, and its external accounts nothing links.
+    let body = if plugins.is_empty() {
+        "<p class=\"empty\">No plugin has reported or been launched yet.</p>".to_string()
+    } else {
+        let rows: String = plugins
+            .iter()
+            .map(|line| {
+                let settings = if line.missing.is_empty() {
+                    "<span class=\"badge good\">ready</span>".to_string()
+                } else {
+                    format!(
+                        "<span class=\"badge warn\">needs {}</span>",
+                        escape(&line.missing.join(", "))
+                    )
+                };
+                format!(
+                    "<tr data-id=\"{id}\"><td>{named}</td><td>{state}<span class=\"hint\">{detail}</span></td>\
+                     <td>{settings}</td><td class=\"flags\">{flags}</td>\
+                     <td class=\"actions\"><a class=\"button\" href=\"{href}\">Manage</a></td></tr>",
+                    id = escape(&line.instance),
+                    named = match &line.name {
+                        Some(name) => named(name, &line.instance),
+                        None => format!("<span class=\"name\">{}</span>", escape(&line.instance)),
+                    },
+                    state = view::state_badge(&line.state),
+                    detail = escape(&line.state.detail),
+                    flags = view::flags(line, false),
+                    href = escape(&view::path(&line.instance)),
+                )
+            })
+            .collect();
+        format!(
+            "<div class=\"scroll\"><table class=\"list plugins\"><thead><tr><th>Plugin</th>\
+             <th>Health</th><th>Settings</th><th>Needs you</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    sections.push(section(
+        "plugins",
+        "Plugins",
+        "Every plugin instance in this deployment: its health, and what it needs of you. \
+         Manage one for its settings, who has access and its own admin page.",
+        "",
+        body,
+    ));
 
     // ── Permissions ─────────────────────────────────────────────────────────
     let mut rows = String::new();
@@ -503,6 +553,11 @@ pub fn render(
     ));
 
     // ── External accounts ───────────────────────────────────────────────────
+    // Goes when plugin-driven linking lands (kernel/a-plugins-admin-view,
+    // point 8): each plugin links its own external accounts from its admin
+    // page, through typed operations not built yet, and the dashboard keeps
+    // only the count on the Plugins tab. Until then, this still links them.
+    //
     // W6.4, beside what makes it a choice rather than a guess: the accounts
     // each connector reports it reaches (W2.8) and those its sidecar refused
     // rows for (W4.8), while nothing links them; then the links; then each
@@ -684,56 +739,6 @@ pub fn render(
         format!("{unlinked_table}{linked_table}{sync_table}{link}{dialogs}"),
     ));
 
-    // ── Plugin settings ─────────────────────────────────────────────────────
-    // W6.11. Each plugin that has reported, and how far its settings are
-    // given; the form is a page of its own (super::settings).
-    let body = if records.plugin_settings.is_empty() {
-        "<p class=\"empty\">No plugin has reported yet.</p>".to_string()
-    } else {
-        let rows: String = records
-            .plugin_settings
-            .iter()
-            .map(|record| {
-                let missing: Vec<&str> = record
-                    .declared_settings
-                    .iter()
-                    .filter(|d| d.required)
-                    .filter(|d| {
-                        !record.secrets_set.contains(&d.name)
-                            && !record.values.iter().any(|v| v.name == d.name)
-                    })
-                    .map(|d| d.name.as_str())
-                    .collect();
-                let state = if missing.is_empty() {
-                    "<span class=\"pill good\">ready</span>".to_string()
-                } else {
-                    format!(
-                        "<span class=\"pill warn\">needs {}</span>",
-                        escape(&missing.join(", "))
-                    )
-                };
-                format!(
-                    "<tr data-id=\"{id}\"><td>{id}</td><td>{declared}</td><td>{state}</td>\
-                     <td class=\"actions\"><a href=\"{href}\">Settings</a></td></tr>",
-                    id = escape(&record.plugin_instance_id),
-                    declared = record.declared_settings.len(),
-                    href = escape(&super::settings::path(&record.plugin_instance_id)),
-                )
-            })
-            .collect();
-        format!(
-            "<div class=\"scroll\"><table class=\"list settings\"><thead><tr><th>Plugin</th>\
-             <th>Settings</th><th>State</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
-        )
-    };
-    sections.push(section(
-        "plugin-settings",
-        "Plugin settings",
-        "What each plugin declared it needs. A secret is set here and never shown again.",
-        "",
-        body,
-    ));
-
     // ── Terminal sessions ───────────────────────────────────────────────────
     // W6.14. Per person: what is being ended is their access from a terminal,
     // so there is no choosing among their sessions to offer.
@@ -775,8 +780,8 @@ pub fn render(
         format!("<p class=\"passed\">{}</p>", escape(notice))
     };
     format!(
-        "<div class=\"admin\"><div class=\"page-head\"><h1>Administer this deployment</h1>\
-         <a href=\"/\">Home</a></div>{notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
+        "<div class=\"admin\"><div class=\"page-head\"><h1>Administer this deployment</h1></div>\
+         {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
          <script>{SCRIPT}</script>",
         sections.concat()
     )

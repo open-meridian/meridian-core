@@ -27,7 +27,7 @@ use prost::Message;
 use crate::accounts::{self, Accounts};
 use crate::clock::Clock;
 use crate::directory::Directory;
-use crate::html::{escape, page};
+use crate::html::{escape, page, page_with, Chrome, Viewer};
 use crate::oidc::Oidc;
 use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
@@ -83,6 +83,12 @@ pub struct App {
     /// What custody connectors last said about their accounts and their
     /// connections, heard on the bus (W2.1, W2.8, W4.8).
     pub custody: Arc<crate::custody::Custody>,
+    /// What each plugin's sidecar last said about it (W4.8, W6.10).
+    pub health: Arc<crate::health::Health>,
+    /// The plugin UI kit, served on every plugin host and on this one
+    /// (spec/plugin-pages-share-one-kit.md, Q2). None where this process
+    /// carries none, which only a build outside the image does.
+    pub kit: Option<Arc<crate::kit::Kit>>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -92,13 +98,20 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-in", get(sign_in).post(sign_in_with_password))
         .route("/callback", get(callback))
         .route("/sign-out", post(sign_out))
+        .route("/mode", get(mode))
+        .route("/.meridian/ui/{*file}", get(kit))
         .merge(terminal::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
-        .route("/plugins/{instance}", get(crate::plugins::open))
+        .route("/plugins/{instance}", get(crate::plugins::frame))
+        .route("/plugins/{instance}/enter", get(crate::plugins::open))
         .with_state(Arc::clone(&app))
+        // The dashboard's pages are framed by nobody but itself: a plugin's
+        // page, on a host below this one, could otherwise frame the admin
+        // portal under something of its own and have a click land on it.
+        .layer(axum::middleware::map_response(framed_only_here))
         // A CLI this does not serve is told so before any terminal path
         // reads what it sent (W6.13).
         .layer(axum::middleware::from_fn(terminal::cli_version))
@@ -108,6 +121,73 @@ pub fn router(app: Arc<App>) -> Router {
             app,
             crate::plugins::on_plugin_host,
         ))
+}
+
+async fn framed_only_here(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("SAMEORIGIN"),
+    );
+    headers
+        .entry(axum::http::header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'self'"));
+    response
+}
+
+/// The kit, on the dashboard's own host, for the dashboard's own pages.
+async fn kit(State(app): State<Arc<App>>, request: axum::extract::Request) -> Response {
+    match &app.kit {
+        Some(kit) => kit.serve(request.method(), request.uri().path()).await,
+        None => (StatusCode::NOT_FOUND, "this dashboard carries no kit\n").into_response(),
+    }
+}
+
+/// The person's mode, where no script set it: remembered for this browser
+/// and back to the page they chose it on. Every value but the three is
+/// ignored.
+async fn mode(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(asked): Query<HashMap<String, String>>,
+) -> Response {
+    let chosen = asked.get("set").map(String::as_str).unwrap_or_default();
+    let back = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|referer| reqwest::Url::parse(referer).ok())
+        .map(|url| match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_string(),
+        })
+        .filter(|path| path.starts_with('/') && !path.starts_with("//"))
+        .unwrap_or_else(|| "/".into());
+    let mut response = redirect(&back);
+    let (value, age) = match chosen {
+        "light" | "dark" => (chosen, 31_536_000),
+        "system" => ("", 0),
+        _ => return response,
+    };
+    let (name, secure) = (
+        cookie_name(app.secure_cookies, crate::html::MODE_COOKIE),
+        if app.secure_cookies { "; Secure" } else { "" },
+    );
+    if let Ok(cookie) = HeaderValue::from_str(&format!(
+        "{name}={value}; Path=/; Max-Age={age}; SameSite=Lax{secure}"
+    )) {
+        response.headers_mut().insert(SET_COOKIE, cookie);
+    }
+    response
+}
+
+/// The person's mode, as the header's menu set it: `light`, `dark`, or
+/// `system` for anything else.
+pub(crate) fn mode_of(app: &App, headers: &HeaderMap) -> &'static str {
+    match cookie(app, headers, crate::html::MODE_COOKIE).as_deref() {
+        Some("light") => "light",
+        Some("dark") => "dark",
+        _ => "system",
+    }
 }
 
 /// Alive, and whether the records are fresh enough to serve. A load balancer
@@ -211,53 +291,151 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    let mut body = format!(
-        "<h1>Open Meridian</h1><p>Signed in as <strong>{}</strong>.</p>",
-        escape(&session.display_name)
-    );
-    if access.deployment_admin {
-        body.push_str(
-            "<p>You are a deployment admin: <a href=\"/admin\">administer this deployment</a>.</p>",
-        );
-    } else if !records
-        .permissions
-        .iter()
-        .any(|p| p.access_group_id == meridian_access::DEPLOYMENT_ADMIN)
-    {
-        body.push_str("<p>Nobody administers this deployment yet. <a href=\"/claim\">Claim it</a> with a code from open-meridian.com.</p>");
-    }
-    // A deployment admin opens any plugin's page (ruling 19), so their list
-    // is every plugin launched as well as those they hold access on.
+    // W6.9: the instances the person holds access on, and for a deployment
+    // admin, who opens any plugin's page (ruling 19), every one launched.
+    let launches = crate::catalogue::launches(&app).await;
     let mut listed: std::collections::BTreeSet<String> = access.plugins.keys().cloned().collect();
-    if access.deployment_admin && app.plugins.is_some() {
-        listed.extend(crate::catalogue::launched(&app).await);
+    if access.deployment_admin {
+        listed.extend(launches.iter().map(|launch| launch.instance_id.clone()));
+    }
+    let name_of = |instance: &str| {
+        launches
+            .iter()
+            .find(|launch| launch.instance_id == instance)
+            .map(|launch| launch.name.clone())
+    };
+    let mut body = String::from(
+        "<div class=\"page-head\"><div><h1>Your plugins</h1>\
+         <p>Open one to work in it. What each shows you is what you hold on it.</p></div>\
+         <div class=\"view-switch\" role=\"group\" aria-label=\"Show plugins as\">\
+         <button type=\"button\" data-view=\"list\" aria-pressed=\"true\">List</button>\
+         <button type=\"button\" data-view=\"tiles\" aria-pressed=\"false\">Tiles</button></div></div>",
+    );
+    if !access.deployment_admin
+        && !records
+            .permissions
+            .iter()
+            .any(|p| p.access_group_id == meridian_access::DEPLOYMENT_ADMIN)
+    {
+        body.push_str(
+            "<p class=\"notice warn\">Nobody administers this deployment yet. \
+             <a href=\"/claim\">Claim it</a> with a code from open-meridian.com.</p>",
+        );
     }
     if listed.is_empty() {
-        body.push_str("<p>You hold no access to any plugin.</p>");
+        body.push_str(
+            "<div class=\"panel empty-state\"><strong>No plugins for you yet</strong>\
+             <p>A deployment admin grants access to a plugin; it is listed here once they do.</p></div>",
+        );
     } else {
-        body.push_str("<h2>Plugins</h2><ul>");
-        for plugin in &listed {
+        body.push_str("<ul class=\"plugins list\" data-plugins>");
+        for instance in &listed {
             // Linked when it can be opened: access to no account yet is
             // listed, and would be refused at the door.
-            let openable = crate::plugins::opening(&access, plugin).is_some();
-            if app.plugins.is_some() && openable && crate::plugins::is_instance(plugin) {
-                body.push_str(&format!(
-                    "<li><a href=\"/plugins/{0}\">{0}</a></li>",
-                    escape(plugin)
-                ));
-            } else {
-                body.push_str(&format!("<li>{}</li>", escape(plugin)));
-            }
+            let openable = app.plugins.is_some()
+                && crate::plugins::opening(&access, instance).is_some()
+                && crate::plugins::is_instance(instance);
+            body.push_str(&plugin_card(
+                instance,
+                name_of(instance).as_deref(),
+                openable,
+                access.deployment_admin && access.on_plugin(instance).is_empty(),
+            ));
         }
         body.push_str("</ul>");
     }
-    body.push_str(&format!(
-        "<form method=\"post\" action=\"/sign-out\"><input type=\"hidden\" name=\"form_token\" \
-         value=\"{}\"><button>Sign out</button></form>",
-        escape(&session.form_token)
-    ));
-    Html(page("Home", &body)).into_response()
+    body.push_str(&format!("<script>{HOME_SCRIPT}</script>"));
+    let viewer = Viewer {
+        display_name: &session.display_name,
+        form_token: &session.form_token,
+        admin: access.deployment_admin,
+    };
+    Html(page_with(
+        "Home",
+        &format!("<div class=\"home\">{body}</div>"),
+        &Chrome {
+            viewer: Some(viewer),
+            main: "page",
+            ..Default::default()
+        },
+    ))
+    .into_response()
 }
+
+/// One plugin instance on the home page: the plugin's name and the
+/// instance's, opening it in the frame.
+fn plugin_card(instance: &str, name: Option<&str>, openable: bool, as_admin: bool) -> String {
+    // The plugin's name where the catalogue launched it; one installed
+    // otherwise is known by its instance alone.
+    let (title, sub) = match name {
+        Some(name) => (
+            name,
+            format!(
+                "<span class=\"plugin-instance\">{}</span>",
+                escape(instance)
+            ),
+        ),
+        None => (instance, String::new()),
+    };
+    let initial: String = title
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(String::from)
+        .unwrap_or_default();
+    let meta = if as_admin {
+        "<span class=\"plugin-meta\"><span class=\"badge accent\">as admin</span></span>"
+    } else {
+        ""
+    };
+    let inner = format!(
+        "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
+         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>\
+         {meta}<span class=\"plugin-open\">{open}</span>",
+        initial = escape(&initial),
+        title = escape(title),
+        open = if openable {
+            "Open"
+        } else {
+            "Not open to you yet"
+        },
+    );
+    if openable {
+        format!(
+            "<li data-instance=\"{id}\"><a class=\"plugin-card\" href=\"/plugins/{id}\">{inner}</a></li>",
+            id = escape(instance)
+        )
+    } else {
+        format!(
+            "<li data-instance=\"{id}\"><div class=\"plugin-card\">{inner}</div></li>",
+            id = escape(instance)
+        )
+    }
+}
+
+/// The list and the tiles, and the person's choice between them remembered
+/// in this browser. Without it the list is shown.
+const HOME_SCRIPT: &str = r#"(function () {
+  var home = document.querySelector(".home");
+  if (!home) return;
+  home.classList.add("js");
+  var plugins = home.querySelector("ul.plugins");
+  var buttons = Array.prototype.slice.call(home.querySelectorAll("[data-view]"));
+  function show(view) {
+    if (view !== "tiles") view = "list";
+    if (plugins) plugins.className = "plugins " + view;
+    buttons.forEach(function (b) { b.setAttribute("aria-pressed", b.getAttribute("data-view") === view ? "true" : "false"); });
+  }
+  var saved = "list";
+  try { saved = localStorage.getItem("meridian.home.view") || "list"; } catch (e) {}
+  show(saved);
+  buttons.forEach(function (b) {
+    b.addEventListener("click", function () {
+      var view = b.getAttribute("data-view");
+      try { localStorage.setItem("meridian.home.view", view); } catch (e) {}
+      show(view);
+    });
+  });
+})();"#;
 
 async fn sign_in(
     State(app): State<Arc<App>>,

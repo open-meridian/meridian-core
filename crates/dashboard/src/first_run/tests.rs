@@ -165,6 +165,8 @@ fn app_with(
         plugins: None,
         registry: None,
         custody: Arc::default(),
+        health: Arc::default(),
+        kit: None,
     })
 }
 

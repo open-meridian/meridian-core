@@ -41,8 +41,11 @@ COPY proto/ proto/
 # meridian-schema's protos at the pinned revision, a build context the Makefile
 # names from Cargo.toml, so the import resolves against what the runtime links.
 COPY --from=schema-proto . /schema-proto/
+# The target cache has an id of its own: keyed by its path alone, it is the
+# same cache as meridian-schema's codegen, whose binary cargo then found fresh
+# and ran here in place of this one ("No such file or directory").
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/codegen/target \
+    --mount=type=cache,id=meridian-core-codegen-target,target=/src/codegen/target \
     cd codegen && cargo run --release --locked
 
 FROM scratch AS export

@@ -147,17 +147,39 @@ fn run() -> Result<(), String> {
             Ok(()) => {
                 let key =
                     var("MERIDIAN_DASHBOARD_SIGNING_KEY_DIR").unwrap_or_else(|| SIGNING_KEY.into());
-                Some(Arc::new(Plugins::new(
-                    &public_url,
-                    &front_door,
-                    Signer::at(key),
-                )?))
+                let plugins = Plugins::new(&public_url, &front_door, Signer::at(key))?;
+                if !plugins.frames() {
+                    tracing::warn!(
+                        %public_url,
+                        "this dashboard's host has no domain, so a browser keeps no framed \
+                         plugin page's session: plugins open in a window of their own. A name \
+                         like meridian.localhost frames them"
+                    );
+                }
+                Some(Arc::new(plugins))
             }
         },
         _ => {
             tracing::info!(
                 "no plugin pages: they need MERIDIAN_DASHBOARD_URL and MERIDIAN_PLUGIN_FRONT_DOOR"
             );
+            None
+        }
+    };
+    // The plugin UI kit, which the image carries (spec/plugin-pages-share-
+    // one-kit.md, Q2): served on every plugin host and on this one, whose
+    // own pages take their tokens from it. A build outside the image has
+    // none, and says so; its pages are unstyled, and nothing else changes.
+    let kit = match meridian_dashboard::kit::Kit::at(
+        var("MERIDIAN_UI_DIR").unwrap_or_else(|| meridian_dashboard::kit::IN_IMAGE.into()),
+    ) {
+        Ok(kit) => {
+            tracing::info!(version = kit.version(), "serving the plugin UI kit");
+            meridian_dashboard::html::use_kit(kit.stylesheet());
+            Some(Arc::new(kit))
+        }
+        Err(reason) => {
+            tracing::warn!("no plugin UI kit to serve: {reason}");
             None
         }
     };
@@ -326,6 +348,9 @@ fn run() -> Result<(), String> {
             // else is started, since what is said before then is not heard.
             let custody = Arc::new(Custody::default());
             meridian_dashboard::custody::listen(&bus, Arc::clone(&custody));
+            // And what each plugin's sidecar says of it (W4.8, W6.10).
+            let health = Arc::new(meridian_dashboard::health::Health::default());
+            meridian_dashboard::health::listen(&bus, Arc::clone(&health));
 
             let sweeping = Arc::clone(&sessions);
             let sweeping_terminals = Arc::clone(&terminals);
@@ -398,6 +423,8 @@ fn run() -> Result<(), String> {
                 plugins,
                 registry,
                 custody,
+                health,
+                kit,
             }));
             let listener = tokio::net::TcpListener::bind(listen)
                 .await

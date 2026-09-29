@@ -32,7 +32,7 @@ use meridian_domain::v1::{
 };
 use prost::Message;
 
-use crate::html::{escape, page};
+use crate::html::{escape, page, page_with, Chrome, Viewer};
 use crate::records;
 use crate::session::Session;
 use crate::web::{refused, session_of, App};
@@ -52,6 +52,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
         .route("/admin/end-terminal-sessions", post(end_terminal_sessions))
+        .route("/admin/plugins/{instance}", get(plugin_view))
         .route(
             "/admin/plugins/{instance}/settings",
             get(settings_page).post(set_settings),
@@ -306,6 +307,20 @@ async fn claim(
     }
 }
 
+/// The header of a page in the admin portal, for a deployment admin.
+fn admin_chrome(session: &Session) -> Chrome<'_> {
+    Chrome {
+        viewer: Some(Viewer {
+            display_name: &session.display_name,
+            form_token: &session.form_token,
+            admin: true,
+        }),
+        crumbs: "<a href=\"/admin\">Admin portal</a>".into(),
+        main: "page",
+        in_admin: true,
+    }
+}
+
 fn token_input(session: &Session) -> String {
     format!(
         "<input type=\"hidden\" name=\"form_token\" value=\"{}\">",
@@ -336,14 +351,104 @@ async fn admin_page(
     };
     let holders = app.terminals.holders(app.clock.now_ns());
     let custody = app.custody.view();
+    let lines = plugin_lines(&app, &records, &custody).await;
     let body = overview::render(
         &records,
         &holders,
         &custody,
+        &lines,
         &token_input(&session),
         &notice,
     );
-    Html(page("Administer", &body)).into_response()
+    Html(page_with("Administer", &body, &admin_chrome(&session))).into_response()
+}
+
+/// Every plugin instance known anywhere, with its health and what it needs.
+async fn plugin_lines(
+    app: &App,
+    records: &AccessRecords,
+    custody: &crate::custody::Heard,
+) -> Vec<view::Line> {
+    let names: HashMap<String, String> = crate::catalogue::launches(app)
+        .await
+        .into_iter()
+        .map(|launch| (launch.instance_id, launch.name))
+        .collect();
+    view::lines(
+        records,
+        &app.health.view(),
+        &names,
+        custody,
+        crate::html::is_development(),
+        app.clock.now_ns(),
+    )
+}
+
+// ── A plugin instance's admin view ──────────────────────────────────────────
+
+pub mod view;
+
+async fn plugin_view(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let custody = app.custody.view();
+    let lines = plugin_lines(&app, &records, &custody).await;
+    let Some(line) = lines.iter().find(|line| line.instance == instance) else {
+        return no_such_plugin(&instance);
+    };
+    let notice = match field(&query, "saved") {
+        "1" => "Saved.",
+        "none" => "Nothing was changed.",
+        _ => "",
+    };
+    // The plugin's own admin page, at /admin on its host, framed; the plugin
+    // serves it to deployment admins alone, by the claim (W6.9).
+    let theme = crate::plugins::Theme::of_mode(crate::web::mode_of(&app, &headers));
+    let admin_page = match app.plugins.as_deref() {
+        None => view::AdminPage::None(
+            "This dashboard serves no plugin pages, so it cannot frame this one's.",
+        ),
+        Some(_) if !crate::plugins::is_instance(&instance) => view::AdminPage::None(
+            "This instance's name cannot be a host, so its page cannot be framed.",
+        ),
+        Some(plugins) if plugins.frames() => view::AdminPage::Framed {
+            src: crate::plugins::entrance(&instance, "/admin", &theme),
+            origin: plugins.origin(&instance),
+        },
+        Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, "/admin", &theme)),
+    };
+    let reports = app.health.view();
+    let body = view::render(&view::View {
+        line,
+        record: settings_of(&records, &instance),
+        report: reports.get(&instance),
+        records: &records,
+        token: &token_input(&session),
+        notice,
+        development: crate::html::is_development(),
+        admin_page,
+    });
+    let mut chrome = admin_chrome(&session);
+    chrome.crumbs = format!(
+        "<a href=\"/admin\">Admin portal</a><span aria-hidden=\"true\">/</span>\
+         <a href=\"/admin#plugins\">Plugins</a><span aria-hidden=\"true\">/</span>\
+         <span class=\"here\"><strong>{}</strong><code>{}</code></span>",
+        escape(line.name.as_deref().unwrap_or(&instance)),
+        escape(&instance)
+    );
+    Html(page_with(
+        &format!("{} admin", line.name.as_deref().unwrap_or(&instance)),
+        &body,
+        &chrome,
+    ))
+    .into_response()
 }
 
 // ── A plugin instance's settings (W6.11) ────────────────────────────────────
@@ -365,29 +470,24 @@ fn no_such_plugin(instance: &str) -> Response {
     )
 }
 
+/// The settings form is in the plugin's admin view now; its old address
+/// goes there.
 async fn settings_page(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Path(instance): Path<String>,
-    Query(query): Query<Fields>,
 ) -> Response {
-    let (session, records) = match gate(&app, &headers, true) {
-        Ok(gated) => gated,
-        Err(response) => return *response,
-    };
-    let Some(record) = settings_of(&records, &instance) else {
-        return no_such_plugin(&instance);
-    };
-    let notice = match field(&query, "saved") {
-        "1" => "Saved.",
-        "none" => "Nothing was changed.",
-        _ => "",
-    };
-    Html(page(
-        &format!("Settings for {instance}"),
-        &settings::render(record, &token_input(&session), notice),
-    ))
-    .into_response()
+    if let Err(response) = gate(&app, &headers, true) {
+        return *response;
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [(
+            axum::http::header::LOCATION,
+            format!("{}#settings", view::path(&instance)),
+        )],
+    )
+        .into_response()
 }
 
 /// The form, as one command to the conductor. What was typed into a secret's
@@ -409,9 +509,9 @@ async fn set_settings(
     let Some(record) = settings_of(&records, &instance) else {
         return no_such_plugin(&instance);
     };
-    let back = settings::path(&instance);
-    let Some(request) = settings::request(record, &fields) else {
-        return after_to(Ok(()), &format!("{back}?saved=none"), &back);
+    let back = view::path(&instance);
+    let Some(request) = settings::request(record, &fields, crate::html::is_development()) else {
+        return after_to(Ok(()), &format!("{back}?saved=none#settings"), &back);
     };
     let outcome = command::<PluginSettingsRecord>(
         &app,
@@ -422,7 +522,7 @@ async fn set_settings(
     )
     .await
     .map(|_| ());
-    after_to(outcome, &format!("{back}?saved=1"), &back)
+    after_to(outcome, &format!("{back}?saved=1#settings"), &back)
 }
 
 // ── The commands ────────────────────────────────────────────────────────────

@@ -13,9 +13,14 @@ accounts its connection reaches, and she links one from the list the
 dashboard shows beside the link action, where its sync state then says what
 to do about it (W2.8, W6.4, W2.1).
 
+The dashboard frames the plugin's page under its own header, and serves the
+UI kit on the plugin's host (spec/plugin-pages-share-one-kit.md, Q2 and Q3);
+the plugin is told when the person administers the deployment (W6.9).
+
 The plugin declares a required secret, so its sidecar reports it unhealthy
-from the start. Ada sets the secret in the plugin's settings form, and the
-report turns healthy with the plugin never restarted (W6.11, W4.7, W4.8). The
+from the start. Ada sets the secret in the settings form of the plugin's admin
+view, and the report turns healthy with the plugin never restarted (W6.11,
+W4.7, W4.8), which the view then says (W6.10). The
 secret is looked for everywhere it must not be: every page fetched in the run,
 and every report on the bus, which this watches as a subscriber of the two
 report topics and nothing else. The target greps the components' logs and the
@@ -300,11 +305,12 @@ def administer(ada, action, fields, patience=0):
 
 
 def settings_form(ada, patience=45):
-    """The plugin's settings page, once the conductor has its declarations
-    and the dashboard has read them again, which is within 30 seconds."""
+    """The plugin's admin view with its settings form, once the conductor has
+    its declarations and the dashboard has read them again, which is within
+    30 seconds."""
     deadline = time.monotonic() + patience
     while True:
-        page = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings"))
+        page = ada.get(dash(f"/admin/plugins/{INSTANCE}"))
         if (page.status == 200 and 'data-setting="api_key"' in page.body) \
                 or time.monotonic() > deadline:
             return page
@@ -331,8 +337,11 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     form = settings_form(ada)
     check(form.status == 200, f"the settings page: {form.status} {sentence(form)}")
     field = form.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
-    check('type="password"' in field and "not set" in field and "required" in field,
-          f"the secret is a password field, not set: {field[:300]}")
+    check('type="password"' in field and "not set" in field and "Required" in field,
+          f"the secret is a password field, not set, and says it is required: {field[:300]}")
+    old = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings"))
+    check(old.status == 303 and (old.location or "").endswith(f"/admin/plugins/{INSTANCE}#settings"),
+          f"the form's old address is the view's: {old.status} {old.location!r}")
     # Only a report heard after this counts: one sent while the conductor
     # was still starting says healthy, having nothing to say otherwise.
     mark = reports.mark()
@@ -340,7 +349,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
                     {"form_token": form_token(form), "secret.api_key": SECRET,
                      "value.poll_minutes": "15"})
     check(done.status == 303, f"saved: {done.status} {sentence(done)}")
-    after = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings?saved=1"))
+    after = ada.get(dash(f"/admin/plugins/{INSTANCE}?saved=1"))
     field = after.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
     check(">set<" in field and 'value=""' in field,
           f"and then it is set, and its field is still empty: {field[:300]}")
@@ -362,6 +371,21 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
           and held.get("registrations") == 1,
           f"from the same process, registered once: {before} then {held}")
 
+    # W6.10: the view says so, from what the sidecar reports.
+    deadline = time.monotonic() + 45
+    view = ada.get(dash(f"/admin/plugins/{INSTANCE}"))
+    while "Healthy" not in view.body.split('id="health"', 1)[-1][:400] and time.monotonic() < deadline:
+        time.sleep(2)
+        view = ada.get(dash(f"/admin/plugins/{INSTANCE}"))
+    health = view.body.split('id="health"', 1)[-1].split("</section>", 1)[0]
+    check('<span class="badge good">Healthy</span>' in health, f"the view says it is healthy: {health[:400]}")
+    head = view.body.split("</header>", 1)[0]
+    check("Ada Park" in head and 'href="/admin">Admin portal<' in head and "/sign-out" in head,
+          "under the one header: the person, the admin portal and signing out")
+    admin_page = view.body.split('id="admin-page"', 1)[-1].split("</section>", 1)[0]
+    check(f'href="/plugins/{INSTANCE}/enter?path=%2Fadmin' in admin_page,
+          f"and the plugin's own admin page, in a window of its own here: {admin_page[:400]}")
+
 
 def main():
     wait_dashboard()
@@ -380,8 +404,8 @@ def main():
     # opens any plugin's page, and is asserted with what she holds on it --
     # before any grant, nothing. Somebody who is neither admin nor granted is
     # refused at both doors; the dashboard's own tests hold that.
-    opened = ada.get(dash(f"/plugins/{INSTANCE}"))
-    check(opened.status == 303, f"before any grant, /plugins/{INSTANCE}: {opened.status} {sentence(opened)}")
+    opened = ada.get(dash(f"/plugins/{INSTANCE}/enter"))
+    check(opened.status == 303, f"before any grant, /plugins/{INSTANCE}/enter: {opened.status} {sentence(opened)}")
     before = Browser()
     status, _, _, _ = on_plugin_host(before, (opened.location or "")[len(f"http://{PLUGIN_HOST}"):])
     check(status == 303, f"the code redeemed: {status}")
@@ -389,6 +413,8 @@ def main():
     seen = json.loads(body) if status == 200 else {}
     check(status == 200 and (seen.get("caller") or {}).get("access") == [],
           f"and the plugin is told she holds nothing on it: {status} {(seen.get('caller') or {}).get('access')}")
+    check((seen.get("caller") or {}).get("deployment_admin") is True,
+          f"and that she administers the deployment, so it may serve her its admin page: {seen.get('caller')}")
 
     say("C: she grants herself read on one account through the plugin")
     page = administer(ada, "/admin/accounts", {"account_id": "", "name": "Plugin page account"})
@@ -411,8 +437,16 @@ def main():
                 "access_group_id": access_group})
 
     say("D: she opens the plugin, and its host gets a session of its own")
-    opened = ada.get(dash(f"/plugins/{INSTANCE}"))
-    check(opened.status == 303, f"/plugins/{INSTANCE}: {opened.status} {sentence(opened)}")
+    # This dashboard is at http://dashboard:8080, a host with no domain, so a
+    # browser would keep no framed page's session (plugins.frames): the frame
+    # sends her to the page's way in, with her theme, in a window of its own.
+    # The frame itself is held by the dashboard's tests, on a name with one.
+    frame = ada.get(dash(f"/plugins/{INSTANCE}"))
+    check(frame.status == 303
+          and (frame.location or "").startswith(f"/plugins/{INSTANCE}/enter?path=%2F&om-scheme=default"),
+          f"/plugins/{INSTANCE}, where no frame can hold it: {frame.status} {frame.location!r}")
+    opened = ada.get(dash(f"/plugins/{INSTANCE}/enter"))
+    check(opened.status == 303, f"/plugins/{INSTANCE}/enter: {opened.status} {sentence(opened)}")
     prefix = f"http://{PLUGIN_HOST}/.meridian/enter?code="
     check((opened.location or "").startswith(prefix), f"to the plugin's host: {opened.location!r}")
     enter_path = (opened.location or "")[len(f"http://{PLUGIN_HOST}"):]
@@ -425,6 +459,11 @@ def main():
     again, _, _, _ = on_plugin_host(Browser(), enter_path)
     check(again == 401, f"the same code again: {again}")
 
+    kit = Browser()  # nobody: the kit is the same files for everybody
+    status, body, _, _ = on_plugin_host(kit, "/.meridian/ui/0.1.0/meridian.css")
+    check(status == 200 and "--space-4" in body,
+          f"the UI kit is served on the plugin's own host: {status} {body[:120]!r}")
+
     say("E: the plugin is told who she is, by its sidecar, and nothing else")
     plugin.cookies["meridian_session"] = ada.cookies.get("meridian_session", "")
     status, body, _, cookies = on_plugin_host(plugin, "/holdings?page=2")
@@ -436,6 +475,7 @@ def main():
     check(caller.get("audience") == INSTANCE, f"for this instance: {caller.get('audience')!r}")
     check(caller.get("display_name") == "Ada Park", f"naming her: {caller.get('display_name')!r}")
     check(caller.get("lifetime_ns") == 60 * 1_000_000_000, f"for 60 seconds: {caller.get('lifetime_ns')}")
+    check(caller.get("deployment_admin") is True, f"administering the deployment: {caller}")
     check(caller.get("access") == [{"tag": "custody", "read": [account], "write": []}],
           f"holding what she was granted: {caller.get('access')}")
     check(seen.get("cookie") is None, f"no cookie reached the plugin: {seen.get('cookie')!r}")
@@ -462,9 +502,13 @@ def main():
           "and the connection's state beside the unlinked account, with what to do")
     administer(ada, "/admin/links", {"plugin_instance_id": INSTANCE,
                                      "external_account_id": "ext-e2e", "account_id": account})
-    waiting = unlinked_on(ada.get(dash("/admin")))
+    overview = ada.get(dash("/admin"))
+    waiting = unlinked_on(overview)
     check("ext-e2e" not in waiting and "ext-e2e-roth" in waiting,
           f"linked, it stops waiting, and the other does not: {waiting}")
+    plugins = overview.body.split('<table class="list plugins">', 1)[-1].split("</table>", 1)[0]
+    check(f'<a href="/admin/plugins/{INSTANCE}">1 external account not linked</a>' in plugins,
+          f"and the plugin's line says how many wait, leading to its admin view: {plugins[:600]}")
 
     say("H: linked, its sync state is shown against its account (W2.1)")
     # The sidecar reads the plugin's links again within 30 seconds of a
@@ -513,7 +557,7 @@ def main():
     home = ada.get(dash("/"))
     ada.post(dash("/sign-out"), {"form_token": form_token(home)})
     status, _, location, _ = on_plugin_host(plugin, "/")
-    check(status == 303 and (location or "").endswith(f"/plugins/{INSTANCE}"),
+    check(status == 303 and (location or "").endswith(f"/plugins/{INSTANCE}/enter"),
           f"after sign-out: {status} to {location!r}")
 
     if FAILURES:

@@ -9,7 +9,7 @@ use meridian_domain::v1::{
     Permission, PluginSettingValue, RedeemClaimCodeReply, SetPluginSettingsRequest, SyncState,
     SyncStatusEvent, UnlinkedExternalAccount, UnlinkedExternalAccountsEvent,
 };
-use meridian_pb::v1::{SettingDeclaration, SettingType};
+use meridian_pb::v1::{SettingChoice, SettingCondition, SettingDeclaration, SettingType};
 use tower::ServiceExt;
 
 use super::*;
@@ -116,6 +116,8 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         plugins: None,
         registry: None,
         custody: Arc::default(),
+        health: Arc::default(),
+        kit: None,
     });
     Harness {
         app,
@@ -425,7 +427,7 @@ fn entries_are_plugin_tag_and_level_one_per_line() {
     assert!(parse_entries("oms-1 write").is_err());
 }
 
-// ── A plugin instance's settings (W6.11) ────────────────────────────────────
+// ── A plugin instance's admin view and settings (W6.9, W6.10, W6.11) ───────
 
 /// Obviously not a real credential, and long enough to find in a page.
 const SECRET: &str = "sk-test-not-a-real-key-7f3a";
@@ -437,24 +439,81 @@ fn declared(name: &str, kind: SettingType, required: bool, secret: bool) -> Sett
         required,
         secret,
         description: format!("What {name} is <for>."),
+        ..Default::default()
     }
 }
 
-/// SnapTrade's shape: two secrets, one of them set, a number and a switch.
+/// SnapTrade's shape: a personal or commercial key, which decides whether a
+/// user secret is needed; two secrets every key needs, one of them set; how
+/// often to read, and when a reading is stale, each with a default and a
+/// unit; and a developer's switch.
 fn snaptrade() -> PluginSettingsRecord {
+    let choice = |value: &str, label: &str, description: &str| SettingChoice {
+        value: value.into(),
+        label: label.into(),
+        description: description.into(),
+    };
     PluginSettingsRecord {
         plugin_instance_id: "snaptrade-1".into(),
-        values: vec![PluginSettingValue {
-            name: "poll_seconds".into(),
-            value: "900".into(),
-        }],
+        values: vec![
+            PluginSettingValue {
+                name: "key_type".into(),
+                value: "personal".into(),
+            },
+            PluginSettingValue {
+                name: "poll_seconds".into(),
+                value: "900".into(),
+            },
+        ],
         secrets_set: vec!["snaptrade_client_id".into()],
         updated_at_ns: T0,
         declared_settings: vec![
-            declared("snaptrade_client_id", SettingType::String, true, true),
-            declared("snaptrade_consumer_key", SettingType::String, true, true),
-            declared("poll_seconds", SettingType::Integer, false, false),
-            declared("synthetic", SettingType::Boolean, false, false),
+            SettingDeclaration {
+                label: "Client ID".into(),
+                ..declared("snaptrade_client_id", SettingType::String, true, true)
+            },
+            SettingDeclaration {
+                label: "Consumer key".into(),
+                ..declared("snaptrade_consumer_key", SettingType::String, true, true)
+            },
+            SettingDeclaration {
+                label: "User secret".into(),
+                applies_when: Some(SettingCondition {
+                    setting: "key_type".into(),
+                    one_of: vec!["commercial".into()],
+                }),
+                ..declared("user_secret", SettingType::String, true, true)
+            },
+            SettingDeclaration {
+                label: "Read every".into(),
+                default_value: "300".into(),
+                unit: "seconds".into(),
+                ..declared("poll_seconds", SettingType::Integer, false, false)
+            },
+            SettingDeclaration {
+                label: "Stale after".into(),
+                default_value: "24".into(),
+                unit: "hours".into(),
+                ..declared("stale_after_hours", SettingType::Integer, false, false)
+            },
+            SettingDeclaration {
+                label: "Serve built-in data".into(),
+                developer: true,
+                ..declared("synthetic", SettingType::Boolean, false, false)
+            },
+            // Declared last, asked for first: it decides which fields follow.
+            SettingDeclaration {
+                label: "Key".into(),
+                choices: vec![
+                    choice("personal", "Personal key", "Belongs to one user."),
+                    choice(
+                        "commercial",
+                        "Commercial key",
+                        "Registers users of its own.",
+                    ),
+                ],
+                ..declared("key_type", SettingType::Choice, true, false)
+            },
         ],
     }
 }
@@ -463,6 +522,102 @@ fn with_settings() -> AccessRecords {
     let mut records = admin_records();
     records.plugin_settings = vec![snaptrade()];
     records
+}
+
+/// The part of `body` for one setting.
+fn setting<'a>(body: &'a str, name: &str) -> &'a str {
+    body.split(&format!("data-setting=\"{name}\""))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no setting {name} in {body}"))
+        .split("<div class=\"setting\"")
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn the_form_says_what_to_fill_in() {
+    let record = snaptrade();
+    let form = settings::form(
+        &record,
+        "<input type=\"hidden\" name=\"form_token\">",
+        false,
+    );
+
+    // The choice first, as radio buttons, since it decides what follows.
+    let first = form.split("data-setting=\"").nth(1).unwrap();
+    assert!(first.starts_with("key_type\""), "{form}");
+    let key = setting(&form, "key_type");
+    assert!(key.contains("Key") && key.contains("Required"), "{key}");
+    assert!(
+        key.contains("<input type=\"radio\" name=\"value.key_type\" value=\"personal\" checked>")
+    );
+    assert!(key.contains("<input type=\"radio\" name=\"value.key_type\" value=\"commercial\">"));
+    assert!(key.contains("Personal key") && key.contains("Belongs to one user."));
+    assert!(
+        !key.contains("value=\"\""),
+        "a required choice has no unset option"
+    );
+
+    // Each field under its label, marked required or optional.
+    let client = setting(&form, "snaptrade_client_id");
+    assert!(client.contains("Client ID") && client.contains("Required"));
+    assert!(client.contains("type=\"password\" name=\"secret.snaptrade_client_id\" value=\"\""));
+    assert!(client.contains(">set<") && client.contains("name=\"clear.snaptrade_client_id\""));
+    let consumer = setting(&form, "snaptrade_consumer_key");
+    assert!(consumer.contains(">not set<") && !consumer.contains("clear."));
+
+    // Applies only to a commercial key: said, and marked for the script.
+    let user = setting(&form, "user_secret");
+    assert!(user.contains("data-applies-setting=\"key_type\""), "{user}");
+    assert!(user.contains("data-applies-one-of=\"[&quot;commercial&quot;]\""));
+    assert!(user.contains("Only when Key is Commercial key."));
+
+    // A default greyed in the empty field, never its value; the unit beside.
+    let poll = setting(&form, "poll_seconds");
+    assert!(poll.contains("Optional") && poll.contains("Read every"));
+    assert!(poll.contains(
+        "<input type=\"number\" step=\"1\" name=\"value.poll_seconds\" value=\"900\" placeholder=\"300\">"
+    ));
+    assert!(poll.contains("<span class=\"unit\">seconds</span>"));
+    assert!(poll.contains("Left empty, the plugin uses 300 seconds."));
+    let stale = setting(&form, "stale_after_hours");
+    assert!(stale.contains("value=\"\" placeholder=\"24\""), "{stale}");
+    assert!(stale.contains("<span class=\"unit\">hours</span>"));
+    assert!(
+        form.contains("What poll_seconds is &lt;for&gt;."),
+        "escaped"
+    );
+
+    // A developer's setting only on a development deployment.
+    assert!(!form.contains("data-setting=\"synthetic\""));
+    let developing = settings::form(&record, "", true);
+    let synthetic = setting(&developing, "synthetic");
+    assert!(synthetic.contains("Developer") && synthetic.contains("name=\"value.synthetic\""));
+}
+
+#[test]
+fn what_is_missing_is_what_is_required_of_the_settings_that_apply() {
+    let names = |record: &PluginSettingsRecord| -> Vec<String> {
+        settings::missing(record, false)
+            .into_iter()
+            .map(|d| d.name.clone())
+            .collect()
+    };
+    // Personal: the user secret does not apply, so it is not missing.
+    let personal = snaptrade();
+    assert_eq!(names(&personal), ["snaptrade_consumer_key"]);
+
+    let mut commercial = snaptrade();
+    commercial.values[0].value = "commercial".into();
+    assert_eq!(
+        names(&commercial),
+        ["snaptrade_consumer_key", "user_secret"]
+    );
+
+    // Nothing chosen: the choice is missing, and what hangs on it waits.
+    let mut unchosen = snaptrade();
+    unchosen.values.remove(0);
+    assert_eq!(names(&unchosen), ["snaptrade_consumer_key", "key_type"]);
 }
 
 type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;
@@ -486,67 +641,146 @@ fn conductor_setting(h: &Harness, refuse_with: Option<&'static str>) -> Asked {
     asked
 }
 
+const VIEW: &str = "/admin/plugins/snaptrade-1";
 const SETTINGS: &str = "/admin/plugins/snaptrade-1/settings";
 
 #[tokio::test]
-async fn a_plugins_settings_form_is_built_from_what_it_declared_for_admins_alone() {
+async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() {
     let h = harness(with_settings(), None);
-    let (status, body) = send(&h, get(&h, SETTINGS, true)).await;
+    let (status, body) = send(&h, get(&h, VIEW, true)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-
-    // A secret is a password field, always empty, saying whether it is set.
-    let client = body
-        .split("data-setting=\"snaptrade_client_id\"")
-        .nth(1)
-        .unwrap()
-        .split("</div>")
-        .next()
-        .unwrap();
-    assert!(client.contains("type=\"password\" name=\"secret.snaptrade_client_id\" value=\"\""));
-    assert!(client.contains(">set<") && client.contains("required"));
-    assert!(client.contains("name=\"clear.snaptrade_client_id\""));
-    let consumer = body
-        .split("data-setting=\"snaptrade_consumer_key\"")
-        .nth(1)
-        .unwrap()
-        .split("</div>")
-        .next()
-        .unwrap();
-    assert!(consumer.contains(">not set<") && !consumer.contains("clear."));
-
-    // What is not secret, as it stands, in a field its type takes.
-    assert!(body
-        .contains("<input type=\"number\" step=\"1\" name=\"value.poll_seconds\" value=\"900\">"));
-    assert!(body.contains("<select name=\"value.synthetic\"><option value=\"\" selected>"));
-    assert!(
-        body.contains("What poll_seconds is &lt;for&gt;."),
-        "escaped"
-    );
+    for part in [
+        "id=\"settings\"",
+        "id=\"health\"",
+        "id=\"access\"",
+        "id=\"admin-page\"",
+    ] {
+        assert!(body.contains(part), "{part} is not in the view");
+    }
+    assert!(body.contains(&format!("action=\"{SETTINGS}\"")));
     assert!(
         body.contains(&format!("value=\"{}\"", h.form_token)),
         "the form token"
     );
+    // This harness serves no plugin pages, and the view says so rather than
+    // framing something that is not there.
+    assert!(body.contains("cannot frame this one"));
 
-    // And the overview lists it, with the required secret it still needs.
+    // The old address of the form is the view's.
+    let old = router(Arc::clone(&h.app))
+        .oneshot(get(&h, SETTINGS, true))
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        old.headers()["location"],
+        format!("{VIEW}#settings").as_str()
+    );
+
+    // The overview's Plugins tab lists it, with the secret it still needs,
+    // leading to the view.
     let (_, overview) = send(&h, get(&h, "/admin", true)).await;
-    let listed = table(&overview, "settings");
+    let listed = table(&overview, "plugins");
     assert!(listed.contains("data-id=\"snaptrade-1\""));
-    assert!(listed.contains("needs snaptrade_consumer_key"), "{listed}");
-    assert!(listed.contains(&format!("href=\"{SETTINGS}\"")));
+    assert!(listed.contains("needs Consumer key"), "{listed}");
+    assert!(listed.contains(&format!("href=\"{VIEW}\"")));
 
-    let unknown = send(&h, get(&h, "/admin/plugins/ghost-1/settings", true)).await;
+    let unknown = send(&h, get(&h, "/admin/plugins/ghost-1", true)).await;
     assert_eq!(unknown.0, StatusCode::NOT_FOUND);
 
     let mut not_admin = with_settings();
     not_admin.permissions.clear();
     let nobody = harness(not_admin, None);
-    assert_eq!(
-        send(&nobody, get(&nobody, SETTINGS, true)).await.0,
-        StatusCode::FORBIDDEN
+    for path in [VIEW, SETTINGS] {
+        assert_eq!(
+            send(&nobody, get(&nobody, path, true)).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&nobody, get(&nobody, path, false)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accounts() {
+    let mut records = with_settings();
+    records.user_groups.push(UserGroup {
+        user_group_id: "UG-2".into(),
+        name: "Operations".into(),
+        ..Default::default()
+    });
+    records
+        .account_groups
+        .push(meridian_domain::v1::AccountGroup {
+            account_group_id: "AcG-1".into(),
+            name: "Growth accounts".into(),
+            account_ids: vec![],
+        });
+    records
+        .access_groups
+        .push(meridian_domain::v1::AccessGroup {
+            access_group_id: "AG-1".into(),
+            name: "Custody readers".into(),
+            entries: vec![meridian_domain::v1::AccessEntry {
+                plugin_instance_id: "snaptrade-1".into(),
+                tag: "holdings".into(),
+                level: meridian_domain::v1::AccessLevel::Read as i32,
+            }],
+            built_in: false,
+        });
+    records.permissions.push(Permission {
+        permission_id: "P-2".into(),
+        user_group_id: "UG-2".into(),
+        account_group_id: "AcG-1".into(),
+        access_group_id: "AG-1".into(),
+    });
+    let h = harness(records, None);
+    h.app.health.hear(
+        "snaptrade-1",
+        meridian_domain::v1::PluginReport {
+            plugin_instance_id: "snaptrade-1".into(),
+            registered: true,
+            healthy: false,
+            health_detail: "required setting snaptrade_consumer_key is not set".into(),
+            contract_version: "v2".into(),
+            reported_at_ns: T0,
+            ..Default::default()
+        },
     );
-    assert_eq!(
-        send(&nobody, get(&nobody, SETTINGS, false)).await.0,
-        StatusCode::UNAUTHORIZED
+    h.app.custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: (1..=5)
+                .map(|n| ExternalAccount {
+                    external_account_id: format!("SNAP-{n}"),
+                    name: format!("Brokerage {n}"),
+                    venue_account_type: "Individual".into(),
+                })
+                .collect(),
+        },
+    );
+
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let health = body.split("id=\"health\"").nth(1).unwrap();
+    assert!(health.contains("Not healthy"), "{health}");
+    assert!(health.contains("required setting snaptrade_consumer_key is not set"));
+    assert!(health.contains("5 external accounts not linked"));
+    let access = table(&body, "access");
+    assert!(access.contains("Operations") && access.contains("holdings"));
+    assert!(access.contains("Growth accounts") && access.contains(">read<"));
+    assert!(body.contains("Deployment admins open it too"));
+
+    // The same flag on the overview, leading to the view (W6.10).
+    let (_, overview) = send(&h, get(&h, "/admin", true)).await;
+    let listed = table(&overview, "plugins");
+    assert!(listed.contains("Not healthy"));
+    assert!(
+        listed.contains(&format!(
+            "<a href=\"{VIEW}\">5 external accounts not linked</a>"
+        )),
+        "{listed}"
     );
 }
 
@@ -555,8 +789,8 @@ async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
     let h = harness(with_settings(), None);
     let asked = conductor_setting(&h, None);
     let form = format!(
-        "form_token={}&secret.snaptrade_client_id=&secret.snaptrade_consumer_key={SECRET}\
-         &value.poll_seconds=900&value.synthetic=true",
+        "form_token={}&value.key_type=commercial&secret.snaptrade_client_id=\
+         &secret.snaptrade_consumer_key={SECRET}&value.poll_seconds=900&value.stale_after_hours=",
         h.form_token
     );
     let response = router(Arc::clone(&h.app))
@@ -566,14 +800,14 @@ async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         response.headers()["location"],
-        format!("{SETTINGS}?saved=1").as_str()
+        format!("{VIEW}?saved=1#settings").as_str()
     );
 
     let (request, by) = asked.lock().unwrap()[0].clone();
     assert_eq!(by, ADA, "on her behalf");
     assert_eq!(request.plugin_instance_id, "snaptrade-1");
-    // Only what changed: the set secret left empty is left alone, and the
-    // number is what it was.
+    // Only what changed: the set secret left empty is left alone, the number
+    // is what it was, and the empty field with a default stores nothing.
     let sent: Vec<(&str, &str)> = request
         .values
         .iter()
@@ -581,11 +815,14 @@ async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
         .collect();
     assert_eq!(
         sent,
-        [("snaptrade_consumer_key", SECRET), ("synthetic", "true")]
+        [
+            ("snaptrade_consumer_key", SECRET),
+            ("key_type", "commercial")
+        ]
     );
     assert!(request.cleared.is_empty());
 
-    let (_, page) = send(&h, get(&h, &format!("{SETTINGS}?saved=1"), true)).await;
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?saved=1"), true)).await;
     assert!(page.contains("Saved."));
     assert!(!page.contains(SECRET), "never shown");
 
@@ -623,7 +860,7 @@ async fn a_settings_form_without_the_sessions_token_sends_nothing() {
         .unwrap();
     assert_eq!(
         response.headers()["location"],
-        format!("{SETTINGS}?saved=none").as_str()
+        format!("{VIEW}?saved=none#settings").as_str()
     );
     assert!(asked.lock().unwrap().is_empty());
 }
@@ -637,19 +874,19 @@ fn a_form_asks_for_what_changed_and_clears_only_what_it_was_told_to() {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     };
-    assert!(settings::request(&record, &form(&[("value.poll_seconds", "900")])).is_none());
+    let asked = |pairs: &[(&str, &str)]| settings::request(&record, &form(pairs), false);
+    assert!(asked(&[("value.poll_seconds", "900")]).is_none());
+    // Not posted is not emptied: a field the form did not carry is left.
+    assert!(asked(&[]).is_none());
 
-    let emptied = settings::request(&record, &form(&[("value.poll_seconds", "")])).unwrap();
+    let emptied = asked(&[("value.poll_seconds", "")]).unwrap();
     assert_eq!(emptied.cleared, ["poll_seconds"]);
 
-    let cleared = settings::request(
-        &record,
-        &form(&[
-            ("value.poll_seconds", "900"),
-            ("clear.snaptrade_client_id", "on"),
-            ("clear.snaptrade_consumer_key", "on"),
-        ]),
-    )
+    let cleared = asked(&[
+        ("value.poll_seconds", "900"),
+        ("clear.snaptrade_client_id", "on"),
+        ("clear.snaptrade_consumer_key", "on"),
+    ])
     .unwrap();
     assert_eq!(
         cleared.cleared,
@@ -657,17 +894,21 @@ fn a_form_asks_for_what_changed_and_clears_only_what_it_was_told_to() {
         "a secret that is not set has nothing to clear"
     );
 
-    let replaced = settings::request(
-        &record,
-        &form(&[
-            ("value.poll_seconds", "900"),
-            ("secret.snaptrade_client_id", " new-key "),
-            ("clear.snaptrade_client_id", "on"),
-            ("value.undeclared", "x"),
-        ]),
-    )
+    let replaced = asked(&[
+        ("value.poll_seconds", "900"),
+        ("secret.snaptrade_client_id", " new-key "),
+        ("clear.snaptrade_client_id", "on"),
+        ("value.undeclared", "x"),
+    ])
     .unwrap();
     assert!(replaced.cleared.is_empty(), "typed in, it is replaced");
     assert_eq!(replaced.values.len(), 1);
     assert_eq!(replaced.values[0].value, "new-key");
+
+    // A developer's setting is not this deployment's to change, whatever is
+    // posted; a development deployment's is.
+    assert!(asked(&[("value.synthetic", "true")]).is_none());
+    let developing =
+        settings::request(&record, &form(&[("value.synthetic", "true")]), true).unwrap();
+    assert_eq!(developing.values[0].name, "synthetic");
 }

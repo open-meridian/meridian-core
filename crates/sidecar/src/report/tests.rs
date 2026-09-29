@@ -117,6 +117,8 @@ async fn what_the_plugin_declared_is_reported_and_nothing_once_it_leaves() {
             required: true,
             secret: true,
             description: "The venue's API key.".into(),
+            label: "API key".into(),
+            ..Default::default()
         },
         SettingDeclaration {
             name: "poll_minutes".into(),

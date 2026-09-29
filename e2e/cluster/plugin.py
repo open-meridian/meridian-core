@@ -360,14 +360,18 @@ with sync_playwright() as playwright:
     if link.count() == 1:
         link.click()
         page.wait_for_load_state()
+        # The dashboard's frame, under its header; the page itself is read
+        # through the frame's way in, which opens it in a window of its own.
+        check(page.locator("iframe[data-plugin-frame]").count() == 1,
+              "opened in the dashboard's frame")
         # A pod's first seconds are refused by the cluster's policy engine,
         # and the plugin's sidecar may still be joining: once more if so.
         for _ in range(10):
+            page.goto(f"{DASHBOARD}/plugins/{INSTANCE}/enter")
+            page.wait_for_load_state()
             if "Reference plugin" in page.content():
                 break
             time.sleep(3)
-            page.goto(f"{DASHBOARD}/plugins/{INSTANCE}")
-            page.wait_for_load_state()
         at = page.url
         check(
             at.startswith(f"http://{INSTANCE}.plugins.{HOST}/"),
@@ -420,7 +424,7 @@ with sync_playwright() as playwright:
     # was granted, not with it: looked for again until it has.
     deadline = time.monotonic() + 60
     while True:
-        page.goto(f"{DASHBOARD}/plugins/{CUSTODY}")
+        page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter")
         page.wait_for_load_state()
         shown = "<td>custody</td>" in page.content()
         if shown or time.monotonic() > deadline:
@@ -513,7 +517,7 @@ with sync_playwright() as playwright:
     mended = saved(f"{scaffold}/__main__.py", main_py)
     check(bool(waited(lambda: first(dev_events("dev.out"), "ready", mended), 60)),
           "and mended by the next save, without anybody restarting anything")
-    page.goto(f"http://{LIVE}.plugins.{HOST}/")
+    page.goto(f"{DASHBOARD}/plugins/{LIVE}/enter")
     page.wait_for_load_state()
     page.click("button:has-text('Open an empty statement for me')")
     page.wait_for_load_state()

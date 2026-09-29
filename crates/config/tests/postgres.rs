@@ -15,7 +15,7 @@ use meridian_domain::v1::{
     ExternalAccountLink, Permission, PluginLaunch, PluginLaunchState, PluginMetadata,
     PluginVersion, SignInRecord, UserGroup,
 };
-use meridian_pb::v1::{SettingDeclaration, SettingType};
+use meridian_pb::v1::{SettingChoice, SettingCondition, SettingDeclaration, SettingType};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -406,6 +406,7 @@ fn declaration(name: &str, kind: SettingType, secret: bool) -> SettingDeclaratio
         required: secret,
         secret,
         description: format!("what {name} is"),
+        ..Default::default()
     }
 }
 
@@ -420,10 +421,41 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
             last_reported_at_ns: 1,
         })
         .unwrap();
+    // Every part the form is built from survives the store: the label, the
+    // choices, the condition, the default and unit, and the developer's mark.
     let declared = vec![
-        declaration("api_key", SettingType::String, true),
-        declaration("poll_minutes", SettingType::Integer, false),
-        declaration("synthetic", SettingType::Boolean, false),
+        SettingDeclaration {
+            label: "Key".into(),
+            choices: vec![
+                SettingChoice {
+                    value: "personal".into(),
+                    label: "Personal key".into(),
+                    description: "Belongs to one user.".into(),
+                },
+                SettingChoice {
+                    value: "commercial".into(),
+                    label: "Commercial key".into(),
+                    ..Default::default()
+                },
+            ],
+            ..declaration("key_type", SettingType::Choice, true)
+        },
+        SettingDeclaration {
+            applies_when: Some(SettingCondition {
+                setting: "key_type".into(),
+                one_of: vec!["commercial".into()],
+            }),
+            ..declaration("api_key", SettingType::String, true)
+        },
+        SettingDeclaration {
+            default_value: "15".into(),
+            unit: "minutes".into(),
+            ..declaration("poll_minutes", SettingType::Integer, false)
+        },
+        SettingDeclaration {
+            developer: true,
+            ..declaration("synthetic", SettingType::Boolean, false)
+        },
     ];
     store
         .record_declared_settings("snaptrade-1", &declared)

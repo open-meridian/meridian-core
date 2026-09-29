@@ -384,22 +384,32 @@ async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
     catalogue_within(app, Duration::from_secs(10)).await
 }
 
-/// The instances launched and not stopped, for a deployment admin's home:
-/// none, said in the log, when the catalogue cannot be read in time, since
-/// a home page that waits on the conductor is a home page that hangs.
-pub(crate) async fn launched(app: &App) -> Vec<String> {
+/// The instances launched and not stopped, with the plugin each runs: for
+/// the home page, which names both, and a deployment admin's, which lists
+/// them all. None, said in the log, when the catalogue cannot be read in
+/// time, since a page that waits on the conductor is a page that hangs.
+pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
     match catalogue_within(app, Duration::from_secs(3)).await {
         Ok(held) => held
             .launches
             .into_iter()
             .filter(|launch| launch.state == PluginLaunchState::Launched as i32)
-            .map(|launch| launch.instance_id)
             .collect(),
         Err(failed) => {
-            tracing::warn!("the launched plugins could not be read for home: {failed}");
+            tracing::warn!("the launched plugins could not be read: {failed}");
             Vec::new()
         }
     }
+}
+
+/// The plugin an instance runs, as the catalogue names it, if it was
+/// launched through it.
+pub(crate) async fn plugin_name(app: &App, instance: &str) -> Option<String> {
+    launches(app)
+        .await
+        .into_iter()
+        .find(|launch| launch.instance_id == instance)
+        .map(|launch| launch.name)
 }
 
 async fn catalogue_within(app: &App, within: Duration) -> Result<PluginCatalogue, String> {

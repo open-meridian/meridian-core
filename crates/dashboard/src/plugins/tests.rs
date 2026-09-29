@@ -199,8 +199,18 @@ fn dashboard(
         plugins: Some(Arc::new(plugins)),
         registry: None,
         custody: Arc::default(),
+        health: Arc::default(),
+        kit: Some(Arc::new(kit())),
     });
     (app, session)
+}
+
+/// A kit of one stylesheet, as the image's is laid out.
+fn kit() -> crate::kit::Kit {
+    let root = std::env::temp_dir().join(format!("meridian-kit-{}", token()));
+    std::fs::create_dir_all(root.join("0.1.0")).unwrap();
+    std::fs::write(root.join("0.1.0/meridian.css"), ":root{}").unwrap();
+    crate::kit::Kit::at(root).unwrap()
 }
 
 struct Answer {
@@ -245,12 +255,13 @@ fn dashboard_cookie(h: &Harness) -> String {
     format!("__Host-{SESSION_COOKIE}={}", h.session)
 }
 
-/// Open the plugin from the dashboard: the code's path on the plugin's host.
+/// Open the plugin from the dashboard, as the frame does: the code's path on
+/// the plugin's host.
 async fn opened(h: &Harness, instance: &str) -> String {
     let answer = get(
         &h.app,
         DASHBOARD,
-        &format!("/plugins/{instance}"),
+        &format!("/plugins/{instance}/enter"),
         &[dashboard_cookie(h)],
     )
     .await;
@@ -330,6 +341,10 @@ async fn a_person_with_access_opens_the_plugin_and_it_is_told_who_they_are() {
     assert_eq!(claims.access[0].read_account_ids, vec!["ACC-1".to_string()]);
     assert!(claims.access[0].write_account_ids.is_empty());
     assert_eq!(claims.expires_at_ns - claims.issued_at_ns, 60 * SECOND_NS);
+    assert!(
+        !claims.deployment_admin,
+        "somebody who does not administer the deployment is asserted as not doing so (W6.9)"
+    );
 }
 
 #[tokio::test]
@@ -453,12 +468,17 @@ async fn a_plugins_host_serves_none_of_the_dashboards_pages() {
     let h = harness(&[INSTANCE]).await;
     // The dashboard's session is host-only, so a browser never sends it here;
     // sent anyway, it opens nothing of the dashboard's.
-    for path in ["/admin", "/", "/healthz", "/first-run"] {
+    for (path, back) in [
+        ("/admin", "/enter?path=%2Fadmin"),
+        ("/", "/enter"),
+        ("/healthz", "/enter?path=%2Fhealthz"),
+        ("/first-run", "/enter?path=%2Ffirst-run"),
+    ] {
         let answer = get(&h.app, PLUGIN_HOST, path, &[dashboard_cookie(&h)]).await;
         assert_eq!(answer.status, StatusCode::SEE_OTHER, "{path}");
         assert_eq!(
             answer.headers[LOCATION],
-            format!("https://{DASHBOARD}/plugins/{INSTANCE}"),
+            format!("https://{DASHBOARD}/plugins/{INSTANCE}{back}"),
             "{path}"
         );
     }
@@ -546,12 +566,17 @@ async fn a_plugin_session_opens_its_own_instance_alone() {
 async fn home_links_each_plugin_a_person_may_open() {
     let h = harness(&[INSTANCE]).await;
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
+    // Not launched through the catalogue, so named by its instance alone.
     assert!(
-        home.body
-            .contains("<a href=\"/plugins/snaptrade-1\">snaptrade-1</a>"),
+        home.body.contains(
+            "<li data-instance=\"snaptrade-1\"><a class=\"plugin-card\" href=\"/plugins/snaptrade-1\">"
+        ),
         "{}",
         home.body
     );
+    assert!(home
+        .body
+        .contains("<span class=\"plugin-name\">snaptrade-1</span>"));
 }
 
 #[test]
@@ -745,6 +770,8 @@ async fn a_deployment_admin_opens_any_plugin_asserted_with_only_what_they_hold()
     let claims = claims_reaching(&h);
     assert_eq!(claims.subject, ADA);
     assert!(claims.access.is_empty(), "{:?}", claims.access);
+    // And said to be one, so the plugin serves its admin page to them (W6.9).
+    assert!(claims.deployment_admin);
 }
 
 #[tokio::test]
@@ -816,13 +843,25 @@ async fn an_admins_home_links_every_plugin_launched() {
     h.app.records.store(admin_records(), h.app.clock.now_ns());
     serving_launched(&h);
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    assert!(
-        home.body
-            .contains("<a href=\"/plugins/snaptrade-1\">snaptrade-1</a>"),
-        "{}",
-        home.body
-    );
+    let card = home
+        .body
+        .split("<li data-instance=\"snaptrade-1\">")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{}", home.body))
+        .split("</li>")
+        .next()
+        .unwrap();
+    // Opened in the frame, named by the plugin and the instance both.
+    assert!(card.contains("href=\"/plugins/snaptrade-1\""), "{card}");
+    assert!(card.contains("<span class=\"plugin-name\">snaptrade</span>"));
+    assert!(card.contains("<span class=\"plugin-instance\">snaptrade-1</span>"));
+    assert!(card.contains("as admin"), "holding nothing on it: {card}");
     assert!(!home.body.contains("stopped-1"), "{}", home.body);
+    // Both views, the list first; the tiles a switch away.
+    assert!(home
+        .body
+        .contains("<ul class=\"plugins list\" data-plugins>"));
+    assert!(home.body.contains("data-view=\"tiles\""));
 }
 
 #[tokio::test]
@@ -831,10 +870,11 @@ async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
     serving_launched(&h);
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     assert!(
-        home.body.contains("You hold no access to any plugin."),
+        home.body.contains("No plugins for you yet"),
         "{}",
         home.body
     );
+    assert!(!home.body.contains("snaptrade-1"), "{}", home.body);
 }
 
 /// A terminal session for Ada, as `meridian connect` gets one.
@@ -1116,5 +1156,218 @@ fn a_page_path_is_a_path_on_the_plugins_host_and_nothing_else() {
         "/a\\b",
     ] {
         assert!(page_path(path).is_err(), "{path}");
+    }
+}
+
+// ── The frame, the theme and the kit (spec/plugin-pages-share-one-kit.md) ──
+
+#[tokio::test]
+async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_theme() {
+    let h = harness(&[INSTANCE]).await;
+    serving_launched(&h);
+    let frame = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(frame.status, StatusCode::OK, "{}", frame.body);
+    let head = frame.body.split("</header>").next().unwrap();
+    // The plugin's name and the instance's, the way back, and the person.
+    assert!(
+        head.contains("<strong>snaptrade</strong><code>snaptrade-1</code>"),
+        "{head}"
+    );
+    assert!(head.contains("<a href=\"/\">Plugins</a>"));
+    assert!(head.contains("Ada") && head.contains("/sign-out"));
+    assert!(
+        !head.contains("Admin portal"),
+        "Ada administers nothing here"
+    );
+    // The page below, entered through the dashboard with the theme on its
+    // address, and told again by message on every load, to its origin alone.
+    assert!(frame.body.contains(
+        "<iframe src=\"/plugins/snaptrade-1/enter?path=%2F&amp;om-scheme=default&amp;om-mode=system\
+         &amp;om-direction=green-up\""
+    ), "{}", frame.body);
+    assert!(frame
+        .body
+        .contains(&format!("data-origin=\"https://{PLUGIN_HOST}\"")));
+    assert!(frame.body.contains("\"meridian:theme\", version: 2"));
+
+    // At a page of the plugin's, where the frame is asked for one.
+    let at = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?path=%2Fholdings%3Fpage%3D2"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert!(
+        at.body.contains("enter?path=%2Fholdings%3Fpage%3D2&amp;"),
+        "{}",
+        at.body
+    );
+
+    // The person's mode, where they chose one.
+    let dark = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}"),
+        &[dashboard_cookie(&h), "__Host-meridian_mode=dark".into()],
+    )
+    .await;
+    assert!(dark.body.contains("om-mode=dark"), "{}", dark.body);
+
+    // The dashboard's own pages are framed by nobody else.
+    assert_eq!(frame.headers["x-frame-options"], "SAMEORIGIN");
+    assert_eq!(
+        frame.headers["content-security-policy"],
+        "frame-ancestors 'self'"
+    );
+}
+
+#[tokio::test]
+async fn the_frames_way_in_lands_on_the_page_asked_for_carrying_the_theme() {
+    let h = harness(&[INSTANCE]).await;
+    let answer = get(
+        &h.app,
+        DASHBOARD,
+        &format!(
+            "/plugins/{INSTANCE}/enter?path=%2Fadmin%3Ftab%3D2&om-scheme=harbour&om-mode=dark\
+             &om-direction=red-up"
+        ),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::SEE_OTHER, "{}", answer.body);
+    let location = answer.headers[LOCATION].to_str().unwrap();
+    let path = &location[format!("https://{PLUGIN_HOST}").len()..];
+    let redeemed = get(&h.app, PLUGIN_HOST, path, &[]).await;
+    assert_eq!(redeemed.status, StatusCode::SEE_OTHER, "{}", redeemed.body);
+    assert_eq!(
+        redeemed.headers[LOCATION],
+        "/admin?tab=2&om-scheme=harbour&om-mode=dark&om-direction=red-up"
+    );
+
+    // Nothing the kit would not take is carried onto the plugin's address,
+    // and nowhere but a page on the plugin's own host.
+    let odd = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}/enter?om-scheme=Evil%22Scheme&om-mode=sepia&om-direction=up"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    let location = odd.headers[LOCATION].to_str().unwrap();
+    let path = &location[format!("https://{PLUGIN_HOST}").len()..];
+    let redeemed = get(&h.app, PLUGIN_HOST, path, &[]).await;
+    assert_eq!(
+        redeemed.headers[LOCATION],
+        "/?om-scheme=default&om-mode=system&om-direction=green-up"
+    );
+    for elsewhere in [
+        "https%3A%2F%2Felsewhere.example",
+        "%2F%2Felsewhere.example",
+        "%2F.meridian%2Fenter",
+    ] {
+        let refused = get(
+            &h.app,
+            DASHBOARD,
+            &format!("/plugins/{INSTANCE}/enter?path={elsewhere}"),
+            &[dashboard_cookie(&h)],
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{elsewhere}");
+    }
+}
+
+#[tokio::test]
+async fn a_page_in_a_window_of_its_own_goes_back_to_the_frame_and_one_in_the_frame_to_its_way_in() {
+    let h = harness(&[INSTANCE]).await;
+    let asked = |dest: &'static str| {
+        let app = Arc::clone(&h.app);
+        async move {
+            router(app)
+                .oneshot(
+                    HttpRequest::get("/holdings?page=2")
+                        .header(HOST, PLUGIN_HOST)
+                        .header("sec-fetch-dest", dest)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let window = asked("document").await;
+    assert_eq!(
+        window.headers()[LOCATION],
+        format!("https://{DASHBOARD}/plugins/{INSTANCE}?path=%2Fholdings%3Fpage%3D2")
+    );
+    let framed = asked("iframe").await;
+    assert_eq!(
+        framed.headers()[LOCATION],
+        format!("https://{DASHBOARD}/plugins/{INSTANCE}/enter?path=%2Fholdings%3Fpage%3D2")
+    );
+}
+
+#[tokio::test]
+async fn the_kit_is_served_on_the_plugins_host_to_anybody_and_its_page_framed_by_the_dashboard_alone(
+) {
+    let h = harness(&[INSTANCE]).await;
+    // No session: the kit is the same files for everybody.
+    let kit = get(&h.app, PLUGIN_HOST, "/.meridian/ui/0.1.0/meridian.css", &[]).await;
+    assert_eq!(kit.status, StatusCode::OK, "{}", kit.body);
+    assert_eq!(kit.headers["content-type"], "text/css; charset=utf-8");
+    assert_eq!(kit.body, ":root{}");
+    assert_eq!(
+        get(
+            &h.app,
+            PLUGIN_HOST,
+            "/.meridian/ui/0.1.0/../../etc/passwd",
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        h.reached.lock().unwrap().is_empty(),
+        "the plugin never saw it"
+    );
+    // And on the dashboard's own host, for its own pages.
+    let own = get(&h.app, DASHBOARD, "/.meridian/ui/0.1.0/meridian.css", &[]).await;
+    assert_eq!(own.status, StatusCode::OK);
+
+    let plugin_session = entered(&h).await;
+    let page = get(
+        &h.app,
+        PLUGIN_HOST,
+        "/",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(
+        page.headers["content-security-policy"],
+        format!("frame-ancestors https://{DASHBOARD}").as_str()
+    );
+}
+
+#[test]
+fn where_no_frame_can_hold_a_session_the_page_opens_in_a_window_of_its_own() {
+    // A cookie set in a frame from another site is refused, and below a host
+    // with no domain every plugin's host is another site.
+    let signer = || Signer::holding(KEY_ID, SigningKey::from_bytes(&[7; 32]));
+    for (address, frames) in [
+        ("http://localhost:8088", false),
+        ("http://dashboard:8080", false),
+        ("http://meridian.localhost", true),
+        ("https://meridian.firm.example", true),
+    ] {
+        let plugins = Plugins::new(address, "http://{instance}:9292", signer()).unwrap();
+        assert_eq!(plugins.frames(), frames, "{address}");
     }
 }

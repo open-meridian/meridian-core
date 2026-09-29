@@ -210,9 +210,10 @@ pub fn grant(snapshot: &Snapshot, request: &GrantPermissionRequest) -> Verdict {
 pub type CheckedSetting<'a> = (&'a SettingDeclaration, Option<String>);
 
 /// A value as its declared type reads it, written the one way the SDK reads
-/// it back: an integer in decimal, a boolean as `true` or `false`, and text as
-/// given. A refusal names the setting and the type, and never the value,
-/// which may be a secret typed into the wrong field.
+/// it back: an integer in decimal, a boolean as `true` or `false`, a choice as
+/// one of its options' values, and text as given. A refusal names the setting
+/// and the type, or a choice's options, and never the value, which may be a
+/// secret typed into the wrong field.
 pub fn setting_value(declaration: &SettingDeclaration, value: &str) -> Result<String, String> {
     let name = &declaration.name;
     if value.is_empty() {
@@ -231,6 +232,26 @@ pub fn setting_value(declaration: &SettingDeclaration, value: &str) -> Result<St
             "false" | "no" | "off" | "0" => Ok("false".into()),
             _ => Err(format!("setting {name} is true or false")),
         };
+    }
+    if declaration.r#type == SettingType::Choice as i32 {
+        let value = value.trim();
+        if declaration
+            .choices
+            .iter()
+            .any(|choice| choice.value == value)
+        {
+            return Ok(value.to_string());
+        }
+        let options: Vec<&str> = declaration
+            .choices
+            .iter()
+            .map(|choice| choice.value.as_str())
+            .collect();
+        return Err(if options.is_empty() {
+            format!("setting {name} is a choice, and the plugin declares no options for it")
+        } else {
+            format!("setting {name} is one of {}", options.join(", "))
+        });
     }
     Ok(value.to_string())
 }

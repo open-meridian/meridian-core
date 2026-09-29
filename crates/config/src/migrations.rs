@@ -46,6 +46,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "plugin_settings",
         sql: include_str!("../migrations/0005_plugin_settings.sql"),
     },
+    Migration {
+        version: 6,
+        name: "setting_declaration_whole",
+        sql: include_str!("../migrations/0006_setting_declaration_whole.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

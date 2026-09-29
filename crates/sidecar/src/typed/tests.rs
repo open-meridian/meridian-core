@@ -676,6 +676,7 @@ fn assertion(key: &SigningKey, access: Vec<TagAccess>) -> CallerAssertion {
         issued_at_ns: issued,
         expires_at_ns: issued + 60_000_000_000,
         assertion_id: "a-1".into(),
+        deployment_admin: false,
     }
     .encode_to_vec();
     CallerAssertion {

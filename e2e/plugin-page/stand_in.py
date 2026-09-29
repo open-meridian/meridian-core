@@ -188,6 +188,7 @@ def decoded(header):
         "audience": claims.audience_instance_id,
         "lifetime_ns": claims.expires_at_ns - claims.issued_at_ns,
         "assertion_id": claims.assertion_id,
+        "deployment_admin": claims.deployment_admin,
         "access": [
             {"tag": held.tag, "read": list(held.read_account_ids), "write": list(held.write_account_ids)}
             for held in claims.access

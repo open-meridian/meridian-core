@@ -25,6 +25,8 @@ DASHBOARD = os.environ["E2E_DASHBOARD"].rstrip("/")
 NAME = os.environ["E2E_NAME"]
 PASSWORD = os.environ["E2E_PASSWORD"]
 SESSION_COOKIE = "meridian_session"
+# What home's header shows a deployment admin and nobody else.
+ADMIN_HOME = 'href="/admin">Admin portal<'
 
 failures = []
 
@@ -60,8 +62,8 @@ with sync_playwright() as playwright:
     sign_in(page, PASSWORD)
     check(page.url == f"{DASHBOARD}/", f"{NAME} signs in and lands home: {page.url}")
     check(
-        "You are a deployment admin" in page.content(),
-        "home says they administer this deployment",
+        ADMIN_HOME in page.content(),
+        "home's header shows them the admin portal",
     )
 
     session = [c for c in page.context.cookies() if c["name"] == SESSION_COOKIE]
@@ -80,14 +82,15 @@ with sync_playwright() as playwright:
     # Sent back on its own: a fresh navigation carries the session because the
     # browser chose to send it, not because a test copied it into a header.
     page.goto(f"{DASHBOARD}/")
-    check("You are a deployment admin" in page.content(), "a new page load is still signed in")
+    check(ADMIN_HOME in page.content(), "a new page load is still signed in")
 
-    # Sign out through the page's own form, whose token the browser carries.
+    # Sign out through the header's menu, whose form carries the token.
+    page.click("header .person summary")
     page.click("text=Sign out")
     page.wait_for_load_state()
     page.goto(f"{DASHBOARD}/")
     check(
-        "You are a deployment admin" not in page.content()
+        ADMIN_HOME not in page.content()
         and "Signed in as" not in page.content(),
         "signing out through the form ends the session",
     )

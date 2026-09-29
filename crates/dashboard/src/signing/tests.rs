@@ -65,6 +65,7 @@ fn claims() -> CallerClaims {
         issued_at_ns: T0,
         expires_at_ns: T0 + 60_000_000_000,
         assertion_id: "a-1".into(),
+        deployment_admin: true,
     }
 }
 

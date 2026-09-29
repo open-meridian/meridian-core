@@ -38,6 +38,8 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         plugins: None,
         registry: None,
         custody: Arc::default(),
+        health: Arc::default(),
+        kit: None,
     })
 }
 
@@ -128,13 +130,13 @@ async fn a_signed_in_person_sees_what_the_records_give_them_now() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Ada &lt;Park&gt;"), "names are escaped");
-    assert!(body.contains("deployment admin"));
+    assert!(body.contains("href=\"/admin\">Admin portal<"));
 
     // Withdrawn in the records: the same live session loses it at once,
     // because access is evaluated per request and never kept in a session.
     app.records.store(AccessRecords::default(), T0);
     let (_, after) = get(app, "/", Some(&format!("__Host-{SESSION_COOKIE}={key}"))).await;
-    assert!(!after.contains("deployment admin"));
+    assert!(!after.contains("Admin portal"));
 }
 
 #[test]
@@ -395,5 +397,5 @@ async fn a_person_signing_in_sees_the_access_they_hold_now() {
         .to_string();
 
     let (_, page) = get(app, "/", Some(&cookie)).await;
-    assert!(page.contains("You are a deployment admin"), "{page}");
+    assert!(page.contains("href=\"/admin\">Admin portal<"), "{page}");
 }
