@@ -27,8 +27,12 @@ spec:
   # sign-in, and the administrator the wizard named was nobody on the home
   # page (task kernel/upgrading-a-deployment-in-place). In an upgrade it is
   # the old binary reading a schema the new one's migration is changing.
+  # rollingUpdate: null clears what Kubernetes filled in for the rolling
+  # update this Deployment had, which server-side apply (Helm 4) otherwise
+  # keeps, and a Recreate Deployment may not carry.
   strategy:
     type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}

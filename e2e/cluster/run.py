@@ -26,6 +26,14 @@ import urllib.request
 
 # What home's header shows a deployment admin and nobody else.
 ADMIN_HOME = 'href="/admin">Admin portal<'
+# What home said to a deployment admin before the one header, which a chart
+# published before it still says until the upgrade test upgrades it.
+ADMIN_HOME_BEFORE = "You are a deployment admin"
+
+
+def administers(page, installed_chart_is_published=False):
+    """Whether home says the person signed in administers the deployment."""
+    return ADMIN_HOME in page or (installed_chart_is_published and ADMIN_HOME_BEFORE in page)
 
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "trial")
@@ -711,11 +719,12 @@ def main():
     status, session = signed_in(name, password)
     s.check(status == 303 and bool(session), f"{who} signs in and holds a session: {status}")
     home = get("/", session)
-    if ADMIN_HOME not in home:
+    published = bool(UPGRADE_FROM)
+    if not administers(home, published):
         import re
 
         s.note(f"home: {re.sub(r'<[^>]*>', ' ', home.split('</style>')[-1])[:300]}")
-    s.check(ADMIN_HOME in home, f"and home says {who} administers it")
+    s.check(administers(home, published), f"and home says {who} administers it")
     if WAY_IN["somebody_else"]:
         # In the directory, so in; not in the group, so not an
         # administrator. Without this, a permission granted to everybody
@@ -724,7 +733,7 @@ def main():
         status, session = signed_in(name, password)
         s.check(status == 303 and bool(session), f"{name} signs in too: {status}")
         s.check(
-            ADMIN_HOME not in get("/", session),
+            not administers(get("/", session), published),
             f"and is not an administrator, being outside the group the wizard named",
         )
 
