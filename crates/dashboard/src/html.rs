@@ -26,15 +26,16 @@ pub fn escape(text: &str) -> String {
 /// the site it was set up from: cool greys, an indigo accent, a navy bar.
 const STYLE: &str = "\
 :root{--ink:#0e1330;--ink-soft:#4a5277;--ink-faint:#676e93;--page:#f5f6fb;--card:#fff;--line:#e3e6f0;\
---line-soft:#eef0f6;--hover:#eef0fa;--accent:#4353f0;--accent-wash:#eceeff;--accent-ink:#fff;\
+--line-soft:#eef0f6;--line-strong:#7e89ad;--hover:#eef0fa;--accent:#4353f0;--accent-wash:#eceeff;\
+--accent-ink:#fff;--primary:#4353f0;--primary-ink:#fff;\
 --danger:#cb2d3f;--danger-wash:#fdecee;--good:#127c5c;--good-wash:#e3f6ef;--warn-ink:#8a5a10;\
 --warn-wash:#fdf3e0;--radius:10px;--shadow:0 1px 2px rgba(14,19,48,.04),0 8px 24px rgba(14,19,48,.06);\
 --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--navy-900:#070b24;--navy-800:#0b1233;\
 --navy-line:rgba(160,176,255,.14);--navy-ink:#e9ecff;--navy-soft:#a9b1d9;--mark:#9aa6ff}\
 @media (prefers-color-scheme:dark){:root{--ink:#e9ecff;--ink-soft:#a9b1d9;--ink-faint:#7a82af;\
---page:#0a0f2c;--card:#10173d;--line:#222c5a;--line-soft:#1a2350;--hover:#18214d;--accent:#8f9bff;\
---accent-wash:#1c2562;--accent-ink:#0a0f2c;--danger:#ff8a95;--danger-wash:#3a1a26;--good:#5fdcb0;\
---good-wash:#12352c;--warn-ink:#f2c46b;--warn-wash:#33291a;--shadow:none}}\
+--page:#0a0f2c;--card:#10173d;--line:#222c5a;--line-soft:#1a2350;--line-strong:#5b6bb0;--hover:#18214d;\
+--accent:#8f9bff;--accent-wash:#1c2562;--accent-ink:#0a0f2c;--primary:#4e61ff;--primary-ink:#fff;\
+--danger:#ff8a95;--danger-wash:#3a1a26;--good:#5fdcb0;--good-wash:#12352c;--warn-ink:#f2c46b;--warn-wash:#33291a;--shadow:none}}\
 *{box-sizing:border-box}[hidden]{display:none!important}\
 body{margin:0;font:14.5px/1.55 Inter,-apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;\
 color:var(--ink);background:var(--page);-webkit-font-smoothing:antialiased}\
@@ -59,7 +60,7 @@ th{font:600 .68rem var(--mono);text-transform:uppercase;letter-spacing:.08em;col
 label{display:block;margin:0 0 .9rem;font-size:.84rem;font-weight:550}\
 input:not([type=checkbox]):not([type=radio]):not([type=hidden]),select,textarea{padding:.5rem .65rem;\
 font:inherit;font-size:14.5px;font-weight:400;color:var(--ink);background:var(--card);\
-border:1px solid var(--line);border-radius:var(--radius);max-width:100%}\
+border:1px solid var(--line-strong);border-radius:var(--radius);max-width:100%}\
 label>input:not([type=checkbox]),label>select,label>textarea{display:block;width:100%;margin-top:.3rem}\
 label:has(>input[type=checkbox]){display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.9rem}\
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-wash)}\
@@ -68,12 +69,12 @@ input::placeholder{color:var(--ink-faint)}\
 .grid-wide{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,1fr);gap:0 .75rem}\
 @media (max-width:36rem){.grid-2,.grid-wide{grid-template-columns:minmax(0,1fr)}}\
 button{display:inline-flex;align-items:center;gap:.4rem;font:inherit;font-weight:550;padding:.48rem .9rem;\
-border-radius:var(--radius);border:1px solid var(--line);background:var(--card);color:var(--ink);\
+border-radius:var(--radius);border:1px solid var(--line-strong);background:var(--card);color:var(--ink);\
 cursor:pointer;margin:.5rem .5rem 0 0}\
 button:hover{background:var(--hover)}\
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}\
+button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-ink)}\
 button.primary:hover{filter:brightness(1.1)}\
-@media (prefers-color-scheme:dark){button.primary{background:#4e61ff;border-color:#4e61ff;color:#fff}}button:disabled{opacity:.5;cursor:not-allowed}\
+button:disabled{opacity:.5;cursor:not-allowed}\
 button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
 .hint{color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
 .refused,.warn,.passed,ul.refusal{border-radius:var(--radius);padding:.65rem .9rem;margin:.75rem 0;font-size:.93rem}\
