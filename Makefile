@@ -1055,15 +1055,17 @@ chart-check:
 		echo "$$rendered" | awk -v n="$$binding" '/^---/{b=0;m=0} /^kind: RoleBinding$$/{b=1} $$0=="  name: "n{m=1} b&&m&&/helm.sh\/hook"?:.*pre-install,pre-upgrade/{f=1} END{exit !f}' \
 			|| { echo "chart-check FAILED: the RoleBinding $$binding is deleted by its Job and is not a pre-install,pre-upgrade hook, so helm upgrade --wait fails on it being gone" >&2; exit 1; }; \
 	done
-	@# One conductor at a time. A rolling update keeps the old one answering
-	@# the bus until the new one is ready, and the new one is not ready while
-	@# it waits for its schema: after the wizard's apply the dashboard read the
-	@# access records from the old one's first-run store, which holds nobody,
-	@# and the administrator the wizard named signed in to a home page saying
-	@# nobody administers it (task kernel/upgrading-a-deployment-in-place).
+	@# One conductor at a time. A rolling update that surges keeps the old one
+	@# answering the bus until the new one is ready, and the new one is not
+	@# ready while it waits for its schema: after the wizard's apply the
+	@# dashboard read the access records from the old one's first-run store,
+	@# which holds nobody, and the administrator the wizard named signed in to
+	@# a home page saying nobody administers it (task
+	@# kernel/upgrading-a-deployment-in-place). No surge, not Recreate: Helm 4's
+	@# server-side apply cannot change an existing Deployment to Recreate.
 	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
-		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-conductor"{c=1} c&&/^    type: Recreate$$/{f=1} END{exit !f}' \
-		|| { echo "chart-check FAILED: the conductor's Deployment rolls, so an old conductor answers beside the new one while it waits for its schema" >&2; exit 1; }
+		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-conductor"{c=1} c&&/^      maxSurge: 0$$/{f=1} END{exit !f}' \
+		|| { echo "chart-check FAILED: the conductor's Deployment surges, so an old conductor answers beside the new one while it waits for its schema" >&2; exit 1; }
 	@# The Ingress (spec/live-plugin-development, ruling 1): none unless asked
 	@# for; asked for, two names to the dashboard's one port, the plugins' a
 	@# wildcard below the host; TLS for both; the address offered to the
