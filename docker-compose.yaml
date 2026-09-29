@@ -205,7 +205,6 @@ services:
       MERIDIAN_BROKER_URL: nats://custody-test-1:custody-test-1-dev-only@nats:4222
       MERIDIAN_PLUGIN_INSTANCE_ID: ${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-test-1}
       MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_PLUGIN_ROLES:-custody}
-      MERIDIAN_PLUGIN_TAGS: ${MERIDIAN_PLUGIN_TAGS:-}
       MERIDIAN_INSTANCE_ID: sidecar-custody-test-1
       # The front door, for e2e-plugin-page; unset, there is none.
       MERIDIAN_FRONT_DOOR_ADDRESS: ${MERIDIAN_FRONT_DOOR_ADDRESS:-}

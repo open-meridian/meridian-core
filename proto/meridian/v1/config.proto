@@ -6,7 +6,7 @@
 //
 // The governing idea: access is three dimensions joined by a permission -- a
 // user group (who), an account group (which accounts), an access group (which
-// plugin, through which tag, at read or write) -- and a person's access is the
+// plugins, each at read or write) -- and a person's access is the
 // union of their user groups' permissions, combined permission by permission.
 // None of it is read from a token, and none of it ever reaches the platform.
 //
@@ -182,21 +182,28 @@ message DefineAccountGroupRequest {
   AccountGroup account_group = 1;
 }
 
-// Which plugin, through which of its tags, at which level. One plugin per
-// entry, so each plugin's users can be counted on their own.
+// Which plugin, at which level. One plugin per entry, so each plugin's users
+// can be counted on their own. The levels are the same for every plugin, and
+// a plugin names no parts of itself for access (decisions/026).
 message AccessEntry {
   string plugin_instance_id = 1;
-  string tag = 2;
   AccessLevel level = 3;
+
+  // One of the plugin's tags, retired with them (decisions/026).
+  reserved 2;
+  reserved "tag";
 }
 
 enum AccessLevel {
   ACCESS_LEVEL_UNSPECIFIED = 0;
 
-  // Queries and receiving events.
+  // What the plugin reads, which it may show the person, cut to the accounts
+  // they may read: queries and receiving events.
   ACCESS_LEVEL_READ = 1;
 
-  // Commands, and everything read allows.
+  // What the plugin publishes, which it may do for the person, acting for
+  // them, on the accounts they may write: commands, and everything read
+  // allows.
   ACCESS_LEVEL_WRITE = 2;
 }
 

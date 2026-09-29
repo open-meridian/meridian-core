@@ -62,13 +62,13 @@ pub(crate) struct Unlinked {
 /// topic access: a plugin that named its own roles would be choosing its own
 /// privileges, and one that named its own instance could publish as a
 /// sibling, because grants are written with instance wildcards so an
-/// instance-scoped topic needs no grant minted per instance. The tags decide
-/// nothing here; they are for people (decisions/020).
+/// instance-scoped topic needs no grant minted per instance. A plugin has no
+/// tags (decisions/026): what people may do through it is their access
+/// groups', at read or write.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub instance_id: String,
     pub roles: Vec<String>,
-    pub tags: Vec<String>,
 }
 
 impl Identity {
@@ -76,13 +76,7 @@ impl Identity {
         Self {
             instance_id: instance_id.into(),
             roles,
-            tags: Vec::new(),
         }
-    }
-
-    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
-        self.tags = tags;
-        self
     }
 }
 
@@ -308,7 +302,6 @@ impl SidecarService for Sidecar {
             // what it expected to be. Learning it is not declaring it.
             instance_id: self.identity.instance_id.clone(),
             roles: self.identity.roles.clone(),
-            tags: self.identity.tags.clone(),
         }))
     }
 
@@ -552,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_plugin_cannot_ask_to_be_a_role_it_was_not_launched_as() {
-        // The hole this closed: the plugin used to supply role and tags, so a
+        // The hole this closed: the plugin used to supply its role, so a
         // read-only plugin could ask to be a connector and be admitted with
         // write grants. There is now nothing in the request that could ask.
         let sc = launched_as(Identity::new("reporting-1", roles(&["reporting"])));
@@ -578,10 +571,10 @@ mod tests {
     async fn the_reply_tells_a_plugin_what_it_was_launched_as() {
         // So a plugin can stop at startup when it is not what it expected to
         // be, rather than running as something else and finding out by refusal.
-        let sc = launched_as(
-            Identity::new("custody-snaptrade-1", roles(&["custody", "reporting"]))
-                .with_tags(vec!["holdings".to_string()]),
-        );
+        let sc = launched_as(Identity::new(
+            "custody-snaptrade-1",
+            roles(&["custody", "reporting"]),
+        ));
 
         let reply = sc
             .register(Request::new(register_req()))
@@ -592,31 +585,11 @@ mod tests {
         assert!(reply.admitted);
         assert_eq!(reply.instance_id, "custody-snaptrade-1");
         assert_eq!(reply.roles, roles(&["custody", "reporting"]));
-        assert_eq!(reply.tags, vec!["holdings".to_string()]);
         // Both roles' grants, the union the plugin will actually be held to.
         assert!(reply
             .publish_grants
             .contains(&"platform.street.command.record-holding".to_string()));
         assert!(reply
-            .subscribe_grants
-            .contains(&"platform.street.event.*".to_string()));
-    }
-
-    #[tokio::test]
-    async fn a_tag_grants_nothing_on_the_bus() {
-        // decisions/020: tags divide a plugin among people. A tag named like a
-        // role adds none of that role's topics.
-        let sc = launched_as(
-            Identity::new("custody-snaptrade-1", roles(&["custody"]))
-                .with_tags(vec!["reporting".to_string()]),
-        );
-        let reply = sc
-            .register(Request::new(register_req()))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(reply.admitted);
-        assert!(!reply
             .subscribe_grants
             .contains(&"platform.street.event.*".to_string()));
     }

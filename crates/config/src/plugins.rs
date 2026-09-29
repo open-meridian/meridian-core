@@ -3,9 +3,9 @@
 //!
 //! The conductor decides and records; the launcher only acts, and only when
 //! the conductor asks (decisions/019). A version arrives with its metadata --
-//! roles from the deployment's fixed list, its own tags -- and its image's
-//! digest; it is recorded once and never replaced. A launch runs a recorded
-//! version as an instance, with exactly the roles and tags it declares, which
+//! roles from the deployment's fixed list, and no tags (decisions/026) -- and
+//! its image's digest; it is recorded once and never replaced. A launch runs a
+//! recorded version as an instance, with exactly the roles it declares, which
 //! is what the administrator was shown and approved: an approval of anything
 //! else is no approval. Its grants are its roles', generated from the matrix,
 //! and nothing here writes a grant or a topic.
@@ -116,17 +116,6 @@ pub fn upload(
             return Err(format!("`{role}` is declared twice"));
         }
     }
-    let mut tags = BTreeSet::new();
-    for tag in &metadata.tags {
-        if !is_name(tag) {
-            return Err(format!(
-                "`{tag}` is not a tag: lowercase letters, digits and single hyphens"
-            ));
-        }
-        if !tags.insert(tag) {
-            return Err(format!("the tag `{tag}` is declared twice"));
-        }
-    }
     if metadata.sdk_version.is_empty() {
         return Err("an upload names no SDK version".into());
     }
@@ -180,21 +169,16 @@ pub fn launch<'a>(
             )
         })?;
     let metadata = version.metadata.as_ref().expect("found by it");
-    for (what, approved, declared) in [
-        ("roles", &request.approved_roles, &metadata.roles),
-        ("tags", &request.approved_tags, &metadata.tags),
-    ] {
-        let (approved, declared) = (set(approved), set(declared));
-        if approved != declared {
-            return Err(format!(
-                "the approval names {what} {}, and {} {} declares {}; an approval of \
-                 something other than what runs is no approval",
-                listed(&approved),
-                request.name,
-                request.version,
-                listed(&declared)
-            ));
-        }
+    let (approved, declared) = (set(&request.approved_roles), set(&metadata.roles));
+    if approved != declared {
+        return Err(format!(
+            "the approval names roles {}, and {} {} declares {}; an approval of \
+             something other than what runs is no approval",
+            listed(&approved),
+            request.name,
+            request.version,
+            listed(&declared)
+        ));
     }
     Ok(version)
 }
@@ -273,7 +257,6 @@ impl Plugins {
             version: metadata.version.clone(),
             image_digest: version.image_digest.clone(),
             roles: metadata.roles.clone(),
-            tags: metadata.tags.clone(),
             launched_by: subject(envelope),
             launched_at_ns: self.clock.now_ns(),
             state: PluginLaunchState::Launched as i32,
@@ -299,7 +282,6 @@ impl Plugins {
                 self.registry, metadata.name, version.image_digest
             ),
             roles: metadata.roles.clone(),
-            tags: metadata.tags.clone(),
             interface: metadata.interface,
             // Whether the deployment is for development is the launcher's to
             // know and to refuse on (spec/live-plugin-development, ruling 2).

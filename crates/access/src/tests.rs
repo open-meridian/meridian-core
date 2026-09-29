@@ -33,7 +33,6 @@ fn access_group(id: &str, level: AccessLevel) -> AccessGroup {
         name: id.into(),
         entries: vec![AccessEntry {
             plugin_instance_id: OMS.into(),
-            tag: "oms".into(),
             level: level as i32,
         }],
         built_in: false,
@@ -102,7 +101,7 @@ fn trader() -> Access {
 
 #[test]
 fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
-    let levels = &trader().plugins[OMS]["oms"];
+    let levels = &trader().plugins[OMS];
     assert_eq!(levels.write, set(&["ACC-GROWTH"]));
     assert_eq!(levels.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
     assert!(
@@ -113,7 +112,7 @@ fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
 
 #[test]
 fn write_includes_read() {
-    let levels = &trader().plugins[OMS]["oms"];
+    let levels = &trader().plugins[OMS];
     assert!(levels.write.is_subset(&levels.read));
 }
 
@@ -137,7 +136,7 @@ fn a_closed_account_stays_readable_and_is_never_writable() {
     let mut records = records();
     records.accounts[0].state = AccountState::Closed as i32;
     let access = person_access(&records, "someone", &["trading-desk".into()]);
-    let levels = &access.plugins[OMS]["oms"];
+    let levels = &access.plugins[OMS];
     assert!(levels.read.contains("ACC-GROWTH"));
     assert!(!levels.write.contains("ACC-GROWTH"));
 }
@@ -214,7 +213,11 @@ fn the_access_table_lists_groups_holding_access_and_people_who_have_signed_in() 
     assert_eq!(tam.subject, "trader-1");
     assert_eq!(tam.user_group_ids, ["UG-TRADERS"]);
     assert_eq!(tam.last_signed_in_at_ns, 7);
-    assert_eq!(tam.access[0].write_account_ids, ["ACC-GROWTH"]);
+    assert_eq!(tam.write_account_ids, ["ACC-GROWTH"]);
+    assert_eq!(tam.read_account_ids, ["ACC-GROWTH", "ACC-INCOME"]);
+    let traders = &table.user_groups[0];
+    assert_eq!(traders.write_account_ids, ["ACC-GROWTH"]);
+    assert_eq!(traders.read_account_ids, ["ACC-GROWTH", "ACC-INCOME"]);
 }
 
 #[test]
@@ -278,4 +281,39 @@ fn a_link_to_a_closed_account_reads_it_and_never_writes_it() {
     }];
     let scope = plugin_scope(&records, &links, "snaptrade");
     assert!(scope.read.contains("ACC-LONELY") && scope.write.is_empty());
+}
+
+#[test]
+fn two_entries_for_one_plugin_come_to_the_higher_level() {
+    // decisions/026: access to a plugin is read or write, and nothing finer.
+    // One access group naming the plugin twice, once at each level, is
+    // write on its accounts, as the union of the two entries says.
+    let mut records = records();
+    records.access_groups.push(AccessGroup {
+        access_group_id: "AX-BOTH".into(),
+        name: "AX-BOTH".into(),
+        entries: vec![
+            AccessEntry {
+                plugin_instance_id: OMS.into(),
+                level: AccessLevel::Read as i32,
+            },
+            AccessEntry {
+                plugin_instance_id: OMS.into(),
+                level: AccessLevel::Write as i32,
+            },
+        ],
+        built_in: false,
+    });
+    records.permissions = vec![permission("P-9", "UG-TRADERS", "AG-INCOME", "AX-BOTH")];
+    let held = person_access(&records, "someone", &["trading-desk".into()]).on_plugin(OMS);
+    assert_eq!(held.read, set(&["ACC-INCOME"]));
+    assert_eq!(held.write, set(&["ACC-INCOME"]));
+}
+
+#[test]
+fn a_plugin_the_person_holds_nothing_on_is_empty_levels() {
+    assert!(trader().on_plugin("another-plugin").is_empty());
+    let held = trader().on_plugin(OMS);
+    assert_eq!(held.read_account_ids(), ["ACC-GROWTH", "ACC-INCOME"]);
+    assert_eq!(held.write_account_ids(), ["ACC-GROWTH"]);
 }

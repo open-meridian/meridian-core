@@ -110,7 +110,11 @@ fn slug(title: &str) -> String {
         }
     }
     let out = out.trim_end_matches('-');
-    if out.is_empty() { "page".into() } else { out.into() }
+    if out.is_empty() {
+        "page".into()
+    } else {
+        out.into()
+    }
 }
 
 /// `key`, or `key-2`, `key-3` and on, whichever no tab already has, so a
@@ -258,8 +262,9 @@ pub fn flags(line: &Line, admin_pages: Option<&str>) -> String {
 }
 
 /// Who may use the instance: each user group an access group gives it to,
-/// with the tag, the level and the accounts; and who opens it as a
-/// deployment admin.
+/// at its level and on its accounts, `write` before `read`; and who opens it
+/// as a deployment admin. A level is the plugin's, the same two for every
+/// plugin, since a plugin declares no tags (decisions/026).
 fn access(records: &AccessRecords, instance: &str) -> String {
     let name = |id: &str, of: &[(&str, &str)]| {
         of.iter()
@@ -277,7 +282,7 @@ fn access(records: &AccessRecords, instance: &str) -> String {
         .iter()
         .map(|g| (g.account_group_id.as_str(), g.name.as_str()))
         .collect();
-    let mut rows = String::new();
+    let mut rows: Vec<(bool, String)> = Vec::new();
     let mut admins = Vec::new();
     for permission in &records.permissions {
         if permission.access_group_id == DEPLOYMENT_ADMIN {
@@ -296,29 +301,31 @@ fn access(records: &AccessRecords, instance: &str) -> String {
             .iter()
             .filter(|e| e.plugin_instance_id == instance)
         {
-            let level = if entry.level == AccessLevel::Write as i32 {
-                "write"
-            } else {
-                "read"
-            };
-            rows.push_str(&format!(
-                "<tr data-user-group=\"{ug}\" data-tag=\"{tag}\" data-level=\"{level}\">\
-                 <td><span class=\"name\">{user}</span><span class=\"id\">through {access}</span></td>\
-                 <td><code>{tag}</code> <span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
-                ug = escape(&permission.user_group_id),
-                user = escape(&name(&permission.user_group_id, &user_groups)),
-                access = escape(&group.name),
-                tag = escape(&entry.tag),
-                accounts = escape(&name(&permission.account_group_id, &account_groups)),
+            let writes = entry.level == AccessLevel::Write as i32;
+            let level = if writes { "write" } else { "read" };
+            rows.push((
+                writes,
+                format!(
+                    "<tr data-user-group=\"{ug}\" data-level=\"{level}\">\
+                     <td><span class=\"name\">{user}</span><span class=\"id\">through {access}</span></td>\
+                     <td><span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
+                    ug = escape(&permission.user_group_id),
+                    user = escape(&name(&permission.user_group_id, &user_groups)),
+                    access = escape(&group.name),
+                    accounts = escape(&name(&permission.account_group_id, &account_groups)),
+                ),
             ));
         }
     }
+    // Write before read, and otherwise in the order the permissions are.
+    rows.sort_by_key(|(writes, _)| !writes);
+    let rows: String = rows.into_iter().map(|(_, row)| row).collect();
     let table = if rows.is_empty() {
         "<p class=\"empty\">No user group holds access to it yet.</p>".to_string()
     } else {
         format!(
             "<div class=\"scroll\"><table class=\"list access\"><thead><tr><th>User group</th>\
-             <th>Tag</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></div>"
+             <th>Level</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
     let admins = if admins.is_empty() {

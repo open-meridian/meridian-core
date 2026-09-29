@@ -7,7 +7,6 @@ fn request() -> CreatePluginRequest {
         instance_id: "snaptrade-1".into(),
         image: format!("localhost:5000/plugins/snaptrade@sha256:{}", "a".repeat(64)),
         roles: vec!["custody".into()],
-        tags: vec!["holdings".into()],
         interface: true,
         ..Default::default()
     }
@@ -64,9 +63,9 @@ fn anything_else_is_refused_before_anything_is_made() {
             },
         ),
         (
-            "a tag that could break out",
+            "a role that is not a name",
             CreatePluginRequest {
-                tags: vec!["a b".into()],
+                roles: vec!["a b".into()],
                 ..request()
             },
         ),
@@ -76,7 +75,7 @@ fn anything_else_is_refused_before_anything_is_made() {
     }
 }
 
-const TEMPLATE: &str = r#"{"metadata":{"name":"r-plugin-__INSTANCE__","labels":{"meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"},"annotations":{"meridian.dev/roles":"__ROLES__"}},"spec":{"template":{"spec":{"hostname":"__INSTANCE__","containers":[{"name":"sidecar","env":[{"name":"MERIDIAN_PLUGIN_TAGS","value":"__TAGS__"}]},{"name":"plugin","image":"__IMAGE__"}]}}}}"#;
+const TEMPLATE: &str = r#"{"metadata":{"name":"r-plugin-__INSTANCE__","labels":{"meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"},"annotations":{"meridian.dev/roles":"__ROLES__"}},"spec":{"template":{"spec":{"hostname":"__INSTANCE__","containers":[{"name":"sidecar","env":[{"name":"MERIDIAN_PLUGIN_ROLES","value":"__ROLES__"}]},{"name":"plugin","image":"__IMAGE__"}]}}}}"#;
 
 #[test]
 fn the_template_is_filled_in_with_the_checked_request_and_nothing_else() {
@@ -93,7 +92,7 @@ fn the_template_is_filled_in_with_the_checked_request_and_nothing_else() {
     );
     assert_eq!(
         made["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"],
-        "holdings"
+        "custody"
     );
 }
 

@@ -4,8 +4,8 @@ Run as a pod by e2e/cluster/run.py, section P, beside the real CLI in the
 pod's other container: results 2 and 3 of plans/a-person-reaches-a-plugin.
 The CLI makes the reference plugin (`meridian plugin new`), connects,
 uploads it -- built by the node's own docker daemon, which the pod is given,
-as a person's machine gives it theirs -- and launches it with no role and no
-tag. This container is the person's browser: it confirms the CLI's
+as a person's machine gives it theirs -- and launches it with no role. This
+container is the person's browser: it confirms the CLI's
 connection, and once the run says the plugin is up, signs in to the
 dashboard as its administrator and opens the plugin's page from home.
 
@@ -316,8 +316,8 @@ with sync_playwright() as playwright:
     )
     launched = said_by("launch.out", 120)
     check(
-        "exit=0" in launched and "roles: none" in launched and "tags:  none" in launched,
-        "`meridian plugin launch` showed it asks for no role and no tag, and launched it",
+        "exit=0" in launched and "roles: none" in launched,
+        "`meridian plugin launch` showed it asks for no role, and launched it",
     )
     check(
         "roles = [\"custody\"]" in said_by("declare-custody.out", 300),
@@ -401,7 +401,7 @@ with sync_playwright() as playwright:
     account_group = row_id(admin, "Account groups", "Custody copy accounts")
     admin = administer(
         context, "/admin/access-groups",
-        {"access_group_id": "", "name": "Custody copy users", "entries": f"{CUSTODY} custody read"},
+        {"access_group_id": "", "name": "Custody copy users", "entries": f"{CUSTODY} read"},
         patience=90,
     )
     access_group = row_id(admin, "Access groups", "Custody copy users")
@@ -444,7 +444,7 @@ with sync_playwright() as playwright:
     administer(
         context, "/admin/access-groups",
         {"access_group_id": access_group or "", "name": "Custody copy users",
-         "entries": f"{CUSTODY} custody write"},
+         "entries": f"{CUSTODY} write"},
     )
     # The sidecar reads the plugin's write scope again within 30 seconds.
     deadline = time.monotonic() + 90

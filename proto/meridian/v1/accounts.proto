@@ -613,9 +613,12 @@ message RestoreOrganisationOwnerRequest {
 message PluginReport {
   string plugin_instance_id = 1;
   // What it was launched as: a set of roles from the fixed list
-  // (decisions/020), and its tags, which are for people.
+  // (decisions/020).
   repeated string roles = 12;
-  repeated string tags = 3;
+
+  // Its tags, retired: a plugin declares none (decisions/026).
+  reserved 3;
+  reserved "tags";
 
   bool registered = 4;
 

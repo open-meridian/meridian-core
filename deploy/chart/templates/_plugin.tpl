@@ -3,10 +3,10 @@
   runs in, whether the chart runs it from sidecars[] or the launcher launched
   it (decisions/019: one template). sidecar.yaml renders the first; the
   launcher fills in the second from launcher.yaml's copy, where the instance,
-  image, roles and tags are placeholders.
+  image and roles are placeholders.
 
-  Takes a dict: top (the chart), name (the Deployment's), instance, roles and
-  tags (comma-joined), brokerSecret and brokerKey (where the sidecar's broker
+  Takes a dict: top (the chart), name (the Deployment's), instance, roles
+  (comma-joined), brokerSecret and brokerKey (where the sidecar's broker
   credential is), plugin (image, pullPolicy, args, env, existingSecret,
   resources, imagePullSecret; absent for a sidecar alone), imageTag,
   launched, which marks what the launcher made and alone may remove, and
@@ -158,8 +158,6 @@ spec:
               value: {{ .instance | quote }}
             - name: MERIDIAN_PLUGIN_ROLES
               value: {{ .roles | quote }}
-            - name: MERIDIAN_PLUGIN_TAGS
-              value: {{ .tags | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
             {{- if $top.Values.dashboard.enabled }}
@@ -220,8 +218,8 @@ spec:
           pod can.
 
           It is given the sidecar's address and nothing else of the sidecar's.
-          No broker credential -- that seam is the boundary. And not its roles
-          or tags: a plugin that named its own roles would be
+          No broker credential -- that seam is the boundary. And not its
+          roles: a plugin that named its own roles would be
           choosing its own privileges (decision 007), so it learns them from
           the sidecar's reply to registration instead.
 

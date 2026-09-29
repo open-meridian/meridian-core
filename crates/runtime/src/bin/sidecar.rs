@@ -44,8 +44,7 @@ fn run() -> Result<(), String> {
     let identity = Identity::new(
         var("MERIDIAN_PLUGIN_INSTANCE_ID").unwrap_or_default(),
         names_from(var("MERIDIAN_PLUGIN_ROLES")),
-    )
-    .with_tags(names_from(var("MERIDIAN_PLUGIN_TAGS")));
+    );
 
     let address = var("MERIDIAN_SIDECAR_ADDRESS").unwrap_or_else(|| DEFAULT_BIND.into());
     let listening: std::net::SocketAddr = address

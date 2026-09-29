@@ -51,6 +51,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "setting_declaration_whole",
         sql: include_str!("../migrations/0006_setting_declaration_whole.sql"),
     },
+    Migration {
+        version: 7,
+        name: "access_is_read_or_write",
+        sql: include_str!("../migrations/0007_access_is_read_or_write.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

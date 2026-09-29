@@ -29,7 +29,7 @@ fn sidecar(bus: Arc<Bus>) -> Arc<Sidecar> {
         &contract,
         bus,
         "dep-local-1",
-        Identity::new("snaptrade-1", vec!["custody".into()]).with_tags(vec!["holdings".into()]),
+        Identity::new("snaptrade-1", vec!["custody".into()]),
     ))
 }
 
@@ -54,7 +54,6 @@ async fn before_registering_a_plugin_is_reported_as_what_it_was_launched_as() {
     let report = sidecar(memory()).report(7);
     assert_eq!(report.plugin_instance_id, "snaptrade-1");
     assert_eq!(report.roles, vec!["custody"]);
-    assert_eq!(report.tags, vec!["holdings"]);
     assert!(!report.registered && !report.healthy);
     assert_eq!(report.reported_at_ns, 7);
 }

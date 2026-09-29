@@ -85,7 +85,6 @@ fn snaptrade(version: &str) -> RecordPluginUploadRequest {
             name: "snaptrade".into(),
             version: version.into(),
             roles: vec!["custody".into()],
-            tags: vec!["holdings".into()],
             interface: true,
             sdk_version: "0.2.0".into(),
         }),
@@ -103,13 +102,12 @@ async fn upload(bus: &Bus, request: RecordPluginUploadRequest) -> Result<PluginV
     .await
 }
 
-fn launching(instance: &str, roles: &[&str], tags: &[&str]) -> LaunchPluginRequest {
+fn launching(instance: &str, roles: &[&str]) -> LaunchPluginRequest {
     LaunchPluginRequest {
         name: "snaptrade".into(),
         version: "0.1.0".into(),
         instance_id: instance.into(),
         approved_roles: roles.iter().map(|r| r.to_string()).collect(),
-        approved_tags: tags.iter().map(|t| t.to_string()).collect(),
         ..Default::default()
     }
 }
@@ -180,10 +178,6 @@ async fn an_upload_is_held_to_the_vocabulary_whatever_the_cli_checked() {
             Box::new(|r| r.metadata.as_mut().unwrap().version = "1.0 beta".into()),
         ),
         (
-            "not a tag",
-            Box::new(|r| r.metadata.as_mut().unwrap().tags = vec!["Holdings".into()]),
-        ),
-        (
             "not an image digest",
             Box::new(|r| r.image_digest = "latest".into()),
         ),
@@ -209,7 +203,7 @@ async fn an_upload_is_held_to_the_vocabulary_whatever_the_cli_checked() {
 async fn a_launch_runs_what_was_approved_by_digest_from_the_deployments_registry() {
     let (bus, launcher) = harness();
     upload(&bus, snaptrade("0.1.0")).await.unwrap();
-    let launched = launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    let launched = launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap();
     assert_eq!(launched.state, PluginLaunchState::Launched as i32);
@@ -227,16 +221,14 @@ async fn a_launch_runs_what_was_approved_by_digest_from_the_deployments_registry
 async fn an_approval_of_anything_but_the_declaration_is_refused_before_the_launcher_hears() {
     let (bus, launcher) = harness();
     upload(&bus, snaptrade("0.1.0")).await.unwrap();
-    for (roles, tags, says) in [
+    for (roles, says) in [
         (
             vec!["custody", "reporting"],
-            vec!["holdings"],
             "names roles custody, reporting",
         ),
-        (vec![], vec!["holdings"], "names roles none"),
-        (vec!["custody"], vec![], "names tags none"),
+        (vec![], "names roles none"),
     ] {
-        let refused = launch(&bus, launching("snaptrade-1", &roles, &tags))
+        let refused = launch(&bus, launching("snaptrade-1", &roles))
             .await
             .unwrap_err();
         assert!(
@@ -248,7 +240,7 @@ async fn an_approval_of_anything_but_the_declaration_is_refused_before_the_launc
         &bus,
         LaunchPluginRequest {
             version: "9.9.9".into(),
-            ..launching("snaptrade-1", &["custody"], &["holdings"])
+            ..launching("snaptrade-1", &["custody"])
         },
     )
     .await
@@ -256,14 +248,14 @@ async fn an_approval_of_anything_but_the_declaration_is_refused_before_the_launc
     assert!(unknown.contains("not in the catalogue"), "{unknown}");
     assert!(launcher.created.lock().unwrap().is_empty());
     // Order aside: an approval is a set.
-    let mut two_tags = snaptrade("0.1.1");
-    two_tags.metadata.as_mut().unwrap().tags = vec!["holdings".into(), "positions".into()];
-    upload(&bus, two_tags).await.unwrap();
+    let mut two_roles = snaptrade("0.1.1");
+    two_roles.metadata.as_mut().unwrap().roles = vec!["custody".into(), "reporting".into()];
+    upload(&bus, two_roles).await.unwrap();
     launch(
         &bus,
         LaunchPluginRequest {
             version: "0.1.1".into(),
-            ..launching("snaptrade-1", &["custody"], &["positions", "holdings"])
+            ..launching("snaptrade-1", &["reporting", "custody"])
         },
     )
     .await
@@ -274,15 +266,15 @@ async fn an_approval_of_anything_but_the_declaration_is_refused_before_the_launc
 async fn an_instance_runs_once_and_is_free_again_when_stopped() {
     let (bus, launcher) = harness();
     upload(&bus, snaptrade("0.1.0")).await.unwrap();
-    launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap();
-    let twice = launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    let twice = launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap_err();
     assert!(twice.contains("already launched"), "{twice}");
     // Another instance of the same version is its own.
-    launch(&bus, launching("snaptrade-2", &["custody"], &["holdings"]))
+    launch(&bus, launching("snaptrade-2", &["custody"]))
         .await
         .unwrap();
 
@@ -312,7 +304,7 @@ async fn an_instance_runs_once_and_is_free_again_when_stopped() {
         .unwrap_err()
         .contains("no launch of snaptrade-1 is live"));
 
-    launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap();
     let catalogue = catalogue(&bus).await;
@@ -329,7 +321,7 @@ async fn a_launch_the_launcher_refuses_is_recorded_as_failed_and_frees_the_insta
     let (bus, launcher) = harness();
     upload(&bus, snaptrade("0.1.0")).await.unwrap();
     *launcher.refuse.lock().unwrap() = Some("a workload for snaptrade-1 already exists".into());
-    let refused = launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    let refused = launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap_err();
     assert!(refused.contains("already exists"), "{refused}");
@@ -338,7 +330,7 @@ async fn a_launch_the_launcher_refuses_is_recorded_as_failed_and_frees_the_insta
     assert!(recorded.failure.contains("already exists"));
 
     *launcher.refuse.lock().unwrap() = None;
-    launch(&bus, launching("snaptrade-1", &["custody"], &["holdings"]))
+    launch(&bus, launching("snaptrade-1", &["custody"]))
         .await
         .unwrap();
 }
@@ -367,7 +359,7 @@ fn a_name_is_a_host_label_a_letter_first() {
 async fn a_live_launch_is_recorded_as_live_and_asked_of_the_launcher_as_live() {
     let (bus, launcher) = harness();
     upload(&bus, snaptrade("0.1.0")).await.unwrap();
-    let mut request = launching("snaptrade-1", &["custody"], &["holdings"]);
+    let mut request = launching("snaptrade-1", &["custody"]);
     request.live = true;
     let launched = launch(&bus, request).await.unwrap();
     assert!(launched.live);
@@ -380,7 +372,7 @@ async fn a_live_launch_is_recorded_as_live_and_asked_of_the_launcher_as_live() {
 
     // And an ordinary launch is not.
     upload(&bus, snaptrade("0.2.0")).await.unwrap();
-    let mut request = launching("snaptrade-2", &["custody"], &["holdings"]);
+    let mut request = launching("snaptrade-2", &["custody"]);
     request.version = "0.2.0".into();
     assert!(!launch(&bus, request).await.unwrap().live);
     assert!(!launcher.created.lock().unwrap()[1].live);

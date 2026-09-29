@@ -95,7 +95,6 @@ fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "oms-1".into(),
             roles: vec!["oms".into()],
-            tags: vec!["reporting".into()],
             last_reported_at_ns: 0,
         })
         .unwrap();
@@ -176,12 +175,19 @@ async fn account_group(h: &Harness, accounts: &[&AccountRecord]) -> AccountGroup
     .unwrap()
 }
 
-fn entry(tag: &str, level: AccessLevel) -> AccessEntry {
+fn entry(level: AccessLevel) -> AccessEntry {
     AccessEntry {
         plugin_instance_id: "oms-1".into(),
-        tag: tag.into(),
         level: level as i32,
     }
+}
+
+/// A length-delimited field, written by hand: what a sender built before a
+/// field was reserved still writes.
+fn length_delimited(number: u32, bytes: &[u8], into: &mut Vec<u8>) {
+    prost::encoding::encode_key(number, prost::encoding::WireType::LengthDelimited, into);
+    prost::encoding::encode_varint(bytes.len() as u64, into);
+    into.extend_from_slice(bytes);
 }
 
 async fn access_group(h: &Harness, entries: Vec<AccessEntry>) -> Result<AccessGroup, String> {
@@ -310,26 +316,21 @@ async fn deployment_admin_is_built_in_and_cannot_be_edited() {
 }
 
 #[tokio::test]
-async fn an_access_entry_names_a_tag_its_plugin_carries_and_says_which_it_does() {
+async fn an_access_entry_names_a_plugin_that_has_reported_and_a_level() {
     let h = harness("dashboard-1");
-    assert!(access_group(&h, vec![entry("oms", AccessLevel::Write)])
+    assert!(access_group(&h, vec![entry(AccessLevel::Write)])
         .await
         .is_ok());
-    assert!(
-        access_group(&h, vec![entry("reporting", AccessLevel::Read)])
-            .await
-            .is_ok()
-    );
+    assert!(access_group(&h, vec![entry(AccessLevel::Read)])
+        .await
+        .is_ok());
 
-    let wrong = access_group(&h, vec![entry("custody", AccessLevel::Read)])
+    let no_level = access_group(&h, vec![entry(AccessLevel::Unspecified)])
         .await
         .unwrap_err();
-    assert!(
-        wrong.contains("does not carry `custody`") && wrong.contains("oms, reporting"),
-        "{wrong}"
-    );
+    assert!(no_level.contains("read or write"), "{no_level}");
 
-    let mut unknown = entry("oms", AccessLevel::Read);
+    let mut unknown = entry(AccessLevel::Read);
     unknown.plugin_instance_id = "never-reported".into();
     assert!(access_group(&h, vec![unknown])
         .await
@@ -338,11 +339,78 @@ async fn an_access_entry_names_a_tag_its_plugin_carries_and_says_which_it_does()
 }
 
 #[tokio::test]
+async fn an_access_entry_naming_a_tag_is_refused_not_widened() {
+    // decisions/026: a plugin declares no tags. A sender built before it
+    // still writes one, in the field now reserved; decoding would drop it and
+    // grant the whole plugin, so the conductor looks for it and refuses.
+    let h = harness("dashboard-1");
+    let mut tagged = entry(AccessLevel::Read).encode_to_vec();
+    length_delimited(2, b"reporting", &mut tagged);
+    let mut group = AccessGroup {
+        name: "Tagged".into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    length_delimited(3, &tagged, &mut group);
+    let mut request = Vec::new();
+    length_delimited(1, &group, &mut request);
+    assert_eq!(
+        DefineAccessGroupRequest::decode(&request[..])
+            .unwrap()
+            .access_group
+            .unwrap()
+            .entries,
+        [entry(AccessLevel::Read)],
+        "decoded, the tag is gone without a word"
+    );
+
+    let refused = h
+        .bus
+        .call_for(
+            DEFINE_ACCESS_GROUP,
+            "meridian.v1.DefineAccessGroupRequest",
+            request,
+            None,
+            None,
+            ADA,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("no tag") && refused.contains("decisions/026"),
+        "{refused}"
+    );
+    assert!(!records(&h)
+        .await
+        .access_groups
+        .iter()
+        .any(|g| g.name == "Tagged"));
+
+    // The same entry without it is an ordinary one.
+    let untagged = DefineAccessGroupRequest {
+        access_group: Some(AccessGroup {
+            name: "Plain".into(),
+            entries: vec![entry(AccessLevel::Read)],
+            ..Default::default()
+        }),
+    };
+    assert_eq!(
+        crate::rules::names_no_tag(&untagged.encode_to_vec()),
+        Ok(())
+    );
+    assert!(
+        crate::rules::names_no_tag(&[0x0a, 0x05]).is_err(),
+        "truncated"
+    );
+}
+
+#[tokio::test]
 async fn a_permission_names_an_account_group_unless_it_is_to_deployment_admin() {
     let h = harness("dashboard-1");
     let traders = user_group(&h).await;
     let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
-    let trading = access_group(&h, vec![entry("oms", AccessLevel::Write)])
+    let trading = access_group(&h, vec![entry(AccessLevel::Write)])
         .await
         .unwrap();
 
@@ -488,7 +556,7 @@ async fn a_change_is_announced_to_the_plugins_it_moved_and_carries_no_setting() 
     let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
     let traders = user_group(&h).await;
     let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
-    let trading = access_group(&h, vec![entry("oms", AccessLevel::Write)])
+    let trading = access_group(&h, vec![entry(AccessLevel::Write)])
         .await
         .unwrap();
     grant(
@@ -526,7 +594,7 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     let traders = user_group(&h).await;
     let growth_account = account(&h, "Growth").await;
     let growth = account_group(&h, &[&growth_account]).await;
-    let trading = access_group(&h, vec![entry("oms", AccessLevel::Read)])
+    let trading = access_group(&h, vec![entry(AccessLevel::Read)])
         .await
         .unwrap();
     grant(
@@ -995,7 +1063,6 @@ async fn reported_by(
     let report = PluginReport {
         plugin_instance_id: "oms-1".into(),
         roles: vec!["oms".into()],
-        tags: vec!["reporting".into()],
         registered,
         declared_settings: declared.clone(),
         reported_at_ns: at,

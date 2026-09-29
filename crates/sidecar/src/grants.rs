@@ -12,8 +12,9 @@
 //! are the ones the runtime was built against, with no file a deployment
 //! could forget to mount or edit to disagree.
 //!
-//! Tags are not here. They divide a plugin among people (W6.7) and grant
-//! nothing on the bus.
+//! People are not here. What a person may do through a plugin is their access
+//! groups', at read or write (W6.7, decisions/026), and grants nothing on the
+//! bus.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;

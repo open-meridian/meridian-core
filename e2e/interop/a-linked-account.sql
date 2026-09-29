@@ -24,8 +24,8 @@ ON CONFLICT DO NOTHING;
 INSERT INTO config_access_group (access_group_id, name) VALUES ('grp-interop', 'Interop')
 ON CONFLICT DO NOTHING;
 -- AccessLevel 2: write.
-INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, tag, level)
-VALUES ('grp-interop', 0, 'custody-test-1', 'holdings', 2)
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
+VALUES ('grp-interop', 0, 'custody-test-1', 2)
 ON CONFLICT DO NOTHING;
 INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
 VALUES ('perm-interop', 'ug-interop', 'ag-interop', 'grp-interop')

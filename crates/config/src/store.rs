@@ -34,27 +34,14 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A plugin the deployment has heard report (W4.8): what it is launched as.
-/// Kept so an access entry can be refused for naming a tag the plugin does not
-/// carry, including after a restart, before the plugin reports again.
+/// Kept so an access entry can be refused for naming a plugin the deployment
+/// has never heard of, including after a restart, before the plugin reports
+/// again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownPlugin {
     pub plugin_instance_id: String,
     pub roles: Vec<String>,
-    pub tags: Vec<String>,
     pub last_reported_at_ns: i64,
-}
-
-impl KnownPlugin {
-    /// A part of the plugin people may be granted: one of its roles, or one
-    /// of its tags (decisions/020). A compliance plugin holding `compliance`
-    /// and `reporting` is granted as those two parts; a tag names a part the
-    /// roles do not divide.
-    pub fn carries(&self, part: &str) -> bool {
-        self.roles
-            .iter()
-            .chain(&self.tags)
-            .any(|carried| carried == part)
-    }
 }
 
 /// A setting's value as the store holds it: as given, or sealed with the

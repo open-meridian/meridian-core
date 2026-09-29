@@ -485,11 +485,9 @@ pub struct PluginReport {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
     /// What it was launched as: a set of roles from the fixed list
-    /// (decisions/020), and its tags, which are for people.
+    /// (decisions/020).
     #[prost(string, repeated, tag = "12")]
     pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "3")]
-    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "4")]
     pub registered: bool,
     /// The plugin's own word (W4.5), and why not when not.
@@ -1257,14 +1255,13 @@ pub struct DefineAccountGroupRequest {
     #[prost(message, optional, tag = "1")]
     pub account_group: ::core::option::Option<AccountGroup>,
 }
-/// Which plugin, through which of its tags, at which level. One plugin per
-/// entry, so each plugin's users can be counted on their own.
+/// Which plugin, at which level. One plugin per entry, so each plugin's users
+/// can be counted on their own. The levels are the same for every plugin, and
+/// a plugin names no parts of itself for access (decisions/026).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessEntry {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub tag: ::prost::alloc::string::String,
     #[prost(enumeration = "AccessLevel", tag = "3")]
     pub level: i32,
 }
@@ -1423,9 +1420,12 @@ impl AccountState {
 #[repr(i32)]
 pub enum AccessLevel {
     Unspecified = 0,
-    /// Queries and receiving events.
+    /// What the plugin reads, which it may show the person, cut to the accounts
+    /// they may read: queries and receiving events.
     Read = 1,
-    /// Commands, and everything read allows.
+    /// What the plugin publishes, which it may do for the person, acting for
+    /// them, on the accounts they may write: commands, and everything read
+    /// allows.
     Write = 2,
 }
 impl AccessLevel {
@@ -2946,10 +2946,6 @@ pub struct PluginMetadata {
     /// no topics, as the reference plugin is.
     #[prost(string, repeated, tag = "3")]
     pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The plugin's own names for its parts, which people are granted at read
-    /// or write (W6.7). They grant nothing on the bus.
-    #[prost(string, repeated, tag = "4")]
-    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Whether it serves a page through its sidecar (decisions/014).
     #[prost(bool, tag = "5")]
     pub interface: bool,
@@ -2991,10 +2987,10 @@ pub struct PluginCatalogue {
     #[prost(message, repeated, tag = "2")]
     pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
 }
-/// A deployment admin launches a version. The roles and tags are the ones
-/// they were shown and approved, and the launch is refused unless they are
-/// exactly the version's metadata: an approval of something other than what
-/// runs is no approval.
+/// A deployment admin launches a version. The roles are the ones they were
+/// shown and approved, and the launch is refused unless they are exactly the
+/// version's metadata: an approval of something other than what runs is no
+/// approval.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LaunchPluginRequest {
     #[prost(string, tag = "1")]
@@ -3007,8 +3003,6 @@ pub struct LaunchPluginRequest {
     pub instance_id: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "4")]
     pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "5")]
-    pub approved_tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// In the live shape, on a development deployment alone: the plugin runs
     /// the files sent to it since, and the launcher refuses this anywhere else
     /// (W8.3, spec/live-plugin-development).
@@ -3028,8 +3022,6 @@ pub struct PluginLaunch {
     pub image_digest: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "5")]
     pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "6")]
-    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "7")]
     pub launched_by: ::prost::alloc::string::String,
     #[prost(int64, tag = "8")]
@@ -3058,8 +3050,6 @@ pub struct CreatePluginRequest {
     pub image: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "3")]
     pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "4")]
-    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bool, tag = "5")]
     pub interface: bool,
     /// The chart's live shape rather than its plugin shape; refused by a

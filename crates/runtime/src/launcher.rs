@@ -4,10 +4,10 @@
 //!
 //! It fills in one template, which the chart renders from the same
 //! definition as the plugins it runs itself, so a launched plugin cannot
-//! differ from a configured one but in its instance, image, roles and tags --
-//! and each of those is checked here before it goes into the template:
-//! an instance that is a host label, an image from the deployment's own
-//! registry by digest and nothing else, roles and tags that are names. It
+//! differ from a configured one but in its instance, image and roles -- and
+//! each of those is checked here before it goes into the template: an
+//! instance that is a host label, an image from the deployment's own
+//! registry by digest and nothing else, roles that are names. It
 //! removes only Deployments carrying its label, and makes none for an
 //! instance that already has one.
 
@@ -16,7 +16,7 @@ use meridian_domain::v1::CreatePluginRequest;
 pub const CREATE_PLUGIN: &str = "platform.deployment.command.create-plugin";
 pub const REMOVE_PLUGIN: &str = "platform.deployment.command.remove-plugin";
 
-/// A host label, a letter first: an instance, a plugin's name, a role, a tag.
+/// A host label, a letter first: an instance, a plugin's name, a role.
 pub fn is_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=63).contains(&bytes.len())
@@ -54,9 +54,9 @@ pub fn checked(request: &CreatePluginRequest, registry: &str) -> Result<(), Stri
     {
         return Err(format!("{} does not carry a sha256 digest", request.image));
     }
-    for part in request.roles.iter().chain(&request.tags) {
-        if !is_name(part) {
-            return Err(format!("`{part}` is not a role or a tag"));
+    for role in &request.roles {
+        if !is_name(role) {
+            return Err(format!("`{role}` is not a role"));
         }
     }
     Ok(())
@@ -101,8 +101,7 @@ pub fn manifest(
     let filled = template
         .replace("__INSTANCE__", &request.instance_id)
         .replace("__IMAGE__", &request.image)
-        .replace("__ROLES__", &request.roles.join(","))
-        .replace("__TAGS__", &request.tags.join(","));
+        .replace("__ROLES__", &request.roles.join(","));
     if let Some(left) = placeholder(&filled) {
         return Err(format!(
             "the template has a placeholder this does not fill: {left}"

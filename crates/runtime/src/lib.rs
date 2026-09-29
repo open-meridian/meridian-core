@@ -462,11 +462,10 @@ pub fn now_ns() -> i64 {
         .unwrap_or_default()
 }
 
-/// Names from one comma-separated value, blanks dropped: a sidecar's roles,
-/// or its tags.
+/// Names from one comma-separated value, blanks dropped: a sidecar's roles.
 ///
-/// Empty and unset are the same thing here: a sidecar with no tags is the
-/// ordinary case, and one with no roles is a plugin admitted with no topics
+/// Empty and unset are the same thing here: a sidecar with no roles is a
+/// plugin admitted with no topics
 /// (decisions/020). v1 read this from the environment too, and a null value
 /// there meant a plugin that registered and then had every publish denied, so
 /// the sidecar logs what it was launched with rather than leaving an operator
@@ -475,7 +474,7 @@ pub fn names_from(raw: Option<String>) -> Vec<String> {
     raw.unwrap_or_default()
         .split(',')
         .map(str::trim)
-        .filter(|tag| !tag.is_empty())
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
 }

@@ -457,15 +457,24 @@ fn a_directory_group_is_a_whole_line_so_a_distinguished_name_survives() {
 }
 
 #[test]
-fn entries_are_plugin_tag_and_level_one_per_line() {
-    let parsed = parse_entries("oms-1 oms write\n\n snaptrade-1 custody read ").unwrap();
+fn entries_are_plugin_and_level_one_per_line() {
+    let parsed = parse_entries("oms-1 write\n\n snaptrade-1 read ").unwrap();
     assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].plugin_instance_id, "oms-1");
     assert_eq!(parsed[0].level, AccessLevel::Write as i32);
     assert_eq!(parsed[1].plugin_instance_id, "snaptrade-1");
-    assert!(parse_entries("oms-1 oms admin")
+    assert_eq!(parsed[1].level, AccessLevel::Read as i32);
+    assert!(parse_entries("oms-1 admin")
         .unwrap_err()
         .contains("not read or write"));
-    assert!(parse_entries("oms-1 write").is_err());
+    assert!(parse_entries("oms-1").is_err());
+    // decisions/026: a plugin declares no tags, so an entry naming one is
+    // refused and says why, rather than read as something else.
+    let tagged = parse_entries("snaptrade-1 custody read").unwrap_err();
+    assert!(
+        tagged.contains("names a tag") && tagged.contains("decisions/026"),
+        "{tagged}"
+    );
 }
 
 // ── A plugin instance's admin view and settings (W6.9, W6.10, W6.11) ───────
@@ -802,7 +811,6 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
             name: "Custody readers".into(),
             entries: vec![meridian_domain::v1::AccessEntry {
                 plugin_instance_id: "snaptrade-1".into(),
-                tag: "holdings".into(),
                 level: meridian_domain::v1::AccessLevel::Read as i32,
             }],
             built_in: false,
@@ -858,8 +866,9 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     )));
     let (_, body) = send(&h, get(&h, &format!("{VIEW}?tab=access"), true)).await;
     let access = table(&body, "access");
-    assert!(access.contains("Operations") && access.contains("holdings"));
+    assert!(access.contains("Operations") && access.contains("Custody readers"));
     assert!(access.contains("Growth accounts") && access.contains(">read<"));
+    assert!(access.contains("<th>Level</th>") && !access.contains("Tag"));
     assert!(body.contains("Deployment admins open it too"));
 
     // The same flag on the overview, leading to the view (W6.10).
@@ -917,10 +926,7 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
             (VIEW.to_string(), "Overview".to_string()),
             (format!("{VIEW}?tab=settings"), "Settings".into()),
             (format!("{VIEW}?tab=access"), "Access".into()),
-            (
-                format!("{VIEW}?tab=connections"),
-                "Connections".into()
-            ),
+            (format!("{VIEW}?tab=connections"), "Connections".into()),
             (format!("{VIEW}?tab=accounts"), "Accounts".into()),
             (format!("{VIEW}?tab=holdings"), "Holdings".into()),
         ]
@@ -931,11 +937,7 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
         "a page is framed only on its own tab"
     );
 
-    let (_, accounts) = send(
-        &h,
-        get(&h, &format!("{VIEW}?tab=accounts"), true),
-    )
-    .await;
+    let (_, accounts) = send(&h, get(&h, &format!("{VIEW}?tab=accounts"), true)).await;
     assert_eq!(tabs_of(&accounts).1, "Accounts");
     let frame = accounts.split("<iframe").nth(1).expect("the page, framed");
     assert!(

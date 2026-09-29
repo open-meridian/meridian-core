@@ -14,7 +14,11 @@
 //! the first and read on the second. Folding accounts and levels separately
 //! would make it write on both, and that is the mistake this crate exists to
 //! make impossible: each permission contributes only its own accounts, at its
-//! own level, to the plugin and tag its entry names.
+//! own level, to the plugin its entry names.
+//!
+//! Per plugin, and nothing finer: a person's access to a plugin is `read` or
+//! `write`, the same for every plugin, and a plugin names no parts of itself
+//! for access (decisions/026).
 //!
 //! `write` includes `read`: every account a person may write is also one they
 //! may read.
@@ -34,7 +38,7 @@ use meridian_domain::v1::{
     AccessLevel, AccessRecords, AccountRecord, AccountState, ExternalAccountLink, Permission,
     UserGroup,
 };
-use meridian_pb::v1::{PersonAccess, PluginAccessReply, TagAccess, UserGroupAccess};
+use meridian_pb::v1::{PersonAccess, PluginAccessReply, UserGroupAccess};
 
 /// The built-in access group. Holds the dashboard's own capabilities and
 /// reaches every account; cannot be edited, deleted, or left without a
@@ -68,10 +72,20 @@ impl Levels {
     pub fn is_empty(&self) -> bool {
         self.read.is_empty() && self.write.is_empty()
     }
+
+    /// The accounts that may be read, as the wire lists them.
+    pub fn read_account_ids(&self) -> Vec<String> {
+        self.read.iter().cloned().collect()
+    }
+
+    /// The accounts that may be written, as the wire lists them.
+    pub fn write_account_ids(&self) -> Vec<String> {
+        self.write.iter().cloned().collect()
+    }
 }
 
-/// Plugin instance, then tag, then the accounts at each level.
-pub type PluginLevels = BTreeMap<String, BTreeMap<String, Levels>>;
+/// Plugin instance, then the accounts at each level.
+pub type PluginLevels = BTreeMap<String, Levels>;
 
 /// One person's access, as the dashboard evaluates it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,11 +99,12 @@ pub struct Access {
 }
 
 impl Access {
-    /// What this person holds on one plugin, as the assertion carries it.
-    pub fn on_plugin(&self, plugin_instance_id: &str) -> Vec<TagAccess> {
+    /// What this person holds on one plugin, as the assertion carries it:
+    /// the accounts they may read and the accounts they may write through it.
+    pub fn on_plugin(&self, plugin_instance_id: &str) -> Levels {
         self.plugins
             .get(plugin_instance_id)
-            .map(tag_access)
+            .cloned()
             .unwrap_or_default()
     }
 }
@@ -149,8 +164,9 @@ fn access_of_groups(records: &AccessRecords, user_group_ids: &BTreeSet<String>) 
 }
 
 /// One permission's contribution: its own accounts, at its own level, to the
-/// plugin and tag each entry names. Nothing crosses from one permission to
-/// another.
+/// plugin each entry names. Nothing crosses from one permission to another,
+/// and two entries naming one plugin come to the higher of their levels,
+/// which is what the union of them is.
 fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevels) {
     let Some(access_group) = records
         .access_groups
@@ -172,8 +188,6 @@ fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevel
             }
         }
         into.entry(entry.plugin_instance_id.clone())
-            .or_default()
-            .entry(entry.tag.clone())
             .or_default()
             .add(&levels);
     }
@@ -205,8 +219,8 @@ fn accounts_of_group<'a>(
 }
 
 /// A plugin's account scope: every account anybody may read through it, and
-/// every account anybody may write through it, across all its tags; and every
-/// account one of its external accounts is linked to.
+/// every account anybody may write through it; and every account one of its
+/// external accounts is linked to.
 ///
 /// Derived from every permission, not from people: the deployment knows no
 /// directory, so it cannot ask who is in a group, only what the groups hold.
@@ -223,14 +237,7 @@ pub fn plugin_scope(
             fold(records, permission, &mut all);
         }
     }
-    let mut scope = Levels::default();
-    for levels in all
-        .get(plugin_instance_id)
-        .into_iter()
-        .flat_map(|tags| tags.values())
-    {
-        scope.add(levels);
-    }
+    let mut scope = all.remove(plugin_instance_id).unwrap_or_default();
     for link in links
         .iter()
         .filter(|link| link.plugin_instance_id == plugin_instance_id)
@@ -263,7 +270,8 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
             (!access.is_empty()).then(|| UserGroupAccess {
                 user_group_id: group.user_group_id.clone(),
                 name: group.name.clone(),
-                access,
+                read_account_ids: access.read_account_ids(),
+                write_account_ids: access.write_account_ids(),
             })
         })
         .collect();
@@ -279,7 +287,8 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
                 display_name: person.display_name.clone(),
                 user_group_ids: held.user_group_ids.into_iter().collect(),
                 last_signed_in_at_ns: person.signed_in_at_ns,
-                access,
+                read_account_ids: access.read_account_ids(),
+                write_account_ids: access.write_account_ids(),
             })
         })
         .collect();
@@ -288,18 +297,6 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
         user_groups,
         people,
     }
-}
-
-/// Tag by tag, as the wire carries it.
-pub fn tag_access(tags: &BTreeMap<String, Levels>) -> Vec<TagAccess> {
-    tags.iter()
-        .filter(|(_, levels)| !levels.is_empty())
-        .map(|(tag, levels)| TagAccess {
-            tag: tag.clone(),
-            read_account_ids: levels.read.iter().cloned().collect(),
-            write_account_ids: levels.write.iter().cloned().collect(),
-        })
-        .collect()
 }
 
 #[cfg(test)]

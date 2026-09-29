@@ -393,9 +393,9 @@ pub fn render(
             "<input type=\"hidden\" name=\"access_group_id\" value=\"{}\">\
              <label>Name<input name=\"name\" value=\"{}\" required></label>\
              <label>Entries, one per line<textarea name=\"entries\" rows=\"4\" \
-             placeholder=\"snaptrade-1 holdings read\">{}</textarea></label>\
-             <p class=\"hint\">Each line is a plugin instance, one of its tags, and <code>read</code> \
-             or <code>write</code>.</p>",
+             placeholder=\"snaptrade-1 read\">{}</textarea></label>\
+             <p class=\"hint\">Each line is a plugin instance and <code>read</code> \
+             or <code>write</code>: read to see what it shows, write to act through it too.</p>",
             escape(id),
             escape(name),
             escape(entries)
@@ -409,7 +409,7 @@ pub fn render(
         } else {
             g.entries
                 .iter()
-                .map(|e| format!("{} {} {}", e.plugin_instance_id, e.tag, level_name(e.level)))
+                .map(|e| format!("{} {}", e.plugin_instance_id, level_name(e.level)))
                 .collect::<Vec<_>>()
                 .join("; ")
         };
@@ -427,9 +427,7 @@ pub fn render(
                     &g.name,
                     &g.entries
                         .iter()
-                        .map(|e| {
-                            format!("{} {} {}", e.plugin_instance_id, e.tag, level_name(e.level))
-                        })
+                        .map(|e| format!("{} {}", e.plugin_instance_id, level_name(e.level)))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
@@ -465,7 +463,7 @@ pub fn render(
     sections.push(section(
         "access-groups",
         "Access groups",
-        "What a permission gives: plugins' tags, at read or write.",
+        "What a permission gives: plugins, each at read or write.",
         &new_button("new-access-group", "New access group"),
         format!("{table}{dialogs}"),
     ));

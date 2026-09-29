@@ -293,9 +293,6 @@ firstRun:
 #     # contract's, compiled into the runtime; none is a plugin admitted with
 #     # no topics. A name that is not a role stops the broker from starting.
 #     roles: []
-#     # Its parts, for people: what access groups grant, at read or write.
-#     # They grant nothing on the bus.
-#     tags: []
 #     # The plugin, as a second container in this sidecar's pod. Optional: a
 #     # sidecar with no plugin runs alone. Adding or removing an entry here is
 #     # one Deployment created or deleted, and nothing else restarts.

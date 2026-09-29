@@ -57,7 +57,6 @@ fn records(instances: &[&str]) -> AccessRecords {
                 .iter()
                 .map(|instance| AccessEntry {
                     plugin_instance_id: instance.to_string(),
-                    tag: "custody".into(),
                     level: AccessLevel::Read as i32,
                 })
                 .collect(),
@@ -337,10 +336,8 @@ async fn a_person_with_access_opens_the_plugin_and_it_is_told_who_they_are() {
     assert_eq!(claims.subject, ADA);
     assert_eq!(claims.display_name, "Ada");
     assert_eq!(claims.audience_instance_id, INSTANCE);
-    assert_eq!(claims.access.len(), 1);
-    assert_eq!(claims.access[0].tag, "custody");
-    assert_eq!(claims.access[0].read_account_ids, vec!["ACC-1".to_string()]);
-    assert!(claims.access[0].write_account_ids.is_empty());
+    assert_eq!(claims.read_account_ids, vec!["ACC-1".to_string()]);
+    assert!(claims.write_account_ids.is_empty());
     assert_eq!(claims.expires_at_ns - claims.issued_at_ns, 60 * SECOND_NS);
     assert!(
         !claims.deployment_admin,
@@ -770,7 +767,10 @@ async fn a_deployment_admin_opens_any_plugin_asserted_with_only_what_they_hold()
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
     let claims = claims_reaching(&h);
     assert_eq!(claims.subject, ADA);
-    assert!(claims.access.is_empty(), "{:?}", claims.access);
+    assert!(
+        claims.read_account_ids.is_empty() && claims.write_account_ids.is_empty(),
+        "{claims:?}"
+    );
     // And said to be one, so the plugin serves its admin page to them (W6.9).
     assert!(claims.deployment_admin);
 }
@@ -790,9 +790,8 @@ async fn an_admin_asserted_with_what_they_hold_where_they_hold_something() {
     )
     .await;
     let claims = claims_reaching(&h);
-    assert_eq!(claims.access.len(), 1);
-    assert_eq!(claims.access[0].read_account_ids, vec!["ACC-1".to_string()]);
-    assert!(claims.access[0].write_account_ids.is_empty());
+    assert_eq!(claims.read_account_ids, vec!["ACC-1".to_string()]);
+    assert!(claims.write_account_ids.is_empty());
 }
 
 #[tokio::test]

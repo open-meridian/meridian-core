@@ -49,7 +49,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use meridian_pb::v1::{CallerClaims, TagAccess};
+use meridian_pb::v1::CallerClaims;
 use prost::Message;
 
 use crate::clock::SECOND_NS;
@@ -300,7 +300,9 @@ impl Plugins {
             subject: person.subject.clone(),
             display_name: person.display_name.clone(),
             audience_instance_id: instance.to_string(),
-            access: Vec::new(),
+            // Nothing on the plugin's accounts: developing it is not access.
+            read_account_ids: Vec::new(),
+            write_account_ids: Vec::new(),
             issued_at_ns: now,
             expires_at_ns: now + ASSERTION_NS,
             assertion_id: token(),
@@ -663,8 +665,9 @@ pub fn pages_possible(public_url: &str) -> Result<(), String> {
 
 /// What a person carries onto a plugin's page.
 pub(crate) struct Opening {
-    /// Their access on the plugin, tag by tag.
-    pub access: Vec<TagAccess>,
+    /// Their access on the plugin: the accounts they may read and the
+    /// accounts they may write through it (decisions/026).
+    pub access: meridian_access::Levels,
     /// Whether they are a deployment admin, which the plugin serves its admin
     /// page by (W6.9); asserted false for everybody else.
     pub deployment_admin: bool,
@@ -677,7 +680,8 @@ impl Opening {
             subject: who.subject.clone(),
             display_name: who.display_name.clone(),
             audience_instance_id: instance.to_string(),
-            access: self.access,
+            read_account_ids: self.access.read_account_ids(),
+            write_account_ids: self.access.write_account_ids(),
             issued_at_ns: now,
             expires_at_ns: now + ASSERTION_NS,
             assertion_id: token(),

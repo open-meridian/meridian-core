@@ -720,6 +720,7 @@ pub fn serve(
         ),
         |cx, request: DefineAccessGroupRequest, envelope| {
             let before = cx.snapshot()?;
+            rules::names_no_tag(&envelope.payload)?;
             let mut group = request.access_group.unwrap_or_default();
             rules::access_group(&before, &group)?;
             if group.access_group_id.is_empty() {
@@ -975,7 +976,6 @@ pub fn serve(
             let plugin = KnownPlugin {
                 plugin_instance_id: report.plugin_instance_id,
                 roles: report.roles,
-                tags: report.tags,
                 last_reported_at_ns: report.reported_at_ns,
             };
             // What it declared, only while it is registered: a plugin between

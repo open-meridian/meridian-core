@@ -33,14 +33,16 @@ message PluginMetadata {
   // dashboard's among them (decisions/020). Empty is a plugin admitted with
   // no topics, as the reference plugin is.
   repeated string roles = 3;
-  // The plugin's own names for its parts, which people are granted at read
-  // or write (W6.7). They grant nothing on the bus.
-  repeated string tags = 4;
   // Whether it serves a page through its sidecar (decisions/014).
   bool interface = 5;
   // The open-meridian version its base image carries, so an administrator
   // can see which plugins stand on a base that needs a fix.
   string sdk_version = 6;
+
+  // The plugin's own names for its parts, retired: a plugin declares no
+  // tags, and a person's access to it is read or write (decisions/026).
+  reserved 4;
+  reserved "tags";
 }
 
 // The dashboard records a version once its image is in the registry.
@@ -76,10 +78,10 @@ message PluginCatalogue {
 // W8.3 — launching
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A deployment admin launches a version. The roles and tags are the ones
-// they were shown and approved, and the launch is refused unless they are
-// exactly the version's metadata: an approval of something other than what
-// runs is no approval.
+// A deployment admin launches a version. The roles are the ones they were
+// shown and approved, and the launch is refused unless they are exactly the
+// version's metadata: an approval of something other than what runs is no
+// approval.
 message LaunchPluginRequest {
   string name = 1;
   string version = 2;
@@ -87,11 +89,14 @@ message LaunchPluginRequest {
   // Unique among the deployment's live plugins.
   string instance_id = 3;
   repeated string approved_roles = 4;
-  repeated string approved_tags = 5;
   // In the live shape, on a development deployment alone: the plugin runs
   // the files sent to it since, and the launcher refuses this anywhere else
   // (W8.3, spec/live-plugin-development).
   bool live = 6;
+
+  // Tags, retired with them (decisions/026).
+  reserved 5;
+  reserved "approved_tags";
 }
 
 enum PluginLaunchState {
@@ -111,7 +116,6 @@ message PluginLaunch {
   string version = 3;
   string image_digest = 4;
   repeated string roles = 5;
-  repeated string tags = 6;
   string launched_by = 7;
   int64 launched_at_ns = 8;
   PluginLaunchState state = 9;
@@ -120,6 +124,10 @@ message PluginLaunch {
   string failure = 12;
   // Launched in the live shape (W8.3).
   bool live = 13;
+
+  // Tags, retired with them (decisions/026).
+  reserved 6;
+  reserved "tags";
 }
 
 // The conductor to the launcher: create this plugin, in the chart's plugin
@@ -130,11 +138,14 @@ message CreatePluginRequest {
   // `localhost:<port>/plugins/<name>@sha256:<hex>`.
   string image = 2;
   repeated string roles = 3;
-  repeated string tags = 4;
   bool interface = 5;
   // The chart's live shape rather than its plugin shape; refused by a
   // launcher on a deployment not installed for development.
   bool live = 6;
+
+  // Tags, retired with them (decisions/026).
+  reserved 4;
+  reserved "tags";
 }
 
 message CreatePluginReply {

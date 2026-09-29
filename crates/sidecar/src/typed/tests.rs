@@ -22,7 +22,6 @@ use meridian_pb::plugin::v1::{
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
     CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, RegisterRequest,
-    TagAccess,
 };
 use prost::Message;
 use tonic::{Code, Request};
@@ -671,19 +670,28 @@ fn now() -> i64 {
     super::now_ns()
 }
 
+/// What a person holds on the plugin: the accounts they may read and the
+/// accounts they may write through it (decisions/026).
+#[derive(Default)]
+struct Held {
+    read: Vec<String>,
+    write: Vec<String>,
+}
+
 /// What the dashboard would have signed for a person holding `access`.
-fn assertion(key: &SigningKey, access: Vec<TagAccess>) -> CallerAssertion {
+fn assertion(key: &SigningKey, access: Held) -> CallerAssertion {
     signed(key, access, false)
 }
 
 /// The same, for a deployment admin when `admin`.
-fn signed(key: &SigningKey, access: Vec<TagAccess>, admin: bool) -> CallerAssertion {
+fn signed(key: &SigningKey, access: Held, admin: bool) -> CallerAssertion {
     let issued = now();
     let claims = CallerClaims {
         subject: "local|ada".into(),
         display_name: "Ada".into(),
         audience_instance_id: "snaptrade-1".into(),
-        access,
+        read_account_ids: access.read,
+        write_account_ids: access.write,
         issued_at_ns: issued,
         expires_at_ns: issued + 60_000_000_000,
         assertion_id: "a-1".into(),
@@ -697,20 +705,18 @@ fn signed(key: &SigningKey, access: Vec<TagAccess>, admin: bool) -> CallerAssert
     }
 }
 
-fn writing(accounts: &[&str]) -> Vec<TagAccess> {
-    vec![TagAccess {
-        tag: "custody".into(),
-        read_account_ids: accounts.iter().map(|a| a.to_string()).collect(),
-        write_account_ids: accounts.iter().map(|a| a.to_string()).collect(),
-    }]
+fn writing(accounts: &[&str]) -> Held {
+    Held {
+        read: accounts.iter().map(|a| a.to_string()).collect(),
+        write: accounts.iter().map(|a| a.to_string()).collect(),
+    }
 }
 
-fn reading(accounts: &[&str]) -> Vec<TagAccess> {
-    vec![TagAccess {
-        tag: "custody".into(),
-        read_account_ids: accounts.iter().map(|a| a.to_string()).collect(),
-        write_account_ids: vec![],
-    }]
+fn reading(accounts: &[&str]) -> Held {
+    Held {
+        read: accounts.iter().map(|a| a.to_string()).collect(),
+        write: vec![],
+    }
 }
 
 /// A sidecar holding the dashboard's key, and a street store that keeps whom
@@ -976,7 +982,7 @@ async fn a_link_for_a_deployment_admin_is_stamped_with_them_and_this_plugin() {
     // plugin yet: the link is what grants it (W4.11), so the write scope is
     // not what admits it.
     let (sidecar, key, heard, _) = linking(&["ext-new", "st-2"]).await;
-    let admin = || Some(signed(&key, vec![], true));
+    let admin = || Some(signed(&key, Held::default(), true));
     let linked = sidecar
         .link_external_account(Request::new(link("ext-new", "ACC-9", "", admin())))
         .await
@@ -1038,7 +1044,11 @@ async fn a_link_is_refused_without_a_deployment_admins_assertion() {
         assert!(refused.message().contains("deployment admin"));
     }
     // One the dashboard did not sign is not an admin's however it reads.
-    let forged = signed(&SigningKey::generate(&mut rand::rngs::OsRng), vec![], true);
+    let forged = signed(
+        &SigningKey::generate(&mut rand::rngs::OsRng),
+        Held::default(),
+        true,
+    );
     let refused = sidecar
         .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(forged))))
         .await
@@ -1061,7 +1071,7 @@ async fn a_link_is_refused_for_an_external_account_this_plugin_did_not_report() 
     // never-reported nobody's. ext-1 is linked and unreported: it may be
     // unlinked, and linked to nothing else.
     let (sidecar, key, heard, _) = linking(&["ext-new"]).await;
-    let admin = || Some(signed(&key, vec![], true));
+    let admin = || Some(signed(&key, Held::default(), true));
     for (external, account, new_name) in [
         ("ext-2", "ACC-1", ""),
         ("never-reported", "", "A new one"),
@@ -1107,7 +1117,7 @@ async fn the_deployments_accounts_are_read_only_for_a_deployment_admin() {
     let (sidecar, key, _, readers) = linking(&[]).await;
     let read = sidecar
         .read_accounts_for_linking(Request::new(ReadAccountsForLinkingParams {
-            acting_for: Some(signed(&key, vec![], true)),
+            acting_for: Some(signed(&key, Held::default(), true)),
         }))
         .await
         .expect("read for her")

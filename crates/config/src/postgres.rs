@@ -141,7 +141,7 @@ impl Store for PostgresStore {
 
         let entries = tx
             .query(
-                "SELECT access_group_id, plugin_instance_id, tag, level FROM config_access_entry
+                "SELECT access_group_id, plugin_instance_id, level FROM config_access_entry
                   ORDER BY access_group_id, position",
                 &[],
             )
@@ -160,8 +160,7 @@ impl Store for PostgresStore {
                 .filter(|entry| entry.get::<_, String>(0) == id)
                 .map(|entry| AccessEntry {
                     plugin_instance_id: entry.get(1),
-                    tag: entry.get(2),
-                    level: i32::from(entry.get::<_, i16>(3)),
+                    level: i32::from(entry.get::<_, i16>(2)),
                 })
                 .collect();
             records.access_groups.push(AccessGroup {
@@ -222,7 +221,7 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT plugin_instance_id, roles, tags, last_reported_at_ns
+                "SELECT plugin_instance_id, roles, last_reported_at_ns
                    FROM config_known_plugin ORDER BY plugin_instance_id",
                 &[],
             )
@@ -231,8 +230,7 @@ impl Store for PostgresStore {
             snapshot.plugins.push(KnownPlugin {
                 plugin_instance_id: row.get(0),
                 roles: row.get(1),
-                tags: row.get(2),
-                last_reported_at_ns: row.get(3),
+                last_reported_at_ns: row.get(2),
             });
         }
 
@@ -297,7 +295,7 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT name, version, roles, tags, interface, sdk_version, image_digest,
+                "SELECT name, version, roles, interface, sdk_version, image_digest,
                         uploaded_by, uploaded_at_ns
                    FROM config_plugin_version ORDER BY name, version",
                 &[],
@@ -309,13 +307,12 @@ impl Store for PostgresStore {
                     name: row.get(0),
                     version: row.get(1),
                     roles: row.get(2),
-                    tags: row.get(3),
-                    interface: row.get(4),
-                    sdk_version: row.get(5),
+                    interface: row.get(3),
+                    sdk_version: row.get(4),
                 }),
-                image_digest: row.get(6),
-                uploaded_by: row.get(7),
-                uploaded_at_ns: row.get(8),
+                image_digest: row.get(5),
+                uploaded_by: row.get(6),
+                uploaded_at_ns: row.get(7),
             });
         }
 
@@ -400,13 +397,12 @@ impl Store for PostgresStore {
         for (position, entry) in group.entries.iter().enumerate() {
             tx.execute(
                 "INSERT INTO config_access_entry
-                        (access_group_id, position, plugin_instance_id, tag, level)
-                 VALUES ($1, $2, $3, $4, $5)",
+                        (access_group_id, position, plugin_instance_id, level)
+                 VALUES ($1, $2, $3, $4)",
                 &[
                     &group.access_group_id,
                     &(position as i32),
                     &entry.plugin_instance_id,
-                    &entry.tag,
                     &(entry.level as i16),
                 ],
             )
@@ -574,15 +570,14 @@ impl Store for PostgresStore {
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()> {
         self.conn()?
             .execute(
-                "INSERT INTO config_known_plugin (plugin_instance_id, roles, tags, last_reported_at_ns)
-                 VALUES ($1, $2, $3, $4)
+                "INSERT INTO config_known_plugin (plugin_instance_id, roles, last_reported_at_ns)
+                 VALUES ($1, $2, $3)
                  ON CONFLICT (plugin_instance_id) DO UPDATE
-                    SET roles = excluded.roles, tags = excluded.tags,
+                    SET roles = excluded.roles,
                         last_reported_at_ns = excluded.last_reported_at_ns",
                 &[
                     &plugin.plugin_instance_id,
                     &plugin.roles,
-                    &plugin.tags,
                     &plugin.last_reported_at_ns,
                 ],
             )
@@ -686,15 +681,14 @@ impl Store for PostgresStore {
             .conn()?
             .execute(
                 "INSERT INTO config_plugin_version
-                        (name, version, roles, tags, interface, sdk_version, image_digest,
+                        (name, version, roles, interface, sdk_version, image_digest,
                          uploaded_by, uploaded_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (name, version) DO NOTHING",
                 &[
                     &metadata.name,
                     &metadata.version,
                     &metadata.roles,
-                    &metadata.tags,
                     &metadata.interface,
                     &metadata.sdk_version,
                     &version.image_digest,
@@ -711,9 +705,9 @@ impl Store for PostgresStore {
             .conn()?
             .execute(
                 "INSERT INTO config_plugin_launch
-                        (instance_id, name, version, image_digest, roles, tags, launched_by,
+                        (instance_id, name, version, image_digest, roles, launched_by,
                          launched_at_ns, state, live)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -721,7 +715,6 @@ impl Store for PostgresStore {
                     &launch.version,
                     &launch.image_digest,
                     &launch.roles,
-                    &launch.tags,
                     &launch.launched_by,
                     &launch.launched_at_ns,
                     &launch.live,
@@ -755,7 +748,7 @@ impl Store for PostgresStore {
     }
 }
 
-const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, tags, \
+const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live";
 
 fn launch_from(row: &postgres::Row) -> PluginLaunch {
@@ -765,14 +758,13 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         version: row.get(2),
         image_digest: row.get(3),
         roles: row.get(4),
-        tags: row.get(5),
-        launched_by: row.get(6),
-        launched_at_ns: row.get(7),
-        state: i32::from(row.get::<_, i16>(8)),
-        stopped_by: row.get(9),
-        stopped_at_ns: row.get(10),
-        failure: row.get(11),
-        live: row.get(12),
+        launched_by: row.get(5),
+        launched_at_ns: row.get(6),
+        state: i32::from(row.get::<_, i16>(7)),
+        stopped_by: row.get(8),
+        stopped_at_ns: row.get(9),
+        failure: row.get(10),
+        live: row.get(11),
     }
 }
 

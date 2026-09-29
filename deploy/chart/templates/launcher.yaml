@@ -13,8 +13,8 @@
 {{- $broker := include "meridian-runtime.brokerSecret" . }}
 {{/*
   The shape a launched plugin runs in: the same definition sidecar.yaml
-  renders the chart's own plugins with, its instance, image, roles and tags
-  left as placeholders the launcher fills in once it has checked them. So a
+  renders the chart's own plugins with, its instance, image and roles left
+  as placeholders the launcher fills in once it has checked them. So a
   launched plugin and a configured one cannot drift apart.
 */}}
 {{- $shape := include "meridian-runtime.plugin" (dict
@@ -22,7 +22,6 @@
       "name" (printf "%s-plugin-__INSTANCE__" $full)
       "instance" "__INSTANCE__"
       "roles" "__ROLES__"
-      "tags" "__TAGS__"
       "brokerSecret" (printf "%s-launched" $broker)
       "brokerKey" "__INSTANCE__.url"
       "plugin" (dict "image" "__IMAGE__")
@@ -48,7 +47,6 @@ data:
         "name" (printf "%s-plugin-__INSTANCE__" $full)
         "instance" "__INSTANCE__"
         "roles" "__ROLES__"
-        "tags" "__TAGS__"
         "brokerSecret" (printf "%s-launched" $broker)
         "brokerKey" "__INSTANCE__.url"
         "plugin" (dict "image" "__IMAGE__")

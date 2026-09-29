@@ -422,7 +422,7 @@ async fn nothing_but_pushing_reaches_the_registry() {
 
 fn upload_body(version: &str, digest: &str, roles: &[&str]) -> String {
     serde_json::json!({
-        "name": "snaptrade", "version": version, "roles": roles, "tags": ["holdings"],
+        "name": "snaptrade", "version": version, "roles": roles,
         "interface": true, "sdk_version": "0.2.0", "image_digest": digest,
     })
     .to_string()
@@ -474,6 +474,35 @@ async fn an_upload_is_recorded_for_the_admin_once_its_image_is_there() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // A CLI built before decisions/026 sends the tags its pyproject names:
+    // refused, saying why, and nothing is recorded. None is no declaration.
+    let mut tagged: serde_json::Value =
+        serde_json::from_str(&upload_body("0.4.0", DIGEST, &["custody"])).unwrap();
+    tagged["tags"] = serde_json::json!(["holdings"]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &tagged.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.contains("declares tags (holdings)") && body.contains("decisions/026"),
+        "{body}"
+    );
+    tagged["tags"] = serde_json::json!([]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &tagged.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -487,7 +516,7 @@ async fn the_catalogue_launching_and_stopping() {
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
-                           "approved_roles": roles, "approved_tags": []})
+                           "approved_roles": roles})
         .to_string()
     };
     let (status, _, body) = send(

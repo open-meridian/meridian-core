@@ -336,13 +336,12 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
-        let may_write: std::collections::BTreeSet<&String> = claims
-            .access
-            .iter()
-            .flat_map(|held| &held.write_account_ids)
-            .collect();
+        // The accounts the person may write through this plugin, whole: a
+        // person's access to a plugin is read or write, with nothing finer
+        // (decisions/026).
+        let may_write = &claims.write_account_ids;
         match account {
-            Some(account) if !may_write.iter().any(|held| *held == account) => {
+            Some(account) if !may_write.iter().any(|held| held == account) => {
                 Err(Status::permission_denied(format!(
                     "the person may not write account {account} through this plugin"
                 )))

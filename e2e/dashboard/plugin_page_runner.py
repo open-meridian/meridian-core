@@ -435,7 +435,7 @@ def main():
     check(status == 303, f"the code redeemed: {status}")
     status, body, _, _ = on_plugin_host(before, "/holdings")
     seen = json.loads(body) if status == 200 else {}
-    check(status == 200 and (seen.get("caller") or {}).get("access") == [],
+    check(status == 200 and (seen.get("caller") or {}).get("access") == {"read": [], "write": []},
           f"and the plugin is told she holds nothing on it: {status} {(seen.get('caller') or {}).get('access')}")
     check((seen.get("caller") or {}).get("deployment_admin") is True,
           f"and that she administers the deployment, so it may serve her its admin page: {seen.get('caller')}")
@@ -449,7 +449,7 @@ def main():
     account_group = row_id(page, "Account groups", "Plugin page accounts")
     page = administer(ada, "/admin/access-groups",
                       {"access_group_id": "", "name": "Plugin page readers",
-                       "entries": f"{INSTANCE} custody read"}, patience=45)
+                       "entries": f"{INSTANCE} read"}, patience=45)
     access_group = row_id(page, "Access groups", "Plugin page readers")
     # The user group the claim made her deployment admin through: the one
     # permission there is before hers.
@@ -500,7 +500,7 @@ def main():
     check(caller.get("display_name") == "Ada Park", f"naming her: {caller.get('display_name')!r}")
     check(caller.get("lifetime_ns") == 60 * 1_000_000_000, f"for 60 seconds: {caller.get('lifetime_ns')}")
     check(caller.get("deployment_admin") is True, f"administering the deployment: {caller}")
-    check(caller.get("access") == [{"tag": "custody", "read": [account], "write": []}],
+    check(caller.get("access") == {"read": [account], "write": []},
           f"holding what she was granted: {caller.get('access')}")
     check(seen.get("cookie") is None, f"no cookie reached the plugin: {seen.get('cookie')!r}")
     check(not cookies, f"and the plugin set none: {cookies}")
@@ -582,7 +582,7 @@ def main():
           f"while she only reads, the sidecar refuses: {refused}")
     administer(ada, "/admin/access-groups",
                {"access_group_id": access_group, "name": "Plugin page readers",
-                "entries": f"{INSTANCE} custody write"})
+                "entries": f"{INSTANCE} write"})
     # The sidecar reads the plugin's write scope again within 30 seconds.
     deadline = time.monotonic() + 45
     written = write(plugin)

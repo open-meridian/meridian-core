@@ -158,7 +158,8 @@ async fn registered() -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>
                 user_groups: vec![UserGroupAccess {
                     user_group_id: "UG-1".into(),
                     name: "Operations".into(),
-                    access: vec![],
+                    read_account_ids: vec![],
+                    write_account_ids: vec![],
                 }],
                 ..Default::default()
             }

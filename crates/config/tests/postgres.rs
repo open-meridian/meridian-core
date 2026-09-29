@@ -114,12 +114,10 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         entries: vec![
             AccessEntry {
                 plugin_instance_id: "oms-1".into(),
-                tag: "oms".into(),
                 level: AccessLevel::Write as i32,
             },
             AccessEntry {
-                plugin_instance_id: "oms-1".into(),
-                tag: "reporting".into(),
+                plugin_instance_id: "reporting-1".into(),
                 level: AccessLevel::Read as i32,
             },
         ],
@@ -142,7 +140,6 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
     let plugin = KnownPlugin {
         plugin_instance_id: "oms-1".into(),
         roles: vec!["oms".into()],
-        tags: vec!["reporting".into()],
         last_reported_at_ns: 3,
     };
     store.record_plugin(&plugin).unwrap();
@@ -301,7 +298,6 @@ fn version(name: &str, version: &str) -> PluginVersion {
             name: name.into(),
             version: version.into(),
             roles: vec!["custody".into()],
-            tags: vec!["holdings".into()],
             interface: true,
             sdk_version: "0.2.0".into(),
         }),
@@ -318,7 +314,6 @@ fn launch(instance: &str) -> PluginLaunch {
         version: "0.1.0".into(),
         image_digest: format!("sha256:{}", "a".repeat(64)),
         roles: vec!["custody".into()],
-        tags: vec!["holdings".into()],
         launched_by: "local|ada".into(),
         launched_at_ns: 2,
         state: PluginLaunchState::Launched as i32,
@@ -449,7 +444,6 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "snaptrade-1".into(),
             roles: vec!["custody".into()],
-            tags: vec![],
             last_reported_at_ns: 1,
         })
         .unwrap();
@@ -690,4 +684,103 @@ fn a_database_behind_this_binary_is_waited_for_and_one_ahead_is_refused() {
         matches!(ahead, meridian_config::store::StoreError::SchemaAhead(_)),
         "a schema ahead of this binary is not one waiting fixes: {ahead:?}"
     );
+}
+
+#[test]
+fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
+    // decisions/026: access to a plugin is read or write, and a plugin
+    // declares no tags. A deployment migrated before it holds entries naming
+    // one plugin through several tags; the migration leaves one entry per
+    // plugin, at the highest level any of its tags had, in the order each
+    // plugin first appeared. `read` on one tag and `write` on another is
+    // `write`.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("config_tagged_{nanos}_{seq}");
+    postgres::Client::connect(&base_url(), postgres::NoTls)
+        .expect("could not reach the test database")
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .expect("could not create a schema");
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+
+    // The store as the release before this one left it: every migration up
+    // to the one that retires tags, recorded as that release recorded them.
+    let (before, retiring): (Vec<_>, Vec<_>) = meridian_config::migrations::MIGRATIONS
+        .iter()
+        .partition(|m| m.name != "access_is_read_or_write");
+    assert_eq!(retiring.len(), 1, "the migration that retires tags");
+    client
+        .batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in before {
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        meridian_config::migrations::record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO config_access_group (access_group_id, name) VALUES
+                 ('AX-TRADING', 'Trading'), ('AX-VIEWING', 'Viewing');
+             INSERT INTO config_access_entry
+                    (access_group_id, position, plugin_instance_id, tag, level) VALUES
+                 ('AX-TRADING', 0, 'snaptrade-1', 'holdings',  1),
+                 ('AX-TRADING', 1, 'oms-1',       'oms',       1),
+                 ('AX-TRADING', 2, 'snaptrade-1', 'custody',   2),
+                 ('AX-TRADING', 3, 'oms-1',       'reporting', 1),
+                 ('AX-VIEWING', 0, 'snaptrade-1', 'custody',   1),
+                 ('AX-VIEWING', 1, 'snaptrade-1', 'holdings',  1);
+             INSERT INTO config_known_plugin (plugin_instance_id, roles, tags, last_reported_at_ns)
+                 VALUES ('snaptrade-1', '{custody}', '{holdings}', 1);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).expect("connects");
+    assert!(store.verify().is_err(), "one migration behind");
+    store.migrate().expect("migrates");
+    store.verify().expect("recognised after migrating");
+
+    let snapshot = store.snapshot().unwrap();
+    let entries = |id: &str| {
+        snapshot
+            .records
+            .access_groups
+            .iter()
+            .find(|g| g.access_group_id == id)
+            .unwrap()
+            .entries
+            .clone()
+    };
+    let entry = |plugin: &str, level: AccessLevel| AccessEntry {
+        plugin_instance_id: plugin.into(),
+        level: level as i32,
+    };
+    assert_eq!(
+        entries("AX-TRADING"),
+        [
+            entry("snaptrade-1", AccessLevel::Write),
+            entry("oms-1", AccessLevel::Read)
+        ],
+        "read on holdings and write on custody is write on the plugin"
+    );
+    assert_eq!(
+        entries("AX-VIEWING"),
+        [entry("snaptrade-1", AccessLevel::Read)],
+        "read on both tags stays read"
+    );
+    assert_eq!(snapshot.plugins[0].roles, ["custody"]);
+
+    let tag_columns: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.columns
+              WHERE table_schema = current_schema() AND column_name IN ('tag', 'tags')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(tag_columns, 0, "no table keeps a tag");
 }

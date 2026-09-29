@@ -88,7 +88,6 @@ impl Sidecar {
         PluginReport {
             plugin_instance_id: self.identity.instance_id.clone(),
             roles: self.identity.roles.clone(),
-            tags: self.identity.tags.clone(),
             registered: registration.is_some(),
             healthy: registration.as_ref().is_some_and(|r| r.healthy),
             health_detail: registration

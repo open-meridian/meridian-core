@@ -433,6 +433,8 @@ struct Upload {
     version: String,
     #[serde(default)]
     roles: Vec<String>,
+    /// Read only to refuse: a plugin declares no tags (decisions/026), and a
+    /// CLI built before that still sends what its pyproject names.
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
@@ -462,6 +464,19 @@ async fn upload(
             format!("`{}` is not a plugin's name", upload.name),
         );
     }
+    if !upload.tags.is_empty() {
+        return refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{} {} declares tags ({}); a plugin declares none, and a person's access to \
+                 it is read or write, the same for every plugin (decisions/026). Remove \
+                 `tags` from [tool.meridian]",
+                upload.name,
+                upload.version,
+                upload.tags.join(", ")
+            ),
+        );
+    }
     // The image first: a version recorded for an image nobody pushed would be
     // a launch waiting to fail.
     match has_manifest(registry, &upload.name, &upload.image_digest).await {
@@ -482,7 +497,6 @@ async fn upload(
             name: upload.name,
             version: upload.version,
             roles: upload.roles,
-            tags: upload.tags,
             interface: upload.interface,
             sdk_version: upload.sdk_version,
         }),
@@ -539,7 +553,7 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         .map(|version| {
             let m = version.metadata.clone().unwrap_or_default();
             serde_json::json!({
-                "name": m.name, "version": m.version, "roles": m.roles, "tags": m.tags,
+                "name": m.name, "version": m.version, "roles": m.roles,
                 "interface": m.interface, "sdk_version": m.sdk_version,
                 "image_digest": version.image_digest,
             })
@@ -569,8 +583,6 @@ struct Launch {
     instance_id: String,
     #[serde(default)]
     approved_roles: Vec<String>,
-    #[serde(default)]
-    approved_tags: Vec<String>,
     /// In the live shape; the launcher refuses it on a deployment not
     /// installed for development (W8.3).
     #[serde(default)]
@@ -591,7 +603,6 @@ async fn launch(
         version: asked.version,
         instance_id: asked.instance_id,
         approved_roles: asked.approved_roles,
-        approved_tags: asked.approved_tags,
         live: asked.live,
     };
     // Longer than the conductor gives the launcher, so its answer arrives.

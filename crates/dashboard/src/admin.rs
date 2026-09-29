@@ -652,15 +652,24 @@ async fn define_account_group(
     })
 }
 
-/// "plugin tag read|write", one per line.
+/// "plugin read|write", one per line: a plugin and a level, the same two
+/// levels for every plugin (decisions/026).
 pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            let [plugin, tag, level] = parts[..] else {
-                return Err(format!("`{line}` is not `plugin tag read|write`"));
+            let [plugin, level] = parts[..] else {
+                return Err(if parts.len() == 3 {
+                    format!(
+                        "`{line}` names a tag; an entry is `plugin read|write`, since a \
+                         plugin declares no tags and access to it is read or write \
+                         (decisions/026)"
+                    )
+                } else {
+                    format!("`{line}` is not `plugin read|write`")
+                });
             };
             let level = match level {
                 "read" => AccessLevel::Read,
@@ -669,7 +678,6 @@ pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
             };
             Ok(AccessEntry {
                 plugin_instance_id: plugin.into(),
-                tag: tag.into(),
                 level: level as i32,
             })
         })
