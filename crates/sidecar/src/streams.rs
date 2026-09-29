@@ -92,7 +92,9 @@ fn applies(
 
 /// The values the deployment holds for the settings the plugin declared, and
 /// the required ones it holds none for, of those that apply. A value for a
-/// setting the plugin did not declare is not the plugin's to see.
+/// setting the plugin did not declare is not the plugin's to see. A required
+/// setting declaring a default is never missing: the plugin uses the default
+/// while none is set (W6.11), so it has what it needs.
 pub(crate) fn settings(
     declared: &[SettingDeclaration],
     configuration: &PluginConfiguration,
@@ -120,6 +122,7 @@ pub(crate) fn settings(
         .iter()
         .filter(|declaration| declaration.required)
         .filter(|declaration| applies(declaration, declared, held))
+        .filter(|declaration| declaration.default_value.is_empty())
         .filter(|declaration| held(&declaration.name).is_none())
         .map(|declaration| declaration.name.clone())
         .collect();
@@ -158,9 +161,10 @@ impl Sidecar {
         })
     }
 
-    /// Required settings the plugin declared and the deployment holds no
-    /// value for. Nothing, when the plugin is not registered or the
-    /// configuration cannot be read: a report is not held up by either.
+    /// Required settings the plugin declared with no default and the
+    /// deployment holds no value for. Nothing, when the plugin is not
+    /// registered or the configuration cannot be read: a report is not held
+    /// up by either.
     pub(crate) async fn missing_settings(&self) -> Vec<String> {
         let Some(registration) = self.registration().filter(|r| !r.departed) else {
             return Vec::new();

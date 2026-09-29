@@ -772,6 +772,79 @@ fn what_is_missing_is_what_is_required_of_the_settings_that_apply() {
     assert_eq!(names(&unchosen), ["snaptrade_consumer_key", "key_type"]);
 }
 
+/// SnapTrade 0.2.0 upgraded from 0.1.0: its key's type a required choice,
+/// "personal" by default, and nothing saved for it.
+fn defaulted_and_unsaved() -> PluginSettingsRecord {
+    let mut record = snaptrade();
+    record.values.retain(|held| held.name != "key_type");
+    let key = record
+        .declared_settings
+        .iter_mut()
+        .find(|declaration| declaration.name == "key_type")
+        .unwrap();
+    key.default_value = "personal".into();
+    record
+}
+
+#[test]
+fn a_required_setting_declaring_a_default_is_not_missing_and_its_option_is_shown_chosen() {
+    let record = defaulted_and_unsaved();
+    let names: Vec<&str> = settings::missing(&record, false)
+        .into_iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    // The default is the value the plugin uses, so the choice is not
+    // missing, and a personal key's user secret does not apply.
+    assert_eq!(names, ["snaptrade_consumer_key"]);
+
+    // The form shows the default's option chosen, since a required choice
+    // has no unset option to show instead.
+    let form = settings::form(&record, "", false);
+    let key = setting(&form, "key_type");
+    assert!(
+        key.contains(r#"<input type="radio" name="value.key_type" value="personal" checked>"#),
+        "{key}"
+    );
+    assert!(key.contains(r#"<input type="radio" name="value.key_type" value="commercial">"#));
+
+    // Saving the form as shown saves the default; until then it is unsaved.
+    let posted: Fields = [("value.key_type".to_string(), "personal".to_string())]
+        .into_iter()
+        .collect();
+    let saved = settings::request(&record, &posted, false).unwrap();
+    assert_eq!(saved.values.len(), 1);
+    assert_eq!(
+        (
+            saved.values[0].name.as_str(),
+            saved.values[0].value.as_str()
+        ),
+        ("key_type", "personal")
+    );
+
+    // Without a default, nothing is chosen and the choice is missing.
+    let mut undefaulted = snaptrade();
+    undefaulted.values.retain(|held| held.name != "key_type");
+    let form = settings::form(&undefaulted, "", false);
+    assert!(!setting(&form, "key_type").contains("checked"));
+
+    // An optional choice keeps its unset option chosen, saying what the
+    // plugin uses then.
+    let mut optional = defaulted_and_unsaved();
+    optional
+        .declared_settings
+        .iter_mut()
+        .find(|declaration| declaration.name == "key_type")
+        .unwrap()
+        .required = false;
+    let form = settings::form(&optional, "", false);
+    let key = setting(&form, "key_type");
+    assert!(
+        key.contains(r#"<input type="radio" name="value.key_type" value="" checked>"#),
+        "{key}"
+    );
+    assert!(key.contains("The plugin uses Personal key."));
+}
+
 type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;
 
 /// A conductor answering set-plugin-settings, or refusing with `refuse_with`.
@@ -889,6 +962,22 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
             StatusCode::UNAUTHORIZED
         );
     }
+}
+
+#[tokio::test]
+async fn the_plugins_tab_and_view_do_not_ask_for_a_required_setting_its_default_fills() {
+    let mut records = admin_records();
+    records.plugin_settings = vec![defaulted_and_unsaved()];
+    let h = harness(records, None);
+    let (_, overview) = send(&h, get(&h, "/admin", true)).await;
+    let listed = table(&overview, "plugins");
+    assert!(listed.contains("needs Consumer key"), "{listed}");
+    assert!(
+        !listed.contains("Key,") && !listed.contains(", Key"),
+        "{listed}"
+    );
+    let (_, view) = send(&h, get(&h, VIEW, true)).await;
+    assert!(view.contains("Needs Consumer key:"), "{view}");
 }
 
 #[tokio::test]

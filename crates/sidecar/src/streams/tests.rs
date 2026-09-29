@@ -135,9 +135,65 @@ fn a_required_setting_that_does_not_apply_to_the_choice_made_is_not_missing() {
     assert_eq!(by_default.missing_required, vec!["user_secret"]);
 }
 
+#[test]
+fn a_required_setting_declaring_a_default_is_not_missing() {
+    // SnapTrade 0.2.0: the key's type a required choice, "personal" by
+    // default. With nothing saved the plugin uses the default, and a
+    // personal key needs only its api_key.
+    let mut declarations = keyed();
+    declarations[0].default_value = "personal".into();
+    let holding = |values: &[(&str, &str)]| PluginConfiguration {
+        settings: values.iter().map(|(n, v)| value(n, v)).collect(),
+        ..Default::default()
+    };
+
+    let nothing_saved = settings(&declarations, &holding(&[("api_key", "k")]));
+    assert!(
+        nothing_saved.missing_required.is_empty(),
+        "the default satisfies key_type: {:?}",
+        nothing_saved.missing_required
+    );
+    // The default is not delivered as a value: the plugin knows its own.
+    assert_eq!(
+        nothing_saved.values,
+        vec![SettingValue {
+            name: "api_key".into(),
+            value: "k".into()
+        }]
+    );
+
+    // A value saved blank is none, and the default still stands.
+    let blank = settings(
+        &declarations,
+        &holding(&[("key_type", ""), ("api_key", "k")]),
+    );
+    assert!(
+        blank.missing_required.is_empty(),
+        "{:?}",
+        blank.missing_required
+    );
+
+    // What has no default is still missing.
+    let no_key = settings(&declarations, &holding(&[]));
+    assert_eq!(no_key.missing_required, vec!["api_key"]);
+
+    // A default choosing commercial still asks for what a commercial key needs.
+    declarations[0].default_value = "commercial".into();
+    let commercial = settings(&declarations, &holding(&[("api_key", "k")]));
+    assert_eq!(commercial.missing_required, vec!["user_secret"]);
+}
+
 /// A registered plugin declaring `api_key` as required, and a conductor
 /// answering with whatever `held` says.
 async fn registered() -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>>) {
+    registered_declaring(vec![declared("api_key", true)]).await
+}
+
+/// A registered plugin declaring `settings`, and a conductor answering with
+/// whatever `held` says.
+async fn registered_declaring(
+    settings: Vec<SettingDeclaration>,
+) -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>>) {
     let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
     let held = Arc::new(Mutex::new(PluginConfiguration {
         plugin_instance_id: "snaptrade-1".into(),
@@ -181,7 +237,7 @@ async fn registered() -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>
     let reply = sidecar
         .register(Request::new(RegisterRequest {
             schema_version: "v2".into(),
-            settings: vec![declared("api_key", true)],
+            settings,
             ..Default::default()
         }))
         .await
@@ -338,6 +394,19 @@ async fn a_plugin_missing_a_required_setting_is_reported_unhealthy_until_it_arri
     .await
     .expect("reported healthy once the setting arrived");
     assert!(healthy.health_detail.is_empty());
+}
+
+#[tokio::test]
+async fn a_plugin_whose_required_choice_has_a_default_reports_healthy_with_nothing_saved() {
+    // SnapTrade 0.2.0 upgraded from 0.1.0: nothing saved for its key's type,
+    // "personal" by default, and a personal key's api_key set.
+    let mut declarations = keyed();
+    declarations[0].default_value = "personal".into();
+    let (sidecar, _bus, held) = registered_declaring(declarations).await;
+    held.lock().unwrap().settings = vec![value("api_key", "k")];
+    let report = sidecar.report_now(7).await;
+    assert!(report.healthy, "{}", report.health_detail);
+    assert!(report.health_detail.is_empty());
 }
 
 #[tokio::test]

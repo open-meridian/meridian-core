@@ -11,9 +11,11 @@
 //! under another setting's value shown only while it does, by a small script,
 //! and with a note saying when, so without the script every field is shown
 //! and the note says which to skip; a default greyed in its empty field and
-//! never stored; a unit beside a number. A setting declared for whoever
-//! develops the plugin is shown only on a development deployment, and a form
-//! posted anywhere else never changes one.
+//! never stored, or for a required choice, which has no unset option, its
+//! option shown chosen and stored when the form is saved; a unit beside a
+//! number. A required setting declaring a default is never missing. A
+//! setting declared for whoever develops the plugin is shown only on a
+//! development deployment, and a form posted anywhere else never changes one.
 //!
 //! **A secret is write-only here.** The record names which secrets are set
 //! and never holds a value, so there is nothing to show: a secret's field is
@@ -102,13 +104,17 @@ pub fn applies(record: &PluginSettingsRecord, declaration: &SettingDeclaration) 
         .is_some_and(|value| condition.one_of.iter().any(|one| one == value))
 }
 
-/// The required settings, of those that apply, that hold no value: what a
-/// deployment admin still has to fill in.
+/// The required settings, of those that apply, that hold no value and
+/// declare no default: what a deployment admin still has to fill in. A
+/// default is the value the plugin uses while none is set (W6.11), so a
+/// required setting declaring one is never missing. The Plugins tab and the
+/// admin view say what a plugin needs from this alone.
 pub fn missing(record: &PluginSettingsRecord, development: bool) -> Vec<&SettingDeclaration> {
     record
         .declared_settings
         .iter()
         .filter(|declaration| declaration.required && shown(declaration, development))
+        .filter(|declaration| declaration.default_value.is_empty())
         .filter(|declaration| applies(record, declaration))
         .filter(|declaration| {
             !record.secrets_set.contains(&declaration.name)
@@ -265,7 +271,17 @@ fn secret_field(declaration: &SettingDeclaration, record: &PluginSettingsRecord)
 
 fn choice_field(declaration: &SettingDeclaration, record: &PluginSettingsRecord) -> String {
     let name = escape(&declaration.name);
-    let held = current(record, &declaration.name).unwrap_or_default();
+    // A required choice has no unset option, so while nothing is saved the
+    // one its plugin uses, its default, is shown chosen. It is saved only
+    // when the form is.
+    let held = current(record, &declaration.name)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            declaration
+                .required
+                .then_some(declaration.default_value.as_str())
+        })
+        .unwrap_or_default();
     let radio = |value: &str, label: &str, description: &str| {
         format!(
             "<label class=\"option\"><input type=\"radio\" name=\"{VALUE_FIELD}{name}\" value=\"{v}\"{c}>\
