@@ -21,6 +21,17 @@
   window is a readiness failure that clears, never a wrong answer and never a
   restart, and a rollout waits for it with any tool that applies the chart.
 
+  And this comes up beside whatever else the release changes, which can be the
+  database itself. So each migration waits for its database to answer, every
+  two seconds for at most five minutes, saying so, before it migrates. On
+  2026-09-29 an upgrade restarted the database this chart brings as this Job
+  started; the migration raced the restart with a single attempt and lost,
+  the Job failed, and every component waited for a schema that never came
+  (CI run 36631603926). Only the connection is waited for. A migration that
+  fails against a database that answers fails at once, which is what the
+  Job's backoffLimit of zero is for: a failed migration stops the release
+  rather than retrying into it.
+
   Cleaned up two ways, each for a case the other misses (task
   kernel/upgrading-a-deployment-in-place). Named by revision, so the next
   upgrade's manifest no longer names this one and Helm removes it then,

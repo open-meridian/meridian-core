@@ -115,8 +115,10 @@ spec:
       meridian.dev/component: database
   template:
     metadata:
+      # Not the release's version: postgres is the same image whichever
+      # release this is, and a label that changes restarts it (see _helpers).
       labels:
-        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        {{- include "meridian-runtime.unversionedLabels" . | nindent 8 }}
         meridian.dev/component: database
     spec:
       {{- with .Values.podSecurityContext }}

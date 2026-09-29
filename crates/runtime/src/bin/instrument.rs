@@ -39,12 +39,16 @@ fn run() -> Result<(), String> {
     // Before the key is touched: a migration job holds database credentials and
     // has no business holding the deployment's private key.
     if std::env::args().nth(1).as_deref() == Some("migrate") {
-        PostgresStore::connect(&url, 1)
-            .and_then(|store| store.migrate())
-            .map(|()| tracing::info!("the instrument store's schema is applied"))
-            .map_err(|failed| {
-                format!("the instrument store's schema could not be applied: {failed}")
-            })?;
+        meridian_runtime::migrate_once_it_answers(
+            "the instrument store's database",
+            &url,
+            |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
+            |store| store.migrate().map_err(|failed| failed.to_string()),
+        )
+        .map(|()| tracing::info!("the instrument store's schema is applied"))
+        .map_err(|failed| {
+            format!("the instrument store's schema could not be applied: {failed}")
+        })?;
         return grant_if_serving(&url);
     }
 

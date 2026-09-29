@@ -11,9 +11,22 @@
 {{- end -}}
 
 {{- define "meridian-runtime.labels" -}}
+{{ include "meridian-runtime.unversionedLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end -}}
+
+{{/*
+  The labels without the release's version, for the pod template of anything
+  whose image does not move with the release: the database this chart brings,
+  and the registry. A pod template is what a rollout compares, so a version
+  label there restarts the pod on every upgrade, whatever else changed. The
+  database restarted under the migration Job that way, the Job failed, and the
+  release never came up (CI run 36631603926). Each resource's own metadata
+  keeps the version, where it restarts nothing. chart-check refuses it back.
+*/}}
+{{- define "meridian-runtime.unversionedLabels" -}}
 app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 

@@ -126,8 +126,17 @@ impl<'a> Waiting<'a> {
 /// back-off, and the upgrade that started it reads as a restart; one that
 /// waits, not ready, is what a rollout waits for (task
 /// kernel/upgrading-a-deployment-in-place, faults 3 and 4).
-pub fn wait_until<T>(
+pub fn wait_until<T>(what: &str, attempt: impl FnMut() -> Result<T, Wait>) -> Result<T, String> {
+    wait_within(what, None, WAIT_AGAIN_AFTER, attempt)
+}
+
+/// [`wait_until`], giving up once `at_most` has passed, when there is a
+/// limit. Waiting and looking again are parameters so the tests below need
+/// not sleep for real.
+fn wait_within<T>(
     what: &str,
+    at_most: Option<Duration>,
+    every: Duration,
     mut attempt: impl FnMut() -> Result<T, Wait>,
 ) -> Result<T, String> {
     let mut waiting = Waiting::new(what);
@@ -138,10 +147,68 @@ pub fn wait_until<T>(
                 return Ok(done);
             }
             Err(Wait::Refused(why)) => return Err(why),
-            Err(Wait::NotYet(why)) => waiting.not_yet(&why),
+            Err(Wait::NotYet(why)) => {
+                if at_most.is_some_and(|limit| waiting.since.elapsed() >= limit) {
+                    return Err(format!(
+                        "gave up waiting for {what} after {}s: {why}",
+                        waiting.since.elapsed().as_secs()
+                    ));
+                }
+                waiting.not_yet(&why);
+            }
         }
-        std::thread::sleep(WAIT_AGAIN_AFTER);
+        std::thread::sleep(every);
     }
+}
+
+/// How long a migration waits for its database to answer before it fails.
+///
+/// Long enough for a database restarting beside the migration Job to come
+/// back, which is what an upgrade that changes the database's pod does; short
+/// enough that a database that is not coming back fails the release within
+/// minutes rather than never.
+pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
+
+/// A store's schema applied: once its database answers, and then once.
+///
+/// The migration Job starts beside everything else an upgrade changes, and on
+/// 2026-09-29 that included the database the chart brings, restarting under
+/// it: the migration raced the restart with a single attempt and lost, the Job
+/// failed, and every component waited for a schema that never came (CI run
+/// 36631603926). So the connection is waited for, as a component waits for
+/// its own, for at most [`MIGRATION_WAITS_AT_MOST`].
+///
+/// Only the connection. A migration that fails once it is connected fails
+/// at once: the Job runs with no retries so that a failed migration stops the
+/// release rather than being tried again into it, and waiting on one would
+/// undo that.
+pub fn migrate_once_it_answers<S>(
+    what: &str,
+    url: &str,
+    connect: impl Fn(&str) -> Result<S, String>,
+    migrate: impl FnOnce(S) -> Result<(), String>,
+) -> Result<(), String> {
+    migrate_once_connected(
+        what,
+        MIGRATION_WAITS_AT_MOST,
+        WAIT_AGAIN_AFTER,
+        || {
+            database_answers(url)?;
+            connect(url).map_err(Wait::NotYet)
+        },
+        migrate,
+    )
+}
+
+fn migrate_once_connected<S>(
+    what: &str,
+    at_most: Duration,
+    every: Duration,
+    connect: impl FnMut() -> Result<S, Wait>,
+    migrate: impl FnOnce(S) -> Result<(), String>,
+) -> Result<(), String> {
+    let store = wait_within(what, Some(at_most), every, connect)?;
+    migrate(store)
 }
 
 /// Whether the database at `url` answers, by one connection made and closed.
@@ -680,4 +747,109 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
     tracing::info!(%role, %schema, "the serving role may read and write what was migrated");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    use super::{migrate_once_connected, Wait};
+
+    const EVERY: Duration = Duration::from_millis(1);
+    const AT_MOST: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_database_that_does_not_answer_yet_is_waited_for_and_then_migrated() {
+        let tried = Cell::new(0);
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            AT_MOST,
+            EVERY,
+            || {
+                tried.set(tried.get() + 1);
+                if tried.get() < 3 {
+                    Err(Wait::NotYet("error connecting to server".into()))
+                } else {
+                    Ok("connected")
+                }
+            },
+            |store| {
+                assert_eq!(store, "connected");
+                migrated.set(migrated.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(done, Ok(()));
+        assert_eq!(tried.get(), 3, "it did not try again until it answered");
+        assert_eq!(migrated.get(), 1);
+    }
+
+    #[test]
+    fn a_migration_that_fails_once_connected_fails_at_once() {
+        // The Job runs with no retries so a failed migration stops the
+        // release. Waiting on one here would be retrying it anyway.
+        let tried = Cell::new(0);
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            AT_MOST,
+            EVERY,
+            || {
+                tried.set(tried.get() + 1);
+                Ok(())
+            },
+            |()| {
+                migrated.set(migrated.get() + 1);
+                Err("column \"note\" is of the wrong type".into())
+            },
+        );
+        assert_eq!(done, Err("column \"note\" is of the wrong type".into()));
+        assert_eq!(
+            tried.get(),
+            1,
+            "it connected again after the migration failed"
+        );
+        assert_eq!(migrated.get(), 1, "it migrated again after failing");
+    }
+
+    #[test]
+    fn a_database_that_never_answers_is_given_up_on() {
+        let tried = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            Duration::from_millis(30),
+            EVERY,
+            || -> Result<(), Wait> {
+                tried.set(tried.get() + 1);
+                Err(Wait::NotYet("error connecting to server".into()))
+            },
+            |()| panic!("it migrated without a connection"),
+        );
+        let said = done.expect_err("it waited for ever");
+        assert!(
+            said.starts_with("gave up waiting for the database after ")
+                && said.ends_with(": error connecting to server"),
+            "it did not say what it gave up on, or why: {said}"
+        );
+        assert!(tried.get() > 1, "it gave up without trying again");
+    }
+
+    #[test]
+    fn a_url_that_cannot_be_read_is_not_waited_for() {
+        let tried = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            AT_MOST,
+            EVERY,
+            || -> Result<(), Wait> {
+                tried.set(tried.get() + 1);
+                Err(Wait::Refused("the database URL is unreadable".into()))
+            },
+            |()| panic!("it migrated without a connection"),
+        );
+        assert_eq!(done, Err("the database URL is unreadable".into()));
+        assert_eq!(tried.get(), 1);
+    }
 }

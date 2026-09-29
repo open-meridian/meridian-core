@@ -42,17 +42,19 @@ fn run() -> Result<(), String> {
     let url = required("MERIDIAN_STREET_DATABASE_URL")?;
 
     if std::env::args().nth(1).as_deref() == Some("migrate") {
-        PostgresStore::connect(&url, 1)
-            .and_then(|store| store.migrate())
-            .map(|()| {
-                tracing::info!(
-                    version = meridian_street::migrations::latest(),
-                    "the street store's schema is applied"
-                )
-            })
-            .map_err(|failed| {
-                format!("the street store's schema could not be applied: {failed}")
-            })?;
+        meridian_runtime::migrate_once_it_answers(
+            "the street store's database",
+            &url,
+            |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
+            |store| store.migrate().map_err(|failed| failed.to_string()),
+        )
+        .map(|()| {
+            tracing::info!(
+                version = meridian_street::migrations::latest(),
+                "the street store's schema is applied"
+            )
+        })
+        .map_err(|failed| format!("the street store's schema could not be applied: {failed}"))?;
         // The tables belong to the role that just made them, and the serving
         // role has to be able to read them.
         return grant_if_serving(&url);

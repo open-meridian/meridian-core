@@ -56,8 +56,10 @@ spec:
       meridian.dev/component: registry
   template:
     metadata:
+      # Not the release's version, which would restart it on every upgrade
+      # (see _helpers).
       labels:
-        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        {{- include "meridian-runtime.unversionedLabels" . | nindent 8 }}
         meridian.dev/component: registry
     spec:
       {{- with .Values.podSecurityContext }}
@@ -141,8 +143,10 @@ spec:
       meridian.dev/component: registry-node
   template:
     metadata:
+      # Not the release's version, which would restart it on every upgrade
+      # (see _helpers).
       labels:
-        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        {{- include "meridian-runtime.unversionedLabels" . | nindent 8 }}
         meridian.dev/component: registry-node
     spec:
       {{- with .Values.podSecurityContext }}

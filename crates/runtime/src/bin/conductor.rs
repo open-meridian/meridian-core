@@ -60,17 +60,21 @@ fn run() -> Result<(), String> {
     // migration job holds no key and should not need one.
     if command.as_deref() == Some("migrate") {
         let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
-        PostgresStore::connect(&url, 1)
-            .and_then(|store| store.migrate())
-            .map(|()| {
-                tracing::info!(
-                    version = meridian_config::migrations::latest(),
-                    "the configuration store's schema is applied"
-                )
-            })
-            .map_err(|failed| {
-                format!("the configuration store's schema could not be applied: {failed}")
-            })?;
+        meridian_runtime::migrate_once_it_answers(
+            "the configuration store's database",
+            &url,
+            |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
+            |store| store.migrate().map_err(|failed| failed.to_string()),
+        )
+        .map(|()| {
+            tracing::info!(
+                version = meridian_config::migrations::latest(),
+                "the configuration store's schema is applied"
+            )
+        })
+        .map_err(|failed| {
+            format!("the configuration store's schema could not be applied: {failed}")
+        })?;
         return grant_if_serving(&url);
     }
 

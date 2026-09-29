@@ -6,8 +6,11 @@
 //! and the dashboard, started before its database answered, aborting in a
 //! destructor (task kernel/upgrading-a-deployment-in-place, faults 3 to 5).
 //! These start the real binaries in those states and watch them wait, serve
-//! once they can, and stop when asked without a panic. Run by `make
-//! test-store`; fails loudly without a database.
+//! once they can, and stop when asked without a panic. And the migration
+//! itself, which on 2026-09-29 met the database restarting under it: it waits
+//! for a database that does not answer yet, and fails at once on one that
+//! answers and refuses the migration. Run by `make test-store`; fails loudly
+//! without a database.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -106,7 +109,13 @@ struct Running {
 
 impl Running {
     fn start(binary: &str, environment: &[(&str, String)]) -> Self {
+        Self::start_with(binary, &[], environment)
+    }
+
+    /// Started as `binary args...`: `migrate` is the Job's command.
+    fn start_with(binary: &str, args: &[&str], environment: &[(&str, String)]) -> Self {
         let mut child = Command::new(binary)
+            .args(args)
             .env_clear()
             .env("RUST_LOG", "info")
             .envs(environment.iter().map(|(name, value)| (*name, value)))
@@ -161,6 +170,25 @@ impl Running {
 
     fn running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
+    }
+
+    /// How it exited, which it must within `within`.
+    fn exited(&mut self, within: Duration) -> std::process::ExitStatus {
+        let started = Instant::now();
+        let exited = loop {
+            if let Some(exited) = self.child.try_wait().unwrap() {
+                break exited;
+            }
+            assert!(
+                started.elapsed() < within,
+                "it was still running after {within:?}:\n{}",
+                self.said()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        // The readers may still be draining the last lines.
+        std::thread::sleep(Duration::from_millis(300));
+        exited
     }
 
     /// Asked to stop, as Kubernetes asks: it exits cleanly, not by a panic
@@ -345,6 +373,80 @@ fn a_store_whose_schema_is_newer_than_it_refuses_rather_than_waits() {
     assert!(
         said.contains("newer than this binary understands"),
         "it did not say why:\n{said}"
+    );
+    assert!(!said.contains("panicked"), "it panicked:\n{said}");
+}
+
+#[test]
+fn a_migration_started_before_its_database_waits_for_it_and_applies() {
+    // An upgrade that restarts the database starts the migration Job beside
+    // it. The Job runs with no retries, so a migration that made one attempt
+    // while the database was not there failed the release, and every
+    // component waited for a schema that never came (CI run 36631603926).
+    let schema = scratch_schema("migrate");
+    let database = free_port();
+    let through = url_for(&schema, Some(&format!("127.0.0.1:{database}")));
+
+    let mut migration = Running::start_with(
+        env!("CARGO_BIN_EXE_meridian-conductor"),
+        &["migrate"],
+        &[("MERIDIAN_CONFIG_DATABASE_URL", through)],
+    );
+
+    migration.until_said(
+        "waiting for the configuration store's database",
+        Duration::from_secs(30),
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        migration.running(),
+        "it gave up on a database that was not there yet:\n{}",
+        migration.said()
+    );
+
+    forward(database, database_address());
+
+    let exited = migration.exited(Duration::from_secs(60));
+    let said = migration.said();
+    assert!(exited.success(), "it exited {exited}:\n{said}");
+    assert!(
+        said.contains("the configuration store's schema is applied"),
+        "it did not say it migrated:\n{said}"
+    );
+    meridian_config::PostgresStore::connect(&url_for(&schema, None), 1)
+        .and_then(|store| store.verify())
+        .expect("it said it migrated and the schema is not there");
+}
+
+#[test]
+fn a_migration_that_fails_once_connected_fails_at_once() {
+    // Only the connection is waited for. A migration that fails against a
+    // database that answers stops the release, which is why the Job does not
+    // retry, so it must not wait here either.
+    let url = url_for(&scratch_schema("broken"), None);
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .batch_execute("CREATE VIEW schema_migration AS SELECT 1 AS not_a_version")
+        .expect("could not break the schema");
+
+    let mut migration = Running::start_with(
+        env!("CARGO_BIN_EXE_meridian-street"),
+        &["migrate"],
+        &[("MERIDIAN_STREET_DATABASE_URL", url)],
+    );
+    let exited = migration.exited(Duration::from_secs(20));
+    let said = migration.said();
+    assert!(
+        !exited.success(),
+        "it said a broken migration applied:\n{said}"
+    );
+    assert!(
+        said.contains("the street store's schema could not be applied"),
+        "it did not say why:\n{said}"
+    );
+    assert!(
+        !said.contains("waiting for"),
+        "it waited on a failed migration:\n{said}"
     );
     assert!(!said.contains("panicked"), "it panicked:\n{said}");
 }

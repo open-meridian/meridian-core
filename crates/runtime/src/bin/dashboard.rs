@@ -53,9 +53,13 @@ fn run() -> Result<(), String> {
     // know which the wizard chose, and an empty table is cheaper than a race.
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         let url = required("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL")?;
-        InPostgres::connect(&url, 1)
-            .and_then(|store| store.migrate())
-            .map_err(|failed| format!("the accounts schema could not be applied: {failed}"))?;
+        meridian_runtime::migrate_once_it_answers(
+            "the accounts database",
+            &url,
+            |url| InPostgres::connect(url, 1),
+            |store| store.migrate(),
+        )
+        .map_err(|failed| format!("the accounts schema could not be applied: {failed}"))?;
         tracing::info!("the accounts schema is applied");
         // The table belongs to the role that just made it.
         return match var("MERIDIAN_SERVING_DATABASE_URL") {
