@@ -566,7 +566,12 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
         configured.read_account_ids,
         std::slice::from_ref(&growth_account.account_id)
     );
-    assert!(configured.write_account_ids.is_empty());
+    // Read through the permission; written through the link, which is the
+    // plugin's right to the one account it names (W4.11, W6.4).
+    assert_eq!(
+        configured.write_account_ids,
+        std::slice::from_ref(&growth_account.account_id)
+    );
     assert_eq!(configured.links.len(), 1);
 
     // And with the records the dashboard reads, so it can tell which of the

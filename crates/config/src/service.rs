@@ -134,7 +134,8 @@ fn stored_settings<'a>(
 /// What a sidecar is told about its plugin, but for its settings: those are
 /// [`configuration`]'s, the one place a secret is opened.
 fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
-    let scope = meridian_access::plugin_scope(&snapshot.records, plugin_instance_id);
+    let scope =
+        meridian_access::plugin_scope(&snapshot.records, &snapshot.links, plugin_instance_id);
     PluginConfiguration {
         plugin_instance_id: plugin_instance_id.to_string(),
         settings: Vec::new(),

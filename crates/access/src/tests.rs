@@ -127,7 +127,7 @@ fn an_empty_account_group_reaches_nothing() {
 
 #[test]
 fn an_account_in_no_group_is_in_no_plugin_scope() {
-    let scope = plugin_scope(&records(), OMS);
+    let scope = plugin_scope(&records(), &[], OMS);
     assert!(!scope.read.contains("ACC-LONELY"));
     assert!(!scope.write.contains("ACC-LONELY"));
 }
@@ -162,15 +162,17 @@ fn an_account_group_naming_an_unknown_account_reaches_only_what_exists() {
     records.account_groups[0]
         .account_ids
         .push("ACC-NOT-YET".into());
-    assert!(!plugin_scope(&records, OMS).read.contains("ACC-NOT-YET"));
+    assert!(!plugin_scope(&records, &[], OMS)
+        .read
+        .contains("ACC-NOT-YET"));
 }
 
 #[test]
 fn a_plugins_scope_is_the_union_of_everyone_who_may_use_it() {
-    let scope = plugin_scope(&records(), OMS);
+    let scope = plugin_scope(&records(), &[], OMS);
     assert_eq!(scope.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
     assert_eq!(scope.write, set(&["ACC-GROWTH"]));
-    assert!(plugin_scope(&records(), "another-plugin").is_empty());
+    assert!(plugin_scope(&records(), &[], "another-plugin").is_empty());
 }
 
 #[test]
@@ -231,4 +233,49 @@ fn a_local_account_is_found_by_the_login_first_run_names_it_by() {
     assert!(user_groups_of(&records, &local_login("ada"), &[])
         .iter()
         .any(|group| group.user_group_id == "UG-admins"));
+}
+
+#[test]
+fn a_link_is_its_plugins_right_to_the_one_account_it_names() {
+    let link = |plugin: &str, account: &str| ExternalAccountLink {
+        plugin_instance_id: plugin.into(),
+        external_account_id: "FIDELITY:1".into(),
+        account_id: account.into(),
+    };
+    let links = [
+        link("snaptrade", "ACC-LONELY"),
+        link("snaptrade", "ACC-NOT-YET"),
+    ];
+    let scope = plugin_scope(&records(), &links, "snaptrade");
+    assert_eq!(
+        scope.read,
+        set(&["ACC-LONELY"]),
+        "an account in no group, by its link"
+    );
+    assert_eq!(
+        scope.write,
+        set(&["ACC-LONELY"]),
+        "and a link to nothing reaches nothing"
+    );
+    assert!(
+        !plugin_scope(&records(), &links, OMS)
+            .read
+            .contains("ACC-LONELY"),
+        "no other plugin's by that link"
+    );
+}
+
+#[test]
+fn a_link_to_a_closed_account_reads_it_and_never_writes_it() {
+    let mut records = records();
+    for account in &mut records.accounts {
+        account.state = AccountState::Closed as i32;
+    }
+    let links = [ExternalAccountLink {
+        plugin_instance_id: "snaptrade".into(),
+        external_account_id: "FIDELITY:1".into(),
+        account_id: "ACC-LONELY".into(),
+    }];
+    let scope = plugin_scope(&records, &links, "snaptrade");
+    assert!(scope.read.contains("ACC-LONELY") && scope.write.is_empty());
 }

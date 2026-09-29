@@ -31,7 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::v1::{
-    AccessLevel, AccessRecords, AccountRecord, AccountState, Permission, UserGroup,
+    AccessLevel, AccessRecords, AccountRecord, AccountState, ExternalAccountLink, Permission,
+    UserGroup,
 };
 use meridian_pb::v1::{PersonAccess, PluginAccessReply, TagAccess, UserGroupAccess};
 
@@ -204,11 +205,18 @@ fn accounts_of_group<'a>(
 }
 
 /// A plugin's account scope: every account anybody may read through it, and
-/// every account anybody may write through it, across all its tags.
+/// every account anybody may write through it, across all its tags; and every
+/// account one of its external accounts is linked to.
 ///
 /// Derived from every permission, not from people: the deployment knows no
 /// directory, so it cannot ask who is in a group, only what the groups hold.
-pub fn plugin_scope(records: &AccessRecords, plugin_instance_id: &str) -> Levels {
+/// A link is the plugin's right to the one account it names while it stands:
+/// the plugin's role grants it the store, the link the account (W4.11, W6.4).
+pub fn plugin_scope(
+    records: &AccessRecords,
+    links: &[ExternalAccountLink],
+    plugin_instance_id: &str,
+) -> Levels {
     let mut all = PluginLevels::new();
     for permission in &records.permissions {
         if permission.access_group_id != DEPLOYMENT_ADMIN {
@@ -222,6 +230,22 @@ pub fn plugin_scope(records: &AccessRecords, plugin_instance_id: &str) -> Levels
         .flat_map(|tags| tags.values())
     {
         scope.add(levels);
+    }
+    for link in links
+        .iter()
+        .filter(|link| link.plugin_instance_id == plugin_instance_id)
+    {
+        let Some(account) = records
+            .accounts
+            .iter()
+            .find(|account| account.account_id == link.account_id)
+        else {
+            continue;
+        };
+        scope.read.insert(account.account_id.clone());
+        if account.state != AccountState::Closed as i32 {
+            scope.write.insert(account.account_id.clone());
+        }
     }
     scope
 }
