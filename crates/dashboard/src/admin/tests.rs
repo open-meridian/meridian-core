@@ -59,6 +59,29 @@ struct Harness {
 /// A dashboard whose records are `records`, with Ada signed in, and a fake
 /// conductor answering define-account and redeem-claim-code.
 fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness {
+    harness_serving(records, refuse_with, None)
+}
+
+/// The same, serving plugins' pages below a name with a domain, so a
+/// plugin's admin pages are framed.
+fn framing(records: AccessRecords) -> Harness {
+    let plugins = crate::plugins::Plugins::new(
+        "https://meridian.example",
+        "http://{instance}.sidecars.invalid:9292",
+        crate::signing::Signer::holding(
+            "dashboard-test",
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        ),
+    )
+    .unwrap();
+    harness_serving(records, None, Some(Arc::new(plugins)))
+}
+
+fn harness_serving(
+    records: AccessRecords,
+    refuse_with: Option<&'static str>,
+    plugins: Option<Arc<crate::plugins::Plugins>>,
+) -> Harness {
     let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
     let seen: Seen = Arc::default();
     for topic in [
@@ -113,7 +136,7 @@ fn harness(records: AccessRecords, refuse_with: Option<&'static str>) -> Harness
         accounts: None,
         sign_in_failures: Default::default(),
         secure_cookies: true,
-        plugins: None,
+        plugins,
         registry: None,
         custody: Arc::default(),
         health: Arc::default(),
@@ -193,9 +216,11 @@ fn table<'a>(body: &'a str, class: &str) -> &'a str {
 }
 
 #[tokio::test]
-async fn reported_accounts_wait_beside_the_link_action_until_one_is_made() {
-    // W2.8 and W6.4: SNAP-1 is linked, SNAP-2 is not, and st-9902 was only
-    // ever refused. The two without a link wait, each with its own link.
+async fn the_dashboard_lists_and_links_no_external_accounts_and_counts_them() {
+    // The product owner, 2026-09-28: each plugin links its own external
+    // accounts on its admin pages (W6.4). SNAP-1 is linked, SNAP-2 is not, and
+    // st-9902 was only ever refused: the dashboard counts the two on the
+    // plugin's line and offers no link of its own.
     let mut records = admin_records();
     records.accounts = vec![AccountRecord {
         account_id: "ACC-1".into(),
@@ -237,34 +262,35 @@ async fn reported_accounts_wait_beside_the_link_action_until_one_is_made() {
 
     let (status, body) = send(&h, get(&h, "/admin", true)).await;
     assert_eq!(status, StatusCode::OK);
-    let waiting = table(&body, "unlinked");
-    assert!(waiting.contains("data-id=\"SNAP-2\""), "{waiting}");
-    assert!(waiting.contains("Roth IRA 5678") && waiting.contains(">Roth IRA<"));
-    assert!(waiting.contains("data-id=\"st-9902\"") && waiting.contains("12 rows refused"));
+    assert!(!body.contains("external-accounts") && !body.contains("External accounts"));
     assert!(
-        !waiting.contains("data-id=\"SNAP-1\""),
-        "a linked account is not waiting"
+        !body.contains("name=\"external_account_id\""),
+        "no link of its own"
     );
-    // Its own link, which posts what W6.4 always took.
-    assert!(body.contains("<input type=\"hidden\" name=\"external_account_id\" value=\"SNAP-2\">"));
-    assert!(table(&body, "linked").contains("data-account=\"ACC-1\""));
+    assert!(!body.contains("/admin/links"));
+    let listed = table(&body, "plugins");
+    assert!(
+        listed.contains(&format!(
+            "<a href=\"{VIEW}\">2 external accounts not linked</a>"
+        )),
+        "{listed}"
+    );
+
+    // Nor does it take a link any more: nothing reaches the conductor.
+    let form = format!(
+        "form_token={}&plugin_instance_id=snaptrade-1&external_account_id=SNAP-2&account_id=ACC-1",
+        h.form_token
+    );
+    let (status, _) = send(&h, post(&h, "/admin/links", &form)).await;
+    assert!(!status.is_success() && !status.is_redirection(), "{status}");
+    assert!(h.seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn an_unlinked_accounts_sync_state_is_shown_beside_it() {
+async fn an_unlinked_accounts_sync_state_is_on_the_plugins_overview() {
     // Ruled 2026-09-28: sync status describes the connection, not recorded
     // data, so it arrives before a link and says whether one is worth making.
-    let h = harness(admin_records(), None);
-    h.app.custody.hear_accounts(
-        "snaptrade-1",
-        ExternalAccountsEvent {
-            accounts: vec![ExternalAccount {
-                external_account_id: "SNAP-9".into(),
-                name: "Hidden Brokerage".into(),
-                venue_account_type: "Individual".into(),
-            }],
-        },
-    );
+    let h = harness(with_settings(), None);
     h.app.custody.hear_sync(
         "snaptrade-1",
         SyncStatusEvent {
@@ -275,17 +301,22 @@ async fn an_unlinked_accounts_sync_state_is_shown_beside_it() {
         },
     );
 
-    let (_, body) = send(&h, get(&h, "/admin", true)).await;
-    let waiting = table(&body, "unlinked");
-    assert!(waiting.contains("data-id=\"SNAP-9\""));
-    assert!(waiting.contains("Holdings unavailable"), "{waiting}");
-    assert!(waiting.contains("Connect the account another way"));
-    assert!(table(&body, "sync").contains("not linked"));
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let sync = table(&body, "sync");
+    assert!(sync.contains("data-id=\"SNAP-9\""));
+    assert!(sync.contains("Holdings unavailable"), "{sync}");
+    assert!(sync.contains("Connect the account another way"));
+    assert!(sync.contains("not linked"));
+    let (_, admin) = send(&h, get(&h, "/admin", true)).await;
+    assert!(
+        !admin.contains("class=\"list sync\""),
+        "and not on the admin portal"
+    );
 }
 
 #[tokio::test]
 async fn a_sync_state_is_shown_with_what_to_do_about_it() {
-    let h = harness(admin_records(), None);
+    let h = harness(with_settings(), None);
     for (external, state) in [
         ("SNAP-1", SyncState::NeedsSignIn),
         ("SNAP-2", SyncState::Disabled),
@@ -305,8 +336,17 @@ async fn a_sync_state_is_shown_with_what_to_do_about_it() {
             },
         );
     }
+    // Another plugin's connection is not this one's.
+    h.app.custody.hear_sync(
+        "other-1",
+        SyncStatusEvent {
+            external_account_id: "OTHER-1".into(),
+            state: SyncState::Stale as i32,
+            ..Default::default()
+        },
+    );
 
-    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
     let sync = table(&body, "sync");
     for said in [
         "Needs sign-in",
@@ -324,6 +364,7 @@ async fn a_sync_state_is_shown_with_what_to_do_about_it() {
     ] {
         assert!(sync.contains(said), "{said} is not shown: {sync}");
     }
+    assert!(!sync.contains("OTHER-1"));
 }
 
 #[tokio::test]
@@ -644,19 +685,51 @@ fn conductor_setting(h: &Harness, refuse_with: Option<&'static str>) -> Asked {
 const VIEW: &str = "/admin/plugins/snaptrade-1";
 const SETTINGS: &str = "/admin/plugins/snaptrade-1/settings";
 
+/// The tabs a view's page offers, as (href, name), and the one it is on.
+fn tabs_of(body: &str) -> (Vec<(String, String)>, String) {
+    let nav = body
+        .split("<nav class=\"tabs view-tabs\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</nav>").next())
+        .expect("the view's tabs");
+    let mut tabs = Vec::new();
+    let mut here = String::new();
+    for link in nav.split("<a href=\"").skip(1) {
+        let href = link.split('"').next().unwrap().replace("&amp;", "&");
+        let name = link.split('>').nth(1).unwrap().split('<').next().unwrap();
+        if link.contains("aria-current=\"page\"") {
+            here = name.to_string();
+        }
+        tabs.push((href, name.to_string()));
+    }
+    (tabs, here)
+}
+
 #[tokio::test]
 async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() {
     let h = harness(with_settings(), None);
     let (status, body) = send(&h, get(&h, VIEW, true)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    for part in [
-        "id=\"settings\"",
-        "id=\"health\"",
-        "id=\"access\"",
-        "id=\"admin-page\"",
+    // Tabs, each a link of its own; the view opens on the first.
+    let (tabs, here) = tabs_of(&body);
+    let names: Vec<&str> = tabs.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(names, ["Overview", "Settings", "Access", "Admin page"]);
+    assert_eq!(here, "Overview");
+    assert_eq!(tabs[0].0, VIEW);
+    assert_eq!(tabs[3].0, format!("{VIEW}?tab=%2Fadmin"));
+    assert!(body.contains("id=\"health\""));
+    for (part, tab) in [
+        ("id=\"settings\"", "settings"),
+        ("id=\"access\"", "access"),
+        ("id=\"admin-page\"", "%2Fadmin"),
     ] {
-        assert!(body.contains(part), "{part} is not in the view");
+        assert!(!body.contains(part), "{part} is only on its own tab");
+        let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={tab}"), true)).await;
+        assert!(page.contains(part), "{part} is not on ?tab={tab}");
+        assert!(!page.contains("id=\"health\""));
     }
+    let (_, body) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
+    assert_eq!(tabs_of(&body).1, "Settings");
     assert!(body.contains(&format!("action=\"{SETTINGS}\"")));
     assert!(
         body.contains(&format!("value=\"{}\"", h.form_token)),
@@ -664,7 +737,11 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     );
     // This harness serves no plugin pages, and the view says so rather than
     // framing something that is not there.
-    assert!(body.contains("cannot frame this one"));
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fadmin"), true)).await;
+    assert!(page.contains("cannot frame this one"));
+    // A tab that is not one is the first.
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fsecret"), true)).await;
+    assert_eq!(tabs_of(&page).1, "Overview");
 
     // The old address of the form is the view's.
     let old = router(Arc::clone(&h.app))
@@ -674,7 +751,7 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     assert_eq!(old.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         old.headers()["location"],
-        format!("{VIEW}#settings").as_str()
+        format!("{VIEW}?tab=settings").as_str()
     );
 
     // The overview's Plugins tab lists it, with the secret it still needs,
@@ -766,7 +843,20 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     let health = body.split("id=\"health\"").nth(1).unwrap();
     assert!(health.contains("Not healthy"), "{health}");
     assert!(health.contains("required setting snaptrade_consumer_key is not set"));
-    assert!(health.contains("5 external accounts not linked"));
+    // The count leads to the plugin's own admin pages, where it links them
+    // (W6.4, W6.10), and to nothing of the dashboard's.
+    assert!(
+        health.contains(&format!(
+            "5 external accounts not linked. <a href=\"{VIEW}?tab=%2Fadmin\">Link them on the \
+             plugin's admin pages</a>."
+        )),
+        "{health}"
+    );
+    assert!(!health.contains("/admin#external-accounts"));
+    assert!(health.contains(&format!(
+        "<a href=\"{VIEW}?tab=settings\">fill in its settings</a>"
+    )));
+    let (_, body) = send(&h, get(&h, &format!("{VIEW}?tab=access"), true)).await;
     let access = table(&body, "access");
     assert!(access.contains("Operations") && access.contains("holdings"));
     assert!(access.contains("Growth accounts") && access.contains(">read<"));
@@ -782,6 +872,113 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
         )),
         "{listed}"
     );
+}
+
+fn declaring(pages: &[(&str, &str)]) -> meridian_domain::v1::PluginReport {
+    meridian_domain::v1::PluginReport {
+        plugin_instance_id: "snaptrade-1".into(),
+        registered: true,
+        healthy: true,
+        reported_at_ns: T0,
+        declared_interface: Some(meridian_pb::v1::InterfaceDeclaration {
+            loopback_port: 8000,
+            title: "SnapTrade".into(),
+            admin_pages: pages
+                .iter()
+                .map(|(path, title)| meridian_pb::v1::PageDeclaration {
+                    path: path.to_string(),
+                    title: title.to_string(),
+                })
+                .collect(),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its_path() {
+    // W6.9, the product owner, 2026-09-29: Overview, Settings, Access, then
+    // one tab per admin page the plugin declared (W4.8), in its order.
+    let h = framing(with_settings());
+    h.app.health.hear(
+        "snaptrade-1",
+        declaring(&[
+            ("/admin/connections", "Connections"),
+            ("/admin/accounts", "Accounts"),
+            ("/admin/holdings", "Holdings"),
+        ]),
+    );
+    let (status, body) = send(&h, get(&h, VIEW, true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (tabs, here) = tabs_of(&body);
+    assert_eq!(
+        tabs,
+        [
+            (VIEW.to_string(), "Overview".to_string()),
+            (format!("{VIEW}?tab=settings"), "Settings".into()),
+            (format!("{VIEW}?tab=access"), "Access".into()),
+            (
+                format!("{VIEW}?tab=%2Fadmin%2Fconnections"),
+                "Connections".into()
+            ),
+            (format!("{VIEW}?tab=%2Fadmin%2Faccounts"), "Accounts".into()),
+            (format!("{VIEW}?tab=%2Fadmin%2Fholdings"), "Holdings".into()),
+        ]
+    );
+    assert_eq!(here, "Overview");
+    assert!(
+        !body.contains("<iframe"),
+        "a page is framed only on its own tab"
+    );
+
+    let (_, accounts) = send(
+        &h,
+        get(&h, &format!("{VIEW}?tab=%2Fadmin%2Faccounts"), true),
+    )
+    .await;
+    assert_eq!(tabs_of(&accounts).1, "Accounts");
+    let frame = accounts.split("<iframe").nth(1).expect("the page, framed");
+    assert!(
+        frame.contains("src=\"/plugins/snaptrade-1/enter?path=%2Fadmin%2Faccounts"),
+        "{frame}"
+    );
+    assert!(frame.contains("data-origin=\"https://snaptrade-1.plugins.meridian.example\""));
+    assert_eq!(accounts.matches("<iframe").count(), 1, "one page at a time");
+}
+
+#[tokio::test]
+async fn a_page_that_is_not_one_on_the_plugins_host_is_no_tab() {
+    let h = framing(with_settings());
+    h.app.health.hear(
+        "snaptrade-1",
+        declaring(&[
+            ("//evil.example/x", "Elsewhere"),
+            ("https://evil.example/", "Absolute"),
+            ("/.meridian/ui/0.1.0/", "The kit"),
+            ("/admin/accounts", ""),
+            ("/admin/accounts", "Twice"),
+        ]),
+    );
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let names: Vec<String> = tabs_of(&body).0.into_iter().map(|(_, name)| name).collect();
+    // Untitled, it is called by its path; the second of a path is dropped.
+    assert_eq!(names, ["Overview", "Settings", "Access", "/admin/accounts"]);
+    for asked in ["%2F%2Fevil.example%2Fx", "https%3A%2F%2Fevil.example%2F"] {
+        let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={asked}"), true)).await;
+        assert_eq!(tabs_of(&page).1, "Overview", "{asked} is framed nowhere");
+        assert!(!page.contains("<iframe"));
+    }
+
+    // Declaring none, the plugin's /admin is the one page tab.
+    h.app.health.hear("snaptrade-1", declaring(&[]));
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let (tabs, _) = tabs_of(&body);
+    assert_eq!(
+        tabs.last().unwrap(),
+        &(format!("{VIEW}?tab=%2Fadmin"), "Admin page".to_string())
+    );
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fadmin"), true)).await;
+    assert!(page.contains("src=\"/plugins/snaptrade-1/enter?path=%2Fadmin&amp;"));
 }
 
 #[tokio::test]
@@ -800,7 +997,7 @@ async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         response.headers()["location"],
-        format!("{VIEW}?saved=1#settings").as_str()
+        format!("{VIEW}?tab=settings&saved=1").as_str()
     );
 
     let (request, by) = asked.lock().unwrap()[0].clone();
@@ -822,7 +1019,7 @@ async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
     );
     assert!(request.cleared.is_empty());
 
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?saved=1"), true)).await;
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=settings&saved=1"), true)).await;
     assert!(page.contains("Saved."));
     assert!(!page.contains(SECRET), "never shown");
 
@@ -860,7 +1057,7 @@ async fn a_settings_form_without_the_sessions_token_sends_nothing() {
         .unwrap();
     assert_eq!(
         response.headers()["location"],
-        format!("{VIEW}?saved=none#settings").as_str()
+        format!("{VIEW}?tab=settings&saved=none").as_str()
     );
     assert!(asked.lock().unwrap().is_empty());
 }

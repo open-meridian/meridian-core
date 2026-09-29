@@ -57,6 +57,9 @@ pub fn close_account(snapshot: &Snapshot, account_id: &str) -> Verdict {
     )
 }
 
+/// A link names an existing account, or a new account's name for the
+/// conductor to create and link in one step, or neither to remove it; never
+/// both (W6.4).
 pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdict {
     required(&request.plugin_instance_id, "the plugin")?;
     required(&request.external_account_id, "the external account")?;
@@ -66,6 +69,14 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
         |p| &p.plugin_instance_id,
         "plugin that has reported, named",
     )?;
+    if !request.new_account_name.is_empty() {
+        if !request.account_id.is_empty() {
+            return Err(
+                "a link names an existing account or a new account's name, not both".into(),
+            );
+        }
+        return required(&request.new_account_name, "a new account's name");
+    }
     if request.account_id.is_empty() {
         return Ok(());
     }

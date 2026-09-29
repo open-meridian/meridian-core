@@ -12,7 +12,7 @@ platform.config.command.define-user-group	command	dashboard	conductor
 platform.config.command.enrol-with-code	command	dashboard	conductor
 platform.config.command.grant-permission	command	dashboard	conductor
 platform.config.command.launch-plugin	command	dashboard	conductor
-platform.config.command.link-external-account	command	dashboard	conductor
+platform.config.command.link-external-account	command	custody	conductor
 platform.config.command.record-plugin-upload	command	dashboard	conductor
 platform.config.command.redeem-claim-code	command	dashboard	conductor
 platform.config.command.send-diagnostic-bundle	command	dashboard	conductor
@@ -23,6 +23,7 @@ platform.config.event.person-signed-in	event	dashboard	conductor
 platform.config.event.plugin-configuration-changed	event	conductor	sidecar
 platform.config.event.unlinked-external-accounts	event	sidecar	dashboard
 platform.config.query.access-records	query	dashboard	conductor
+platform.config.query.accounts	query	custody	conductor
 platform.config.query.check-first-run-answer	query	dashboard	first-run
 platform.config.query.enrolment	query	dashboard	conductor
 platform.config.query.first-run-sealing-key	query	dashboard	first-run

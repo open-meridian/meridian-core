@@ -41,6 +41,9 @@ pub struct Registration {
     /// The settings it declared (W4.7): what WatchSettings delivers, and what
     /// makes it unhealthy while a required one has no value.
     pub settings: Vec<meridian_pb::v1::SettingDeclaration>,
+    /// The interface it declared, if it serves one: its report carries it, so
+    /// the dashboard learns the plugin's admin pages (W4.8, W6.9).
+    pub interface: Option<meridian_pb::v1::InterfaceDeclaration>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -106,6 +109,11 @@ pub struct Sidecar {
     /// with how many rows were refused for each (W4.8). Forgotten once one
     /// is linked and a row for it recorded.
     pub(crate) unlinked: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Unlinked>>>,
+    /// The external accounts the plugin last said its connection reaches
+    /// (W2.8): the whole list each time. A link is admitted only for one of
+    /// these (W6.4). Empty until the plugin first reports, since nothing
+    /// survives a restart of either.
+    pub(crate) reported: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     /// Woken when registration changes, so a report goes out at once rather
     /// than at the next interval.
     pub(crate) changed: Arc<tokio::sync::Notify>,
@@ -162,6 +170,7 @@ impl Sidecar {
             configuration,
             refusals: Arc::default(),
             unlinked: Arc::default(),
+            reported: Arc::default(),
             live: Arc::default(),
             changed: Arc::default(),
             verifier: None,
@@ -276,6 +285,7 @@ impl SidecarService for Sidecar {
             health_detail: String::new(),
             contract_version: req.schema_version.clone(),
             settings: req.settings.clone(),
+            interface: req.interface.clone(),
         });
         self.changed.notify_one();
 

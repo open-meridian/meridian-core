@@ -6,9 +6,16 @@
 //! that does not vary by operation, which is why it is written once and the
 //! part that does is generated.
 //!
+//! The deployment's configuration is the exception to a plugin acting as
+//! itself: a command or query in the `config` domain -- linking an external
+//! account, reading the deployment's accounts to link it to (W6.4) -- is
+//! admitted only acting for a deployment admin, and a link only for an
+//! external account the plugin itself reported (W2.8).
+//!
 //! A refusal is the call's gRPC status, chosen by what the caller should do
 //! about it: `permission_denied` for a topic none of the plugin's roles
-//! grants, `invalid_argument` for a number the wire does not carry,
+//! grants, or the deployment's configuration without a deployment admin,
+//! `invalid_argument` for a number the wire does not carry,
 //! `failed_precondition` for an external account nobody has linked,
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
 //! did not answer in time, `aborted` when it answered with a refusal.
@@ -16,12 +23,20 @@
 use meridian_bus::BusError;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1 as domain;
+use meridian_domain::v1::{ExternalAccountsEvent, LinkExternalAccountRequest};
 use meridian_pb::plugin::v1 as plugin;
 use meridian_pb::v1::CallerAssertion;
 use prost::Message;
 use tonic::{Response, Status};
 
 use crate::service::Sidecar;
+
+/// The deployment's configuration: what a plugin sends here it sends only for
+/// a deployment admin (W6.4).
+const CONFIGURATION: &str = "platform.config.";
+const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
+/// Where a plugin says which external accounts its connection reaches (W2.8).
+const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
 
 // The tonic surface already returns `Result<_, Status>` everywhere; boxing the
 // error here alone would buy nothing.
@@ -106,39 +121,68 @@ impl Sidecar {
     ) -> Result<Response<plugin::Published>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        let payload = message.encode_to_vec();
         let message_id = self
             .bus
-            .publish(&topic, payload_type, message.encode_to_vec(), None, None)
+            .publish(&topic, payload_type, payload.clone(), None, None)
             .map_err(refused)?;
+        if payload_type == EXTERNAL_ACCOUNTS {
+            self.keep_reported(&payload);
+        }
         Ok(Response::new(plugin::Published { message_id }))
     }
 
-    /// A command or a query: checked, asked, and the domain reply handed back
-    /// as its plugin-facing mirror, which it is on the wire.
+    /// The external accounts the plugin just said it reaches, the whole list,
+    /// in place of the last: the ones a link may name (W2.8, W6.4).
+    fn keep_reported(&self, payload: &[u8]) {
+        if let Ok(event) = ExternalAccountsEvent::decode(payload) {
+            *self.reported.lock().expect("reported lock poisoned") = event
+                .accounts
+                .into_iter()
+                .map(|account| account.external_account_id)
+                .collect();
+        }
+    }
+
+    /// A query: checked, asked, and the domain reply handed back as its
+    /// plugin-facing mirror, which it is on the wire. One of the deployment's
+    /// configuration is asked only for a deployment admin, who is stamped on
+    /// it (W6.4); any other carries no person (decisions/014).
     pub(crate) async fn call_typed<D: Message, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
         message: D,
+        acting_for: Option<CallerAssertion>,
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        let subject = if topic.starts_with(CONFIGURATION) {
+            self.vouched_admin(&topic, acting_for.as_ref(), now_ns())?
+        } else {
+            String::new()
+        };
         let (_, payload) = self
             .bus
-            .call(&topic, payload_type, message.encode_to_vec(), None, None)
+            .call_for(
+                &topic,
+                payload_type,
+                message.encode_to_vec(),
+                None,
+                None,
+                &subject,
+            )
             .await
             .map_err(refused)?;
-        R::decode(payload.as_slice())
-            .map(Response::new)
-            .map_err(|failed| {
-                Status::internal(format!("the reply did not read as its mirror: {failed}"))
-            })
+        mirrored(payload)
     }
 
     /// A command: checked against the grant, against the plugin's write scope
     /// for the account it names, and -- when it is sent for a person (W4.9) --
     /// against what the dashboard vouched that person may write; then asked,
-    /// with the person stamped on the envelope.
+    /// with the person stamped on the envelope. One to the deployment's
+    /// configuration is checked instead against the person being a deployment
+    /// admin, and a link against what the plugin reported (W6.4).
     pub(crate) async fn command_typed<D: Message, R: Message + Default>(
         &self,
         topic: &str,
@@ -150,6 +194,17 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let now = now_ns();
+        if topic.starts_with(CONFIGURATION) {
+            // A deployment admin's act on the deployment's configuration, not
+            // a write to an account: a link names an account nothing may write
+            // through this plugin yet, since the link is what grants it (W4.11).
+            let subject = self.vouched_admin(&topic, acting_for.as_ref(), now)?;
+            if topic == LINK_EXTERNAL_ACCOUNT {
+                self.reported_by_this_plugin(&message.encode_to_vec(), now)
+                    .await?;
+            }
+            return self.ask_for(&topic, payload_type, message, &subject).await;
+        }
         if let Some(account) = &account {
             let configuration = self.configuration(now).await?;
             if !configuration.write_account_ids.contains(account) {
@@ -165,23 +220,102 @@ impl Sidecar {
             None => String::new(),
             Some(assertion) => self.vouched_writer(&assertion, account.as_deref(), now)?,
         };
+        self.ask_for(&topic, payload_type, message, &subject).await
+    }
+
+    /// Asked, with the person stamped on the envelope, and the reply read as
+    /// its plugin-facing mirror.
+    async fn ask_for<D: Message, R: Message + Default>(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        message: D,
+        subject: &str,
+    ) -> Result<Response<R>, Status> {
         let (_, payload) = self
             .bus
             .call_for(
-                &topic,
+                topic,
                 payload_type,
                 message.encode_to_vec(),
                 None,
                 None,
-                &subject,
+                subject,
             )
             .await
             .map_err(refused)?;
-        R::decode(payload.as_slice())
-            .map(Response::new)
-            .map_err(|failed| {
-                Status::internal(format!("the reply did not read as its mirror: {failed}"))
-            })
+        mirrored(payload)
+    }
+
+    /// The deployment admin an assertion vouches for, or the refusal: the
+    /// deployment's configuration is sent to only for one (W6.4), and never
+    /// by the plugin as itself.
+    fn vouched_admin(
+        &self,
+        topic: &str,
+        acting_for: Option<&CallerAssertion>,
+        now_ns: i64,
+    ) -> Result<String, Status> {
+        let refuse = |refusal: String| {
+            self.note_refusal(&refusal);
+            Err(Status::permission_denied(refusal))
+        };
+        let Some(assertion) = acting_for else {
+            return refuse(format!(
+                "{topic} is the deployment's configuration: a plugin sends it only acting for \
+                 a deployment admin, and this carries no assertion"
+            ));
+        };
+        let verifier = self.verifier.as_ref().ok_or_else(|| {
+            Status::unauthenticated(
+                "this sidecar holds none of the dashboard's keys, so it can vouch for nobody",
+            )
+        })?;
+        let claims = verifier
+            .vouched(assertion, now_ns)
+            .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        if !claims.deployment_admin {
+            return refuse(format!(
+                "{topic} is the deployment's configuration: a plugin sends it only acting for \
+                 a deployment admin, and {} is not one",
+                claims.subject
+            ));
+        }
+        Ok(claims.subject)
+    }
+
+    /// A link names an external account this plugin said its connection
+    /// reaches (W2.8), or -- to remove it -- one it already links. Any other
+    /// is refused before the conductor hears of it.
+    async fn reported_by_this_plugin(&self, link: &[u8], now_ns: i64) -> Result<(), Status> {
+        let link = LinkExternalAccountRequest::decode(link)
+            .map_err(|failed| Status::internal(format!("the link did not read: {failed}")))?;
+        let external = link.external_account_id.as_str();
+        if self
+            .reported
+            .lock()
+            .expect("reported lock poisoned")
+            .contains(external)
+        {
+            return Ok(());
+        }
+        let unlinking = link.account_id.is_empty() && link.new_account_name.is_empty();
+        if unlinking
+            && self
+                .configuration(now_ns)
+                .await?
+                .links
+                .iter()
+                .any(|held| held.external_account_id == external)
+        {
+            return Ok(());
+        }
+        let refusal = format!(
+            "external account {external} is not one this plugin reported: a plugin links only \
+             the accounts its connection reaches (W2.8)"
+        );
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
     }
 
     /// The person an assertion vouches for, if they may write `account`
@@ -219,6 +353,16 @@ impl Sidecar {
             _ => Ok(claims.subject),
         }
     }
+}
+
+/// A domain reply, read as the plugin-facing mirror it is on the wire.
+#[allow(clippy::result_large_err)]
+fn mirrored<R: Message + Default>(payload: Vec<u8>) -> Result<Response<R>, Status> {
+    R::decode(payload.as_slice())
+        .map(Response::new)
+        .map_err(|failed| {
+            Status::internal(format!("the reply did not read as its mirror: {failed}"))
+        })
 }
 
 pub(crate) fn now_ns() -> i64 {

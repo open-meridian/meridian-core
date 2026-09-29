@@ -17,8 +17,8 @@ syntax = "proto3";
 
 package meridian.v1;
 
-// The settings a plugin declares at registration, which its report carries
-// onward (W4.8). Plugin-facing, and imported from there at the revision this
+// The settings and the interface a plugin declares at registration, which its
+// report carries onward (W4.8). Plugin-facing, and imported from there at the revision this
 // repository pins.
 import "meridian/v1/sidecar.proto";
 
@@ -640,6 +640,12 @@ message PluginReport {
   // them (W6.11). Empty while the plugin is not registered, and the conductor
   // then keeps what it last declared.
   repeated SettingDeclaration declared_settings = 13;
+
+  // The interface the plugin declared when it registered (W4.8, W6.9): its
+  // title and its admin pages, in order, which the dashboard's admin view of
+  // the instance shows as tabs. Unset while the plugin is not registered, or
+  // when it serves no interface.
+  InterfaceDeclaration declared_interface = 14;
 
   // A single role, before a plugin could hold several.
   reserved 2;

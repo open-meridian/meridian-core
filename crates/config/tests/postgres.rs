@@ -173,6 +173,38 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
 }
 
 #[test]
+fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
+    // W6.4: a link naming a new account creates it and links it in one step.
+    let store = store("account_and_link");
+    let account = AccountRecord {
+        account_id: "ACC-NEW".into(),
+        name: "Fidelity Brokerage".into(),
+        state: AccountState::Open as i32,
+        created_at_ns: 9,
+    };
+    let link = ExternalAccountLink {
+        plugin_instance_id: "snaptrade-1".into(),
+        external_account_id: "st-acct-4471".into(),
+        account_id: "ACC-NEW".into(),
+    };
+    store.put_account_and_link(&account, &link).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.records.accounts, std::slice::from_ref(&account));
+    assert_eq!(snapshot.links, std::slice::from_ref(&link));
+
+    // The same account again fails on the account, and the link it would
+    // have moved is left as it was: neither is written.
+    let other = ExternalAccountLink {
+        external_account_id: "st-acct-9".into(),
+        ..link.clone()
+    };
+    assert!(store.put_account_and_link(&account, &other).is_err());
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.records.accounts.len(), 1);
+    assert_eq!(snapshot.links, [link]);
+}
+
+#[test]
 fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
     let store = store("shape");
     store.put_user_group(&user_group("UG-1", "ada")).unwrap();

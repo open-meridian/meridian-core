@@ -1,7 +1,8 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
-//! Twelve commands and queries from the dashboard, two queries from sidecars,
-//! two events heard, one announced. Every change is written the same way:
+//! Eleven commands and queries from the dashboard, two queries from sidecars,
+//! a command and a query from a plugin acting for a deployment admin, two
+//! events heard, one announced. Every change is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
 //! again only when something it would be told has changed.
@@ -28,14 +29,23 @@
 //! The dashboard calls on a person's behalf, and the envelope carries them as
 //! `acting_for_subject`. A claim redemption needs it to know whom to make the
 //! first deployment admin; every other change is logged with it.
+//!
+//! # A plugin's own external accounts
+//!
+//! A plugin links its external accounts from its own admin page, and reads
+//! the deployment's accounts to offer, each acting for the deployment admin
+//! viewing it (W6.4). Its sidecar admits either only with an assertion saying
+//! the person is one, and stamps them; here, a link or a read naming nobody is
+//! refused, a plugin links only its own external accounts, and a link naming
+//! a new account creates and links it in one step.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
-    AccessRecordsRequest, AccountRecord, AccountState, ClaimCodePurpose, CloseAccountRequest,
-    DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
+    AccessRecordsRequest, AccountRecord, AccountState, Accounts, AccountsRequest, ClaimCodePurpose,
+    CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
     GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
     PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport, PluginSettingValue,
@@ -57,6 +67,7 @@ pub const REDEEM_CLAIM_CODE: &str = "platform.config.command.redeem-claim-code";
 pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
 pub const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
+pub const ACCOUNTS: &str = "platform.config.query.accounts";
 pub const DEFINE_USER_GROUP: &str = "platform.config.command.define-user-group";
 pub const DEFINE_ACCOUNT_GROUP: &str = "platform.config.command.define-account-group";
 pub const DEFINE_ACCESS_GROUP: &str = "platform.config.command.define-access-group";
@@ -345,6 +356,19 @@ pub(crate) fn subject(envelope: &Envelope) -> String {
         .unwrap_or_default()
 }
 
+/// The deployment admin a plugin's sidecar vouched for and stamped, or the
+/// refusal: a plugin reaches the deployment's configuration only acting for
+/// one (W6.4), and what it does there is recorded as theirs.
+fn deployment_admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
+    let by = subject(envelope);
+    if by.is_empty() {
+        return Err(format!(
+            "{what} is a deployment admin's to ask for, and this is sent for nobody"
+        ));
+    }
+    Ok(by)
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -573,23 +597,65 @@ pub fn serve(
             "meridian.v1.ExternalAccountLink",
         ),
         |cx, request: LinkExternalAccountRequest, envelope| {
+            let by = deployment_admin_acting(envelope, "a link")?;
+            if publisher(envelope) != request.plugin_instance_id {
+                return Err(format!(
+                    "a plugin links only its own external accounts, and this names {}",
+                    request.plugin_instance_id
+                ));
+            }
             let before = cx.snapshot()?;
             rules::link(&before, &request)?;
-            let link = ExternalAccountLink {
+            let mut link = ExternalAccountLink {
                 plugin_instance_id: request.plugin_instance_id,
                 external_account_id: request.external_account_id,
                 account_id: request.account_id,
             };
-            cx.store.put_link(&link).map_err(|f| f.to_string())?;
+            if request.new_account_name.is_empty() {
+                cx.store.put_link(&link).map_err(|f| f.to_string())?;
+            } else {
+                // Created and linked in one step, so nothing is left half-done.
+                let now = cx.clock.now_ns();
+                let account = AccountRecord {
+                    account_id: ids::account(now),
+                    name: request.new_account_name.trim().to_string(),
+                    state: AccountState::Open as i32,
+                    created_at_ns: now,
+                };
+                link.account_id = account.account_id.clone();
+                cx.store
+                    .put_account_and_link(&account, &link)
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    account = account.account_id,
+                    plugin = link.plugin_instance_id,
+                    by,
+                    "account defined"
+                );
+            }
             tracing::info!(
                 plugin = link.plugin_instance_id,
                 external = link.external_account_id,
                 account = link.account_id,
-                by = subject(envelope),
+                by,
                 "external account link set"
             );
             cx.announce(&before)?;
             Ok(link)
+        },
+    );
+
+    answer(
+        &context,
+        ACCOUNTS,
+        ("meridian.v1.AccountsRequest", "meridian.v1.Accounts"),
+        |cx, _: AccountsRequest, envelope| {
+            deployment_admin_acting(envelope, "the deployment's accounts")?;
+            // Names, identifiers and states: nothing of who may read them,
+            // and no holdings, which are not the configuration's.
+            Ok(Accounts {
+                accounts: cx.snapshot()?.records.accounts,
+            })
         },
     );
 

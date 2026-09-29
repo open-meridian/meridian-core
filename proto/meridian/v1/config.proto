@@ -71,7 +71,9 @@ message AccessRecords {
 // W6.3 — accounts
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The only thing holdings are recorded against. A plugin never creates one.
+// The only thing holdings are recorded against. A plugin creates one only by
+// linking an external account to a new one, acting for a deployment admin
+// (W6.4).
 message AccountRecord {
   string account_id = 1;
   string name = 2;
@@ -101,18 +103,34 @@ message CloseAccountRequest {
 // W6.4 — linking a plugin's external account
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Links, or with an empty `account_id` unlinks, one external account a plugin
-// reported. Held as one of that plugin's settings.
+// Links an external account a plugin reported, or removes its link.
+// Names an existing account, or a new account's name for the conductor to
+// create and link in one step, or neither to remove the link; never both. Held
+// as one of that plugin's settings. Sent by the plugin from its own admin page,
+// acting for the deployment admin viewing it (W6.4); the plugin's sidecar
+// stamps plugin_instance_id.
 message LinkExternalAccountRequest {
   string plugin_instance_id = 1;
   string external_account_id = 2;
   string account_id = 3;
+
+  // A new account's name, for the conductor to create and link in one step.
+  string new_account_name = 4;
 }
 
 message ExternalAccountLink {
   string plugin_instance_id = 1;
   string external_account_id = 2;
   string account_id = 3;
+}
+
+// The deployment's accounts, read by a plugin acting for a deployment admin
+// to offer the accounts an external account can be linked to (W6.4).
+message AccountsRequest {}
+
+message Accounts {
+  // Names, identifiers and states; no holdings.
+  repeated AccountRecord accounts = 1;
 }
 
 // Published by a sidecar when its plugin brought data for external accounts

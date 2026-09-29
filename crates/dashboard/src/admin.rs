@@ -26,9 +26,8 @@ use meridian_bus::BusError;
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, ClaimCodePurpose,
     CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
-    DefineUserGroupRequest, GrantPermissionRequest, LinkExternalAccountRequest,
-    PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup,
-    WithdrawPermissionReply, WithdrawPermissionRequest,
+    DefineUserGroupRequest, GrantPermissionRequest, PluginSettingsRecord, RedeemClaimCodeReply,
+    RedeemClaimCodeRequest, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use prost::Message;
 
@@ -45,7 +44,6 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin", get(admin_page))
         .route("/admin/accounts", post(define_account))
         .route("/admin/accounts/close", post(close_account))
-        .route("/admin/links", post(link))
         .route("/admin/user-groups", post(define_user_group))
         .route("/admin/account-groups", post(define_account_group))
         .route("/admin/access-groups", post(define_access_group))
@@ -352,14 +350,7 @@ async fn admin_page(
     let holders = app.terminals.holders(app.clock.now_ns());
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
-    let body = overview::render(
-        &records,
-        &holders,
-        &custody,
-        &lines,
-        &token_input(&session),
-        &notice,
-    );
+    let body = overview::render(&records, &holders, &lines, &token_input(&session), &notice);
     Html(page_with("Administer", &body, &admin_chrome(&session))).into_response()
 }
 
@@ -408,31 +399,42 @@ async fn plugin_view(
         "none" => "Nothing was changed.",
         _ => "",
     };
-    // The plugin's own admin page, at /admin on its host, framed; the plugin
+    // The tabs: the view's own, then the plugin's admin pages as its report
+    // declares them (W4.8, W6.9), and the one asked for.
+    let reports = app.health.view();
+    let report = reports.get(&instance);
+    let tabs = view::tabs(report);
+    let current = view::chosen(&tabs, field(&query, "tab"));
+    // One of the plugin's own admin pages, on its host, framed; the plugin
     // serves it to deployment admins alone, by the claim (W6.9).
     let theme = crate::plugins::Theme::of_mode(crate::web::mode_of(&app, &headers));
-    let admin_page = match app.plugins.as_deref() {
-        None => view::AdminPage::None(
-            "This dashboard serves no plugin pages, so it cannot frame this one's.",
-        ),
-        Some(_) if !crate::plugins::is_instance(&instance) => view::AdminPage::None(
-            "This instance's name cannot be a host, so its page cannot be framed.",
-        ),
-        Some(plugins) if plugins.frames() => view::AdminPage::Framed {
-            src: crate::plugins::entrance(&instance, "/admin", &theme),
-            origin: plugins.origin(&instance),
-        },
-        Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, "/admin", &theme)),
-    };
-    let reports = app.health.view();
+    let admin_page = current
+        .page
+        .as_deref()
+        .map(|page| match app.plugins.as_deref() {
+            None => view::AdminPage::None(
+                "This dashboard serves no plugin pages, so it cannot frame this one's.",
+            ),
+            Some(_) if !crate::plugins::is_instance(&instance) => view::AdminPage::None(
+                "This instance's name cannot be a host, so its page cannot be framed.",
+            ),
+            Some(plugins) if plugins.frames() => view::AdminPage::Framed {
+                src: crate::plugins::entrance(&instance, page, &theme),
+                origin: plugins.origin(&instance),
+            },
+            Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, page, &theme)),
+        });
     let body = view::render(&view::View {
         line,
         record: settings_of(&records, &instance),
-        report: reports.get(&instance),
+        report,
         records: &records,
+        custody: &custody,
         token: &token_input(&session),
         notice,
         development: crate::html::is_development(),
+        tabs: &tabs,
+        current,
         admin_page,
     });
     let mut chrome = admin_chrome(&session);
@@ -484,7 +486,7 @@ async fn settings_page(
         StatusCode::SEE_OTHER,
         [(
             axum::http::header::LOCATION,
-            format!("{}#settings", view::path(&instance)),
+            view::tab_href(&instance, view::SETTINGS),
         )],
     )
         .into_response()
@@ -509,9 +511,9 @@ async fn set_settings(
     let Some(record) = settings_of(&records, &instance) else {
         return no_such_plugin(&instance);
     };
-    let back = view::path(&instance);
+    let back = view::tab_href(&instance, view::SETTINGS);
     let Some(request) = settings::request(record, &fields, crate::html::is_development()) else {
-        return after_to(Ok(()), &format!("{back}?saved=none#settings"), &back);
+        return after_to(Ok(()), &format!("{back}&saved=none"), &back);
     };
     let outcome = command::<PluginSettingsRecord>(
         &app,
@@ -522,7 +524,7 @@ async fn set_settings(
     )
     .await
     .map(|_| ());
-    after_to(outcome, &format!("{back}?saved=1#settings"), &back)
+    after_to(outcome, &format!("{back}&saved=1"), &back)
 }
 
 // ── The commands ────────────────────────────────────────────────────────────
@@ -577,29 +579,6 @@ async fn close_account(
             &session,
             "platform.config.command.close-account",
             "meridian.v1.CloseAccountRequest",
-            request,
-        )
-        .await
-        .map(|_| ())
-    })
-}
-
-async fn link(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Form(fields): Form<Fields>,
-) -> Response {
-    admin_form!(app, headers, fields, session, {
-        let request = LinkExternalAccountRequest {
-            plugin_instance_id: field(&fields, "plugin_instance_id").into(),
-            external_account_id: field(&fields, "external_account_id").into(),
-            account_id: field(&fields, "account_id").into(),
-        };
-        command::<meridian_domain::v1::ExternalAccountLink>(
-            &app,
-            &session,
-            "platform.config.command.link-external-account",
-            "meridian.v1.LinkExternalAccountRequest",
             request,
         )
         .await

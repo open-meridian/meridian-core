@@ -6,13 +6,13 @@ use std::time::Duration;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccessRecordsRequest, AccountGroup,
-    AccountRecord, AccountState, ClaimCodePurpose, CloseAccountRequest, DefineAccessGroupRequest,
-    DefineAccountGroupRequest, DefineAccountRequest, DefineUserGroupRequest, DiagnosticBundle,
-    DiagnosticBundleReceipt, ExternalAccountLink, GrantPermissionRequest,
-    LinkExternalAccountRequest, Permission, PluginConfiguration, PluginConfigurationChangedEvent,
-    PluginConfigurationRequest, PluginReport, PluginSettingValue, PluginSettingsRecord,
-    RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest, SignInRecord,
-    UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
+    AccountRecord, AccountState, Accounts, AccountsRequest, ClaimCodePurpose, CloseAccountRequest,
+    DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
+    DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
+    GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
+    PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport, PluginSettingValue,
+    PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest,
+    SignInRecord, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use meridian_pb::v1::{SettingChoice, SettingDeclaration, SettingType};
 use prost::Message;
@@ -545,6 +545,7 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
             plugin_instance_id: "oms-1".into(),
             external_account_id: "st-4471".into(),
             account_id: growth_account.account_id.clone(),
+            new_account_name: String::new(),
         },
     )
     .await
@@ -582,24 +583,44 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     assert_eq!(read.links[0].account_id, growth_account.account_id);
 }
 
-#[tokio::test]
-async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
-    let h = harness("dashboard-1");
-    let open = account(&h, "Growth").await;
-    let link = |plugin: &str, account: &str| LinkExternalAccountRequest {
+fn link_request(plugin: &str, account: &str, new_name: &str) -> LinkExternalAccountRequest {
+    LinkExternalAccountRequest {
         plugin_instance_id: plugin.into(),
         external_account_id: "st-1".into(),
         account_id: account.into(),
-    };
-    let unknown: Result<ExternalAccountLink, _> = ask(
-        &h,
-        LINK_EXTERNAL_ACCOUNT,
-        "meridian.v1.LinkExternalAccountRequest",
-        link("ghost-1", &open.account_id),
-    )
-    .await;
-    assert!(unknown.is_err());
+        new_account_name: new_name.into(),
+    }
+}
 
+/// A link as a plugin's sidecar sends it: from the plugin, for `by`.
+async fn link_for(
+    h: &Harness,
+    request: LinkExternalAccountRequest,
+    by: &str,
+) -> Result<ExternalAccountLink, String> {
+    let (_, bytes) = h
+        .bus
+        .call_for(
+            LINK_EXTERNAL_ACCOUNT,
+            "meridian.v1.LinkExternalAccountRequest",
+            request.encode_to_vec(),
+            None,
+            None,
+            by,
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    Ok(ExternalAccountLink::decode(&bytes[..]).expect("decodes"))
+}
+
+#[tokio::test]
+async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
+    let ghost = harness("ghost-1");
+    let unknown = link_for(&ghost, link_request("ghost-1", "", "A new one"), ADA).await;
+    assert!(unknown.unwrap_err().contains("plugin that has reported"));
+
+    let h = harness("oms-1");
+    let open = account(&h, "Growth").await;
     let _: AccountRecord = ask(
         &h,
         CLOSE_ACCOUNT,
@@ -610,14 +631,160 @@ async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
     )
     .await
     .unwrap();
-    let closed: Result<ExternalAccountLink, _> = ask(
+    let closed = link_for(&h, link_request("oms-1", &open.account_id, ""), ADA).await;
+    assert!(closed.unwrap_err().contains("closed"));
+    let missing = link_for(&h, link_request("oms-1", "ACC-NONE", ""), ADA).await;
+    assert!(missing
+        .unwrap_err()
+        .contains("there is no account ACC-NONE"));
+}
+
+#[tokio::test]
+async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
+    // W6.4: from the plugin's own admin page, for the deployment admin.
+    let h = harness("oms-1");
+    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let linked = link_for(&h, link_request("oms-1", "", "  Fidelity Brokerage "), ADA)
+        .await
+        .unwrap();
+    assert!(
+        !linked.account_id.is_empty(),
+        "the reply names the new account"
+    );
+    let read = records(&h).await;
+    let made = read
+        .accounts
+        .iter()
+        .find(|a| a.account_id == linked.account_id)
+        .expect("the account exists");
+    assert_eq!(made.name, "Fidelity Brokerage");
+    assert_eq!(made.state, AccountState::Open as i32);
+    assert_eq!(read.links, std::slice::from_ref(&linked));
+    assert_eq!(linked.plugin_instance_id, "oms-1");
+    assert_eq!(linked.external_account_id, "st-1");
+    let event = tokio::time::timeout(Duration::from_secs(2), announced.recv())
+        .await
+        .expect("announced")
+        .unwrap();
+    let event = PluginConfigurationChangedEvent::decode(&event.envelope.payload[..]).unwrap();
+    assert_eq!(event.plugin_instance_id, "oms-1", "its sidecar is told");
+
+    // The link is the plugin's right to the account (W4.11).
+    let configured: PluginConfiguration = ask(
         &h,
-        LINK_EXTERNAL_ACCOUNT,
-        "meridian.v1.LinkExternalAccountRequest",
-        link("oms-1", &open.account_id),
+        PLUGIN_CONFIGURATION,
+        "meridian.v1.PluginConfigurationRequest",
+        PluginConfigurationRequest {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        configured.write_account_ids,
+        std::slice::from_ref(&linked.account_id)
+    );
+
+    // Neither name removes it, and the account stays: records outlive links.
+    let unlinked = link_for(&h, link_request("oms-1", "", ""), ADA)
+        .await
+        .unwrap();
+    assert_eq!(unlinked.account_id, "");
+    let read = records(&h).await;
+    assert!(read.links.is_empty());
+    assert!(read
+        .accounts
+        .iter()
+        .any(|a| a.account_id == linked.account_id));
+}
+
+#[tokio::test]
+async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_nothing() {
+    let h = harness("oms-1");
+    let growth = account(&h, "Growth").await;
+    let both = link_for(
+        &h,
+        link_request("oms-1", &growth.account_id, "Another"),
+        ADA,
     )
     .await;
-    assert!(closed.unwrap_err().contains("closed"));
+    assert!(both.unwrap_err().contains("not both"));
+    let blank = link_for(&h, link_request("oms-1", "", "   "), ADA).await;
+    assert!(blank
+        .unwrap_err()
+        .contains("a new account's name is required"));
+    let read = records(&h).await;
+    assert_eq!(read.accounts.len(), 1, "no account was made");
+    assert!(read.links.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_is_a_deployment_admins_act_on_the_plugins_own_accounts() {
+    // Sent for nobody, it is refused: there is nobody to record it as.
+    let h = harness("oms-1");
+    let growth = account(&h, "Growth").await;
+    let nobody = link_for(&h, link_request("oms-1", &growth.account_id, ""), "").await;
+    assert!(nobody.unwrap_err().contains("sent for nobody"));
+    // A plugin names only its own external accounts, whatever it sends.
+    let other = link_for(&h, link_request("snaptrade-1", &growth.account_id, ""), ADA).await;
+    assert!(other
+        .unwrap_err()
+        .contains("only its own external accounts"));
+    assert!(records(&h).await.links.is_empty());
+}
+
+#[tokio::test]
+async fn the_deployments_accounts_are_read_for_a_deployment_admin_names_ids_and_states() {
+    let h = harness("oms-1");
+    let growth = account(&h, "Growth").await;
+    let old = account(&h, "Old income").await;
+    let _: AccountRecord = ask(
+        &h,
+        CLOSE_ACCOUNT,
+        "meridian.v1.CloseAccountRequest",
+        CloseAccountRequest {
+            account_id: old.account_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let read: Accounts = ask(
+        &h,
+        ACCOUNTS,
+        "meridian.v1.AccountsRequest",
+        AccountsRequest {},
+    )
+    .await
+    .unwrap();
+    let said: Vec<(&str, &str, i32)> = read
+        .accounts
+        .iter()
+        .map(|a| (a.account_id.as_str(), a.name.as_str(), a.state))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                growth.account_id.as_str(),
+                "Growth",
+                AccountState::Open as i32
+            ),
+            (
+                old.account_id.as_str(),
+                "Old income",
+                AccountState::Closed as i32
+            ),
+        ]
+    );
+    let for_nobody = h
+        .bus
+        .call(
+            ACCOUNTS,
+            "meridian.v1.AccountsRequest",
+            AccountsRequest {}.encode_to_vec(),
+            None,
+            None,
+        )
+        .await;
+    assert!(for_nobody.is_err(), "for nobody, nothing is answered");
 }
 
 #[tokio::test]

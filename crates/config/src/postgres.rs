@@ -442,6 +442,41 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn put_account_and_link(
+        &self,
+        account: &AccountRecord,
+        link: &ExternalAccountLink,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO config_account (account_id, name, state, created_at_ns)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &account.account_id,
+                &account.name,
+                &(account.state as i16),
+                &account.created_at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO config_external_account_link
+                    (plugin_instance_id, external_account_id, account_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (plugin_instance_id, external_account_id)
+             DO UPDATE SET account_id = excluded.account_id",
+            &[
+                &link.plugin_instance_id,
+                &link.external_account_id,
+                &link.account_id,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(())
+    }
+
     fn add_permission(&self, permission: &Permission) -> Result<()> {
         let mut conn = self.conn()?;
         insert_permission(&mut *conn, permission)

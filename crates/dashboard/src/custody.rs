@@ -2,10 +2,11 @@
 //!
 //! Three things, each heard on the bus and none asked for: the accounts a
 //! connection reaches (W2.8), the accounts refused for want of a link (W4.8),
-//! and why a connection's data is or is not current (W2.1). The dashboard shows
-//! them beside the link action (W6.4), so a deployment admin links the accounts
-//! they mean before anything is refused, sees any that were refused anyway,
-//! and knows whose fix a connection that is not current is.
+//! and why a connection's data is or is not current (W2.1). The dashboard
+//! counts the accounts nothing links on each plugin's health, leading to the
+//! plugin's own admin pages where it links them (W6.4, W6.10), and shows each
+//! connection's state on the plugin's overview, so a deployment admin knows
+//! whose fix a connection that is not current is.
 //!
 //! Held in memory and nowhere else. Every one of them is said again by whoever
 //! said it -- a connector reports its accounts and its sync state on each read,

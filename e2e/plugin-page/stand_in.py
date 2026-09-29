@@ -11,8 +11,18 @@ A POST to /write records a holding for the person the request came from
 decides whether that person may write the account.
 
 A POST to /report says, as the plugin itself, which accounts its connection
-reaches (W2.8) and why the linked one is not current (W2.1), which is what the
-dashboard lists beside its link action and shows with what to do.
+reaches (W2.8) and why the linked one is not current (W2.1): the dashboard
+counts the unlinked on its health, and shows the sync state with what to do.
+
+Its admin pages link them (W6.4), as a plugin's own admin page does: a GET of
+/accounts reads the deployment's accounts, and a POST to /link sends a link
+-- to an existing account, a new one named, or neither to remove it -- each
+acting for the person the request came from, whom the sidecar admits only
+when they administer the deployment. /link with "as_itself" sends it as the
+plugin, which the sidecar refuses. It declares three admin pages, which the
+dashboard's admin view of it shows as tabs (W4.8, W6.9); a GET of one is a
+small page on the UI kit saying which it is and who asked, and the Accounts
+page what it would offer to link.
 
 It declares two settings at registration (W4.1): a required secret, the way a
 venue's API key is, and a number. It watches them on the stream its sidecar
@@ -45,6 +55,12 @@ EXTERNAL_ACCOUNT = "ext-e2e"
 OTHER_ACCOUNT = "ext-e2e-roth"
 
 STARTED_AT_NS = time.time_ns()
+# Its admin pages, in the order the dashboard's admin view shows them as tabs.
+ADMIN_PAGES = [
+    sidecar_pb2.PageDeclaration(path="/admin/connections", title="Connections"),
+    sidecar_pb2.PageDeclaration(path="/admin/accounts", title="Accounts"),
+    sidecar_pb2.PageDeclaration(path="/admin/holdings", title="Holdings"),
+]
 DECLARED = [
     sidecar_pb2.SettingDeclaration(
         name="api_key", type=sidecar_pb2.SETTING_TYPE_STRING, required=True, secret=True,
@@ -62,7 +78,8 @@ def register():
     stub = sidecar_pb2_grpc.SidecarServiceStub(grpc.insecure_channel(SIDECAR))
     request = sidecar_pb2.RegisterRequest(
         schema_version="v2",
-        interface=sidecar_pb2.InterfaceDeclaration(loopback_port=PORT, title="Plugin page"),
+        interface=sidecar_pb2.InterfaceDeclaration(
+            loopback_port=PORT, title="Plugin page", admin_pages=ADMIN_PAGES),
         settings=DECLARED,
     )
     for _ in range(60):
@@ -178,6 +195,66 @@ def report():
     return said
 
 
+def refused_as(refused):
+    return {"ok": False, "code": refused.code().name, "detail": refused.details()}
+
+
+def accounts_for(header):
+    """The deployment's accounts, read for the person the header names."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        read = ops.ReadAccountsForLinking(
+            operations_pb2.ReadAccountsForLinkingParams(acting_for=assertion_of(header)),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "accounts": [
+        {"account_id": a.account_id, "name": a.name, "state": a.state} for a in read.accounts]}
+
+
+def link_for(header, asked):
+    """A link as the plugin's admin page sends it, for the person the header
+    names, or as the plugin itself when asked to."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    params = operations_pb2.LinkExternalAccountParams(
+        external_account_id=asked.get("external_account_id", ""),
+        account_id=asked.get("account_id", ""),
+        new_account_name=asked.get("new_account_name", ""))
+    if not asked.get("as_itself"):
+        params.acting_for.CopyFrom(assertion_of(header))
+    try:
+        linked = ops.LinkExternalAccount(params, timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "account_id": linked.account_id,
+            "plugin_instance_id": linked.plugin_instance_id}
+
+
+KIT = "/.meridian/ui/0.1.0/meridian.css"
+
+
+def admin_page(path, header):
+    """One of its admin pages, on the kit: which it is, for whom, and on the
+    Accounts page what it reaches and the deployment's accounts it offers."""
+    import html
+    title = next(page.title for page in ADMIN_PAGES if page.path == path)
+    caller = decoded(header) if header else {}
+    rows = ""
+    if path == "/admin/accounts":
+        read = accounts_for(header) if header else {"ok": False}
+        offered = ", ".join(html.escape(a["name"]) for a in read.get("accounts", [])) or "none"
+        rows = "".join(
+            f"<tr><td>{html.escape(external)}</td><td>{html.escape(name)}</td><td>{offered}</td></tr>"
+            for external, name in ((EXTERNAL_ACCOUNT, "E2E Brokerage"), (OTHER_ACCOUNT, "E2E Roth")))
+        rows = ("<table><thead><tr><th>External account</th><th>At the venue</th>"
+                f"<th>Could link to</th></tr></thead><tbody>{rows}</tbody></table>")
+    return (f"<!doctype html><html><head><meta charset=\"utf-8\"><link rel=\"stylesheet\" href=\"{KIT}\">"
+            f"<title>{html.escape(title)}</title></head><body><main class=\"page\">"
+            f"<h1>{html.escape(title)}</h1><p>A stand-in plugin's admin page, <code>{html.escape(path)}</code>, "
+            f"served to {html.escape(caller.get('display_name', 'nobody'))}, deployment admin: "
+            f"{'yes' if caller.get('deployment_admin') else 'no'}.</p>{rows}</main></body></html>")
+
+
 def decoded(header):
     assertion = assertion_of(header)
     claims = sidecar_pb2.CallerClaims.FromString(assertion.claims)
@@ -199,10 +276,19 @@ def decoded(header):
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         callers = self.headers.get_all("Meridian-Caller") or []
-        if self.path == "/settings":
-            body = json.dumps(settings_said()).encode()
+        if self.path in ("/settings", "/accounts"):
+            said = settings_said() if self.path == "/settings" else accounts_for(callers[0])
+            body = json.dumps(said).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.split("?", 1)[0] in {page.path for page in ADMIN_PAGES}:
+            body = admin_page(self.path.split("?", 1)[0], callers[0] if callers else None).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -226,9 +312,11 @@ class Page(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         callers = self.headers.get_all("Meridian-Caller") or []
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        sent = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.path == "/report":
             done = report()
+        elif self.path == "/link":
+            done = link_for(callers[0], json.loads(sent or b"{}"))
         else:
             done = write_for(callers[0]) if callers else {"ok": False, "detail": "nobody"}
         body = json.dumps(done).encode()

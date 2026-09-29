@@ -9,9 +9,16 @@ stand-in that says what reached it.
 Ada signs in with the account first run made, claims the deployment, and
 grants herself read on one account through the plugin -- what an
 administrator does -- and only then can she open it. The plugin says which
-accounts its connection reaches, and she links one from the list the
-dashboard shows beside the link action, where its sync state then says what
-to do about it (W2.8, W6.4, W2.1).
+accounts its connection reaches, and the dashboard counts those nothing links
+on the plugin's health. She links them on the plugin's own admin page, which
+reads the deployment's accounts and sends each link acting for her: to her
+account, to a new one it creates, and one removed again; the sidecar refuses
+the plugin as itself and an account it did not report, and the conductor a
+link naming both. The plugin's overview then shows the sync state against
+the account it is linked to, with what to do (W2.8, W6.4, W2.1).
+
+Its admin view is tabbed: Overview, Settings, Access, then the three admin
+pages it declared, each a link of its own (W4.8, W6.9).
 
 The dashboard frames the plugin's page under its own header, and serves the
 UI kit on the plugin's host (spec/plugin-pages-share-one-kit.md, Q2 and Q3);
@@ -215,8 +222,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def post_on_plugin_host(browser, path):
-    request = urllib.request.Request(dash(path), data=b"", method="POST",
+def post_on_plugin_host(browser, path, sent=None):
+    data = json.dumps(sent).encode() if sent is not None else b""
+    request = urllib.request.Request(dash(path), data=data, method="POST",
                                      headers={"Host": PLUGIN_HOST})
     request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in browser.cookies.items()))
     try:
@@ -226,35 +234,44 @@ def post_on_plugin_host(browser, path):
         return refused.code, refused.read().decode()
 
 
-def unlinked_on(page):
-    """The external accounts the admin page lists as waiting for a link."""
-    table = page.body.split('<table class="list unlinked">', 1)
-    if len(table) < 2:
-        return []
-    return re.findall(r'<tr data-id="([^"]+)"', table[1].split("</table>", 1)[0])
+VIEW = f"/admin/plugins/{INSTANCE}"
 
 
-def unlinked_table(page):
-    """The admin page's table of accounts waiting for a link, as text."""
-    table = page.body.split('<table class="list unlinked">', 1)
-    return table[1].split("</table>", 1)[0] if len(table) > 1 else ""
+def unlinked_said(page):
+    """What the plugin's line on the admin portal says of its unlinked
+    external accounts, if anything."""
+    plugins = page.body.split('<table class="list plugins">', 1)[-1].split("</table>", 1)[0]
+    found = re.search(r'data-flag="unlinked"[^>]*>(.*?)</p>', plugins, re.S)
+    return found.group(1) if found else ""
 
 
 def sync_on(page):
-    """The admin page's sync status table, as text."""
+    """The plugin's overview's sync status table, as text."""
     table = page.body.split('<table class="list sync">', 1)
     return table[1].split("</table>", 1)[0] if len(table) > 1 else ""
 
 
-def admin_until(ada, holds, seconds=30):
-    """/admin, read again until `holds` of it or `seconds` pass: what a
-    plugin says reaches the dashboard over the bus, a moment later."""
+def admin_until(ada, holds, seconds=30, path="/admin"):
+    """A dashboard page, read again until `holds` of it or `seconds` pass:
+    what a plugin says reaches the dashboard over the bus, a moment later."""
     deadline = time.monotonic() + seconds
-    page = ada.get(dash("/admin"))
+    page = ada.get(dash(path))
     while not holds(page) and time.monotonic() < deadline:
         time.sleep(1)
-        page = ada.get(dash("/admin"))
+        page = ada.get(dash(path))
     return page
+
+
+def tabs_on(page):
+    """The admin view's tabs, as (href, name), in order."""
+    nav = page.body.split('<nav class="tabs view-tabs"', 1)[-1].split("</nav>", 1)[0]
+    return [(href.replace("&amp;", "&"), name)
+            for href, name in re.findall(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', nav)]
+
+
+def link(plugin, **asked):
+    status, body = post_on_plugin_host(plugin, "/link", asked)
+    return json.loads(body) if status == 200 else {"ok": False, "detail": f"{status} {body[:200]}"}
 
 
 def report(plugin):
@@ -305,12 +322,12 @@ def administer(ada, action, fields, patience=0):
 
 
 def settings_form(ada, patience=45):
-    """The plugin's admin view with its settings form, once the conductor has
+    """The plugin's admin view on its Settings tab, once the conductor has
     its declarations and the dashboard has read them again, which is within
     30 seconds."""
     deadline = time.monotonic() + patience
     while True:
-        page = ada.get(dash(f"/admin/plugins/{INSTANCE}"))
+        page = ada.get(dash(f"{VIEW}?tab=settings"))
         if (page.status == 200 and 'data-setting="api_key"' in page.body) \
                 or time.monotonic() > deadline:
             return page
@@ -340,8 +357,8 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     check('type="password"' in field and "not set" in field and "Required" in field,
           f"the secret is a password field, not set, and says it is required: {field[:300]}")
     old = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings"))
-    check(old.status == 303 and (old.location or "").endswith(f"/admin/plugins/{INSTANCE}#settings"),
-          f"the form's old address is the view's: {old.status} {old.location!r}")
+    check(old.status == 303 and (old.location or "").endswith(f"{VIEW}?tab=settings"),
+          f"the form's old address is the view's Settings tab: {old.status} {old.location!r}")
     # Only a report heard after this counts: one sent while the conductor
     # was still starting says healthy, having nothing to say otherwise.
     mark = reports.mark()
@@ -349,7 +366,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
                     {"form_token": form_token(form), "secret.api_key": SECRET,
                      "value.poll_minutes": "15"})
     check(done.status == 303, f"saved: {done.status} {sentence(done)}")
-    after = ada.get(dash(f"/admin/plugins/{INSTANCE}?saved=1"))
+    after = ada.get(dash(f"{VIEW}?tab=settings&saved=1"))
     field = after.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
     check(">set<" in field and 'value=""' in field,
           f"and then it is set, and its field is still empty: {field[:300]}")
@@ -382,9 +399,16 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     head = view.body.split("</header>", 1)[0]
     check("Ada Park" in head and 'href="/admin">Admin portal<' in head and "/sign-out" in head,
           "under the one header: the person, the admin portal and signing out")
-    admin_page = view.body.split('id="admin-page"', 1)[-1].split("</section>", 1)[0]
-    check(f'href="/plugins/{INSTANCE}/enter?path=%2Fadmin' in admin_page,
-          f"and the plugin's own admin page, in a window of its own here: {admin_page[:400]}")
+    # W6.9: tabs, the plugin's three admin pages after the view's own.
+    tabs = tabs_on(view)
+    check([name for _, name in tabs]
+          == ["Overview", "Settings", "Access", "Connections", "Accounts", "Holdings"],
+          f"the view's tabs, then the admin pages it declared, in its order: {tabs}")
+    check(tabs[4][0] == f"{VIEW}?tab=%2Fadmin%2Faccounts", f"each a link of its own: {tabs}")
+    accounts = ada.get(dash(tabs[4][0]))
+    admin_page = accounts.body.split('id="admin-page"', 1)[-1].split("</section>", 1)[0]
+    check(f'href="/plugins/{INSTANCE}/enter?path=%2Fadmin%2Faccounts' in admin_page,
+          f"its Accounts page, in a window of its own here: {admin_page[:400]}")
 
 
 def main():
@@ -485,39 +509,63 @@ def main():
     check(front_door() == 401, "with no assertion, refused")
     check(front_door(seen.get("raw") or "x") == 403, "an assertion already used, refused")
 
-    say("G: the accounts the plugin reaches wait beside the link action (W2.8, W6.4)")
+    say("G: the plugin links the accounts it reaches, acting for her (W2.8, W6.4)")
     said = report(plugin)
     check(said.get("accounts") == "published", f"the accounts are published: {said}")
     check(said.get("sync") == "published",
           f"and its sync state, though nobody linked it, since it describes the connection: {said}")
-    page = admin_until(ada, lambda page: "ext-e2e-roth" in unlinked_on(page)
-                       and "Needs sign-in" in unlinked_table(page))
-    waiting = unlinked_on(page)
-    check(waiting[:2] == ["ext-e2e", "ext-e2e-roth"], f"both wait, in the plugin's order: {waiting}")
-    check("Roth IRA" in page.body and "E2E Brokerage" in page.body,
-          "with the custodian's name and the venue's own type")
-    check('name="external_account_id" value="ext-e2e"' in page.body,
-          "each with a link of its own")
-    check("Sign in again at the venue" in unlinked_table(page),
-          "and the connection's state beside the unlinked account, with what to do")
-    administer(ada, "/admin/links", {"plugin_instance_id": INSTANCE,
-                                     "external_account_id": "ext-e2e", "account_id": account})
-    overview = ada.get(dash("/admin"))
-    waiting = unlinked_on(overview)
-    check("ext-e2e" not in waiting and "ext-e2e-roth" in waiting,
-          f"linked, it stops waiting, and the other does not: {waiting}")
-    plugins = overview.body.split('<table class="list plugins">', 1)[-1].split("</table>", 1)[0]
-    check(f'<a href="/admin/plugins/{INSTANCE}">1 external account not linked</a>' in plugins,
-          f"and the plugin's line says how many wait, leading to its admin view: {plugins[:600]}")
+    page = admin_until(ada, lambda page: "2 external accounts not linked" in unlinked_said(page))
+    check(f'<a href="{VIEW}">2 external accounts not linked</a>' in unlinked_said(page),
+          f"the dashboard counts both on the plugin's line, leading to its view: {unlinked_said(page)!r}")
+    check("External accounts" not in page.body and "/admin/links" not in page.body
+          and 'name="external_account_id"' not in page.body,
+          "and lists and links none itself")
+    status, body, _, _ = on_plugin_host(plugin, "/accounts")
+    read = json.loads(body) if status == 200 else {}
+    check(read.get("ok") and any(a["account_id"] == account for a in read.get("accounts", [])),
+          f"the plugin reads the deployment's accounts for her: {status} {body[:300]}")
+    check(all(set(a) == {"account_id", "name", "state"} for a in read.get("accounts", [])),
+          "names, identifiers and states only")
+    itself = link(plugin, external_account_id="ext-e2e", account_id=account, as_itself=True)
+    check(itself.get("code") == "PERMISSION_DENIED" and "deployment admin" in itself.get("detail", ""),
+          f"as itself, the plugin is refused: {itself}")
+    unreported = link(plugin, external_account_id="ext-nobody-reported", account_id=account)
+    check(unreported.get("code") == "PERMISSION_DENIED" and "reported" in unreported.get("detail", ""),
+          f"an account it did not report is refused at the sidecar: {unreported}")
+    both = link(plugin, external_account_id="ext-e2e", account_id=account,
+                new_account_name="Two at once")
+    check(both.get("code") == "ABORTED" and "not both" in both.get("detail", ""),
+          f"naming both an account and a new one is refused by the conductor: {both}")
+    linked = link(plugin, external_account_id="ext-e2e", account_id=account)
+    check(linked.get("ok") and linked.get("account_id") == account
+          and linked.get("plugin_instance_id") == INSTANCE,
+          f"linked to her account, for this plugin: {linked}")
+    created = link(plugin, external_account_id="ext-e2e-roth", new_account_name="E2E Roth")
+    check(created.get("ok") and created.get("account_id") not in (None, "", account),
+          f"linked to a new account, made in the same step: {created}")
+    # The dashboard reads the records again within 30 seconds; the link was
+    # the plugin's, so nothing here asked it to read them sooner.
+    page = admin_until(ada, lambda page: row_id(page, "Accounts", "E2E Roth") is not None
+                       and "not linked" not in unlinked_said(page), seconds=45)
+    check(row_id(page, "Accounts", "E2E Roth") == created.get("account_id"),
+          "the new account is the deployment's, under the name given")
+    check("not linked" not in unlinked_said(page), f"none waits: {unlinked_said(page)!r}")
+    removed = link(plugin, external_account_id="ext-e2e-roth")
+    check(removed.get("ok") and removed.get("account_id") == "", f"and unlinked again: {removed}")
+    page = admin_until(ada, lambda page: "1 external account not linked" in unlinked_said(page),
+                       seconds=45)
+    check("1 external account not linked" in unlinked_said(page),
+          f"so one waits again, and its account stays: {unlinked_said(page)!r}")
+    check(row_id(page, "Accounts", "E2E Roth") is not None, "records outlive a link")
 
-    say("H: linked, its sync state is shown against its account (W2.1)")
+    say("H: linked, its sync state is shown against its account on its overview (W2.1)")
     # The sidecar reads the plugin's links again within 30 seconds of a
     # change, so the state is reported again until it arrives with the account.
     deadline = time.monotonic() + 45
     while True:
         said = report(plugin)
         time.sleep(1)
-        shown = sync_on(ada.get(dash("/admin")))
+        shown = sync_on(ada.get(dash(VIEW)))
         row = shown.split('data-id="ext-e2e"', 1)[-1].split("</tr>", 1)[0]
         if ("Needs sign-in" in row and "not linked" not in row) or time.monotonic() > deadline:
             break

@@ -134,6 +134,7 @@ nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:60
 .admin:not(.js) nav.tabs{display:none}\
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
+.plugin-view nav.tabs{margin-bottom:1rem}.plugin-view .stack>*+*{margin-top:1.25rem}\
 .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin:0 0 .5rem}\
 .section-head h2{margin:0 0 .15rem}.section-head .hint{margin:0}.section-head button{margin:0;flex-shrink:0}\
 .scroll{overflow-x:auto}table.list td{vertical-align:middle}\

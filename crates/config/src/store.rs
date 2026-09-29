@@ -151,6 +151,14 @@ pub trait Store: Send + Sync {
     /// Insert or replace one link; an empty `account_id` removes it.
     fn put_link(&self, link: &ExternalAccountLink) -> Result<()>;
 
+    /// Atomic: a new account and the link naming it, both or neither, so a
+    /// link that creates its account is never left half-done (W6.4).
+    fn put_account_and_link(
+        &self,
+        account: &AccountRecord,
+        link: &ExternalAccountLink,
+    ) -> Result<()>;
+
     fn add_permission(&self, permission: &Permission) -> Result<()>;
 
     /// Atomic: refuses the last permission to deployment admin.

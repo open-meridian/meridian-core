@@ -8,18 +8,22 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    ExternalAccountLink, ExternalAccountsEvent, MissingInstrumentDetectedEvent,
-    PluginConfiguration, PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest,
-    SyncState, SyncStatusEvent,
+    AccountRecord, AccountState, Accounts, ExternalAccountLink, ExternalAccountsEvent,
+    LinkExternalAccountRequest, MissingInstrumentDetectedEvent, PluginConfiguration,
+    PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest, SyncState,
+    SyncStatusEvent,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Decimal, ExternalAccount, HoldingSide, Identifier, Money, RecordHoldingParams,
-    RecordHoldingsStatementParams, ReportExternalAccountsParams, ReportMissingInstrumentParams,
-    ReportSyncStatusParams,
+    Decimal, ExternalAccount, HoldingSide, Identifier, LinkExternalAccountParams, Money,
+    ReadAccountsForLinkingParams, RecordHoldingParams, RecordHoldingsStatementParams,
+    ReportExternalAccountsParams, ReportMissingInstrumentParams, ReportSyncStatusParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{CallerAssertion, CallerClaims, RegisterRequest, TagAccess};
+use meridian_pb::v1::{
+    CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, RegisterRequest,
+    TagAccess,
+};
 use prost::Message;
 use tonic::{Code, Request};
 
@@ -38,8 +42,10 @@ fn contract() -> Contract {
          platform.custody.*.event.sync-status\tevent\tcustody\tdashboard\n\
          platform.custody.*.event.external-accounts\tevent\tcustody\tdashboard\n\
          platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n\
-         platform.street.command.record-statement\tcommand\tcustody\tstreet\n",
-        "name\tkind\ncustody\trole\nstreet\tcomponent\nsidecar\tcomponent\n",
+         platform.street.command.record-statement\tcommand\tcustody\tstreet\n\
+         platform.config.command.link-external-account\tcommand\tcustody\tconductor\n\
+         platform.config.query.accounts\tquery\tcustody\tconductor\n",
+        "name\tkind\ncustody\trole\nstreet\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
     )
     .unwrap()
 }
@@ -667,6 +673,11 @@ fn now() -> i64 {
 
 /// What the dashboard would have signed for a person holding `access`.
 fn assertion(key: &SigningKey, access: Vec<TagAccess>) -> CallerAssertion {
+    signed(key, access, false)
+}
+
+/// The same, for a deployment admin when `admin`.
+fn signed(key: &SigningKey, access: Vec<TagAccess>, admin: bool) -> CallerAssertion {
     let issued = now();
     let claims = CallerClaims {
         subject: "local|ada".into(),
@@ -676,7 +687,7 @@ fn assertion(key: &SigningKey, access: Vec<TagAccess>) -> CallerAssertion {
         issued_at_ns: issued,
         expires_at_ns: issued + 60_000_000_000,
         assertion_id: "a-1".into(),
-        deployment_admin: false,
+        deployment_admin: admin,
     }
     .encode_to_vec();
     CallerAssertion {
@@ -866,4 +877,305 @@ async fn a_command_naming_no_account_is_sent_for_somebody_who_may_write_somethin
         .record_holdings_statement(Request::new(statement(writing(&["ACC-1"]))))
         .await
         .expect("admitted");
+}
+
+// ── The deployment's configuration, for a deployment admin (W6.4) ───────────
+
+const LINK: &str = "platform.config.command.link-external-account";
+const ACCOUNTS: &str = "platform.config.query.accounts";
+
+/// What the conductor heard: each link, and whom it was for.
+type Heard = Arc<Mutex<Vec<(LinkExternalAccountRequest, String)>>>;
+
+/// A sidecar holding the dashboard's key, whose plugin reported `reported`,
+/// and a conductor that links as asked -- making ACC-NEW for a new account's
+/// name -- and answers the accounts it holds, keeping whom each was for.
+async fn linking(reported: &[&str]) -> (Sidecar, SigningKey, Heard, Arc<Mutex<Vec<String>>>) {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier = Arc::new(Verifier::holding(
+        "snaptrade-1",
+        KEY_ID,
+        key.verifying_key(),
+    ));
+    let (sidecar, bus, _) = registered_with(&["custody"], Some(verifier)).await;
+    let heard: Heard = Arc::default();
+    let keeping = Arc::clone(&heard);
+    bus.serve(LINK, move |envelope| {
+        let request = LinkExternalAccountRequest::decode(&envelope.payload[..]).unwrap();
+        let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+        keeping.lock().unwrap().push((request.clone(), by));
+        let account = if request.new_account_name.is_empty() {
+            request.account_id
+        } else {
+            "ACC-NEW".into()
+        };
+        Ok((
+            "meridian.v1.ExternalAccountLink".into(),
+            ExternalAccountLink {
+                plugin_instance_id: request.plugin_instance_id,
+                external_account_id: request.external_account_id,
+                account_id: account,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let readers = Arc::new(Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&readers);
+    bus.serve(ACCOUNTS, move |envelope| {
+        keeping
+            .lock()
+            .unwrap()
+            .push(envelope.meta.clone().unwrap_or_default().acting_for_subject);
+        Ok((
+            "meridian.v1.Accounts".into(),
+            Accounts {
+                accounts: vec![AccountRecord {
+                    account_id: "ACC-1".into(),
+                    name: "Growth".into(),
+                    state: AccountState::Open as i32,
+                    created_at_ns: 1,
+                }],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    if !reported.is_empty() {
+        sidecar
+            .report_external_accounts(Request::new(ReportExternalAccountsParams {
+                accounts: reported
+                    .iter()
+                    .map(|id| ExternalAccount {
+                        external_account_id: id.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            }))
+            .await
+            .expect("reported");
+    }
+    (sidecar, key, heard, readers)
+}
+
+fn link(
+    external: &str,
+    account: &str,
+    new_name: &str,
+    by: Option<CallerAssertion>,
+) -> LinkExternalAccountParams {
+    LinkExternalAccountParams {
+        external_account_id: external.into(),
+        account_id: account.into(),
+        new_account_name: new_name.into(),
+        acting_for: by,
+    }
+}
+
+#[tokio::test]
+async fn a_link_for_a_deployment_admin_is_stamped_with_them_and_this_plugin() {
+    // Linking ext-new to ACC-9, an account nothing may write through this
+    // plugin yet: the link is what grants it (W4.11), so the write scope is
+    // not what admits it.
+    let (sidecar, key, heard, _) = linking(&["ext-new", "st-2"]).await;
+    let admin = || Some(signed(&key, vec![], true));
+    let linked = sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-9", "", admin())))
+        .await
+        .expect("admitted")
+        .into_inner();
+    assert_eq!(linked.account_id, "ACC-9");
+    let created = sidecar
+        .link_external_account(Request::new(link(
+            "st-2",
+            "",
+            "Fidelity Brokerage",
+            admin(),
+        )))
+        .await
+        .expect("admitted")
+        .into_inner();
+    assert_eq!(
+        created.account_id, "ACC-NEW",
+        "the account the conductor made"
+    );
+    sidecar
+        .link_external_account(Request::new(link("ext-new", "", "", admin())))
+        .await
+        .expect("an unlink, admitted");
+
+    let heard = heard.lock().unwrap();
+    assert_eq!(heard.len(), 3);
+    for (request, by) in heard.iter() {
+        assert_eq!(
+            request.plugin_instance_id, "snaptrade-1",
+            "stamped by the sidecar"
+        );
+        assert_eq!(by, "local|ada", "recorded as hers");
+    }
+    assert_eq!(heard[1].0.new_account_name, "Fidelity Brokerage");
+    assert_eq!(
+        (
+            heard[2].0.account_id.as_str(),
+            heard[2].0.new_account_name.as_str()
+        ),
+        ("", "")
+    );
+}
+
+#[tokio::test]
+async fn a_link_is_refused_without_a_deployment_admins_assertion() {
+    let (sidecar, key, heard, _) = linking(&["ext-new"]).await;
+    for (by, said) in [
+        (None, "carries no assertion"),
+        // A person who writes the account, and does not administer.
+        (Some(signed(&key, writing(&["ACC-1"]), false)), "is not one"),
+    ] {
+        let refused = sidecar
+            .link_external_account(Request::new(link("ext-new", "ACC-1", "", by)))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(refused.message().contains(said), "{}", refused.message());
+        assert!(refused.message().contains("deployment admin"));
+    }
+    // One the dashboard did not sign is not an admin's however it reads.
+    let forged = signed(&SigningKey::generate(&mut rand::rngs::OsRng), vec![], true);
+    let refused = sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(forged))))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Unauthenticated);
+    assert!(
+        heard.lock().unwrap().is_empty(),
+        "nothing reaches the conductor"
+    );
+    assert_eq!(
+        sidecar.report(0).refused_grants,
+        2,
+        "the report counts both"
+    );
+}
+
+#[tokio::test]
+async fn a_link_is_refused_for_an_external_account_this_plugin_did_not_report() {
+    // W2.8: ext-new is reported; ext-2 is another plugin's name, and
+    // never-reported nobody's. ext-1 is linked and unreported: it may be
+    // unlinked, and linked to nothing else.
+    let (sidecar, key, heard, _) = linking(&["ext-new"]).await;
+    let admin = || Some(signed(&key, vec![], true));
+    for (external, account, new_name) in [
+        ("ext-2", "ACC-1", ""),
+        ("never-reported", "", "A new one"),
+        ("never-reported", "", ""),
+        ("ext-1", "ACC-3", ""),
+    ] {
+        let refused = sidecar
+            .link_external_account(Request::new(link(external, account, new_name, admin())))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied, "{external}");
+        assert!(
+            refused.message().contains("not one this plugin reported"),
+            "{}",
+            refused.message()
+        );
+    }
+    assert!(heard.lock().unwrap().is_empty());
+    sidecar
+        .link_external_account(Request::new(link("ext-1", "", "", admin())))
+        .await
+        .expect("its own link, removed");
+
+    // Reported again without it, ext-new is no longer one to link.
+    sidecar
+        .report_external_accounts(Request::new(ReportExternalAccountsParams {
+            accounts: vec![ExternalAccount {
+                external_account_id: "st-9".into(),
+                ..Default::default()
+            }],
+        }))
+        .await
+        .unwrap();
+    let refused = sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-1", "", admin())))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn the_deployments_accounts_are_read_only_for_a_deployment_admin() {
+    let (sidecar, key, _, readers) = linking(&[]).await;
+    let read = sidecar
+        .read_accounts_for_linking(Request::new(ReadAccountsForLinkingParams {
+            acting_for: Some(signed(&key, vec![], true)),
+        }))
+        .await
+        .expect("read for her")
+        .into_inner();
+    assert_eq!(read.accounts.len(), 1);
+    assert_eq!(
+        (
+            read.accounts[0].account_id.as_str(),
+            read.accounts[0].name.as_str()
+        ),
+        ("ACC-1", "Growth")
+    );
+    for by in [None, Some(signed(&key, reading(&["ACC-1"]), false))] {
+        let refused = sidecar
+            .read_accounts_for_linking(Request::new(ReadAccountsForLinkingParams {
+                acting_for: by,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+    }
+    assert_eq!(
+        *readers.lock().unwrap(),
+        vec!["local|ada".to_string()],
+        "asked once, for her"
+    );
+}
+
+#[tokio::test]
+async fn the_report_carries_the_interface_the_plugin_declared() {
+    // W4.8: its admin pages, in its order, for the dashboard's tabs (W6.9).
+    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let sidecar = Sidecar::under(
+        &contract(),
+        bus,
+        "DEP-test",
+        Identity::new("snaptrade-1", vec!["custody".into()]),
+    );
+    assert!(
+        sidecar.report(0).declared_interface.is_none(),
+        "not registered, none"
+    );
+    let declared = InterfaceDeclaration {
+        loopback_port: 8000,
+        title: "SnapTrade".into(),
+        admin_pages: ["Connections", "Accounts", "Holdings"]
+            .iter()
+            .map(|title| PageDeclaration {
+                path: format!("/admin/{}", title.to_lowercase()),
+                title: title.to_string(),
+            })
+            .collect(),
+    };
+    sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v2".into(),
+            interface: Some(declared.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(sidecar.report(0).declared_interface, Some(declared));
+    sidecar
+        .leave(Request::new(meridian_pb::v1::LeaveRequest::default()))
+        .await
+        .unwrap();
+    assert!(
+        sidecar.report(0).declared_interface.is_none(),
+        "gone when it leaves"
+    );
 }

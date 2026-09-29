@@ -3,15 +3,16 @@
 //! What the sidecar knows of its plugin, on the bus for the conductor and the
 //! dashboard: registered or not, healthy or not with the plugin's own reason,
 //! when it last said so, the contract version it registered with, the grants
-//! it was refused, and the settings it declared -- which is how the conductor
-//! learns what a settings form holds and which of it is secret. The sidecar speaks for the plugin because it is the
-//! one that sees refusals and silence, which the plugin cannot report about
-//! itself.
+//! it was refused, and the settings and the interface it declared -- which is
+//! how the conductor learns what a settings form holds and which of it is
+//! secret, and the dashboard which admin pages to show as tabs. The sidecar
+//! speaks for the plugin because it is the one that sees refusals and silence,
+//! which the plugin cannot report about itself.
 //!
 //! A plugin missing a required setting it declared is reported unhealthy with
 //! that reason, whatever it says of itself (W4.7). Beside the report, the
-//! external accounts it sent rows for that nobody has linked, for the
-//! dashboard to show a deployment admin (W4.8, W6.4).
+//! external accounts it sent rows for that nobody has linked, which the
+//! dashboard counts on the plugin's health (W4.8, W6.10).
 //!
 //! Sent when the sidecar starts, whenever the plugin registers or leaves or
 //! its configuration changes, and every 30 seconds between. The first is what makes a plugin known to the
@@ -111,6 +112,9 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.settings.clone())
                 .unwrap_or_default(),
+            // Its admin pages among them, which the dashboard's admin view of
+            // the instance shows as tabs (W6.9).
+            declared_interface: registration.as_ref().and_then(|r| r.interface.clone()),
         }
     }
 }

@@ -519,6 +519,14 @@ pub struct PluginReport {
     pub declared_settings: ::prost::alloc::vec::Vec<
         ::meridian_pb::v1::SettingDeclaration,
     >,
+    /// The interface the plugin declared when it registered (W4.8, W6.9): its
+    /// title and its admin pages, in order, which the dashboard's admin view of
+    /// the instance shows as tabs. Unset while the plugin is not registered, or
+    /// when it serves no interface.
+    #[prost(message, optional, tag = "14")]
+    pub declared_interface: ::core::option::Option<
+        ::meridian_pb::v1::InterfaceDeclaration,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -1127,7 +1135,9 @@ pub struct AccessRecords {
     #[prost(message, repeated, tag = "9")]
     pub plugin_settings: ::prost::alloc::vec::Vec<PluginSettingsRecord>,
 }
-/// The only thing holdings are recorded against. A plugin never creates one.
+/// The only thing holdings are recorded against. A plugin creates one only by
+/// linking an external account to a new one, acting for a deployment admin
+/// (W6.4).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountRecord {
     #[prost(string, tag = "1")]
@@ -1152,8 +1162,12 @@ pub struct CloseAccountRequest {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
-/// Links, or with an empty `account_id` unlinks, one external account a plugin
-/// reported. Held as one of that plugin's settings.
+/// Links an external account a plugin reported, or removes its link.
+/// Names an existing account, or a new account's name for the conductor to
+/// create and link in one step, or neither to remove the link; never both. Held
+/// as one of that plugin's settings. Sent by the plugin from its own admin page,
+/// acting for the deployment admin viewing it (W6.4); the plugin's sidecar
+/// stamps plugin_instance_id.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LinkExternalAccountRequest {
     #[prost(string, tag = "1")]
@@ -1162,6 +1176,9 @@ pub struct LinkExternalAccountRequest {
     pub external_account_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub account_id: ::prost::alloc::string::String,
+    /// A new account's name, for the conductor to create and link in one step.
+    #[prost(string, tag = "4")]
+    pub new_account_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExternalAccountLink {
@@ -1171,6 +1188,16 @@ pub struct ExternalAccountLink {
     pub external_account_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub account_id: ::prost::alloc::string::String,
+}
+/// The deployment's accounts, read by a plugin acting for a deployment admin
+/// to offer the accounts an external account can be linked to (W6.4).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AccountsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Accounts {
+    /// Names, identifiers and states; no holdings.
+    #[prost(message, repeated, tag = "1")]
+    pub accounts: ::prost::alloc::vec::Vec<AccountRecord>,
 }
 /// Published by a sidecar when its plugin brought data for external accounts
 /// with no link, which it refused (W2, W4.8). In the config domain rather than

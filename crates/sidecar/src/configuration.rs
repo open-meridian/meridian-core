@@ -212,7 +212,8 @@ impl Sidecar {
                 self.changed.notify_one();
                 Err(Status::failed_precondition(format!(
                     "external account {external_account_id} is not linked to an account; a \
-                     deployment admin links it (W6.4), and the next statement records it"
+                     deployment admin links it on the plugin's admin page (W6.4), and the next \
+                     statement records it"
                 )))
             }
         }

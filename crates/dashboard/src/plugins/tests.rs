@@ -133,6 +133,7 @@ async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> H
             interface: Some(InterfaceDeclaration {
                 loopback_port: plugin_port.into(),
                 title: "Holdings".into(),
+                admin_pages: vec![],
             }),
             ..Default::default()
         }))

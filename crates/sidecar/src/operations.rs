@@ -69,7 +69,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
         let message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
-        self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message).await
+        self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, None).await
     }
 
     /// W3.2: `platform.reference.event.instrument-missing`.
@@ -81,5 +81,29 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         message.placeholder_instrument_id = Default::default();
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
+    }
+
+    /// W6.4: `platform.config.command.link-external-account`.
+    async fn link_external_account(
+        &self,
+        request: Request<plugin::LinkExternalAccountParams>,
+    ) -> Result<Response<plugin::LinkExternalAccountResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::LinkExternalAccountRequest = self.as_domain(params)?;
+        message.plugin_instance_id = self.instance_id().to_string();
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.config.command.link-external-account", "meridian.v1.LinkExternalAccountRequest", message, account, acting_for).await
+    }
+
+    /// W6.4: `platform.config.query.accounts`.
+    async fn read_accounts_for_linking(
+        &self,
+        request: Request<plugin::ReadAccountsForLinkingParams>,
+    ) -> Result<Response<plugin::ReadAccountsForLinkingResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::AccountsRequest = self.as_domain(params)?;
+        self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, acting_for).await
     }
 }

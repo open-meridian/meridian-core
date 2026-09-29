@@ -97,6 +97,23 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn put_account_and_link(
+        &self,
+        account: &AccountRecord,
+        link: &ExternalAccountLink,
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        upsert(&mut state.records.accounts, account, |a| {
+            a.account_id == account.account_id
+        });
+        state.links.retain(|l| {
+            !(l.plugin_instance_id == link.plugin_instance_id
+                && l.external_account_id == link.external_account_id)
+        });
+        state.links.push(link.clone());
+        Ok(())
+    }
+
     fn add_permission(&self, permission: &Permission) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
         state.records.permissions.push(permission.clone());
