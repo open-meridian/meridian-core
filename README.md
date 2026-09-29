@@ -15,7 +15,7 @@ the whole path from registering a deployment on the platform to signing in:
 curl -fsSL https://raw.githubusercontent.com/open-meridian/meridian-cli/main/install.sh | sh
 meridian doctor
 meridian up --id DEP-…            # with the enrolment code from open-meridian.com
-meridian connect http://meridian.localhost
+meridian connect
 ```
 
 A laptop cluster is enough to try it (Rancher Desktop, k3s, kind or Docker
