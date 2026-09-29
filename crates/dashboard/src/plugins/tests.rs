@@ -1182,7 +1182,7 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
     assert!(head.contains("<a href=\"/\">Plugins</a>"));
     assert!(head.contains("Ada") && head.contains("/sign-out"));
     assert!(
-        !head.contains("Admin portal"),
+        !head.contains("href=\"/admin\">Admin<"),
         "Ada administers nothing here"
     );
     // The page below, entered through the dashboard with the theme on its

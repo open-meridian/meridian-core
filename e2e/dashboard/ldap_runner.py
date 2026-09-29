@@ -123,7 +123,7 @@ def is_admin_home(page):
     # What home's header shows a deployment admin, which is not what /admin's
     # heading says. Copying the wrong string made bob look unprivileged on a
     # page that had just let him into /admin.
-    return 'href="/admin">Admin portal<' in page.body
+    return 'href="/admin">Admin<' in page.body
 
 
 def wait_dashboard():

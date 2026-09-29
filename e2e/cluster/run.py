@@ -25,15 +25,18 @@ import urllib.error
 import urllib.request
 
 # What home's header shows a deployment admin and nobody else.
-ADMIN_HOME = 'href="/admin">Admin portal<'
-# What home said to a deployment admin before the one header, which a chart
-# published before it still says until the upgrade test upgrades it.
-ADMIN_HOME_BEFORE = "You are a deployment admin"
+ADMIN_HOME = 'href="/admin">Admin<'
+# What home said to a deployment admin in charts published before this one,
+# which the upgrade test's published chart still says until it is upgraded:
+# the words before the one header, and the header's link before one button.
+ADMIN_HOME_BEFORE = ("You are a deployment admin", 'href="/admin">Admin portal<')
 
 
 def administers(page, installed_chart_is_published=False):
     """Whether home says the person signed in administers the deployment."""
-    return ADMIN_HOME in page or (installed_chart_is_published and ADMIN_HOME_BEFORE in page)
+    return ADMIN_HOME in page or (
+        installed_chart_is_published and any(said in page for said in ADMIN_HOME_BEFORE)
+    )
 
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "trial")

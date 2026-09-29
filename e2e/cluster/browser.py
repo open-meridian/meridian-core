@@ -26,7 +26,7 @@ NAME = os.environ["E2E_NAME"]
 PASSWORD = os.environ["E2E_PASSWORD"]
 SESSION_COOKIE = "meridian_session"
 # What home's header shows a deployment admin and nobody else.
-ADMIN_HOME = 'href="/admin">Admin portal<'
+ADMIN_HOME = 'href="/admin">Admin<'
 
 failures = []
 

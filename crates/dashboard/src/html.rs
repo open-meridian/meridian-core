@@ -61,7 +61,6 @@ header.bar .bar-link{display:inline-flex;align-items:center;gap:.4rem;padding:.3
 color:var(--ink-soft);font-weight:550;white-space:nowrap}\
 header.bar .bar-link:hover{background:var(--hover);color:var(--ink);text-decoration:none}\
 header.bar .bar-link.here{background:var(--accent-wash);color:var(--accent)}\
-header.bar nav.sides{display:flex;gap:.25rem}\
 header.bar .person>summary{display:flex;align-items:center;gap:.5rem;padding:.3rem .5rem}\
 header.bar .person .avatar{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;\
 background:var(--accent-wash);color:var(--accent);font-weight:650;font-size:.8rem}\
@@ -351,17 +350,16 @@ fn header(chrome: &Chrome) -> String {
     let right = match &chrome.viewer {
         None => String::new(),
         Some(viewer) => {
-            // An admin moves between the two sides of the dashboard, so both
-            // are named, the one they are on marked; a person with no admin
-            // has one side, and the mark leads home.
+            // An admin moves between the two sides of the dashboard: one
+            // button to the side they are not on, "Admin" from the plugins
+            // and "Plugs" from the admin portal (the product owner,
+            // 2026-09-29). A person with no admin has one side, and no button.
             let admin = if viewer.admin {
-                format!(
-                    "<nav class=\"sides\" aria-label=\"Sides of the dashboard\">\
-                     <a class=\"bar-link{}\" href=\"/\">Plugins</a>\
-                     <a class=\"bar-link{}\" href=\"/admin\">Admin portal</a></nav>",
-                    if chrome.in_admin { "" } else { " here" },
-                    if chrome.in_admin { " here" } else { "" }
-                )
+                if chrome.in_admin {
+                    "<a class=\"bar-link side\" href=\"/\">Plugs</a>".to_string()
+                } else {
+                    "<a class=\"bar-link side\" href=\"/admin\">Admin</a>".to_string()
+                }
             } else {
                 String::new()
             };
@@ -462,11 +460,11 @@ mod tests {
         let head = admin.split("</header>").next().unwrap();
         assert!(head.contains("Ada &lt;Park&gt;"), "{head}");
         assert!(head.contains("action=\"/sign-out\"") && head.contains("value=\"tok-1\""));
-        assert!(head.contains("href=\"/admin\">Admin portal<"));
         assert!(
-            head.contains("<a class=\"bar-link here\" href=\"/\">Plugins</a>"),
-            "home is the Plugins side, marked: {head}"
+            head.contains("<a class=\"bar-link side\" href=\"/admin\">Admin</a>"),
+            "from the plugins, the way to the admin portal: {head}"
         );
+        assert!(!head.contains(">Plugs<"), "and not the side they are on");
         let in_admin = page_with(
             "Admin",
             "",
@@ -478,9 +476,9 @@ mod tests {
         );
         let head = in_admin.split("</header>").next().unwrap();
         assert!(
-            head.contains("<a class=\"bar-link\" href=\"/\">Plugins</a>")
-                && head.contains("<a class=\"bar-link here\" href=\"/admin\">Admin portal</a>"),
-            "in the portal, the way back to the plugins: {head}"
+            head.contains("<a class=\"bar-link side\" href=\"/\">Plugs</a>")
+                && !head.contains(">Admin</a>"),
+            "in the portal, the way back to the plugins, and only that: {head}"
         );
 
         let person = page_with(
@@ -491,7 +489,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!person.contains("Admin portal") && !person.contains(">Plugins</a>"));
+        assert!(!person.contains(">Admin</a>") && !person.contains(">Plugs</a>"));
         assert!(
             !page("Sign in", "").contains("/sign-out"),
             "nobody to sign out"

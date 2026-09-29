@@ -397,7 +397,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     health = view.body.split('id="health"', 1)[-1].split("</section>", 1)[0]
     check('<span class="badge good">Healthy</span>' in health, f"the view says it is healthy: {health[:400]}")
     head = view.body.split("</header>", 1)[0]
-    check("Ada Park" in head and 'href="/admin">Admin portal<' in head and "/sign-out" in head,
+    check("Ada Park" in head and 'href="/admin">Admin<' in head and "/sign-out" in head,
           "under the one header: the person, the admin portal and signing out")
     # W6.9: tabs, the plugin's three admin pages after the view's own.
     tabs = tabs_on(view)
