@@ -209,8 +209,9 @@ async fn the_admin_pages_are_for_deployment_admins_only() {
 
 /// The table in `body` whose class list includes `class`.
 fn table<'a>(body: &'a str, class: &str) -> &'a str {
-    body.split(&format!("<table class=\"list {class}\">"))
+    body.split(&format!("<table class=\"list {class}\""))
         .nth(1)
+        .and_then(|rest| rest.split_once('>').map(|(_, inside)| inside))
         .and_then(|rest| rest.split("</table>").next())
         .unwrap_or_else(|| panic!("no {class} table in the page"))
 }
@@ -1142,5 +1143,33 @@ async fn a_plugin_page_titled_as_one_of_the_views_own_does_not_take_its_tab() {
     assert!(
         page.contains(&format!("action=\"{SETTINGS}\"")),
         "?tab=settings is still the view's own"
+    );
+}
+
+#[tokio::test]
+async fn the_plugins_tab_names_the_instance_apart_and_offers_a_search() {
+    let h = harness(admin_records(), None);
+    h.app.custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: vec![ExternalAccount {
+                external_account_id: "SNAP-1".into(),
+                name: "Individual Brokerage 1234".into(),
+                venue_account_type: "Individual".into(),
+            }],
+        },
+    );
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    assert!(
+        body.contains("<th>Plugin</th><th>Instance</th><th>Health</th>"),
+        "the instance its own column"
+    );
+    assert!(
+        body.contains("data-filter=\"plugins-table\"") && body.contains("id=\"plugins-table\""),
+        "a search box narrowing the plugins' table"
+    );
+    assert!(
+        table(&body, "plugins").contains("<td><code>snaptrade-1</code></td>"),
+        "the instance in its own cell"
     );
 }

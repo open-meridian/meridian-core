@@ -142,13 +142,14 @@ pub fn render(
                     )
                 };
                 format!(
-                    "<tr data-id=\"{id}\"><td>{named}</td><td>{state}<span class=\"hint\">{detail}</span></td>\
+                    "<tr data-id=\"{id}\"><td>{plugin}</td><td><code>{id}</code></td>\
+                     <td>{state}<span class=\"hint\">{detail}</span></td>\
                      <td>{settings}</td><td class=\"flags\">{flags}</td>\
                      <td class=\"actions\"><a class=\"button\" href=\"{href}\">Manage</a></td></tr>",
                     id = escape(&line.instance),
-                    named = match &line.name {
-                        Some(name) => named(name, &line.instance),
-                        None => format!("<span class=\"name\">{}</span>", escape(&line.instance)),
+                    plugin = match &line.name {
+                        Some(name) => format!("<span class=\"name\">{}</span>", escape(name)),
+                        None => "<span class=\"faint\">not from the catalogue</span>".to_string(),
                     },
                     state = view::state_badge(&line.state),
                     detail = escape(&line.state.detail),
@@ -158,8 +159,11 @@ pub fn render(
             })
             .collect();
         format!(
-            "<div class=\"scroll\"><table class=\"list plugins\"><thead><tr><th>Plugin</th>\
-             <th>Health</th><th>Settings</th><th>Needs you</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<input class=\"filter\" type=\"search\" data-filter=\"plugins-table\" hidden \
+             placeholder=\"Search by plugin, instance, health or what it needs\" aria-label=\"Search plugins\">\
+             <div class=\"scroll\"><table class=\"list plugins\" id=\"plugins-table\"><thead><tr><th>Plugin</th>\
+             <th>Instance</th><th>Health</th><th>Settings</th><th>Needs you</th><th></th></tr></thead>\
+             <tbody>{rows}</tbody></table></div>"
         )
     };
     sections.push(section(

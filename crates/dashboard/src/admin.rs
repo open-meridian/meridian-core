@@ -313,7 +313,7 @@ fn admin_chrome(session: &Session) -> Chrome<'_> {
             form_token: &session.form_token,
             admin: true,
         }),
-        crumbs: "<a href=\"/admin\">Admin portal</a>".into(),
+        crumbs: "<a href=\"/admin\">Admin</a>".into(),
         main: "page",
         in_admin: true,
     }
@@ -439,7 +439,7 @@ async fn plugin_view(
     });
     let mut chrome = admin_chrome(&session);
     chrome.crumbs = format!(
-        "<a href=\"/admin\">Admin portal</a><span aria-hidden=\"true\">/</span>\
+        "<a href=\"/admin\">Admin</a><span aria-hidden=\"true\">/</span>\
          <a href=\"/admin#plugins\">Plugins</a><span aria-hidden=\"true\">/</span>\
          <span class=\"here\"><strong>{}</strong><code>{}</code></span>",
         escape(line.name.as_deref().unwrap_or(&instance)),

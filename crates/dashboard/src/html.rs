@@ -140,7 +140,8 @@ section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display
 .scroll{overflow-x:auto}table.list td{vertical-align:middle}\
 @media (max-width:36rem){.section-head{flex-direction:column}td.actions{white-space:normal}}\
 table.list tbody tr:hover td{background:var(--line-soft)}\
-table.list .name{font-weight:550}table.plugins td:first-child{white-space:nowrap}\
+table.list .name{font-weight:550}table.list .hint{margin:.15rem 0 0}\
+input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins td:first-child{white-space:nowrap}\
 .id{display:block;font:.76rem var(--mono);color:var(--ink-faint);font-weight:400}\
 td.actions{text-align:right;white-space:nowrap}td.actions form{display:inline}\
 td.actions button,td.actions .button{margin:0 0 0 .35rem;padding:.3rem .7rem;font-size:.84rem}\
@@ -304,6 +305,21 @@ const CHROME_SCRIPT: &str = r#"(function () {
     frames.forEach(tell);
     var menu = chosen.closest("details"); if (menu) menu.open = false;
   });
+  // A search box names the table it narrows (data-filter="id"): rows whose
+  // text holds every word typed stay, the rest hide. Without script, every
+  // row shows.
+  document.querySelectorAll("input[data-filter]").forEach(function (box) {
+    var table = document.getElementById(box.getAttribute("data-filter"));
+    if (!table) return;
+    box.hidden = false;
+    box.addEventListener("input", function () {
+      var words = box.value.toLowerCase().split(/\s+/).filter(Boolean);
+      table.querySelectorAll("tbody tr").forEach(function (row) {
+        var text = row.textContent.toLowerCase();
+        row.hidden = !words.every(function (w) { return text.indexOf(w) !== -1; });
+      });
+    });
+  });
 })();"#;
 
 /// Who is signed in, for the header.
@@ -340,7 +356,7 @@ pub fn page_with(title: &str, body: &str, chrome: &Chrome) -> String {
 
 fn header(chrome: &Chrome) -> String {
     let crumbs = if chrome.crumbs.is_empty() {
-        "<span class=\"where\">Deployment</span>".to_string()
+        "<span class=\"where\">Dashboard</span>".to_string()
     } else {
         format!(
             "<nav class=\"crumbs\" aria-label=\"Where you are\">{}</nav>",
@@ -350,13 +366,14 @@ fn header(chrome: &Chrome) -> String {
     let right = match &chrome.viewer {
         None => String::new(),
         Some(viewer) => {
-            // An admin moves between the two sides of the dashboard: one
-            // button to the side they are not on, "Admin" from the plugins
-            // and "Plugs" from the admin portal (the product owner,
-            // 2026-09-29). A person with no admin has one side, and no button.
+            // An admin moves between the two sides: one button to the side
+            // they are not on, "Admin" from the dashboard and "Dashboard"
+            // from the admin portal, each of which has its Plugins (the
+            // product owner, 2026-09-29). A person with no admin has one
+            // side, and no button.
             let admin = if viewer.admin {
                 if chrome.in_admin {
-                    "<a class=\"bar-link side\" href=\"/\">Plugs</a>".to_string()
+                    "<a class=\"bar-link side\" href=\"/\">Dashboard</a>".to_string()
                 } else {
                     "<a class=\"bar-link side\" href=\"/admin\">Admin</a>".to_string()
                 }
@@ -464,7 +481,10 @@ mod tests {
             head.contains("<a class=\"bar-link side\" href=\"/admin\">Admin</a>"),
             "from the plugins, the way to the admin portal: {head}"
         );
-        assert!(!head.contains(">Plugs<"), "and not the side they are on");
+        assert!(
+            !head.contains(">Dashboard</a>"),
+            "and not the side they are on"
+        );
         let in_admin = page_with(
             "Admin",
             "",
@@ -476,7 +496,7 @@ mod tests {
         );
         let head = in_admin.split("</header>").next().unwrap();
         assert!(
-            head.contains("<a class=\"bar-link side\" href=\"/\">Plugs</a>")
+            head.contains("<a class=\"bar-link side\" href=\"/\">Dashboard</a>")
                 && !head.contains(">Admin</a>"),
             "in the portal, the way back to the plugins, and only that: {head}"
         );
@@ -489,7 +509,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!person.contains(">Admin</a>") && !person.contains(">Plugs</a>"));
+        assert!(!person.contains(">Admin</a>") && !person.contains(">Dashboard</a>"));
         assert!(
             !page("Sign in", "").contains("/sign-out"),
             "nobody to sign out"
