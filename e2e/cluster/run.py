@@ -531,6 +531,18 @@ def main():
     else:
         print("B: installed, carrying only those two values", flush=True)
         run("kubectl", "create", "namespace", NAMESPACE)
+        # A new namespace's default service account is made by a controller
+        # a moment later, and a pod asking for it before then is refused: the
+        # install's hooks would wait on pods that were never made.
+        wait_for(
+            f"the default service account in {NAMESPACE}",
+            lambda: subprocess.run(
+                ["kubectl", "--namespace", NAMESPACE, "get", "serviceaccount", "default"],
+                capture_output=True,
+            ).returncode == 0,
+            seconds=120,
+        )
+        s.note(f"{NAMESPACE} has its default service account")
         values = [
             "--set", f"deployment.id={deployment_id}",
             "--set", f"deployment.enrolmentCode={enrolment_code}",

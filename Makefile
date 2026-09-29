@@ -411,6 +411,20 @@ e2e-cluster-upgrade:
 # started, and CoreDNS reads that file through a mount that never updates:
 # without the restart the name resolves to nothing on a runner, and to the
 # desktop's own answer on a laptop, which hides the defect.
+#
+# Nothing uses the cluster until it is ready. `k3d cluster create --wait`
+# returns once the server has started, which is before k3s has made its own
+# deployments or its aggregated API answers, and on 2026-09-29 three runs
+# failed there before any product code ran: CoreDNS not found by the restart,
+# the API server unable to handle the request, and a pre-install hook left
+# waiting five minutes. So each step below is waited for in turn, each for at
+# most E2E_K3D_READY_SECONDS, with a line saying what and for how long, and on
+# giving up the cluster's pods: the API server ready; the default service
+# account made, which is the controllers running; k3s's own deployments there
+# and available (E2E_K3D_SYSTEM: names, the database's volume, the metrics API
+# helm's discovery lists, and the Ingress the run arrives through); and every
+# API group discoverable, since a helm install asks for them all. A cluster
+# that fails to be created at all is made once more before giving up.
 K3D ?= k3d
 E2E_K3D_CLUSTER ?= meridian-e2e
 E2E_K3D_NETWORK ?= meridian-k3d
@@ -421,23 +435,53 @@ E2E_K3D_KUBECONFIG ?= $(CURDIR)/.e2e-k3d.kubeconfig
 E2E_CLUSTER_TARGET ?= e2e-cluster
 # Set to anything to keep the cluster afterwards, for reading.
 E2E_K3D_KEEP ?=
+E2E_K3D_READY_SECONDS ?= 300
+E2E_K3D_SYSTEM ?= coredns local-path-provisioner metrics-server traefik
+
+# `ready <what> <command...>`: the command, every two seconds until it
+# succeeds or E2E_K3D_READY_SECONDS have passed.
+K3D_READY = ready() { \
+	  what="$$1"; shift; start=$$(date +%s); \
+	  echo "e2e-cluster-k3d: waiting for $$what, at most $(E2E_K3D_READY_SECONDS)s"; \
+	  until "$$@" >/dev/null 2>&1; do \
+	    if [ $$(( $$(date +%s) - start )) -ge $(E2E_K3D_READY_SECONDS) ]; then \
+	      echo "e2e-cluster-k3d: gave up on $$what after $(E2E_K3D_READY_SECONDS)s. It said:" >&2; \
+	      "$$@" >&2 || true; \
+	      echo "e2e-cluster-k3d: and the cluster's pods:" >&2; \
+	      kubectl get pods -A -o wide >&2 || true; \
+	      echo "e2e-cluster-k3d: the cluster is left; remove it with: $(K3D) cluster delete $(E2E_K3D_CLUSTER)" >&2; \
+	      return 1; \
+	    fi; \
+	    sleep 2; \
+	  done; \
+	  echo "e2e-cluster-k3d:   ready after $$(( $$(date +%s) - start ))s"; \
+	}
 
 e2e-cluster-k3d:
 	@docker network inspect $(E2E_K3D_NETWORK) >/dev/null 2>&1 \
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET)"
-	@$(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
+	@: >.e2e-k3d.log; made=; for attempt in 1 2; do \
+	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
-		--api-port $(E2E_K3D_API) -p "80:80@loadbalancer" --wait >/dev/null
-	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
-	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout restart deploy/coredns >/dev/null
-	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout status deploy/coredns --timeout=120s >/dev/null
-	@for i in $$(seq 1 120); do \
-		KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system get deploy/traefik >/dev/null 2>&1 && break; sleep 2; \
+		--api-port $(E2E_K3D_API) -p "80:80@loadbalancer" \
+		--wait --timeout $(E2E_K3D_READY_SECONDS)s >>.e2e-k3d.log 2>&1; then made=yes; break; fi; \
+	  echo "e2e-cluster-k3d: making the cluster failed, attempt $$attempt of 2; the tail of .e2e-k3d.log:" >&2; \
+	  tail -20 .e2e-k3d.log >&2; \
+	  $(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true; \
 	done; \
-	KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n kube-system rollout status deploy/traefik --timeout=300s >/dev/null \
-		|| { echo "e2e-cluster-k3d: k3s's Traefik did not come up, and the run reaches the deployment through it" >&2; exit 1; }
+	[ -n "$$made" ] || { echo "e2e-cluster-k3d: the cluster could not be made, twice" >&2; exit 1; }
+	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
+	@$(K3D_READY); export KUBECONFIG=$(E2E_K3D_KUBECONFIG); began=$$(date +%s); \
+	ready "the API server (/readyz)" kubectl get --raw /readyz \
+	&& ready "the default service account" kubectl -n default get serviceaccount default \
+	&& ready "kube-system's deployments to exist: $(E2E_K3D_SYSTEM)" kubectl -n kube-system get deployment $(E2E_K3D_SYSTEM) \
+	&& ready "kube-system's deployments to be available" kubectl -n kube-system wait --for=condition=Available --timeout=10s deployment $(E2E_K3D_SYSTEM) \
+	&& ready "every API group to be discoverable" kubectl api-resources \
+	&& kubectl -n kube-system rollout restart deploy/coredns >/dev/null \
+	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
+	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
 		E2E_IMAGE_LOAD="$(K3D) image import -c $(E2E_K3D_CLUSTER)"; \
 	  held=$$?; \
