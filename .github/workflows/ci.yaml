@@ -88,7 +88,8 @@ jobs:
 
   # The four runs that install the chart on a real cluster and sign a person
   # in: spec/installation-and-first-run, paths 1 and 2 and path 1's other two
-  # ways in. Everything above stands something in; these stand in nothing,
+  # ways in. And a fifth that upgrades one in place from the chart published
+  # last (task kernel/upgrading-a-deployment-in-place). Everything above stands something in; these stand in nothing,
   # and on 2026-09-24 and 25 they found seven defects in a chart that every
   # job above had passed -- one of them published, because `publish` waited
   # on this workflow and this workflow had never installed a chart.
@@ -108,7 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc]
+        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc, e2e-cluster-upgrade]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -155,9 +156,12 @@ jobs:
           echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
           sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
 
+      # Helm 4 for the upgrade: its --wait waits for every resource a release
+      # names to exist, and failed an upgrade that Helm 3's passed. The
+      # installs keep the version they were proven on.
       - uses: azure/setup-helm@v4
         with:
-          version: v3.16.2
+          version: ${{ matrix.target == 'e2e-cluster-upgrade' && 'v4.2.3' || 'v3.16.2' }}
 
       - name: make e2e-cluster-k3d
         working-directory: workspace/meridian-core

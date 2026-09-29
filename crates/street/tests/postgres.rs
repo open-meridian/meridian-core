@@ -1231,4 +1231,10 @@ fn a_database_ahead_of_this_binary_is_refused() {
         said.contains(&meridian_street::migrations::latest().to_string()),
         "the refusal has to name both versions: {said}"
     );
+    // Told apart from every other refusal at start, because a starting store
+    // waits out the others and must not wait out this one.
+    assert!(
+        matches!(refused, meridian_street::store::StoreError::SchemaAhead(_)),
+        "a schema ahead of this binary is not one waiting fixes: {refused:?}"
+    );
 }

@@ -17,6 +17,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.street.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -61,5 +62,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.streetKey) }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
+          volumeMounts:
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}

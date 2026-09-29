@@ -17,6 +17,18 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.conductor.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # Recreate: the old conductor stops before the new one starts. A rolling
+  # update keeps the old one answering the bus until the new one is ready,
+  # and the new one is not ready while it waits for its schema, so for that
+  # whole wait two conductors answer the same questions from two stores.
+  # After the wizard's apply the old one's is first run's, in memory, holding
+  # nobody: the cluster run's dashboard read the access records from it at
+  # sign-in, and the administrator the wizard named was nobody on the home
+  # page (task kernel/upgrading-a-deployment-in-place). In an upgrade it is
+  # the old binary reading a schema the new one's migration is changing.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -121,6 +133,8 @@ spec:
               value: /run/meridian/settings-key
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           # No port and no Service. It speaks outward over HTTPS and inward over
           # the broker; nothing needs to reach it.
           volumeMounts:
@@ -134,6 +148,7 @@ spec:
             - name: settings-key
               mountPath: /run/meridian/settings-key
               readOnly: true
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
             {{- if include "meridian-runtime.generatedKey" . }}
             # The key this component made, in a volume only it mounts. Writable,
             # because the first start is what creates the pair; after that
@@ -144,6 +159,7 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         {{- if include "meridian-runtime.generatedKey" . }}
         - name: key
           persistentVolumeClaim:

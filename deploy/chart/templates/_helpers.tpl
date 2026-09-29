@@ -108,3 +108,41 @@ runtime
 {{- define "meridian-runtime.databaseSecret" -}}
 {{- .Values.database.existingSecret | default (printf "%s-database" (include "meridian-runtime.fullname" .)) -}}
 {{- end -}}
+
+{{/*
+Readiness for a component with no port: the street store, the instrument
+store, the conductor and the launcher.
+
+Each waits for what it needs -- its database, its schema, the broker --
+rather than exiting, and writes this file once it serves
+(meridian_runtime::Ready). The probe looks for it, so a rollout waits for a
+component that is still waiting, where before it counted the pod ready the
+moment it started and stopped the old one (task
+kernel/upgrading-a-deployment-in-place). A file rather than a port, because a
+port would be a way into a component that nothing outside its pod needs to
+reach. Four pieces, because a container's env, probe and mounts and its pod's
+volumes are four places.
+*/}}
+{{- define "meridian-runtime.readyEnv" -}}
+- name: MERIDIAN_READY_FILE
+  value: /run/meridian-ready/serving
+{{- end -}}
+
+{{- define "meridian-runtime.readyProbe" -}}
+readinessProbe:
+  exec:
+    command: ["test", "-e", "/run/meridian-ready/serving"]
+  periodSeconds: 5
+{{- end -}}
+
+{{- define "meridian-runtime.readyMount" -}}
+- name: ready
+  mountPath: /run/meridian-ready
+{{- end -}}
+
+{{- define "meridian-runtime.readyVolume" -}}
+- name: ready
+  emptyDir:
+    medium: Memory
+    sizeLimit: 1Mi
+{{- end -}}

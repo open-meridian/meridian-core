@@ -16,9 +16,19 @@
   appears, which is the whole of the waiting.
 
   What the hook gave up is ordering: the components come up while this runs.
-  They verify the schema rather than applying it and refuse to serve one they
-  do not recognise, so the window is a readiness failure that clears, never a
-  wrong answer.
+  They verify the schema rather than applying it, wait, not ready, for one
+  this has not reached yet, and refuse one newer than they understand. So the
+  window is a readiness failure that clears, never a wrong answer and never a
+  restart, and a rollout waits for it with any tool that applies the chart.
+
+  Cleaned up two ways, each for a case the other misses (task
+  kernel/upgrading-a-deployment-in-place). Named by revision, so the next
+  upgrade's manifest no longer names this one and Helm removes it then,
+  whatever became of it: a failed migration stays readable for as long as its
+  release is the current one. And a day after it finishes, for the Job Helm
+  never compares against: an upgrade that failed is not the release the next
+  one diffs from, so its Jobs were left behind for good. Every Job in this
+  chart does the same, and chart-check refuses one that does not.
 
   An administrator whose delivery tooling does not honour hooks runs the same
   image with `migrate` themselves; the runtime refuses to serve against a
@@ -35,6 +45,7 @@ spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
   # No deadline: this may wait for a database the wizard has not configured
   # yet, and a deadline would count that wait as failure.
+  # A day, finished either way: see above.
   ttlSecondsAfterFinished: 86400
   template:
     metadata:

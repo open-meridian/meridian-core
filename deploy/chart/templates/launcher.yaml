@@ -105,6 +105,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -158,13 +159,17 @@ spec:
                   key: {{ .Values.launcher.instanceId }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           volumeMounts:
             - name: template
               mountPath: /etc/meridian/launcher
               readOnly: true
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         - name: template
           configMap:
             name: {{ $name }}-template

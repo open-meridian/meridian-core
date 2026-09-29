@@ -4,11 +4,15 @@
   Make this deployment's key, inside the cluster, before anything starts.
 
   `public-key` writes a key pair when the volume has none and prints only the
-  public half. The private half stays in the volume the instrument store mounts, which
+  public half. The private half stays in the volume the conductor mounts, which
   is the whole point: a key generated anywhere else has been in a file, a shell
   history and a backup before it arrives.
 
-  Read the public half from this job's log and register it with the platform.
+  Nobody reads the public half from this job's log any more: the conductor
+  registers it with the enrolment code (W5.24), and the wizard shows its
+  fingerprint. So the job goes once it has succeeded, rather than staying as a
+  finished Job from the install for the life of the deployment; one that
+  failed stays, and the install with it, to be read.
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -40,8 +44,7 @@ metadata:
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-10"
-    # Left behind on purpose: its log is where the public half is read from.
-    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 1
   template:

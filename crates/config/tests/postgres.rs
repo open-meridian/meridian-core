@@ -651,3 +651,43 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() 
     );
     assert!(neither.is_err());
 }
+
+#[test]
+fn a_database_behind_this_binary_is_waited_for_and_one_ahead_is_refused() {
+    // A starting conductor waits out a schema the migration Job has not
+    // reached, and refuses one a newer release migrated: waiting never fixes
+    // that, and this binary's queries may already be wrong against it. The
+    // two have to be told apart by what the store returns, not by its words.
+    let (store, url) = store_at("ahead");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+
+    client
+        .execute(
+            "DELETE FROM config_schema_migration WHERE version = $1",
+            &[&meridian_config::migrations::latest()],
+        )
+        .expect("could not pretend to be behind");
+    let behind = store.verify().expect_err("a schema behind must not verify");
+    assert!(
+        matches!(behind, meridian_config::store::StoreError::Unavailable(_)),
+        "a schema behind this binary is one the migration reaches: {behind:?}"
+    );
+
+    client
+        .execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns)
+             VALUES (999, 'later', 1), ($1, 'restored', 1)",
+            &[&meridian_config::migrations::latest()],
+        )
+        .expect("could not pretend to be ahead");
+    let ahead = store.verify().expect_err("a newer schema must not verify");
+    let said = ahead.to_string();
+    assert!(
+        said.contains("999") && said.contains(&meridian_config::migrations::latest().to_string()),
+        "the refusal has to name both versions: {said}"
+    );
+    assert!(
+        matches!(ahead, meridian_config::store::StoreError::SchemaAhead(_)),
+        "a schema ahead of this binary is not one waiting fixes: {ahead:?}"
+    );
+}

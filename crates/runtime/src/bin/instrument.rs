@@ -15,7 +15,10 @@
 use std::sync::Arc;
 
 use meridian_instrument::{InstrumentService, PostgresStore, SystemClock};
-use meridian_runtime::{bus_from_env, report_inward_forever, required, shutdown, var};
+use meridian_runtime::{
+    bus_from_env, on_runtime, report_inward_forever, required, shutdown, var, wait_for_store,
+    Ready, Wait,
+};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -45,45 +48,55 @@ fn run() -> Result<(), String> {
         return grant_if_serving(&url);
     }
 
-    let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
-    store.verify().map_err(|failed| failed.to_string())?;
+    // Not ready until it serves, whatever this pod said before.
+    let ready = Ready::from_env();
+
+    // Waited for rather than refused: in an upgrade this starts beside the Job
+    // that migrates for it.
+    let store: Arc<dyn meridian_instrument::Store> = Arc::new(wait_for_store(
+        "the instrument store's database",
+        &url,
+        |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
+        |store| {
+            store
+                .verify()
+                .map_err(|failed| Wait::NotYet(failed.to_string()))
+        },
+    )?);
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "instrument-1".into());
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|failed| failed.to_string())?
-        .block_on(async {
-            let bus = bus_from_env(&instance_id).await?;
-            let reporting_bus = Arc::clone(&bus);
+    // The store is borrowed, never moved in, so it outlives the runtime
+    // (meridian_runtime::on_runtime).
+    on_runtime(async {
+        let bus = bus_from_env(&instance_id).await?;
+        let reporting_bus = Arc::clone(&bus);
 
-            let service = InstrumentService::new(bus, Arc::new(store), Arc::new(SystemClock));
+        let service = InstrumentService::new(bus, Arc::clone(&store), Arc::new(SystemClock));
 
-            // Registered and subscribed before this returns, so nothing is
-            // published into the gap between starting and listening.
-            let running = service.start();
+        // Registered and subscribed before this returns, so nothing is
+        // published into the gap between starting and listening.
+        let running = service.start();
 
-            // W5.20. Said on the bus for the conductor to carry outward. This
-            // process holds no key, and giving it one so it could report
-            // directly would put the deployment's identity back in a store.
-            tokio::spawn(
-                async move { report_inward_forever(reporting_bus, "instrument", 0).await },
-            );
+        // W5.20. Said on the bus for the conductor to carry outward. This
+        // process holds no key, and giving it one so it could report
+        // directly would put the deployment's identity back in a store.
+        tokio::spawn(async move { report_inward_forever(reporting_bus, "instrument", 0).await });
 
-            tracing::info!(instance_id, "the instrument store is serving");
+        tracing::info!(instance_id, "the instrument store is serving");
+        ready.serving();
 
-            tokio::select! {
-                _ = running => {
-                    tracing::warn!("the bus shut down");
-                    Ok(())
-                }
-                _ = shutdown() => {
-                    tracing::info!("stopping");
-                    Ok(())
-                }
+        tokio::select! {
+            _ = running => {
+                tracing::warn!("the bus shut down");
+                Ok(())
             }
-        })
+            _ = shutdown() => {
+                tracing::info!("stopping");
+                Ok(())
+            }
+        }
+    })
 }
 
 /// Grant to the serving role, when this deployment has one.

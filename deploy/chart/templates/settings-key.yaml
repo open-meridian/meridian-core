@@ -22,6 +22,7 @@
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-settings-key" $full }}
+{{- $binding := printf "%s-grant" $name }}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
 apiVersion: v1
 kind: Secret
@@ -59,15 +60,20 @@ rules:
     verbs: ["get", "patch"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    resourceNames: [{{ $name | quote }}]
+    resourceNames: [{{ $binding | quote }}]
     verbs: ["delete"]
 ---
+# The rights, bound for each install and upgrade and given up by the Job: a
+# hook, for the reason first-run.yaml gives.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ $name }}
+  name: {{ $binding }}
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
 subjects:
   - kind: ServiceAccount
     name: {{ $name }}
@@ -85,7 +91,9 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   backoffLimit: 6
-  ttlSecondsAfterFinished: 3600
+  # Named by revision and gone a day after it finishes, for the reasons
+  # migrate-job.yaml gives.
+  ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
@@ -114,7 +122,7 @@ spec:
             - name: MERIDIAN_SETTINGS_KEY_SECRET
               value: {{ $name | quote }}
             - name: MERIDIAN_SETTINGS_KEY_BINDING
-              value: {{ $name | quote }}
+              value: {{ $binding | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           resources:

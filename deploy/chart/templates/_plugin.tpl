@@ -46,6 +46,7 @@ metadata:
   {{- end }}
 spec:
   replicas: 1
+  revisionHistoryLimit: {{ $top.Values.revisionHistoryLimit }}
   # One copy of an instance at a time, always: a rolling update would start the
   # new pod beside the old, two plugins under one instance's name, hostname
   # and credential. The old stops first, and the page is away for the moment

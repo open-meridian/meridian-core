@@ -23,6 +23,12 @@ use meridian_pb::v1::SettingDeclaration;
 pub enum StoreError {
     #[error("the configuration store is unavailable: {0}")]
     Unavailable(String),
+
+    /// The database was migrated by a newer release than this binary. Its own
+    /// variant because it is the one refusal at start that waiting never
+    /// fixes: a starting conductor waits out every other one.
+    #[error("{0}")]
+    SchemaAhead(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

@@ -15,7 +15,7 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{checked, manifest, template_for, CREATE_PLUGIN, REMOVE_PLUGIN};
-use meridian_runtime::{bus_from_env, required, shutdown, var};
+use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
 
 fn main() {
@@ -100,6 +100,9 @@ impl Launcher {
 }
 
 fn run() -> Result<(), String> {
+    // Not ready until it serves, whatever this pod said before.
+    let ready = Ready::from_env();
+
     let template_path = required("MERIDIAN_LAUNCHER_TEMPLATE")?;
     let template = std::fs::read_to_string(&template_path)
         .map_err(|failed| format!("{template_path} could not be read: {failed}"))?;
@@ -174,6 +177,7 @@ fn run() -> Result<(), String> {
                 Ok(("meridian.v1.RemovePluginReply".into(), gone.encode_to_vec()))
             });
             tracing::info!(instance_id, "the launcher is serving");
+            ready.serving();
             shutdown().await;
             tracing::info!("stopping");
             Ok(())

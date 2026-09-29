@@ -97,7 +97,7 @@ pub fn verify(applied: Option<i64>) -> Result<()> {
         // Ahead, which is a rollback: the database has been migrated by a newer
         // release. Refused rather than tolerated, because this binary does not
         // know what that release changed and its queries may already be wrong.
-        Some(at) if at > latest => Err(StoreError::Unavailable(format!(
+        Some(at) if at > latest => Err(StoreError::SchemaAhead(format!(
             "the street store's database is at schema version {at}, which is newer than this \
              binary understands ({latest}). Run the release that migrated it, or restore \
              a database at {latest}."

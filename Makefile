@@ -136,11 +136,11 @@ test:
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
-			-p meridian-config --test postgres -p meridian-runtime --test grants \
+			-p meridian-config --test postgres -p meridian-runtime --test grants --test waiting \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the three stores pass against Postgres, and the migration grants the serving role what it made"
+	@echo "test-store OK: the three stores pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -271,6 +271,7 @@ e2e-cluster: network
 	 E2E_IDP_ISSUER=http://host.docker.internal:$(E2E_IDP_PORT) \
 	 E2E_BROWSER_IMAGE=$(E2E_BROWSER_IMAGE) \
 	 E2E_DRIVER=$(E2E_DRIVER) E2E_CLI_IMAGE=$(E2E_CLI_IMAGE) \
+	 E2E_UPGRADE_FROM=$(E2E_UPGRADE_FROM) E2E_UPGRADE_VERSION=$(E2E_UPGRADE_VERSION) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
 		$(PY) e2e/cluster/run.py; \
@@ -367,7 +368,27 @@ e2e-cluster-oidc:
 	  docker rm -f $(E2E_IDP_CONTAINER) >/dev/null 2>&1 || true; \
 	  exit $$held
 
-# Any of the four cluster runs, on a k3d cluster made for it and removed after:
+# The same run, as an upgrade in place (task kernel/upgrading-a-deployment-in-
+# place): the chart published last, installed and set up through its wizard,
+# then upgraded to this checkout's chart and image as an administrator does,
+# `helm upgrade --reset-then-reuse-values --wait`. It then holds the namespace
+# to what an upgrade must leave: every pod on the new image, no container
+# restarted, at most three old ReplicaSets a Deployment and no finished Job
+# from an earlier revision. Its own target, so a failure says it was the
+# upgrade; no browser, terminal or plugin, which the install runs already
+# prove and which an upgrade does not change.
+#
+# The chart comes from where `publish` pushes it, the latest version unless
+# E2E_UPGRADE_VERSION names one, and its image from the registry it names: the
+# cluster pulls both. Made with the helm on the path, which CI makes Helm 4:
+# its --wait is the one that failed.
+E2E_UPGRADE_FROM ?=
+E2E_UPGRADE_VERSION ?=
+E2E_PUBLISHED_CHART ?= oci://ghcr.io/open-meridian/charts/meridian-runtime
+e2e-cluster-upgrade:
+	@$(MAKE) --no-print-directory e2e-cluster E2E_UPGRADE_FROM=$(E2E_PUBLISHED_CHART)
+
+# Any of the five cluster runs, on a k3d cluster made for it and removed after:
 # what CI runs, and what anybody with Docker and k3d can run to reproduce it.
 #
 #   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-oidc
@@ -993,6 +1014,56 @@ chart-check:
 		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
 	true
+	@# Upgrades leave nothing behind to pile up (task kernel/upgrading-a-
+	@# deployment-in-place): four upgrades of one deployment left 26 old
+	@# ReplicaSets and Jobs from earlier revisions. Every Deployment keeps three
+	@# old ReplicaSets rather than Kubernetes' ten. Every Job goes once it is
+	@# done: a hook when it succeeds, any other by carrying its revision in its
+	@# name, so the next upgrade removes it, and by a TTL, for the Jobs of an
+	@# upgrade that failed, which no later one removes. Rendered with a plugin,
+	@# so every Deployment and Job the chart has is in it.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--set 'sidecars[0].instanceId=check-1' 2>/dev/null)"; \
+	[ "$$(echo "$$rendered" | grep -cE '^kind: (Deployment|Job)$$')" -ge 12 ] \
+		|| { echo "chart-check FAILED: the render has fewer Deployments and Jobs than the chart makes, so the check below would prove little" >&2; exit 1; }; \
+	left="$$(echo "$$rendered" | awk ' \
+		function judge() { \
+			if (kind == "Deployment" && !limit) print "  the Deployment " name " keeps ten old ReplicaSets; give it revisionHistoryLimit: 3"; \
+			if (kind == "Job" && hook && !succeeded) print "  the hook Job " name " stays after it succeeds; give it hook-delete-policy hook-succeeded"; \
+			if (kind == "Job" && !hook && name !~ /-1$$/) print "  the Job " name " is not named by its revision, so no upgrade removes it"; \
+			if (kind == "Job" && !hook && !ttl) print "  the Job " name " has no ttlSecondsAfterFinished, so one a failed upgrade left stays for good"; \
+			kind = ""; name = ""; limit = 0; hook = 0; succeeded = 0; ttl = 0 \
+		} \
+		/^---/ { judge(); next } \
+		/^kind: / { kind = $$2 } \
+		/^  name: / && name == "" { name = $$2 } \
+		/^  revisionHistoryLimit: 3$$/ { limit = 1 } \
+		/helm.sh\/hook"?:/ { hook = 1 } \
+		/helm.sh\/hook-delete-policy"?:.*hook-succeeded/ { succeeded = 1 } \
+		/^  ttlSecondsAfterFinished: / { ttl = 1 } \
+		END { judge() }')"; \
+	[ -z "$$left" ] || { echo "chart-check FAILED: an upgrade would leave these behind:" >&2; echo "$$left" >&2; exit 1; }
+	@# A binding a Job deletes when it gives its rights up (decisions/016) is a
+	@# hook, never a resource of the release: `helm upgrade --wait` waits for
+	@# every resource the release names to exist, and failed on one of these
+	@# being gone (task kernel/upgrading-a-deployment-in-place, fault 2).
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	given_up="$$(echo "$$rendered" | grep -A1 'resources: \["rolebindings"\]' | grep resourceNames | tr -d '[]",' | sed 's/.*resourceNames://')"; \
+	[ "$$(echo $$given_up | wc -w | tr -d ' ')" -ge 3 ] \
+		|| { echo "chart-check FAILED: found fewer bindings given up than the three Jobs that give theirs up, so the check below would prove little" >&2; exit 1; }; \
+	for binding in $$given_up; do \
+		echo "$$rendered" | awk -v n="$$binding" '/^---/{b=0;m=0} /^kind: RoleBinding$$/{b=1} $$0=="  name: "n{m=1} b&&m&&/helm.sh\/hook"?:.*pre-install,pre-upgrade/{f=1} END{exit !f}' \
+			|| { echo "chart-check FAILED: the RoleBinding $$binding is deleted by its Job and is not a pre-install,pre-upgrade hook, so helm upgrade --wait fails on it being gone" >&2; exit 1; }; \
+	done
+	@# One conductor at a time. A rolling update keeps the old one answering
+	@# the bus until the new one is ready, and the new one is not ready while
+	@# it waits for its schema: after the wizard's apply the dashboard read the
+	@# access records from the old one's first-run store, which holds nobody,
+	@# and the administrator the wizard named signed in to a home page saying
+	@# nobody administers it (task kernel/upgrading-a-deployment-in-place).
+	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-conductor"{c=1} c&&/^    type: Recreate$$/{f=1} END{exit !f}' \
+		|| { echo "chart-check FAILED: the conductor's Deployment rolls, so an old conductor answers beside the new one while it waits for its schema" >&2; exit 1; }
 	@# The Ingress (spec/live-plugin-development, ruling 1): none unless asked
 	@# for; asked for, two names to the dashboard's one port, the plugins' a
 	@# wildcard below the host; TLS for both; the address offered to the
@@ -1039,7 +1110,7 @@ chart-check:
 	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
 	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup\|initContainers' \
 		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, and the live shape there alone"
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, the live shape there alone, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

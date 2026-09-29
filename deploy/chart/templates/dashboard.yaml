@@ -25,6 +25,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   # Recreate, for the reason replicaCount is 1: a rolling update starts the
   # new pod beside the old one, and for as long as both serve, the Ingress
   # sends a request to either -- a person signed in on one is nobody on the
@@ -286,6 +287,15 @@ spec:
             tcpSocket:
               port: http
             periodSeconds: 20
+          # Starting is waiting for its database and the broker, which in an
+          # upgrade restart beside it, and it listens once it has them. Until
+          # then the liveness above would count a dashboard that is waiting as
+          # one that is dead, and restart it; this gives a start an hour.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 720
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:

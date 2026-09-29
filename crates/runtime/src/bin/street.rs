@@ -11,13 +11,18 @@
 //! exists in one place. Tying them together made every instrument-store change inherit
 //! the street store's caution.
 //!
-//! `meridian-street migrate` applies its schema, once per release. Starting verifies
-//! and refuses a schema it does not recognise.
+//! `meridian-street migrate` applies its schema, once per release. Starting verifies:
+//! it waits for a database that does not answer yet or a schema the migration
+//! has not reached, and refuses one newer than it understands.
 
 use std::sync::Arc;
 
-use meridian_runtime::{bus_from_env, now_ns, report_inward_forever, required, shutdown, var};
+use meridian_runtime::{
+    bus_from_env, now_ns, on_runtime, report_inward_forever, required, shutdown, var,
+    wait_for_store, Ready, Wait,
+};
 use meridian_street::service::SystemClock;
+use meridian_street::store::StoreError;
 use meridian_street::PostgresStore;
 
 fn main() {
@@ -53,61 +58,72 @@ fn run() -> Result<(), String> {
         return grant_if_serving(&url);
     }
 
-    let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
+    // Not ready until it serves, whatever this pod said before.
+    let ready = Ready::from_env();
 
     // Verified, never applied. N replicas starting together would race to
     // apply the same migration, and a process that migrates on start changes a
-    // customer's database because somebody restarted a pod.
-    store.verify().map_err(|failed| failed.to_string())?;
+    // customer's database because somebody restarted a pod. So a schema the
+    // migration Job has not reached yet is waited for, not applied, and one a
+    // newer release made is refused.
+    let store: Arc<dyn meridian_street::Store> = Arc::new(wait_for_store(
+        "the street store's database",
+        &url,
+        |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
+        |store| {
+            store.verify().map_err(|failed| match failed {
+                StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
+                other => Wait::NotYet(other.to_string()),
+            })
+        },
+    )?);
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "street-1".into());
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|failed| failed.to_string())?
-        .block_on(async {
-            let bus = bus_from_env(&instance_id).await?;
+    // The store is borrowed, never moved in, so it outlives the runtime
+    // (meridian_runtime::on_runtime).
+    on_runtime(async {
+        let bus = bus_from_env(&instance_id).await?;
 
-            // Registered before anything can call them. A component that
-            // announces itself and then cannot answer is worse than one that
-            // has not arrived.
-            let store: Arc<dyn meridian_street::Store> = Arc::new(store);
-            meridian_street::service::serve(bus.clone(), store.clone(), Arc::new(SystemClock));
+        // Registered before anything can call them. A component that
+        // announces itself and then cannot answer is worse than one that
+        // has not arrived.
+        meridian_street::service::serve(bus.clone(), Arc::clone(&store), Arc::new(SystemClock));
 
-            // W3.9. Subscribed before this returns, like the handlers above;
-            // only the moving is spawned.
-            tokio::spawn(meridian_street::service::follow_replacements(
-                bus.clone(),
-                store.clone(),
-            ));
+        // W3.9. Subscribed before this returns, like the handlers above;
+        // only the moving is spawned.
+        tokio::spawn(meridian_street::service::follow_replacements(
+            bus.clone(),
+            Arc::clone(&store),
+        ));
 
-            // And asked about, for a replacement said while this process was
-            // not listening.
-            tokio::spawn(meridian_street::service::sweep_forever(
-                bus.clone(),
-                store,
-                Arc::new(SystemClock),
-                meridian_street::service::SWEEP_EVERY,
-            ));
+        // And asked about, for a replacement said while this process was
+        // not listening.
+        tokio::spawn(meridian_street::service::sweep_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            Arc::new(SystemClock),
+            meridian_street::service::SWEEP_EVERY,
+        ));
 
-            // W5.20. Said on the bus, for the instrument store to carry outward: this
-            // process holds no key, and giving it one so it could report
-            // directly would make it a second thing able to authenticate as
-            // the whole deployment.
-            let reporting = bus.clone();
-            let schema = meridian_street::migrations::latest();
-            tokio::spawn(async move { report_inward_forever(reporting, "street", schema).await });
+        // W5.20. Said on the bus, for the instrument store to carry outward: this
+        // process holds no key, and giving it one so it could report
+        // directly would make it a second thing able to authenticate as
+        // the whole deployment.
+        let reporting = bus.clone();
+        let schema = meridian_street::migrations::latest();
+        tokio::spawn(async move { report_inward_forever(reporting, "street", schema).await });
 
-            tracing::info!(
-                instance_id,
-                started_at_ns = now_ns(),
-                "the street store is serving"
-            );
-            shutdown().await;
-            tracing::info!("stopping");
-            Ok(())
-        })
+        tracing::info!(
+            instance_id,
+            started_at_ns = now_ns(),
+            "the street store is serving"
+        );
+        ready.serving();
+        shutdown().await;
+        tracing::info!("stopping");
+        Ok(())
+    })
 }
 
 /// Grant to the serving role, when this deployment has one.

@@ -9,8 +9,9 @@
 //! argument that a control process accumulating a store becomes the one nobody
 //! writes migrations for. Configuration was ruled to live here, as it did in
 //! v1, so the store came with its migration history, and
-//! `meridian-conductor migrate` applies it once per release. Starting verifies
-//! and refuses a schema it does not recognise.
+//! `meridian-conductor migrate` applies it once per release. Starting verifies:
+//! it waits for a schema the migration has not reached, and refuses one newer
+//! than it understands.
 //!
 //! `conductor public-key` prints the public half of the deployment's key,
 //! generating one if there is none. That moved here with the key: the process
@@ -23,11 +24,12 @@
 use std::sync::{Arc, Mutex};
 
 use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
+use meridian_config::store::StoreError;
 use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
-    bus_from_env, key_at, now_ns, platform_from_env, report_forever, required, shutdown, var,
-    PlatformUpstream,
+    bus_from_env, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
+    shutdown, var, wait_for_store, PlatformUpstream, Ready, Wait,
 };
 
 fn main() {
@@ -110,6 +112,9 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // Not ready until it serves, whatever this pod said before.
+    let ready = Ready::from_env();
+
     // No database is first run, not a misconfiguration: the wizard is where a
     // deployment's database is chosen, and the wizard cannot run without this
     // component, which enrols the deployment and relays its claim code. What
@@ -117,9 +122,20 @@ fn run() -> Result<(), String> {
     // yet, so memory is the honest place for it.
     let store: Arc<dyn meridian_config::Store> = match var("MERIDIAN_CONFIG_DATABASE_URL") {
         Some(url) => {
-            let store = PostgresStore::connect(&url, 8).map_err(|failed| failed.to_string())?;
-            // Verified, never applied, for the reason every store gives.
-            store.verify().map_err(|failed| failed.to_string())?;
+            // Verified, never applied, for the reason every store gives; and
+            // waited for, because in an upgrade this starts beside the Job
+            // that migrates for it. A schema a newer release made is refused.
+            let store = wait_for_store(
+                "the configuration store's database",
+                &url,
+                |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
+                |store| {
+                    store.verify().map_err(|failed| match failed {
+                        StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
+                        other => Wait::NotYet(other.to_string()),
+                    })
+                },
+            )?;
             Arc::new(store)
         }
         None => {
@@ -137,96 +153,95 @@ fn run() -> Result<(), String> {
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
     let platform = platform_from_env(key)?;
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|failed| failed.to_string())?
-        .block_on(async {
-            // W5.24, before anything asks the platform for anything: a fresh
-            // deployment has generated a key nothing has registered, and an
-            // enrolment code is what registers it. Never fatal. A deployment
-            // whose code has expired or been spent keeps running and says so,
-            // because the wizard is where somebody enters a new one and the
-            // wizard is served by a component that has to be up.
-            let enrolment = Arc::new(Mutex::new(
-                enrol(&platform, &public_key_pem, &key_path).await,
-            ));
+    // The store is borrowed, never moved in, so it outlives the runtime
+    // (meridian_runtime::on_runtime).
+    on_runtime(async {
+        // W5.24, before anything asks the platform for anything: a fresh
+        // deployment has generated a key nothing has registered, and an
+        // enrolment code is what registers it. Never fatal. A deployment
+        // whose code has expired or been spent keeps running and says so,
+        // because the wizard is where somebody enters a new one and the
+        // wizard is served by a component that has to be up.
+        let enrolment = Arc::new(Mutex::new(
+            enrol(&platform, &public_key_pem, &key_path).await,
+        ));
 
-            let bus = bus_from_env(&instance_id).await?;
+        let bus = bus_from_env(&instance_id).await?;
 
-            // W7.2. The wizard's first page, and everything it shows until a
-            // claim code is redeemed. The conductor holds the key and is what
-            // enrols, so it is what knows.
-            serve_enrolment_state(&bus, Arc::clone(&enrolment));
-            serve_enrol_with_code(
-                &bus,
-                Arc::clone(&enrolment),
-                Arc::clone(&platform),
-                public_key_pem.clone(),
-                key_path.clone(),
-            );
+        // W7.2. The wizard's first page, and everything it shows until a
+        // claim code is redeemed. The conductor holds the key and is what
+        // enrols, so it is what knows.
+        serve_enrolment_state(&bus, Arc::clone(&enrolment));
+        serve_enrol_with_code(
+            &bus,
+            Arc::clone(&enrolment),
+            Arc::clone(&platform),
+            public_key_pem.clone(),
+            key_path.clone(),
+        );
 
-            // Subscribed before the loop starts, for the reason at-most-once
-            // delivery makes unforgiving: what arrives before a subscriber
-            // exists is dropped, and dropped silently.
-            let misses = bus.subscribe(INSTRUMENT_MISSING);
+        // Subscribed before the loop starts, for the reason at-most-once
+        // delivery makes unforgiving: what arrives before a subscriber
+        // exists is dropped, and dropped silently.
+        let misses = bus.subscribe(INSTRUMENT_MISSING);
 
-            // The config domain: registered and subscribed before the loop
-            // starts, so nothing the dashboard or a sidecar asks is missed.
-            meridian_config::serve(
-                Arc::clone(&bus),
-                Arc::clone(&store),
-                Arc::new(meridian_config::SystemClock),
-                Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
-                // Read when first needed and kept once found, so the Job
-                // finishing after this starts needs no restart.
-                Arc::new(meridian_config::SettingsKey::at(
-                    var("MERIDIAN_SETTINGS_KEY_DIR").unwrap_or_else(|| SETTINGS_KEY.into()),
-                )),
-            );
+        // The config domain: registered and subscribed before the loop
+        // starts, so nothing the dashboard or a sidecar asks is missed.
+        meridian_config::serve(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            Arc::new(meridian_config::SystemClock),
+            Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
+            // Read when first needed and kept once found, so the Job
+            // finishing after this starts needs no restart.
+            Arc::new(meridian_config::SettingsKey::at(
+                var("MERIDIAN_SETTINGS_KEY_DIR").unwrap_or_else(|| SETTINGS_KEY.into()),
+            )),
+        );
 
-            // W8: the plugin catalogue, and launching from it. Every launch
-            // runs an image from the deployment's own registry as each node
-            // reaches it, by digest (spec/the-local-plugin-registry).
-            meridian_config::serve_plugins(
-                Arc::clone(&bus),
-                Arc::clone(&store),
-                Arc::new(meridian_config::SystemClock),
-                var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
-            );
+        // W8: the plugin catalogue, and launching from it. Every launch
+        // runs an image from the deployment's own registry as each node
+        // reaches it, by digest (spec/the-local-plugin-registry).
+        meridian_config::serve_plugins(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            Arc::new(meridian_config::SystemClock),
+            var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
+        );
 
-            let carrying = Arc::clone(&bus);
-            let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
-            let running = tokio::spawn(conductor.consume(misses));
+        let carrying = Arc::clone(&bus);
+        let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
+        let running = tokio::spawn(conductor.consume(misses));
 
-            // W5.19 outward, W5.20 inward: this component holds the key, so it
-            // is the one that can tell the platform anything, and what it tells
-            // it includes what the others have said about themselves.
-            let reporting = Arc::clone(&platform);
-            let collecting = Arc::clone(&bus);
-            let schema = meridian_config::migrations::latest();
-            tokio::spawn(async move {
-                report_forever(reporting, collecting, "conductor", schema).await
-            });
+        // W5.19 outward, W5.20 inward: this component holds the key, so it
+        // is the one that can tell the platform anything, and what it tells
+        // it includes what the others have said about themselves.
+        let reporting = Arc::clone(&platform);
+        let collecting = Arc::clone(&bus);
+        let schema = meridian_config::migrations::latest();
+        tokio::spawn(
+            async move { report_forever(reporting, collecting, "conductor", schema).await },
+        );
 
-            tracing::info!(
-                instance_id,
-                platform = platform.address(),
-                started_at_ns = now_ns(),
-                "the conductor is connected"
-            );
+        tracing::info!(
+            instance_id,
+            platform = platform.address(),
+            started_at_ns = now_ns(),
+            "the conductor is connected"
+        );
+        ready.serving();
 
-            tokio::select! {
-                _ = running => {
-                    tracing::warn!("the bus shut down");
-                    Ok(())
-                }
-                _ = shutdown() => {
-                    tracing::info!("stopping");
-                    Ok(())
-                }
+        tokio::select! {
+            _ = running => {
+                tracing::warn!("the bus shut down");
+                Ok(())
             }
-        })
+            _ = shutdown() => {
+                tracing::info!("stopping");
+                Ok(())
+            }
+        }
+    })
 }
 
 /// Answer what the wizard shows before anything is redeemed.

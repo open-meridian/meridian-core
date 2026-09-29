@@ -8,6 +8,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.instrument.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -52,15 +53,21 @@ spec:
                 secretKeyRef:
                   name: {{ (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.database.key }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           # No port. Everything this component says goes over the broker, so
           # nothing outside its pod needs to reach it. A Service in front of it
           # would be a second way in that nothing asks for.
-          # No volumes. The key and the platform address moved to the conductor
-          # with the connection that used them (decisions/011), and this
-          # component now mounts nothing at all: what it learns, it learns on
-          # the bus.
+          # No other volume. The key and the platform address moved to the
+          # conductor with the connection that used them (decisions/011), and
+          # what this component learns, it learns on the bus; the one it mounts
+          # is where it says it is ready.
+          volumeMounts:
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -26,7 +26,9 @@ use meridian_dashboard::terminal::Terminals;
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
-use meridian_runtime::{bus_from_env, now_ns, required, shutdown, var};
+use meridian_runtime::{
+    bus_from_env, now_ns, on_runtime, required, shutdown, var, wait_for_store, Wait,
+};
 
 /// Where the chart mounts the dashboard's signing key.
 const SIGNING_KEY: &str = "/etc/meridian/dashboard-signing";
@@ -278,17 +280,25 @@ fn run() -> Result<(), String> {
     }
 
     // Before the runtime starts, because this is the blocking Postgres
-    // client and it makes a runtime of its own: constructed inside one it
-    // panics in a destructor, which reads as a crash with no cause.
+    // client and it makes a runtime of its own: used or dropped inside one it
+    // panics, and dropping the pool's other connections while unwinding
+    // aborts (meridian_runtime::on_runtime).
     //
     // Connected and verified here rather than at App construction, so a
-    // database that is not there stops the dashboard with a sentence rather
-    // than failing at the first sign-in.
+    // database that is not there yet is waited for, saying so, rather than
+    // failing at the first sign-in. The chart's startup probe gives the
+    // dashboard as long as that takes before its liveness counts.
     let accounts = match &accounts_url {
         Some(url) => {
-            let store = InPostgres::connect(url, 4)
-                .map_err(|failed| format!("the accounts database: {failed}"))?;
-            store.verify()?;
+            let store = wait_for_store(
+                "the accounts database",
+                url,
+                |url| {
+                    InPostgres::connect(url, 4)
+                        .map_err(|failed| format!("the accounts database: {failed}"))
+                },
+                |store| store.verify().map_err(Wait::NotYet),
+            )?;
             // The first administrator, as first run left it: a name
             // and a hash in a Secret. Made here at start rather than
             // written by the Job, because the Job may not reach
@@ -324,121 +334,125 @@ fn run() -> Result<(), String> {
         None => None,
     };
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|failed| failed.to_string())?
-        .block_on(async {
-            let bus = bus_from_env(&instance_id).await?;
-            let records = Arc::new(RecordsCache::default());
-            let sessions = Arc::new(Sessions::default());
-            let terminals = Arc::new(Terminals::default());
-            let clock = Arc::new(SystemClock);
+    // The accounts store is borrowed, never moved in, so it outlives the
+    // runtime (meridian_runtime::on_runtime).
+    on_runtime(async {
+        let bus = bus_from_env(&instance_id).await?;
+        let records = Arc::new(RecordsCache::default());
+        let sessions = Arc::new(Sessions::default());
+        let terminals = Arc::new(Terminals::default());
+        let clock = Arc::new(SystemClock);
 
-            // Once before listening, so the first request finds records when
-            // the conductor is up. When it is not, the dashboard still
-            // listens, and says why it refuses rather than failing to start.
-            if let Err(failed) = refresh(&bus, &records, clock.as_ref()).await {
-                tracing::warn!("the access records could not be read yet: {failed}");
+        // Once before listening, so the first request finds records when
+        // the conductor is up. When it is not, the dashboard still
+        // listens, and says why it refuses rather than failing to start.
+        if let Err(failed) = refresh(&bus, &records, clock.as_ref()).await {
+            tracing::warn!("the access records could not be read yet: {failed}");
+        }
+        tokio::spawn(refresh_forever(
+            Arc::clone(&bus),
+            Arc::clone(&records),
+            clock.clone(),
+        ));
+
+        // What custody connectors say about their accounts and connections,
+        // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything
+        // else is started, since what is said before then is not heard.
+        let custody = Arc::new(Custody::default());
+        meridian_dashboard::custody::listen(&bus, Arc::clone(&custody));
+        // And what each plugin's sidecar says of it (W4.8, W6.10).
+        let health = Arc::new(meridian_dashboard::health::Health::default());
+        meridian_dashboard::health::listen(&bus, Arc::clone(&health));
+
+        let sweeping = Arc::clone(&sessions);
+        let sweeping_terminals = Arc::clone(&terminals);
+        let sweeping_plugins = plugins.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                every.tick().await;
+                sweeping.sweep(now_ns());
+                sweeping_terminals.sweep(now_ns());
+                if let Some(plugins) = &sweeping_plugins {
+                    plugins.sweep(&sweeping, &sweeping_terminals, now_ns());
+                }
             }
-            tokio::spawn(refresh_forever(Arc::clone(&bus), Arc::clone(&records), clock.clone()));
+        });
 
-            // What custody connectors say about their accounts and connections,
-            // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything
-            // else is started, since what is said before then is not heard.
-            let custody = Arc::new(Custody::default());
-            meridian_dashboard::custody::listen(&bus, Arc::clone(&custody));
-            // And what each plugin's sidecar says of it (W4.8, W6.10).
-            let health = Arc::new(meridian_dashboard::health::Health::default());
-            meridian_dashboard::health::listen(&bus, Arc::clone(&health));
-
-            let sweeping = Arc::clone(&sessions);
-            let sweeping_terminals = Arc::clone(&terminals);
-            let sweeping_plugins = plugins.clone();
-            tokio::spawn(async move {
-                let mut every = tokio::time::interval(Duration::from_secs(60));
-                loop {
+        let oidc = match &provider {
+            Some(config) => {
+                let oidc = Arc::new(discover(config).await?);
+                // The directory's keys, read again every 15 minutes, so a
+                // rotation is picked up without a restart. A sign-in that
+                // meets a key it does not know also reads them at once.
+                let refreshing = Arc::clone(&oidc);
+                tokio::spawn(async move {
+                    let mut every = tokio::time::interval(Duration::from_secs(15 * 60));
                     every.tick().await;
-                    sweeping.sweep(now_ns());
-                    sweeping_terminals.sweep(now_ns());
-                    if let Some(plugins) = &sweeping_plugins {
-                        plugins.sweep(&sweeping, &sweeping_terminals, now_ns());
-                    }
-                }
-            });
-
-            let oidc = match &provider {
-                Some(config) => {
-                    let oidc = Arc::new(discover(config).await?);
-                    // The directory's keys, read again every 15 minutes, so a
-                    // rotation is picked up without a restart. A sign-in that
-                    // meets a key it does not know also reads them at once.
-                    let refreshing = Arc::clone(&oidc);
-                    tokio::spawn(async move {
-                        let mut every = tokio::time::interval(Duration::from_secs(15 * 60));
+                    loop {
                         every.tick().await;
-                        loop {
-                            every.tick().await;
-                            if let Err(failed) = refreshing.refresh().await {
-                                tracing::warn!("the directory's keys could not be read again: {failed}");
-                            }
+                        if let Err(failed) = refreshing.refresh().await {
+                            tracing::warn!(
+                                "the directory's keys could not be read again: {failed}"
+                            );
                         }
-                    });
-                    Some(oidc)
-                }
-                None => None,
-            };
-
-            // First run is the absence of a directory rather than a flag, so
-            // ending it is the configuration landing and nothing anybody can
-            // switch back from inside the dashboard (requirement 18).
-            let first_run = oidc.is_none() && directory.is_none() && accounts.is_none();
-            if first_run {
-                // Not an error, and the ordinary state of a deployment nobody
-                // has set up yet: no way in means the wizard, which is where
-                // one is configured (W7). Said only here, where it is true --
-                // it used to be said whenever there was no provider, which a
-                // deployment holding its own accounts read as being in first
-                // run while it was not.
-                tracing::info!(
-                    "no way to sign in is configured: this deployment serves its first-run wizard"
-                );
+                    }
+                });
+                Some(oidc)
             }
+            None => None,
+        };
 
-            let app = router(Arc::new(App {
-                first_run,
-                wizard: Arc::new(WizardSession::suggesting(
-                    var("MERIDIAN_DASHBOARD_SUGGESTED_URL").unwrap_or_default(),
-                )),
-                records,
-                sessions,
-                terminals,
-                clock,
-                bus,
-                oidc,
-                directory: directory.map(Arc::new),
-                accounts,
-                sign_in_failures: Default::default(),
-                secure_cookies,
-                plugins,
-                registry,
-                custody,
-                health,
-                kit,
-            }));
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .map_err(|failed| format!("could not listen on {listen}: {failed}"))?;
+        // First run is the absence of a directory rather than a flag, so
+        // ending it is the configuration landing and nothing anybody can
+        // switch back from inside the dashboard (requirement 18).
+        let first_run = oidc.is_none() && directory.is_none() && accounts.is_none();
+        if first_run {
+            // Not an error, and the ordinary state of a deployment nobody
+            // has set up yet: no way in means the wizard, which is where
+            // one is configured (W7). Said only here, where it is true --
+            // it used to be said whenever there was no provider, which a
+            // deployment holding its own accounts read as being in first
+            // run while it was not.
+            tracing::info!(
+                "no way to sign in is configured: this deployment serves its first-run wizard"
+            );
+        }
 
-            tracing::info!(instance_id, %listen, started_at_ns = now_ns(), "the dashboard is listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    shutdown().await;
-                    tracing::info!("stopping");
-                })
-                .await
-                .map_err(|failed| failed.to_string())
-        })
+        let app = router(Arc::new(App {
+            first_run,
+            wizard: Arc::new(WizardSession::suggesting(
+                var("MERIDIAN_DASHBOARD_SUGGESTED_URL").unwrap_or_default(),
+            )),
+            records,
+            sessions,
+            terminals,
+            clock,
+            bus,
+            oidc,
+            directory: directory.map(Arc::new),
+            accounts: accounts.clone(),
+            sign_in_failures: Default::default(),
+            secure_cookies,
+            plugins,
+            registry,
+            custody,
+            health,
+            kit,
+        }));
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .map_err(|failed| format!("could not listen on {listen}: {failed}"))?;
+
+        tracing::info!(instance_id, %listen, started_at_ns = now_ns(), "the dashboard is listening");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown().await;
+                tracing::info!("stopping");
+            })
+            .await
+            .map_err(|failed| failed.to_string())
+    })
 }
 
 /// The directory's discovery document, retried for a minute: a bundled

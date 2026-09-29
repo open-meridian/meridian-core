@@ -78,13 +78,12 @@ key:
   # secret puts it in a file, a shell history and a backup before it ever
   # arrives.
   #
-  # A job runs before the instrument store and prints the public half to its log:
+  # A job runs once, at install, before anything that mounts the key, and
+  # makes it in the volume; it is removed once it succeeds. The conductor
+  # registers the public half with the enrolment code, and the wizard shows
+  # its fingerprint. To read the public half itself:
   #
-  #   kubectl logs job/<release>-meridian-runtime-key
-  #
-  # Register that with the platform. Until you do, the instrument store runs and its
-  # calls are refused, which is the honest order: a key cannot be registered
-  # before it exists.
+  #   kubectl exec deploy/<release>-meridian-runtime-conductor -- meridian-conductor public-key
   #
   # Never written into Helm's release history: the job writes it to a volume,
   # and nothing reads it back out.
@@ -142,6 +141,14 @@ migrate:
 
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
+
+# How many old ReplicaSets each Deployment keeps: enough to roll back to the
+# last few releases, and no more. Kubernetes keeps ten by default, and four
+# upgrades of a development deployment left 26 ReplicaSets for six
+# Deployments, growing by one per Deployment per upgrade (task
+# kernel/upgrading-a-deployment-in-place). chart-check refuses a Deployment
+# that does not say this.
+revisionHistoryLimit: 3
 
 # Each component is its own Deployment with its own tag, which is what makes
 # "upgrade one without the others" a values change rather than a redesign.

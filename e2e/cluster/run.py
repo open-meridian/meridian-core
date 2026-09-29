@@ -137,6 +137,18 @@ WAY_IN = WAYS_IN[SIGN_IN]
 DRIVER = os.environ.get("E2E_DRIVER", "runner")
 CLI_IMAGE = os.environ.get("E2E_CLI_IMAGE", "meridian-cli-e2e:local")
 
+# An upgrade in place (task kernel/upgrading-a-deployment-in-place): install
+# the chart published last from E2E_UPGRADE_FROM, set it up, then upgrade to
+# this checkout's chart and image as an administrator does. Empty is an
+# install of this checkout's chart, as every other run is. The version is
+# the latest published unless E2E_UPGRADE_VERSION names one.
+UPGRADE_FROM = os.environ.get("E2E_UPGRADE_FROM", "")
+UPGRADE_VERSION = os.environ.get("E2E_UPGRADE_VERSION", "")
+# The helm this installs and upgrades with. CI gives the upgrade Helm 4, whose
+# --wait waits for every resource a release names to exist, which Helm 3's
+# never did: it is what found a RoleBinding the chart's own Job deletes.
+HELM = os.environ.get("E2E_HELM", "helm")
+
 # The registry's node proxy port, as the chart's registry.hostPort.
 REGISTRY_PORT = int(os.environ.get("E2E_REGISTRY_PORT", "5000"))
 
@@ -513,7 +525,18 @@ def main():
             "--set", f"deployment.enrolmentCode={enrolment_code}",
             "--set", f"platform.address={PLATFORM_FROM_POD}",
         ]
-        if IMAGE:
+        chart = [CHART]
+        if UPGRADE_FROM:
+            # The published chart, with the image it was published beside:
+            # what a deployment made before this checkout is running.
+            version = UPGRADE_VERSION or next(
+                line.split(":", 1)[1].strip().strip('"')
+                for line in run(HELM, "show", "chart", UPGRADE_FROM).splitlines()
+                if line.startswith("version:")
+            )
+            s.note(f"from {UPGRADE_FROM} {version}")
+            chart = [UPGRADE_FROM, "--version", version]
+        elif IMAGE:
             repository, _, tag = IMAGE.rpartition(":")
             values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
         values += [
@@ -523,7 +546,7 @@ def main():
             "--set", f"ingress.host={HOST}",
             "--set", f"ingress.className={INGRESS_CLASS}",
         ]
-        run("helm", "upgrade", "--install", RELEASE, CHART, "--namespace", NAMESPACE, *values)
+        run(HELM, "upgrade", "--install", RELEASE, *chart, "--namespace", NAMESPACE, *values)
 
         wait_for(
             "the dashboard",
@@ -704,6 +727,17 @@ def main():
             ADMIN_HOME not in get("/", session),
             f"and is not an administrator, being outside the group the wizard named",
         )
+
+    if UPGRADE_FROM:
+        upgraded(s)
+        # And the deployment it upgraded is the same one: the administrator
+        # the wizard named signs in to the new version.
+        status, session = signed_in(*WAY_IN["administrator"])
+        s.check(
+            status == 303 and ADMIN_HOME in get("/", session),
+            f"after the upgrade {who} signs in, and is still a deployment admin: {status}",
+        )
+        return verdict(s)
 
     if WAY_IN["by"] == "password":
         print("I: and in a real browser", flush=True)
@@ -1064,6 +1098,10 @@ spec:
         )
         s.check(status != 303, f"and the code, once spent, is refused: {status}")
 
+    return verdict(s)
+
+
+def verdict(s):
     print(flush=True)
     if s.failures:
         print(f"e2e-cluster FAILED: {len(s.failures)}", flush=True)
@@ -1072,6 +1110,165 @@ spec:
         return 1
     print("e2e-cluster OK", flush=True)
     return 0
+
+
+def upgraded(s):
+    """This checkout's chart and image over the published one, set up and serving.
+
+    The upgrade an administrator makes: the new chart's defaults with the
+    deployment's own values, `--reset-then-reuse-values`, which `--reuse-values`
+    is not (it kept the old chart's image tag), and `--wait`, which failed on
+    the chart's own RoleBinding. Then what the task's done-when asks of the
+    namespace it leaves: every pod on the new image, none restarted, no more
+    than three old ReplicaSets a Deployment and no finished Job from an
+    earlier revision (task kernel/upgrading-a-deployment-in-place).
+    """
+    print("U: upgraded in place, to the chart and the image this checkout builds", flush=True)
+    repository, _, tag = IMAGE.rpartition(":")
+    started = time.time()
+    done = subprocess.run(
+        [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE,
+         "--reset-then-reuse-values", "--wait", "--timeout", "10m",
+         "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
+        capture_output=True, text=True,
+    )
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"    | {line}", flush=True)
+    s.check(
+        done.returncode == 0,
+        f"helm upgrade --reset-then-reuse-values --wait succeeded: exit {done.returncode}, "
+        f"{int(time.time() - started)}s",
+    )
+    revision = int(json.loads(run(HELM, "status", RELEASE, "--namespace", NAMESPACE, "-o", "json"))["version"])
+
+    def pods():
+        return json.loads(kubectl("get", "pods", "-o", "json"))["items"]
+
+    def ours(container):
+        return "meridian-runtime" in container["image"]
+
+    def containers(pod):
+        return pod["spec"].get("initContainers", []) + pod["spec"]["containers"]
+
+    def jobs():
+        return json.loads(kubectl("get", "jobs", "-o", "json"))["items"]
+
+    # The one thing the chart installed first leaves that no upgrade can
+    # take away: its pre-install key Job, which that chart never deleted and
+    # this one deletes on success. A pre-install hook does not run on an
+    # upgrade, so it stays, finished, with its pod on the old image. That Job
+    # and nothing else: any other Job or pod left on the old image fails.
+    old_key_job = f"{RELEASE}-meridian-runtime-key"
+
+    def left_by_the_old_chart(job):
+        annotations = job["metadata"].get("annotations", {})
+        return (
+            job["metadata"]["name"] == old_key_job
+            and "pre-install" in annotations.get("helm.sh/hook", "")
+            and "hook-succeeded" not in annotations.get("helm.sh/hook-delete-policy", "")
+            and bool(job["status"].get("succeeded"))
+        )
+
+    # A pod the upgrade replaced may still be stopping after --wait returns.
+    def stale():
+        kept = {job["metadata"]["uid"] for job in jobs() if left_by_the_old_chart(job)}
+        left, exempt = [], []
+        for pod in pods():
+            if not any(ours(c) and c["image"] != IMAGE for c in containers(pod)):
+                continue
+            owners = {
+                owner["uid"]
+                for owner in pod["metadata"].get("ownerReferences", [])
+                if owner.get("kind") == "Job"
+            }
+            (exempt if owners & kept else left).append(pod["metadata"]["name"])
+        return sorted(left), sorted(exempt)
+    for _ in range(180):
+        if not stale()[0]:
+            break
+        time.sleep(1)
+    left, exempt = stale()
+    if exempt:
+        s.note(f"on the old image, the pod of {old_key_job}, which the chart installed first kept: {exempt}")
+    s.check(not left, f"every pod runs {IMAGE}" + (f"; not: {left}" if left else ""))
+
+    restarted = sorted(
+        f"{pod['metadata']['name']}/{status['name']} ({status['restartCount']})"
+        for pod in pods()
+        if any(ours(container) for container in containers(pod))
+        for status in pod["status"].get("initContainerStatuses", [])
+        + pod["status"].get("containerStatuses", [])
+        if status.get("restartCount", 0)
+    )
+    s.check(
+        not restarted,
+        "no container restarted: each waited for its migration and the broker instead"
+        + (f"; restarted: {restarted}" if restarted else ""),
+    )
+
+    migrated = f"{RELEASE}-meridian-runtime-migrate-{revision}"
+    wait_for(
+        f"{migrated} to finish",
+        lambda: kubectl("get", "job", migrated, "-o", "jsonpath={.status.succeeded}") == "1",
+        seconds=300,
+    )
+    s.check(True, f"{migrated} migrated the schema")
+
+    deployments = json.loads(kubectl("get", "deployments", "-o", "json"))["items"]
+    limits = {d["metadata"]["name"]: d["spec"].get("revisionHistoryLimit") for d in deployments}
+    s.check(
+        all(limit == 3 for limit in limits.values()),
+        f"every Deployment keeps three old ReplicaSets: {limits}",
+    )
+
+    # Old ReplicaSets are trimmed by the Deployment controller after the
+    # rollout, so asked until they are, for a while.
+    def old_replica_sets():
+        counted = {name: 0 for name in limits}
+        for replica_set in json.loads(kubectl("get", "replicasets", "-o", "json"))["items"]:
+            owner = (replica_set["metadata"].get("ownerReferences") or [{}])[0].get("name")
+            if owner in counted and not replica_set["spec"].get("replicas"):
+                counted[owner] += 1
+        return counted
+    for _ in range(60):
+        if all(count <= 3 for count in old_replica_sets().values()):
+            break
+        time.sleep(1)
+    counted = old_replica_sets()
+    s.check(
+        all(count <= 3 for count in counted.values()),
+        f"at most three old ReplicaSets a Deployment: {counted}",
+    )
+
+    # Named by revision and removed by Helm with the next one. A hook Job
+    # carries no revision: it goes when it succeeds. The old chart's key Job,
+    # above, is the one it kept, and the only one excused.
+    def earlier_jobs():
+        earlier, kept = [], []
+        for job in jobs():
+            name = job["metadata"]["name"]
+            annotations = job["metadata"].get("annotations", {})
+            finished = job["status"].get("succeeded") or job["status"].get("failed")
+            suffix = name.rsplit("-", 1)[-1]
+            if left_by_the_old_chart(job):
+                kept.append(name)
+            elif "helm.sh/hook" in annotations:
+                if finished:
+                    earlier.append(name)
+            elif not (suffix.isdigit() and int(suffix) == revision):
+                earlier.append(name)
+        return earlier, kept
+    for _ in range(120):
+        if not earlier_jobs()[0]:
+            break
+        time.sleep(1)
+    earlier, kept = earlier_jobs()
+    if kept:
+        s.note(f"left by the chart installed first, which kept its hook Job once done: {kept}")
+    s.check(
+        not earlier,
+        f"no finished Job from before revision {revision}" + (f"; left: {earlier}" if earlier else ""),
+    )
 
 
 sys.exit(main())

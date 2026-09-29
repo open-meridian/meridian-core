@@ -29,6 +29,12 @@ pub enum StoreError {
     #[error("the street store is unavailable: {0}")]
     Unavailable(String),
 
+    /// The database was migrated by a newer release than this binary. Its own
+    /// variant because it is the one refusal at start that waiting never
+    /// fixes: a starting component waits out every other one.
+    #[error("{0}")]
+    SchemaAhead(String),
+
     #[error("no statement {0}")]
     UnknownStatement(String),
 

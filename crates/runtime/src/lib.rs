@@ -49,18 +49,247 @@ pub const REPORT_INWARD_EVERY: Duration = Duration::from_secs(20);
 /// process subscribed is gone. Long enough that they have said it again.
 pub const REPORT_AGAIN_AFTER: Duration = Duration::from_secs(45);
 
+/// How often a component waiting for something it needs looks again.
+pub const WAIT_AGAIN_AFTER: Duration = Duration::from_secs(2);
+
+/// How often a waiting component says, again, what it is waiting for: often
+/// enough that somebody reading the log during an upgrade sees it, rarely
+/// enough that a minute's migration is not a page of the same line.
+pub const WAIT_SAY_EVERY: Duration = Duration::from_secs(20);
+
+/// Why something a component needs is not there to be used.
+#[derive(Debug)]
+pub enum Wait {
+    /// Not yet, and time fixes it: a database not answering, a schema the
+    /// migration Job has not reached, a broker still starting. An upgrade
+    /// starts every component beside the Job that migrates for it, so each
+    /// meets this on every release (task kernel/upgrading-a-deployment-in-place).
+    NotYet(String),
+    /// Never, by waiting: a schema newer than this binary understands, which
+    /// only another release fixes. Refused, with the sentence that says so.
+    Refused(String),
+}
+
+/// A component waiting, and saying so.
+struct Waiting<'a> {
+    what: &'a str,
+    since: std::time::Instant,
+    said: Option<std::time::Instant>,
+}
+
+impl<'a> Waiting<'a> {
+    fn new(what: &'a str) -> Self {
+        Self {
+            what,
+            since: std::time::Instant::now(),
+            said: None,
+        }
+    }
+
+    /// Said at once and then every [`WAIT_SAY_EVERY`], so the first line is
+    /// the one that explains a pod that is running and not ready.
+    fn not_yet(&mut self, why: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .said
+            .is_none_or(|said| now.duration_since(said) >= WAIT_SAY_EVERY)
+        {
+            tracing::info!(
+                waited_s = self.since.elapsed().as_secs(),
+                "waiting for {}: {why}",
+                self.what
+            );
+            self.said = Some(now);
+        }
+    }
+
+    fn over(&self) {
+        if self.said.is_some() {
+            tracing::info!(
+                waited_s = self.since.elapsed().as_secs(),
+                "{} is there; no longer waiting",
+                self.what
+            );
+        }
+    }
+}
+
+/// Wait, on this thread, until `attempt` succeeds, or refuses in a way time
+/// does not fix.
+///
+/// For what a component needs before its runtime starts: a store's database
+/// and schema, which the blocking Postgres client reaches, and which must be
+/// reached outside the runtime for the reason [`on_runtime`] gives.
+///
+/// Waiting rather than exiting is the point. A component that exits because
+/// its migration has not finished is restarted by Kubernetes after a
+/// back-off, and the upgrade that started it reads as a restart; one that
+/// waits, not ready, is what a rollout waits for (task
+/// kernel/upgrading-a-deployment-in-place, faults 3 and 4).
+pub fn wait_until<T>(
+    what: &str,
+    mut attempt: impl FnMut() -> Result<T, Wait>,
+) -> Result<T, String> {
+    let mut waiting = Waiting::new(what);
+    loop {
+        match attempt() {
+            Ok(done) => {
+                waiting.over();
+                return Ok(done);
+            }
+            Err(Wait::Refused(why)) => return Err(why),
+            Err(Wait::NotYet(why)) => waiting.not_yet(&why),
+        }
+        std::thread::sleep(WAIT_AGAIN_AFTER);
+    }
+}
+
+/// Whether the database at `url` answers, by one connection made and closed.
+///
+/// Asked before a store builds its pool, because the pool is the wrong tool
+/// for the question: it spends thirty seconds failing, logging every attempt
+/// as an error, and says only that it timed out. This fails in seconds and
+/// says why.
+pub fn database_answers(url: &str) -> Result<(), Wait> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|failed| Wait::Refused(format!("the database URL is unreadable: {failed}")))?;
+    config.connect_timeout(Duration::from_secs(5));
+    config
+        .connect(postgres::NoTls)
+        .map(drop)
+        .map_err(|failed| Wait::NotYet(failed.to_string()))
+}
+
+/// A store, once its database answers and holds the schema this binary
+/// expects.
+///
+/// `connect` builds the store's pool and `verify` reads its schema, saying
+/// [`Wait::Refused`] for one newer than this binary. The pool is built once
+/// and kept across attempts, so waiting for a migration is one read every
+/// [`WAIT_AGAIN_AFTER`] rather than a pool made and thrown away.
+pub fn wait_for_store<S>(
+    what: &str,
+    url: &str,
+    connect: impl Fn(&str) -> Result<S, String>,
+    verify: impl Fn(&S) -> Result<(), Wait>,
+) -> Result<S, String> {
+    let mut connected: Option<S> = None;
+    wait_until(what, || {
+        database_answers(url)?;
+        let store = match connected.take() {
+            Some(store) => store,
+            None => connect(url).map_err(Wait::NotYet)?,
+        };
+        match verify(&store) {
+            Ok(()) => Ok(store),
+            Err(failed) => {
+                connected = Some(store);
+                Err(failed)
+            }
+        }
+    })
+}
+
+/// Run a component's asynchronous half to its end, on a runtime of its own
+/// that is stopped before this returns.
+///
+/// The blocking Postgres client closes a connection by running a runtime of
+/// its own, and that panics on a thread already driving one. So a store
+/// dropped inside the runtime -- by its last task ending, or by an early
+/// return taking the async block's captures with it -- panicked on every
+/// shutdown, and aborted as the pool's other connections were dropped while
+/// unwinding ("panic in a destructor during cleanup"). The dashboard did that
+/// on a cluster when it started before its database and broker were there
+/// (task kernel/upgrading-a-deployment-in-place, fault 5).
+///
+/// The rule this keeps: a store is made before this is called and held by the
+/// caller, the future borrows it, and the runtime is gone before the caller's
+/// last reference is. Only a drop outside any runtime closes a connection.
+pub fn on_runtime<F>(serving: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|failed| failed.to_string())?;
+    let served = runtime.block_on(serving);
+    // Every task, and every store reference a task held, goes here, while the
+    // caller still holds its own.
+    drop(runtime);
+    served
+}
+
+/// Whether this component serves, as the file its readiness probe looks for.
+///
+/// A component that waits for what it needs has to be seen waiting: without a
+/// readiness that says otherwise, its pod counts as ready the moment it
+/// starts, the rollout stops the old one, and an upgrade reports success over
+/// a component still waiting for its schema. The components with no port say
+/// it with a file (`MERIDIAN_READY_FILE`, which the chart sets and probes);
+/// with the variable unset -- compose, a developer's shell -- this does
+/// nothing.
+pub struct Ready(Option<std::path::PathBuf>);
+
+impl Ready {
+    /// Not ready, whatever an earlier container in this pod said: the file
+    /// is on a volume that outlives a restarted container, and a new process
+    /// waiting for its schema must not inherit the old one's word.
+    pub fn from_env() -> Self {
+        let path = var("MERIDIAN_READY_FILE").map(std::path::PathBuf::from);
+        if let Some(path) = &path {
+            let _ = std::fs::remove_file(path);
+        }
+        Self(path)
+    }
+
+    /// Serving: said once everything this component needs is there and its
+    /// handlers are registered.
+    pub fn serving(&self) {
+        let Some(path) = &self.0 else { return };
+        match std::fs::write(path, b"serving\n") {
+            Ok(()) => tracing::debug!(path = %path.display(), "marked ready"),
+            Err(failed) => tracing::warn!(
+                path = %path.display(),
+                %failed,
+                "this component serves and could not say so; its readiness probe will fail"
+            ),
+        }
+    }
+}
+
+impl Drop for Ready {
+    /// Stopping is no longer serving.
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// The bus this component talks on.
 ///
 /// A broker when one is configured, and in-process when none is. Both are
 /// real: a developer running one binary needs no broker, and a deployment with
 /// separate components cannot work without one. What decides it is a single
 /// setting rather than a build flag, so the same image does both.
+///
+/// A broker that does not answer yet is waited for, and never a reason to
+/// exit: in an upgrade the broker restarts beside everything that connects to
+/// it, and a component that exited on it was restarted once per release.
 pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
     let backend: Arc<dyn Backend> = match var("MERIDIAN_BROKER_URL") {
         Some(url) => {
-            let broker = NatsBackend::connect(&url)
-                .await
-                .map_err(|failed| format!("the broker could not be reached: {failed}"))?;
+            let mut waiting = Waiting::new("the broker");
+            let broker = loop {
+                match NatsBackend::connect(&url).await {
+                    Ok(broker) => break broker,
+                    Err(failed) => waiting.not_yet(&format!("it could not be reached: {failed}")),
+                }
+                tokio::time::sleep(WAIT_AGAIN_AFTER).await;
+            };
+            waiting.over();
             tracing::info!("connected to the broker");
             Arc::new(broker)
         }

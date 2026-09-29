@@ -13,6 +13,7 @@
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-first-run" $full }}
+{{- $binding := printf "%s-grant" $name }}
 {{- $database := include "meridian-runtime.databaseSecret" . }}
 {{- $oidc := printf "%s-dashboard-oidc" $full }}
 {{- $ldap := .Values.firstRun.directorySecretName | default (printf "%s-ldap-bind" $full) }}
@@ -59,15 +60,30 @@ rules:
   # rights" a thing that happens rather than a thing that was meant.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    resourceNames: [{{ $name | quote }}]
+    resourceNames: [{{ $binding | quote }}]
     verbs: ["delete"]
 ---
+# The rights, bound for each install and upgrade and given up by the Job
+# (decisions/016). A hook rather than a release resource, because the Job
+# deletes it: Helm's --wait waits for every resource the release names to
+# exist, and failed an upgrade on this binding being gone
+# ("RoleBinding/...-dashboard-key not ready: NotFound", task
+# kernel/upgrading-a-deployment-in-place). A hook is made before the release's
+# resources and never waited for, and Argo CD and Flux treat it the same way.
+# Recreated every time, so each revision's Job finds it; named apart from the
+# release resource it replaces, which the first upgrade to this chart removes.
+# An uninstall leaves a hook behind, so a binding whose Job never finished
+# outlives the release, naming a Role and an account the uninstall removed:
+# it grants nothing, and the next install replaces it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ $name }}
+  name: {{ $binding }}
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
 subjects:
   - kind: ServiceAccount
     name: {{ $name }}
@@ -85,7 +101,9 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   backoffLimit: 6
-  ttlSecondsAfterFinished: 3600
+  # Named by revision and gone a day after it finishes, for the reasons
+  # migrate-job.yaml gives.
+  ttlSecondsAfterFinished: 86400
   template:
     metadata:
       labels:
@@ -129,7 +147,7 @@ spec:
             - name: MERIDIAN_FIRST_RUN_ADDRESSES_SECRET
               value: {{ $addresses | quote }}
             - name: MERIDIAN_FIRST_RUN_BINDING
-              value: {{ $name | quote }}
+              value: {{ $binding | quote }}
             - name: MERIDIAN_FIRST_RUN_RESTART
               value: {{ join "," $restart | quote }}
 {{- if .Values.database.brought.enabled }}
