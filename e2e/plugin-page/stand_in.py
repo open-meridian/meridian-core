@@ -14,13 +14,22 @@ A POST to /report says, as the plugin itself, which accounts its connection
 reaches (W2.8) and why the linked one is not current (W2.1), which is what the
 dashboard lists beside its link action and shows with what to do.
 
+It declares two settings at registration (W4.1): a required secret, the way a
+venue's API key is, and a number. It watches them on the stream its sidecar
+serves (W4.7), and a GET of /settings says what it holds: the names, what is
+still missing, and a digest of the secret -- never the secret, which a page
+must not carry -- and when this process started and how often it registered,
+so the runner can tell it was not restarted to get it.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
 import base64
+import hashlib
 import http.server
 import json
 import os
+import threading
 import time
 import uuid
 
@@ -35,12 +44,26 @@ EXTERNAL_ACCOUNT = "ext-e2e"
 # Reached and never linked, so it stays on the dashboard's list.
 OTHER_ACCOUNT = "ext-e2e-roth"
 
+STARTED_AT_NS = time.time_ns()
+DECLARED = [
+    sidecar_pb2.SettingDeclaration(
+        name="api_key", type=sidecar_pb2.SETTING_TYPE_STRING, required=True, secret=True,
+        description="The venue's API key."),
+    sidecar_pb2.SettingDeclaration(
+        name="poll_minutes", type=sidecar_pb2.SETTING_TYPE_INTEGER,
+        description="How often to read the venue, in minutes."),
+]
+# What the settings stream last delivered, as this plugin would say it.
+HELD = {"deliveries": 0, "values": {}, "missing_required": [], "registrations": 0}
+HELD_LOCK = threading.Lock()
+
 
 def register():
     stub = sidecar_pb2_grpc.SidecarServiceStub(grpc.insecure_channel(SIDECAR))
     request = sidecar_pb2.RegisterRequest(
         schema_version="v2",
         interface=sidecar_pb2.InterfaceDeclaration(loopback_port=PORT, title="Plugin page"),
+        settings=DECLARED,
     )
     for _ in range(60):
         try:
@@ -50,9 +73,39 @@ def register():
             continue
         if not reply.admitted:
             raise SystemExit(f"refused: {reply.refusal_reason}")
+        with HELD_LOCK:
+            HELD["registrations"] += 1
         print("registered, serving a page on loopback", flush=True)
         return
     raise SystemExit("the sidecar never answered")
+
+
+def watch_settings():
+    """Hold what the sidecar delivers, for as long as the process runs."""
+    stub = sidecar_pb2_grpc.SidecarServiceStub(grpc.insecure_channel(SIDECAR))
+    while True:
+        try:
+            for delivery in stub.WatchSettings(sidecar_pb2.WatchSettingsRequest()):
+                with HELD_LOCK:
+                    HELD["deliveries"] += 1
+                    HELD["values"] = {v.name: v.value for v in delivery.values}
+                    HELD["missing_required"] = list(delivery.missing_required)
+        except grpc.RpcError:
+            time.sleep(1)
+
+
+def settings_said():
+    """The settings as this plugin holds them, fit for a page: a secret by its
+    digest alone."""
+    with HELD_LOCK:
+        values = dict(HELD["values"])
+        said = {k: HELD[k] for k in ("deliveries", "missing_required", "registrations")}
+    secret = values.pop("api_key", None)
+    said["names"] = sorted(values) + (["api_key"] if secret is not None else [])
+    said["values"] = values
+    said["api_key_sha256"] = hashlib.sha256(secret.encode()).hexdigest() if secret else None
+    said["started_at_ns"] = STARTED_AT_NS
+    return said
 
 
 def assertion_of(header):
@@ -145,6 +198,14 @@ def decoded(header):
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         callers = self.headers.get_all("Meridian-Caller") or []
+        if self.path == "/settings":
+            body = json.dumps(settings_said()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         seen = {
             "path": self.path,
             "callers": len(callers),
@@ -182,4 +243,5 @@ class Page(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     register()
+    threading.Thread(target=watch_settings, daemon=True).start()
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Page).serve_forever()

@@ -15,6 +15,10 @@
 //! `conductor public-key` prints the public half of the deployment's key,
 //! generating one if there is none. That moved here with the key: the process
 //! that holds a private half is the process that can speak for its public one.
+//!
+//! `conductor settings-key` is the chart's Job making the key secret plugin
+//! settings are sealed with, once (meridian_config::sealing). Only this
+//! component mounts it.
 
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +48,9 @@ fn main() {
 const ENROLMENT_STATE: &str = "platform.config.query.enrolment";
 const ENROL_WITH_CODE: &str = "platform.config.command.enrol-with-code";
 
+/// Where the chart mounts the settings key's Secret.
+const SETTINGS_KEY: &str = "/run/meridian/settings-key";
+
 fn run() -> Result<(), String> {
     let command = std::env::args().nth(1);
 
@@ -63,6 +70,31 @@ fn run() -> Result<(), String> {
                 format!("the configuration store's schema could not be applied: {failed}")
             })?;
         return grant_if_serving(&url);
+    }
+
+    // The key secret settings are sealed with, made once by the chart's Job,
+    // which holds nothing else: no database, no deployment key.
+    if command.as_deref() == Some("settings-key") {
+        let secret = required("MERIDIAN_SETTINGS_KEY_SECRET")?;
+        let binding = required("MERIDIAN_SETTINGS_KEY_BINDING")?;
+        let cluster =
+            meridian_first_run::cluster::ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let done = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|failed| failed.to_string())?
+            .block_on(meridian_config::sealing::provision(
+                &cluster, &secret, &binding,
+            ))?;
+        match done {
+            meridian_config::sealing::Provisioned::Made => {
+                tracing::info!("the settings key is made")
+            }
+            meridian_config::sealing::Provisioned::Kept => {
+                tracing::info!("there is a settings key already; nothing was changed")
+            }
+        }
+        return Ok(());
     }
 
     let key_path = var("MERIDIAN_KEY_PATH").unwrap_or_else(|| "/var/lib/meridian/key.pem".into());
@@ -146,6 +178,11 @@ fn run() -> Result<(), String> {
                 Arc::clone(&store),
                 Arc::new(meridian_config::SystemClock),
                 Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
+                // Read when first needed and kept once found, so the Job
+                // finishing after this starts needs no restart.
+                Arc::new(meridian_config::SettingsKey::at(
+                    var("MERIDIAN_SETTINGS_KEY_DIR").unwrap_or_else(|| SETTINGS_KEY.into()),
+                )),
             );
 
             // W8: the plugin catalogue, and launching from it. Every launch

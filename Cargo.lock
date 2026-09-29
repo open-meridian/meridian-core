@@ -1757,9 +1757,12 @@ dependencies = [
 name = "meridian-config"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chacha20poly1305",
  "meridian-access",
  "meridian-bus",
  "meridian-domain",
+ "meridian-first-run",
  "meridian-pb",
  "meridian-sidecar",
  "postgres",

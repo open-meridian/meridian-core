@@ -17,6 +17,11 @@ syntax = "proto3";
 
 package meridian.v1;
 
+// The settings a plugin declares at registration, which its report carries
+// onward (W4.8). Plugin-facing, and imported from there at the revision this
+// repository pins.
+import "meridian/v1/sidecar.proto";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Vocabulary
 // ─────────────────────────────────────────────────────────────────────────────
@@ -628,6 +633,13 @@ message PluginReport {
   string last_refusal_reason = 10;
 
   int64 reported_at_ns = 11;
+
+  // The settings the plugin declared when it registered (W4.1): names, types,
+  // and whether each is required or secret. Never a value. The conductor
+  // checks a deployment admin's settings against these and tells a secret by
+  // them (W6.11). Empty while the plugin is not registered, and the conductor
+  // then keeps what it last declared.
+  repeated SettingDeclaration declared_settings = 13;
 
   // A single role, before a plugin could hold several.
   reserved 2;

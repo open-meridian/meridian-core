@@ -6,9 +6,10 @@ use axum::http::Request;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccountRecord, AccountState, ExternalAccount, ExternalAccountLink, ExternalAccountsEvent,
-    Permission, RedeemClaimCodeReply, SyncState, SyncStatusEvent, UnlinkedExternalAccount,
-    UnlinkedExternalAccountsEvent,
+    Permission, PluginSettingValue, RedeemClaimCodeReply, SetPluginSettingsRequest, SyncState,
+    SyncStatusEvent, UnlinkedExternalAccount, UnlinkedExternalAccountsEvent,
 };
+use meridian_pb::v1::{SettingDeclaration, SettingType};
 use tower::ServiceExt;
 
 use super::*;
@@ -422,4 +423,251 @@ fn entries_are_plugin_tag_and_level_one_per_line() {
         .unwrap_err()
         .contains("not read or write"));
     assert!(parse_entries("oms-1 write").is_err());
+}
+
+// ── A plugin instance's settings (W6.11) ────────────────────────────────────
+
+/// Obviously not a real credential, and long enough to find in a page.
+const SECRET: &str = "sk-test-not-a-real-key-7f3a";
+
+fn declared(name: &str, kind: SettingType, required: bool, secret: bool) -> SettingDeclaration {
+    SettingDeclaration {
+        name: name.into(),
+        r#type: kind as i32,
+        required,
+        secret,
+        description: format!("What {name} is <for>."),
+    }
+}
+
+/// SnapTrade's shape: two secrets, one of them set, a number and a switch.
+fn snaptrade() -> PluginSettingsRecord {
+    PluginSettingsRecord {
+        plugin_instance_id: "snaptrade-1".into(),
+        values: vec![PluginSettingValue {
+            name: "poll_seconds".into(),
+            value: "900".into(),
+        }],
+        secrets_set: vec!["snaptrade_client_id".into()],
+        updated_at_ns: T0,
+        declared_settings: vec![
+            declared("snaptrade_client_id", SettingType::String, true, true),
+            declared("snaptrade_consumer_key", SettingType::String, true, true),
+            declared("poll_seconds", SettingType::Integer, false, false),
+            declared("synthetic", SettingType::Boolean, false, false),
+        ],
+    }
+}
+
+fn with_settings() -> AccessRecords {
+    let mut records = admin_records();
+    records.plugin_settings = vec![snaptrade()];
+    records
+}
+
+type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;
+
+/// A conductor answering set-plugin-settings, or refusing with `refuse_with`.
+fn conductor_setting(h: &Harness, refuse_with: Option<&'static str>) -> Asked {
+    let asked: Asked = Arc::default();
+    let keeping = Arc::clone(&asked);
+    h.app.bus.serve(
+        "platform.config.command.set-plugin-settings",
+        move |envelope| {
+            let request = SetPluginSettingsRequest::decode(&envelope.payload[..]).unwrap();
+            let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+            keeping.lock().unwrap().push((request, by));
+            match refuse_with {
+                Some(sentence) => Err(sentence.to_string()),
+                None => Ok(("".into(), snaptrade().encode_to_vec())),
+            }
+        },
+    );
+    asked
+}
+
+const SETTINGS: &str = "/admin/plugins/snaptrade-1/settings";
+
+#[tokio::test]
+async fn a_plugins_settings_form_is_built_from_what_it_declared_for_admins_alone() {
+    let h = harness(with_settings(), None);
+    let (status, body) = send(&h, get(&h, SETTINGS, true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A secret is a password field, always empty, saying whether it is set.
+    let client = body
+        .split("data-setting=\"snaptrade_client_id\"")
+        .nth(1)
+        .unwrap()
+        .split("</div>")
+        .next()
+        .unwrap();
+    assert!(client.contains("type=\"password\" name=\"secret.snaptrade_client_id\" value=\"\""));
+    assert!(client.contains(">set<") && client.contains("required"));
+    assert!(client.contains("name=\"clear.snaptrade_client_id\""));
+    let consumer = body
+        .split("data-setting=\"snaptrade_consumer_key\"")
+        .nth(1)
+        .unwrap()
+        .split("</div>")
+        .next()
+        .unwrap();
+    assert!(consumer.contains(">not set<") && !consumer.contains("clear."));
+
+    // What is not secret, as it stands, in a field its type takes.
+    assert!(body
+        .contains("<input type=\"number\" step=\"1\" name=\"value.poll_seconds\" value=\"900\">"));
+    assert!(body.contains("<select name=\"value.synthetic\"><option value=\"\" selected>"));
+    assert!(
+        body.contains("What poll_seconds is &lt;for&gt;."),
+        "escaped"
+    );
+    assert!(
+        body.contains(&format!("value=\"{}\"", h.form_token)),
+        "the form token"
+    );
+
+    // And the overview lists it, with the required secret it still needs.
+    let (_, overview) = send(&h, get(&h, "/admin", true)).await;
+    let listed = table(&overview, "settings");
+    assert!(listed.contains("data-id=\"snaptrade-1\""));
+    assert!(listed.contains("needs snaptrade_consumer_key"), "{listed}");
+    assert!(listed.contains(&format!("href=\"{SETTINGS}\"")));
+
+    let unknown = send(&h, get(&h, "/admin/plugins/ghost-1/settings", true)).await;
+    assert_eq!(unknown.0, StatusCode::NOT_FOUND);
+
+    let mut not_admin = with_settings();
+    not_admin.permissions.clear();
+    let nobody = harness(not_admin, None);
+    assert_eq!(
+        send(&nobody, get(&nobody, SETTINGS, true)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&nobody, get(&nobody, SETTINGS, false)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn a_secret_typed_in_goes_to_the_conductor_and_never_back_into_a_page() {
+    let h = harness(with_settings(), None);
+    let asked = conductor_setting(&h, None);
+    let form = format!(
+        "form_token={}&secret.snaptrade_client_id=&secret.snaptrade_consumer_key={SECRET}\
+         &value.poll_seconds=900&value.synthetic=true",
+        h.form_token
+    );
+    let response = router(Arc::clone(&h.app))
+        .oneshot(post(&h, SETTINGS, &form))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        format!("{SETTINGS}?saved=1").as_str()
+    );
+
+    let (request, by) = asked.lock().unwrap()[0].clone();
+    assert_eq!(by, ADA, "on her behalf");
+    assert_eq!(request.plugin_instance_id, "snaptrade-1");
+    // Only what changed: the set secret left empty is left alone, and the
+    // number is what it was.
+    let sent: Vec<(&str, &str)> = request
+        .values
+        .iter()
+        .map(|v| (v.name.as_str(), v.value.as_str()))
+        .collect();
+    assert_eq!(
+        sent,
+        [("snaptrade_consumer_key", SECRET), ("synthetic", "true")]
+    );
+    assert!(request.cleared.is_empty());
+
+    let (_, page) = send(&h, get(&h, &format!("{SETTINGS}?saved=1"), true)).await;
+    assert!(page.contains("Saved."));
+    assert!(!page.contains(SECRET), "never shown");
+
+    // Refused, the page says the conductor's sentence and not what was typed.
+    let refused = harness(with_settings(), None);
+    conductor_setting(
+        &refused,
+        Some("setting snaptrade_consumer_key could not be stored"),
+    );
+    let form = format!(
+        "form_token={}&secret.snaptrade_consumer_key={SECRET}",
+        refused.form_token
+    );
+    let (status, body) = send(&refused, post(&refused, SETTINGS, &form)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("could not be stored"), "{body}");
+    assert!(!body.contains(SECRET));
+}
+
+#[tokio::test]
+async fn a_settings_form_without_the_sessions_token_sends_nothing() {
+    let h = harness(with_settings(), None);
+    let asked = conductor_setting(&h, None);
+    let form = format!("form_token=forged&secret.snaptrade_consumer_key={SECRET}");
+    let (status, body) = send(&h, post(&h, SETTINGS, &form)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!body.contains(SECRET));
+    assert!(asked.lock().unwrap().is_empty());
+
+    // And a form that changes nothing sends nothing, and says so.
+    let form = format!("form_token={}&value.poll_seconds=900", h.form_token);
+    let response = router(Arc::clone(&h.app))
+        .oneshot(post(&h, SETTINGS, &form))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["location"],
+        format!("{SETTINGS}?saved=none").as_str()
+    );
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_form_asks_for_what_changed_and_clears_only_what_it_was_told_to() {
+    let record = snaptrade();
+    let form = |pairs: &[(&str, &str)]| -> Fields {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    assert!(settings::request(&record, &form(&[("value.poll_seconds", "900")])).is_none());
+
+    let emptied = settings::request(&record, &form(&[("value.poll_seconds", "")])).unwrap();
+    assert_eq!(emptied.cleared, ["poll_seconds"]);
+
+    let cleared = settings::request(
+        &record,
+        &form(&[
+            ("value.poll_seconds", "900"),
+            ("clear.snaptrade_client_id", "on"),
+            ("clear.snaptrade_consumer_key", "on"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        cleared.cleared,
+        ["snaptrade_client_id"],
+        "a secret that is not set has nothing to clear"
+    );
+
+    let replaced = settings::request(
+        &record,
+        &form(&[
+            ("value.poll_seconds", "900"),
+            ("secret.snaptrade_client_id", " new-key "),
+            ("clear.snaptrade_client_id", "on"),
+            ("value.undeclared", "x"),
+        ]),
+    )
+    .unwrap();
+    assert!(replaced.cleared.is_empty(), "typed in, it is replaced");
+    assert_eq!(replaced.values.len(), 1);
+    assert_eq!(replaced.values[0].value, "new-key");
 }

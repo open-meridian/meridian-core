@@ -8,13 +8,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_config::store::{Ending, KnownPlugin, Store, Withdrawal};
-use meridian_config::{PostgresStore, DEPLOYMENT_ADMIN};
+use meridian_config::store::{Ending, Held, KnownPlugin, SettingChange, Store, Withdrawal};
+use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccountGroup, AccountRecord, AccountState,
     ExternalAccountLink, Permission, PluginLaunch, PluginLaunchState, PluginMetadata,
     PluginVersion, SignInRecord, UserGroup,
 };
+use meridian_pb::v1::{SettingDeclaration, SettingType};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +28,12 @@ fn base_url() -> String {
 
 /// A migrated store in a schema of this test's own.
 fn store(tag: &str) -> PostgresStore {
+    store_at(tag).0
+}
+
+/// The same, and the URL that reaches its schema, to read its tables as a
+/// database dump would.
+fn store_at(tag: &str) -> (PostgresStore, String) {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -46,7 +53,7 @@ fn store(tag: &str) -> PostgresStore {
     store.migrate().expect("migrates");
     store.migrate().expect("migrating twice is a no-op");
     store.verify().expect("recognised after migrating");
-    store
+    (store, url)
 }
 
 fn user_group(id: &str, login: &str) -> UserGroup {
@@ -387,4 +394,196 @@ fn a_live_launch_is_read_back_as_live() {
     };
     assert!(read("snaptrade-1"));
     assert!(!read("snaptrade-2"));
+}
+
+/// Obviously not a real credential, and long enough to find in bytes.
+const SECRET: &str = "sk-test-not-a-real-key-7f3a";
+
+fn declaration(name: &str, kind: SettingType, secret: bool) -> SettingDeclaration {
+    SettingDeclaration {
+        name: name.into(),
+        r#type: kind as i32,
+        required: secret,
+        secret,
+        description: format!("what {name} is"),
+    }
+}
+
+#[test]
+fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
+    let store = store("declared");
+    store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "snaptrade-1".into(),
+            roles: vec!["custody".into()],
+            tags: vec![],
+            last_reported_at_ns: 1,
+        })
+        .unwrap();
+    let declared = vec![
+        declaration("api_key", SettingType::String, true),
+        declaration("poll_minutes", SettingType::Integer, false),
+        declaration("synthetic", SettingType::Boolean, false),
+    ];
+    store
+        .record_declared_settings("snaptrade-1", &declared)
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared
+    );
+    store
+        .record_declared_settings("snaptrade-1", &declared[1..])
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared[1..]
+    );
+}
+
+#[test]
+fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() {
+    let (store, url) = store_at("settings");
+    let key = SettingsKey::holding(&[7u8; 32]);
+    let sealed = key.seal("snaptrade-1", "api_key", SECRET).unwrap();
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[
+                SettingChange {
+                    name: "api_key".into(),
+                    held: Some(Held::Sealed(sealed.clone())),
+                },
+                SettingChange {
+                    name: "poll_minutes".into(),
+                    held: Some(Held::Plain("15".into())),
+                },
+            ],
+            "local|ada",
+            5,
+        )
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let held: Vec<(&str, &Held, &str, i64)> = snapshot
+        .settings
+        .iter()
+        .map(|s| (s.name.as_str(), &s.held, s.set_by.as_str(), s.set_at_ns))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("api_key", &Held::Sealed(sealed.clone()), "local|ada", 5),
+            ("poll_minutes", &Held::Plain("15".into()), "local|ada", 5),
+        ]
+    );
+    assert_eq!(
+        key.open("snaptrade-1", "api_key", &sealed).unwrap(),
+        SECRET,
+        "and opens with the key"
+    );
+
+    // What a dump of the database holds: every row of both tables as text.
+    let mut dump = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let text: String = dump
+        .query_one(
+            "SELECT coalesce(string_agg(s::text, '|'), '')
+               FROM (SELECT * FROM config_plugin_setting) s",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        text.contains("poll_minutes"),
+        "the dump read the table: {text}"
+    );
+    assert!(!text.contains(SECRET), "no secret at rest");
+    let hex: String = SECRET.bytes().map(|b| format!("{b:02x}")).collect();
+    assert!(!text.contains(&hex), "not even as bytea");
+    let value: Option<String> = dump
+        .query_one(
+            "SELECT value FROM config_plugin_setting WHERE name = 'api_key'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(value, None, "a secret is never written to the value column");
+
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[SettingChange {
+                name: "api_key".into(),
+                held: None,
+            }],
+            "local|grace",
+            9,
+        )
+        .unwrap();
+    let names: Vec<String> = store
+        .snapshot()
+        .unwrap()
+        .settings
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, ["poll_minutes"], "cleared");
+
+    // Who, what and when; the table has nowhere to put a value.
+    let changes: Vec<(String, String, i16, String, i64)> = dump
+        .query(
+            "SELECT plugin_instance_id, name, action, changed_by, changed_at_ns
+               FROM config_plugin_setting_change ORDER BY change_id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect();
+    let expected = |name: &str, action: i16, by: &str, at: i64| {
+        (
+            "snaptrade-1".to_string(),
+            name.to_string(),
+            action,
+            by.to_string(),
+            at,
+        )
+    };
+    assert_eq!(
+        changes,
+        [
+            expected("api_key", 1, "local|ada", 5),
+            expected("poll_minutes", 1, "local|ada", 5),
+            expected("api_key", 2, "local|grace", 9),
+        ]
+    );
+    let columns: Vec<String> = dump
+        .query(
+            "SELECT column_name::text FROM information_schema.columns
+              WHERE table_schema = current_schema()
+                AND table_name = 'config_plugin_setting_change'",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(
+        !columns.iter().any(|c| c == "value" || c == "sealed"),
+        "{columns:?}"
+    );
+
+    // And the table itself refuses a row that is neither, or both.
+    let both = dump.execute(
+        "INSERT INTO config_plugin_setting (plugin_instance_id, name, value, sealed, set_by, set_at_ns)
+         VALUES ('snaptrade-1', 'x', 'a', '\\x00', 'someone', 1)",
+        &[],
+    );
+    assert!(both.is_err());
+    let neither = dump.execute(
+        "INSERT INTO config_plugin_setting (plugin_instance_id, name, set_by, set_at_ns)
+         VALUES ('snaptrade-1', 'y', 'someone', 1)",
+        &[],
+    );
+    assert!(neither.is_err());
 }

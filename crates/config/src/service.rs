@@ -1,6 +1,6 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
-//! Eleven commands and queries from the dashboard, two queries from sidecars,
+//! Twelve commands and queries from the dashboard, two queries from sidecars,
 //! two events heard, one announced. Every change is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
@@ -10,9 +10,18 @@
 //!
 //! Its own plugin's configuration and access table, and no other. The request
 //! names no plugin: the answer is for the instance the envelope says published
-//! the question, which the bus stamps and a plugin cannot forge. Secrets will
+//! the question, which the bus stamps and a plugin cannot forge. Secrets
 //! travel on that reply and nowhere else, because the broker narrows
 //! publishing to an instance and not subscribing (the topic registry says why).
+//!
+//! # Settings
+//!
+//! Checked against what the plugin declared at registration, which its
+//! sidecar's report carries here (W4.8). A secret is sealed with the
+//! deployment's settings key before it is written, and opened only to answer
+//! that plugin's sidecar ([`crate::sealing`]). What the dashboard is told of a
+//! secret is that it is set; no reply, log line or record here carries its
+//! value, and who changed a setting is recorded without it.
 //!
 //! # Who asked
 //!
@@ -29,16 +38,17 @@ use meridian_domain::v1::{
     DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
     GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
-    PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport,
-    RedeemClaimCodeReply, RedeemClaimCodeRequest, SignInRecord, UserGroup, WithdrawPermissionReply,
-    WithdrawPermissionRequest,
+    PluginConfigurationChangedEvent, PluginConfigurationRequest, PluginReport, PluginSettingValue,
+    PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest,
+    SignInRecord, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use meridian_pb::v1::PluginAccessRequest;
 use prost::Message;
 
 use crate::ids;
 use crate::rules;
-use crate::store::{KnownPlugin, Snapshot, Store, Withdrawal};
+use crate::sealing::SettingsKey;
+use crate::store::{Held, KnownPlugin, SettingChange, Snapshot, Store, StoredSetting, Withdrawal};
 use crate::DEPLOYMENT_ADMIN;
 
 pub const PERSON_SIGNED_IN: &str = "platform.config.event.person-signed-in";
@@ -53,6 +63,7 @@ pub const DEFINE_ACCESS_GROUP: &str = "platform.config.command.define-access-gro
 pub const GRANT_PERMISSION: &str = "platform.config.command.grant-permission";
 pub const WITHDRAW_PERMISSION: &str = "platform.config.command.withdraw-permission";
 pub const SEND_DIAGNOSTIC_BUNDLE: &str = "platform.config.command.send-diagnostic-bundle";
+pub const SET_PLUGIN_SETTINGS: &str = "platform.config.command.set-plugin-settings";
 pub const PLUGIN_CONFIGURATION: &str = "platform.config.query.plugin-configuration";
 pub const PLUGIN_CONFIGURATION_CHANGED: &str = "platform.config.event.plugin-configuration-changed";
 pub const PLUGIN_ACCESS: &str = "platform.config.query.plugin-access";
@@ -104,11 +115,25 @@ pub fn deployment_admin() -> meridian_domain::v1::AccessGroup {
     }
 }
 
-/// What a sidecar is told about its plugin, derived from one snapshot.
-///
-/// Settings are empty until the settings slice gives them somewhere to come
-/// from (kernel/dashboard-health-settings-and-bundle).
-pub fn configuration(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
+/// A plugin's settings as stored: the ones it declared, secrets still sealed.
+fn stored_settings<'a>(
+    snapshot: &'a Snapshot,
+    plugin_instance_id: &'a str,
+) -> impl Iterator<Item = &'a StoredSetting> {
+    let declared = snapshot
+        .declared_settings
+        .get(plugin_instance_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    snapshot.settings.iter().filter(move |held| {
+        held.plugin_instance_id == plugin_instance_id
+            && declared.iter().any(|d| d.name == held.name)
+    })
+}
+
+/// What a sidecar is told about its plugin, but for its settings: those are
+/// [`configuration`]'s, the one place a secret is opened.
+fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
     let scope = meridian_access::plugin_scope(&snapshot.records, plugin_instance_id);
     PluginConfiguration {
         plugin_instance_id: plugin_instance_id.to_string(),
@@ -124,6 +149,70 @@ pub fn configuration(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginCon
     }
 }
 
+/// What a sidecar is told about its plugin, derived from one snapshot:
+/// secrets opened, for that sidecar to hand to its plugin and nobody else.
+///
+/// A secret that does not open with this deployment's key -- the key was
+/// lost, or replaced -- is left out and said so, naming the setting: the
+/// plugin then reports it missing if it is required, and a deployment admin
+/// sets it again.
+pub fn configuration(
+    snapshot: &Snapshot,
+    plugin_instance_id: &str,
+    key: &SettingsKey,
+) -> PluginConfiguration {
+    let mut configuration = told(snapshot, plugin_instance_id);
+    configuration.settings = stored_settings(snapshot, plugin_instance_id)
+        .filter_map(|held| {
+            let value = match &held.held {
+                Held::Plain(value) => value.clone(),
+                Held::Sealed(sealed) => match key.open(plugin_instance_id, &held.name, sealed) {
+                    Ok(value) => value,
+                    Err(why) => {
+                        tracing::warn!("{why}; the plugin is not given it until it is set again");
+                        return None;
+                    }
+                },
+            };
+            Some(PluginSettingValue {
+                name: held.name.clone(),
+                value,
+            })
+        })
+        .collect();
+    configuration
+}
+
+/// What the dashboard may show of a plugin's settings (W6.11): what it
+/// declared, the values that are not secret, and which secrets are set.
+///
+/// A setting declared secret, or held sealed, is only ever named: whatever
+/// the plugin declares later, nothing sealed is shown.
+pub fn settings_record(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginSettingsRecord {
+    let declared = snapshot
+        .declared_settings
+        .get(plugin_instance_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut record = PluginSettingsRecord {
+        plugin_instance_id: plugin_instance_id.to_string(),
+        ..Default::default()
+    };
+    for held in stored_settings(snapshot, plugin_instance_id) {
+        let secret = declared.iter().any(|d| d.name == held.name && d.secret);
+        match &held.held {
+            Held::Plain(value) if !secret => record.values.push(PluginSettingValue {
+                name: held.name.clone(),
+                value: value.clone(),
+            }),
+            _ => record.secrets_set.push(held.name.clone()),
+        }
+        record.updated_at_ns = record.updated_at_ns.max(held.set_at_ns);
+    }
+    record.declared_settings = declared;
+    record
+}
+
 /// Every plugin anything could be configured for.
 fn plugins_in(snapshot: &Snapshot) -> BTreeSet<String> {
     let mut plugins: BTreeSet<String> = snapshot
@@ -132,18 +221,33 @@ fn plugins_in(snapshot: &Snapshot) -> BTreeSet<String> {
         .map(|p| p.plugin_instance_id.clone())
         .collect();
     plugins.extend(snapshot.links.iter().map(|l| l.plugin_instance_id.clone()));
+    plugins.extend(
+        snapshot
+            .settings
+            .iter()
+            .map(|s| s.plugin_instance_id.clone()),
+    );
     for group in &snapshot.records.access_groups {
         plugins.extend(group.entries.iter().map(|e| e.plugin_instance_id.clone()));
     }
     plugins
 }
 
-/// The plugins whose configuration differs between two snapshots.
+/// The plugins whose configuration differs between two snapshots. Settings
+/// are compared as stored, so telling which changed opens no secret.
 pub fn changed_plugins(before: &Snapshot, after: &Snapshot) -> Vec<String> {
     let mut all = plugins_in(before);
     all.extend(plugins_in(after));
+    let settings = |snapshot: &Snapshot, plugin: &str| -> Vec<(String, Held)> {
+        stored_settings(snapshot, plugin)
+            .map(|held| (held.name.clone(), held.held.clone()))
+            .collect()
+    };
     all.into_iter()
-        .filter(|plugin| configuration(before, plugin) != configuration(after, plugin))
+        .filter(|plugin| {
+            told(before, plugin) != told(after, plugin)
+                || settings(before, plugin) != settings(after, plugin)
+        })
         .collect()
 }
 
@@ -152,6 +256,7 @@ struct Context {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     upstream: Arc<dyn Upstream>,
+    key: Arc<SettingsKey>,
 }
 
 impl Context {
@@ -293,17 +398,22 @@ pub(crate) fn answer_on<C, Req, Rep, F>(
 
 /// Register every handler the configuration store serves, and start listening
 /// for the two events it keeps. Call inside a runtime.
+///
+/// `key` seals a secret setting before it is written and opens it for its
+/// plugin's sidecar; nothing else here holds it.
 pub fn serve(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     upstream: Arc<dyn Upstream>,
+    key: Arc<SettingsKey>,
 ) {
     let context = Arc::new(Context {
         bus: Arc::clone(&bus),
         store,
         clock,
         upstream,
+        key,
     });
 
     answer(
@@ -315,13 +425,74 @@ pub fn serve(
         ),
         |cx, _: AccessRecordsRequest, _| {
             let snapshot = cx.snapshot()?;
+            // Each known plugin's settings form (W6.11): what it declared,
+            // and which secrets are set, never what they are.
+            let plugin_settings = snapshot
+                .plugins
+                .iter()
+                .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
+                .collect();
             let mut records = snapshot.records;
             records.read_at_ns = cx.clock.now_ns();
+            records.plugin_settings = plugin_settings;
             // With the links, so the dashboard can tell which of the accounts
             // a connector reports have none (W2.8, W6.4). Only the dashboard
             // asks this, and it may already see every account.
             records.links = snapshot.links;
             Ok(records)
+        },
+    );
+
+    answer(
+        &context,
+        SET_PLUGIN_SETTINGS,
+        (
+            "meridian.v1.SetPluginSettingsRequest",
+            "meridian.v1.PluginSettingsRecord",
+        ),
+        |cx, request: SetPluginSettingsRequest, envelope| {
+            let before = cx.snapshot()?;
+            let plugin = request.plugin_instance_id.as_str();
+            // Every value checked, and every secret sealed, before anything
+            // is written: a refusal part-way through changes nothing.
+            let mut changes = Vec::new();
+            for (declaration, value) in rules::plugin_settings(&before, &request)? {
+                let name = declaration.name.clone();
+                let held = match value {
+                    None => None,
+                    Some(value) if declaration.secret => Some(Held::Sealed(
+                        cx.key.seal(plugin, &name, &value).map_err(|why| {
+                            format!("secret setting {name} was not stored, and nothing was: {why}")
+                        })?,
+                    )),
+                    Some(value) => Some(Held::Plain(value)),
+                };
+                changes.push(SettingChange { name, held });
+            }
+            if !changes.is_empty() {
+                let by = subject(envelope);
+                cx.store
+                    .put_plugin_settings(plugin, &changes, &by, cx.clock.now_ns())
+                    .map_err(|f| f.to_string())?;
+                let named = |set: bool| -> String {
+                    changes
+                        .iter()
+                        .filter(|change| change.held.is_some() == set)
+                        .map(|change| change.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                // Names, never values.
+                tracing::info!(
+                    plugin,
+                    set = named(true),
+                    cleared = named(false),
+                    by,
+                    "plugin settings changed"
+                );
+                cx.announce(&before)?;
+            }
+            Ok(settings_record(&cx.snapshot()?, plugin))
         },
     );
 
@@ -680,7 +851,7 @@ pub fn serve(
         ),
         |cx, _: PluginConfigurationRequest, envelope| {
             let plugin = publisher(envelope);
-            Ok(configuration(&cx.snapshot()?, &plugin))
+            Ok(configuration(&cx.snapshot()?, &plugin, &cx.key))
         },
     );
 
@@ -740,8 +911,24 @@ pub fn serve(
                 tags: report.tags,
                 last_reported_at_ns: report.reported_at_ns,
             };
+            // What it declared, only while it is registered: a plugin between
+            // registrations declares nothing, and keeps its form meanwhile.
+            // And only from its own sidecar, which is on the bus as the
+            // plugin's instance: which settings are secret is not something
+            // another component may say about a plugin.
+            let own = publisher(&delivery.envelope) == plugin.plugin_instance_id;
+            let declared = (report.registered && own).then_some(report.declared_settings);
             let store = Arc::clone(&noting.store);
-            match tokio::task::spawn_blocking(move || store.record_plugin(&plugin)).await {
+            let keeping = move || {
+                store.record_plugin(&plugin)?;
+                match declared {
+                    Some(declared) => {
+                        store.record_declared_settings(&plugin.plugin_instance_id, &declared)
+                    }
+                    None => Ok(()),
+                }
+            };
+            match tokio::task::spawn_blocking(keeping).await {
                 Ok(Ok(())) => {}
                 Ok(Err(failed)) => tracing::warn!("a plugin report was not kept: {failed}"),
                 Err(failed) => tracing::warn!("a plugin report was not kept: {failed}"),

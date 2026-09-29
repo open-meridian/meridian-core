@@ -510,6 +510,15 @@ pub struct PluginReport {
     pub last_refusal_reason: ::prost::alloc::string::String,
     #[prost(int64, tag = "11")]
     pub reported_at_ns: i64,
+    /// The settings the plugin declared when it registered (W4.1): names, types,
+    /// and whether each is required or secret. Never a value. The conductor
+    /// checks a deployment admin's settings against these and tells a secret by
+    /// them (W6.11). Empty while the plugin is not registered, and the conductor
+    /// then keeps what it last declared.
+    #[prost(message, repeated, tag = "13")]
+    pub declared_settings: ::prost::alloc::vec::Vec<
+        ::meridian_pb::v1::SettingDeclaration,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -1113,6 +1122,10 @@ pub struct AccessRecords {
     /// none. Only the conductor and each plugin's own sidecar knew them before.
     #[prost(message, repeated, tag = "8")]
     pub links: ::prost::alloc::vec::Vec<ExternalAccountLink>,
+    /// Each known plugin's settings form (W6.11): what it declared, its values
+    /// that are not secret, and which secrets are set. Never a secret's value.
+    #[prost(message, repeated, tag = "9")]
+    pub plugin_settings: ::prost::alloc::vec::Vec<PluginSettingsRecord>,
 }
 /// The only thing holdings are recorded against. A plugin never creates one.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1312,6 +1325,12 @@ pub struct PluginSettingsRecord {
     pub secrets_set: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(int64, tag = "4")]
     pub updated_at_ns: i64,
+    /// What the plugin declared when it last registered (W4.8), which the form
+    /// is built from and every value is checked against.
+    #[prost(message, repeated, tag = "5")]
+    pub declared_settings: ::prost::alloc::vec::Vec<
+        ::meridian_pb::v1::SettingDeclaration,
+    >,
 }
 /// Answered for the instance the envelope names, and no other. Secrets travel
 /// only on this reply, never on a broadcast, because the broker narrows

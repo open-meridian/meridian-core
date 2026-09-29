@@ -12,13 +12,25 @@ administrator does -- and only then can she open it. The plugin says which
 accounts its connection reaches, and she links one from the list the
 dashboard shows beside the link action, where its sync state then says what
 to do about it (W2.8, W6.4, W2.1).
+
+The plugin declares a required secret, so its sidecar reports it unhealthy
+from the start. Ada sets the secret in the plugin's settings form, and the
+report turns healthy with the plugin never restarted (W6.11, W4.7, W4.8). The
+secret is looked for everywhere it must not be: every page fetched in the run,
+and every report on the bus, which this watches as a subscriber of the two
+report topics and nothing else. The target greps the components' logs and the
+configuration store for it afterwards.
 """
+import hashlib
 import json
 import os
 import re
+import socket
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +54,137 @@ INSTANCE = os.environ.get("E2E_PLUGIN_INSTANCE", "custody-test-1")
 # to the dashboard and names the host, which is the same request.
 PLUGIN_HOST = f"{INSTANCE}.plugins.dashboard:8080"
 FRONT_DOOR = os.environ.get("E2E_FRONT_DOOR", f"http://sidecar-{INSTANCE}:9292")
+# Obviously fake, and the same value the target greps the logs for.
+SECRET = os.environ.get("E2E_SETTING_SECRET", "sk-test-not-a-real-key-e2e")
+BROKER = os.environ.get("E2E_BROKER", "nats://tests:tests-dev-only@nats:4222")
+REPORT_TOPICS = ("platform.deployment.event.plugin-report",
+                 "platform.deployment.event.component-report")
+# Every page body the run fetched, to look for the secret in.
+PAGES = []
+
+
+def kept(send):
+    def sending(self, method, url, fields=None):
+        reply = send(self, method, url, fields)
+        PAGES.append(reply.body)
+        return reply
+    return sending
+
+
+Browser.send = kept(Browser.send)
+
+
+def fields_of(message):
+    """A protobuf message's fields by number: an int for a varint, bytes for
+    anything length-delimited. Enough to read an envelope and a report."""
+    fields, at = {}, 0
+    while at < len(message):
+        key, at = varint(message, at)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, at = varint(message, at)
+        elif wire == 2:
+            length, at = varint(message, at)
+            value, at = message[at:at + length], at + length
+        elif wire == 1:
+            value, at = message[at:at + 8], at + 8
+        elif wire == 5:
+            value, at = message[at:at + 4], at + 4
+        else:
+            raise ValueError(f"wire type {wire}")
+        fields.setdefault(number, []).append(value)
+    return fields
+
+
+def varint(data, at):
+    shift = value = 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, at
+
+
+class Reports:
+    """Every report on the bus from now on, as a subscriber of the report
+    topics alone -- never of a plugin's configuration, which carries its
+    secret to its sidecar by design."""
+
+    def __init__(self):
+        self.raw = []
+        self.plugins = []
+        self.lock = threading.Lock()
+        url = urllib.parse.urlparse(BROKER)
+        self.sock = socket.create_connection((url.hostname, url.port or 4222), timeout=10)
+        self.file = self.sock.makefile("rb")
+        self.file.readline()  # INFO
+        connect = {"verbose": False, "pedantic": False, "user": url.username,
+                   "pass": url.password, "name": "e2e-reports", "lang": "python",
+                   "version": "0", "protocol": 1}
+        lines = [f"CONNECT {json.dumps(connect)}"]
+        lines += [f"SUB {topic} {sid}" for sid, topic in enumerate(REPORT_TOPICS, 1)]
+        self.sock.sendall(("\r\n".join(lines + ["PING"]) + "\r\n").encode())
+        self.sock.settimeout(None)
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        while True:
+            line = self.file.readline()
+            if not line:
+                return
+            if line.startswith(b"PING"):
+                self.sock.sendall(b"PONG\r\n")
+            elif line.startswith(b"MSG "):
+                parts = line.split()
+                payload = self.file.read(int(parts[-1]))
+                self.file.readline()
+                self.keep(parts[1].decode(), payload)
+            elif line.startswith(b"-ERR"):
+                print(f"the broker said {line!r}", flush=True)
+
+    def keep(self, topic, envelope):
+        with self.lock:
+            self.raw.append(envelope)
+        if topic != REPORT_TOPICS[0]:
+            return
+        report = fields_of(fields_of(envelope).get(3, [b""])[0])
+        said = {
+            "instance": report.get(1, [b""])[0].decode(),
+            "registered": bool(report.get(4, [0])[0]),
+            "healthy": bool(report.get(5, [0])[0]),
+            "detail": report.get(6, [b""])[0].decode(),
+            # Field 13: what it declared, by name (W4.8).
+            "declared": [fields_of(d).get(1, [b""])[0].decode() for d in report.get(13, [])],
+        }
+        with self.lock:
+            self.plugins.append(said)
+
+    def mark(self):
+        with self.lock:
+            return len(self.plugins)
+
+    def until(self, holds, since=0, seconds=60):
+        """The first report of the plugin, from the `since`th heard, for which
+        `holds`."""
+        deadline = time.monotonic() + seconds
+        seen = since
+        while time.monotonic() < deadline:
+            with self.lock:
+                fresh = self.plugins[seen:]
+                seen = len(self.plugins)
+            for said in fresh:
+                if said["instance"] == INSTANCE and holds(said):
+                    return said
+            time.sleep(0.5)
+        with self.lock:
+            last = [s for s in self.plugins if s["instance"] == INSTANCE][-1:]
+        return {"timed_out": True, "last": last}
+
+    def any_carry(self, text):
+        with self.lock:
+            return sum(1 for raw in self.raw if text.encode() in raw), len(self.raw)
 
 
 def on_plugin_host(browser, path):
@@ -58,6 +201,7 @@ def on_plugin_host(browser, path):
     for value in cookies:
         name, _, rest = value.partition("=")
         browser.cookies[name] = rest.split(";")[0]
+    PAGES.append(body)
     return status, body, headers.get("Location"), cookies
 
 
@@ -155,8 +299,73 @@ def administer(ada, action, fields, patience=0):
     return ada.get(dash("/admin"))
 
 
+def settings_form(ada, patience=45):
+    """The plugin's settings page, once the conductor has its declarations
+    and the dashboard has read them again, which is within 30 seconds."""
+    deadline = time.monotonic() + patience
+    while True:
+        page = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings"))
+        if (page.status == 200 and 'data-setting="api_key"' in page.body) \
+                or time.monotonic() > deadline:
+            return page
+        time.sleep(2)
+
+
+def plugin_settings(plugin):
+    status, body, _, _ = on_plugin_host(plugin, "/settings")
+    return json.loads(body) if status == 200 else {"failed": f"{status} {body[:200]}"}
+
+
+def settings_reach_the_running_plugin(ada, plugin, reports):
+    """W6.11, W4.7, W4.8: a required secret, set in the dashboard, reaches a
+    plugin that reported unhealthy for want of it, without a restart."""
+    missing = reports.until(lambda r: r["registered"] and not r["healthy"])
+    check(missing.get("detail") == "required setting api_key is not set",
+          f"before it is set, the plugin is reported unhealthy, naming it: {missing}")
+    check(missing.get("declared") == ["api_key", "poll_minutes"],
+          f"and the report carries what it declared: {missing.get('declared')}")
+    before = plugin_settings(plugin)
+    check(before.get("missing_required") == ["api_key"],
+          f"the plugin is told it is missing: {before}")
+
+    form = settings_form(ada)
+    check(form.status == 200, f"the settings page: {form.status} {sentence(form)}")
+    field = form.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
+    check('type="password"' in field and "not set" in field and "required" in field,
+          f"the secret is a password field, not set: {field[:300]}")
+    # Only a report heard after this counts: one sent while the conductor
+    # was still starting says healthy, having nothing to say otherwise.
+    mark = reports.mark()
+    done = ada.post(dash(f"/admin/plugins/{INSTANCE}/settings"),
+                    {"form_token": form_token(form), "secret.api_key": SECRET,
+                     "value.poll_minutes": "15"})
+    check(done.status == 303, f"saved: {done.status} {sentence(done)}")
+    after = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings?saved=1"))
+    field = after.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
+    check(">set<" in field and 'value=""' in field,
+          f"and then it is set, and its field is still empty: {field[:300]}")
+    check('name="value.poll_minutes" value="15"' in after.body, "the number is shown as it stands")
+
+    healthy = reports.until(lambda r: r["registered"] and r["healthy"], since=mark)
+    check(healthy.get("healthy") is True,
+          f"the report turns healthy without a restart: {healthy}")
+    deadline = time.monotonic() + 45
+    held = plugin_settings(plugin)
+    while held.get("missing_required") != [] and time.monotonic() < deadline:
+        time.sleep(1)
+        held = plugin_settings(plugin)
+    check(held.get("missing_required") == [], f"the plugin is missing nothing: {held}")
+    check(held.get("api_key_sha256") == hashlib.sha256(SECRET.encode()).hexdigest(),
+          "the plugin holds the secret that was set")
+    check(held.get("values", {}).get("poll_minutes") == "15", f"and the number: {held}")
+    check(held.get("started_at_ns") == before.get("started_at_ns")
+          and held.get("registrations") == 1,
+          f"from the same process, registered once: {before} then {held}")
+
+
 def main():
     wait_dashboard()
+    reports = Reports()
 
     say("A: Ada signs in and claims the deployment")
     ada = Browser()
@@ -289,6 +498,16 @@ def main():
         time.sleep(3)
         written = write(plugin)
     check(written.get("ok"), f"once she writes, it is recorded: {written}")
+
+    say("K: a required secret set in the dashboard reaches the running plugin (W6.11)")
+    settings_reach_the_running_plugin(ada, plugin, reports)
+    ada.get(dash("/admin"))
+
+    say("L: the secret is in no page and no report")
+    pages = [page for page in PAGES if SECRET in page]
+    check(not pages, f"in {len(pages)} of the {len(PAGES)} pages fetched")
+    carried, total = reports.any_carry(SECRET)
+    check(total > 0 and carried == 0, f"in {carried} of the {total} reports heard")
 
     say("J: signing out of the dashboard ends the plugin's session")
     home = ada.get(dash("/"))

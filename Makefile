@@ -628,8 +628,18 @@ e2e-dashboard-accounts: network
 # reports the accounts its connection reaches and a sync state, which the
 # dashboard lists beside its link action and shows with what to do (W2.8,
 # W2.1, W6.4).
+#
+# The stand-in declares a required secret, and a deployment admin sets it in
+# the plugin's settings form: its sidecar's report turns healthy with the
+# plugin never restarted (W6.11, W4.7). The secret is then looked for where it
+# must not be -- every page and report, by the runner; every component's log
+# and the configuration store's table, here. Not the broker's log: the
+# development broker traces every payload (-DV), the configuration reply that
+# carries a secret to its sidecar included, which a deployment's does not.
+E2E_SETTING_SECRET := sk-test-not-a-real-key-e2e-5c1d
 E2E_PLUGIN_PAGE := MERIDIAN_PLUGIN_FRONT_DOOR='http://sidecar-{instance}:9292' \
 	MERIDIAN_FRONT_DOOR_ADDRESS=0.0.0.0:9292 \
+	E2E_SETTING_SECRET=$(E2E_SETTING_SECRET) \
 	$(E2E_ACCOUNTS)
 
 e2e-plugin-page: network
@@ -646,6 +656,7 @@ e2e-plugin-page: network
 	$(E2E_PLUGIN_PAGE) build dashboard conductor sidecar street >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) up -d postgres nats fake-platform >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-keys >>.e2e-plugin-page.log 2>&1; \
+	$(E2E_PLUGIN_PAGE) run --rm -T settings-key >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T conductor meridian-conductor migrate >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T street meridian-street migrate >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T dashboard meridian-dashboard migrate >>.e2e-plugin-page.log 2>&1; \
@@ -653,9 +664,22 @@ e2e-plugin-page: network
 	status=0; $(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner || status=$$?; \
 	if [ $$status -ne 0 ]; then $(E2E_PLUGIN_PAGE) logs dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 		echo "e2e-plugin-page FAILED; the components' logs are in .e2e-plugin-page.log" >&2; \
+		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi; \
+	$(E2E_PLUGIN_PAGE) logs --no-color conductor dashboard sidecar plugin-page street postgres >.e2e-plugin-page.components.log 2>&1; \
+	grep -q "plugin settings changed" .e2e-plugin-page.components.log \
+		|| { echo "e2e-plugin-page FAILED: the conductor logged no settings change, so the grep below would prove nothing" >&2; \
+		     $(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+	if grep -qF "$(E2E_SETTING_SECRET)" .e2e-plugin-page.components.log; then \
+		echo "e2e-plugin-page FAILED: the secret setting is in a component's log; see .e2e-plugin-page.components.log" >&2; \
+		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi; \
+	stored="$$($(E2E_PLUGIN_PAGE) exec -T postgres psql -U meridian -d meridian -Atc \
+		"select s::text from config_plugin_setting s where name = 'api_key' and value is null and sealed is not null")"; \
+	if [ -z "$$stored" ] || echo "$$stored" | grep -qF "$(E2E_SETTING_SECRET)" \
+		|| echo "$$stored" | grep -qi "$$(printf %s '$(E2E_SETTING_SECRET)' | od -An -tx1 | tr -d ' \n')"; then \
+		echo "e2e-plugin-page FAILED: the secret is not held sealed in the configuration store" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, links an account it reaches from the dashboard's list and sees its sync state with what to do, and it writes for them only what they may write"
+	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, links an account it reaches from the dashboard's list and sees its sync state with what to do, and it writes for them only what they may write; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -816,6 +840,21 @@ chart-check:
 		| awk '/^kind: Deployment/{c=""} /meridian.dev\/component:/{c=$$2} /key.pem/{print c}' \
 		| sort -u | wc -l | tr -d ' ')" = "1" \
 		|| { echo "chart-check FAILED: more than one component mounts the deployment key" >&2; exit 1; }
+	@# Requirement 35 as amended 2026-09-28. The key secret plugin settings
+	@# are sealed with opens every one of them, so the conductor, which
+	@# delivers them, is the one workload that mounts it. The chart makes its
+	@# Secret empty and keeps it, and a Job fills it once: a key drawn by a
+	@# template would sit in the release's own record.
+	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) 2>/dev/null)"; \
+	holders="$$(echo "$$rendered" | awk '/^---/{n=""} /^  name: / && n==""{n=$$2} /secretName: check-meridian-runtime-settings-key$$/{print n}' | sort -u)"; \
+	[ "$$holders" = "check-meridian-runtime-conductor" ] \
+		|| { echo "chart-check FAILED: the settings key is mounted by: $$holders; only the conductor mounts it" >&2; exit 1; }; \
+	echo "$$rendered" | awk '/^---/{f=0} /^kind: Secret$$/{s=1} /^---/{s=0} s&&/^  name: check-meridian-runtime-settings-key$$/{f=1} f&&/^data:/{print "has data"}' | grep -q . \
+		&& { echo "chart-check FAILED: a fresh install renders a settings key; the Job makes it, in the cluster" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '"meridian-conductor", "settings-key"' \
+		|| { echo "chart-check FAILED: nothing makes the settings key" >&2; exit 1; }; \
+	echo "$$rendered" | awk '/^---/{s=0;f=0} /^kind: Secret$$/{s=1} s&&/^  name: check-meridian-runtime-settings-key$$/{f=1} f&&/helm.sh\/resource-policy: keep/{print; exit}' | grep -q . \
+		|| { echo "chart-check FAILED: the settings key's Secret is not kept when the release goes" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) \
 		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' 2>/dev/null \
 		| grep -q "sidecar-check-1" \
@@ -1000,7 +1039,7 @@ chart-check:
 	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
 	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup\|initContainers' \
 		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, and the live shape there alone"
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, and the live shape there alone"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

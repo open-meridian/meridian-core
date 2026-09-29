@@ -2,9 +2,11 @@
 //!
 //! Accounts; the three dimensions of access -- user groups, account groups,
 //! access groups -- and the permissions joining them; external-account links;
-//! who has signed in; and which plugins have reported what they carry. Every
-//! record a deployment admin authors lives here, beside plugin settings, and
-//! the platform receives none of it (spec/deployment-dashboard-and-access).
+//! who has signed in; which plugins have reported what they carry, and the
+//! settings each declared; and the settings a deployment admin gave them,
+//! secrets sealed ([`sealing`]). Every record a deployment admin authors lives
+//! here, and the platform receives none of it
+//! (spec/deployment-dashboard-and-access).
 //!
 //! # Why the conductor holds a store after all
 //!
@@ -27,6 +29,7 @@ pub mod migrations;
 pub mod plugins;
 pub mod postgres;
 pub mod rules;
+pub mod sealing;
 pub mod service;
 pub mod store;
 
@@ -36,11 +39,15 @@ pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use plugins::serve_plugins;
 pub use postgres::PostgresStore;
+pub use sealing::SettingsKey;
 pub use service::{
     configuration, deployment_admin, install_named_administrator, serve, Clock, SystemClock,
     Upstream,
 };
-pub use store::{Ending, KnownPlugin, Snapshot, Store, StoreError, Withdrawal};
+pub use store::{
+    Ending, Held, KnownPlugin, SettingChange, Snapshot, Store, StoreError, StoredSetting,
+    Withdrawal,
+};
 
 #[cfg(test)]
 mod tests;

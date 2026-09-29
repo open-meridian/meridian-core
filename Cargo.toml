@@ -79,6 +79,12 @@ ring = "0.17"
 # on the bus see ciphertext (spec/installation-and-first-run, ruling 4).
 # RFC 9180, and a pure-Rust implementation.
 hpke = { version = "0.12", default-features = false, features = ["x25519", "alloc"] }
+# Seals a secret plugin setting before the configuration store writes it, with
+# a key only the conductor holds (spec/deployment-dashboard-and-access,
+# requirement 35 as amended 2026-09-28). XChaCha20-Poly1305, whose nonce is
+# long enough to draw at random for every write. Pure Rust, and already in the
+# tree through hpke above, so naming it adds no dependency.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 rand = "0.8"
 bcrypt = "0.17"
 libc = "0.2"

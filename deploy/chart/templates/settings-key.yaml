@@ -1,0 +1,121 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The key secret plugin settings are sealed with (spec/deployment-dashboard-
+  and-access, requirement 35 as amended 2026-09-28). A setting a plugin
+  declares secret -- an API key, say -- is encrypted with it before the
+  conductor writes it to the configuration store, and only the conductor,
+  which delivers settings to plugins, mounts it. A dump or a backup of the
+  database alone reveals no secret.
+
+  Made inside the cluster by a Job, the way the dashboard's signing key is
+  (decisions/016): the chart makes the Secret empty so a Role can name it, and
+  the Job fills it, creates nothing, and deletes its own RoleBinding when
+  done. Made there rather than here, because a key a template drew would be
+  written into the release's own record, which anybody reading the release
+  history could read.
+
+  Rendered with whatever it already holds, and kept when the release goes:
+  every secret stored was sealed with this key, so an upgrade never replaces
+  it and a Job that finds one does nothing else. Lost, the secrets it sealed
+  are lost with it; each plugin then reports the required ones missing, and a
+  deployment admin sets them again.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-settings-key" $full }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+{{- if and $existing $existing.data }}
+data:
+  {{- toYaml $existing.data | nindent 2 }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# The one Secret it fills, by name, and its own binding. `create` on nothing:
+# RBAC cannot narrow `create` to a name, which is why the chart makes it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $name | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    resourceNames: [{{ $name | quote }}]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-{{ .Release.Revision }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: settings-key
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $name }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: settings-key
+          image: "{{ .Values.image.repository }}:{{ .Values.conductor.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-conductor", "settings-key"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            # Every name it may touch, from the chart, because the Role names
+            # the same ones.
+            - name: MERIDIAN_SETTINGS_KEY_SECRET
+              value: {{ $name | quote }}
+            - name: MERIDIAN_SETTINGS_KEY_BINDING
+              value: {{ $name | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

@@ -22,13 +22,14 @@ use crate::html::escape;
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 7] = [
+const TABS: [(&str, &str); 8] = [
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
     ("account-groups", "Account groups"),
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
     ("external-accounts", "External accounts"),
+    ("plugin-settings", "Plugin settings"),
     ("terminal-sessions", "Terminal sessions"),
 ];
 
@@ -681,6 +682,56 @@ pub fn render(
          reports, and any refused for want of a link, wait here until one is made.",
         &new_button("new-link", "Link an external account"),
         format!("{unlinked_table}{linked_table}{sync_table}{link}{dialogs}"),
+    ));
+
+    // ── Plugin settings ─────────────────────────────────────────────────────
+    // W6.11. Each plugin that has reported, and how far its settings are
+    // given; the form is a page of its own (super::settings).
+    let body = if records.plugin_settings.is_empty() {
+        "<p class=\"empty\">No plugin has reported yet.</p>".to_string()
+    } else {
+        let rows: String = records
+            .plugin_settings
+            .iter()
+            .map(|record| {
+                let missing: Vec<&str> = record
+                    .declared_settings
+                    .iter()
+                    .filter(|d| d.required)
+                    .filter(|d| {
+                        !record.secrets_set.contains(&d.name)
+                            && !record.values.iter().any(|v| v.name == d.name)
+                    })
+                    .map(|d| d.name.as_str())
+                    .collect();
+                let state = if missing.is_empty() {
+                    "<span class=\"pill good\">ready</span>".to_string()
+                } else {
+                    format!(
+                        "<span class=\"pill warn\">needs {}</span>",
+                        escape(&missing.join(", "))
+                    )
+                };
+                format!(
+                    "<tr data-id=\"{id}\"><td>{id}</td><td>{declared}</td><td>{state}</td>\
+                     <td class=\"actions\"><a href=\"{href}\">Settings</a></td></tr>",
+                    id = escape(&record.plugin_instance_id),
+                    declared = record.declared_settings.len(),
+                    href = escape(&super::settings::path(&record.plugin_instance_id)),
+                )
+            })
+            .collect();
+        format!(
+            "<div class=\"scroll\"><table class=\"list settings\"><thead><tr><th>Plugin</th>\
+             <th>Settings</th><th>State</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    sections.push(section(
+        "plugin-settings",
+        "Plugin settings",
+        "What each plugin declared it needs. A secret is set here and never shown again.",
+        "",
+        body,
     ));
 
     // ── Terminal sessions ───────────────────────────────────────────────────

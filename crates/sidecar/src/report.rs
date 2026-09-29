@@ -2,8 +2,9 @@
 //!
 //! What the sidecar knows of its plugin, on the bus for the conductor and the
 //! dashboard: registered or not, healthy or not with the plugin's own reason,
-//! when it last said so, the contract version it registered with, and the
-//! grants it was refused. The sidecar speaks for the plugin because it is the
+//! when it last said so, the contract version it registered with, the grants
+//! it was refused, and the settings it declared -- which is how the conductor
+//! learns what a settings form holds and which of it is secret. The sidecar speaks for the plugin because it is the
 //! one that sees refusals and silence, which the plugin cannot report about
 //! itself.
 //!
@@ -104,6 +105,12 @@ impl Sidecar {
             refused_grants,
             last_refusal_reason,
             reported_at_ns: now_ns,
+            // What it declared, for the conductor to check a setting against
+            // and tell a secret by (W6.11). Declarations, never values.
+            declared_settings: registration
+                .as_ref()
+                .map(|r| r.settings.clone())
+                .unwrap_or_default(),
         }
     }
 }

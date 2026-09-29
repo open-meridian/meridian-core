@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,8 +27,8 @@ use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, ClaimCodePurpose,
     CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, GrantPermissionRequest, LinkExternalAccountRequest,
-    RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup, WithdrawPermissionReply,
-    WithdrawPermissionRequest,
+    PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, UserGroup,
+    WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use prost::Message;
 
@@ -52,6 +52,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
         .route("/admin/end-terminal-sessions", post(end_terminal_sessions))
+        .route(
+            "/admin/plugins/{instance}/settings",
+            get(settings_page).post(set_settings),
+        )
 }
 
 fn field<'a>(fields: &'a Fields, name: &str) -> &'a str {
@@ -176,22 +180,29 @@ async fn command<Rep: Message + Default>(
 }
 
 fn after(outcome: Result<(), String>) -> Response {
+    after_to(outcome, "/admin", "/admin")
+}
+
+/// To `done` when it was, and otherwise the store's sentence, with a way
+/// back to `back`.
+fn after_to(outcome: Result<(), String>, done: &str, back: &str) -> Response {
     match outcome {
         Ok(()) => (
             StatusCode::SEE_OTHER,
-            [(axum::http::header::LOCATION, "/admin")],
+            [(axum::http::header::LOCATION, done.to_string())],
         )
             .into_response(),
-        // Back, not to /admin: the browser's back returns to the tab the form
-        // was on, with what was typed into it.
+        // Back, not to the page: the browser's back returns to the tab the
+        // form was on, with what was typed into it.
         Err(sentence) => (
             StatusCode::BAD_REQUEST,
             Html(page(
                 "Not done",
                 &format!(
                     "<h1>Not done</h1><p class=\"refused\">{}</p>\
-                     <p><a href=\"/admin\" onclick=\"history.back();return false\">Back</a></p>",
-                    escape(&sentence)
+                     <p><a href=\"{}\" onclick=\"history.back();return false\">Back</a></p>",
+                    escape(&sentence),
+                    escape(back)
                 ),
             )),
         )
@@ -333,6 +344,85 @@ async fn admin_page(
         &notice,
     );
     Html(page("Administer", &body)).into_response()
+}
+
+// ── A plugin instance's settings (W6.11) ────────────────────────────────────
+
+mod settings;
+
+fn settings_of<'a>(records: &'a AccessRecords, instance: &str) -> Option<&'a PluginSettingsRecord> {
+    records
+        .plugin_settings
+        .iter()
+        .find(|record| record.plugin_instance_id == instance)
+}
+
+fn no_such_plugin(instance: &str) -> Response {
+    status_page(
+        StatusCode::NOT_FOUND,
+        "No such plugin",
+        &format!("no plugin {instance} has reported, so what it needs is not known yet"),
+    )
+}
+
+async fn settings_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let Some(record) = settings_of(&records, &instance) else {
+        return no_such_plugin(&instance);
+    };
+    let notice = match field(&query, "saved") {
+        "1" => "Saved.",
+        "none" => "Nothing was changed.",
+        _ => "",
+    };
+    Html(page(
+        &format!("Settings for {instance}"),
+        &settings::render(record, &token_input(&session), notice),
+    ))
+    .into_response()
+}
+
+/// The form, as one command to the conductor. What was typed into a secret's
+/// field goes there and nowhere else: not into a log line, and not back into
+/// a page, including the one saying it was refused.
+async fn set_settings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let Some(record) = settings_of(&records, &instance) else {
+        return no_such_plugin(&instance);
+    };
+    let back = settings::path(&instance);
+    let Some(request) = settings::request(record, &fields) else {
+        return after_to(Ok(()), &format!("{back}?saved=none"), &back);
+    };
+    let outcome = command::<PluginSettingsRecord>(
+        &app,
+        &session,
+        "platform.config.command.set-plugin-settings",
+        "meridian.v1.SetPluginSettingsRequest",
+        request,
+    )
+    .await
+    .map(|_| ());
+    after_to(outcome, &format!("{back}?saved=1"), &back)
 }
 
 // ── The commands ────────────────────────────────────────────────────────────

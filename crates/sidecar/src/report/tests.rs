@@ -8,7 +8,9 @@ use meridian_domain::v1::PluginReport;
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::RecordHoldingsStatementParams;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{HeartbeatRequest, LeaveRequest, RegisterRequest};
+use meridian_pb::v1::{
+    HeartbeatRequest, LeaveRequest, RegisterRequest, SettingDeclaration, SettingType,
+};
 use prost::Message;
 use tonic::Request;
 
@@ -102,6 +104,48 @@ async fn what_the_plugin_said_and_what_it_was_refused_are_reported() {
     assert!(
         !sidecar.report(8).registered,
         "a plugin that left is not registered"
+    );
+}
+
+#[tokio::test]
+async fn what_the_plugin_declared_is_reported_and_nothing_once_it_leaves() {
+    let sidecar = sidecar(memory());
+    let declared = vec![
+        SettingDeclaration {
+            name: "api_key".into(),
+            r#type: SettingType::String as i32,
+            required: true,
+            secret: true,
+            description: "The venue's API key.".into(),
+        },
+        SettingDeclaration {
+            name: "poll_minutes".into(),
+            r#type: SettingType::Integer as i32,
+            ..Default::default()
+        },
+    ];
+    assert!(sidecar.report(1).declared_settings.is_empty());
+    let reply = sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v2".into(),
+            settings: declared.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    assert_eq!(sidecar.report(2).declared_settings, declared);
+
+    sidecar
+        .leave(Request::new(LeaveRequest {
+            reason: "redeploy".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        sidecar.report(3).declared_settings.is_empty(),
+        "and the conductor keeps what it last declared"
     );
 }
 

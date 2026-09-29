@@ -11,10 +11,13 @@
 //! admin, and installing the first deployment admin. Those are single store
 //! operations, and each store makes them atomic.
 
+use std::collections::BTreeMap;
+
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Permission,
     PluginCatalogue, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
+use meridian_pb::v1::SettingDeclaration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -48,6 +51,45 @@ impl KnownPlugin {
     }
 }
 
+/// A setting's value as the store holds it: as given, or sealed with the
+/// deployment's settings key when the plugin declared it secret
+/// ([`crate::sealing`]).
+///
+/// Its `Debug` says which and how long, never what: a value has no business
+/// in a log line, and a secret is only ever held sealed.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Held {
+    Plain(String),
+    Sealed(Vec<u8>),
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Held::Plain(value) => write!(out, "Plain({} bytes)", value.len()),
+            Held::Sealed(sealed) => write!(out, "Sealed({} bytes)", sealed.len()),
+        }
+    }
+}
+
+/// One setting a deployment admin gave a plugin (W6.11), and who last
+/// changed it when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSetting {
+    pub plugin_instance_id: String,
+    pub name: String,
+    pub held: Held,
+    pub set_by: String,
+    pub set_at_ns: i64,
+}
+
+/// A change to one setting: a value to hold, or `None` to clear it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingChange {
+    pub name: String,
+    pub held: Option<Held>,
+}
+
 /// Everything, read at once, so rules and derivations see one state.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -58,6 +100,11 @@ pub struct Snapshot {
     pub plugins: Vec<KnownPlugin>,
     /// Every plugin version uploaded and every launch, live or ended (W8).
     pub catalogue: PluginCatalogue,
+    /// What each plugin declared when it last registered, by instance (W4.8):
+    /// what a setting is checked against, and how a secret is told.
+    pub declared_settings: BTreeMap<String, Vec<SettingDeclaration>>,
+    /// Every setting given to any plugin, secrets sealed (W6.11).
+    pub settings: Vec<StoredSetting>,
 }
 
 /// How a live launch ended: stopped by an administrator, or failed.
@@ -117,6 +164,25 @@ pub trait Store: Send + Sync {
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;
 
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()>;
+
+    /// Replace what a plugin declared it needs. Written only from the report
+    /// of a registered plugin, so one that is between registrations keeps
+    /// what it last declared.
+    fn record_declared_settings(
+        &self,
+        plugin_instance_id: &str,
+        declared: &[SettingDeclaration],
+    ) -> Result<()>;
+
+    /// Apply every change to one plugin's settings, and record who made each
+    /// and when -- never the value -- all in one step.
+    fn put_plugin_settings(
+        &self,
+        plugin_instance_id: &str,
+        changes: &[SettingChange],
+        by: &str,
+        at_ns: i64,
+    ) -> Result<()>;
 
     /// Record an uploaded version, unless that name and version is recorded
     /// already: false then, and the recorded one stands. An uploaded version

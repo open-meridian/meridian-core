@@ -9,7 +9,11 @@ use meridian_domain::v1::{
     PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
 
-use crate::store::{Ending, KnownPlugin, Result, Snapshot, Store, Withdrawal};
+use meridian_pb::v1::SettingDeclaration;
+
+use crate::store::{
+    Ending, KnownPlugin, Result, SettingChange, Snapshot, Store, StoredSetting, Withdrawal,
+};
 use crate::DEPLOYMENT_ADMIN;
 
 pub struct MemoryStore {
@@ -147,6 +151,45 @@ impl Store for MemoryStore {
         upsert(&mut state.plugins, plugin, |p| {
             p.plugin_instance_id == plugin.plugin_instance_id
         });
+        Ok(())
+    }
+
+    fn record_declared_settings(
+        &self,
+        plugin_instance_id: &str,
+        declared: &[SettingDeclaration],
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        state
+            .declared_settings
+            .insert(plugin_instance_id.to_string(), declared.to_vec());
+        Ok(())
+    }
+
+    /// Who changed what is not kept here: nothing in memory outlives a
+    /// restart, and the Postgres store is where a deployment's record is.
+    fn put_plugin_settings(
+        &self,
+        plugin_instance_id: &str,
+        changes: &[SettingChange],
+        by: &str,
+        at_ns: i64,
+    ) -> Result<()> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        for change in changes {
+            state.settings.retain(|held| {
+                !(held.plugin_instance_id == plugin_instance_id && held.name == change.name)
+            });
+            if let Some(held) = &change.held {
+                state.settings.push(StoredSetting {
+                    plugin_instance_id: plugin_instance_id.to_string(),
+                    name: change.name.clone(),
+                    held: held.clone(),
+                    set_by: by.to_string(),
+                    set_at_ns: at_ns,
+                });
+            }
+        }
         Ok(())
     }
 

@@ -8,6 +8,11 @@ description = "The conductor's configuration store: accounts, access and plugin 
 
 [dependencies]
 rand.workspace = true
+# Secret settings are sealed before they are written (crate::sealing).
+chacha20poly1305.workspace = true
+# The settings key is made in the cluster by a Job, with first run's narrow
+# rights over one named Secret (decisions/016).
+meridian-first-run = { path = "../first-run" }
 meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-domain.workspace = true
@@ -24,5 +29,6 @@ r2d2_postgres.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 postgres.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

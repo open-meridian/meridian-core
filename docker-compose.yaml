@@ -128,6 +128,10 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - runtime-keys:/var/lib/meridian
+      # The key secret plugin settings are sealed with, made by the
+      # settings-key service below as the chart's Job makes it, and mounted
+      # here alone. Empty until then, and a secret is refused meanwhile.
+      - settings-key:/run/meridian/settings-key:ro
     networks: [meridian]
 
   # The dashboard: the one address staff use. No key and no database of its
@@ -547,6 +551,22 @@ services:
       - plugin-page-keys:/keys
     networks: [meridian]
 
+  # The settings key, made once as the chart's Job makes it: thirty-two
+  # random bytes, in a volume only the conductor mounts.
+  settings-key:
+    profiles: [e2e]
+    image: alpine/openssl:3.3.2
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -s /keys/key ] && exit 0
+        openssl rand -out /keys/key 32
+        chmod 0444 /keys/key
+    volumes:
+      - settings-key:/keys
+    networks: [meridian]
+
   # A plugin serving a page, in the sidecar's network namespace as a plugin is
   # in its sidecar's pod, saying what reached it.
   plugin-page:
@@ -572,6 +592,11 @@ services:
       E2E_LOCAL_ACCOUNT_NAME: ada
       E2E_LOCAL_ACCOUNT_PASSWORD: Password1!
       E2E_STATE: /state
+      # The secret setting the run gives the plugin, obviously fake, and
+      # looked for afterwards everywhere it must not be.
+      E2E_SETTING_SECRET: ${E2E_SETTING_SECRET:-sk-test-not-a-real-key-e2e}
+      # The test identity, to hear the report topics and nothing else.
+      E2E_BROKER: nats://tests:tests-dev-only@nats:4222
     volumes:
       - ./e2e/dashboard:/e2e:ro
       - dashboard-e2e-state:/state
@@ -637,6 +662,7 @@ volumes:
   e2e-state:
   dashboard-e2e-state:
   plugin-page-keys:
+  settings-key:
 
 networks:
   meridian:

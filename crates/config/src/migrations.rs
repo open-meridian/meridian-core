@@ -41,6 +41,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "plugin_launch_live",
         sql: include_str!("../migrations/0004_plugin_launch_live.sql"),
     },
+    Migration {
+        version: 5,
+        name: "plugin_settings",
+        sql: include_str!("../migrations/0005_plugin_settings.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

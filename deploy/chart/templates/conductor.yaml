@@ -116,6 +116,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.conductorKey) }}
+            # The key secret plugin settings are sealed with (settings-key.yaml).
+            - name: MERIDIAN_SETTINGS_KEY_DIR
+              value: /run/meridian/settings-key
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           # No port and no Service. It speaks outward over HTTPS and inward over
@@ -123,6 +126,13 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/meridian
+              readOnly: true
+            # Mounted here and in no other component: only the conductor, which
+            # delivers settings to plugins, opens a secret one. Empty until the
+            # settings-key Job fills it, and read when first needed, so the Job
+            # finishing after this starts needs no restart.
+            - name: settings-key
+              mountPath: /run/meridian/settings-key
               readOnly: true
             {{- if include "meridian-runtime.generatedKey" . }}
             # The key this component made, in a volume only it mounts. Writable,
@@ -139,6 +149,12 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "meridian-runtime.fullname" . }}-key
         {{- end }}
+        - name: settings-key
+          secret:
+            secretName: {{ include "meridian-runtime.fullname" . }}-settings-key
+            # Group-readable, as the dashboard's signing key is, so a pod run
+            # as a non-root user with an fsGroup can read it.
+            defaultMode: 0440
         - name: config
           projected:
             defaultMode: 0400

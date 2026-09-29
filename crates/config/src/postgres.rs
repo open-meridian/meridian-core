@@ -19,8 +19,13 @@ use meridian_domain::v1::{
     PluginLaunch, PluginMetadata, PluginVersion, SignInRecord, UserGroup,
 };
 
+use meridian_pb::v1::SettingDeclaration;
+
 use crate::migrations;
-use crate::store::{Ending, KnownPlugin, Result, Snapshot, Store, StoreError, Withdrawal};
+use crate::store::{
+    Ending, Held, KnownPlugin, Result, SettingChange, Snapshot, Store, StoreError, StoredSetting,
+    Withdrawal,
+};
 use crate::DEPLOYMENT_ADMIN;
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -227,6 +232,52 @@ impl Store for PostgresStore {
                 roles: row.get(1),
                 tags: row.get(2),
                 last_reported_at_ns: row.get(3),
+            });
+        }
+
+        for row in tx
+            .query(
+                "SELECT plugin_instance_id, name, type, required, secret, description
+                   FROM config_plugin_setting_declaration
+                  ORDER BY plugin_instance_id, position",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot
+                .declared_settings
+                .entry(row.get(0))
+                .or_default()
+                .push(SettingDeclaration {
+                    name: row.get(1),
+                    r#type: i32::from(row.get::<_, i16>(2)),
+                    required: row.get(3),
+                    secret: row.get(4),
+                    description: row.get(5),
+                });
+        }
+
+        for row in tx
+            .query(
+                "SELECT plugin_instance_id, name, value, sealed, set_by, set_at_ns
+                   FROM config_plugin_setting ORDER BY plugin_instance_id, name",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let held = match (
+                row.get::<_, Option<String>>(2),
+                row.get::<_, Option<Vec<u8>>>(3),
+            ) {
+                (_, Some(sealed)) => Held::Sealed(sealed),
+                (value, None) => Held::Plain(value.unwrap_or_default()),
+            };
+            snapshot.settings.push(StoredSetting {
+                plugin_instance_id: row.get(0),
+                name: row.get(1),
+                held,
+                set_by: row.get(4),
+                set_at_ns: row.get(5),
             });
         }
 
@@ -488,6 +539,94 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         Ok(())
+    }
+
+    fn record_declared_settings(
+        &self,
+        plugin_instance_id: &str,
+        declared: &[SettingDeclaration],
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.execute(
+            "DELETE FROM config_plugin_setting_declaration WHERE plugin_instance_id = $1",
+            &[&plugin_instance_id],
+        )
+        .map_err(unavailable)?;
+        for (position, declaration) in declared.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO config_plugin_setting_declaration
+                        (plugin_instance_id, position, name, type, required, secret, description)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &plugin_instance_id,
+                    &(position as i32),
+                    &declaration.name,
+                    &(declaration.r#type as i16),
+                    &declaration.required,
+                    &declaration.secret,
+                    &declaration.description,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)
+    }
+
+    fn put_plugin_settings(
+        &self,
+        plugin_instance_id: &str,
+        changes: &[SettingChange],
+        by: &str,
+        at_ns: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        for change in changes {
+            let action: i16 = match &change.held {
+                None => {
+                    tx.execute(
+                        "DELETE FROM config_plugin_setting
+                          WHERE plugin_instance_id = $1 AND name = $2",
+                        &[&plugin_instance_id, &change.name],
+                    )
+                    .map_err(unavailable)?;
+                    2
+                }
+                Some(held) => {
+                    let (value, sealed) = match held {
+                        Held::Plain(value) => (Some(value.as_str()), None),
+                        Held::Sealed(sealed) => (None, Some(sealed.as_slice())),
+                    };
+                    tx.execute(
+                        "INSERT INTO config_plugin_setting
+                                (plugin_instance_id, name, value, sealed, set_by, set_at_ns)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT (plugin_instance_id, name) DO UPDATE
+                            SET value = excluded.value, sealed = excluded.sealed,
+                                set_by = excluded.set_by, set_at_ns = excluded.set_at_ns",
+                        &[
+                            &plugin_instance_id,
+                            &change.name,
+                            &value,
+                            &sealed,
+                            &by,
+                            &at_ns,
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                    1
+                }
+            };
+            tx.execute(
+                "INSERT INTO config_plugin_setting_change
+                        (plugin_instance_id, name, action, changed_by, changed_at_ns)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&plugin_instance_id, &change.name, &action, &by, &at_ns],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
     fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {

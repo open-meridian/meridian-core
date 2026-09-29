@@ -4,12 +4,16 @@
 //! it is a deployment admin at a form, and "invalid request" tells them
 //! nothing. Refusals are the spec's: deployment admin is built in; an access
 //! entry names a tag its plugin carries; a permission to deployment admin
-//! names no account group and every other names one.
+//! names no account group and every other names one; a setting is one its
+//! plugin declared, in a form its declared type reads.
+
+use std::collections::BTreeSet;
 
 use meridian_domain::v1::{
     AccessGroup, AccessLevel, AccountGroup, AccountState, DefineAccountRequest,
-    GrantPermissionRequest, LinkExternalAccountRequest, UserGroup,
+    GrantPermissionRequest, LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
 };
+use meridian_pb::v1::{SettingDeclaration, SettingType};
 
 use crate::store::Snapshot;
 use crate::DEPLOYMENT_ADMIN;
@@ -199,4 +203,84 @@ pub fn grant(snapshot: &Snapshot, request: &GrantPermissionRequest) -> Verdict {
         return Err("that permission is already granted".into());
     }
     Ok(())
+}
+
+/// One setting as checked: what the plugin declared of it, and the value to
+/// hold, or `None` to clear it.
+pub type CheckedSetting<'a> = (&'a SettingDeclaration, Option<String>);
+
+/// A value as its declared type reads it, written the one way the SDK reads
+/// it back: an integer in decimal, a boolean as `true` or `false`, and text as
+/// given. A refusal names the setting and the type, and never the value,
+/// which may be a secret typed into the wrong field.
+pub fn setting_value(declaration: &SettingDeclaration, value: &str) -> Result<String, String> {
+    let name = &declaration.name;
+    if value.is_empty() {
+        return Err(format!("setting {name} is empty; clear it instead"));
+    }
+    if declaration.r#type == SettingType::Integer as i32 {
+        return value
+            .trim()
+            .parse::<i64>()
+            .map(|number| number.to_string())
+            .map_err(|_| format!("setting {name} is a whole number"));
+    }
+    if declaration.r#type == SettingType::Boolean as i32 {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Ok("true".into()),
+            "false" | "no" | "off" | "0" => Ok("false".into()),
+            _ => Err(format!("setting {name} is true or false")),
+        };
+    }
+    Ok(value.to_string())
+}
+
+/// W6.11. Every setting named is one the plugin declared when it last
+/// registered, named once, and its value is one its type reads. Checked
+/// whole before anything is written, so a refusal changes nothing.
+pub fn plugin_settings<'a>(
+    snapshot: &'a Snapshot,
+    request: &SetPluginSettingsRequest,
+) -> Result<Vec<CheckedSetting<'a>>, String> {
+    let plugin = &request.plugin_instance_id;
+    required(plugin, "the plugin")?;
+    if !snapshot
+        .plugins
+        .iter()
+        .any(|known| &known.plugin_instance_id == plugin)
+    {
+        return Err(format!(
+            "no plugin {plugin} has reported, so what it needs is unknown"
+        ));
+    }
+    let declared = snapshot
+        .declared_settings
+        .get(plugin)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let find = |name: &str| {
+        declared
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .ok_or_else(|| format!("plugin {plugin} declares no setting named {name}"))
+    };
+
+    let mut named = BTreeSet::new();
+    let mut checked = Vec::new();
+    for given in &request.values {
+        if !named.insert(given.name.as_str()) {
+            return Err(format!("setting {} is given twice", given.name));
+        }
+        let declaration = find(&given.name)?;
+        checked.push((declaration, Some(setting_value(declaration, &given.value)?)));
+    }
+    for name in &request.cleared {
+        if !named.insert(name.as_str()) {
+            return Err(format!(
+                "setting {name} is both given and cleared, or cleared twice"
+            ));
+        }
+        checked.push((find(name)?, None));
+    }
+    Ok(checked)
 }
