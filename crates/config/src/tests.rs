@@ -133,8 +133,8 @@ async fn account(h: &Harness, name: &str) -> AccountRecord {
         DEFINE_ACCOUNT,
         "meridian.v1.DefineAccountRequest",
         DefineAccountRequest {
-            account_id: String::new(),
             name: name.into(),
+            ..Default::default()
         },
     )
     .await
@@ -270,6 +270,7 @@ async fn an_account_is_defined_renamed_and_closed_and_never_deleted() {
         DefineAccountRequest {
             account_id: created.account_id.clone(),
             name: "Growth".into(),
+            ..Default::default()
         },
     )
     .await
@@ -289,6 +290,146 @@ async fn an_account_is_defined_renamed_and_closed_and_never_deleted() {
     .unwrap();
     assert_eq!(closed.state, AccountState::Closed as i32);
     assert_eq!(records(&h).await.accounts.len(), 1);
+}
+
+async fn define(h: &Harness, request: DefineAccountRequest) -> Result<AccountRecord, String> {
+    ask(
+        h,
+        DEFINE_ACCOUNT,
+        "meridian.v1.DefineAccountRequest",
+        request,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_account_carries_a_custodian_type_owner_and_note_each_edit_sets_whole() {
+    // W6.3: free text and optional; an edit sets all four as given, so an
+    // empty one clears it.
+    let h = harness("dashboard-1");
+    let created = define(
+        &h,
+        DefineAccountRequest {
+            name: "Growth Fund".into(),
+            custodian: " Fidelity ".into(),
+            account_type: "Roth IRA".into(),
+            owner: "Fund I".into(),
+            note: "Opened for the 2026 rollover.".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.custodian, "Fidelity", "trimmed");
+    assert_eq!(created.account_type, "Roth IRA");
+    assert_eq!(created.owner, "Fund I");
+    assert_eq!(created.note, "Opened for the 2026 rollover.");
+    assert_eq!(records(&h).await.accounts, std::slice::from_ref(&created));
+
+    let edited = define(
+        &h,
+        DefineAccountRequest {
+            account_id: created.account_id.clone(),
+            name: "Growth Fund".into(),
+            custodian: "Fidelity".into(),
+            account_type: "Roth IRA".into(),
+            owner: "Fund II".into(),
+            note: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(edited.owner, "Fund II");
+    assert_eq!(edited.note, "", "left empty, cleared");
+    assert_eq!(edited.created_at_ns, created.created_at_ns);
+    assert_eq!(edited.state, AccountState::Open as i32);
+
+    let cleared = define(
+        &h,
+        DefineAccountRequest {
+            account_id: created.account_id.clone(),
+            name: "Growth Fund".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            cleared.custodian.as_str(),
+            cleared.account_type.as_str(),
+            cleared.owner.as_str(),
+            cleared.note.as_str()
+        ),
+        ("", "", "", "")
+    );
+    assert_eq!(records(&h).await.accounts, [cleared]);
+}
+
+#[tokio::test]
+async fn an_account_field_past_its_bound_is_refused_naming_it_and_nothing_changes() {
+    // 200 characters each, the note 2,000; characters, not bytes.
+    let h = harness("dashboard-1");
+    let long_note = define(
+        &h,
+        DefineAccountRequest {
+            name: "Growth".into(),
+            custodian: "é".repeat(200),
+            note: "n".repeat(2_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(long_note.note.chars().count(), 2_000, "kept whole");
+
+    for (request, field) in [
+        (
+            DefineAccountRequest {
+                custodian: "c".repeat(201),
+                ..Default::default()
+            },
+            "an account's custodian is 201 characters",
+        ),
+        (
+            DefineAccountRequest {
+                account_type: "t".repeat(201),
+                ..Default::default()
+            },
+            "an account's type is 201 characters",
+        ),
+        (
+            DefineAccountRequest {
+                owner: "o".repeat(201),
+                ..Default::default()
+            },
+            "an account's owner is 201 characters",
+        ),
+        (
+            DefineAccountRequest {
+                note: "n".repeat(2_001),
+                ..Default::default()
+            },
+            "an account's note is 2001 characters, and at most 2000 are kept",
+        ),
+    ] {
+        let refused = define(
+            &h,
+            DefineAccountRequest {
+                account_id: long_note.account_id.clone(),
+                name: "Renamed".into(),
+                ..request
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains(field), "{refused}");
+    }
+    assert_eq!(
+        records(&h).await.accounts,
+        [long_note],
+        "no refused edit changed it"
+    );
 }
 
 #[tokio::test]
@@ -613,7 +754,7 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
             plugin_instance_id: "oms-1".into(),
             external_account_id: "st-4471".into(),
             account_id: growth_account.account_id.clone(),
-            new_account_name: String::new(),
+            ..Default::default()
         },
     )
     .await
@@ -657,6 +798,7 @@ fn link_request(plugin: &str, account: &str, new_name: &str) -> LinkExternalAcco
         external_account_id: "st-1".into(),
         account_id: account.into(),
         new_account_name: new_name.into(),
+        ..Default::default()
     }
 }
 
@@ -765,6 +907,74 @@ async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
 }
 
 #[tokio::test]
+async fn a_new_account_made_by_a_link_carries_what_the_plugin_sent_of_it() {
+    // W6.4: the plugin pre-fills the custodian and type from the venue, and
+    // the admin may change them; held to W6.3's bounds.
+    let h = harness("oms-1");
+    let linked = link_for(
+        &h,
+        LinkExternalAccountRequest {
+            new_account_custodian: "Fidelity".into(),
+            new_account_type: " Roth IRA ".into(),
+            new_account_owner: "Fund I".into(),
+            new_account_note: "Linked from SnapTrade.".into(),
+            ..link_request("oms-1", "", "Fidelity Brokerage")
+        },
+        ADA,
+    )
+    .await
+    .unwrap();
+    let read = records(&h).await;
+    let made = read
+        .accounts
+        .iter()
+        .find(|a| a.account_id == linked.account_id)
+        .expect("the account exists");
+    assert_eq!(made.custodian, "Fidelity");
+    assert_eq!(made.account_type, "Roth IRA");
+    assert_eq!(made.owner, "Fund I");
+    assert_eq!(made.note, "Linked from SnapTrade.");
+
+    let too_long = link_for(
+        &h,
+        LinkExternalAccountRequest {
+            new_account_note: "n".repeat(2_001),
+            ..link_request("oms-1", "", "Another")
+        },
+        ADA,
+    )
+    .await;
+    assert!(too_long
+        .unwrap_err()
+        .contains("a new account's note is 2001 characters"));
+    assert_eq!(
+        records(&h).await.accounts.len(),
+        1,
+        "refused, so nothing was made or linked"
+    );
+}
+
+#[tokio::test]
+async fn a_new_accounts_fields_are_ignored_when_the_link_names_an_existing_one() {
+    // They describe a new account; an existing one is edited only by W6.3.
+    let h = harness("oms-1");
+    let growth = account(&h, "Growth").await;
+    let linked = link_for(
+        &h,
+        LinkExternalAccountRequest {
+            new_account_custodian: "Fidelity".into(),
+            new_account_note: "n".repeat(2_001),
+            ..link_request("oms-1", &growth.account_id, "")
+        },
+        ADA,
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked.account_id, growth.account_id);
+    assert_eq!(records(&h).await.accounts, [growth], "unchanged");
+}
+
+#[tokio::test]
 async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_nothing() {
     let h = harness("oms-1");
     let growth = account(&h, "Growth").await;
@@ -800,9 +1010,21 @@ async fn a_link_is_a_deployment_admins_act_on_the_plugins_own_accounts() {
 }
 
 #[tokio::test]
-async fn the_deployments_accounts_are_read_for_a_deployment_admin_names_ids_and_states() {
+async fn the_deployments_accounts_are_read_for_a_deployment_admin_with_what_describes_them() {
     let h = harness("oms-1");
-    let growth = account(&h, "Growth").await;
+    let growth = define(
+        &h,
+        DefineAccountRequest {
+            name: "Growth".into(),
+            custodian: "Fidelity".into(),
+            account_type: "Roth IRA".into(),
+            owner: "Fund I".into(),
+            note: "Rollover, 2026.".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let old = account(&h, "Old income").await;
     let _: AccountRecord = ask(
         &h,
@@ -841,6 +1063,10 @@ async fn the_deployments_accounts_are_read_for_a_deployment_admin_names_ids_and_
                 AccountState::Closed as i32
             ),
         ]
+    );
+    assert_eq!(
+        read.accounts[0], growth,
+        "its custodian, type, owner and note with it, so a plugin can tell accounts apart"
     );
     let for_nobody = h
         .bus

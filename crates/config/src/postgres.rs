@@ -94,7 +94,9 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT account_id, name, state, created_at_ns FROM config_account
+                "SELECT account_id, name, state, created_at_ns,
+                        custodian, account_type, owner, note
+                   FROM config_account
                   ORDER BY account_id",
                 &[],
             )
@@ -105,6 +107,10 @@ impl Store for PostgresStore {
                 name: row.get(1),
                 state: i32::from(row.get::<_, i16>(2)),
                 created_at_ns: row.get(3),
+                custodian: row.get::<_, Option<String>>(4).unwrap_or_default(),
+                account_type: row.get::<_, Option<String>>(5).unwrap_or_default(),
+                owner: row.get::<_, Option<String>>(6).unwrap_or_default(),
+                note: row.get::<_, Option<String>>(7).unwrap_or_default(),
             });
         }
 
@@ -333,14 +339,23 @@ impl Store for PostgresStore {
     fn put_account(&self, account: &AccountRecord) -> Result<()> {
         self.conn()?
             .execute(
-                "INSERT INTO config_account (account_id, name, state, created_at_ns)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (account_id) DO UPDATE SET name = excluded.name, state = excluded.state",
+                "INSERT INTO config_account
+                        (account_id, name, state, created_at_ns,
+                         custodian, account_type, owner, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (account_id) DO UPDATE
+                    SET name = excluded.name, state = excluded.state,
+                        custodian = excluded.custodian, account_type = excluded.account_type,
+                        owner = excluded.owner, note = excluded.note",
                 &[
                     &account.account_id,
                     &account.name,
                     &(account.state as i16),
                     &account.created_at_ns,
+                    &unless_empty(&account.custodian),
+                    &unless_empty(&account.account_type),
+                    &unless_empty(&account.owner),
+                    &unless_empty(&account.note),
                 ],
             )
             .map_err(unavailable)?;
@@ -446,13 +461,19 @@ impl Store for PostgresStore {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.execute(
-            "INSERT INTO config_account (account_id, name, state, created_at_ns)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO config_account
+                    (account_id, name, state, created_at_ns,
+                     custodian, account_type, owner, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 &account.account_id,
                 &account.name,
                 &(account.state as i16),
                 &account.created_at_ns,
+                &unless_empty(&account.custodian),
+                &unless_empty(&account.account_type),
+                &unless_empty(&account.owner),
+                &unless_empty(&account.note),
             ],
         )
         .map_err(unavailable)?;
@@ -746,6 +767,12 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         Ok(ended.as_ref().map(launch_from))
     }
+}
+
+/// An account's optional text as its column holds it: NULL for none, so an
+/// account with none of the four reads as it did before they existed.
+fn unless_empty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \

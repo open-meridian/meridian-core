@@ -552,6 +552,10 @@ async fn define_account(
         let request = DefineAccountRequest {
             account_id: field(&fields, "account_id").into(),
             name: field(&fields, "name").into(),
+            custodian: field(&fields, "custodian").into(),
+            account_type: field(&fields, "account_type").into(),
+            owner: field(&fields, "owner").into(),
+            note: field(&fields, "note").into(),
         };
         command::<meridian_domain::v1::AccountRecord>(
             &app,

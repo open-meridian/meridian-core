@@ -5,9 +5,10 @@ use axum::http::header::COOKIE;
 use axum::http::Request;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
-    AccountRecord, AccountState, ExternalAccount, ExternalAccountLink, ExternalAccountsEvent,
-    Permission, PluginSettingValue, RedeemClaimCodeReply, SetPluginSettingsRequest, SyncState,
-    SyncStatusEvent, UnlinkedExternalAccount, UnlinkedExternalAccountsEvent,
+    AccountRecord, AccountState, DefineAccountRequest, ExternalAccount, ExternalAccountLink,
+    ExternalAccountsEvent, Permission, PluginSettingValue, RedeemClaimCodeReply,
+    SetPluginSettingsRequest, SyncState, SyncStatusEvent, UnlinkedExternalAccount,
+    UnlinkedExternalAccountsEvent,
 };
 use meridian_pb::v1::{SettingChoice, SettingCondition, SettingDeclaration, SettingType};
 use tower::ServiceExt;
@@ -52,6 +53,8 @@ fn admin_records() -> AccessRecords {
 struct Harness {
     app: Arc<App>,
     seen: Seen,
+    /// Each payload the fake conductor was sent, in order.
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
     session: String,
     form_token: String,
 }
@@ -84,16 +87,19 @@ fn harness_serving(
 ) -> Harness {
     let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
     let seen: Seen = Arc::default();
+    let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     for topic in [
         "platform.config.command.define-account",
         "platform.config.command.redeem-claim-code",
     ] {
         let seen = Arc::clone(&seen);
+        let sent = Arc::clone(&sent);
         bus.serve(topic, move |envelope| {
             let meta = envelope.meta.clone().unwrap_or_default();
             seen.lock()
                 .unwrap()
                 .push((meta.topic.clone(), meta.acting_for_subject.clone()));
+            sent.lock().unwrap().push(envelope.payload.clone());
             if let Some(sentence) = refuse_with {
                 return Err(sentence.to_string());
             }
@@ -145,6 +151,7 @@ fn harness_serving(
     Harness {
         app,
         seen,
+        sent,
         session,
         form_token,
     }
@@ -228,6 +235,7 @@ async fn the_dashboard_lists_and_links_no_external_accounts_and_counts_them() {
         name: "Growth".into(),
         state: AccountState::Open as i32,
         created_at_ns: T0,
+        ..Default::default()
     }];
     records.links = vec![ExternalAccountLink {
         plugin_instance_id: "snaptrade-1".into(),
@@ -380,6 +388,99 @@ async fn a_change_is_sent_on_the_admins_behalf() {
             "platform.config.command.define-account".to_string(),
             ADA.to_string()
         )]
+    );
+}
+
+#[tokio::test]
+async fn an_accounts_custodian_type_owner_and_note_are_sent_as_the_form_gives_them() {
+    // W6.3: all four from the define and edit form; an empty one is sent
+    // empty, which clears it.
+    let h = harness(admin_records(), None);
+    let form = format!(
+        "form_token={}&account_id=ACC-1&name=Growth&custodian=+Fidelity+\
+         &account_type=Roth+IRA&owner=Fund+I&note=",
+        h.form_token
+    );
+    let (status, _) = send(&h, post(&h, "/admin/accounts", &form)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let sent = h.sent.lock().unwrap();
+    let request = DefineAccountRequest::decode(&sent[0][..]).unwrap();
+    assert_eq!(
+        request,
+        DefineAccountRequest {
+            account_id: "ACC-1".into(),
+            name: "Growth".into(),
+            custodian: "Fidelity".into(),
+            account_type: "Roth IRA".into(),
+            owner: "Fund I".into(),
+            note: String::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
+    let mut records = admin_records();
+    records.accounts = vec![
+        AccountRecord {
+            account_id: "ACC-1".into(),
+            name: "Growth".into(),
+            state: AccountState::Open as i32,
+            created_at_ns: T0,
+            custodian: "Fidelity".into(),
+            account_type: "Roth IRA".into(),
+            owner: "Fund <I>".into(),
+            note: "Rollover, 2026.".into(),
+        },
+        AccountRecord {
+            account_id: "ACC-2".into(),
+            name: "Income".into(),
+            state: AccountState::Open as i32,
+            created_at_ns: T0,
+            ..Default::default()
+        },
+    ];
+    let h = harness(records, None);
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    assert!(
+        body.contains("data-filter=\"accounts-table\"") && body.contains("id=\"accounts-table\""),
+        "a search box narrowing the accounts' table, on the generic filter"
+    );
+    let accounts = table(&body, "accounts");
+    assert!(
+        accounts
+            .contains("<th>Name</th><th>Custodian</th><th>Type</th><th>Owner</th><th>State</th>"),
+        "{accounts}"
+    );
+    assert!(
+        accounts.contains(
+            "<span class=\"hint\">Rollover, 2026.</span></td>\
+             <td>Fidelity</td><td>Roth IRA</td><td>Fund &lt;I&gt;</td>"
+        ),
+        "the note under the name, then its custodian, type and owner, escaped: {accounts}"
+    );
+    let income = accounts.split("data-id=\"ACC-2\"").nth(1).unwrap();
+    assert!(
+        income.contains("<td></td><td></td><td></td>")
+            && !income.split("</tr>").next().unwrap().contains("hint"),
+        "an account with none shows none: {income}"
+    );
+
+    // Its edit dialog holds all four, bounded as the conductor bounds them.
+    let dialog = body.split("<dialog id=\"edit-ACC-1\">").nth(1).unwrap();
+    let dialog = dialog.split("</dialog>").next().unwrap();
+    for field in [
+        "name=\"custodian\" value=\"Fidelity\" maxlength=\"200\"",
+        "name=\"account_type\" value=\"Roth IRA\" maxlength=\"200\"",
+        "name=\"owner\" value=\"Fund &lt;I&gt;\" maxlength=\"200\"",
+        "name=\"note\" rows=\"3\" maxlength=\"2000\">Rollover, 2026.</textarea>",
+    ] {
+        assert!(dialog.contains(field), "{field} is not in {dialog}");
+    }
+    let new = body.split("<dialog id=\"new-account\">").nth(1).unwrap();
+    assert!(
+        new.contains("name=\"custodian\" value=\"\"") && new.contains("name=\"note\""),
+        "and so does a new account's"
     );
 }
 

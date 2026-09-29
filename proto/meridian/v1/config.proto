@@ -79,6 +79,19 @@ message AccountRecord {
   string name = 2;
   AccountState state = 3;
   int64 created_at_ns = 4;
+
+  // Free text, optional, and searchable as the name is (W6.3). Where the
+  // account is held, e.g. "Fidelity". At most 200 characters.
+  string custodian = 5;
+
+  // What the account is, e.g. "Roth IRA". At most 200 characters.
+  string account_type = 6;
+
+  // One ownership or grouping label, e.g. "Fund I". At most 200 characters.
+  string owner = 7;
+
+  // Anything else worth knowing about it. At most 2,000 characters.
+  string note = 8;
 }
 
 enum AccountState {
@@ -89,10 +102,16 @@ enum AccountState {
   ACCOUNT_STATE_CLOSED = 2;
 }
 
-// Creates an account when `account_id` is empty; renames it otherwise.
+// Creates an account when `account_id` is empty; edits it otherwise, setting
+// its name, custodian, type, owner and note to those given, so an empty one
+// clears it.
 message DefineAccountRequest {
   string account_id = 1;
   string name = 2;
+  string custodian = 3;
+  string account_type = 4;
+  string owner = 5;
+  string note = 6;
 }
 
 message CloseAccountRequest {
@@ -116,6 +135,14 @@ message LinkExternalAccountRequest {
 
   // A new account's name, for the conductor to create and link in one step.
   string new_account_name = 4;
+
+  // The new account's custodian, type, owner and note (W6.3), which the
+  // plugin may pre-fill from what the venue reported. Ignored unless
+  // new_account_name is given: an existing account is edited only by W6.3.
+  string new_account_custodian = 5;
+  string new_account_type = 6;
+  string new_account_owner = 7;
+  string new_account_note = 8;
 }
 
 message ExternalAccountLink {
@@ -129,7 +156,8 @@ message ExternalAccountLink {
 message AccountsRequest {}
 
 message Accounts {
-  // Names, identifiers and states; no holdings.
+  // Each account's identifier, name, state, custodian, type, owner and note;
+  // no holdings.
   repeated AccountRecord accounts = 1;
 }
 

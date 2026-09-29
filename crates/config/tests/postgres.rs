@@ -92,6 +92,7 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         name: "Growth".into(),
         state: AccountState::Open as i32,
         created_at_ns: 7,
+        ..AccountRecord::default()
     };
     store.put_account(&account).unwrap();
     store
@@ -147,6 +148,10 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.records.accounts[0].name, "Growth Fund");
     assert_eq!(snapshot.records.accounts[0].created_at_ns, 7);
+    assert_eq!(
+        snapshot.records.accounts[0].custodian, "",
+        "none of the four given, none held"
+    );
     assert_eq!(snapshot.records.user_groups, [group]);
     assert_eq!(snapshot.records.account_groups, [accounts]);
     assert!(
@@ -178,6 +183,9 @@ fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
         name: "Fidelity Brokerage".into(),
         state: AccountState::Open as i32,
         created_at_ns: 9,
+        custodian: "Fidelity".into(),
+        account_type: "Roth IRA".into(),
+        ..AccountRecord::default()
     };
     let link = ExternalAccountLink {
         plugin_instance_id: "snaptrade-1".into(),
@@ -709,10 +717,14 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
 
     // The store as the release before this one left it: every migration up
     // to the one that retires tags, recorded as that release recorded them.
-    let (before, retiring): (Vec<_>, Vec<_>) = meridian_config::migrations::MIGRATIONS
+    let before: Vec<_> = meridian_config::migrations::MIGRATIONS
         .iter()
-        .partition(|m| m.name != "access_is_read_or_write");
-    assert_eq!(retiring.len(), 1, "the migration that retires tags");
+        .take_while(|m| m.name != "access_is_read_or_write")
+        .collect();
+    assert!(
+        before.len() < meridian_config::migrations::MIGRATIONS.len(),
+        "the migration that retires tags"
+    );
     client
         .batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -740,7 +752,7 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
         .unwrap();
 
     let store = PostgresStore::connect(&url, 2).expect("connects");
-    assert!(store.verify().is_err(), "one migration behind");
+    assert!(store.verify().is_err(), "migrations behind");
     store.migrate().expect("migrates");
     store.verify().expect("recognised after migrating");
 
@@ -783,4 +795,127 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
         .unwrap()
         .get(0);
     assert_eq!(tag_columns, 0, "no table keeps a tag");
+}
+
+#[test]
+fn an_accounts_custodian_type_owner_and_note_are_written_edited_and_cleared() {
+    // W6.3: free text, optional, and set whole by each edit, so an empty one
+    // clears it; an empty one is held as NULL, as every account's was before
+    // the four existed.
+    let (store, url) = store_at("attributes");
+    let described = AccountRecord {
+        account_id: "ACC-1".into(),
+        name: "Growth".into(),
+        state: AccountState::Open as i32,
+        created_at_ns: 7,
+        custodian: "Fidelity".into(),
+        account_type: "Roth IRA".into(),
+        owner: "Fund I".into(),
+        note: "n".repeat(2_000),
+    };
+    store.put_account(&described).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().records.accounts,
+        std::slice::from_ref(&described),
+        "all four, and a note of 2,000 characters, kept whole"
+    );
+
+    let edited = AccountRecord {
+        owner: "Fund II".into(),
+        note: "Moved to Fund II.".into(),
+        ..described.clone()
+    };
+    store.put_account(&edited).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().records.accounts,
+        std::slice::from_ref(&edited)
+    );
+
+    let cleared = AccountRecord {
+        custodian: String::new(),
+        account_type: String::new(),
+        owner: String::new(),
+        note: String::new(),
+        ..edited
+    };
+    store.put_account(&cleared).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().records.accounts,
+        std::slice::from_ref(&cleared)
+    );
+    let mut dump = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+    let nulls: i64 = dump
+        .query_one(
+            "SELECT count(*) FROM config_account
+              WHERE custodian IS NULL AND account_type IS NULL AND owner IS NULL AND note IS NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(nulls, 1, "a cleared one is NULL, not ''");
+
+    // The column's own bound, for whatever writes past the conductor's rules.
+    let too_long = dump.execute(
+        "UPDATE config_account SET note = repeat('n', 2001) WHERE account_id = 'ACC-1'",
+        &[],
+    );
+    assert!(too_long.is_err(), "a note past 2,000 characters is refused");
+}
+
+#[test]
+fn an_account_from_before_its_attributes_reads_back_with_none() {
+    // Migration 8 adds the columns nullable and with no default, so an
+    // account written by the release before reads as it did.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("config_before_attributes_{nanos}_{seq}");
+    postgres::Client::connect(&base_url(), postgres::NoTls)
+        .expect("could not reach the test database")
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .expect("could not create a schema");
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+
+    let before: Vec<_> = meridian_config::migrations::MIGRATIONS
+        .iter()
+        .take_while(|m| m.name != "account_attributes")
+        .collect();
+    assert!(
+        before.len() < meridian_config::migrations::MIGRATIONS.len(),
+        "the migration that adds them"
+    );
+    client
+        .batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in before {
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        meridian_config::migrations::record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO config_account (account_id, name, state, created_at_ns)
+                 VALUES ('ACC-OLD', 'Old income', 1, 5);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).expect("connects");
+    assert!(store.verify().is_err(), "one migration behind");
+    store.migrate().expect("migrates");
+    store.verify().expect("recognised after migrating");
+
+    assert_eq!(
+        store.snapshot().unwrap().records.accounts,
+        [AccountRecord {
+            account_id: "ACC-OLD".into(),
+            name: "Old income".into(),
+            state: AccountState::Open as i32,
+            created_at_ns: 5,
+            ..AccountRecord::default()
+        }]
+    );
 }

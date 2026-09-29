@@ -56,6 +56,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "access_is_read_or_write",
         sql: include_str!("../migrations/0007_access_is_read_or_write.sql"),
     },
+    Migration {
+        version: 8,
+        name: "account_attributes",
+        sql: include_str!("../migrations/0008_account_attributes.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

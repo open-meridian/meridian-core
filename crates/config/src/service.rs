@@ -532,6 +532,15 @@ pub fn serve(
             let before = cx.snapshot()?;
             rules::define_account(&before, &request)?;
             let now = cx.clock.now_ns();
+            // An edit sets all four as given, so an empty one clears it.
+            let described = AccountRecord {
+                name: request.name.clone(),
+                custodian: request.custodian.trim().to_string(),
+                account_type: request.account_type.trim().to_string(),
+                owner: request.owner.trim().to_string(),
+                note: request.note.trim().to_string(),
+                ..AccountRecord::default()
+            };
             let account = match before
                 .records
                 .accounts
@@ -539,14 +548,16 @@ pub fn serve(
                 .find(|a| a.account_id == request.account_id)
             {
                 Some(existing) => AccountRecord {
-                    name: request.name.clone(),
-                    ..existing.clone()
+                    account_id: existing.account_id.clone(),
+                    state: existing.state,
+                    created_at_ns: existing.created_at_ns,
+                    ..described
                 },
                 None => AccountRecord {
                     account_id: ids::account(now),
-                    name: request.name.clone(),
                     state: AccountState::Open as i32,
                     created_at_ns: now,
+                    ..described
                 },
             };
             cx.store.put_account(&account).map_err(|f| f.to_string())?;
@@ -621,6 +632,10 @@ pub fn serve(
                     name: request.new_account_name.trim().to_string(),
                     state: AccountState::Open as i32,
                     created_at_ns: now,
+                    custodian: request.new_account_custodian.trim().to_string(),
+                    account_type: request.new_account_type.trim().to_string(),
+                    owner: request.new_account_owner.trim().to_string(),
+                    note: request.new_account_note.trim().to_string(),
                 };
                 link.account_id = account.account_id.clone();
                 cx.store
@@ -651,7 +666,8 @@ pub fn serve(
         ("meridian.v1.AccountsRequest", "meridian.v1.Accounts"),
         |cx, _: AccountsRequest, envelope| {
             deployment_admin_acting(envelope, "the deployment's accounts")?;
-            // Names, identifiers and states: nothing of who may read them,
+            // Each account as the configuration holds it, its custodian,
+            // type, owner and note with it: nothing of who may read them,
             // and no holdings, which are not the configuration's.
             Ok(Accounts {
                 accounts: cx.snapshot()?.records.accounts,

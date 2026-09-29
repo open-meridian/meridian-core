@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 
+use meridian_domain::account;
 use meridian_domain::v1::{
     AccessGroup, AccessLevel, AccountGroup, AccountState, DefineAccountRequest,
     GrantPermissionRequest, LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
@@ -36,8 +37,46 @@ fn exists<T>(items: &[T], id: &str, key: impl Fn(&T) -> &str, what: &str) -> Ver
     }
 }
 
+/// Refused naming the field when longer than `most` characters. Characters,
+/// not bytes, because the person counting is reading them.
+fn at_most(value: &str, most: usize, what: &str) -> Verdict {
+    let length = value.trim().chars().count();
+    if length > most {
+        return Err(format!(
+            "{what} is {length} characters, and at most {most} are kept"
+        ));
+    }
+    Ok(())
+}
+
+/// W6.3's bounds on an account's custodian, type, owner and note, each
+/// named as `whose` field when refused.
+fn account_attributes(
+    whose: &str,
+    custodian: &str,
+    account_type: &str,
+    owner: &str,
+    note: &str,
+) -> Verdict {
+    at_most(
+        custodian,
+        account::LABEL_MOST,
+        &format!("{whose} custodian"),
+    )?;
+    at_most(account_type, account::LABEL_MOST, &format!("{whose} type"))?;
+    at_most(owner, account::LABEL_MOST, &format!("{whose} owner"))?;
+    at_most(note, account::NOTE_MOST, &format!("{whose} note"))
+}
+
 pub fn define_account(snapshot: &Snapshot, request: &DefineAccountRequest) -> Verdict {
     required(&request.name, "an account's name")?;
+    account_attributes(
+        "an account's",
+        &request.custodian,
+        &request.account_type,
+        &request.owner,
+        &request.note,
+    )?;
     if !request.account_id.is_empty() {
         exists(
             &snapshot.records.accounts,
@@ -60,7 +99,8 @@ pub fn close_account(snapshot: &Snapshot, account_id: &str) -> Verdict {
 
 /// A link names an existing account, or a new account's name for the
 /// conductor to create and link in one step, or neither to remove it; never
-/// both (W6.4).
+/// both (W6.4). A new account's custodian, type, owner and note are held to
+/// W6.3's bounds; with no new account they are ignored, not refused.
 pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdict {
     required(&request.plugin_instance_id, "the plugin")?;
     required(&request.external_account_id, "the external account")?;
@@ -76,7 +116,14 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
                 "a link names an existing account or a new account's name, not both".into(),
             );
         }
-        return required(&request.new_account_name, "a new account's name");
+        required(&request.new_account_name, "a new account's name")?;
+        return account_attributes(
+            "a new account's",
+            &request.new_account_custodian,
+            &request.new_account_type,
+            &request.new_account_owner,
+            &request.new_account_note,
+        );
     }
     if request.account_id.is_empty() {
         return Ok(());

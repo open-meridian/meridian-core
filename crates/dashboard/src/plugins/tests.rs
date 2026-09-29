@@ -38,6 +38,7 @@ fn records(instances: &[&str]) -> AccessRecords {
             name: "Growth".into(),
             state: AccountState::Open as i32,
             created_at_ns: 0,
+            ..Default::default()
         }],
         account_groups: vec![AccountGroup {
             account_group_id: "AcG-1".into(),

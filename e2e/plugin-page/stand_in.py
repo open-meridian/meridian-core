@@ -209,7 +209,9 @@ def accounts_for(header):
     except grpc.RpcError as refused:
         return refused_as(refused)
     return {"ok": True, "accounts": [
-        {"account_id": a.account_id, "name": a.name, "state": a.state} for a in read.accounts]}
+        {"account_id": a.account_id, "name": a.name, "state": a.state,
+         "custodian": a.custodian, "account_type": a.account_type, "owner": a.owner,
+         "note": a.note} for a in read.accounts]}
 
 
 def link_for(header, asked):
@@ -219,7 +221,11 @@ def link_for(header, asked):
     params = operations_pb2.LinkExternalAccountParams(
         external_account_id=asked.get("external_account_id", ""),
         account_id=asked.get("account_id", ""),
-        new_account_name=asked.get("new_account_name", ""))
+        new_account_name=asked.get("new_account_name", ""),
+        new_account_custodian=asked.get("new_account_custodian", ""),
+        new_account_type=asked.get("new_account_type", ""),
+        new_account_owner=asked.get("new_account_owner", ""),
+        new_account_note=asked.get("new_account_note", ""))
     if not asked.get("as_itself"):
         params.acting_for.CopyFrom(assertion_of(header))
     try:

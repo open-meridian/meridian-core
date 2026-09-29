@@ -16,6 +16,7 @@ fn account(id: &str, state: AccountState) -> AccountRecord {
         name: id.into(),
         state: state as i32,
         created_at_ns: 0,
+        ..Default::default()
     }
 }
 

@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 
-use meridian_domain::v1::{AccessLevel, AccessRecords, AccountState};
+use meridian_domain::account;
+use meridian_domain::v1::{AccessLevel, AccessRecords, AccountRecord, AccountState};
 
 use crate::html::escape;
 
@@ -473,12 +474,30 @@ pub fn render(
     ));
 
     // ── Accounts ────────────────────────────────────────────────────────────
-    let account_fields = |id: &str, name: &str| {
+    // W6.3: a name, and optionally a custodian, a type, an owner and a note,
+    // free text and all searchable. An edit sets all four as given.
+    let account_fields = |a: Option<&AccountRecord>| {
+        let a = a.cloned().unwrap_or_default();
         format!(
-            "<input type=\"hidden\" name=\"account_id\" value=\"{}\">\
-             <label>Name<input name=\"name\" value=\"{}\" required></label>",
-            escape(id),
-            escape(name)
+            "<input type=\"hidden\" name=\"account_id\" value=\"{id}\">\
+             <label>Name<input name=\"name\" value=\"{name}\" required></label>\
+             <label>Custodian<input name=\"custodian\" value=\"{custodian}\" maxlength=\"{label}\" \
+             placeholder=\"Where it is held, e.g. Fidelity\"></label>\
+             <label>Type<input name=\"account_type\" value=\"{account_type}\" maxlength=\"{label}\" \
+             placeholder=\"What it is, e.g. Roth IRA\"></label>\
+             <label>Owner<input name=\"owner\" value=\"{owner}\" maxlength=\"{label}\" \
+             placeholder=\"One ownership or grouping label, e.g. Fund I\"></label>\
+             <label>Note<textarea name=\"note\" rows=\"3\" maxlength=\"{note_most}\">{note}</textarea></label>\
+             <p class=\"hint\">All but the name are optional and free text, and the search box \
+             finds an account by any of them. Leaving one empty clears it.</p>",
+            id = escape(&a.account_id),
+            name = escape(&a.name),
+            custodian = escape(&a.custodian),
+            account_type = escape(&a.account_type),
+            owner = escape(&a.owner),
+            note = escape(&a.note),
+            label = account::LABEL_MOST,
+            note_most = account::NOTE_MOST,
         )
     };
     let mut rows = String::new();
@@ -491,14 +510,14 @@ pub fn render(
         } else {
             dialogs.push_str(&dialog(
                 &escape(&edit),
-                &format!("Rename {}", escape(&a.name)),
+                &format!("Edit {}", escape(&a.name)),
                 "/admin/accounts#accounts",
                 token,
-                &account_fields(&a.account_id, &a.name),
+                &account_fields(Some(a)),
                 "Save",
             ));
             format!(
-                "<button type=\"button\" data-dialog-open=\"{edit}\">Rename</button>\
+                "<button type=\"button\" data-dialog-open=\"{edit}\">Edit</button>\
                  <form method=\"post\" action=\"/admin/accounts/close#accounts\" \
                  data-confirm=\"Close {name}? A closed account is kept, and nobody works in it.\">{token}\
                  <input type=\"hidden\" name=\"account_id\" value=\"{id}\"><button type=\"submit\">Close</button></form>",
@@ -507,12 +526,21 @@ pub fn render(
                 id = escape(&a.account_id),
             )
         };
+        let note = if a.note.is_empty() {
+            String::new()
+        } else {
+            format!("<span class=\"hint\">{}</span>", escape(&a.note))
+        };
         rows.push_str(&format!(
-            "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}</td><td>{state}</td>\
+            "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}{note}</td>\
+             <td>{custodian}</td><td>{account_type}</td><td>{owner}</td><td>{state}</td>\
              <td class=\"actions\">{actions}</td></tr>",
             id = escape(&a.account_id),
             name = escape(&a.name),
             named = named(&a.name, &a.account_id),
+            custodian = escape(&a.custodian),
+            account_type = escape(&a.account_type),
+            owner = escape(&a.owner),
             state = if closed {
                 "<span class=\"pill\">closed</span>"
             } else {
@@ -525,18 +553,25 @@ pub fn render(
         "New account",
         "/admin/accounts#accounts",
         token,
-        &account_fields("", ""),
+        &account_fields(None),
         "Create",
     ));
     let table = if rows.is_empty() {
         "<p class=\"empty\">No accounts yet.</p>".to_string()
     } else {
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>Name</th><th>State</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        format!(
+            "<input class=\"filter\" type=\"search\" data-filter=\"accounts-table\" hidden \
+             placeholder=\"Search by name, custodian, type, owner or note\" aria-label=\"Search accounts\">\
+             <div class=\"scroll\"><table class=\"list accounts\" id=\"accounts-table\"><thead><tr><th>Name</th>\
+             <th>Custodian</th><th>Type</th><th>Owner</th><th>State</th><th></th></tr></thead>\
+             <tbody>{rows}</tbody></table></div>"
+        )
     };
     sections.push(section(
         "accounts",
         "Accounts",
-        "The firm's accounts, which permissions and plugins work on. Closed, never deleted.",
+        "The firm's accounts, which permissions and plugins work on: where each is held, \
+         what it is and who owns it. Closed, never deleted.",
         &new_button("new-account", "New account"),
         format!("{table}{dialogs}"),
     ));

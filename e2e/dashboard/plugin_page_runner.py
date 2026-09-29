@@ -301,6 +301,12 @@ def row_id(page, section, name):
     return found.group(1) if found else None
 
 
+def account_row(page, account_id):
+    """The Accounts tab's row for one account, as HTML."""
+    table = page.body.split("<h2>Accounts</h2>", 1)[-1].split("</table>", 1)[0]
+    return table.split(f'<tr data-id="{account_id}"', 1)[-1].split("</tr>", 1)[0]
+
+
 def sentence(page):
     found = re.search(r"<p[^>]*>(.*?)</p>", page.body, re.S)
     return found.group(1) if found else page.body[:200]
@@ -441,9 +447,16 @@ def main():
           f"and that she administers the deployment, so it may serve her its admin page: {seen.get('caller')}")
 
     say("C: she grants herself read on one account through the plugin")
-    page = administer(ada, "/admin/accounts", {"account_id": "", "name": "Plugin page account"})
+    page = administer(ada, "/admin/accounts",
+                      {"account_id": "", "name": "Plugin page account", "custodian": "Fidelity",
+                       "account_type": "Roth IRA", "owner": "Fund I", "note": "Made by the e2e."})
     account = row_id(page, "Accounts", "Plugin page account")
     check(account is not None, "the account is listed")
+    row = account_row(page, account)
+    check(all(f"<td>{said}</td>" in row for said in ("Fidelity", "Roth IRA", "Fund I"))
+          and '<span class="hint">Made by the e2e.</span>' in row,
+          f"with its custodian, type, owner and note (W6.3): {row[:400]}")
+    check('data-filter="accounts-table"' in page.body, "and the tab offers a search")
     page = administer(ada, "/admin/account-groups",
                       {"account_group_id": "", "name": "Plugin page accounts", "account_ids": account})
     account_group = row_id(page, "Account groups", "Plugin page accounts")
@@ -524,8 +537,10 @@ def main():
     read = json.loads(body) if status == 200 else {}
     check(read.get("ok") and any(a["account_id"] == account for a in read.get("accounts", [])),
           f"the plugin reads the deployment's accounts for her: {status} {body[:300]}")
-    check(all(set(a) == {"account_id", "name", "state"} for a in read.get("accounts", [])),
-          "names, identifiers and states only")
+    mine = next((a for a in read.get("accounts", []) if a["account_id"] == account), {})
+    check((mine.get("custodian"), mine.get("account_type"), mine.get("owner"), mine.get("note"))
+          == ("Fidelity", "Roth IRA", "Fund I", "Made by the e2e."),
+          f"each with its custodian, type, owner and note, to tell them apart: {mine}")
     itself = link(plugin, external_account_id="ext-e2e", account_id=account, as_itself=True)
     check(itself.get("code") == "PERMISSION_DENIED" and "deployment admin" in itself.get("detail", ""),
           f"as itself, the plugin is refused: {itself}")
@@ -540,7 +555,8 @@ def main():
     check(linked.get("ok") and linked.get("account_id") == account
           and linked.get("plugin_instance_id") == INSTANCE,
           f"linked to her account, for this plugin: {linked}")
-    created = link(plugin, external_account_id="ext-e2e-roth", new_account_name="E2E Roth")
+    created = link(plugin, external_account_id="ext-e2e-roth", new_account_name="E2E Roth",
+                   new_account_custodian="E2E Brokerage", new_account_type="Roth IRA")
     check(created.get("ok") and created.get("account_id") not in (None, "", account),
           f"linked to a new account, made in the same step: {created}")
     # The dashboard reads the records again within 30 seconds; the link was
@@ -549,6 +565,9 @@ def main():
                        and "not linked" not in unlinked_said(page), seconds=45)
     check(row_id(page, "Accounts", "E2E Roth") == created.get("account_id"),
           "the new account is the deployment's, under the name given")
+    row = account_row(page, created.get("account_id") or "")
+    check("<td>E2E Brokerage</td><td>Roth IRA</td>" in row,
+          f"with the custodian and type the plugin sent (W6.4): {row[:400]}")
     check("not linked" not in unlinked_said(page), f"none waits: {unlinked_said(page)!r}")
     removed = link(plugin, external_account_id="ext-e2e-roth")
     check(removed.get("ok") and removed.get("account_id") == "", f"and unlinked again: {removed}")

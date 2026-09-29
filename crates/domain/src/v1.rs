@@ -1146,14 +1146,37 @@ pub struct AccountRecord {
     pub state: i32,
     #[prost(int64, tag = "4")]
     pub created_at_ns: i64,
+    /// Free text, optional, and searchable as the name is (W6.3). Where the
+    /// account is held, e.g. "Fidelity". At most 200 characters.
+    #[prost(string, tag = "5")]
+    pub custodian: ::prost::alloc::string::String,
+    /// What the account is, e.g. "Roth IRA". At most 200 characters.
+    #[prost(string, tag = "6")]
+    pub account_type: ::prost::alloc::string::String,
+    /// One ownership or grouping label, e.g. "Fund I". At most 200 characters.
+    #[prost(string, tag = "7")]
+    pub owner: ::prost::alloc::string::String,
+    /// Anything else worth knowing about it. At most 2,000 characters.
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
 }
-/// Creates an account when `account_id` is empty; renames it otherwise.
+/// Creates an account when `account_id` is empty; edits it otherwise, setting
+/// its name, custodian, type, owner and note to those given, so an empty one
+/// clears it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DefineAccountRequest {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub custodian: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub account_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub owner: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub note: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CloseAccountRequest {
@@ -1177,6 +1200,17 @@ pub struct LinkExternalAccountRequest {
     /// A new account's name, for the conductor to create and link in one step.
     #[prost(string, tag = "4")]
     pub new_account_name: ::prost::alloc::string::String,
+    /// The new account's custodian, type, owner and note (W6.3), which the
+    /// plugin may pre-fill from what the venue reported. Ignored unless
+    /// new_account_name is given: an existing account is edited only by W6.3.
+    #[prost(string, tag = "5")]
+    pub new_account_custodian: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub new_account_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub new_account_owner: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub new_account_note: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExternalAccountLink {
@@ -1193,7 +1227,8 @@ pub struct ExternalAccountLink {
 pub struct AccountsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Accounts {
-    /// Names, identifiers and states; no holdings.
+    /// Each account's identifier, name, state, custodian, type, owner and note;
+    /// no holdings.
     #[prost(message, repeated, tag = "1")]
     pub accounts: ::prost::alloc::vec::Vec<AccountRecord>,
 }

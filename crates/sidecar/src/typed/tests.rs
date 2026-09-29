@@ -940,6 +940,10 @@ async fn linking(reported: &[&str]) -> (Sidecar, SigningKey, Heard, Arc<Mutex<Ve
                     name: "Growth".into(),
                     state: AccountState::Open as i32,
                     created_at_ns: 1,
+                    custodian: "Fidelity".into(),
+                    account_type: "Roth IRA".into(),
+                    owner: "Fund I".into(),
+                    note: "Rollover, 2026.".into(),
                 }],
             }
             .encode_to_vec(),
@@ -973,6 +977,7 @@ fn link(
         account_id: account.into(),
         new_account_name: new_name.into(),
         acting_for: by,
+        ..Default::default()
     }
 }
 
@@ -990,12 +995,13 @@ async fn a_link_for_a_deployment_admin_is_stamped_with_them_and_this_plugin() {
         .into_inner();
     assert_eq!(linked.account_id, "ACC-9");
     let created = sidecar
-        .link_external_account(Request::new(link(
-            "st-2",
-            "",
-            "Fidelity Brokerage",
-            admin(),
-        )))
+        .link_external_account(Request::new(LinkExternalAccountParams {
+            new_account_custodian: "Fidelity".into(),
+            new_account_type: "Roth IRA".into(),
+            new_account_owner: "Fund I".into(),
+            new_account_note: "Linked from SnapTrade.".into(),
+            ..link("st-2", "", "Fidelity Brokerage", admin())
+        }))
         .await
         .expect("admitted")
         .into_inner();
@@ -1018,6 +1024,16 @@ async fn a_link_for_a_deployment_admin_is_stamped_with_them_and_this_plugin() {
         assert_eq!(by, "local|ada", "recorded as hers");
     }
     assert_eq!(heard[1].0.new_account_name, "Fidelity Brokerage");
+    assert_eq!(
+        (
+            heard[1].0.new_account_custodian.as_str(),
+            heard[1].0.new_account_type.as_str(),
+            heard[1].0.new_account_owner.as_str(),
+            heard[1].0.new_account_note.as_str(),
+        ),
+        ("Fidelity", "Roth IRA", "Fund I", "Linked from SnapTrade."),
+        "the new account's description reaches the conductor as sent (W6.4)"
+    );
     assert_eq!(
         (
             heard[2].0.account_id.as_str(),
@@ -1129,6 +1145,16 @@ async fn the_deployments_accounts_are_read_only_for_a_deployment_admin() {
             read.accounts[0].name.as_str()
         ),
         ("ACC-1", "Growth")
+    );
+    assert_eq!(
+        (
+            read.accounts[0].custodian.as_str(),
+            read.accounts[0].account_type.as_str(),
+            read.accounts[0].owner.as_str(),
+            read.accounts[0].note.as_str(),
+        ),
+        ("Fidelity", "Roth IRA", "Fund I", "Rollover, 2026."),
+        "each account's custodian, type, owner and note reach the plugin (W6.4)"
     );
     for by in [None, Some(signed(&key, reading(&["ACC-1"]), false))] {
         let refused = sidecar
