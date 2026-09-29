@@ -404,7 +404,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     check([name for _, name in tabs]
           == ["Overview", "Settings", "Access", "Connections", "Accounts", "Holdings"],
           f"the view's tabs, then the admin pages it declared, in its order: {tabs}")
-    check(tabs[4][0] == f"{VIEW}?tab=%2Fadmin%2Faccounts", f"each a link of its own: {tabs}")
+    check(tabs[4][0] == f"{VIEW}?tab=accounts", f"each a link of its own: {tabs}")
     accounts = ada.get(dash(tabs[4][0]))
     admin_page = accounts.body.split('id="admin-page"', 1)[-1].split("</section>", 1)[0]
     check(f'href="/plugins/{INSTANCE}/enter?path=%2Fadmin%2Faccounts' in admin_page,

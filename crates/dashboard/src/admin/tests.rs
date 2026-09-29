@@ -716,12 +716,12 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     assert_eq!(names, ["Overview", "Settings", "Access", "Admin page"]);
     assert_eq!(here, "Overview");
     assert_eq!(tabs[0].0, VIEW);
-    assert_eq!(tabs[3].0, format!("{VIEW}?tab=%2Fadmin"));
+    assert_eq!(tabs[3].0, format!("{VIEW}?tab=admin"));
     assert!(body.contains("id=\"health\""));
     for (part, tab) in [
         ("id=\"settings\"", "settings"),
         ("id=\"access\"", "access"),
-        ("id=\"admin-page\"", "%2Fadmin"),
+        ("id=\"admin-page\"", "admin"),
     ] {
         assert!(!body.contains(part), "{part} is only on its own tab");
         let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={tab}"), true)).await;
@@ -737,10 +737,10 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     );
     // This harness serves no plugin pages, and the view says so rather than
     // framing something that is not there.
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fadmin"), true)).await;
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=admin"), true)).await;
     assert!(page.contains("cannot frame this one"));
     // A tab that is not one is the first.
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fsecret"), true)).await;
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=secret"), true)).await;
     assert_eq!(tabs_of(&page).1, "Overview");
 
     // The old address of the form is the view's.
@@ -847,7 +847,7 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     // (W6.4, W6.10), and to nothing of the dashboard's.
     assert!(
         health.contains(&format!(
-            "5 external accounts not linked. <a href=\"{VIEW}?tab=%2Fadmin\">Link them on the \
+            "5 external accounts not linked. <a href=\"{VIEW}?tab=admin\">Link them on the \
              plugin's admin pages</a>."
         )),
         "{health}"
@@ -918,11 +918,11 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
             (format!("{VIEW}?tab=settings"), "Settings".into()),
             (format!("{VIEW}?tab=access"), "Access".into()),
             (
-                format!("{VIEW}?tab=%2Fadmin%2Fconnections"),
+                format!("{VIEW}?tab=connections"),
                 "Connections".into()
             ),
-            (format!("{VIEW}?tab=%2Fadmin%2Faccounts"), "Accounts".into()),
-            (format!("{VIEW}?tab=%2Fadmin%2Fholdings"), "Holdings".into()),
+            (format!("{VIEW}?tab=accounts"), "Accounts".into()),
+            (format!("{VIEW}?tab=holdings"), "Holdings".into()),
         ]
     );
     assert_eq!(here, "Overview");
@@ -933,7 +933,7 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
 
     let (_, accounts) = send(
         &h,
-        get(&h, &format!("{VIEW}?tab=%2Fadmin%2Faccounts"), true),
+        get(&h, &format!("{VIEW}?tab=accounts"), true),
     )
     .await;
     assert_eq!(tabs_of(&accounts).1, "Accounts");
@@ -963,6 +963,11 @@ async fn a_page_that_is_not_one_on_the_plugins_host_is_no_tab() {
     let names: Vec<String> = tabs_of(&body).0.into_iter().map(|(_, name)| name).collect();
     // Untitled, it is called by its path; the second of a path is dropped.
     assert_eq!(names, ["Overview", "Settings", "Access", "/admin/accounts"]);
+    assert_eq!(
+        tabs_of(&body).0[3].0,
+        format!("{VIEW}?tab=admin-accounts"),
+        "named in the query by its path, made a word"
+    );
     for asked in ["%2F%2Fevil.example%2Fx", "https%3A%2F%2Fevil.example%2F"] {
         let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={asked}"), true)).await;
         assert_eq!(tabs_of(&page).1, "Overview", "{asked} is framed nowhere");
@@ -975,9 +980,9 @@ async fn a_page_that_is_not_one_on_the_plugins_host_is_no_tab() {
     let (tabs, _) = tabs_of(&body);
     assert_eq!(
         tabs.last().unwrap(),
-        &(format!("{VIEW}?tab=%2Fadmin"), "Admin page".to_string())
+        &(format!("{VIEW}?tab=admin"), "Admin page".to_string())
     );
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=%2Fadmin"), true)).await;
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=admin"), true)).await;
     assert!(page.contains("src=\"/plugins/snaptrade-1/enter?path=%2Fadmin&amp;"));
 }
 
@@ -1108,4 +1113,32 @@ fn a_form_asks_for_what_changed_and_clears_only_what_it_was_told_to() {
     let developing =
         settings::request(&record, &form(&[("value.synthetic", "true")]), true).unwrap();
     assert_eq!(developing.values[0].name, "synthetic");
+}
+
+#[tokio::test]
+async fn a_plugin_page_titled_as_one_of_the_views_own_does_not_take_its_tab() {
+    let h = framing(with_settings());
+    h.app.health.hear(
+        "snaptrade-1",
+        declaring(&[
+            ("/admin/settings", "Settings"),
+            ("/admin/ladder", "Cash ladder"),
+            ("/admin/other", "Cash  ladder!"),
+        ]),
+    );
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let hrefs: Vec<String> = tabs_of(&body).0.into_iter().map(|(href, _)| href).collect();
+    assert_eq!(
+        hrefs[3..],
+        [
+            format!("{VIEW}?tab=settings-2"),
+            format!("{VIEW}?tab=cash-ladder"),
+            format!("{VIEW}?tab=cash-ladder-2"),
+        ]
+    );
+    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
+    assert!(
+        page.contains(&format!("action=\"{SETTINGS}\"")),
+        "?tab=settings is still the view's own"
+    );
 }

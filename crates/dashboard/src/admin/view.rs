@@ -8,8 +8,9 @@
 //! gets one tab framing its `/admin`.
 //!
 //! A tab is a link, `?tab=settings` or, for a plugin's page, `?tab=` its
-//! path, so each opens directly and none needs script: the page holds only
-//! the tab asked for, and frames only that page.
+//! title in lower case (`?tab=accounts`; the product owner, 2026-09-29), so
+//! each opens directly and none needs script: the page holds only the tab
+//! asked for, and frames only that page.
 //!
 //! The admin overview's Plugins tab lists every instance with the same line
 //! this view heads with: its health, what its settings still need, and how
@@ -71,25 +72,58 @@ pub fn tabs(report: Option<&PluginReport>) -> Vec<Tab> {
     let mut pages: Vec<Tab> = Vec::new();
     for page in declared {
         let path = page.path.trim();
-        if crate::plugins::page_path(path).is_err() || pages.iter().any(|t| t.key == path) {
+        if crate::plugins::page_path(path).is_err()
+            || pages.iter().any(|t| t.page.as_deref() == Some(path))
+        {
             continue;
         }
         let title = page.title.trim();
+        let title = if title.is_empty() { path } else { title };
+        let key = unique(slug(title), &tabs, &pages);
         pages.push(Tab {
-            key: path.into(),
-            title: if title.is_empty() { path } else { title }.into(),
+            key,
+            title: title.into(),
             page: Some(path.into()),
         });
     }
     if pages.is_empty() {
         pages.push(Tab {
-            key: ADMIN.into(),
+            key: "admin".into(),
             title: "Admin page".into(),
             page: Some(ADMIN.into()),
         });
     }
     tabs.extend(pages);
     tabs
+}
+
+/// A title as the query names its tab: lower case, letters and digits, runs of
+/// anything else one hyphen. "Accounts" is `accounts`, "Cash ladder" is
+/// `cash-ladder`; a title with none of either is `page`.
+fn slug(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-');
+    if out.is_empty() { "page".into() } else { out.into() }
+}
+
+/// `key`, or `key-2`, `key-3` and on, whichever no tab already has, so a
+/// plugin page called "Settings" does not take the view's own.
+fn unique(key: String, own: &[Tab], pages: &[Tab]) -> String {
+    let taken = |k: &str| own.iter().chain(pages).any(|t| t.key == k);
+    if !taken(&key) {
+        return key;
+    }
+    (2..)
+        .map(|n| format!("{key}-{n}"))
+        .find(|k| !taken(k))
+        .expect("an unused key")
 }
 
 /// The tab asked for, or the first when none is, or one that is not there.
