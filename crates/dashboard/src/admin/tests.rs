@@ -464,7 +464,7 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
     );
     assert!(
         accounts.contains(
-            "<span class=\"hint\">Rollover, 2026.</span></td>\
+            "<span class=\"hint note\" id=\"account-note-0\">Rollover, 2026.</span></td>\
              <td>Fidelity</td><td>Roth IRA</td><td>Fund &lt;I&gt;</td>"
         ),
         "the note under the name, then its custodian, type and owner, escaped: {accounts}"
@@ -498,6 +498,121 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
     assert_eq!(fill["fields"]["owner"], "Fund <I>");
     assert_eq!(fill["fields"]["note"], "Rollover, 2026.");
     assert!(body.contains("data-dialog-open=\"account\" data-title=\"Edit Growth\""));
+}
+
+#[tokio::test]
+async fn an_accounts_note_is_in_its_row_and_shown_whole_in_one_shared_bubble() {
+    // The product owner, 2026-09-30: "show notes in a bubble when we hover
+    // over the line". A note is free text an admin wrote, so it is escaped
+    // wherever it is, and it reaches the bubble only as text.
+    let written = "Rollover <script>alert(\"x\")</script> & 'Fund I'\nsecond line";
+    let mut records = admin_records();
+    records.accounts = vec![
+        AccountRecord {
+            account_id: "ACC-1".into(),
+            name: "Growth".into(),
+            state: AccountState::Open as i32,
+            created_at_ns: T0,
+            note: written.into(),
+            ..Default::default()
+        },
+        AccountRecord {
+            account_id: "ACC-2".into(),
+            name: "Income".into(),
+            state: AccountState::Open as i32,
+            created_at_ns: T0,
+            ..Default::default()
+        },
+        AccountRecord {
+            account_id: "ACC-3".into(),
+            name: "Reserve".into(),
+            state: AccountState::Closed as i32,
+            created_at_ns: T0,
+            note: "Wound down.".into(),
+            ..Default::default()
+        },
+    ];
+    let h = harness(records, None);
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    let accounts = table(&body, "accounts");
+    let row = |id: &str| {
+        accounts
+            .split(&format!("<tr data-id=\"{id}\""))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no row {id}"))
+            .split("</tr>")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    // The note whole in its row, escaped, which is what shows without
+    // script, and what a screen reader is given as its marker's description.
+    let escaped = "Rollover &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;Fund I&#39;\nsecond line";
+    let growth = row("ACC-1");
+    assert!(
+        growth.contains(&format!(
+            "<td><span class=\"name\">Growth</span><button type=\"button\" class=\"note-mark\" \
+             aria-label=\"Note\" aria-describedby=\"account-note-0\"></button>\
+             <span class=\"id\">ACC-1</span><span class=\"hint note\" id=\"account-note-0\">{escaped}</span></td>"
+        )),
+        "{growth}"
+    );
+    assert!(!body.contains("<script>alert"), "the note is never markup");
+    assert!(
+        !body.contains(written),
+        "nowhere in the page unescaped, not even in a title"
+    );
+
+    // Only a row with a note has a marker; a closed account's note is shown
+    // as an open one's is.
+    let income = row("ACC-2");
+    assert!(
+        !income.contains("note-mark") && !income.contains("aria-describedby"),
+        "{income}"
+    );
+    assert!(row("ACC-3").contains(
+        "<button type=\"button\" class=\"note-mark\" aria-label=\"Note\" \
+         aria-describedby=\"account-note-2\"></button>"
+    ));
+    assert_eq!(body.matches("class=\"note-mark\"").count(), 2);
+
+    // One bubble for the table, empty until a row fills it, and hidden from
+    // a screen reader, which has the note from the row.
+    assert_eq!(body.matches("class=\"note-bubble\"").count(), 1);
+    assert!(body.contains(
+        "<div class=\"note-bubble\" id=\"accounts-note-bubble\" aria-hidden=\"true\" hidden></div>"
+    ));
+
+    // The page's script puts the note in the bubble as text, and never as
+    // markup.
+    let script = super::overview::NOTE_SCRIPT;
+    assert!(body.contains(script.trim()));
+    assert!(script.contains("bubble.textContent = note.textContent;"));
+    for markup in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    ] {
+        assert!(!script.contains(markup), "{markup}");
+    }
+}
+
+#[tokio::test]
+async fn with_no_note_there_is_no_bubble() {
+    let mut records = admin_records();
+    records.accounts = vec![AccountRecord {
+        account_id: "ACC-1".into(),
+        name: "Growth".into(),
+        state: AccountState::Open as i32,
+        created_at_ns: T0,
+        ..Default::default()
+    }];
+    let h = harness(records, None);
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    assert!(!body.contains("class=\"note-bubble\""), "no bubble element");
+    assert!(!body.contains("class=\"note-mark\""));
 }
 
 /// What the Edit on the row `id` fills its dialog with.

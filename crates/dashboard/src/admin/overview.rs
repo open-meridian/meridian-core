@@ -735,7 +735,7 @@ pub fn render(
         note_most = account::NOTE_MOST,
     );
     let mut rows = String::new();
-    for a in &accounts_sorted {
+    for (row, a) in accounts_sorted.iter().enumerate() {
         let closed = a.state == AccountState::Closed as i32;
         let actions = if closed {
             String::new()
@@ -757,18 +757,32 @@ pub fn render(
                 id = escape(&a.account_id),
             )
         };
-        let note = if a.note.is_empty() {
-            String::new()
+        // The note, whole under the name, which is how it reads without
+        // script. With script it is one line cut short, and the row's bubble
+        // ([`NOTE_SCRIPT`]) holds it whole. Its marker is how a keyboard
+        // reaches the bubble, and a screen reader is given the note as the
+        // marker's description, from the row itself.
+        let (mark, note) = if a.note.is_empty() {
+            (String::new(), String::new())
         } else {
-            format!("<span class=\"hint\">{}</span>", escape(&a.note))
+            (
+                format!(
+                    "<button type=\"button\" class=\"note-mark\" aria-label=\"Note\" \
+                     aria-describedby=\"account-note-{row}\"></button>"
+                ),
+                format!(
+                    "<span class=\"hint note\" id=\"account-note-{row}\">{}</span>",
+                    escape(&a.note)
+                ),
+            )
         };
         rows.push_str(&format!(
-            "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}{note}</td>\
+            "<tr data-id=\"{id}\" data-name=\"{name}\"><td><span class=\"name\">{name}</span>{mark}\
+             <span class=\"id\">{id}</span>{note}</td>\
              <td>{custodian}</td><td>{account_type}</td><td>{owner}</td><td>{state}</td>\
              <td class=\"actions\">{actions}</td></tr>",
             id = escape(&a.account_id),
             name = escape(&a.name),
-            named = named(&a.name, &a.account_id),
             custodian = escape(&a.custodian),
             account_type = escape(&a.account_type),
             owner = escape(&a.owner),
@@ -799,6 +813,15 @@ pub fn render(
             &rows,
         )
     };
+    // One bubble for every row, moved to the row pointed at or focused, so
+    // the page grows with the notes and not with a bubble per row. Hidden
+    // from a screen reader, which has the note from the row.
+    let bubble = if accounts_sorted.iter().any(|a| !a.note.is_empty()) {
+        "<div class=\"note-bubble\" id=\"accounts-note-bubble\" aria-hidden=\"true\" hidden></div>"
+    } else {
+        ""
+    };
+    let table = format!("{table}{bubble}");
     sections.push(section(
         "accounts",
         "Accounts",
@@ -886,7 +909,7 @@ pub fn render(
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
-         <script>{SCRIPT_START}{}{SCRIPT_END}</script>",
+         <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}</script>",
         sections.concat(),
         picker::SCRIPT,
     )
@@ -925,6 +948,86 @@ const SCRIPT_START: &str = r##"(function () {
   });
   show(location.hash.slice(1));
   window.addEventListener("hashchange", function () { show(location.hash.slice(1)); });
+"##;
+
+/// An account's note in a bubble (the product owner, 2026-09-30: "show notes
+/// in a bubble when we hover over the line"): pointing at a row with a note,
+/// or focusing or pressing its marker, shows the note whole in the one bubble,
+/// placed under the row, or over it when there is no room below. It stays
+/// while the pointer is on the row or on the bubble, and goes on leaving them,
+/// on Escape, on a press elsewhere, and when the table scrolls, is searched or
+/// sorted, or the window resizes. The note reaches the bubble as text, never as markup.
+pub(super) const NOTE_SCRIPT: &str = r##"
+  (function () {
+    var table = document.getElementById("accounts-table");
+    var bubble = document.getElementById("accounts-note-bubble");
+    if (!table || !bubble) return;
+    document.body.appendChild(bubble);
+    var shown = null;
+    var leaving = 0;
+    function hide() {
+      window.clearTimeout(leaving);
+      shown = null;
+      bubble.hidden = true;
+    }
+    function later() {
+      window.clearTimeout(leaving);
+      leaving = window.setTimeout(hide, 150);
+    }
+    function show(row) {
+      window.clearTimeout(leaving);
+      if (row === shown) return;
+      var note = row && row.querySelector(".note");
+      if (!note) { hide(); return; }
+      shown = row;
+      bubble.textContent = note.textContent;
+      bubble.hidden = false;
+      var edge = 8;
+      var line = row.getBoundingClientRect();
+      var cell = row.cells[0].getBoundingClientRect();
+      var width = bubble.offsetWidth;
+      var height = bubble.offsetHeight;
+      var top = line.bottom;
+      if (top + height > window.innerHeight - edge && line.top - height >= edge) top = line.top - height;
+      var left = Math.max(edge, Math.min(cell.left, window.innerWidth - width - edge));
+      bubble.style.top = top + window.scrollY + "px";
+      bubble.style.left = left + window.scrollX + "px";
+    }
+    table.addEventListener("mouseover", function (event) {
+      var row = event.target.closest("tbody tr");
+      if (row && table.contains(row)) show(row); else later();
+    });
+    table.addEventListener("mouseout", function (event) {
+      if (!bubble.contains(event.relatedTarget) && !table.contains(event.relatedTarget)) later();
+    });
+    bubble.addEventListener("mouseenter", function () { window.clearTimeout(leaving); });
+    bubble.addEventListener("mouseleave", function (event) {
+      if (!shown || !shown.contains(event.relatedTarget)) later();
+    });
+    table.addEventListener("focusin", function (event) {
+      var mark = event.target.closest(".note-mark");
+      if (mark) show(mark.closest("tr"));
+    });
+    table.addEventListener("focusout", function (event) {
+      if (event.target.closest(".note-mark")) hide();
+    });
+    // A press on a marker shows its note, which is how a touch reaches it; a
+    // press on anything else but the bubble or the shown row's text hides it.
+    document.addEventListener("click", function (event) {
+      var mark = event.target.closest(".note-mark");
+      if (mark && table.contains(mark)) { show(mark.closest("tr")); return; }
+      if (bubble.contains(event.target)) return;
+      if (shown && shown.contains(event.target) && !event.target.closest("button, a, form")) return;
+      hide();
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && shown) hide();
+    });
+    window.addEventListener("resize", hide);
+    if (table.parentNode) table.parentNode.addEventListener("scroll", hide);
+    var filter = document.querySelector("[data-filter=\"accounts-table\"]");
+    if (filter) filter.addEventListener("input", hide);
+  })();
 "##;
 
 const SCRIPT_END: &str = r##"

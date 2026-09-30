@@ -142,6 +142,18 @@ section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display
 @media (max-width:36rem){.section-head{flex-direction:column}td.actions{white-space:normal}}\
 table.list tbody tr:hover td{background:var(--line-soft)}\
 table.list .name{font-weight:550}table.list .hint{margin:.15rem 0 0}\
+table.list .note{overflow-wrap:anywhere}\
+.admin.js table.list .note{max-width:22rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+button.note-mark{display:inline-grid;place-items:center;width:1.05rem;height:1.05rem;margin:0 0 0 .4rem;padding:0;\
+border-radius:50%;border:1px solid var(--line-strong);background:var(--card);color:var(--ink-soft);\
+font:600 .66rem/1 var(--mono);vertical-align:.1em;cursor:help}\
+button.note-mark::before{content:\"i\"}\
+button.note-mark:hover,button.note-mark:focus-visible{border-color:var(--accent);color:var(--accent);background:var(--card)}\
+button.note-mark:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
+.admin:not(.js) button.note-mark{display:none}\
+.note-bubble{position:absolute;z-index:20;max-width:min(24rem,calc(100vw - 1rem));padding:.55rem .75rem;\
+background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:var(--radius);\
+box-shadow:var(--shadow-pop);font-size:.88rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}\
 input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins td:first-child{white-space:nowrap}\
 .filter-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:0 0 .9rem}.filter-row input.filter{margin:0}\
 .filter-count{color:var(--ink-faint);font-size:.84rem}\

@@ -453,9 +453,13 @@ def main():
     account = row_id(page, "Accounts", "Plugin page account")
     check(account is not None, "the account is listed")
     row = account_row(page, account)
+    noted = re.search(r'<span class="hint note" id="(account-note-\d+)">Made by the e2e\.</span>', row)
     check(all(f"<td>{said}</td>" in row for said in ("Fidelity", "Roth IRA", "Fund I"))
-          and '<span class="hint">Made by the e2e.</span>' in row,
+          and noted is not None,
           f"with its custodian, type, owner and note (W6.3): {row[:400]}")
+    check(noted is not None and f'class="note-mark" aria-label="Note" aria-describedby="{noted[1]}"' in row
+          and 'id="accounts-note-bubble"' in page.body,
+          f"and its note in the one bubble, reached by its marker, which it describes: {row[:400]}")
     check('data-filter="accounts-table"' in page.body, "and the tab offers a search")
     page = administer(ada, "/admin/account-groups",
                       {"account_group_id": "", "name": "Plugin page accounts", "account_ids": account})
