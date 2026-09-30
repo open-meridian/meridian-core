@@ -134,6 +134,30 @@ fn a_database_from_before_the_history_is_brought_up_to_date() {
 }
 
 #[test]
+fn the_local_accounts_are_listed_by_name_with_their_display_names_and_nothing_else() {
+    let (database, _) = migrated("people");
+    let store = accounts::InPostgres::on(database);
+    for (name, display) in [("bob", ""), ("Ada", "Ada Park")] {
+        store
+            .put(&LocalAccount {
+                name: name.into(),
+                display_name: display.into(),
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g".into(),
+                created_at_ns: T0,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        store.people().unwrap(),
+        [
+            ("ada".to_string(), "Ada Park".to_string()),
+            ("bob".to_string(), String::new())
+        ]
+    );
+}
+
+#[test]
 fn a_schema_newer_than_this_binary_is_refused_not_waited_for() {
     let (database, url) = migrated("ahead");
     postgres::Client::connect(&url, postgres::NoTls)

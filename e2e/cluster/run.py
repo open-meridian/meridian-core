@@ -24,12 +24,18 @@ import time
 import urllib.error
 import urllib.request
 
-# What home's header shows a deployment admin and nobody else.
-ADMIN_HOME = 'href="/admin">Admin<'
+# What home's header shows a deployment admin and nobody else: the gear to
+# Settings, named for a screen reader.
+ADMIN_HOME = 'href="/admin" aria-label="Settings"'
 # What home said to a deployment admin in charts published before this one,
 # which the upgrade test's published chart still says until it is upgraded:
-# the words before the one header, and the header's link before one button.
-ADMIN_HOME_BEFORE = ("You are a deployment admin", 'href="/admin">Admin portal<')
+# the words before the one header, the header's link before one button, and
+# that button before it was a gear.
+ADMIN_HOME_BEFORE = (
+    "You are a deployment admin",
+    'href="/admin">Admin portal<',
+    'href="/admin">Admin<',
+)
 
 
 def administers(page, installed_chart_is_published=False):

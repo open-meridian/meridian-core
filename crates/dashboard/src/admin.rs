@@ -12,7 +12,7 @@
 //! Every page but the claim page is refused to anybody not holding deployment
 //! admin, checked against the records on each request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -321,7 +321,8 @@ fn admin_chrome(session: &Session) -> Chrome<'_> {
             form_token: &session.form_token,
             admin: true,
         }),
-        crumbs: "<a href=\"/admin\">Admin</a>".into(),
+        // The settings home, where this chrome is drawn as it is.
+        crumbs: crate::html::crumb_here("Settings", None),
         main: "page",
         in_admin: true,
     }
@@ -337,6 +338,57 @@ fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod overview;
+pub mod people;
+mod picker;
+
+/// Everybody this dashboard can name for a user group (people.rs): those the
+/// groups name, those holding a terminal session, and the accounts this
+/// deployment holds itself. The local accounts are read off the async
+/// threads, as a sign-in reads them; if they cannot be read, the page still
+/// lists the rest and says so in the log.
+async fn people_known(
+    app: &App,
+    records: &AccessRecords,
+    holders: &[(String, String, usize)],
+) -> Vec<people::Person> {
+    let local = match &app.accounts {
+        None => Vec::new(),
+        Some(accounts) => {
+            let accounts = Arc::clone(accounts);
+            match tokio::task::spawn_blocking(move || accounts.people()).await {
+                Ok(Ok(held)) => held,
+                Ok(Err(unread)) => {
+                    tracing::warn!(%unread, "the local accounts could not be listed");
+                    Vec::new()
+                }
+                Err(joined) => {
+                    tracing::warn!(%joined, "listing the local accounts did not finish");
+                    Vec::new()
+                }
+            }
+        }
+    };
+    let local: Vec<(String, String)> = local
+        .into_iter()
+        .map(|(name, display)| (format!("local|{name}"), display))
+        .collect();
+    people::gather(
+        holders
+            .iter()
+            .map(|(login, name, _)| (login.as_str(), name.as_str()))
+            .chain(
+                local
+                    .iter()
+                    .map(|(login, name)| (login.as_str(), name.as_str())),
+            )
+            .chain(
+                records
+                    .user_groups
+                    .iter()
+                    .flat_map(|g| g.logins.iter().map(|login| (login.as_str(), ""))),
+            ),
+    )
+}
 
 async fn admin_page(
     State(app): State<Arc<App>>,
@@ -364,8 +416,16 @@ async fn admin_page(
     };
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
-    let body = overview::render(&records, &holders, &lines, &token_input(&session), &notice);
-    Html(page_with("Administer", &body, &admin_chrome(&session))).into_response()
+    let people = people_known(&app, &records, &holders).await;
+    let body = overview::render(
+        &records,
+        &holders,
+        &lines,
+        &people,
+        &token_input(&session),
+        &notice,
+    );
+    Html(page_with("Settings", &body, &admin_chrome(&session))).into_response()
 }
 
 /// Every plugin instance known anywhere, with its health and what it needs.
@@ -453,12 +513,13 @@ async fn plugin_view(
         admin_page,
     });
     let mut chrome = admin_chrome(&session);
+    // The way back is the breadcrumb: the settings home, its plugins, then
+    // this one by its name, its instance ID on hover.
     chrome.crumbs = format!(
-        "<a href=\"/admin\">Admin</a><span aria-hidden=\"true\">/</span>\
-         <a href=\"/admin#plugins\">Plugins</a><span aria-hidden=\"true\">/</span>\
-         <span class=\"here\"><strong>{}</strong><code>{}</code></span>",
-        escape(line.name.as_deref().unwrap_or(&instance)),
-        escape(&instance)
+        "{}{}{}",
+        crate::html::crumb_link("/admin", "Settings"),
+        crate::html::crumb_link("/admin#plugins", "Plugins"),
+        crate::html::crumb_here(line.name.as_deref().unwrap_or(&instance), Some(&instance)),
     );
     Html(page_with(
         &format!("{} admin", line.name.as_deref().unwrap_or(&instance)),
@@ -605,18 +666,65 @@ async fn close_account(
     })
 }
 
+/// Each `name` a form sent, whole, in order: one per box ticked.
+fn every(pairs: &[(String, String)], name: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// A form's fields where each name is sent once; a repeated one keeps its
+/// last, as `Form<Fields>` would.
+fn once(pairs: &[(String, String)]) -> Fields {
+    pairs.iter().cloned().collect()
+}
+
+/// Logins typed in: one per line, and on a line several split by commas
+/// only where every part is a login (`issuer|subject`). A distinguished
+/// name's commas are its own, so `ldap:dc=firm|uid=ada,ou=people` stays one.
+fn typed_logins(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .flat_map(|line| {
+            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+            if parts.len() > 1 && parts.iter().all(|part| part.contains('|')) {
+                parts.into_iter().map(String::from).collect()
+            } else {
+                vec![line.to_string()]
+            }
+        })
+        .collect()
+}
+
+/// The people chosen (`login`, one per box, whole) and those typed in
+/// (`logins`), once each, in that order.
+fn logins_of(pairs: &[(String, String)]) -> Vec<String> {
+    let mut logins = every(pairs, "login");
+    for typed in every(pairs, "logins") {
+        logins.extend(typed_logins(&typed));
+    }
+    let mut seen = HashSet::new();
+    logins.retain(|login| seen.insert(login.clone()));
+    logins
+}
+
 async fn define_user_group(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Form(fields): Form<Fields>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let fields = once(&pairs);
     admin_form!(app, headers, fields, session, {
         let request = DefineUserGroupRequest {
             user_group: Some(UserGroup {
                 user_group_id: field(&fields, "user_group_id").into(),
                 name: field(&fields, "name").into(),
                 directory_groups: lines(&fields, "directory_groups"),
-                logins: list(&fields, "logins"),
+                logins: logins_of(&pairs),
             }),
         };
         command::<UserGroup>(
@@ -703,13 +811,51 @@ pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
         .collect()
 }
 
+/// An access group's entries as the form sends them: each plugin chosen
+/// (`plugin`, one per box) at its one level (`level.{plugin}`, read or
+/// write), and any typed as `plugin read|write` lines (`entries`, as the
+/// form was before). A plugin named twice is refused: an access group gives
+/// each plugin one level, and write includes read (the product owner,
+/// 2026-09-30).
+pub fn entries_of(pairs: &[(String, String)]) -> Result<Vec<AccessEntry>, String> {
+    let fields = once(pairs);
+    let mut entries = Vec::new();
+    for plugin in every(pairs, "plugin") {
+        let level = match field(&fields, &format!("level.{plugin}")) {
+            "read" => AccessLevel::Read,
+            "write" => AccessLevel::Write,
+            "" => return Err(format!("`{plugin}` has no level: choose read or write")),
+            other => return Err(format!("`{other}` is not read or write")),
+        };
+        entries.push(AccessEntry {
+            plugin_instance_id: plugin,
+            level: level as i32,
+        });
+    }
+    for typed in every(pairs, "entries") {
+        entries.extend(parse_entries(&typed)?);
+    }
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        if !seen.insert(entry.plugin_instance_id.clone()) {
+            return Err(format!(
+                "`{}` is named twice; an access group gives each plugin one level, and write \
+                 includes read",
+                entry.plugin_instance_id
+            ));
+        }
+    }
+    Ok(entries)
+}
+
 async fn define_access_group(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Form(fields): Form<Fields>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let fields = once(&pairs);
     admin_form!(app, headers, fields, session, {
-        match parse_entries(field(&fields, "entries")) {
+        match entries_of(&pairs) {
             Err(sentence) => Err(sentence),
             Ok(entries) => {
                 let request = DefineAccessGroupRequest {

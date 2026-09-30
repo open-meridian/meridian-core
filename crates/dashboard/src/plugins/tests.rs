@@ -863,8 +863,62 @@ async fn an_admins_home_links_every_plugin_launched() {
     // Both views, the list first; the tiles a switch away.
     assert!(home
         .body
-        .contains("<ul class=\"plugins list\" data-plugins>"));
+        .contains("<ul class=\"plugins list\" id=\"home-plugins\" data-plugins>"));
     assert!(home.body.contains("data-view=\"tiles\""));
+    assert!(
+        !home.body.contains("data-filter=\"home-plugins\""),
+        "one plugin needs no search box"
+    );
+}
+
+/// The product owner, 2026-09-30: lists are built for 100 and more. Past a
+/// screenful, home offers a search box over its plugins, which are in the
+/// order a person reads them, by name then instance, and says when a search
+/// matches none.
+#[tokio::test]
+async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        let launches = (0..150)
+            .map(|i| meridian_domain::v1::PluginLaunch {
+                // Instances in one order, names in another.
+                instance_id: format!("plugin-{i:03}"),
+                name: format!("Plugin {:03}", 149 - i),
+                version: "0.1.0".into(),
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
+            })
+            .collect();
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: vec![],
+                launches,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
+    assert_eq!(home.body.matches("<li data-instance=").count(), 150);
+    let order: Vec<&str> = home
+        .body
+        .split("<li data-instance=\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap())
+        .collect();
+    assert_eq!(order[0], "plugin-149", "Plugin 000 first");
+    assert_eq!(order[149], "plugin-000", "Plugin 149 last");
+    let search = home.body.split("<ul class=").next().unwrap();
+    assert!(
+        search.contains("data-filter=\"home-plugins\" hidden")
+            && search.contains("aria-label=\"Search your plugins\"")
+            && search.contains("data-filter-count=\"home-plugins\""),
+        "a search box, hidden until the script shows it"
+    );
+    assert!(home.body.contains(
+        "<p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>"
+    ));
 }
 
 #[tokio::test]
@@ -1179,15 +1233,20 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
     .await;
     assert_eq!(frame.status, StatusCode::OK, "{}", frame.body);
     let head = frame.body.split("</header>").next().unwrap();
-    // The plugin's name and the instance's, the way back, and the person.
+    // The plugin's name, its instance on hover, the way back, and the person.
     assert!(
-        head.contains("<strong>snaptrade</strong><code>snaptrade-1</code>"),
+        head.contains(
+            "<span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade</span>"
+        ),
         "{head}"
     );
-    assert!(head.contains("<a href=\"/\">Plugins</a>"));
+    assert!(!head.contains("<code>") && !head.contains("<strong>snaptrade"));
+    assert!(
+        head.contains("<a href=\"/\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>")
+    );
     assert!(head.contains("Ada") && head.contains("/sign-out"));
     assert!(
-        !head.contains("href=\"/admin\">Admin<"),
+        !head.contains("href=\"/admin\""),
         "Ada administers nothing here"
     );
     // The page below, entered through the dashboard with the theme on its

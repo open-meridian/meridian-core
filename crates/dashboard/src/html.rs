@@ -48,19 +48,18 @@ background:var(--card);border-bottom:1px solid var(--line)}\
 header.bar a.brand{display:inline-flex;align-items:center;gap:.55rem;color:var(--ink);font-weight:650;\
 letter-spacing:-.01em;text-decoration:none;flex-shrink:0}\
 header.bar a.brand svg{width:24px;height:24px;color:var(--accent)}\
-header.bar .where{font:600 .7rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint)}\
 header.bar .crumbs{display:flex;align-items:center;gap:.5rem;min-width:0;padding-left:.75rem;\
-border-left:1px solid var(--line);color:var(--ink-soft)}\
+border-left:1px solid var(--line);font:400 1em/1.55 var(--sans);color:var(--ink-soft)}\
 header.bar .crumbs a{color:var(--ink-soft);white-space:nowrap}header.bar .crumbs a:hover{color:var(--ink)}\
-header.bar .crumbs .here{display:flex;align-items:baseline;gap:.45rem;min-width:0;color:var(--ink)}\
-header.bar .crumbs .here strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
-header.bar .crumbs .here code{color:var(--ink-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+header.bar .crumbs .sep{color:var(--ink-faint)}\
+header.bar .crumbs .here{min-width:0;color:var(--ink);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
 header.bar .crumbs .own-window{color:var(--ink-faint);padding:0 .25rem}\
 header.bar .spacer{flex:1 1 auto}\
 header.bar .bar-link{display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .7rem;border-radius:var(--radius);\
 color:var(--ink-soft);font-weight:550;white-space:nowrap}\
 header.bar .bar-link:hover{background:var(--hover);color:var(--ink);text-decoration:none}\
 header.bar .bar-link.here{background:var(--accent-wash);color:var(--accent)}\
+header.bar .bar-link.side{padding:.4rem}header.bar .bar-link.side svg{display:block;width:20px;height:20px}\
 header.bar .person>summary{display:flex;align-items:center;gap:.5rem;padding:.3rem .5rem}\
 header.bar .person .avatar{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;\
 background:var(--accent-wash);color:var(--accent);font-weight:650;font-size:.8rem}\
@@ -70,8 +69,8 @@ header.bar .menu-pop a{color:var(--ink)}header.bar .menu-pop button{width:100%;m
 background:none;font-weight:400;justify-content:flex-start}header.bar .menu-pop button:hover{background:var(--hover)}\
 .menu-label{padding:.35rem .6rem .15rem;font:600 .68rem var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint)}\
 .menu-pop a[aria-current=true]::after{content:\"\\2713\";margin-left:auto;color:var(--accent)}\
-@media (max-width:40rem){header.bar{padding:0 .75rem;gap:.4rem}header.bar .person .person-name,header.bar a.brand span,\
-header.bar .where{display:none}header.bar .crumbs{padding-left:.5rem}header.bar .crumbs>a{display:none}\
+@media (max-width:40rem){header.bar{padding:0 .75rem;gap:.4rem}header.bar .person .person-name,header.bar a.brand span{display:none}\
+header.bar .crumbs{padding-left:.5rem}header.bar .crumbs>a,header.bar .crumbs>.sep{display:none}\
 header.bar .bar-link{padding:.35rem .5rem}}\
 main.sheet{width:calc(100% - 2rem);max-width:44rem;margin:2.5rem auto 4rem;padding:1.9rem 2.1rem;background:var(--card);\
 border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}\
@@ -103,6 +102,7 @@ cursor:pointer;margin:.5rem .5rem 0 0}\
 button:hover{background:var(--hover)}\
 button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-ink)}\
 button.primary:hover{filter:brightness(1.1)}\
+button.danger{background:var(--danger-wash);border-color:var(--danger);color:var(--danger)}\
 button:disabled{opacity:.5;cursor:not-allowed}\
 button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
 .hint{display:block;color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
@@ -126,6 +126,7 @@ form:not(.js) [data-next],form:not(.js) [data-back]{display:none}.off{display:no
 padding:.5rem 1.25rem;margin:0;font-size:.9rem}\
 .page-head{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap}\
 .page-head h1{margin:0}.page-head p{margin:.3rem 0 0}\
+.page-head .actions{display:flex;gap:.5rem;flex-wrap:wrap}.page-head .actions button{margin:0}\
 nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;padding-bottom:.75rem;\
 border-bottom:1px solid var(--line);font-size:.88rem}\
 nav.tabs a{padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
@@ -142,6 +143,26 @@ section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display
 table.list tbody tr:hover td{background:var(--line-soft)}\
 table.list .name{font-weight:550}table.list .hint{margin:.15rem 0 0}\
 input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins td:first-child{white-space:nowrap}\
+.filter-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:0 0 .9rem}.filter-row input.filter{margin:0}\
+.filter-count{color:var(--ink-faint);font-size:.84rem}\
+th button.sort{margin:0;padding:0;border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}\
+th[aria-sort=ascending] button.sort::after{content:\" \\2191\"}th[aria-sort=descending] button.sort::after{content:\" \\2193\"}\
+.more{color:var(--ink-faint)}\
+fieldset.checks.picker{max-height:none;overflow:visible;min-width:0}\
+.picker-tools{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.25rem 0 .5rem}\
+.picker-tools input[type=search]{flex:1 1 12rem;min-width:0}.picker-tools button{margin:0;padding:.3rem .7rem;font-size:.84rem}\
+.picker-status{margin:0 0 .35rem;color:var(--ink-faint);font-size:.84rem}\
+ul.picker-chosen{list-style:none;display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .5rem;padding:0}\
+ul.picker-chosen:empty{display:none}\
+ul.picker-chosen button{margin:0;padding:.1rem .55rem;border-radius:99px;font-size:.8rem;font-weight:500;\
+background:var(--accent-wash);border-color:var(--accent);color:var(--accent)}\
+ul.picker-chosen .more{align-self:center;font-size:.8rem}\
+.picker-options{max-height:16rem;overflow:auto;border-top:1px solid var(--line-soft);padding-top:.25rem}\
+.picker-option{display:flex;align-items:center;gap:.5rem;justify-content:space-between}\
+.picker-option label.check{margin:.2rem 0;min-width:0;flex:1 1 auto;overflow-wrap:anywhere}\
+.picker-option label.check .id{display:inline;margin-left:.35rem}\
+.picker-option select{width:auto;min-height:0;padding:.2rem .4rem;font-size:.84rem;flex-shrink:0}\
+.picker-none{margin:.5rem 0;color:var(--ink-soft);font-size:.88rem}\
 .id{display:block;font:.76rem var(--mono);color:var(--ink-faint);font-weight:400}\
 td.actions{text-align:right;white-space:nowrap}td.actions form{display:inline}\
 td.actions button,td.actions .button{margin:0 0 0 .35rem;padding:.3rem .7rem;font-size:.84rem}\
@@ -256,6 +277,55 @@ const MARK: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><rect x=\"1\
      5 4.5 5 7s-2 5-5 7M24 9c-3 2-5 4.5-5 7s2 5 5 7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" \
      stroke-linecap=\"round\"/></svg>";
 
+/// The side button's icons (the product owner, 2026-09-30): a gear for
+/// Settings and a house for the Dashboard, drawn here in the header's line
+/// and taking the colour they are set in. No icon font, nothing from outside.
+const GEAR: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M19 9.7 \
+     21.4 9.9 21.4 14.1 19 14.3 18.6 15.4 20.1 17.2 17.2 20.1 15.4 18.6 14.3 19 14.1 21.4 9.9 21.4 9.7 19 8.6 18.6 \
+     6.8 20.1 3.9 17.2 5.4 15.4 5 14.3 2.6 14.1 2.6 9.9 5 9.7 5.4 8.6 3.9 6.8 6.8 3.9 8.6 5.4 9.7 5 9.9 2.6 14.1 2.6 \
+     14.3 5 15.4 5.4 17.2 3.9 20.1 6.8 18.6 8.6Z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" \
+     stroke-linejoin=\"round\"/><circle cx=\"12\" cy=\"12\" r=\"3\" fill=\"none\" stroke=\"currentColor\" \
+     stroke-width=\"1.7\"/></svg>";
+
+const HOUSE: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M3.5 11.2 \
+     12 4l8.5 7.2M5.8 9.4V20h12.4V9.4M10 20v-5.5h4V20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" \
+     stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
+/// A deployment admin's way between the two sides: a gear to Settings from
+/// the dashboard, a house to the Dashboard from Settings. Named for a screen
+/// reader and a pointer alike, since it has no words.
+fn side_button(in_admin: bool) -> String {
+    let (href, name, icon) = if in_admin {
+        ("/", "Dashboard", HOUSE)
+    } else {
+        ("/admin", "Settings", GEAR)
+    };
+    format!(
+        "<a class=\"bar-link side\" href=\"{href}\" aria-label=\"{name}\" title=\"{name}\">{icon}</a>"
+    )
+}
+
+/// The breadcrumb's last crumb: where the person is, never a link to itself.
+/// `tooltip` is shown on hover (a plugin's instance ID beside its name).
+pub fn crumb_here(name: &str, tooltip: Option<&str>) -> String {
+    let title = tooltip
+        .map(|t| format!(" title=\"{}\"", escape(t)))
+        .unwrap_or_default();
+    format!(
+        "<span class=\"here\" aria-current=\"page\"{title}>{}</span>",
+        escape(name)
+    )
+}
+
+/// A crumb on the way back, and the separator after it.
+pub fn crumb_link(href: &str, name: &str) -> String {
+    format!(
+        "<a href=\"{}\">{}</a><span class=\"sep\" aria-hidden=\"true\">/</span>",
+        escape(href),
+        escape(name)
+    )
+}
+
 const DEVELOPMENT_BANNER: &str = "<p class=\"development\"><strong>Development \
      deployment.</strong> It runs plugin code as it is being written, which nobody \
      has reviewed. Nothing here is for real use.</p>";
@@ -291,7 +361,8 @@ const CHROME_SCRIPT: &str = r#"(function () {
     frame.contentWindow.postMessage(message, origin);
   }
   var frames = Array.prototype.slice.call(document.querySelectorAll("iframe[data-plugin-frame]"));
-  frames.forEach(function (frame) { frame.addEventListener("load", function () { tell(frame); }); });
+  // Each load is a new page: its header actions go until it offers its own.
+  frames.forEach(function (frame) { frame.addEventListener("load", function () { draw(frame, []); tell(frame); }); });
   // A seamless frame's height is its page's, by meridian:size (meridian-ui's
   // README, "The frame: seamless"): taken only from that frame's own window,
   // from exactly the origin its theme is told to, as a whole number of
@@ -308,6 +379,55 @@ const CHROME_SCRIPT: &str = r#"(function () {
       if (!Number.isInteger(data.height) || data.height < 0) return;
       frame.style.height = Math.min(data.height, TALLEST) + "px";
       frame.setAttribute("data-sized", "");
+    });
+  });
+  // A seamless frame's header actions, by meridian:actions (meridian-ui's
+  // README, "The frame: seamless"): the page's own buttons, drawn in the
+  // header's area its frame names (data-actions), under the size's guards and
+  // only in the kit's shape, else not at all. A label is text, never markup;
+  // a click is told back to the page, at the plugin's origin alone, and the
+  // page presses its own button, so its form posts with its own token.
+  var MOST_ACTIONS = 4;
+  var LONGEST_LABEL = 40;
+  var ACTION_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
+  function offered(list) {
+    if (!Array.isArray(list) || list.length > MOST_ACTIONS) return null;
+    var ids = [];
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i];
+      if (!a || typeof a !== "object" || Array.isArray(a)) return null;
+      if (typeof a.id !== "string" || !ACTION_ID.test(a.id) || ids.indexOf(a.id) !== -1) return null;
+      if (typeof a.label !== "string" || !a.label.trim() || a.label.length > LONGEST_LABEL) return null;
+      if (a.tone !== undefined && a.tone !== "primary" && a.tone !== "danger") return null;
+      if (a.disabled !== undefined && typeof a.disabled !== "boolean") return null;
+      ids.push(a.id);
+    }
+    return list;
+  }
+  function draw(frame, list) {
+    var area = frame.hasAttribute("data-actions") && document.getElementById(frame.getAttribute("data-actions"));
+    if (!area) return;
+    area.replaceChildren.apply(area, list.map(function (a) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.textContent = a.label;
+      if (a.tone) button.className = a.tone;
+      button.disabled = a.disabled === true;
+      button.addEventListener("click", function () {
+        if (!frame.contentWindow) return;
+        frame.contentWindow.postMessage({ type: "meridian:action", version: 1, id: a.id }, frame.dataset.origin);
+      });
+      return button;
+    }));
+  }
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    frames.forEach(function (frame) {
+      if (!frame.hasAttribute("data-seamless") || !frame.contentWindow) return;
+      if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;
+      if (!data || data.type !== "meridian:actions" || data.version !== 1) return;
+      var list = offered(data.actions);
+      if (list) draw(frame, list);
     });
   });
   function mark() {
@@ -330,18 +450,71 @@ const CHROME_SCRIPT: &str = r#"(function () {
     frames.forEach(tell);
     var menu = chosen.closest("details"); if (menu) menu.open = false;
   });
-  // A search box names the table it narrows (data-filter="id"): rows whose
-  // text holds every word typed stay, the rest hide. Without script, every
-  // row shows.
-  document.querySelectorAll("input[data-filter]").forEach(function (box) {
-    var table = document.getElementById(box.getAttribute("data-filter"));
-    if (!table) return;
-    box.hidden = false;
-    box.addEventListener("input", function () {
+  // A search box names the list it narrows (data-filter="id"): a table's
+  // rows, or a list's items. Those whose text holds every word typed stay,
+  // the rest hide. Each item's text is read once, and a keystroke only flips
+  // the items whose state changes, at most once a frame, so a few thousand
+  // stay quick. data-filter-none="id" is said when nothing matches, and
+  // data-filter-count="id" how many are shown. Without script, every item
+  // shows and the box stays hidden.
+  function each(selector, act) { Array.prototype.forEach.call(document.querySelectorAll(selector), act); }
+  each("input[data-filter]", function (box) {
+    var id = box.getAttribute("data-filter");
+    var list = document.getElementById(id);
+    if (!list) return;
+    var items = Array.prototype.slice.call(list.tagName === "TABLE" ? list.querySelectorAll("tbody tr") : list.children);
+    var texts = items.map(function (item) { return item.textContent.toLowerCase(); });
+    var none = document.querySelector("[data-filter-none=\"" + id + "\"]");
+    var count = document.querySelector("[data-filter-count=\"" + id + "\"]");
+    var pending = false;
+    function narrow() {
+      pending = false;
       var words = box.value.toLowerCase().split(/\s+/).filter(Boolean);
-      table.querySelectorAll("tbody tr").forEach(function (row) {
-        var text = row.textContent.toLowerCase();
-        row.hidden = !words.every(function (w) { return text.indexOf(w) !== -1; });
+      var shown = 0;
+      for (var i = 0; i < items.length; i++) {
+        var hide = !words.every(function (w) { return texts[i].indexOf(w) !== -1; });
+        if (items[i].hidden !== hide) items[i].hidden = hide;
+        if (!hide) shown++;
+      }
+      if (none) none.hidden = shown !== 0;
+      if (count) count.textContent = words.length ? shown + " of " + items.length + " shown" : items.length + " in all";
+    }
+    box.hidden = false;
+    if (count) { count.hidden = false; narrow(); }
+    box.addEventListener("input", function () {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(narrow);
+    });
+  });
+  // A table marked data-sortable sorts by a column when its heading is
+  // pressed, and back the other way when pressed again: text in the page's
+  // language, numbers as numbers. Without script, the order is the server's.
+  each("table[data-sortable]", function (table) {
+    var body = table.tBodies[0];
+    if (!body) return;
+    var collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+    Array.prototype.forEach.call(table.tHead ? table.tHead.rows[0].cells : [], function (th, column) {
+      if (!th.textContent.trim()) return;
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "sort";
+      button.textContent = th.textContent;
+      th.textContent = "";
+      th.appendChild(button);
+      button.addEventListener("click", function () {
+        var up = th.getAttribute("aria-sort") !== "ascending";
+        Array.prototype.forEach.call(table.tHead.rows[0].cells, function (other) { other.removeAttribute("aria-sort"); });
+        th.setAttribute("aria-sort", up ? "ascending" : "descending");
+        var rows = Array.prototype.slice.call(body.rows);
+        rows.sort(function (a, b) {
+          var x = a.cells[column] ? a.cells[column].textContent.trim() : "";
+          var y = b.cells[column] ? b.cells[column].textContent.trim() : "";
+          return up ? collator.compare(x, y) : collator.compare(y, x);
+        });
+        var sorted = document.createDocumentFragment();
+        rows.forEach(function (row) { sorted.appendChild(row); });
+        body.appendChild(sorted);
       });
     });
   });
@@ -380,28 +553,25 @@ pub fn page_with(title: &str, body: &str, chrome: &Chrome) -> String {
 }
 
 fn header(chrome: &Chrome) -> String {
-    let crumbs = if chrome.crumbs.is_empty() {
-        "<span class=\"where\">Dashboard</span>".to_string()
-    } else {
-        format!(
-            "<nav class=\"crumbs\" aria-label=\"Where you are\">{}</nav>",
-            chrome.crumbs
-        )
-    };
+    // Home is the Dashboard: a crumb as any other page's last one.
+    let crumbs = format!(
+        "<nav class=\"crumbs\" aria-label=\"Where you are\">{}</nav>",
+        if chrome.crumbs.is_empty() {
+            crumb_here("Dashboard", None)
+        } else {
+            chrome.crumbs.clone()
+        }
+    );
     let right = match &chrome.viewer {
         None => String::new(),
         Some(viewer) => {
             // An admin moves between the two sides: one button to the side
-            // they are not on, "Admin" from the dashboard and "Dashboard"
-            // from the admin portal, each of which has its Plugins (the
-            // product owner, 2026-09-29). A person with no admin has one
-            // side, and no button.
+            // they are not on, Settings from the dashboard and the Dashboard
+            // from Settings, each of which has its Plugins (the product
+            // owner, 2026-09-29), drawn as a gear and a house (2026-09-30).
+            // A person with no admin has one side, and no button.
             let admin = if viewer.admin {
-                if chrome.in_admin {
-                    "<a class=\"bar-link side\" href=\"/\">Dashboard</a>".to_string()
-                } else {
-                    "<a class=\"bar-link side\" href=\"/admin\">Admin</a>".to_string()
-                }
+                side_button(chrome.in_admin)
             } else {
                 String::new()
             };
@@ -561,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_names_the_person_signs_them_out_and_shows_an_admin_the_portal() {
+    fn the_header_names_the_person_signs_them_out_and_shows_an_admin_the_other_side() {
         let viewer = |admin| Viewer {
             display_name: "Ada <Park>",
             form_token: "tok-1",
@@ -578,16 +748,24 @@ mod tests {
         let head = admin.split("</header>").next().unwrap();
         assert!(head.contains("Ada &lt;Park&gt;"), "{head}");
         assert!(head.contains("action=\"/sign-out\"") && head.contains("value=\"tok-1\""));
+        // From the dashboard, a gear to Settings: named, and with a tooltip,
+        // since it has no words.
+        let side = head
+            .split("<a class=\"bar-link side\" ")
+            .nth(1)
+            .and_then(|rest| rest.split("</a>").next())
+            .expect("the side button");
         assert!(
-            head.contains("<a class=\"bar-link side\" href=\"/admin\">Admin</a>"),
-            "from the plugins, the way to the admin portal: {head}"
+            side.starts_with("href=\"/admin\" aria-label=\"Settings\" title=\"Settings\">"),
+            "{side}"
         );
+        assert!(side.contains(GEAR) && !side.contains(HOUSE), "{side}");
         assert!(
-            !head.contains(">Dashboard</a>"),
+            !head.contains("aria-label=\"Dashboard\""),
             "and not the side they are on"
         );
         let in_admin = page_with(
-            "Admin",
+            "Settings",
             "",
             &Chrome {
                 viewer: Some(viewer(true)),
@@ -597,9 +775,10 @@ mod tests {
         );
         let head = in_admin.split("</header>").next().unwrap();
         assert!(
-            head.contains("<a class=\"bar-link side\" href=\"/\">Dashboard</a>")
-                && !head.contains(">Admin</a>"),
-            "in the portal, the way back to the plugins, and only that: {head}"
+            head.contains(&format!(
+                "<a class=\"bar-link side\" href=\"/\" aria-label=\"Dashboard\" title=\"Dashboard\">{HOUSE}</a>"
+            )) && !head.contains("aria-label=\"Settings\""),
+            "in Settings, a house back to the Dashboard, and only that: {head}"
         );
 
         let person = page_with(
@@ -610,11 +789,169 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!person.contains(">Admin</a>") && !person.contains(">Dashboard</a>"));
+        assert!(
+            !person.contains("bar-link side"),
+            "a person with no admin has one side"
+        );
+        assert!(!person.contains("aria-label=\"Settings\"") && !person.contains("href=\"/admin\""));
         assert!(
             !page("Sign in", "").contains("/sign-out"),
             "nobody to sign out"
         );
+    }
+
+    #[test]
+    fn the_side_buttons_icons_are_drawn_here_in_the_colour_they_are_set_in() {
+        for icon in [GEAR, HOUSE] {
+            assert!(icon.starts_with(
+                "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\">"
+            ));
+            assert!(icon.ends_with("</svg>"));
+            assert!(icon.contains("stroke=\"currentColor\""), "{icon}");
+            // Nothing from elsewhere: no reference, no font, no other colour.
+            for outside in ["href", "url(", "xlink", "<use", "<image", "#", "rgb"] {
+                assert!(!icon.contains(outside), "{outside} in {icon}");
+            }
+        }
+        assert!(
+            STYLE.contains("header.bar .bar-link.side svg{display:block;width:20px;height:20px}")
+        );
+    }
+
+    /// Every crumb in the header, on every kind of page, is drawn one way: the
+    /// body's font at one size, links soft, the current page ink at one
+    /// weight and never a link to itself, the separators faint.
+    #[test]
+    fn every_crumb_is_one_style_and_the_current_one_is_never_a_link() {
+        let crumbs = |chrome: &Chrome| -> String {
+            let head = header(chrome);
+            head.split("<nav class=\"crumbs\" aria-label=\"Where you are\">")
+                .nth(1)
+                .and_then(|rest| rest.split("</nav>").next())
+                .expect("the crumbs")
+                .to_string()
+        };
+        // Home: the Dashboard, as any page's last crumb.
+        let home = crumbs(&Chrome::default());
+        assert_eq!(
+            home,
+            "<span class=\"here\" aria-current=\"page\">Dashboard</span>"
+        );
+        assert!(!STYLE.contains(".where"), "no crumb of a style of its own");
+        // Deeper: links back, then where the person is, named, its ID on hover.
+        let deep = crumbs(&Chrome {
+            crumbs: format!(
+                "{}{}{}",
+                crumb_link("/admin", "Settings"),
+                crumb_link("/admin#plugins", "Plugins"),
+                crumb_here("Snap <Trade>", Some("snaptrade-1"))
+            ),
+            ..Default::default()
+        });
+        assert_eq!(
+            deep,
+            "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+             <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+             <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">Snap &lt;Trade&gt;</span>"
+        );
+        for markup in ["<strong", "<code", "class=\"where\""] {
+            assert!(!deep.contains(markup) && !home.contains(markup), "{markup}");
+        }
+        for rule in [
+            "header.bar .crumbs{display:flex;align-items:center;gap:.5rem;min-width:0;padding-left:.75rem;\
+             border-left:1px solid var(--line);font:400 1em/1.55 var(--sans);color:var(--ink-soft)}",
+            "header.bar .crumbs a{color:var(--ink-soft);white-space:nowrap}",
+            "header.bar .crumbs .sep{color:var(--ink-faint)}",
+            "header.bar .crumbs .here{min-width:0;color:var(--ink);font-weight:500;",
+        ] {
+            assert!(STYLE.contains(rule), "{rule}");
+        }
+        // On a phone, the leading crumbs go and the current one stays.
+        assert!(STYLE.contains(
+            "header.bar .crumbs{padding-left:.5rem}header.bar .crumbs>a,header.bar .crumbs>.sep{display:none}"
+        ));
+    }
+
+    /// The header-actions listener, as it is written (as the size's is held
+    /// above): the same guards as the size's, then the kit's shape, before
+    /// anything is drawn; drawn as text; a click told to the plugin alone.
+    #[test]
+    fn a_seamless_frames_header_actions_are_taken_only_from_its_own_page_in_the_kits_shape() {
+        let listener = CHROME_SCRIPT
+            .split("window.addEventListener(\"message\"")
+            .nth(2)
+            .expect("the actions listener")
+            .split("\n  });\n")
+            .next()
+            .unwrap();
+        let guards = [
+            "if (!frame.hasAttribute(\"data-seamless\") || !frame.contentWindow) return;",
+            "if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;",
+            "if (!data || data.type !== \"meridian:actions\" || data.version !== 1) return;",
+            "var list = offered(data.actions);",
+            "if (list) draw(frame, list);",
+        ];
+        let mut at = Vec::new();
+        for guard in guards {
+            at.push(
+                listener
+                    .find(guard)
+                    .unwrap_or_else(|| panic!("{guard}\nnot in:{listener}")),
+            );
+        }
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "every check before anything is drawn"
+        );
+
+        // The shape: at most a few, each id the kit's and once, a short label,
+        // a tone it knows and a boolean; anything else refuses the message.
+        let shape = CHROME_SCRIPT
+            .split("function offered(list) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the shape");
+        for check in [
+            "if (!Array.isArray(list) || list.length > MOST_ACTIONS) return null;",
+            "if (!a || typeof a !== \"object\" || Array.isArray(a)) return null;",
+            "if (typeof a.id !== \"string\" || !ACTION_ID.test(a.id) || ids.indexOf(a.id) !== -1) return null;",
+            "if (typeof a.label !== \"string\" || !a.label.trim() || a.label.length > LONGEST_LABEL) return null;",
+            "if (a.tone !== undefined && a.tone !== \"primary\" && a.tone !== \"danger\") return null;",
+            "if (a.disabled !== undefined && typeof a.disabled !== \"boolean\") return null;",
+        ] {
+            assert!(shape.contains(check), "{check}\nnot in:{shape}");
+        }
+        assert!(CHROME_SCRIPT.contains("var MOST_ACTIONS = 4;"));
+        assert!(CHROME_SCRIPT.contains("var LONGEST_LABEL = 40;"));
+        assert!(CHROME_SCRIPT.contains("var ACTION_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;"));
+
+        let draw = CHROME_SCRIPT
+            .split("function draw(frame, list) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the drawing");
+        assert!(
+            draw.contains("button.textContent = a.label;"),
+            "a label is text"
+        );
+        assert!(
+            !draw.contains("innerHTML") && !CHROME_SCRIPT.contains("innerHTML"),
+            "never markup"
+        );
+        assert!(
+            draw.contains("if (a.tone) button.className = a.tone;"),
+            "a tone already checked"
+        );
+        assert!(draw.contains(
+            "frame.contentWindow.postMessage({ type: \"meridian:action\", version: 1, id: a.id }, frame.dataset.origin);"
+        ), "the click, to the plugin's origin alone");
+        assert!(!CHROME_SCRIPT.contains("\"*\""), "never to any origin");
+        // A new page in the frame is offered nothing until it says.
+        assert!(CHROME_SCRIPT.contains(
+            "frame.addEventListener(\"load\", function () { draw(frame, []); tell(frame); });"
+        ));
+        // The tones the header can draw.
+        assert!(STYLE.contains("button.danger{background:var(--danger-wash);border-color:var(--danger);color:var(--danger)}"));
     }
 
     #[test]

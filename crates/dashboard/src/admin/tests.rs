@@ -85,6 +85,16 @@ fn harness_serving(
     refuse_with: Option<&'static str>,
     plugins: Option<Arc<crate::plugins::Plugins>>,
 ) -> Harness {
+    harness_holding(records, refuse_with, plugins, None)
+}
+
+/// The same, holding local accounts of its own.
+fn harness_holding(
+    records: AccessRecords,
+    refuse_with: Option<&'static str>,
+    plugins: Option<Arc<crate::plugins::Plugins>>,
+    accounts: Option<Arc<dyn crate::accounts::Accounts>>,
+) -> Harness {
     let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
     let seen: Seen = Arc::default();
     let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
@@ -139,7 +149,7 @@ fn harness_serving(
         bus,
         oidc: None,
         directory: None,
-        accounts: None,
+        accounts,
         sign_in_failures: Default::default(),
         secure_cookies: true,
         plugins,
@@ -466,22 +476,53 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
         "an account with none shows none: {income}"
     );
 
-    // Its edit dialog holds all four, bounded as the conductor bounds them.
-    let dialog = body.split("<dialog id=\"edit-ACC-1\">").nth(1).unwrap();
+    // One dialog for a new account and for each edit, holding all four,
+    // bounded as the conductor bounds them; an Edit fills it with what the
+    // account holds.
+    assert_eq!(body.matches("<dialog id=\"account\">").count(), 1);
+    let dialog = body.split("<dialog id=\"account\">").nth(1).unwrap();
     let dialog = dialog.split("</dialog>").next().unwrap();
     for field in [
-        "name=\"custodian\" value=\"Fidelity\" maxlength=\"200\"",
-        "name=\"account_type\" value=\"Roth IRA\" maxlength=\"200\"",
-        "name=\"owner\" value=\"Fund &lt;I&gt;\" maxlength=\"200\"",
-        "name=\"note\" rows=\"3\" maxlength=\"2000\">Rollover, 2026.</textarea>",
+        "name=\"account_id\" value=\"\" data-record-id",
+        "name=\"custodian\" value=\"\" maxlength=\"200\"",
+        "name=\"account_type\" value=\"\" maxlength=\"200\"",
+        "name=\"owner\" value=\"\" maxlength=\"200\"",
+        "name=\"note\" rows=\"3\" maxlength=\"2000\"></textarea>",
     ] {
         assert!(dialog.contains(field), "{field} is not in {dialog}");
     }
-    let new = body.split("<dialog id=\"new-account\">").nth(1).unwrap();
-    assert!(
-        new.contains("name=\"custodian\" value=\"\"") && new.contains("name=\"note\""),
-        "and so does a new account's"
-    );
+    let fill = fill_of(&body, "ACC-1");
+    assert_eq!(fill["fields"]["account_id"], "ACC-1");
+    assert_eq!(fill["fields"]["custodian"], "Fidelity");
+    assert_eq!(fill["fields"]["account_type"], "Roth IRA");
+    assert_eq!(fill["fields"]["owner"], "Fund <I>");
+    assert_eq!(fill["fields"]["note"], "Rollover, 2026.");
+    assert!(body.contains("data-dialog-open=\"account\" data-title=\"Edit Growth\""));
+}
+
+/// What the Edit on the row `id` fills its dialog with.
+fn fill_of(body: &str, id: &str) -> serde_json::Value {
+    let row = body
+        .split(&format!("<tr data-id=\"{id}\""))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no row {id}"))
+        .split("</tr>")
+        .next()
+        .unwrap();
+    let fill = row
+        .split("data-fill=\"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no Edit on {row}"))
+        .split('"')
+        .next()
+        .unwrap();
+    let json = fill
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    serde_json::from_str(&json).unwrap()
 }
 
 #[tokio::test]
@@ -1189,6 +1230,68 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
     );
 }
 
+/// The product owner, 2026-09-30: the view's header holds no buttons of its
+/// own ("All plugins" and "Open its page" are gone); the way back is the
+/// breadcrumb, Settings then Plugins, and a framed page's own actions are
+/// drawn in the header, in the area its frame names.
+#[tokio::test]
+async fn the_views_header_is_the_breadcrumb_and_a_framed_pages_own_actions() {
+    let h = framing(with_settings());
+    h.app.health.hear(
+        "snaptrade-1",
+        declaring(&[("/admin/connections", "Connections")]),
+    );
+    let (_, overview) = send(&h, get(&h, VIEW, true)).await;
+    let (_, framed) = send(&h, get(&h, &format!("{VIEW}?tab=connections"), true)).await;
+    for page in [&overview, &framed] {
+        for gone in [
+            "All plugins",
+            "Open its page",
+            "href=\"/plugins/snaptrade-1\"",
+        ] {
+            assert!(!page.contains(gone), "{gone}");
+        }
+        let head = page.split("</header>").next().unwrap();
+        let crumbs = head
+            .split("<nav class=\"crumbs\" aria-label=\"Where you are\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</nav>").next())
+            .expect("the crumbs");
+        assert_eq!(
+            crumbs,
+            "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+             <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+             <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade-1</span>",
+            "the settings home, the plugins list, then this one by name, its ID on hover"
+        );
+        assert!(!head.contains(">Admin<"));
+    }
+    // Only a framed page has actions to draw, and its frame names the area.
+    assert!(!overview.contains("id=\"page-actions\""));
+    let page_head = framed
+        .split("<div class=\"plugin-view\"><div class=\"page-head\">")
+        .nth(1)
+        .and_then(|rest| rest.split("<nav").next())
+        .expect("the view's head");
+    assert!(
+        page_head.ends_with(
+            "<div class=\"actions\" id=\"page-actions\" role=\"group\" aria-label=\"Connections actions\"></div></div>"
+        ),
+        "empty until the page offers its own: {page_head}"
+    );
+    let frame = framed
+        .split("<iframe")
+        .nth(1)
+        .unwrap()
+        .split('>')
+        .next()
+        .unwrap();
+    assert!(
+        frame.contains(" data-seamless ") && frame.contains("data-actions=\"page-actions\""),
+        "{frame}"
+    );
+}
+
 #[tokio::test]
 async fn a_page_that_is_not_one_on_the_plugins_host_is_no_tab() {
     let h = framing(with_settings());
@@ -1412,4 +1515,450 @@ async fn the_plugins_tab_names_the_instance_apart_and_offers_a_search() {
         table(&body, "plugins").contains("<td><code>snaptrade-1</code></td>"),
         "the instance in its own cell"
     );
+}
+
+// ── Built for a hundred and more (the product owner, 2026-09-30) ────────────
+
+const ACCOUNTS: usize = 500;
+const PEOPLE: usize = 200;
+const GROUPS: usize = 30;
+
+/// A deployment of a realistic size: 500 accounts (every tenth closed), 200
+/// people across 30 user groups, 30 account groups of 50 accounts, and 30
+/// access groups, each over four of 33 plugins.
+fn a_firm() -> AccessRecords {
+    let mut records = admin_records();
+    records.accounts = (0..ACCOUNTS)
+        .map(|i| AccountRecord {
+            account_id: format!("ACC-{i:04}"),
+            name: format!("Account {:04}", ACCOUNTS - 1 - i),
+            custodian: if i % 2 == 0 { "Fidelity" } else { "Schwab" }.into(),
+            state: if i % 10 == 0 {
+                AccountState::Closed
+            } else {
+                AccountState::Open
+            } as i32,
+            created_at_ns: T0,
+            ..Default::default()
+        })
+        .collect();
+    // People from a directory, and one whose subject is a distinguished name.
+    let login = |i: usize| match i {
+        0 => "ldap:dc=firm,dc=internal|uid=zed,ou=people,dc=firm,dc=internal".to_string(),
+        _ => format!("https://idp.example.org|user-{:03}", PEOPLE - i),
+    };
+    records.user_groups.extend((0..GROUPS).map(|g| UserGroup {
+        user_group_id: format!("UG-{:02}", g + 2),
+        name: format!("Desk {g:02}"),
+        directory_groups: vec![format!("cn=desk-{g},ou=groups,dc=firm")],
+        logins: (0..PEOPLE).filter(|i| i % GROUPS == g).map(login).collect(),
+    }));
+    records.account_groups = (0..GROUPS)
+        .map(|g| meridian_domain::v1::AccountGroup {
+            account_group_id: format!("AcG-{g:02}"),
+            name: format!("Book {g:02}"),
+            account_ids: (0..50).map(|k| format!("ACC-{:04}", g * 10 + k)).collect(),
+        })
+        .collect();
+    records.access_groups = (0..GROUPS)
+        .map(|g| meridian_domain::v1::AccessGroup {
+            access_group_id: format!("AG-{g:02}"),
+            name: format!("Access {g:02}"),
+            entries: (0..4)
+                .map(|k| meridian_domain::v1::AccessEntry {
+                    plugin_instance_id: format!("plugin-{:02}", (g + k) % 40),
+                    level: if k == 0 {
+                        AccessLevel::Write
+                    } else {
+                        AccessLevel::Read
+                    } as i32,
+                })
+                .collect(),
+            built_in: false,
+        })
+        .collect();
+    records
+}
+
+#[tokio::test]
+async fn every_option_is_in_the_page_once_however_many_records_there_are() {
+    let h = harness(a_firm(), None);
+    let (status, body) = send(&h, get(&h, "/admin", true)).await;
+    assert_eq!(status, StatusCode::OK);
+    // One dialog per kind of record, whatever the number of records.
+    for kind in ["user-group", "account-group", "access-group", "account"] {
+        assert_eq!(
+            body.matches(&format!("<dialog id=\"{kind}\">")).count(),
+            1,
+            "{kind}"
+        );
+    }
+    assert!(!body.contains("<dialog id=\"edit-"), "no dialog per record");
+    // So each option is there once: every account, every person named, every plugin.
+    assert_eq!(body.matches("name=\"account_ids\"").count(), ACCOUNTS);
+    // Admins' Ada and the 200.
+    assert_eq!(body.matches("name=\"login\"").count(), PEOPLE + 1);
+    assert_eq!(body.matches("name=\"plugin\"").count(), 33);
+    assert_eq!(body.matches("<select name=\"level.").count(), 33);
+    assert!(
+        body.len() < 1 << 20,
+        "the page is {} bytes for {ACCOUNTS} accounts and {PEOPLE} people",
+        body.len()
+    );
+    // A closed account is an option only while a group holds it.
+    let closed = body
+        .split("value=\"ACC-0010\"")
+        .next()
+        .unwrap()
+        .rsplit("<div class=\"picker-option\"")
+        .next()
+        .unwrap();
+    assert!(
+        closed.starts_with(" data-also=\"Fidelity  \" data-only-when-chosen>"),
+        "{closed}"
+    );
+    // Each Edit carries its record.
+    let fill = fill_of(&body, "AcG-03");
+    assert_eq!(fill["fields"]["name"], "Book 03");
+    assert_eq!(fill["checked"]["account_ids"].as_array().unwrap().len(), 50);
+}
+
+#[tokio::test]
+async fn people_are_listed_by_user_id_then_login_id_and_found_by_either_or_their_name() {
+    let accounts = crate::accounts::InMemory::default();
+    for (name, display) in [("mo", "Mo Local"), ("ada", "")] {
+        crate::accounts::Accounts::put(
+            &accounts,
+            &crate::accounts::LocalAccount {
+                name: name.into(),
+                display_name: display.into(),
+                password_hash: "x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let h = harness_holding(a_firm(), None, None, Some(Arc::new(accounts)));
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    let picker = body
+        .split("id=\"user-group-people\"")
+        .nth(1)
+        .unwrap()
+        .split("</fieldset>")
+        .next()
+        .unwrap();
+    let logins: Vec<&str> = picker
+        .split("name=\"login\" value=\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap())
+        .collect();
+    assert_eq!(
+        logins.len(),
+        PEOPLE + 3,
+        "the groups' people, and two local accounts"
+    );
+    // By user ID: 8812 (Ada's directory login), then ada (local), mo, the
+    // directory's user-001.. and zed, the user ID of a distinguished name.
+    assert_eq!(logins[0], ADA);
+    assert_eq!(logins[1], "local|ada");
+    assert_eq!(logins[2], "local|mo");
+    assert_eq!(logins[3], "https://idp.example.org|user-001");
+    assert_eq!(
+        logins.last().unwrap(),
+        &"ldap:dc=firm,dc=internal|uid=zed,ou=people,dc=firm,dc=internal"
+    );
+    // Each shows its user ID and name, its login small beside, all searched.
+    assert!(picker.contains(
+        "value=\"local|mo\"> <span class=\"option-label\">mo (Mo Local)</span> \
+         <span class=\"id\">local|mo</span>"
+    ));
+    assert!(picker.contains(
+        "<span class=\"option-label\">zed</span> \
+         <span class=\"id\">ldap:dc=firm,dc=internal|uid=zed,ou=people,dc=firm,dc=internal</span>"
+    ));
+    // A group's row names its people by user ID, the first few, and how
+    // many more, the rest there for the search.
+    let row = body
+        .split("<tr data-id=\"UG-02\"")
+        .nth(1)
+        .unwrap()
+        .split("</tr>")
+        .next()
+        .unwrap();
+    assert!(
+        row.contains("<td>user-020, user-050, user-080<span class=\"more\"> and 4 more</span>"),
+        "{row}"
+    );
+    assert!(row.contains("https://idp.example.org|user-170") && row.contains("uid=zed"));
+}
+
+#[tokio::test]
+async fn every_list_on_the_settings_page_is_searchable_sortable_and_says_when_none_match() {
+    let h = harness(a_firm(), None);
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    for (id, noun) in [
+        ("permissions-table", "permissions"),
+        ("user-groups-table", "user groups"),
+        ("account-groups-table", "account groups"),
+        ("access-groups-table", "access groups"),
+        ("accounts-table", "accounts"),
+    ] {
+        assert!(
+            body.contains(&format!("data-filter=\"{id}\" hidden")),
+            "{id}"
+        );
+        assert!(
+            body.contains(&format!("aria-label=\"Search {noun}\"")),
+            "{id}"
+        );
+        assert!(
+            body.contains(&format!("data-filter-count=\"{id}\"")),
+            "{id}"
+        );
+        assert!(
+            body.contains(&format!("id=\"{id}\" data-sortable>")),
+            "{id}"
+        );
+        assert!(
+            body.contains(&format!(
+                "<p class=\"empty\" data-filter-none=\"{id}\" hidden>No {noun} match that search.</p>"
+            )),
+            "{id}"
+        );
+    }
+    // In the order a person reads them: accounts by name.
+    let accounts = table(&body, "accounts");
+    let first = accounts.split("<tr data-id=\"").nth(1).unwrap();
+    assert!(
+        first.starts_with("ACC-0499\""),
+        "Account 0000 first: {}",
+        &first[..40]
+    );
+}
+
+#[test]
+fn logins_are_taken_whole_when_chosen_and_split_only_between_logins_when_typed() {
+    let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    };
+    let dn = "ldap:dc=firm,dc=internal|uid=ada,ou=people,dc=firm,dc=internal";
+    assert_eq!(
+        logins_of(&pairs(&[
+            ("login", dn),
+            ("login", "local|bob"),
+            (
+                "logins",
+                "local|cy, local|di\nldap:dc=firm|uid=ed,ou=people\n\nlocal|bob"
+            ),
+        ])),
+        [
+            dn,
+            "local|bob",
+            "local|cy",
+            "local|di",
+            "ldap:dc=firm|uid=ed,ou=people",
+        ]
+    );
+    // As the form before the picker sent them.
+    assert_eq!(
+        logins_of(&pairs(&[("logins", "local|nobody-e2e")])),
+        ["local|nobody-e2e"]
+    );
+}
+
+#[test]
+fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
+    let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    };
+    let entries = entries_of(&pairs(&[
+        ("plugin", "oms-1"),
+        ("level.oms-1", "write"),
+        ("plugin", "snaptrade-1"),
+        ("level.snaptrade-1", "read"),
+        ("level.unchosen-1", "write"),
+    ]))
+    .unwrap();
+    let got: Vec<(&str, i32)> = entries
+        .iter()
+        .map(|e| (e.plugin_instance_id.as_str(), e.level))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("oms-1", AccessLevel::Write as i32),
+            ("snaptrade-1", AccessLevel::Read as i32)
+        ],
+        "a level beside a plugin not chosen gives nothing"
+    );
+    // The lines the form took before, still.
+    assert_eq!(
+        entries_of(&pairs(&[("entries", "oms-1 read")]))
+            .unwrap()
+            .len(),
+        1
+    );
+    // One level each: never twice, however it is sent.
+    for twice in [
+        pairs(&[
+            ("plugin", "oms-1"),
+            ("level.oms-1", "read"),
+            ("entries", "oms-1 write"),
+        ]),
+        pairs(&[("entries", "oms-1 read\noms-1 write")]),
+        pairs(&[
+            ("plugin", "oms-1"),
+            ("plugin", "oms-1"),
+            ("level.oms-1", "read"),
+        ]),
+    ] {
+        let refused = entries_of(&twice).unwrap_err();
+        assert!(
+            refused.contains("named twice") && refused.contains("write includes read"),
+            "{refused}"
+        );
+    }
+    assert!(entries_of(&pairs(&[("plugin", "oms-1")]))
+        .unwrap_err()
+        .contains("no level"));
+    assert!(
+        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "admin")]))
+            .unwrap_err()
+            .contains("not read or write")
+    );
+}
+
+/// The define commands the page sends, as the fake conductor received them.
+fn conductor_defining(h: &Harness, topic: &'static str) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    let kept: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let keeping = Arc::clone(&kept);
+    h.app.bus.serve(topic, move |envelope| {
+        keeping.lock().unwrap().push(envelope.payload.clone());
+        Ok(("".into(), Vec::new()))
+    });
+    kept
+}
+
+#[tokio::test]
+async fn the_access_group_form_sends_one_level_per_plugin_and_refuses_two() {
+    let h = harness(admin_records(), None);
+    let sent = conductor_defining(&h, "platform.config.command.define-access-group");
+    let form = format!(
+        "form_token={}&access_group_id=&name=Traders&plugin=oms-1&level.oms-1=write\
+         &plugin=snaptrade-1&level.snaptrade-1=read&level.other-1=write",
+        h.form_token
+    );
+    let (status, _) = send(&h, post(&h, "/admin/access-groups", &form)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let request = DefineAccessGroupRequest::decode(&sent.lock().unwrap()[0][..]).unwrap();
+    let group = request.access_group.unwrap();
+    assert_eq!(group.name, "Traders");
+    let levels: Vec<(String, i32)> = group
+        .entries
+        .into_iter()
+        .map(|e| (e.plugin_instance_id, e.level))
+        .collect();
+    assert_eq!(
+        levels,
+        [
+            ("oms-1".to_string(), AccessLevel::Write as i32),
+            ("snaptrade-1".to_string(), AccessLevel::Read as i32)
+        ]
+    );
+
+    let twice = format!(
+        "form_token={}&name=Traders&plugin=oms-1&level.oms-1=read&entries=oms-1+write",
+        h.form_token
+    );
+    let (status, body) = send(&h, post(&h, "/admin/access-groups", &twice)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("named twice"), "{body}");
+    assert_eq!(sent.lock().unwrap().len(), 1, "nothing more was sent");
+}
+
+#[tokio::test]
+async fn the_user_group_form_sends_the_people_chosen_and_those_typed_in() {
+    let h = harness(admin_records(), None);
+    let sent = conductor_defining(&h, "platform.config.command.define-user-group");
+    let dn = "ldap:dc=firm,dc=internal|uid=ada,ou=people,dc=firm,dc=internal";
+    let form = format!(
+        "form_token={}&user_group_id=UG-9&name=Ops&login={}&login=local%7Cbob\
+         &logins=local%7Ccy%0Alocal%7Cbob&directory_groups=cn%3Dops%2Cou%3Dgroups",
+        h.form_token,
+        dn.replace('|', "%7C")
+            .replace(',', "%2C")
+            .replace('=', "%3D")
+            .replace(':', "%3A")
+    );
+    let (status, _) = send(&h, post(&h, "/admin/user-groups", &form)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let request = DefineUserGroupRequest::decode(&sent.lock().unwrap()[0][..]).unwrap();
+    let group = request.user_group.unwrap();
+    assert_eq!(group.user_group_id, "UG-9");
+    assert_eq!(group.logins, [dn, "local|bob", "local|cy"]);
+    assert_eq!(group.directory_groups, ["cn=ops,ou=groups"]);
+}
+
+#[tokio::test]
+async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
+    let h = framing(a_firm());
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    for (dialog, picker, name) in [
+        ("user-group", "user-group-people", "login"),
+        ("account-group", "account-group-accounts", "account_ids"),
+        ("access-group", "access-group-plugins", "plugin"),
+    ] {
+        let inside = body
+            .split(&format!("<dialog id=\"{dialog}\">"))
+            .nth(1)
+            .unwrap()
+            .split("</dialog>")
+            .next()
+            .unwrap();
+        assert!(
+            inside.contains(&format!(
+                "<fieldset class=\"checks picker\" id=\"{picker}\" data-picker>"
+            )),
+            "{dialog}"
+        );
+        assert!(
+            inside.contains("<div class=\"picker-tools\" hidden>"),
+            "{dialog}"
+        );
+        assert!(
+            inside.contains(&format!("type=\"checkbox\" name=\"{name}\"")),
+            "{dialog}"
+        );
+        assert!(
+            inside.contains("data-record-id>"),
+            "{dialog}: its id is cleared for a new one"
+        );
+        assert!(
+            !inside.contains(" checked"),
+            "{dialog}: a new one chooses nothing"
+        );
+    }
+    // An access entry's level: one choice, read or write.
+    assert!(body.contains(
+        "<select name=\"level.plugin-00\" aria-label=\"Level on plugin-00\"><option value=\"read\">Read</option>\
+         <option value=\"write\">Write (includes read)</option></select>"
+    ));
+    let fill = fill_of(&body, "AG-00");
+    assert_eq!(fill["fields"]["level.plugin-00"], "write");
+    assert_eq!(fill["fields"]["level.plugin-01"], "read");
+    assert_eq!(fill["checked"]["plugin"].as_array().unwrap().len(), 4);
+    // The page's script: the pickers, and a dialog filled from its Edit.
+    for held in [
+        "Array.prototype.forEach.call(document.querySelectorAll(\"[data-picker]\"), picker);",
+        "form.reset();",
+        "function (el) { el.value = \"\"; }",
+        "if (ticked[el.name]) el.checked = ticked[el.name][el.value] === true;",
+        "if (p.refresh) p.refresh();",
+    ] {
+        assert!(body.contains(held), "{held}");
+    }
 }

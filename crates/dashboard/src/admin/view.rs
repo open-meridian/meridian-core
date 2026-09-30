@@ -511,7 +511,8 @@ fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
         Some(AdminPage::Framed { src, origin }) => {
             return format!(
                 "<iframe class=\"admin-frame\" id=\"admin-page\" data-page=\"{path}\" src=\"{}\" \
-                 title=\"{title} &middot; {}\" data-plugin-frame data-seamless data-origin=\"{}\"></iframe>",
+                 title=\"{title} &middot; {}\" data-plugin-frame data-seamless data-origin=\"{}\" \
+                 data-actions=\"{PAGE_ACTIONS}\"></iframe>",
                 escape(src),
                 escape(&tab.title),
                 escape(origin)
@@ -531,6 +532,10 @@ fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
         "<section class=\"panel padded\" id=\"admin-page\" data-page=\"{path}\">{said}</section>"
     )
 }
+
+/// The header's area for a framed page's own actions (meridian-ui's
+/// `meridian:actions`), which the chrome's script draws; its frame names it.
+const PAGE_ACTIONS: &str = "page-actions";
 
 pub fn render(view: &View) -> String {
     let line = view.line;
@@ -572,11 +577,22 @@ pub fn render(view: &View) -> String {
             connections(&line.instance, view.custody, view.records)
         ),
     };
+    // The header's buttons are the framed page's own, which it declares
+    // (the product owner, 2026-09-30): the way back is the breadcrumb, and a
+    // plugin's page is reached from the Dashboard.
+    let framed =
+        view.current.page.is_some() && matches!(view.admin_page, Some(AdminPage::Framed { .. }));
+    let actions = if framed {
+        format!(
+            "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"{} actions\"></div>",
+            escape(&view.current.title)
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<div class=\"plugin-view\"><div class=\"page-head\"><div><h1>{title}</h1><p><code>{instance}</code> &middot; \
-         the plugin's health, settings and access, and its own admin pages.</p></div>\
-         <div class=\"actions\"><a class=\"button\" href=\"/admin#plugins\">All plugins</a>\
-         <a class=\"button primary\" href=\"/plugins/{instance}\">Open its page</a></div></div>\
+         the plugin's health, settings and access, and its own admin pages.</p></div>{actions}</div>\
          {nav}<div class=\"tab-body\" data-current=\"{current}\">{body}</div></div>",
         nav = nav(&line.instance, view.tabs, view.current),
         current = escape(&view.current.key),

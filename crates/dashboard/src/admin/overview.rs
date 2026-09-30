@@ -18,8 +18,12 @@ use std::collections::HashMap;
 use meridian_domain::account;
 use meridian_domain::v1::{AccessLevel, AccessRecords, AccountRecord, AccountState};
 
+use std::collections::HashSet;
+
 use crate::html::escape;
 
+use super::people::Person;
+use super::picker::{self, Choice};
 use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
@@ -65,13 +69,27 @@ fn new_button(dialog: &str, label: &str) -> String {
     )
 }
 
+/// An Edit that opens `dialog` holding this record: `fill` says what its
+/// fields hold (`fields`, by name) and which boxes are ticked (`checked`, by
+/// name), and `title` heads it.
+fn edit_button(dialog: &str, title: &str, fill: &serde_json::Value) -> String {
+    format!(
+        "<button type=\"button\" data-dialog-open=\"{dialog}\" data-title=\"{}\" data-fill=\"{}\">Edit</button>",
+        escape(title),
+        escape(&fill.to_string())
+    )
+}
+
+/// One dialog per kind of record, for a new one and for each edit, which the
+/// page's script fills from the Edit pressed. Its heading and its button say
+/// which, from `data-title-new` and `data-label-new`.
 fn dialog(id: &str, title: &str, action: &str, token: &str, fields: &str, submit: &str) -> String {
     format!(
         "<dialog id=\"{id}\"><form method=\"post\" action=\"{action}\">{token}\
-         <div class=\"dialog-head\"><h2>{title}</h2></div>\
+         <div class=\"dialog-head\"><h2 data-title-new=\"{title}\">{title}</h2></div>\
          <div class=\"dialog-body\">{fields}</div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\">{submit}</button></div></form></dialog>"
+         <button type=\"submit\" class=\"primary\" data-label-new=\"{submit}\">{submit}</button></div></form></dialog>"
     )
 }
 
@@ -89,10 +107,52 @@ fn options(chosen: &str, items: &[(String, String)]) -> String {
         .collect()
 }
 
+/// A table of `noun` (the product owner, 2026-09-30: "assuming 100+ items"):
+/// a search box narrowing it in the browser with a count of what is shown,
+/// headings that sort it, and what it says when a search matches none. The
+/// rows come sorted from here, so without script it is in that order, whole.
+fn listing(id: &str, class: &str, noun: &str, search: &str, head: &str, rows: &str) -> String {
+    format!(
+        "<div class=\"filter-row\"><input class=\"filter\" type=\"search\" data-filter=\"{id}\" hidden \
+         placeholder=\"{search}\" aria-label=\"Search {noun}\">\
+         <span class=\"filter-count\" data-filter-count=\"{id}\" aria-live=\"polite\" hidden></span></div>\
+         <div class=\"scroll\"><table class=\"list{class}\" id=\"{id}\" data-sortable><thead><tr>{head}</tr></thead>\
+         <tbody>{rows}</tbody></table></div>\
+         <p class=\"empty\" data-filter-none=\"{id}\" hidden>No {noun} match that search.</p>"
+    )
+}
+
+/// The first few of `items`, and how many more: a cell stays a line however
+/// big the group. The rest are in the cell, hidden, so a search finds a row
+/// by any of them.
+fn summary(items: &[String], most: usize) -> String {
+    let shown: Vec<String> = items.iter().take(most).map(|i| escape(i)).collect();
+    if items.len() <= most {
+        return shown.join(", ");
+    }
+    let rest: Vec<String> = items.iter().skip(most).map(|i| escape(i)).collect();
+    format!(
+        "{}<span class=\"more\"> and {} more</span><span hidden>, {}</span>",
+        shown.join(", "),
+        items.len() - most,
+        rest.join(", ")
+    )
+}
+
+/// How many of a group's members a row shows before "and N more".
+const SHOWN_MEMBERS: usize = 3;
+
+/// Names in the order a person reads a list: by name ignoring case, then by
+/// identifier.
+fn by_name<'a>(name: &'a str, id: &'a str) -> (String, &'a str) {
+    (name.to_lowercase(), id)
+}
+
 pub fn render(
     records: &AccessRecords,
     holders: &[(String, String, usize)],
     plugins: &[Line],
+    people: &[Person],
     token: &str,
     notice: &str,
 ) -> String {
@@ -116,6 +176,14 @@ pub fn render(
         .iter()
         .map(|a| (a.account_id.as_str(), a.name.as_str()))
         .collect();
+    let plugin_names: HashMap<&str, &str> = plugins
+        .iter()
+        .filter_map(|line| {
+            line.name
+                .as_deref()
+                .map(|name| (line.instance.as_str(), name))
+        })
+        .collect();
     let name_of = |names: &HashMap<&str, &str>, id: &str| -> String {
         names
             .get(id)
@@ -131,7 +199,14 @@ pub fn render(
     let body = if plugins.is_empty() {
         "<p class=\"empty\">No plugin has reported or been launched yet.</p>".to_string()
     } else {
-        let rows: String = plugins
+        let mut sorted: Vec<&Line> = plugins.iter().collect();
+        sorted.sort_by(|a, b| {
+            by_name(a.name.as_deref().unwrap_or(&a.instance), &a.instance).cmp(&by_name(
+                b.name.as_deref().unwrap_or(&b.instance),
+                &b.instance,
+            ))
+        });
+        let rows: String = sorted
             .iter()
             .map(|line| {
                 let settings = if line.missing.is_empty() {
@@ -159,12 +234,13 @@ pub fn render(
                 )
             })
             .collect();
-        format!(
-            "<input class=\"filter\" type=\"search\" data-filter=\"plugins-table\" hidden \
-             placeholder=\"Search by plugin, instance, health or what it needs\" aria-label=\"Search plugins\">\
-             <div class=\"scroll\"><table class=\"list plugins\" id=\"plugins-table\"><thead><tr><th>Plugin</th>\
-             <th>Instance</th><th>Health</th><th>Settings</th><th>Needs you</th><th></th></tr></thead>\
-             <tbody>{rows}</tbody></table></div>"
+        listing(
+            "plugins-table",
+            " plugins",
+            "plugins",
+            "Search by plugin, instance, health or what it needs",
+            "<th>Plugin</th><th>Instance</th><th>Health</th><th>Settings</th><th>Needs you</th><th></th>",
+            &rows,
         )
     };
     sections.push(section(
@@ -177,8 +253,17 @@ pub fn render(
     ));
 
     // ── Permissions ─────────────────────────────────────────────────────────
+    let mut permissions: Vec<_> = records.permissions.iter().collect();
+    permissions.sort_by_key(|p| {
+        (
+            name_of(&user_group_names, &p.user_group_id).to_lowercase(),
+            name_of(&account_group_names, &p.account_group_id).to_lowercase(),
+            name_of(&access_group_names, &p.access_group_id).to_lowercase(),
+            p.permission_id.clone(),
+        )
+    });
     let mut rows = String::new();
-    for p in &records.permissions {
+    for p in permissions {
         let accounts = if p.account_group_id.is_empty() {
             "<span class=\"name\">every account</span>".to_string()
         } else {
@@ -204,28 +289,38 @@ pub fn render(
     let table = if rows.is_empty() {
         "<p class=\"empty\">No permissions yet.</p>".to_string()
     } else {
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>User group</th><th>On accounts</th><th>Access</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        listing(
+            "permissions-table",
+            "",
+            "permissions",
+            "Search by user group, account group or access group",
+            "<th>User group</th><th>On accounts</th><th>Access</th><th></th>",
+            &rows,
+        )
     };
-    let user_groups: Vec<(String, String)> = records
+    let mut user_groups: Vec<(String, String)> = records
         .user_groups
         .iter()
         .map(|g| (g.user_group_id.clone(), g.name.clone()))
         .collect();
+    user_groups.sort_by(|a, b| by_name(&a.1, &a.0).cmp(&by_name(&b.1, &b.0)));
+    let mut every_group: Vec<(String, String)> = records
+        .account_groups
+        .iter()
+        .map(|g| (g.account_group_id.clone(), g.name.clone()))
+        .collect();
+    every_group.sort_by(|a, b| by_name(&a.1, &a.0).cmp(&by_name(&b.1, &b.0)));
     let mut account_groups = vec![(
         String::new(),
         "Every account (deployment admin only)".to_string(),
     )];
-    account_groups.extend(
-        records
-            .account_groups
-            .iter()
-            .map(|g| (g.account_group_id.clone(), g.name.clone())),
-    );
-    let access_groups: Vec<(String, String)> = records
+    account_groups.extend(every_group);
+    let mut access_groups: Vec<(String, String)> = records
         .access_groups
         .iter()
         .map(|g| (g.access_group_id.clone(), g.name.clone()))
         .collect();
+    access_groups.sort_by(|a, b| by_name(&a.1, &a.0).cmp(&by_name(&b.1, &b.0)));
     let grant = dialog(
         "new-permission",
         "Grant a permission",
@@ -253,194 +348,335 @@ pub fn render(
     ));
 
     // ── User groups ─────────────────────────────────────────────────────────
-    let user_group_fields = |id: &str, name: &str, directory: &str, logins: &str| {
-        format!(
-            "<input type=\"hidden\" name=\"user_group_id\" value=\"{}\">\
-             <label>Name<input name=\"name\" value=\"{}\" required></label>\
-             <label>Directory groups, one per line<textarea name=\"directory_groups\" rows=\"3\">{}</textarea></label>\
-             <label>Logins, one per line<textarea name=\"logins\" rows=\"3\">{}</textarea></label>\
-             <p class=\"hint\">Somebody is in the group when their directory says they are in \
-             one of its groups, or when their login is listed. A login here is <code>local|name</code> \
-             for an account this deployment holds.</p>",
-            escape(id),
-            escape(name),
-            escape(directory),
-            escape(logins)
-        )
-    };
+    // People are chosen by their user ID, then their login ID
+    // (super::people); one typed in is taken as it always was.
+    let person_of: HashMap<&str, &Person> = people.iter().map(|p| (p.login.as_str(), p)).collect();
+    let people_choices: Vec<Choice> = people
+        .iter()
+        .map(|person| Choice {
+            value: person.login.clone(),
+            label: if person.name.is_empty() {
+                person.user_id.clone()
+            } else {
+                format!("{} ({})", person.user_id, person.name)
+            },
+            detail: person.login.clone(),
+            ..Default::default()
+        })
+        .collect();
+    let user_group_fields = format!(
+        "<input type=\"hidden\" name=\"user_group_id\" value=\"\" data-record-id>\
+         <label>Name<input name=\"name\" value=\"\" required></label>\
+         {picker}\
+         <label>Other logins, one per line<textarea name=\"logins\" rows=\"2\"></textarea></label>\
+         <label>Directory groups, one per line<textarea name=\"directory_groups\" rows=\"3\"></textarea></label>\
+         <p class=\"hint\">Somebody is in the group when their directory says they are in \
+         one of its groups, or when their login is chosen or listed. People are listed by user ID, \
+         then login ID; somebody not listed yet is added by their login, <code>local|name</code> \
+         for an account this deployment holds.</p>",
+        picker = if people_choices.is_empty() {
+            String::new()
+        } else {
+            picker::many(
+                "user-group-people",
+                "login",
+                "People",
+                "people",
+                &people_choices,
+                &HashSet::new(),
+            )
+        },
+    );
+    let mut groups: Vec<_> = records.user_groups.iter().collect();
+    groups.sort_by(|a, b| {
+        by_name(&a.name, &a.user_group_id).cmp(&by_name(&b.name, &b.user_group_id))
+    });
     let mut rows = String::new();
-    let mut dialogs = String::new();
-    for g in &records.user_groups {
-        let edit = format!("edit-{}", g.user_group_id);
+    for g in groups {
+        let mut members: Vec<Person> = g
+            .logins
+            .iter()
+            .map(|login| {
+                person_of
+                    .get(login.as_str())
+                    .map(|p| (*p).clone())
+                    .unwrap_or(Person {
+                        user_id: super::people::user_id(login),
+                        login: login.clone(),
+                        name: String::new(),
+                    })
+            })
+            .collect();
+        super::people::sort(&mut members);
+        let shown: Vec<String> = members.iter().map(|p| p.user_id.clone()).collect();
+        let searched: Vec<String> = members
+            .iter()
+            .map(|p| format!("{} {}", p.login, p.name))
+            .collect();
+        let fill = serde_json::json!({
+            "fields": {
+                "user_group_id": g.user_group_id,
+                "name": g.name,
+                "directory_groups": g.directory_groups.join("\n"),
+            },
+            "checked": { "login": g.logins },
+        });
         rows.push_str(&format!(
-            "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}</td><td>{dirs}</td><td>{logins}</td>\
-             <td class=\"actions\"><button type=\"button\" data-dialog-open=\"{edit}\">Edit</button></td></tr>",
+            "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}</td><td>{dirs}</td>\
+             <td>{logins}<span hidden> {searched}</span></td>\
+             <td class=\"actions\">{edit}</td></tr>",
             id = escape(&g.user_group_id),
             name = escape(&g.name),
             named = named(&g.name, &g.user_group_id),
-            dirs = escape(&g.directory_groups.join(", ")),
-            logins = escape(&g.logins.join(", ")),
-            edit = escape(&edit),
-        ));
-        dialogs.push_str(&dialog(
-            &escape(&edit),
-            &format!("Edit {}", escape(&g.name)),
-            "/admin/user-groups#user-groups",
-            token,
-            &user_group_fields(
-                &g.user_group_id,
-                &g.name,
-                &g.directory_groups.join("\n"),
-                &g.logins.join("\n"),
-            ),
-            "Save",
+            dirs = summary(&g.directory_groups, SHOWN_MEMBERS),
+            logins = summary(&shown, SHOWN_MEMBERS),
+            searched = escape(&searched.join(" ")),
+            edit = edit_button("user-group", &format!("Edit {}", g.name), &fill),
         ));
     }
-    dialogs.push_str(&dialog(
-        "new-user-group",
+    let dialogs = dialog(
+        "user-group",
         "New user group",
         "/admin/user-groups#user-groups",
         token,
-        &user_group_fields("", "", "", ""),
+        &user_group_fields,
         "Create",
-    ));
+    );
     let table = if rows.is_empty() {
         "<p class=\"empty\">No user groups yet.</p>".to_string()
     } else {
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>Name</th><th>Directory groups</th><th>Logins</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        listing(
+            "user-groups-table",
+            "",
+            "user groups",
+            "Search by name, directory group, user ID or login",
+            "<th>Name</th><th>Directory groups</th><th>People</th><th></th>",
+            &rows,
+        )
     };
     sections.push(section(
         "user-groups",
         "User groups",
         "People, by the directory groups they are in or by their logins.",
-        &new_button("new-user-group", "New user group"),
+        &new_button("user-group", "New user group"),
         format!("{table}{dialogs}"),
     ));
 
     // ── Account groups ──────────────────────────────────────────────────────
-    let account_group_fields = |id: &str, name: &str, members: &[String]| {
-        let boxes: String = records
-            .accounts
-            .iter()
-            .filter(|a| a.state != AccountState::Closed as i32 || members.contains(&a.account_id))
-            .map(|a| {
-                format!(
-                    "<label class=\"check\"><input type=\"checkbox\" name=\"account_ids\" value=\"{}\"{}> {}</label>",
-                    escape(&a.account_id),
-                    if members.contains(&a.account_id) { " checked" } else { "" },
-                    escape(&a.name)
-                )
-            })
-            .collect();
-        let boxes = if boxes.is_empty() {
+    // Every account is an option once; a closed one is listed only where a
+    // group holds it already, and an account a group names that is not
+    // known here is listed by its identifier, so an edit never drops it.
+    let mut accounts_sorted: Vec<&AccountRecord> = records.accounts.iter().collect();
+    accounts_sorted
+        .sort_by(|a, b| by_name(&a.name, &a.account_id).cmp(&by_name(&b.name, &b.account_id)));
+    let mut account_choices: Vec<Choice> = accounts_sorted
+        .iter()
+        .map(|a| {
+            let closed = a.state == AccountState::Closed as i32;
+            Choice {
+                value: a.account_id.clone(),
+                label: if closed {
+                    format!("{} (closed)", a.name)
+                } else {
+                    a.name.clone()
+                },
+                detail: a.account_id.clone(),
+                also: [a.custodian.as_str(), &a.account_type, &a.owner].join(" "),
+                only_when_chosen: closed,
+                ..Default::default()
+            }
+        })
+        .collect();
+    let mut unknown: Vec<&str> = records
+        .account_groups
+        .iter()
+        .flat_map(|g| g.account_ids.iter().map(String::as_str))
+        .filter(|id| !account_names.contains_key(id))
+        .collect();
+    unknown.sort_unstable();
+    unknown.dedup();
+    account_choices.extend(unknown.into_iter().map(|id| Choice {
+        value: id.to_string(),
+        label: id.to_string(),
+        only_when_chosen: true,
+        ..Default::default()
+    }));
+    let account_group_fields = format!(
+        "<input type=\"hidden\" name=\"account_group_id\" value=\"\" data-record-id>\
+         <label>Name<input name=\"name\" value=\"\" required></label>{}",
+        if records.accounts.is_empty() {
             "<p class=\"hint\">No accounts yet: define one under Accounts.</p>".to_string()
         } else {
-            format!("<fieldset class=\"checks\"><legend>Accounts</legend>{boxes}</fieldset>")
-        };
-        format!(
-            "<input type=\"hidden\" name=\"account_group_id\" value=\"{}\">\
-             <label>Name<input name=\"name\" value=\"{}\" required></label>{boxes}",
-            escape(id),
-            escape(name)
-        )
-    };
+            picker::many(
+                "account-group-accounts",
+                "account_ids",
+                "Accounts",
+                "accounts",
+                &account_choices,
+                &HashSet::new(),
+            )
+        }
+    );
+    let mut groups: Vec<_> = records.account_groups.iter().collect();
+    groups.sort_by(|a, b| {
+        by_name(&a.name, &a.account_group_id).cmp(&by_name(&b.name, &b.account_group_id))
+    });
     let mut rows = String::new();
-    let mut dialogs = String::new();
-    for g in &records.account_groups {
-        let edit = format!("edit-{}", g.account_group_id);
-        let members: Vec<String> = g
+    for g in groups {
+        let mut members: Vec<String> = g
             .account_ids
             .iter()
             .map(|id| name_of(&account_names, id))
             .collect();
+        members.sort_by_key(|m| m.to_lowercase());
+        let fill = serde_json::json!({
+            "fields": { "account_group_id": g.account_group_id, "name": g.name },
+            "checked": { "account_ids": g.account_ids },
+        });
         rows.push_str(&format!(
             "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}</td><td>{members}</td>\
-             <td class=\"actions\"><button type=\"button\" data-dialog-open=\"{edit}\">Edit</button></td></tr>",
+             <td class=\"actions\">{edit}</td></tr>",
             id = escape(&g.account_group_id),
             name = escape(&g.name),
             named = named(&g.name, &g.account_group_id),
-            members = escape(&members.join(", ")),
-            edit = escape(&edit),
-        ));
-        dialogs.push_str(&dialog(
-            &escape(&edit),
-            &format!("Edit {}", escape(&g.name)),
-            "/admin/account-groups#account-groups",
-            token,
-            &account_group_fields(&g.account_group_id, &g.name, &g.account_ids),
-            "Save",
+            members = summary(&members, SHOWN_MEMBERS),
+            edit = edit_button("account-group", &format!("Edit {}", g.name), &fill),
         ));
     }
-    dialogs.push_str(&dialog(
-        "new-account-group",
+    let dialogs = dialog(
+        "account-group",
         "New account group",
         "/admin/account-groups#account-groups",
         token,
-        &account_group_fields("", "", &[]),
+        &account_group_fields,
         "Create",
-    ));
+    );
     let table = if rows.is_empty() {
         "<p class=\"empty\">No account groups yet.</p>".to_string()
     } else {
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>Name</th><th>Accounts</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        listing(
+            "account-groups-table",
+            "",
+            "account groups",
+            "Search by name or account",
+            "<th>Name</th><th>Accounts</th><th></th>",
+            &rows,
+        )
     };
     sections.push(section(
         "account-groups",
         "Account groups",
         "Accounts gathered, so a permission can name them together.",
-        &new_button("new-account-group", "New account group"),
+        &new_button("account-group", "New account group"),
         format!("{table}{dialogs}"),
     ));
 
     // ── Access groups ───────────────────────────────────────────────────────
-    let access_group_fields = |id: &str, name: &str, entries: &str| {
-        format!(
-            "<input type=\"hidden\" name=\"access_group_id\" value=\"{}\">\
-             <label>Name<input name=\"name\" value=\"{}\" required></label>\
-             <label>Entries, one per line<textarea name=\"entries\" rows=\"4\" \
-             placeholder=\"snaptrade-1 read\">{}</textarea></label>\
-             <p class=\"hint\">Each line is a plugin instance and <code>read</code> \
-             or <code>write</code>: read to see what it shows, write to act through it too.</p>",
-            escape(id),
-            escape(name),
-            escape(entries)
-        )
-    };
-    let mut rows = String::new();
-    let mut dialogs = String::new();
+    // Plugins, each at exactly one level (the product owner, 2026-09-30:
+    // write includes read): every plugin known here, and any an access group
+    // names that is not, each with its level beside it.
+    let mut instances: Vec<(String, String)> = plugins
+        .iter()
+        .map(|line| (line.instance.clone(), line.name.clone().unwrap_or_default()))
+        .collect();
     for g in &records.access_groups {
-        let entries = if g.built_in {
-            "the dashboard, and every account".to_string()
+        for e in &g.entries {
+            if !instances.iter().any(|(id, _)| id == &e.plugin_instance_id) {
+                instances.push((e.plugin_instance_id.clone(), String::new()));
+            }
+        }
+    }
+    instances.sort_by(|a, b| {
+        let name = |(id, name): &(String, String)| {
+            if name.is_empty() {
+                id.clone()
+            } else {
+                name.clone()
+            }
+        };
+        by_name(&name(a), &a.0).cmp(&by_name(&name(b), &b.0))
+    });
+    let plugin_choices: Vec<Choice> = instances
+        .iter()
+        .map(|(id, name)| Choice {
+            value: id.clone(),
+            label: if name.is_empty() {
+                id.clone()
+            } else {
+                name.clone()
+            },
+            detail: id.clone(),
+            after: level_select(id),
+            ..Default::default()
+        })
+        .collect();
+    let access_group_fields = format!(
+        "<input type=\"hidden\" name=\"access_group_id\" value=\"\" data-record-id>\
+         <label>Name<input name=\"name\" value=\"\" required></label>{}\
+         <p class=\"hint\">Each plugin chosen is given at one level: read to see what it shows, \
+         write to act through it too, which includes read.</p>",
+        if plugin_choices.is_empty() {
+            "<p class=\"hint\">No plugins yet: launch one from the catalogue.</p>".to_string()
         } else {
-            g.entries
+            picker::many(
+                "access-group-plugins",
+                "plugin",
+                "Plugins",
+                "plugins",
+                &plugin_choices,
+                &HashSet::new(),
+            )
+        }
+    );
+    let mut groups: Vec<_> = records.access_groups.iter().collect();
+    // The built-in first, then by name.
+    groups.sort_by(|a, b| {
+        (!a.built_in, a.name.to_lowercase(), &a.access_group_id).cmp(&(
+            !b.built_in,
+            b.name.to_lowercase(),
+            &b.access_group_id,
+        ))
+    });
+    let mut rows = String::new();
+    for g in groups {
+        let entries: Vec<String> = if g.built_in {
+            vec!["the dashboard, and every account".to_string()]
+        } else {
+            let mut entries: Vec<String> = g
+                .entries
                 .iter()
-                .map(|e| format!("{} {}", e.plugin_instance_id, level_name(e.level)))
-                .collect::<Vec<_>>()
-                .join("; ")
+                .map(|e| {
+                    format!(
+                        "{} {}",
+                        name_of(&plugin_names, &e.plugin_instance_id),
+                        level_name(e.level)
+                    )
+                })
+                .collect();
+            entries.sort_by_key(|e| e.to_lowercase());
+            entries
         };
         let action = if g.built_in {
             "<span class=\"pill\">built in</span>".to_string()
         } else {
-            let edit = format!("edit-{}", g.access_group_id);
-            dialogs.push_str(&dialog(
-                &escape(&edit),
-                &format!("Edit {}", escape(&g.name)),
-                "/admin/access-groups#access-groups",
-                token,
-                &access_group_fields(
-                    &g.access_group_id,
-                    &g.name,
-                    &g.entries
-                        .iter()
-                        .map(|e| format!("{} {}", e.plugin_instance_id, level_name(e.level)))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                "Save",
-            ));
-            format!(
-                "<button type=\"button\" data-dialog-open=\"{}\">Edit</button>",
-                escape(&edit)
+            let mut fields = serde_json::Map::new();
+            fields.insert("access_group_id".into(), g.access_group_id.clone().into());
+            fields.insert("name".into(), g.name.clone().into());
+            for e in &g.entries {
+                fields.insert(
+                    format!("level.{}", e.plugin_instance_id),
+                    level_name(e.level).into(),
+                );
+            }
+            let chosen: Vec<&str> = g
+                .entries
+                .iter()
+                .map(|e| e.plugin_instance_id.as_str())
+                .collect();
+            edit_button(
+                "access-group",
+                &format!("Edit {}", g.name),
+                &serde_json::json!({ "fields": fields, "checked": { "plugin": chosen } }),
             )
         };
         rows.push_str(&format!(
@@ -449,79 +685,74 @@ pub fn render(
             id = escape(&g.access_group_id),
             name = escape(&g.name),
             named = named(&g.name, &g.access_group_id),
-            entries = escape(&entries),
+            entries = summary(&entries, SHOWN_MEMBERS),
         ));
     }
-    dialogs.push_str(&dialog(
-        "new-access-group",
+    let dialogs = dialog(
+        "access-group",
         "New access group",
         "/admin/access-groups#access-groups",
         token,
-        &access_group_fields("", "", ""),
+        &access_group_fields,
         "Create",
-    ));
+    );
     let table = if rows.is_empty() {
         "<p class=\"empty\">No access groups yet.</p>".to_string()
     } else {
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>Name</th><th>Gives</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        listing(
+            "access-groups-table",
+            "",
+            "access groups",
+            "Search by name or plugin",
+            "<th>Name</th><th>Gives</th><th></th>",
+            &rows,
+        )
     };
     sections.push(section(
         "access-groups",
         "Access groups",
         "What a permission gives: plugins, each at read or write.",
-        &new_button("new-access-group", "New access group"),
+        &new_button("access-group", "New access group"),
         format!("{table}{dialogs}"),
     ));
 
     // ── Accounts ────────────────────────────────────────────────────────────
     // W6.3: a name, and optionally a custodian, a type, an owner and a note,
     // free text and all searchable. An edit sets all four as given.
-    let account_fields = |a: Option<&AccountRecord>| {
-        let a = a.cloned().unwrap_or_default();
-        format!(
-            "<input type=\"hidden\" name=\"account_id\" value=\"{id}\">\
-             <label>Name<input name=\"name\" value=\"{name}\" required></label>\
-             <label>Custodian<input name=\"custodian\" value=\"{custodian}\" maxlength=\"{label}\" \
-             placeholder=\"Where it is held, e.g. Fidelity\"></label>\
-             <label>Type<input name=\"account_type\" value=\"{account_type}\" maxlength=\"{label}\" \
-             placeholder=\"What it is, e.g. Roth IRA\"></label>\
-             <label>Owner<input name=\"owner\" value=\"{owner}\" maxlength=\"{label}\" \
-             placeholder=\"One ownership or grouping label, e.g. Fund I\"></label>\
-             <label>Note<textarea name=\"note\" rows=\"3\" maxlength=\"{note_most}\">{note}</textarea></label>\
-             <p class=\"hint\">All but the name are optional and free text, and the search box \
-             finds an account by any of them. Leaving one empty clears it.</p>",
-            id = escape(&a.account_id),
-            name = escape(&a.name),
-            custodian = escape(&a.custodian),
-            account_type = escape(&a.account_type),
-            owner = escape(&a.owner),
-            note = escape(&a.note),
-            label = account::LABEL_MOST,
-            note_most = account::NOTE_MOST,
-        )
-    };
+    let account_fields = format!(
+        "<input type=\"hidden\" name=\"account_id\" value=\"\" data-record-id>\
+         <label>Name<input name=\"name\" value=\"\" required></label>\
+         <label>Custodian<input name=\"custodian\" value=\"\" maxlength=\"{label}\" \
+         placeholder=\"Where it is held, e.g. Fidelity\"></label>\
+         <label>Type<input name=\"account_type\" value=\"\" maxlength=\"{label}\" \
+         placeholder=\"What it is, e.g. Roth IRA\"></label>\
+         <label>Owner<input name=\"owner\" value=\"\" maxlength=\"{label}\" \
+         placeholder=\"One ownership or grouping label, e.g. Fund I\"></label>\
+         <label>Note<textarea name=\"note\" rows=\"3\" maxlength=\"{note_most}\"></textarea></label>\
+         <p class=\"hint\">All but the name are optional and free text, and the search box \
+         finds an account by any of them. Leaving one empty clears it.</p>",
+        label = account::LABEL_MOST,
+        note_most = account::NOTE_MOST,
+    );
     let mut rows = String::new();
-    let mut dialogs = String::new();
-    for a in &records.accounts {
+    for a in &accounts_sorted {
         let closed = a.state == AccountState::Closed as i32;
-        let edit = format!("edit-{}", a.account_id);
         let actions = if closed {
             String::new()
         } else {
-            dialogs.push_str(&dialog(
-                &escape(&edit),
-                &format!("Edit {}", escape(&a.name)),
-                "/admin/accounts#accounts",
-                token,
-                &account_fields(Some(a)),
-                "Save",
-            ));
+            let fill = serde_json::json!({ "fields": {
+                "account_id": a.account_id,
+                "name": a.name,
+                "custodian": a.custodian,
+                "account_type": a.account_type,
+                "owner": a.owner,
+                "note": a.note,
+            } });
             format!(
-                "<button type=\"button\" data-dialog-open=\"{edit}\">Edit</button>\
-                 <form method=\"post\" action=\"/admin/accounts/close#accounts\" \
+                "{edit}<form method=\"post\" action=\"/admin/accounts/close#accounts\" \
                  data-confirm=\"Close {name}? A closed account is kept, and nobody works in it.\">{token}\
                  <input type=\"hidden\" name=\"account_id\" value=\"{id}\"><button type=\"submit\">Close</button></form>",
-                edit = escape(&edit),
+                edit = edit_button("account", &format!("Edit {}", a.name), &fill),
                 name = escape(&a.name),
                 id = escape(&a.account_id),
             )
@@ -548,23 +779,24 @@ pub fn render(
             },
         ));
     }
-    dialogs.push_str(&dialog(
-        "new-account",
+    let dialogs = dialog(
+        "account",
         "New account",
         "/admin/accounts#accounts",
         token,
-        &account_fields(None),
+        &account_fields,
         "Create",
-    ));
+    );
     let table = if rows.is_empty() {
         "<p class=\"empty\">No accounts yet.</p>".to_string()
     } else {
-        format!(
-            "<input class=\"filter\" type=\"search\" data-filter=\"accounts-table\" hidden \
-             placeholder=\"Search by name, custodian, type, owner or note\" aria-label=\"Search accounts\">\
-             <div class=\"scroll\"><table class=\"list accounts\" id=\"accounts-table\"><thead><tr><th>Name</th>\
-             <th>Custodian</th><th>Type</th><th>Owner</th><th>State</th><th></th></tr></thead>\
-             <tbody>{rows}</tbody></table></div>"
+        listing(
+            "accounts-table",
+            " accounts",
+            "accounts",
+            "Search by name, custodian, type, owner or note",
+            "<th>Name</th><th>Custodian</th><th>Type</th><th>Owner</th><th>State</th><th></th>",
+            &rows,
         )
     };
     sections.push(section(
@@ -572,32 +804,67 @@ pub fn render(
         "Accounts",
         "The firm's accounts, which permissions and plugins work on: where each is held, \
          what it is and who owns it. Closed, never deleted.",
-        &new_button("new-account", "New account"),
+        &new_button("account", "New account"),
         format!("{table}{dialogs}"),
     ));
 
     // ── Terminal sessions ───────────────────────────────────────────────────
     // W6.14. Per person: what is being ended is their access from a terminal,
-    // so there is no choosing among their sessions to offer.
+    // so there is no choosing among their sessions to offer. By user ID, then
+    // login ID.
     let body = if holders.is_empty() {
         "<p class=\"empty\">Nobody holds a terminal session.</p>".to_string()
     } else {
-        let rows: String = holders
+        let mut held: Vec<(Person, usize)> = holders
             .iter()
             .map(|(login, name, count)| {
-                format!(
-                    "<tr data-id=\"{login}\" data-name=\"{name}\"><td>{named}</td><td>{count}</td><td class=\"actions\">\
-                     <form method=\"post\" action=\"/admin/end-terminal-sessions#terminal-sessions\" \
-                     data-confirm=\"End {name}'s terminal sessions? Their CLI signs in again.\">{token}\
-                     <input type=\"hidden\" name=\"login\" value=\"{login}\">\
-                     <button type=\"submit\">End them</button></form></td></tr>",
-                    login = escape(login),
-                    name = escape(name),
-                    named = named(name, login),
+                (
+                    Person {
+                        user_id: super::people::user_id(login),
+                        login: login.clone(),
+                        name: name.clone(),
+                    },
+                    *count,
                 )
             })
             .collect();
-        format!("<div class=\"scroll\"><table class=\"list\"><thead><tr><th>Person</th><th>Sessions</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        held.sort_by(|(a, _), (b, _)| {
+            a.user_id
+                .to_lowercase()
+                .cmp(&b.user_id.to_lowercase())
+                .then_with(|| a.login.cmp(&b.login))
+        });
+        let rows: String = held
+            .iter()
+            .map(|(person, count)| {
+                let called = if person.name.is_empty() {
+                    &person.user_id
+                } else {
+                    &person.name
+                };
+                format!(
+                    "<tr data-id=\"{login}\" data-name=\"{name}\"><td><span class=\"name\">{user}</span></td>\
+                     <td>{named}</td><td>{count}</td><td class=\"actions\">\
+                     <form method=\"post\" action=\"/admin/end-terminal-sessions#terminal-sessions\" \
+                     data-confirm=\"End {called}'s terminal sessions? Their CLI signs in again.\">{token}\
+                     <input type=\"hidden\" name=\"login\" value=\"{login}\">\
+                     <button type=\"submit\">End them</button></form></td></tr>",
+                    login = escape(&person.login),
+                    name = escape(&person.name),
+                    user = escape(&person.user_id),
+                    named = named(&person.name, &person.login),
+                    called = escape(called),
+                )
+            })
+            .collect();
+        listing(
+            "terminal-sessions-table",
+            "",
+            "people",
+            "Search by user ID, name or login",
+            "<th>User ID</th><th>Person</th><th>Sessions</th><th></th>",
+            &rows,
+        )
     };
     sections.push(section(
         "terminal-sessions",
@@ -617,16 +884,28 @@ pub fn render(
         format!("<p class=\"passed\">{}</p>", escape(notice))
     };
     format!(
-        "<div class=\"admin\"><div class=\"page-head\"><h1>Administer this deployment</h1></div>\
+        "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
-         <script>{SCRIPT}</script>",
-        sections.concat()
+         <script>{SCRIPT_START}{}{SCRIPT_END}</script>",
+        sections.concat(),
+        picker::SCRIPT,
     )
 }
 
-/// Tabs, dialogs, and a question before anything destructive. Without it the
-/// page is every section at once and every form posts as it did.
-const SCRIPT: &str = r##"(function () {
+/// A plugin's one level in an access group: read, or write, which includes
+/// read. One choice, so an entry can never name both.
+fn level_select(instance: &str) -> String {
+    format!(
+        "<select name=\"level.{id}\" aria-label=\"Level on {id}\"><option value=\"read\">Read</option>\
+         <option value=\"write\">Write (includes read)</option></select>",
+        id = escape(instance)
+    )
+}
+
+/// Tabs, dialogs, the pickers ([`picker::SCRIPT`], between the two halves),
+/// and a question before anything destructive. Without it the page is every
+/// section at once and every form posts as it did.
+const SCRIPT_START: &str = r##"(function () {
   var root = document.querySelector(".admin");
   if (!root) return;
   root.classList.add("js");
@@ -646,11 +925,46 @@ const SCRIPT: &str = r##"(function () {
   });
   show(location.hash.slice(1));
   window.addEventListener("hashchange", function () { show(location.hash.slice(1)); });
+"##;
+
+const SCRIPT_END: &str = r##"
+  // One dialog per kind of record: a New opens it empty, an Edit fills it
+  // from the record it was drawn with (data-fill: fields by name, and boxes
+  // ticked by name), and its heading and button say which.
+  function prepare(dialog, opener) {
+    var form = dialog.querySelector("form");
+    if (!form) return;
+    form.reset();
+    Array.prototype.forEach.call(form.querySelectorAll("[data-record-id]"), function (el) { el.value = ""; });
+    var fill = null;
+    try { fill = JSON.parse(opener.getAttribute("data-fill") || "null"); } catch (e) { fill = null; }
+    if (fill) {
+      var fields = fill.fields || {};
+      var checked = fill.checked || {};
+      var ticked = {};
+      Object.keys(checked).forEach(function (name) {
+        ticked[name] = Object.create(null);
+        checked[name].forEach(function (value) { ticked[name][value] = true; });
+      });
+      Array.prototype.forEach.call(form.elements, function (el) {
+        if (el.type === "checkbox") {
+          if (ticked[el.name]) el.checked = ticked[el.name][el.value] === true;
+        } else if (Object.prototype.hasOwnProperty.call(fields, el.name)) {
+          el.value = fields[el.name];
+        }
+      });
+    }
+    var head = dialog.querySelector("[data-title-new]");
+    if (head) head.textContent = fill ? opener.getAttribute("data-title") : head.getAttribute("data-title-new");
+    var submit = dialog.querySelector("[data-label-new]");
+    if (submit) submit.textContent = fill ? "Save" : submit.getAttribute("data-label-new");
+    Array.prototype.forEach.call(dialog.querySelectorAll("[data-picker]"), function (p) { if (p.refresh) p.refresh(); });
+  }
   document.addEventListener("click", function (event) {
     var opener = event.target.closest("[data-dialog-open]");
     if (opener) {
       var dialog = document.getElementById(opener.getAttribute("data-dialog-open"));
-      if (dialog) { dialog.showModal(); var first = dialog.querySelector("input:not([type=hidden]), select, textarea"); if (first) first.focus(); }
+      if (dialog) { prepare(dialog, opener); dialog.showModal(); var first = dialog.querySelector("input:not([type=hidden]), select, textarea"); if (first) first.focus(); }
       return;
     }
     var closer = event.target.closest("[data-dialog-close]");

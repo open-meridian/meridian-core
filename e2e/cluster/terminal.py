@@ -329,7 +329,7 @@ def terminal_sessions(page):
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     admin, page = admin_page(browser)
-    check("Administer this deployment" in page.content(), "the administrator's own browser is on the admin page")
+    check("<h1>Settings</h1>" in page.content(), "the administrator's own browser is on the settings page")
     check(terminal_sessions(page) == 0, "nobody holds a terminal session yet")
 
     subject = connect(browser, "first")

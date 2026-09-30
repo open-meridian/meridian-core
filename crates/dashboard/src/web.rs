@@ -328,8 +328,20 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
              <p>A deployment admin grants access to a plugin; it is listed here once they do.</p></div>",
         );
     } else {
-        body.push_str("<ul class=\"plugins list\" data-plugins>");
-        for instance in &listed {
+        // By name, then instance: what a person reads the list by. Past a
+        // screenful, a search box narrows it, in the browser.
+        let mut listed: Vec<&String> = listed.iter().collect();
+        let called = |instance: &str| name_of(instance).unwrap_or_else(|| instance.to_string());
+        listed.sort_by_key(|instance| (called(instance).to_lowercase(), instance.to_string()));
+        if listed.len() > SEARCH_FROM {
+            body.push_str(
+                "<div class=\"filter-row\"><input class=\"filter\" type=\"search\" data-filter=\"home-plugins\" \
+                 hidden placeholder=\"Search your plugins\" aria-label=\"Search your plugins\">\
+                 <span class=\"filter-count\" data-filter-count=\"home-plugins\" aria-live=\"polite\" hidden></span></div>",
+            );
+        }
+        body.push_str("<ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
+        for instance in listed.iter().map(|i| i.as_str()) {
             // Linked when it can be opened: access to no account yet is
             // listed, and would be refused at the door.
             let openable = app.plugins.is_some()
@@ -342,7 +354,9 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 access.deployment_admin && access.on_plugin(instance).is_empty(),
             ));
         }
-        body.push_str("</ul>");
+        body.push_str(
+            "</ul><p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>",
+        );
     }
     body.push_str(&format!("<script>{HOME_SCRIPT}</script>"));
     let viewer = Viewer {
@@ -361,6 +375,9 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     ))
     .into_response()
 }
+
+/// More plugins than this on the home page, and it offers a search box.
+const SEARCH_FROM: usize = 8;
 
 /// One plugin instance on the home page: the plugin's name and the
 /// instance's, opening it in the frame.

@@ -638,12 +638,10 @@ pub(crate) async fn frame(
     }
     let name = crate::catalogue::plugin_name(&app, &instance).await;
     let crumbs = format!(
-        "<a href=\"/\">Plugins</a><span aria-hidden=\"true\">/</span>\
-         <span class=\"here\"><strong>{}</strong><code>{}</code></span>\
-         <a class=\"own-window\" href=\"{}\" target=\"_blank\" rel=\"noopener\" \
+        "{}{}<a class=\"own-window\" href=\"{}\" target=\"_blank\" rel=\"noopener\" \
          title=\"Open it in a window of its own\">&#8599;</a>",
-        escape(name.as_deref().unwrap_or(&instance)),
-        escape(&instance),
+        crate::html::crumb_link("/", "Plugins"),
+        crate::html::crumb_here(name.as_deref().unwrap_or(&instance), Some(&instance)),
         escape(&entrance(&instance, path, &theme)),
     );
     let body = format!(

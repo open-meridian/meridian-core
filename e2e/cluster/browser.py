@@ -25,8 +25,9 @@ DASHBOARD = os.environ["E2E_DASHBOARD"].rstrip("/")
 NAME = os.environ["E2E_NAME"]
 PASSWORD = os.environ["E2E_PASSWORD"]
 SESSION_COOKIE = "meridian_session"
-# What home's header shows a deployment admin and nobody else.
-ADMIN_HOME = 'href="/admin">Admin<'
+# What home's header shows a deployment admin and nobody else: the gear to
+# Settings, named for a screen reader.
+ADMIN_HOME = 'href="/admin" aria-label="Settings"'
 
 failures = []
 

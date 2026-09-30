@@ -65,6 +65,12 @@ pub trait Accounts: Send + Sync {
     /// increment, so a threshold of five admits somebody running six at once
     /// -- which is the shape of guessing the threshold exists for.
     fn count_attempt(&self, name: &str, succeeded: bool, now_ns: i64) -> Result<(), String>;
+
+    /// Each account's name and display name, by name: who can be chosen into
+    /// a user group. Nothing else of an account leaves the store this way.
+    fn people(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Failed sign-ins by the name typed, whether or not an account has it, so the
@@ -243,6 +249,16 @@ impl Accounts for InMemory {
         }
         Ok(())
     }
+
+    fn people(&self) -> Result<Vec<(String, String)>, String> {
+        let held = self.held.lock().expect("accounts lock poisoned");
+        let mut people: Vec<(String, String)> = held
+            .values()
+            .map(|a| (a.name.clone(), a.display_name.clone()))
+            .collect();
+        people.sort();
+        Ok(people)
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +284,17 @@ impl InPostgres {
 }
 
 impl Accounts for InPostgres {
+    fn people(&self) -> Result<Vec<(String, String)>, String> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT name, display_name FROM dashboard_local_account ORDER BY name",
+                &[],
+            )
+            .map_err(|failed| format!("{failed}"))?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
     fn by_name(&self, name: &str) -> Result<Option<LocalAccount>, String> {
         let rows = self
             .conn()?
