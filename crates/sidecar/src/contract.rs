@@ -45,8 +45,10 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// after v2 was cut: reporting its external accounts and linking them, the
 /// account side's fields, the caller's deployment-admin flag, what a setting
 /// and an admin page declare, its links on the account-scope stream, and the
-/// refusal code beside a refusal.
-pub const CONTRACT_CURRENT: u32 = 3;
+/// refusal code beside a refusal. v4 is the asset class as an enum rather than
+/// free text, on the miss a plugin reports, and the refusal of an enum value
+/// the contract does not define (sdk-contract/asset-class-is-an-enum).
+pub const CONTRACT_CURRENT: u32 = 4;
 
 /// Admit a plugin's declared contract version, or say why not.
 ///
@@ -110,15 +112,16 @@ mod tests {
 
     #[test]
     fn a_plugin_built_for_the_current_contract_is_admitted() {
-        assert_eq!(admit("v3"), Ok(3));
+        assert_eq!(admit("v4"), Ok(4));
     }
 
     #[test]
     fn a_plugin_built_before_the_last_addition_still_registers() {
         // The floor stays when the current version rises: a plugin built on
-        // an SDK declaring v2 keeps registering with this sidecar. Under
+        // an SDK declaring v2 or v3 keeps registering with this sidecar. Under
         // `declared == current` it would be refused.
         assert_eq!(admit("v2"), Ok(2));
+        assert_eq!(admit("v3"), Ok(3));
         assert_eq!(admit_within(1, 2, "v1"), Ok(1));
     }
 
@@ -140,6 +143,22 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_built_for_the_asset_class_enum_is_refused_by_a_sidecar_at_v3() {
+        // A plugin built on an SDK declaring v4 reports its misses with the
+        // enum; a sidecar at v3 reads the old free-text field and would drop
+        // the class. Refused at the door instead, naming both.
+        assert_eq!(
+            admit_within(2, 3, "v4"),
+            Err(
+                "the plugin was built against contract v4, newer than this sidecar \
+                 (v2 through v3); upgrade the runtime, or rebuild the plugin against \
+                 v3 or earlier"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
     fn a_range_refuses_on_both_sides_of_it() {
         assert!(admit_within(2, 3, "v1").unwrap_err().contains("older than"));
         assert!(admit_within(2, 3, "v4").unwrap_err().contains("newer than"));
@@ -154,7 +173,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v3); rebuild it against v2 or later"
+                 (v2 through v4); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -163,11 +182,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v4"),
+            admit("v5"),
             Err(
-                "the plugin was built against contract v4, newer than this sidecar \
-                 (v2 through v3); upgrade the runtime, or rebuild the plugin against \
-                 v3 or earlier"
+                "the plugin was built against contract v5, newer than this sidecar \
+                 (v2 through v4); upgrade the runtime, or rebuild the plugin against \
+                 v4 or earlier"
                     .into()
             )
         );
@@ -178,7 +197,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v3"
+                "the plugin declared no contract version; this sidecar accepts v2 through v4"
                     .into()
             )
         );

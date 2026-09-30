@@ -58,7 +58,7 @@ use meridian_domain::v1::{
     InstrumentReplacedEvent, MissReason, MissingInstrumentDetectedEvent,
 };
 
-use crate::apply::to_wire;
+use crate::apply::{asset_class_value, to_wire};
 use crate::store::{Instrument, Placeholder, Result, Store};
 
 /// How many replacements are followed from one ID before stopping.
@@ -98,7 +98,7 @@ pub fn announcement(
 ) -> MissingInstrumentDetectedEvent {
     MissingInstrumentDetectedEvent {
         source: placeholder.source.clone(),
-        asset_class: placeholder.asset_class.clone(),
+        asset_class: asset_class_value(&placeholder.asset_class),
         identifiers: placeholder
             .identifiers
             .members()
@@ -135,7 +135,7 @@ fn legacy_announcement(
             .find(|source| !source.is_empty())
             .unwrap_or_default()
             .to_string(),
-        asset_class: instrument.asset_class.clone(),
+        asset_class: asset_class_value(&instrument.asset_class),
         identifiers: to_wire(instrument).identifiers,
         as_of_ns: instrument.valid_from_ns,
         publisher_instance_id: publisher_instance_id.to_string(),
@@ -189,7 +189,7 @@ pub fn record_of(placeholder: &Placeholder) -> PbInstrument {
                 source: member.source.clone(),
             })
             .collect(),
-        asset_class: placeholder.asset_class.clone(),
+        asset_class: asset_class_value(&placeholder.asset_class),
         lifecycle_state: InstrumentLifecycleState::Define as i32,
         version: 0,
         valid_from_ns: placeholder.as_of_ns,
@@ -261,6 +261,7 @@ mod tests {
     use super::*;
     use crate::store::{Asked, Identifier, IdentifierSet, Stood};
     use crate::MemoryStore;
+    use meridian_domain::v1::AssetClass;
 
     const AS_OF: i64 = 1_757_289_600_000_000_000;
     const NOW: i64 = 1_757_376_000_000_000_000;
@@ -297,7 +298,7 @@ mod tests {
                 valid_from_ns: AS_OF,
                 valid_to_ns: None,
             }],
-            asset_class: "EQUITY".into(),
+            asset_class: "ASSET_CLASS_EQUITY".into(),
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "ZZ Top Holdings".into(),
@@ -364,7 +365,7 @@ mod tests {
 
         let event = &announced[0];
         assert_eq!(event.placeholder_instrument_id, "LCL-LEGACY");
-        assert_eq!(event.asset_class, "EQUITY");
+        assert_eq!(event.asset_class, AssetClass::Equity as i32);
         assert_eq!(event.identifiers[0].value, "BBG000ZZTOP1");
         assert_eq!(event.as_of_ns, AS_OF);
         assert_eq!(event.reason, MissReason::NotFound as i32);

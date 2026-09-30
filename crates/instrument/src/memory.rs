@@ -112,7 +112,7 @@ mod tests {
                 valid_from_ns: 100,
                 valid_to_ns: None,
             }],
-            asset_class: "EQUITY".into(),
+            asset_class: "ASSET_CLASS_EQUITY".into(),
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "Apple Inc.".into(),

@@ -23,6 +23,8 @@
 //! under the row lock it takes anyway. `RETURNING` then says which happened,
 //! and that is the whole of [`Applied`].
 
+use meridian_domain::asset_class;
+use meridian_domain::v1::AssetClass;
 use postgres::types::ToSql;
 use postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
@@ -124,13 +126,61 @@ impl PostgresStore {
 
         let created = SCHEMA
             .iter()
-            .try_for_each(|file| conn.batch_execute(file).map_err(unavailable));
+            .try_for_each(|file| conn.batch_execute(file).map_err(unavailable))
+            .and_then(|()| Self::classes_to_the_enum(&mut conn));
 
         // Released whether or not the schema went in, so a failure does not
         // leave every other instance waiting on a lock nobody holds usefully.
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
         created
+    }
+
+    /// The asset class was free text until the enum
+    /// (sdk-contract/asset-class-is-an-enum). Rewrites each class the columns
+    /// hold that is not already the enum's name: to the class it plainly
+    /// meant (`EQUITY`, `ETF` to fund), or to none when it meant nothing
+    /// plainly, reported rather than guessed. The platform's own migration
+    /// maps its master the same way, so the replica and the authority agree,
+    /// and the next pull of an instrument brings any class a person set since.
+    ///
+    /// A re-run finds nothing: every value it leaves is a name or empty.
+    fn classes_to_the_enum(conn: &mut Connection) -> Result<()> {
+        for table in ["instrument", "instrument_placeholder"] {
+            let held = conn
+                .query(
+                    &format!(
+                        "SELECT DISTINCT asset_class FROM {table} \
+                          WHERE asset_class <> '' AND asset_class NOT LIKE 'ASSET\\_CLASS\\_%'"
+                    ),
+                    &[],
+                )
+                .map_err(unavailable)?;
+            for row in held {
+                let was: String = row.get(0);
+                let class = asset_class::legacy(&was);
+                let now = asset_class::name(class.unwrap_or(AssetClass::Unspecified));
+                let changed = conn
+                    .execute(
+                        &format!("UPDATE {table} SET asset_class = $1 WHERE asset_class = $2"),
+                        &[&now, &was],
+                    )
+                    .map_err(unavailable)?;
+                match class {
+                    Some(_) => {
+                        tracing::info!(table, was, now, changed, "asset class mapped to the enum")
+                    }
+                    None => tracing::warn!(
+                        table,
+                        was,
+                        changed,
+                        "asset class is not one the enum defines and was cleared; \
+                         set it in the security master"
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn conn(&self) -> Result<Connection> {

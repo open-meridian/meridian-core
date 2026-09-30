@@ -459,7 +459,7 @@ mod tests {
 
     use meridian_bus::{Envelope, MemoryBackend, MessageMeta};
     use meridian_domain::v1::{
-        Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentLifecycleState,
+        AssetClass, Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentLifecycleState,
         InstrumentReplacedEvent, MissReason, MissingInstrumentDetectedEvent,
         ResolveIdentifierReply, ResolveIdentifierRequest as PbResolveIdentifierRequest,
         ResolveInstrumentReply,
@@ -501,7 +501,7 @@ mod tests {
                 valid_from_ns: AS_OF - 1,
                 valid_to_ns: None,
             }],
-            asset_class: "EQUITY".into(),
+            asset_class: "ASSET_CLASS_EQUITY".into(),
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "Apple Inc. common stock".into(),
@@ -523,7 +523,7 @@ mod tests {
                     value: "BBG000ZZTOP1".into(),
                     source: String::new(),
                 }],
-                asset_class: "EQUITY".into(),
+                asset_class: AssetClass::Equity as i32,
                 currency: "USD".into(),
                 exchange_mic: "XNAS".into(),
                 lifecycle_state: InstrumentLifecycleState::Active as i32,

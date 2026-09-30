@@ -44,10 +44,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use meridian_domain::asset_class;
 use meridian_domain::v1::{
-    ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt, EscalateInstrumentRequest,
-    Identifier as PbIdentifier, InstrumentRecord as PbInstrument, MissReason,
-    MissingInstrumentDetectedEvent, RedeemClaimCodeReply,
+    AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
+    EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
+    MissReason, MissingInstrumentDetectedEvent, RedeemClaimCodeReply,
 };
 use serde::Deserialize;
 
@@ -379,7 +380,7 @@ impl Platform {
     ) -> Result<Option<PbInstrument>, PlatformError> {
         let request = EscalateInstrumentRequest {
             source: event.source.clone(),
-            asset_class: event.asset_class.clone(),
+            asset_class: event.asset_class,
             identifiers: event.identifiers.clone(),
             as_of_ns: event.as_of_ns,
             requesting_deployment_id: self.config.deployment_id.clone(),
@@ -388,7 +389,11 @@ impl Platform {
 
         let body = serde_json::to_vec(&serde_json::json!({
             "source": request.source,
-            "asset_class": request.asset_class,
+            // The enum's name, as the platform spells a lifecycle state; empty
+            // when the publisher did not know the class.
+            "asset_class": asset_class::name(
+                AssetClass::try_from(request.asset_class).unwrap_or(AssetClass::Unspecified)
+            ),
             "identifiers": request
                 .identifiers
                 .iter()
@@ -823,6 +828,17 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         ));
     }
 
+    // The enum's name, or empty for a stub with none. What the free-text field
+    // held before the enum is read too, while a platform that has not yet
+    // migrated its master still sends it (sdk-contract/asset-class-is-an-enum);
+    // a class it did not plainly mean is refused, as an undefined state is.
+    let asset_class = asset_class::legacy(&record.asset_class).ok_or_else(|| {
+        PlatformError::Malformed(format!(
+            "{} arrived with asset class {:?}, which the schema does not define",
+            record.instrument_id, record.asset_class
+        ))
+    })? as i32;
+
     let lifecycle_state =
         meridian_domain::v1::InstrumentLifecycleState::from_str_name(&record.lifecycle_state)
             .ok_or_else(|| {
@@ -843,7 +859,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
                 source: identifier.source,
             })
             .collect(),
-        asset_class: record.asset_class,
+        asset_class,
         currency: record.currency,
         exchange_mic: record.exchange_mic,
         description: record.description,
@@ -1108,7 +1124,7 @@ pub(crate) mod tests {
             "instrument": {
                 "instrument_id": instrument_id,
                 "identifiers": [{"scheme": "figi", "value": "BBG000B9XRY4", "source": ""}],
-                "asset_class": "EQUITY",
+                "asset_class": "ASSET_CLASS_EQUITY",
                 "currency": "USD",
                 "exchange_mic": "XNAS",
                 "description": "Apple Inc. common stock",
@@ -1310,7 +1326,7 @@ pub(crate) mod tests {
     fn miss(reason: MissReason) -> MissingInstrumentDetectedEvent {
         MissingInstrumentDetectedEvent {
             source: "snaptrade".into(),
-            asset_class: "EQUITY".into(),
+            asset_class: AssetClass::Equity as i32,
             identifiers: vec![
                 PbIdentifier {
                     scheme: "symbol".into(),
@@ -1566,7 +1582,7 @@ pub(crate) mod tests {
                     "minted": true,
                     "instrument": {
                         "instrument_id": "INS-01J8",
-                        "asset_class": "EQUITY",
+                        "asset_class": "ASSET_CLASS_EQUITY",
                         "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
                         "version": 1,
                     }
@@ -1816,6 +1832,62 @@ pub(crate) mod tests {
             PlatformError::Malformed(detail) => assert!(detail.contains("DEFINED"), "{detail}"),
             other => panic!("expected a malformed record, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_record_with_an_asset_class_the_schema_does_not_define_is_refused() {
+        // sdk-contract/asset-class-is-an-enum: a class is one the enum defines,
+        // or none. One that is neither is refused, not read as none.
+        let transport = Fake::new(vec![Ok(reply(
+            200,
+            &serde_json::json!({
+                "found": true,
+                "instrument": {
+                    "instrument_id": "INS-ONE",
+                    "asset_class": "equities-ish",
+                    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                }
+            })
+            .to_string(),
+        ))]);
+
+        let failed = platform(transport)
+            .pull_instrument("INS-ONE", AS_OF, NOW)
+            .await
+            .unwrap_err();
+
+        match failed {
+            PlatformError::Malformed(detail) => {
+                assert!(detail.contains("equities-ish"), "{detail}")
+            }
+            other => panic!("expected a malformed record, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_class_from_before_the_enum_is_read_as_the_enums() {
+        // A platform that has not yet migrated its master sends what the free
+        // text held; its migration maps it the same way.
+        let transport = Fake::new(vec![Ok(reply(
+            200,
+            &serde_json::json!({
+                "found": true,
+                "instrument": {
+                    "instrument_id": "INS-ONE",
+                    "asset_class": "ETF",
+                    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                }
+            })
+            .to_string(),
+        ))]);
+
+        let record = platform(transport)
+            .pull_instrument("INS-ONE", AS_OF, NOW)
+            .await
+            .unwrap()
+            .expect("found");
+
+        assert_eq!(record.asset_class, AssetClass::Fund as i32);
     }
 
     #[tokio::test]

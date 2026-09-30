@@ -8,9 +8,11 @@
 //! And one type written by hand, [`exact::Exact`]: a `meridian.v1.Decimal` as
 //! the runtime holds it. Here because every component that reads a quantity
 //! has to read it the same way, and this is the crate they all share. For the
-//! same reason, [`account`]'s bounds on an account's free text.
+//! same reason, [`account`]'s bounds on an account's free text, and
+//! [`asset_class`]'s reading of an asset class from text.
 
 pub mod account;
+pub mod asset_class;
 pub mod exact;
 
 #[allow(clippy::all)]

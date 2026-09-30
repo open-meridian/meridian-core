@@ -15,8 +15,8 @@ use meridian_domain::v1::{
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Decimal, ExternalAccount, HoldingSide, Identifier, LinkExternalAccountParams, Money,
-    ReadAccountsForLinkingParams, RecordHoldingParams, RecordHoldingsStatementParams,
+    AssetClass, Decimal, ExternalAccount, HoldingSide, Identifier, LinkExternalAccountParams,
+    Money, ReadAccountsForLinkingParams, RecordHoldingParams, RecordHoldingsStatementParams,
     ReportExternalAccountsParams, ReportMissingInstrumentParams, ReportSyncStatusParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
@@ -324,7 +324,7 @@ async fn a_plugin_cannot_set_what_the_sidecar_stamps() {
 
     let mut bytes = ReportMissingInstrumentParams {
         source: "snaptrade".into(),
-        asset_class: "equity".into(),
+        asset_class: AssetClass::Equity as i32,
         ..Default::default()
     }
     .encode_to_vec();
@@ -348,6 +348,42 @@ async fn a_plugin_cannot_set_what_the_sidecar_stamps() {
     let event = MissingInstrumentDetectedEvent::decode(&delivery.envelope.payload[..]).unwrap();
     assert_eq!(event.publisher_instance_id, "snaptrade-1");
     assert_eq!(event.source, "snaptrade");
+    assert_eq!(event.asset_class, AssetClass::Equity as i32);
+}
+
+#[tokio::test]
+async fn an_asset_class_the_contract_does_not_define_is_refused_naming_the_field() {
+    // sdk-contract/asset-class-is-an-enum. Proto3 carries any number, so a
+    // plugin that built its params by hand could otherwise put a class nobody
+    // ruled on the bus. The SDK refuses it before sending; this is the door.
+    let (sidecar, bus, _) = registered(&["custody"]).await;
+    let mut listening = bus.subscribe(INSTRUMENT_MISSING);
+
+    let refused = sidecar
+        .report_missing_instrument(Request::new(ReportMissingInstrumentParams {
+            source: "snaptrade".into(),
+            asset_class: 99,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert_eq!(
+        refused.message(),
+        "asset_class is 99, which the contract does not define"
+    );
+
+    // No class at all is not refused here: a publisher may not know it.
+    sidecar
+        .report_missing_instrument(Request::new(ReportMissingInstrumentParams {
+            source: "snaptrade".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("published without a class");
+    let delivery = delivered(&mut listening).await;
+    let event = MissingInstrumentDetectedEvent::decode(&delivery.envelope.payload[..]).unwrap();
+    assert_eq!(event.asset_class, AssetClass::Unspecified as i32);
 }
 
 #[tokio::test]

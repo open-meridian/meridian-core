@@ -55,8 +55,9 @@
 //! `design/replica-holds-one-version` owns closing it.
 
 use meridian_domain::v1::{
-    Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent, ResolveIdentifierReply,
-    ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    AssetClass, Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent,
+    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    ResolveInstrumentRequest,
 };
 
 use meridian_symbology::rank;
@@ -235,7 +236,7 @@ pub fn resolve_instrument(
 pub fn missing_instrument(
     request: &ResolveIdentifierRequest,
     reply: &ResolveIdentifierReply,
-    asset_class: &str,
+    asset_class: AssetClass,
     publisher_instance_id: &str,
     observed_at_ns: i64,
 ) -> Option<MissingInstrumentDetectedEvent> {
@@ -245,7 +246,7 @@ pub fn missing_instrument(
 
     Some(MissingInstrumentDetectedEvent {
         source: source_of(request).to_string(),
-        asset_class: asset_class.to_string(),
+        asset_class: asset_class as i32,
 
         // Everything held, not just what was tried. A reader with access to the
         // platform may be able to pull on a scheme this store could not.
@@ -345,7 +346,7 @@ mod tests {
         Instrument {
             instrument_id: instrument_id.into(),
             identifiers,
-            asset_class: "EQUITY".into(),
+            asset_class: "ASSET_CLASS_EQUITY".into(),
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "Apple Inc. common stock".into(),
@@ -914,7 +915,14 @@ mod tests {
         let request = request(vec![asked("figi", "BBG000B9XRY4", "")]);
         let reply = resolved("INS-ONE".into());
 
-        assert!(missing_instrument(&request, &reply, "EQUITY", "custody-snaptrade-1", 1).is_none());
+        assert!(missing_instrument(
+            &request,
+            &reply,
+            AssetClass::Equity,
+            "custody-snaptrade-1",
+            1
+        )
+        .is_none());
     }
 
     #[test]
@@ -935,14 +943,14 @@ mod tests {
         let event = missing_instrument(
             &request,
             &missed(MissReason::NotFound),
-            "EQUITY",
+            AssetClass::Equity,
             "custody-snaptrade-1",
             1_757_376_000_000_000_000,
         )
         .unwrap();
 
         assert_eq!(event.source, "snaptrade");
-        assert_eq!(event.asset_class, "EQUITY");
+        assert_eq!(event.asset_class, AssetClass::Equity as i32);
         assert_eq!(event.identifiers.len(), 2);
         assert_eq!(event.as_of_ns, AS_OF);
         assert_eq!(event.publisher_instance_id, "custody-snaptrade-1");
@@ -959,7 +967,7 @@ mod tests {
         let event = missing_instrument(
             &request,
             &missed(MissReason::Ambiguous),
-            "EQUITY",
+            AssetClass::Equity,
             "custody-snaptrade-1",
             1,
         )

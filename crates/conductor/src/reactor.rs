@@ -178,7 +178,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use meridian_bus::{Bus, Delivery, Envelope, MemoryBackend, MessageMeta};
-    use meridian_domain::v1::{Identifier as PbIdentifier, MissReason};
+    use meridian_domain::v1::{AssetClass, Identifier as PbIdentifier, MissReason};
 
     use super::*;
     use crate::platform::tests::{failure, platform as platform_with, record_json, reply, Fake};
@@ -207,7 +207,7 @@ mod tests {
     fn miss_event() -> MissingInstrumentDetectedEvent {
         MissingInstrumentDetectedEvent {
             source: "snaptrade".into(),
-            asset_class: "EQUITY".into(),
+            asset_class: AssetClass::Equity as i32,
             identifiers: vec![PbIdentifier {
                 scheme: "figi".into(),
                 value: "BBG000ZZTOP1".into(),

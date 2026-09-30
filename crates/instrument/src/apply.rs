@@ -18,8 +18,10 @@
 //! current" from "nobody checked". The first is a healthy store confirming
 //! itself; the second is a connection that stopped working.
 
+use meridian_domain::asset_class;
 use meridian_domain::v1::{
-    Identifier as PbIdentifier, InstrumentAppliedEvent, InstrumentRecord as PbInstrument,
+    AssetClass, Identifier as PbIdentifier, InstrumentAppliedEvent,
+    InstrumentRecord as PbInstrument,
 };
 
 use crate::store::{Applied, Identifier, Instrument, Result, Store};
@@ -69,7 +71,7 @@ fn from_wire(record: &PbInstrument) -> Instrument {
             .iter()
             .map(|identifier| from_wire_identifier(identifier, record.valid_from_ns))
             .collect(),
-        asset_class: record.asset_class.clone(),
+        asset_class: asset_class_name(record.asset_class),
         currency: record.currency.clone(),
         exchange_mic: record.exchange_mic.clone(),
         description: record.description.clone(),
@@ -115,7 +117,7 @@ pub(crate) fn to_wire(instrument: &Instrument) -> PbInstrument {
                 source: identifier.source.clone(),
             })
             .collect(),
-        asset_class: instrument.asset_class.clone(),
+        asset_class: asset_class_value(&instrument.asset_class),
         currency: instrument.currency.clone(),
         exchange_mic: instrument.exchange_mic.clone(),
         description: instrument.description.clone(),
@@ -124,6 +126,20 @@ pub(crate) fn to_wire(instrument: &Instrument) -> PbInstrument {
         valid_from_ns: instrument.valid_from_ns,
         record_time_ns: instrument.record_time_ns,
     }
+}
+
+/// An asset class as the store holds it: the enum's name, or empty for none,
+/// which is what the column held before the enum and still means "no class".
+/// Text the enum does not define reads as none; nothing writes it, and
+/// [`crate::PostgresStore::migrate`] mapped what the free-text column held.
+pub(crate) fn asset_class_value(name: &str) -> i32 {
+    asset_class::read(name).unwrap_or(AssetClass::Unspecified) as i32
+}
+
+/// The inverse of [`asset_class_value`]. A number the enum does not define is
+/// none, as it is on the wire.
+pub(crate) fn asset_class_name(value: i32) -> String {
+    asset_class::name(AssetClass::try_from(value).unwrap_or(AssetClass::Unspecified)).to_string()
 }
 
 fn lifecycle_value(name: &str) -> i32 {
@@ -153,7 +169,7 @@ mod tests {
                 value: "BBG000B9XRY4".into(),
                 source: String::new(),
             }],
-            asset_class: "EQUITY".into(),
+            asset_class: AssetClass::Equity as i32,
             currency: "USD".into(),
             exchange_mic: "XNAS".into(),
             description: "Apple Inc. common stock".into(),
@@ -232,7 +248,7 @@ mod tests {
             .by_id("INS-01J8XQ4M7K0000000000AAPL")
             .unwrap()
             .unwrap();
-        assert_eq!(held.asset_class, "EQUITY");
+        assert_eq!(held.asset_class, "ASSET_CLASS_EQUITY");
         assert_eq!(held.currency, "USD");
         assert_eq!(held.exchange_mic, "XNAS");
         assert_eq!(held.description, "Apple Inc. common stock");

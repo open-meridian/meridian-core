@@ -28,6 +28,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ReportSyncStatusParams>,
     ) -> Result<Response<plugin::Published>, Status> {
         let mut message: domain::SyncStatusEvent = self.as_domain(request.into_inner())?;
+        self.known("state", message.state, domain::SyncState::try_from(message.state).is_ok())?;
         message.account_id = self.linked_account_if_any(&message.external_account_id).await?;
         self.publish_typed("platform.custody.{instance}.event.sync-status", "meridian.v1.SyncStatusEvent", message).await
     }
@@ -58,6 +59,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.exact("quantity", message.quantity.as_ref())?;
         self.exact_money("market_value", message.market_value.as_ref())?;
         self.exact("settle_date_quantity", message.settle_date_quantity.as_ref())?;
+        self.known("side", message.side, domain::HoldingSide::try_from(message.side).is_ok())?;
         message.account_id = self.linked_account(&message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
@@ -78,6 +80,8 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ReportMissingInstrumentParams>,
     ) -> Result<Response<plugin::Published>, Status> {
         let mut message: domain::MissingInstrumentDetectedEvent = self.as_domain(request.into_inner())?;
+        self.known("asset_class", message.asset_class, domain::AssetClass::try_from(message.asset_class).is_ok())?;
+        self.known("reason", message.reason, domain::MissReason::try_from(message.reason).is_ok())?;
         message.placeholder_instrument_id = Default::default();
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await

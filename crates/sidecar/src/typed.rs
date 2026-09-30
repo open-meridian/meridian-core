@@ -98,6 +98,22 @@ impl Sidecar {
         self.exact(field, value.and_then(|money| money.amount.as_ref()))
     }
 
+    /// An enum value the plugin sent, refused naming its field when the
+    /// contract does not define it: proto3 carries any number, so an asset
+    /// class of 99 would otherwise reach the bus as though it were one
+    /// (sdk-contract/asset-class-is-an-enum). The generated SDKs refuse these
+    /// before sending; this is for a plugin that built its params by hand.
+    /// Zero, the unspecified value, is defined: whether one is required is
+    /// the receiving component's to say.
+    pub(crate) fn known(&self, field: &str, value: i32, defined: bool) -> Result<(), Status> {
+        if defined {
+            return Ok(());
+        }
+        let refusal = format!("{field} is {value}, which the contract does not define");
+        self.note_refusal(&refusal);
+        Err(Status::invalid_argument(refusal))
+    }
+
     /// The topic this instance sends on: its own identifier where the row
     /// names `{instance}`, so a plugin can speak only as itself.
     fn own_topic(&self, topic: &str) -> String {

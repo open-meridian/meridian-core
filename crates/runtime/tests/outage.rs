@@ -48,7 +48,7 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
                 value: figi.clone(),
                 source: String::new(),
             }],
-            asset_class: "EQUITY".into(),
+            asset_class: meridian_domain::v1::AssetClass::Equity as i32,
             lifecycle_state: meridian_domain::v1::InstrumentLifecycleState::Active as i32,
             version: 1,
             valid_from_ns: stamp,

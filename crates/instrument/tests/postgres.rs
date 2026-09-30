@@ -57,7 +57,7 @@ fn instrument(instrument_id: &str, identifiers: Vec<Identifier>, version: i64) -
     Instrument {
         instrument_id: instrument_id.into(),
         identifiers,
-        asset_class: "EQUITY".into(),
+        asset_class: "ASSET_CLASS_EQUITY".into(),
         currency: "USD".into(),
         exchange_mic: "XNAS".into(),
         description: "Apple Inc. common stock".into(),
@@ -442,6 +442,54 @@ fn a_start_against_a_database_with_no_schema_refuses_and_names_the_fix() {
 
     store.migrate().expect("could not apply the schema");
     store.verify().expect("a migrated database must verify");
+
+    admin
+        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
+        .unwrap();
+}
+
+#[test]
+fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleared() {
+    // sdk-contract/asset-class-is-an-enum. The column held whatever the
+    // platform sent; the platform's own migration maps its master the same
+    // way, so what is held here agrees with the authority afterwards.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let scratch = format!("classes_{}", unique("t").replace('-', "_"));
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
+        .unwrap();
+    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let store = PostgresStore::connect(&scoped, 1).unwrap();
+    store.migrate().unwrap();
+
+    for (id, class) in [
+        ("INS-A", "EQUITY"),
+        ("INS-B", "ETF"),
+        ("INS-C", "REIT"),
+        ("INS-D", ""),
+        ("INS-E", "ASSET_CLASS_DEBT"),
+    ] {
+        admin
+            .execute(
+                &format!(
+                    "INSERT INTO {scratch}.instrument (instrument_id, asset_class, version, \
+                     valid_from_ns, record_time_ns) VALUES ($1, $2, 1, 0, 0)"
+                ),
+                &[&id, &class],
+            )
+            .unwrap();
+    }
+
+    store.migrate().unwrap();
+    store.migrate().expect("a second run finds nothing to do");
+
+    let class = |id: &str| store.by_id(id).unwrap().unwrap().asset_class;
+    assert_eq!(class("INS-A"), "ASSET_CLASS_EQUITY");
+    assert_eq!(class("INS-B"), "ASSET_CLASS_FUND", "an ETF is a fund");
+    assert_eq!(class("INS-C"), "", "not guessed: cleared, and reported");
+    assert_eq!(class("INS-D"), "");
+    assert_eq!(class("INS-E"), "ASSET_CLASS_DEBT");
 
     admin
         .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))

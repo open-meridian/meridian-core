@@ -22,6 +22,9 @@ package meridian.v1;
 // repository pins.
 import "meridian/v1/sidecar.proto";
 
+// The asset class a research scope names (W1.12).
+import "meridian/v1/reference.proto";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Vocabulary
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,10 +776,14 @@ message ReadDiagnosticBundleRequest {
 // The kinds of security an agent researches and populates. Empty means
 // nothing: an agent with no scope works on nothing.
 message ResearchScope {
-  repeated string asset_classes = 1;
+  repeated AssetClass asset_classes = 4;
   // Optional narrowing, by listing venue and by identifier scheme.
   repeated string venue_mics = 2;
   repeated string schemes = 3;
+
+  // Once strings, and free text; retired for the enum
+  // (sdk-contract/asset-class-is-an-enum). The name carries on above.
+  reserved 1;
 }
 
 // A record the platform owns; every authorisation of an agent reads it.
