@@ -213,7 +213,8 @@ ingress:
 
 # The dashboard: the one address staff use. Signs people in through the firm's
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
-# One replica: sessions live in memory.
+# One replica: browser sessions live in memory. Terminal sessions are kept in
+# the dashboard's own tables, so a restart leaves them standing.
 #
 # On. It was off until its sign-in had run end to end against a real
 # directory, and that is now what `make e2e-dashboard` proves on every run.

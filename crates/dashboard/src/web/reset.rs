@@ -246,7 +246,20 @@ async fn reset(
     };
 
     let browsers = app.sessions.end_person(&subject);
-    let terminals = app.terminals.end_person(&subject);
+    // The password is set by now, and what it opened is ended as far as it
+    // can be; a terminal session that could not be ended is logged loudly
+    // rather than undoing a reset the platform's code has already paid for.
+    let terminals = match app.terminals.end_person(&subject).await {
+        Ok(ended) => ended,
+        Err(unavailable) => {
+            tracing::error!(
+                login,
+                %unavailable,
+                "a password was reset and its terminal sessions could not be ended"
+            );
+            0
+        }
+    };
     app.sign_in_failures.clear(login);
     tracing::info!(
         login,

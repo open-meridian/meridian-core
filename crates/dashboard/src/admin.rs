@@ -224,7 +224,15 @@ async fn end_terminal_sessions(
         return *response;
     }
     let login = field(&fields, "login");
-    let ended = app.terminals.end_person(login);
+    let ended = match app.terminals.end_person(login).await {
+        Ok(ended) => ended,
+        Err(unavailable) => {
+            tracing::error!(login, %unavailable, "terminal sessions could not be ended");
+            return crate::web::refused(&format!(
+                "{login}'s terminal sessions were not ended: {unavailable}"
+            ));
+        }
+    };
     tracing::info!(login, ended, by = %session.subject, "terminal sessions ended");
     (
         StatusCode::SEE_OTHER,
@@ -347,7 +355,13 @@ async fn admin_page(
         ),
         Err(_) => String::new(),
     };
-    let holders = app.terminals.holders(app.clock.now_ns());
+    let holders = match app.terminals.holders(app.clock.now_ns()).await {
+        Ok(holders) => holders,
+        Err(unavailable) => {
+            tracing::error!(%unavailable, "terminal sessions could not be listed");
+            return crate::web::refused(&unavailable.to_string());
+        }
+    };
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
     let body = overview::render(&records, &holders, &lines, &token_input(&session), &notice);

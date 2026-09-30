@@ -10,11 +10,22 @@ the same shape -- a value the wizard collected and nobody read. Neither was
 caught because nothing signed anybody in on this route. This does.
 
 Phases:
-  main   -- the account first run made exists, and somebody uses it
-  locked -- and enough wrong passwords stop it being usable at all
+  main      -- the account first run made exists, and somebody uses it
+  connect   -- a terminal connects as them (W6.13), as a released CLI does
+  restarted -- after the dashboard is recreated, that terminal's session still
+               pushes and uploads a plugin, and signing out ends it
+               (kernel/terminal-sessions-survive-a-restart)
+  locked    -- and enough wrong passwords stop it being usable at all
 """
+import base64
+import hashlib
+import json
 import os
+import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Shared with the LDAP suite, which is self-contained for the same reason this
@@ -27,6 +38,8 @@ from ldap_runner import (  # noqa: E402
     form_token,
     home,
     is_admin_home,
+    recall,
+    remember,
     say,
     sign_in,
     signed_in_as,
@@ -74,6 +87,141 @@ def main_phase():
     check(admin.status == 200, f"GET /admin: {admin.status}")
 
 
+# What `meridian connect` listens on. Nothing listens here: the code is read
+# from the redirect, which is all the loopback address is for.
+BACK = "http://127.0.0.1:53682/callback"
+# The oldest release that must keep working across the change: the session it
+# holds is the same token, presented the same way.
+CLI_VERSION = "0.1.14"
+PLUGIN = "e2e-restart"
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def terminal(method, path, session, body=None, content_type=None):
+    """A request as the CLI makes one: bearer, version, no cookie."""
+    request = urllib.request.Request(dash(path), data=body, method=method)
+    request.add_header("Authorization", f"Bearer {session}")
+    request.add_header("Meridian-CLI-Version", CLI_VERSION)
+    if content_type:
+        request.add_header("Content-Type", content_type)
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        answer = opener.open(request)
+        return answer.status, answer.read().decode(errors="replace"), answer.headers
+    except urllib.error.HTTPError as refused:
+        return refused.code, refused.read().decode(errors="replace"), refused.headers
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def hidden(page, name):
+    found = re.search(rf'name="{name}" value="([^"]+)"', page.body)
+    return found.group(1) if found else ""
+
+
+def connect_phase():
+    say("E: a terminal connects as them, as `meridian connect` does")
+    verifier = b64url(os.urandom(32))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    browser = Browser()
+    asked = browser.get(dash("/terminal/authorize?" + urllib.parse.urlencode({
+        "redirect_uri": BACK,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "e2e-restart",
+    })))
+    request = hidden(asked, "terminal")
+    check(asked.status == 200 and request, f"the terminal's sign-in is the form: {asked.status}")
+
+    confirming = browser.post(dash("/sign-in"),
+                              {"name": NAME, "password": PASSWORD, "terminal": request})
+    check(confirming.status == 200 and "Connect a terminal" in confirming.body,
+          f"signed in afresh, and asked to confirm: {confirming.status}")
+    decided = browser.post(dash("/terminal/authorize"), {
+        "request": hidden(confirming, "request"),
+        "confirm": hidden(confirming, "confirm"),
+        "decision": "connect",
+    })
+    back = urllib.parse.urlparse(decided.location or "")
+    code = urllib.parse.parse_qs(back.query).get("code", [""])[0]
+    check(decided.status == 302 and code, f"the loopback address gets a code: {decided.status}")
+
+    exchanged = Browser().post(dash("/terminal/token"), {
+        "code": code, "code_verifier": verifier, "redirect_uri": BACK,
+    })
+    session = json.loads(exchanged.body).get("session", "") if exchanged.status == 200 else ""
+    check(session, f"and the CLI trades it for a session: {exchanged.status}")
+    status, body, _ = terminal("GET", "/terminal/plugins", session)
+    check(status == 200, f"which lists the catalogue: {status} {body[:200]}")
+    remember("terminal_session", session)
+
+
+def push_and_upload(session):
+    """What `meridian plugin upload` sends, through the dashboard: an image's
+    blobs and manifest to the deployment's registry, then its record."""
+    base = f"/terminal/registry/v2/plugins/{PLUGIN}"
+
+    def blob(content):
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        status, body, headers = terminal("POST", f"{base}/blobs/uploads/", session, b"")
+        location = headers.get("Location") or ""
+        check(status == 202 and location, f"a blob upload starts: {status} {body[:200]}")
+        joiner = "&" if "?" in location else "?"
+        status, body, _ = terminal("PUT", f"{location}{joiner}digest={digest}", session,
+                                   content, "application/octet-stream")
+        check(status == 201, f"and the blob is sent: {status} {body[:200]}")
+        return digest
+
+    config = json.dumps({"architecture": "amd64", "os": "linux",
+                         "rootfs": {"type": "layers", "diff_ids": []}}).encode()
+    layer = b"a layer nobody runs"
+    manifest = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": blob(config), "size": len(config)},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": blob(layer), "size": len(layer)}],
+    }).encode()
+    status, body, headers = terminal("PUT", f"{base}/manifests/0.1.0", session, manifest,
+                                     "application/vnd.oci.image.manifest.v1+json")
+    digest = headers.get("Docker-Content-Digest") or ""
+    check(status == 201 and digest, f"the manifest names them: {status} {body[:200]}")
+
+    status, body, _ = terminal("POST", "/terminal/plugins", session, json.dumps({
+        "name": PLUGIN, "version": "0.1.0", "roles": [], "interface": False,
+        "sdk_version": "0.1.0", "image_digest": digest,
+    }).encode(), "application/json")
+    return status, body
+
+
+def restarted_phase():
+    say("F: the dashboard restarted, and the terminal's session stands")
+    session = recall("terminal_session")
+    check(bool(session), "a session was kept from before the restart")
+    if not session:
+        return
+    status, body, _ = terminal("GET", "/terminal/plugins", session)
+    check(status == 200,
+          f"the session made before the restart is honoured after it: {status} {body[:200]}")
+    status, body = push_and_upload(session)
+    check(status == 201 and f'"name":"{PLUGIN}"' in body.replace(" ", ""),
+          f"and a plugin is pushed and uploaded on it: {status} {body[:200]}")
+
+    say("G: signing out ends it, and the refusal says why")
+    status, _, _ = terminal("POST", "/terminal/sign-out", session)
+    check(status == 204, f"signed out: {status}")
+    status, body, _ = terminal("GET", "/terminal/plugins", session)
+    check(status == 401 and '"reason":"ended"' in body.replace(" ", ""),
+          f"refused as ended, not as unknown: {status} {body[:200]}")
+
+
 def locked_phase():
     say("D: enough wrong passwords and the account stops being usable")
     guesser = Browser()
@@ -98,6 +246,10 @@ def main():
     wait_dashboard()
     if phase == "main":
         main_phase()
+    elif phase == "connect":
+        connect_phase()
+    elif phase == "restarted":
+        restarted_phase()
     elif phase == "locked":
         locked_phase()
     else:

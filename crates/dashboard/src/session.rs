@@ -7,8 +7,10 @@
 //! reaches a live session within the records' refresh, and a session cannot
 //! carry a stale grant.
 //!
-//! In memory, on one replica: a restart signs everyone out, which the spec
-//! accepts. Two bounds, stated in the contract (decisions/015) and not in
+//! A browser's, in memory, on one replica: a restart signs every browser
+//! out, which the spec accepts. A terminal's is kept in the dashboard's own
+//! table instead ([`crate::terminal`]), because reconnecting a terminal costs
+//! a browser, a fresh sign-in and a confirmation (W6.13). Two bounds, stated in the contract (decisions/015) and not in
 //! configuration: 30 minutes idle and 12 hours absolute. A person removed
 //! from a directory group keeps access until one of them ends the session.
 

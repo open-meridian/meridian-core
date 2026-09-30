@@ -236,12 +236,12 @@ fn answer(port: u16, path: &str) -> Option<String> {
 
 #[test]
 fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
-    // The accounts table made where the dashboard will find it, and the
+    // The dashboard's tables made where it will find them, and the
     // dashboard pointed at a port where nothing answers yet.
     let schema = scratch_schema("dashboard");
-    meridian_dashboard::accounts::InPostgres::connect(&url_for(&schema, None), 1)
-        .and_then(|store| store.migrate())
-        .expect("could not make the accounts table");
+    meridian_dashboard::database::Database::connect(&url_for(&schema, None), 1)
+        .and_then(|database| database.migrate())
+        .expect("could not make the dashboard's tables");
     let database = free_port();
     let through = url_for(&schema, Some(&format!("127.0.0.1:{database}")));
     let listen = free_port();
@@ -255,7 +255,10 @@ fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
         ],
     );
 
-    dashboard.until_said("waiting for the accounts database", Duration::from_secs(30));
+    dashboard.until_said(
+        "waiting for the dashboard's database",
+        Duration::from_secs(30),
+    );
     // Long enough to have looked again, and still waiting, not serving.
     std::thread::sleep(Duration::from_secs(5));
     assert!(
@@ -271,7 +274,7 @@ fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
 
     forward(database, database_address());
 
-    dashboard.until_said("the accounts database is there", Duration::from_secs(30));
+    dashboard.until_said("the dashboard's database is there", Duration::from_secs(30));
     dashboard.until_said("the dashboard is listening", Duration::from_secs(30));
     let first = answer(listen, "/healthz");
     assert!(

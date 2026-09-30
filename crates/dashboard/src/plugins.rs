@@ -67,7 +67,7 @@ use crate::clock::SECOND_NS;
 use crate::html::{escape, page};
 use crate::session::{token, Sessions, ABSOLUTE_NS};
 use crate::signing::Signer;
-use crate::terminal::Terminals;
+use crate::terminal::{Terminals, Unavailable};
 use crate::web::{cookie, redirect, refused, set_cookie, App, SESSION_COOKIE};
 
 /// The plugin host's own session.
@@ -103,26 +103,37 @@ pub(crate) struct Who {
 
 impl Came {
     /// The person, if the session is still live; touched, since this is
-    /// them using it.
-    fn who(&self, app: &App, now_ns: i64) -> Option<Who> {
-        match self {
+    /// them using it. An error only when a terminal's could not be asked
+    /// about, which is not the same as its having ended.
+    async fn who(&self, app: &App, now_ns: i64) -> Result<Option<Who>, Unavailable> {
+        Ok(match self {
             Came::Browser(key) => app.sessions.find(key, now_ns).map(|s| Who {
                 subject: s.subject,
                 display_name: s.display_name,
                 directory_groups: s.directory_groups,
             }),
-            Came::Terminal(hash) => app.terminals.find_hashed(hash, now_ns).ok().map(|p| Who {
-                subject: p.subject,
-                display_name: p.display_name,
-                directory_groups: p.directory_groups,
-            }),
-        }
+            Came::Terminal(hash) => app
+                .terminals
+                .find_hashed(hash, now_ns)
+                .await?
+                .ok()
+                .map(|p| Who {
+                    subject: p.subject,
+                    display_name: p.display_name,
+                    directory_groups: p.directory_groups,
+                }),
+        })
     }
 
-    fn is_live(&self, sessions: &Sessions, terminals: &Terminals, now_ns: i64) -> bool {
+    async fn is_live(
+        &self,
+        sessions: &Sessions,
+        terminals: &Terminals,
+        now_ns: i64,
+    ) -> Result<bool, Unavailable> {
         match self {
-            Came::Browser(key) => sessions.is_live(key, now_ns),
-            Came::Terminal(hash) => terminals.is_live_hashed(hash, now_ns),
+            Came::Browser(key) => Ok(sessions.is_live(key, now_ns)),
+            Came::Terminal(hash) => terminals.is_live_hashed(hash, now_ns).await,
         }
     }
 }
@@ -425,16 +436,35 @@ impl Plugins {
     }
 
     /// Forget codes past their minute and plugin sessions whose dashboard or
-    /// terminal session has ended.
-    pub fn sweep(&self, sessions: &Sessions, terminals: &Terminals, now_ns: i64) {
+    /// terminal session has ended. One whose terminal session could not be
+    /// asked about is kept for the next sweep: a database briefly away has
+    /// ended nobody's session.
+    pub async fn sweep(&self, sessions: &Sessions, terminals: &Terminals, now_ns: i64) {
         self.codes
             .lock()
             .expect("code lock poisoned")
             .retain(|_, code| code.expires_at_ns >= now_ns);
-        self.entered
+        let held: Vec<(String, Came)> = self
+            .entered
             .lock()
             .expect("entered lock poisoned")
-            .retain(|_, held| held.came.is_live(sessions, terminals, now_ns));
+            .iter()
+            .map(|(key, held)| (key.clone(), held.came.clone()))
+            .collect();
+        let mut ended = Vec::new();
+        for (key, came) in held {
+            match came.is_live(sessions, terminals, now_ns).await {
+                Ok(true) => {}
+                Ok(false) => ended.push(key),
+                Err(unavailable) => {
+                    tracing::warn!(%unavailable, "a plugin page's session was not swept");
+                }
+            }
+        }
+        let mut entered = self.entered.lock().expect("entered lock poisoned");
+        for key in ended {
+            entered.remove(&key);
+        }
     }
 }
 
@@ -744,13 +774,13 @@ fn declined(status: StatusCode, reason: impl Into<String>) -> Response {
 /// The person on a terminal session, what they hold on the plugin as opening
 /// it from the dashboard would find it (W6.9's checks, ruling 19 included),
 /// and the session a plugin-host session opened for them would end with.
-fn from_terminal(
+async fn from_terminal(
     app: &App,
     headers: &HeaderMap,
     instance: &str,
     now: i64,
 ) -> Result<(Who, Opening, Came), Box<Response>> {
-    let person = crate::web::terminal_session_of(app, headers)?;
+    let person = crate::web::terminal_session_of(app, headers).await?;
     let came = Came::Terminal(
         crate::web::bearer(headers)
             .map(|token| crate::terminal::hashed(&token))
@@ -809,7 +839,7 @@ pub(crate) async fn open_from_terminal(
     headers: HeaderMap,
 ) -> Response {
     let now = app.clock.now_ns();
-    let came = match from_terminal(&app, &headers, &instance, now) {
+    let came = match from_terminal(&app, &headers, &instance, now).await {
         Ok((_, _, came)) => came,
         Err(refusal) => return *refusal,
     };
@@ -862,7 +892,7 @@ pub(crate) async fn page_from_terminal(
     headers: HeaderMap,
 ) -> Response {
     let now = app.clock.now_ns();
-    let (who, opened) = match from_terminal(&app, &headers, &instance, now) {
+    let (who, opened) = match from_terminal(&app, &headers, &instance, now).await {
         Ok((who, opened, _)) => (who, opened),
         Err(refusal) => return *refusal,
     };
@@ -994,16 +1024,25 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
     };
 
     if request.uri().path() == ENTER_PATH {
-        return enter(app, plugins, instance, &request, now);
+        // By its address alone: a request's body is not Sync, so a borrow
+        // of the whole request cannot be held across the store's answer.
+        let uri = request.uri().clone();
+        return enter(app, plugins, instance, &uri, now).await;
     }
 
     // Whose request this is: the plugin host's session, and the dashboard or
     // terminal session it came from, still live.
     let key = cookie(app, request.headers(), PLUGIN_COOKIE);
-    let session = key
+    let came = key
         .as_deref()
-        .and_then(|key| plugins.entered(key, instance))
-        .and_then(|came| came.who(app, now));
+        .and_then(|key| plugins.entered(key, instance));
+    let session = match came {
+        Some(came) => match came.who(app, now).await {
+            Ok(who) => who,
+            Err(unavailable) => return refused(&unavailable.to_string()),
+        },
+        None => None,
+    };
     let Some(session) = session else {
         if let Some(key) = &key {
             plugins.leave(key);
@@ -1075,14 +1114,25 @@ fn again(plugins: &Plugins, instance: &str, request: &Request) -> Response {
     redirect(url.as_str())
 }
 
-fn enter(app: &App, plugins: &Plugins, instance: &str, request: &Request, now: i64) -> Response {
-    let asked = Query::<HashMap<String, String>>::try_from_uri(request.uri())
+async fn enter(
+    app: &App,
+    plugins: &Plugins,
+    instance: &str,
+    uri: &axum::http::Uri,
+    now: i64,
+) -> Response {
+    let asked = Query::<HashMap<String, String>>::try_from_uri(uri)
         .map(|Query(asked)| asked)
         .unwrap_or_default();
     let code = asked.get("code").map(String::as_str).unwrap_or_default();
-    let came = plugins
-        .redeem(code, instance, now)
-        .filter(|came| came.is_live(&app.sessions, &app.terminals, now));
+    let came = match plugins.redeem(code, instance, now) {
+        Some(came) => match came.is_live(&app.sessions, &app.terminals, now).await {
+            Ok(true) => Some(came),
+            Ok(false) => None,
+            Err(unavailable) => return refused(&unavailable.to_string()),
+        },
+        None => None,
+    };
     let Some(came) = came else {
         return said(
             StatusCode::UNAUTHORIZED,

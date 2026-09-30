@@ -187,7 +187,7 @@ struct Harness {
 }
 
 /// A terminal session, by the steps a CLI takes.
-fn terminal_session(terminals: &Terminals, subject: &str) -> String {
+async fn terminal_session(terminals: &Terminals, subject: &str) -> String {
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     const BACK: &str = "http://127.0.0.1:53682/callback";
@@ -202,6 +202,8 @@ fn terminal_session(terminals: &Terminals, subject: &str) -> String {
     let (_, code) = terminals.decide(&id, &confirm, true, T0).unwrap();
     terminals
         .exchange(&code.unwrap(), VERIFIER, BACK, T0)
+        .await
+        .expect("the store answers")
         .unwrap()
         .session
 }
@@ -214,8 +216,8 @@ async fn harness() -> Harness {
     cache.store(records(), T0);
     let terminals = Arc::new(Terminals::default());
     let sessions = Arc::new(Sessions::default());
-    let ada = terminal_session(&terminals, "local|ada");
-    let bob = terminal_session(&terminals, "local|bob");
+    let ada = terminal_session(&terminals, "local|ada").await;
+    let bob = terminal_session(&terminals, "local|bob").await;
     let browser = sessions.start("local|ada", "Ada", vec![], T0);
     let app = Arc::new(App {
         first_run: false,

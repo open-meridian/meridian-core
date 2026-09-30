@@ -136,11 +136,12 @@ test:
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
-			-p meridian-config --test postgres -p meridian-runtime --test grants --test waiting \
+			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
+			-p meridian-runtime --test grants --test waiting \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the three stores pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
+	@echo "test-store OK: the three stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -673,6 +674,11 @@ E2E_ACCOUNTS := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://
 	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
 	$(COMPOSE) --profile e2e
 
+# The deployment's plugin registry, which a terminal pushes through the
+# dashboard to: the same image the chart runs. Set only for this suite, so the
+# plugin-page suite that shares E2E_ACCOUNTS keeps serving none.
+E2E_ACCOUNTS_REGISTRY := MERIDIAN_REGISTRY_UPSTREAM=http://e2e-registry:5000 $(E2E_ACCOUNTS)
+
 e2e-dashboard-accounts: network
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
@@ -681,14 +687,17 @@ e2e-dashboard-accounts: network
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1 || true
 	@set -e; \
 	$(E2E_ACCOUNTS) build dashboard conductor >>.e2e-dashboard-accounts.log 2>&1; \
-	$(E2E_ACCOUNTS) up -d postgres nats fake-platform >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) up -d postgres nats fake-platform e2e-registry >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T dashboard meridian-dashboard migrate >>.e2e-dashboard-accounts.log 2>&1; \
-	$(E2E_ACCOUNTS) up -d conductor dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS_REGISTRY) up -d conductor dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner main; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner connect; \
+	$(E2E_ACCOUNTS_REGISTRY) up -d --force-recreate --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner restarted; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
-	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, and enough wrong passwords stop it"
+	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, a terminal's session outlives a dashboard restart and uploads a plugin, and enough wrong passwords stop it"
 
 # A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
 # of their own: the account branch's dashboard, holding a key made as the

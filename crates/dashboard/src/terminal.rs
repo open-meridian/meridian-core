@@ -5,7 +5,7 @@
 //! signs in afresh -- never on a browser session they already hold -- and
 //! confirms; the browser is sent back to the loopback address with a one-time
 //! code; the CLI exchanges the code, with its verifier, for a session of its
-//! own (RFC 8252). This module is that exchange's memory, and nothing about
+//! own (RFC 8252). This module is that exchange's state, and nothing about
 //! HTTP.
 //!
 //! Three things are held, each bounded so that nobody can fill this process
@@ -17,23 +17,32 @@
 //! - **Codes**: 60 seconds, spent by their first use. A code presented twice
 //!   ends the session its first use made, because the only way to present it
 //!   twice is for somebody else to have it too.
-//! - **Sessions**: decisions/015's bounds, counted from the sign-in. Held by
-//!   the SHA-256 of the token and never the token, so a dump of this process
-//!   signs nobody in. What ended a session is remembered until it would have
-//!   lapsed anyway, so the CLI can say which.
+//! - **Sessions**: decisions/015's bounds, counted from the sign-in. Kept by
+//!   the SHA-256 of the token and never the token, so a dump signs nobody in;
+//!   and kept in the dashboard's own table in the deployment's database
+//!   ([`TerminalSessions`]), so a restart or an upgrade leaves them standing
+//!   and ending one ends it on every replica (W6.13, ruled 2026-09-30). What
+//!   ended a session is kept beside it until it would have lapsed anyway, so
+//!   the CLI can say which.
+//!
+//! Requests and codes stay in memory: minutes long, so a restart during one
+//! costs a retry rather than a session.
 //!
 //! A session names a person and nothing they may do. Access is evaluated per
 //! request from the records, exactly as a browser's is.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::clock::{MINUTE_NS, SECOND_NS};
-use crate::session::{token, ABSOLUTE_NS, IDLE_NS};
+use crate::session::{token, ABSOLUTE_NS};
+
+mod sessions;
+pub use sessions::{InMemory, InPostgres, TerminalSessions};
 
 /// How long a terminal's request waits for somebody to sign in and confirm.
 pub const REQUEST_NS: i64 = 10 * MINUTE_NS;
@@ -78,7 +87,7 @@ pub enum Refusal {
     Lapsed,
     /// Signed out, or ended by a deployment admin.
     Ended,
-    /// Never issued here -- or issued before this dashboard restarted.
+    /// Never issued here, or gone long enough that why no longer matters.
     Unknown,
 }
 
@@ -171,7 +180,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// A terminal session's key in this store.
+/// A terminal session's key where it is kept.
 pub fn hashed(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
@@ -192,11 +201,8 @@ struct Code {
     redeemed: Option<String>,
 }
 
-struct Held {
-    person: Person,
-    last_seen_at_ns: i64,
-}
-
+/// What is held only in this process: minutes long at most, so a restart
+/// during one costs a retry, not a session.
 #[derive(Default)]
 struct Inner {
     waiting: HashMap<String, Waiting>,
@@ -206,19 +212,56 @@ struct Inner {
     /// browser's.
     by_provider_state: HashMap<String, String>,
     codes: HashMap<String, Code>,
-    sessions: HashMap<String, Held>,
-    /// Why a session ended, until it would have lapsed anyway.
-    gone: HashMap<String, (Refusal, i64)>,
 }
 
-#[derive(Default)]
+/// The store could not be asked. Said as a 503, never as a refusal of the
+/// session: a CLI told its session is unknown tells its person to sign in
+/// again, which a database that is briefly away does not call for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable(pub String);
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "terminal sessions could not be read: {}", self.0)
+    }
+}
+
 pub struct Terminals {
     inner: Mutex<Inner>,
+    sessions: Arc<dyn TerminalSessions>,
+}
+
+impl Default for Terminals {
+    /// Sessions in memory: for tests, and a dashboard given no database.
+    fn default() -> Self {
+        Self::keeping(Arc::new(InMemory::default()))
+    }
 }
 
 impl Terminals {
+    /// Sessions kept in `sessions`; everything else in memory.
+    pub fn keeping(sessions: Arc<dyn TerminalSessions>) -> Self {
+        Self {
+            inner: Mutex::default(),
+            sessions,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("terminal lock poisoned")
+    }
+
+    /// Ask the session store, off the async runtime: the store may be the
+    /// blocking Postgres client, which panics when used on it.
+    async fn stored<T: Send + 'static>(
+        &self,
+        ask: impl FnOnce(&dyn TerminalSessions) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, Unavailable> {
+        let sessions = Arc::clone(&self.sessions);
+        tokio::task::spawn_blocking(move || ask(sessions.as_ref()))
+            .await
+            .map_err(|failed| Unavailable(failed.to_string()))?
+            .map_err(Unavailable)
     }
 
     /// Hold a checked request, and return the id the sign-in carries.
@@ -317,41 +360,62 @@ impl Terminals {
 
     /// Trade a code for a session. Every refusal is the same refusal, as
     /// RFC 6749 has it; which check failed is for the log.
-    pub fn exchange(
+    pub async fn exchange(
         &self,
         code: &str,
         verifier: &str,
         redirect_uri: &str,
         now_ns: i64,
-    ) -> Result<Issued, &'static str> {
+    ) -> Result<Result<Issued, &'static str>, Unavailable> {
+        let decided = self.redeem(code, verifier, redirect_uri, now_ns);
+        match decided {
+            Redeemed::Refused(why) => Ok(Err(why)),
+            Redeemed::Twice(first) => {
+                // Presented twice. Somebody else has it, so what it bought
+                // is theirs too, and ends.
+                self.stored(move |sessions| sessions.end(&first)).await?;
+                Ok(Err("code used twice; the session it made is ended"))
+            }
+            Redeemed::Issued {
+                key,
+                person,
+                issued,
+            } => {
+                self.stored(move |sessions| sessions.keep(&key, &person, now_ns))
+                    .await?;
+                Ok(Ok(issued))
+            }
+        }
+    }
+
+    /// The part of an exchange held in memory, decided under the lock and
+    /// before anything is asked of the store.
+    fn redeem(&self, code: &str, verifier: &str, redirect_uri: &str, now_ns: i64) -> Redeemed {
         let mut inner = self.lock();
         let Some(held) = inner.codes.get(code) else {
-            return Err("unknown code");
+            return Redeemed::Refused("unknown code");
         };
         if let Some(first) = held.redeemed.clone() {
-            // Presented twice. Somebody else has it, so what it bought is
-            // theirs too, and ends.
-            let signed_in_at_ns = held.person.signed_in_at_ns;
-            inner.sessions.remove(&first);
-            inner
-                .gone
-                .insert(first, (Refusal::Ended, signed_in_at_ns + ABSOLUTE_NS));
-            return Err("code used twice; the session it made is ended");
+            return Redeemed::Twice(first);
         }
         let held = inner.codes.remove(code).expect("found above");
         if now_ns - held.issued_at_ns > CODE_NS {
-            return Err("code expired");
+            return Redeemed::Refused("code expired");
         }
         if held.request.redirect_uri != redirect_uri {
-            return Err("redirect_uri differs from the one the code was issued to");
+            return Redeemed::Refused("redirect_uri differs from the one the code was issued to");
         }
         if !verifies(verifier, &held.request.challenge) {
-            return Err("verifier does not match the challenge");
+            return Redeemed::Refused("verifier does not match the challenge");
         }
         let session = token();
         let key = hashed(&session);
-        let expires_at_ns = held.person.signed_in_at_ns + ABSOLUTE_NS;
-        let subject = held.person.subject.clone();
+        let person = held.person.clone();
+        let issued = Issued {
+            session,
+            subject: person.subject.clone(),
+            expires_at_ns: person.signed_in_at_ns + ABSOLUTE_NS,
+        };
         inner.codes.insert(
             code.to_string(),
             Code {
@@ -359,136 +423,91 @@ impl Terminals {
                 ..held
             },
         );
-        let person = inner.codes[code].person.clone();
-        inner.sessions.insert(
+        Redeemed::Issued {
             key,
-            Held {
-                person,
-                last_seen_at_ns: now_ns,
-            },
-        );
-        Ok(Issued {
-            session,
-            subject,
-            expires_at_ns,
-        })
+            person,
+            issued,
+        }
     }
 
     /// The person behind a session, touched; or why not.
-    pub fn find(&self, session: &str, now_ns: i64) -> Result<Person, Refusal> {
-        self.find_hashed(&hashed(session), now_ns)
+    pub async fn find(
+        &self,
+        session: &str,
+        now_ns: i64,
+    ) -> Result<Result<Person, Refusal>, Unavailable> {
+        self.find_hashed(&hashed(session), now_ns).await
     }
 
     /// Whether a session is live, by its hash, without touching it: for a
     /// sweep, which is not somebody using it.
-    pub fn is_live_hashed(&self, key: &str, now_ns: i64) -> bool {
-        self.lock().sessions.get(key).is_some_and(|held| {
-            now_ns - held.last_seen_at_ns <= IDLE_NS
-                && now_ns - held.person.signed_in_at_ns <= ABSOLUTE_NS
-        })
+    pub async fn is_live_hashed(&self, key: &str, now_ns: i64) -> Result<bool, Unavailable> {
+        let key = key.to_string();
+        self.stored(move |sessions| sessions.is_live(&key, now_ns))
+            .await
     }
 
-    /// As `find`, by the hash this store keys a session by: what a plugin
-    /// host's session opened from a terminal holds of it (W6.15), so the
-    /// token itself is still kept nowhere.
-    pub fn find_hashed(&self, key: &str, now_ns: i64) -> Result<Person, Refusal> {
+    /// As `find`, by the hash sessions are kept by: what a plugin host's
+    /// session opened from a terminal holds of it (W6.15), so the token
+    /// itself is still kept nowhere.
+    pub async fn find_hashed(
+        &self,
+        key: &str,
+        now_ns: i64,
+    ) -> Result<Result<Person, Refusal>, Unavailable> {
         let key = key.to_string();
-        let mut inner = self.lock();
-        if let Some(held) = inner.sessions.get_mut(&key) {
-            let idle = now_ns - held.last_seen_at_ns > IDLE_NS;
-            let old = now_ns - held.person.signed_in_at_ns > ABSOLUTE_NS;
-            if !(idle || old) {
-                held.last_seen_at_ns = now_ns;
-                return Ok(held.person.clone());
-            }
-            let until = held.person.signed_in_at_ns + ABSOLUTE_NS;
-            inner.sessions.remove(&key);
-            inner.gone.insert(key, (Refusal::Lapsed, until));
-            return Err(Refusal::Lapsed);
-        }
-        Err(inner
-            .gone
-            .get(&key)
-            .map(|(why, _)| *why)
-            .unwrap_or(Refusal::Unknown))
+        self.stored(move |sessions| sessions.find(&key, now_ns))
+            .await
     }
 
     /// `meridian sign-out`. Ending a session that has already gone is not
     /// an error: the CLI forgets it either way.
-    pub fn end(&self, session: &str) {
+    pub async fn end(&self, session: &str) -> Result<(), Unavailable> {
         let key = hashed(session);
-        let mut inner = self.lock();
-        if let Some(held) = inner.sessions.remove(&key) {
-            let until = held.person.signed_in_at_ns + ABSOLUTE_NS;
-            inner.gone.insert(key, (Refusal::Ended, until));
-        }
+        self.stored(move |sessions| sessions.end(&key)).await
     }
 
     /// End every terminal session a person holds, and say how many.
-    pub fn end_person(&self, subject: &str) -> usize {
-        let mut inner = self.lock();
-        let theirs: Vec<String> = inner
-            .sessions
-            .iter()
-            .filter(|(_, held)| held.person.subject == subject)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in &theirs {
-            let held = inner.sessions.remove(key).expect("listed above");
-            let until = held.person.signed_in_at_ns + ABSOLUTE_NS;
-            inner.gone.insert(key.clone(), (Refusal::Ended, until));
-        }
-        theirs.len()
+    pub async fn end_person(&self, subject: &str) -> Result<usize, Unavailable> {
+        let subject = subject.to_string();
+        self.stored(move |sessions| sessions.end_person(&subject))
+            .await
     }
 
     /// Who holds a live terminal session, how many, by name -- for the admin
     /// page. Nothing about the sessions themselves.
-    pub fn holders(&self, now_ns: i64) -> Vec<(String, String, usize)> {
-        let inner = self.lock();
-        let mut counted: HashMap<&str, (&str, usize)> = HashMap::new();
-        for held in inner.sessions.values() {
-            let live = now_ns - held.last_seen_at_ns <= IDLE_NS
-                && now_ns - held.person.signed_in_at_ns <= ABSOLUTE_NS;
-            if live {
-                counted
-                    .entry(held.person.subject.as_str())
-                    .or_insert((held.person.display_name.as_str(), 0))
-                    .1 += 1;
-            }
-        }
-        let mut holders: Vec<_> = counted
-            .into_iter()
-            .map(|(subject, (name, n))| (subject.to_string(), name.to_string(), n))
-            .collect();
-        holders.sort();
-        holders
+    pub async fn holders(&self, now_ns: i64) -> Result<Vec<(String, String, usize)>, Unavailable> {
+        self.stored(move |sessions| sessions.holders(now_ns)).await
     }
 
     /// Forget everything past its bound.
-    pub fn sweep(&self, now_ns: i64) {
-        let mut inner = self.lock();
-        inner
-            .waiting
-            .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
-        let waiting: std::collections::HashSet<String> = inner.waiting.keys().cloned().collect();
-        inner.by_provider_state.retain(|_, id| waiting.contains(id));
-        inner
-            .codes
-            .retain(|_, c| now_ns - c.issued_at_ns <= CODE_NS);
-        let mut lapsed = Vec::new();
-        inner.sessions.retain(|key, held| {
-            let live = now_ns - held.last_seen_at_ns <= IDLE_NS
-                && now_ns - held.person.signed_in_at_ns <= ABSOLUTE_NS;
-            if !live {
-                lapsed.push((key.clone(), held.person.signed_in_at_ns + ABSOLUTE_NS));
-            }
-            live
-        });
-        for (key, until) in lapsed {
-            inner.gone.insert(key, (Refusal::Lapsed, until));
+    pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
+        {
+            let mut inner = self.lock();
+            inner
+                .waiting
+                .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
+            let waiting: std::collections::HashSet<String> =
+                inner.waiting.keys().cloned().collect();
+            inner.by_provider_state.retain(|_, id| waiting.contains(id));
+            inner
+                .codes
+                .retain(|_, c| now_ns - c.issued_at_ns <= CODE_NS);
         }
-        inner.gone.retain(|_, (_, until)| now_ns <= *until);
+        self.stored(move |sessions| sessions.sweep(now_ns)).await
     }
+}
+
+/// What the in-memory half of an exchange decided.
+enum Redeemed {
+    Refused(&'static str),
+    /// Presented before: the session its first use made, by hash.
+    Twice(String),
+    Issued {
+        key: String,
+        person: Person,
+        issued: Issued,
+    },
 }
 
 /// A moment as RFC 3339 in UTC, to the second. Here rather than a date

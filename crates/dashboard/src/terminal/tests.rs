@@ -1,4 +1,6 @@
 use super::*;
+use crate::clock::MINUTE_NS;
+use crate::session::IDLE_NS;
 
 const T0: i64 = 1_790_380_800_000_000_000;
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -78,51 +80,83 @@ fn a_request_is_refused_before_anybody_signs_in_to_it() {
     assert!(check(BACK, CHALLENGE, "S256", &"s".repeat(257)).is_err());
 }
 
-#[test]
-fn a_confirmed_request_is_exchanged_once_for_a_session_counted_from_the_sign_in() {
+#[tokio::test]
+async fn a_confirmed_request_is_exchanged_once_for_a_session_counted_from_the_sign_in() {
     let terminals = Terminals::default();
     let code = code_at(&terminals, T0);
     let issued = terminals
         .exchange(&code, VERIFIER, BACK, T0 + SECOND_NS)
+        .await
+        .unwrap()
         .expect("exchanged");
     assert_eq!(issued.subject, "local|ada");
     assert_eq!(issued.expires_at_ns, T0 + ABSOLUTE_NS, "from the sign-in");
     assert_eq!(
-        terminals.find(&issued.session, T0 + 2 * SECOND_NS),
+        terminals
+            .find(&issued.session, T0 + 2 * SECOND_NS)
+            .await
+            .unwrap(),
         Ok(ada(T0))
     );
 }
 
-#[test]
-fn a_code_used_twice_ends_the_session_its_first_use_made() {
+#[tokio::test]
+async fn a_code_used_twice_ends_the_session_its_first_use_made() {
     let terminals = Terminals::default();
     let code = code_at(&terminals, T0);
-    let issued = terminals.exchange(&code, VERIFIER, BACK, T0).unwrap();
-    assert!(terminals.exchange(&code, VERIFIER, BACK, T0).is_err());
-    assert_eq!(terminals.find(&issued.session, T0), Err(Refusal::Ended));
+    let issued = terminals
+        .exchange(&code, VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(terminals
+        .exchange(&code, VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        terminals.find(&issued.session, T0).await.unwrap(),
+        Err(Refusal::Ended)
+    );
 }
 
-#[test]
-fn a_code_is_spent_by_a_wrong_verifier_or_address_and_lapses_after_a_minute() {
+#[tokio::test]
+async fn a_code_is_spent_by_a_wrong_verifier_or_address_and_lapses_after_a_minute() {
     let terminals = Terminals::default();
 
     let code = code_at(&terminals, T0);
     let wrong = "x".repeat(43);
-    assert!(terminals.exchange(&code, &wrong, BACK, T0).is_err());
+    assert!(terminals
+        .exchange(&code, &wrong, BACK, T0)
+        .await
+        .unwrap()
+        .is_err());
     assert!(
-        terminals.exchange(&code, VERIFIER, BACK, T0).is_err(),
+        terminals
+            .exchange(&code, VERIFIER, BACK, T0)
+            .await
+            .unwrap()
+            .is_err(),
         "one wrong guess spends it; there is no second"
     );
 
     let code = code_at(&terminals, T0);
     assert!(terminals
         .exchange(&code, VERIFIER, "http://127.0.0.1:1/callback", T0)
+        .await
+        .unwrap()
         .is_err());
-    assert!(terminals.exchange(&code, VERIFIER, BACK, T0).is_err());
+    assert!(terminals
+        .exchange(&code, VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .is_err());
 
     let code = code_at(&terminals, T0);
     assert!(terminals
         .exchange(&code, VERIFIER, BACK, T0 + CODE_NS + 1)
+        .await
+        .unwrap()
         .is_err());
 }
 
@@ -177,96 +211,281 @@ fn requests_nobody_finishes_cannot_fill_the_dashboard() {
     );
 }
 
-#[test]
-fn a_session_lapses_idle_or_old_and_says_which() {
+#[tokio::test]
+async fn a_session_lapses_idle_or_old_and_says_which() {
     let terminals = Terminals::default();
     let code = code_at(&terminals, T0);
-    let idle = terminals.exchange(&code, VERIFIER, BACK, T0).unwrap();
+    let idle = terminals
+        .exchange(&code, VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        terminals.find(&idle.session, T0 + IDLE_NS + 1),
+        terminals
+            .find(&idle.session, T0 + IDLE_NS + 1)
+            .await
+            .unwrap(),
         Err(Refusal::Lapsed)
     );
     assert_eq!(
-        terminals.find(&idle.session, T0 + IDLE_NS + 2),
+        terminals
+            .find(&idle.session, T0 + IDLE_NS + 2)
+            .await
+            .unwrap(),
         Err(Refusal::Lapsed),
         "and keeps saying so"
     );
 
     let code = code_at(&terminals, T0);
-    let used = terminals.exchange(&code, VERIFIER, BACK, T0).unwrap();
+    let used = terminals
+        .exchange(&code, VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
     let mut now = T0;
     while now + 20 * MINUTE_NS <= T0 + ABSOLUTE_NS {
         now += 20 * MINUTE_NS;
-        assert!(terminals.find(&used.session, now).is_ok());
+        assert!(terminals.find(&used.session, now).await.unwrap().is_ok());
     }
     assert_eq!(
-        terminals.find(&used.session, T0 + ABSOLUTE_NS + 1),
+        terminals
+            .find(&used.session, T0 + ABSOLUTE_NS + 1)
+            .await
+            .unwrap(),
         Err(Refusal::Lapsed)
     );
 }
 
-#[test]
-fn signing_out_and_an_admin_ending_them_both_read_as_ended() {
+#[tokio::test]
+async fn signing_out_and_an_admin_ending_them_both_read_as_ended() {
     let terminals = Terminals::default();
     let one = terminals
         .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
         .unwrap();
-    terminals.end(&one.session);
-    assert_eq!(terminals.find(&one.session, T0), Err(Refusal::Ended));
-    terminals.end(&one.session);
+    terminals.end(&one.session).await.unwrap();
+    assert_eq!(
+        terminals.find(&one.session, T0).await.unwrap(),
+        Err(Refusal::Ended)
+    );
+    terminals.end(&one.session).await.unwrap();
 
     let two = terminals
         .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
         .unwrap();
     let three = terminals
         .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(
-        terminals.holders(T0),
+        terminals.holders(T0).await.unwrap(),
         vec![("local|ada".into(), "Ada".into(), 2)]
     );
     assert_eq!(
-        terminals.end_person("local|ada"),
+        terminals.end_person("local|ada").await.unwrap(),
         2,
         "all of them, per person"
     );
-    assert_eq!(terminals.find(&two.session, T0), Err(Refusal::Ended));
-    assert_eq!(terminals.find(&three.session, T0), Err(Refusal::Ended));
-    assert!(terminals.holders(T0).is_empty());
-    assert_eq!(terminals.find("never-issued", T0), Err(Refusal::Unknown));
+    assert_eq!(
+        terminals.find(&two.session, T0).await.unwrap(),
+        Err(Refusal::Ended)
+    );
+    assert_eq!(
+        terminals.find(&three.session, T0).await.unwrap(),
+        Err(Refusal::Ended)
+    );
+    assert!(terminals.holders(T0).await.unwrap().is_empty());
+    assert_eq!(
+        terminals.find("never-issued", T0).await.unwrap(),
+        Err(Refusal::Unknown)
+    );
 }
 
-#[test]
-fn only_a_hash_of_a_session_is_held() {
-    let terminals = Terminals::default();
+/// Terminals over a store the test can look into, as a dashboard's state
+/// over the database it keeps sessions in.
+fn over(store: &Arc<InMemory>) -> Terminals {
+    Terminals::keeping(Arc::clone(store) as Arc<dyn TerminalSessions>)
+}
+
+#[tokio::test]
+async fn only_a_hash_of_a_session_is_kept() {
+    let store = Arc::new(InMemory::default());
+    let terminals = over(&store);
     let issued = terminals
         .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
         .unwrap();
-    let inner = terminals.lock();
-    assert!(!inner.sessions.contains_key(&issued.session));
-    assert!(inner.sessions.contains_key(&hashed(&issued.session)));
+    let (sessions, _) = store.keys();
+    assert_eq!(sessions, vec![hashed(&issued.session)]);
+    assert!(!sessions.contains(&issued.session));
 }
 
-#[test]
-fn a_sweep_forgets_what_is_past_its_bound_and_why_it_ended_once_that_no_longer_matters() {
-    let terminals = Terminals::default();
+#[tokio::test]
+async fn a_sweep_forgets_what_is_past_its_bound_and_why_it_ended_once_that_no_longer_matters() {
+    let store = Arc::new(InMemory::default());
+    let terminals = over(&store);
     let open = terminals.open(request(), T0);
     terminals.through_provider("provider-state", &open);
     let issued = terminals
         .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
         .unwrap();
-    terminals.end(&issued.session);
+    terminals.end(&issued.session).await.unwrap();
 
-    terminals.sweep(T0 + REQUEST_NS + 1);
-    let inner = terminals.lock();
-    assert!(inner.waiting.is_empty());
-    assert!(inner.by_provider_state.is_empty());
-    assert!(inner.codes.is_empty());
-    assert_eq!(inner.gone.len(), 1, "still within its 12 hours");
-    drop(inner);
+    terminals.sweep(T0 + REQUEST_NS + 1).await.unwrap();
+    {
+        let inner = terminals.lock();
+        assert!(inner.waiting.is_empty());
+        assert!(inner.by_provider_state.is_empty());
+        assert!(inner.codes.is_empty());
+    }
+    assert_eq!(
+        store.keys().1.len(),
+        1,
+        "why it ended, still within its 12 hours"
+    );
 
-    terminals.sweep(T0 + ABSOLUTE_NS + 1);
-    assert!(terminals.lock().gone.is_empty());
+    terminals.sweep(T0 + ABSOLUTE_NS + 1).await.unwrap();
+    assert!(store.keys().1.is_empty());
+}
+
+#[tokio::test]
+async fn a_sweep_removes_a_lapsed_session_and_keeps_saying_why() {
+    let store = Arc::new(InMemory::default());
+    let terminals = over(&store);
+    let idle = terminals
+        .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
+    terminals.sweep(T0 + IDLE_NS + 1).await.unwrap();
+    assert!(store.keys().0.is_empty(), "the session is gone");
+    assert_eq!(
+        terminals
+            .find(&idle.session, T0 + IDLE_NS + 2)
+            .await
+            .unwrap(),
+        Err(Refusal::Lapsed),
+        "and why is kept"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_session_met_on_use_is_refused_and_removed_then() {
+    let store = Arc::new(InMemory::default());
+    let terminals = over(&store);
+    let issued = terminals
+        .exchange(&code_at(&terminals, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminals
+            .find(&issued.session, T0 + IDLE_NS + 1)
+            .await
+            .unwrap(),
+        Err(Refusal::Lapsed)
+    );
+    let (sessions, gone) = store.keys();
+    assert!(
+        sessions.is_empty(),
+        "removed on use, not left for the sweep"
+    );
+    assert_eq!(gone, vec![hashed(&issued.session)]);
+}
+
+#[tokio::test]
+async fn a_session_outlives_the_dashboard_state_that_issued_it() {
+    // A restart, as far as a session can tell: everything held in memory
+    // gone, the store the same.
+    let store = Arc::new(InMemory::default());
+    let before = over(&store);
+    let issued = before
+        .exchange(&code_at(&before, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(before);
+
+    let after = over(&store);
+    assert_eq!(
+        after.find(&issued.session, T0 + MINUTE_NS).await.unwrap(),
+        Ok(ada(T0))
+    );
+    // The bounds carry across it too: still 12 hours from the sign-in, and
+    // idle counted from the last use, whichever state saw it.
+    assert_eq!(
+        after
+            .find(&issued.session, T0 + MINUTE_NS + IDLE_NS)
+            .await
+            .unwrap(),
+        Ok(ada(T0))
+    );
+    assert_eq!(
+        after
+            .find(&issued.session, T0 + ABSOLUTE_NS + 1)
+            .await
+            .unwrap(),
+        Err(Refusal::Lapsed)
+    );
+}
+
+#[tokio::test]
+async fn signing_out_on_one_dashboard_ends_the_session_on_another() {
+    let store = Arc::new(InMemory::default());
+    let one = over(&store);
+    let other = over(&store);
+    let issued = one
+        .exchange(&code_at(&one, T0), VERIFIER, BACK, T0)
+        .await
+        .unwrap()
+        .unwrap();
+    other.end(&issued.session).await.unwrap();
+    assert_eq!(
+        one.find(&issued.session, T0).await.unwrap(),
+        Err(Refusal::Ended)
+    );
+}
+
+/// A store that cannot be asked, as a database that is away.
+struct Away;
+
+impl TerminalSessions for Away {
+    fn keep(&self, _: &str, _: &Person, _: i64) -> Result<(), String> {
+        Err("away".into())
+    }
+    fn find(&self, _: &str, _: i64) -> Result<Result<Person, Refusal>, String> {
+        Err("away".into())
+    }
+    fn is_live(&self, _: &str, _: i64) -> Result<bool, String> {
+        Err("away".into())
+    }
+    fn end(&self, _: &str) -> Result<(), String> {
+        Err("away".into())
+    }
+    fn end_person(&self, _: &str) -> Result<usize, String> {
+        Err("away".into())
+    }
+    fn holders(&self, _: i64) -> Result<Vec<(String, String, usize)>, String> {
+        Err("away".into())
+    }
+    fn sweep(&self, _: i64) -> Result<(), String> {
+        Err("away".into())
+    }
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_be_asked_is_unavailable_and_never_a_refusal() {
+    let terminals = Terminals::keeping(Arc::new(Away));
+    let code = code_at(&terminals, T0);
+    assert!(terminals.exchange(&code, VERIFIER, BACK, T0).await.is_err());
+    assert!(terminals.find("anything", T0).await.is_err());
 }
 
 #[test]

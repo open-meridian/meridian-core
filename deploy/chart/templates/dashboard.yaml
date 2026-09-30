@@ -7,13 +7,15 @@
   refuses to serve a directory without one rather than guessing.
 */}}
 {{- if gt (int .Values.dashboard.replicaCount) 1 }}
-{{- fail "dashboard.replicaCount must be 1: sessions live in the dashboard's memory, and a second replica would sign people out at random" }}
+{{- fail "dashboard.replicaCount must be 1: browser sessions live in the dashboard's memory, and a second replica would sign people out at random" }}
 {{- end }}
 {{/*
   The dashboard: the one address a firm's staff use. It signs people in
-  through the firm's directory, holds no deployment key and no database, and
-  reads who may do what from the conductor over the broker, as the instance
-  dashboard.instanceId with the admin role's grants.
+  through the firm's directory, holds no deployment key, keeps terminal
+  sessions (and, on one branch, accounts) in tables of its own in the
+  deployment's database, and reads who may do what from the conductor over
+  the broker, as the instance dashboard.instanceId with the admin role's
+  grants.
   spec/deployment-dashboard-and-access.
 */}}
 apiVersion: apps/v1
@@ -120,9 +122,10 @@ spec:
                   key: administrator-display-name
                   optional: true
             # Whether this deployment holds its accounts at all, which first
-            # run says; and where, which is the database every deployment has,
-            # as the role the components serve as. The address alone decides
-            # nothing, because every branch has one.
+            # run says; and the dashboard's tables, in the database every
+            # deployment has, as the role the components serve as. The address
+            # alone decides nothing about accounts, because every branch has
+            # one: every branch keeps its terminal sessions there.
             - name: MERIDIAN_LOCAL_ACCOUNTS
               valueFrom:
                 secretKeyRef:

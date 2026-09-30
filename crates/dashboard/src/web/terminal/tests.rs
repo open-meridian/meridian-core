@@ -36,7 +36,7 @@ fn routes(app: Arc<App>) -> Router {
     router(app).route(
         "/terminal/probe",
         get(move |headers: HeaderMap| async move {
-            match terminal_session_of(&probed, &headers) {
+            match terminal_session_of(&probed, &headers).await {
                 Ok(person) => person.subject.into_response(),
                 Err(refusal) => *refusal,
             }
@@ -333,6 +333,101 @@ async fn signing_out_ends_the_session_and_the_terminal_is_told_why() {
         again.status(),
         StatusCode::NO_CONTENT,
         "the CLI forgets it either way"
+    );
+}
+
+/// Ada's dashboard, keeping terminal sessions in `store`: two of these over
+/// one store are a dashboard before and after a restart, or two replicas.
+fn over(store: &Arc<crate::terminal::InMemory>) -> Arc<App> {
+    let app = app_holding_ada();
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.terminals = Arc::new(crate::terminal::Terminals::keeping(
+        Arc::clone(store) as Arc<dyn crate::terminal::TerminalSessions>
+    ));
+    Arc::new(built)
+}
+
+#[tokio::test]
+async fn a_session_made_before_a_restart_is_honoured_after_it_and_ends_everywhere() {
+    let store = Arc::new(crate::terminal::InMemory::default());
+    let before = over(&store);
+    let session = connected(&before).await;
+
+    // Everything the dashboard held in memory is new; the store is not.
+    let after = over(&store);
+    assert_eq!(
+        probe(&after, Some(&session), None).await,
+        (StatusCode::OK, "local|ada".into())
+    );
+
+    let out = send(
+        &after,
+        Request::post("/terminal/sign-out")
+            .header(AUTHORIZATION, format!("Bearer {session}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(out.status(), StatusCode::NO_CONTENT);
+    let (status, body) = probe(&before, Some(&session), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body,
+        serde_json::json!({"error": "invalid_token", "reason": "ended"}).to_string(),
+        "ended on the other dashboard too, and it says so"
+    );
+}
+
+struct Away;
+
+impl crate::terminal::TerminalSessions for Away {
+    fn keep(&self, _: &str, _: &Person, _: i64) -> Result<(), String> {
+        Err("away".into())
+    }
+    fn find(&self, _: &str, _: i64) -> Result<Result<Person, Refusal>, String> {
+        Err("away".into())
+    }
+    fn is_live(&self, _: &str, _: i64) -> Result<bool, String> {
+        Err("away".into())
+    }
+    fn end(&self, _: &str) -> Result<(), String> {
+        Err("away".into())
+    }
+    fn end_person(&self, _: &str) -> Result<usize, String> {
+        Err("away".into())
+    }
+    fn holders(&self, _: i64) -> Result<Vec<(String, String, usize)>, String> {
+        Err("away".into())
+    }
+    fn sweep(&self, _: i64) -> Result<(), String> {
+        Err("away".into())
+    }
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_be_asked_is_a_503_so_nobody_is_told_to_sign_in_again() {
+    let app = app_holding_ada();
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.terminals = Arc::new(crate::terminal::Terminals::keeping(Arc::new(Away)));
+    let app = Arc::new(built);
+
+    let (status, body) = probe(&app, Some("a-session"), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("temporarily_unavailable"), "{body}");
+    assert!(!body.contains("invalid_token"), "{body}");
+
+    let out = send(
+        &app,
+        Request::post("/terminal/sign-out")
+            .header(AUTHORIZATION, "Bearer a-session")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        out.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not ended, and not said to be"
     );
 }
 

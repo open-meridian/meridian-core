@@ -244,8 +244,16 @@ async fn exchange(State(app): State<Arc<App>>, Form(asked): Form<Exchanged>) -> 
     match app
         .terminals
         .exchange(&asked.code, &asked.code_verifier, &asked.redirect_uri, now)
+        .await
     {
-        Ok(issued) => {
+        Err(unavailable) => {
+            tracing::error!(%unavailable, "a terminal code could not be exchanged");
+            json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": "temporarily_unavailable", "error_description": unavailable.to_string()}),
+            )
+        }
+        Ok(Ok(issued)) => {
             tracing::info!(subject = %issued.subject, "a terminal session began");
             json(
                 StatusCode::OK,
@@ -259,7 +267,7 @@ async fn exchange(State(app): State<Arc<App>>, Form(asked): Form<Exchanged>) -> 
         }
         // One refusal whatever the reason, as RFC 6749 has it; the reason
         // is for whoever reads the log.
-        Err(why) => {
+        Ok(Err(why)) => {
             tracing::info!(why, "a terminal code was refused");
             json(
                 StatusCode::BAD_REQUEST,
@@ -270,21 +278,37 @@ async fn exchange(State(app): State<Arc<App>>, Form(asked): Form<Exchanged>) -> 
 }
 
 /// `meridian sign-out`. The same answer whether or not the session was
-/// still live, because the CLI forgets it either way.
+/// still live, because the CLI forgets it either way -- unless it could not
+/// be ended at all, which is said rather than passed off as done.
 async fn sign_out(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Some(session) = bearer(&headers) {
-        app.terminals.end(&session);
+        if let Err(unavailable) = app.terminals.end(&session).await {
+            tracing::error!(%unavailable, "a terminal session could not be ended");
+            return json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": "temporarily_unavailable", "error_description": unavailable.to_string()}),
+            );
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
 /// The terminal session a request presents, or the refusal to send back.
 /// Only for `/terminal/` paths, and it reads no cookie.
-pub fn terminal_session_of(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
+pub async fn terminal_session_of(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
     let found = match bearer(headers) {
-        Some(session) => app.terminals.find(&session, app.clock.now_ns()),
-        None => Err(Refusal::Unknown),
+        Some(session) => app.terminals.find(&session, app.clock.now_ns()).await,
+        None => Ok(Err(Refusal::Unknown)),
     };
+    // A store that cannot be asked is ours to fix, not the person's: a 503,
+    // so the CLI does not tell them to sign in again.
+    let found = found.map_err(|unavailable| {
+        tracing::error!(%unavailable, "a terminal session could not be read");
+        Box::new(json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "temporarily_unavailable", "error_description": unavailable.to_string()}),
+        ))
+    })?;
     found.map_err(|refusal| {
         let mut response = json(
             StatusCode::UNAUTHORIZED,

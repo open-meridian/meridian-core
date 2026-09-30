@@ -12,13 +12,14 @@
 //! and a key rotation to handle on every restart -- to protect a value the
 //! component doing the sealing had in hand the whole time.
 //!
-//! Optional, and that matters for the other two branches: a deployment
-//! signing people in through a provider or through LDAP configures no
-//! database here, runs no migration, and keeps a dashboard that holds nothing
-//! but its sessions.
+//! Used only on this branch: a deployment signing people in through a
+//! provider or through LDAP keeps no account here. Its dashboard still uses
+//! the same database, for terminal sessions ([`crate::database`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+use crate::database::Database;
 
 /// Failures before an account is locked.
 ///
@@ -250,77 +251,19 @@ mod tests;
 
 // ── In Postgres ──────────────────────────────────────────────────────────────
 
-/// The accounts, in the database the deployment already has.
-///
-/// Its own tables, prefixed `dashboard_`, beside the conductor's `config_`
-/// ones. Two components sharing a table is not supported; two components
-/// keeping their own tables in one database is the arrangement this
-/// deployment already runs.
+/// The accounts, in the dashboard's own tables ([`crate::database`]).
 pub struct InPostgres {
-    pool: r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>,
+    database: Database,
 }
 
-/// Names this store's schema lock, distinct from every other component's, so
-/// a deployment migrating them together does not have one wait on another.
-const SCHEMA_LOCK: i64 = 0x6461_7368_626f_6172_u64 as i64;
-
-const MIGRATION: &str = include_str!("../migrations/0001_local_account.sql");
-
 impl InPostgres {
-    pub fn connect(url: &str, pool_size: u32) -> Result<Self, String> {
-        let config: postgres::Config = url.parse().map_err(|failed| format!("{failed}"))?;
-        let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
-            .build(manager)
-            .map_err(|failed| format!("{failed}"))?;
-        Ok(Self { pool })
+    /// On a database already verified at start.
+    pub fn on(database: Database) -> Self {
+        Self { database }
     }
 
-    /// Apply the schema, under an advisory lock. `meridian-dashboard migrate`,
-    /// as the migrating role, once per release -- never at start, where the
-    /// role the dashboard serves as may not create a table.
-    pub fn migrate(&self) -> Result<(), String> {
-        let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
-            .map_err(|failed| format!("{failed}"))?;
-        let outcome = conn
-            .batch_execute(MIGRATION)
-            .map_err(|failed| format!("the accounts table could not be made: {failed}"));
-        let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
-        outcome
-    }
-
-    /// Verified at start, never applied: the other stores' rule, for the same
-    /// reason. One table and one migration, so "there" is the whole of the
-    /// version; a second migration is where this grows a version table.
-    pub fn verify(&self) -> Result<(), String> {
-        let there: bool = self
-            .conn()?
-            .query_one(
-                "SELECT to_regclass('dashboard_local_account') IS NOT NULL",
-                &[],
-            )
-            .map_err(|failed| format!("{failed}"))?
-            .get(0);
-        if there {
-            Ok(())
-        } else {
-            Err("the accounts database has no accounts table. \
-                 Run `meridian-dashboard migrate` before starting."
-                .into())
-        }
-    }
-
-    fn conn(
-        &self,
-    ) -> Result<
-        r2d2::PooledConnection<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>,
-        String,
-    > {
-        self.pool
-            .get()
-            .map_err(|failed| format!("no connection to the accounts database: {failed}"))
+    fn conn(&self) -> Result<crate::database::Connection, String> {
+        self.database.conn()
     }
 }
 

@@ -1,13 +1,14 @@
 //! The dashboard, as its own process: the one address a firm's staff use.
 //!
 //! Signs people in through the firm's directory and serves what they may
-//! reach. It holds no deployment key, and a database only where the deployment
-//! holds its own accounts (decisions/018): it reads the access records from
-//! the conductor's configuration store over the bus, as the instance its
-//! launch configuration names, with the `admin` role's grants. Sessions live
-//! in memory, so a restart signs everyone out.
+//! reach. It holds no deployment key: it reads the access records from the
+//! conductor's configuration store over the bus, as the instance its launch
+//! configuration names, with the `admin` role's grants. A browser's session
+//! lives in memory, so a restart signs every browser out; a terminal's is
+//! kept in the dashboard's own tables, and so are the accounts of a
+//! deployment that holds its own (decisions/018).
 //!
-//! `meridian-dashboard migrate` applies the accounts table, once per release.
+//! `meridian-dashboard migrate` applies those tables, once per release.
 //!
 //! Refuses to serve until it has read the records once, and again whenever it
 //! has not read them for 10 minutes (decisions/015).
@@ -18,11 +19,12 @@ use std::time::Duration;
 
 use meridian_dashboard::accounts::{Accounts as _, InPostgres};
 use meridian_dashboard::custody::Custody;
+use meridian_dashboard::database::{Database, Unverified};
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::plugins::Plugins;
 use meridian_dashboard::signing::Signer;
-use meridian_dashboard::terminal::Terminals;
+use meridian_dashboard::terminal::{self, TerminalSessions, Terminals};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
 };
@@ -47,20 +49,20 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    // The accounts table, once per release, as the migrating role: the
+    // The dashboard's tables, once per release, as the migrating role: the
     // migrate Job's container, beside every other store's. Made in every
-    // deployment whichever way it signs people in, because the Job cannot
-    // know which the wizard chose, and an empty table is cheaper than a race.
+    // deployment whichever way it signs people in: terminal sessions are
+    // kept on every branch, and the Job cannot know which the wizard chose.
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         let url = required("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL")?;
         meridian_runtime::migrate_once_it_answers(
-            "the accounts database",
+            "the dashboard's database",
             &url,
-            |url| InPostgres::connect(url, 1),
-            |store| store.migrate(),
+            |url| Database::connect(url, 1),
+            |database| database.migrate(),
         )
-        .map_err(|failed| format!("the accounts schema could not be applied: {failed}"))?;
-        tracing::info!("the accounts schema is applied");
+        .map_err(|failed| format!("the dashboard's schema could not be applied: {failed}"))?;
+        tracing::info!("the dashboard's schema is applied");
         // The table belongs to the role that just made it.
         return match var("MERIDIAN_SERVING_DATABASE_URL") {
             Some(serving) => meridian_runtime::grant_serving(&url, &serving),
@@ -292,17 +294,44 @@ fn run() -> Result<(), String> {
     // database that is not there yet is waited for, saying so, rather than
     // failing at the first sign-in. The chart's startup probe gives the
     // dashboard as long as that takes before its liveness counts.
-    let accounts = match &accounts_url {
-        Some(url) => {
-            let store = wait_for_store(
-                "the accounts database",
-                url,
-                |url| {
-                    InPostgres::connect(url, 4)
-                        .map_err(|failed| format!("the accounts database: {failed}"))
-                },
-                |store| store.verify().map_err(Wait::NotYet),
-            )?;
+    //
+    // Wherever somebody can sign in: terminal sessions are kept there on
+    // every branch (W6.13), and accounts on the branch that holds them. Not
+    // during first run, which signs nobody in and may be the very thing
+    // making the database.
+    let signs_people_in = provider.is_some() || directory.is_some() || accounts_url.is_some();
+    let database = match var("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL") {
+        Some(url) if signs_people_in => Some(wait_for_store(
+            "the dashboard's database",
+            &url,
+            |url| {
+                Database::connect(url, 4)
+                    .map_err(|failed| format!("the dashboard's database: {failed}"))
+            },
+            |database| {
+                database.verify().map_err(|unverified| match unverified {
+                    Unverified::NotYet(said) => Wait::NotYet(said),
+                    Unverified::Ahead(said) => Wait::Refused(said),
+                })
+            },
+        )?),
+        _ => None,
+    };
+    let terminal_sessions: Arc<dyn TerminalSessions> = match &database {
+        Some(database) => Arc::new(terminal::InPostgres::on(database.clone())),
+        None => {
+            if signs_people_in {
+                tracing::warn!(
+                    "no database is given for this dashboard, so terminal sessions are held \
+                     in memory and end when it restarts"
+                );
+            }
+            Arc::new(terminal::InMemory::default())
+        }
+    };
+    let accounts = match (&accounts_url, &database) {
+        (Some(_), Some(database)) => {
+            let store = InPostgres::on(database.clone());
             // The first administrator, as first run left it: a name
             // and a hash in a Secret. Made here at start rather than
             // written by the Job, because the Job may not reach
@@ -317,7 +346,7 @@ fn run() -> Result<(), String> {
             ) {
                 let existing = store
                     .by_name(&name)
-                    .map_err(|failed| format!("the accounts database: {failed}"))?;
+                    .map_err(|failed| format!("the dashboard's database: {failed}"))?;
                 if existing.is_none() {
                     store
                         .put(&meridian_dashboard::accounts::LocalAccount {
@@ -335,16 +364,18 @@ fn run() -> Result<(), String> {
             }
             Some(Arc::new(store) as Arc<dyn meridian_dashboard::accounts::Accounts>)
         }
-        None => None,
+        // Refused above: the branch needs the address, and has it.
+        (Some(_), None) => unreachable!("accounts are on and no database was connected"),
+        (None, _) => None,
     };
 
-    // The accounts store is borrowed, never moved in, so it outlives the
-    // runtime (meridian_runtime::on_runtime).
+    // The stores are borrowed, never moved in, so they outlive the runtime
+    // (meridian_runtime::on_runtime).
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
         let records = Arc::new(RecordsCache::default());
         let sessions = Arc::new(Sessions::default());
-        let terminals = Arc::new(Terminals::default());
+        let terminals = Arc::new(Terminals::keeping(terminal_sessions.clone()));
         let clock = Arc::new(SystemClock);
 
         // Once before listening, so the first request finds records when
@@ -376,9 +407,13 @@ fn run() -> Result<(), String> {
             loop {
                 every.tick().await;
                 sweeping.sweep(now_ns());
-                sweeping_terminals.sweep(now_ns());
+                if let Err(unavailable) = sweeping_terminals.sweep(now_ns()).await {
+                    tracing::warn!(%unavailable, "terminal sessions were not swept");
+                }
                 if let Some(plugins) = &sweeping_plugins {
-                    plugins.sweep(&sweeping, &sweeping_terminals, now_ns());
+                    plugins
+                        .sweep(&sweeping, &sweeping_terminals, now_ns())
+                        .await;
                 }
             }
         });

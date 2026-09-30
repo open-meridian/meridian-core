@@ -178,6 +178,9 @@ services:
       # Plugins' pages, for e2e-plugin-page: each instance's sidecar, by the
       # alias the sidecar below carries. Unset, the dashboard serves none.
       MERIDIAN_PLUGIN_FRONT_DOOR: ${MERIDIAN_PLUGIN_FRONT_DOOR:-}
+      # The plugin registry a terminal pushes through here (W8.1), for
+      # e2e-dashboard-accounts. Unset, the dashboard says it runs none.
+      MERIDIAN_REGISTRY_UPSTREAM: ${MERIDIAN_REGISTRY_UPSTREAM:-}
       MERIDIAN_DASHBOARD_SIGNING_KEY_DIR: /keys/signing
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
@@ -323,6 +326,13 @@ services:
 
   # The one platform call a claim makes, answered: one known code, once.
   # The real platform does not serve it yet.
+  # The deployment's plugin registry, as the chart runs it, for a terminal's
+  # upload in e2e-dashboard-accounts.
+  e2e-registry:
+    profiles: [e2e]
+    image: registry:2.8.3
+    networks: [meridian]
+
   fake-platform:
     profiles: [e2e]
     image: python:3.12-alpine

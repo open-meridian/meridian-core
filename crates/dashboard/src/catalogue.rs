@@ -90,8 +90,8 @@ fn refused(status: StatusCode, reason: impl Into<String>) -> Response {
 }
 
 /// A deployment admin's terminal session, or the refusal.
-fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
-    let person = terminal_session_of(app, headers)?;
+async fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
+    let person = terminal_session_of(app, headers).await?;
     let records = app
         .records
         .current(app.clock.now_ns())
@@ -109,12 +109,12 @@ fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
 
 /// The admin, then their JSON: who is asking is settled before what they
 /// sent is read, so a stranger learns nothing from a body's refusal.
-fn admin_asking<T: serde::de::DeserializeOwned>(
+async fn admin_asking<T: serde::de::DeserializeOwned>(
     app: &App,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(Person, T), Box<Response>> {
-    let person = admin(app, headers)?;
+    let person = admin(app, headers).await?;
     let asked = serde_json::from_slice(body).map_err(|failed| {
         Box::new(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -212,7 +212,7 @@ async fn pass_through(
     Path((name, rest)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    if let Err(refusal) = admin(&app, request.headers()) {
+    if let Err(refusal) = admin(&app, request.headers()).await {
         return *refusal;
     }
     let Some(registry) = &app.registry else {
@@ -319,7 +319,7 @@ async fn develop(
     Path((instance, what)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    let person = match admin(&app, request.headers()) {
+    let person = match admin(&app, request.headers()).await {
         Ok(person) => person,
         Err(refusal) => return *refusal,
     };
@@ -448,7 +448,7 @@ async fn upload(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, upload): (Person, Upload) = match admin_asking(&app, &headers, &body) {
+    let (person, upload): (Person, Upload) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
@@ -540,7 +540,7 @@ fn state_name(state: i32) -> &'static str {
 }
 
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(refusal) = admin(&app, &headers) {
+    if let Err(refusal) = admin(&app, &headers).await {
         return *refusal;
     }
     let held = match catalogue(&app).await {
@@ -594,7 +594,7 @@ async fn launch(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, asked): (Person, Launch) = match admin_asking(&app, &headers, &body) {
+    let (person, asked): (Person, Launch) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
@@ -641,7 +641,7 @@ async fn stop(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, asked): (Person, Stop) = match admin_asking(&app, &headers, &body) {
+    let (person, asked): (Person, Stop) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };

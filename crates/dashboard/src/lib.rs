@@ -20,6 +20,7 @@ pub mod admin;
 pub mod catalogue;
 pub mod clock;
 pub mod custody;
+pub mod database;
 pub mod directory;
 pub mod first_run;
 pub mod health;

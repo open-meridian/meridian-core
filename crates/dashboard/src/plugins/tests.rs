@@ -661,7 +661,7 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     entered(&h).await;
     let kept = plugins.mint(Came::Browser(h.session.clone()), INSTANCE, now);
 
-    plugins.sweep(&h.app.sessions, &h.app.terminals, now);
+    plugins.sweep(&h.app.sessions, &h.app.terminals, now).await;
     assert_eq!(
         plugins.entered.lock().unwrap().len(),
         1,
@@ -670,7 +670,9 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     assert!(plugins.codes.lock().unwrap().contains_key(&kept));
 
     h.app.sessions.end(&h.session);
-    plugins.sweep(&h.app.sessions, &h.app.terminals, now + CODE_NS + 1);
+    plugins
+        .sweep(&h.app.sessions, &h.app.terminals, now + CODE_NS + 1)
+        .await;
     assert!(plugins.entered.lock().unwrap().is_empty());
     assert!(plugins.codes.lock().unwrap().is_empty());
 }
@@ -879,7 +881,7 @@ async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
 }
 
 /// A terminal session for Ada, as `meridian connect` gets one.
-fn terminal(app: &Arc<App>) -> String {
+async fn terminal(app: &Arc<App>) -> String {
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     const BACK: &str = "http://127.0.0.1:53682/callback";
@@ -899,6 +901,8 @@ fn terminal(app: &Arc<App>) -> String {
     let (_, code) = terminals.decide(&id, &confirm, true, now).unwrap();
     terminals
         .exchange(&code.unwrap(), VERIFIER, BACK, now)
+        .await
+        .expect("the store answers")
         .unwrap()
         .session
 }
@@ -933,7 +937,7 @@ async fn a_deployment_admin_sends_a_live_plugin_a_change_from_the_terminal() {
     std::fs::create_dir_all(&dir).unwrap();
     let h = harness_with(&[], Some(dir.clone())).await;
     h.app.records.store(admin_records(), h.app.clock.now_ns());
-    let session = terminal(&h.app);
+    let session = terminal(&h.app).await;
     let change = r#"{"files":{"src/page.py":"cHJpbnQoMSk="}}"#;
 
     let sent = develop(
@@ -999,7 +1003,7 @@ async fn a_deployment_admin_sends_a_live_plugin_a_change_from_the_terminal() {
 async fn an_instance_that_is_not_live_has_no_development_path() {
     let h = harness(&[]).await;
     h.app.records.store(admin_records(), h.app.clock.now_ns());
-    let session = terminal(&h.app);
+    let session = terminal(&h.app).await;
     let answer = develop(
         &h.app,
         Method::PUT,
@@ -1017,7 +1021,7 @@ async fn an_instance_that_is_not_live_has_no_development_path() {
 #[tokio::test]
 async fn a_terminal_link_enters_the_plugins_host_once_and_ends_with_the_terminal_session() {
     let h = harness(&[INSTANCE]).await;
-    let session = terminal(&h.app);
+    let session = terminal(&h.app).await;
     let opened = develop(
         &h.app,
         Method::POST,
@@ -1059,7 +1063,7 @@ async fn a_terminal_link_enters_the_plugins_host_once_and_ends_with_the_terminal
     assert!(!home.body.contains("Ada"), "{}", home.body);
 
     // The terminal session ends, and the host's with it.
-    h.app.terminals.end(&session);
+    h.app.terminals.end(&session).await.unwrap();
     let after = get(&h.app, PLUGIN_HOST, "/", &[cookie]).await;
     assert_eq!(
         after.status,
@@ -1071,7 +1075,7 @@ async fn a_terminal_link_enters_the_plugins_host_once_and_ends_with_the_terminal
 #[tokio::test]
 async fn a_terminal_reads_the_page_as_the_person_is_served_it() {
     let h = harness(&[INSTANCE]).await;
-    let session = terminal(&h.app);
+    let session = terminal(&h.app).await;
     let read = develop(
         &h.app,
         Method::GET,
@@ -1092,7 +1096,7 @@ async fn a_terminal_reads_the_page_as_the_person_is_served_it() {
 #[tokio::test]
 async fn a_terminal_is_held_to_what_opening_the_page_is_held_to() {
     let h = harness(&["another-plugin"]).await;
-    let session = terminal(&h.app);
+    let session = terminal(&h.app).await;
     for (method, path) in [
         (Method::POST, format!("/terminal/plugins/{INSTANCE}/open")),
         (Method::GET, format!("/terminal/plugins/{INSTANCE}/page")),
