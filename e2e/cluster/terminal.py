@@ -322,8 +322,10 @@ def terminal_sessions(page):
     page.reload()
     if "Nobody holds a terminal session" in page.content():
         return 0
-    rows = page.locator("#terminal-sessions tr[data-id]")
-    return sum(int(rows.nth(i).locator("td").nth(1).inner_text()) for i in range(rows.count()))
+    # By the count's own attribute, not its column: the table has gained
+    # columns before (User ID), and a positional read then sums names.
+    counts = page.locator("#terminal-sessions tr[data-id] td[data-count]")
+    return sum(int(counts.nth(i).get_attribute("data-count")) for i in range(counts.count()))
 
 
 with sync_playwright() as playwright:

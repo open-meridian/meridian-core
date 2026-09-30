@@ -867,7 +867,7 @@ pub fn render(
                 };
                 format!(
                     "<tr data-id=\"{login}\" data-name=\"{name}\"><td><span class=\"name\">{user}</span></td>\
-                     <td>{named}</td><td>{count}</td><td class=\"actions\">\
+                     <td>{named}</td><td data-count=\"{count}\">{count}</td><td class=\"actions\">\
                      <form method=\"post\" action=\"/admin/end-terminal-sessions#terminal-sessions\" \
                      data-confirm=\"End {called}'s terminal sessions? Their CLI signs in again.\">{token}\
                      <input type=\"hidden\" name=\"login\" value=\"{login}\">\
