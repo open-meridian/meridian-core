@@ -479,8 +479,15 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
     // One dialog for a new account and for each edit, holding all four,
     // bounded as the conductor bounds them; an Edit fills it with what the
     // account holds.
-    assert_eq!(body.matches("<dialog id=\"account\">").count(), 1);
-    let dialog = body.split("<dialog id=\"account\">").nth(1).unwrap();
+    assert_eq!(
+        body.matches("<dialog id=\"account\" aria-labelledby=\"account-title\">")
+            .count(),
+        1
+    );
+    let dialog = body
+        .split("<dialog id=\"account\" aria-labelledby=\"account-title\">")
+        .nth(1)
+        .unwrap();
     let dialog = dialog.split("</dialog>").next().unwrap();
     for field in [
         "name=\"account_id\" value=\"\" data-record-id",
@@ -837,7 +844,7 @@ fn setting<'a>(body: &'a str, name: &str) -> &'a str {
     body.split(&format!("data-setting=\"{name}\""))
         .nth(1)
         .unwrap_or_else(|| panic!("no setting {name} in {body}"))
-        .split("<div class=\"setting\"")
+        .split("<div class=\"setting ")
         .next()
         .unwrap()
 }
@@ -878,16 +885,21 @@ fn the_form_says_what_to_fill_in() {
     let user = setting(&form, "user_secret");
     assert!(user.contains("data-applies-setting=\"key_type\""), "{user}");
     assert!(user.contains("data-applies-one-of=\"[&quot;commercial&quot;]\""));
-    assert!(user.contains("Only when Key is Commercial key."));
+    assert!(
+        user.contains("<span class=\"badge info applies\">Only when Key is Commercial key</span>")
+    );
 
     // A default greyed in the empty field, never its value; the unit beside.
     let poll = setting(&form, "poll_seconds");
     assert!(poll.contains("Optional") && poll.contains("Read every"));
     assert!(poll.contains(
-        "<input type=\"number\" step=\"1\" name=\"value.poll_seconds\" value=\"900\" placeholder=\"300\">"
+        "<input type=\"number\" step=\"1\" name=\"value.poll_seconds\" value=\"900\" placeholder=\"300\" \
+         id=\"setting-poll_seconds\" aria-describedby=\"setting-poll_seconds-about\">"
     ));
     assert!(poll.contains("<span class=\"unit\">seconds</span>"));
-    assert!(poll.contains("Left empty, the plugin uses 300 seconds."));
+    assert!(poll.contains(
+        "<span class=\"badge\" title=\"Left empty, the plugin uses 300 seconds.\">default 300 seconds</span>"
+    ));
     let stale = setting(&form, "stale_after_hours");
     assert!(stale.contains("value=\"\" placeholder=\"24\""), "{stale}");
     assert!(stale.contains("<span class=\"unit\">hours</span>"));
@@ -896,11 +908,19 @@ fn the_form_says_what_to_fill_in() {
         "escaped"
     );
 
-    // A developer's setting only on a development deployment.
+    // A developer's setting only on a development deployment, under
+    // "Developer".
     assert!(!form.contains("data-setting=\"synthetic\""));
+    assert!(!form.contains("<details"));
     let developing = settings::form(&record, "", true);
     let synthetic = setting(&developing, "synthetic");
-    assert!(synthetic.contains("Developer") && synthetic.contains("name=\"value.synthetic\""));
+    assert!(synthetic.contains("name=\"value.synthetic\""));
+    let details = developing
+        .split("<details class=\"developer\">")
+        .nth(1)
+        .unwrap();
+    assert!(details.starts_with("<summary>Developer "), "{details}");
+    assert!(details.contains("data-setting=\"synthetic\""));
 }
 
 #[test]
@@ -998,7 +1018,309 @@ fn a_required_setting_declaring_a_default_is_not_missing_and_its_option_is_shown
         key.contains(r#"<input type="radio" name="value.key_type" value="" checked>"#),
         "{key}"
     );
-    assert!(key.contains("The plugin uses Personal key."));
+    assert!(key.contains(
+        "<span class=\"badge\" title=\"Not set, the plugin uses Personal key.\">default Personal key</span>"
+    ));
+}
+
+/// The part of `body` between `open` and the first `close` after it.
+fn between<'a>(body: &'a str, open: &str, close: &str) -> &'a str {
+    body.split(open)
+        .nth(1)
+        .unwrap_or_else(|| panic!("no {open} in {body}"))
+        .split(close)
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn the_form_fits_one_screen_without_losing_what_it_says() {
+    // The product owner, 2026-09-30: "let's compact ... a bit and make the
+    // form short enough to display in one page".
+    let record = snaptrade();
+    let form = settings::form(&record, "", true);
+
+    // Long fields across the form: the choice that decides which follow,
+    // and every secret. Short ones two to a row: numbers and an on/off.
+    for (name, size) in [
+        ("key_type", "wide"),
+        ("snaptrade_client_id", "wide"),
+        ("snaptrade_consumer_key", "wide"),
+        ("user_secret", "wide"),
+        ("poll_seconds", "short"),
+        ("stale_after_hours", "short"),
+        ("synthetic", "short"),
+    ] {
+        assert!(
+            form.contains(&format!(
+                "<div class=\"setting {size}\" data-setting=\"{name}\""
+            )),
+            "{name} is {size}"
+        );
+    }
+    let fields = between(&form, "<div class=\"fields\">", "<details");
+    assert!(!fields.contains("data-setting=\"synthetic\""));
+
+    // A choice's options on one line, each its label alone: what each
+    // means is in the field's hint.
+    let key = setting(&form, "key_type");
+    let options = between(key, "<div class=\"options\">", "</div>");
+    assert_eq!(options.matches("<label class=\"option\">").count(), 2);
+    assert!(!options.contains("hint"), "{options}");
+    assert!(key.contains("<fieldset class=\"choice\" aria-describedby=\"setting-key_type-about\">"));
+    assert!(key.contains("Personal key: Belongs to one user.\nCommercial key: Registers users"));
+
+    // Each hint one small line under its field, which the field and its
+    // marker are described by, and no other paragraph in the form.
+    let client = setting(&form, "snaptrade_client_id");
+    assert!(client.contains(
+        "<label class=\"setting-label\" for=\"setting-snaptrade_client_id\">Client ID</label>\
+         <button type=\"button\" class=\"note-mark\" aria-label=\"About Client ID\" \
+         aria-describedby=\"setting-snaptrade_client_id-about\"></button>"
+    ));
+    assert!(client.contains(
+        "id=\"setting-snaptrade_client_id\" autocomplete=\"new-password\" \
+         placeholder=\"Type a new value to replace it\" aria-describedby=\"setting-snaptrade_client_id-about\">"
+    ));
+    assert!(client.contains(
+        "<p class=\"hint about\" id=\"setting-snaptrade_client_id-about\">What snaptrade_client_id is \
+         &lt;for&gt;.\nA secret: never shown again once set.</p>"
+    ));
+    // Clearing a secret sits beside its field.
+    assert!(client.contains(
+        "aria-describedby=\"setting-snaptrade_client_id-about\"><label class=\"check\">\
+         <input type=\"checkbox\" name=\"clear.snaptrade_client_id\"> Clear it</label></span>"
+    ));
+    let paragraphs = form.matches("<p").count();
+    assert_eq!(paragraphs, form.matches("<p class=\"hint about\"").count());
+    assert_eq!(paragraphs, 7, "a hint for each field, each described");
+    // Required or optional, set or not, the default, the unit and when it
+    // applies stay in view, small.
+    let user = setting(&form, "user_secret");
+    assert!(user.contains(
+        "<span class=\"badge warn\">Required</span> <span class=\"badge\">not set</span> \
+         <span class=\"badge info applies\">Only when Key is Commercial key</span>"
+    ));
+    let stale = setting(&form, "stale_after_hours");
+    assert!(stale.contains("<span class=\"badge\">Optional</span>"));
+    assert!(stale.contains(">default 24 hours</span>"));
+    assert!(stale.contains("<span class=\"unit\">hours</span>"));
+
+    // The hints' one bubble, as an account's note: filled as text, and
+    // hidden from a screen reader, which has the hint from the field.
+    assert_eq!(form.matches("class=\"note-bubble").count(), 1);
+    assert!(form.contains(
+        "<div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>"
+    ));
+    let script = between(&form, "<script>", "</script>");
+    assert!(script.contains("form.classList.add(\"js\");"));
+    assert!(script.contains("bubble.textContent = about.textContent;"));
+    assert!(!script.contains("innerHTML"));
+    for shown_by in ["\"focusin\"", "\"mouseover\"", "\"click\"", "\"Escape\""] {
+        assert!(script.contains(shown_by), "{shown_by}");
+    }
+    // A field that does not apply still collapses by the script alone.
+    assert!(script.contains("holder.hidden = oneOf.indexOf("));
+
+    // A developer's settings under a closed "Developer", and Save last.
+    assert!(form.contains(
+        "<details class=\"developer\"><summary>Developer \
+         <span class=\"summary-note\">1 setting for whoever develops the plugin</span></summary>"
+    ));
+    assert!(form.contains(
+        "</details><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button>\
+         </div></form>"
+    ));
+
+    // Open while a developer's setting is required and missing.
+    let mut needed = snaptrade();
+    needed
+        .declared_settings
+        .iter_mut()
+        .find(|declaration| declaration.name == "synthetic")
+        .unwrap()
+        .required = true;
+    assert!(settings::form(&needed, "", true).contains("<details class=\"developer\" open>"));
+}
+
+/// What a browser posts of a form as it stands: each named input's value, a
+/// radio or a box only when checked, and a select's option selected, or its
+/// first.
+fn submitted(form: &str) -> Fields {
+    let attribute = |tag: &str, name: &str| -> Option<String> {
+        tag.split(&format!(" {name}=\""))
+            .nth(1)
+            .map(|rest| rest.split('"').next().unwrap().to_string())
+    };
+    let mut posted = Fields::new();
+    for tag in form
+        .split("<input")
+        .skip(1)
+        .map(|rest| rest.split('>').next().unwrap())
+    {
+        let Some(name) = attribute(tag, "name") else {
+            continue;
+        };
+        let kind = attribute(tag, "type").unwrap_or_default();
+        let ticked = tag.contains(" checked");
+        let value = match kind.as_str() {
+            "radio" | "checkbox" if !ticked => continue,
+            "checkbox" => attribute(tag, "value").unwrap_or_else(|| "on".into()),
+            _ => attribute(tag, "value").unwrap_or_default(),
+        };
+        posted.insert(name, value);
+    }
+    for select in form.split("<select").skip(1) {
+        let (open, rest) = select.split_once('>').unwrap();
+        let options = rest.split("</select>").next().unwrap();
+        let chosen = options
+            .split("<option")
+            .skip(1)
+            .find(|option| option.contains(" selected"))
+            .or_else(|| options.split("<option").nth(1))
+            .unwrap();
+        posted.insert(
+            attribute(open, "name").unwrap(),
+            attribute(chosen, "value").unwrap(),
+        );
+    }
+    posted
+}
+
+#[test]
+fn the_compact_form_posts_what_the_form_always_did() {
+    let record = snaptrade();
+    for development in [false, true] {
+        let form = settings::form(&record, "", development);
+        let posted = submitted(&form);
+        let mut names: Vec<&str> = posted.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        // Every field the form had, a hidden one too: the user secret under
+        // a personal key, and a developer's setting in its closed section.
+        let mut expected = vec![
+            "secret.snaptrade_client_id",
+            "secret.snaptrade_consumer_key",
+            "secret.user_secret",
+            "value.key_type",
+            "value.poll_seconds",
+            "value.stale_after_hours",
+        ];
+        if development {
+            expected.push("value.synthetic");
+        }
+        expected.sort_unstable();
+        assert_eq!(names, expected, "development: {development}");
+        assert_eq!(posted["value.key_type"], "personal");
+        assert_eq!(posted["value.poll_seconds"], "900");
+        assert_eq!(posted["value.stale_after_hours"], "");
+        // Saved as it stands, it asks for nothing.
+        assert_eq!(
+            settings::request(&record, &posted, development),
+            None,
+            "development: {development}"
+        );
+    }
+
+    // A developer's setting changed under "Developer" is saved on a
+    // development deployment, and nowhere else.
+    let mut posted = submitted(&settings::form(&record, "", true));
+    posted.insert("value.synthetic".into(), "true".into());
+    let saved = settings::request(&record, &posted, true).unwrap();
+    assert_eq!(saved.values.len(), 1);
+    assert_eq!(
+        (
+            saved.values[0].name.as_str(),
+            saved.values[0].value.as_str()
+        ),
+        ("synthetic", "true")
+    );
+    assert_eq!(settings::request(&record, &posted, false), None);
+
+    // Clear it, beside its field, clears the secret that is set.
+    let mut posted = submitted(&settings::form(&record, "", false));
+    posted.insert("clear.snaptrade_client_id".into(), "on".into());
+    let cleared = settings::request(&record, &posted, false).unwrap();
+    assert_eq!(cleared.cleared, ["snaptrade_client_id"]);
+    assert!(cleared.values.is_empty());
+}
+
+#[tokio::test]
+async fn each_section_adds_with_a_short_button_and_its_dialog_says_what_is_made() {
+    // The product owner, 2026-09-30: "maybe replace 'New access group', 'New
+    // user group', and 'New account group' to '+ Add' as well and just use
+    // Access / User / Account?"
+    let h = framing(a_firm());
+    let (_, body) = send(&h, get(&h, "/admin", true)).await;
+    for (section, heading, dialog, what, title) in [
+        (
+            "permissions",
+            "Permissions",
+            "new-permission",
+            "a permission",
+            "Grant a permission",
+        ),
+        (
+            "user-groups",
+            "User",
+            "user-group",
+            "a user group",
+            "New user group",
+        ),
+        (
+            "account-groups",
+            "Account",
+            "account-group",
+            "an account group",
+            "New account group",
+        ),
+        (
+            "access-groups",
+            "Access",
+            "access-group",
+            "an access group",
+            "New access group",
+        ),
+        (
+            "accounts",
+            "Accounts",
+            "account",
+            "an account",
+            "New account",
+        ),
+    ] {
+        let part = between(
+            &body,
+            &format!("<section class=\"admin-section\" id=\"{section}\">"),
+            "</section>",
+        );
+        assert!(part.contains(&format!("<h2>{heading}</h2>")), "{section}");
+        assert!(
+            part.contains(&format!(
+                "<button type=\"button\" class=\"primary\" data-dialog-open=\"{dialog}\" \
+                 aria-label=\"Add {what}\">+ Add</button>"
+            )),
+            "{section}"
+        );
+        // The dialog is named by its heading, which says it in full.
+        assert!(
+            part.contains(&format!(
+                "<dialog id=\"{dialog}\" aria-labelledby=\"{dialog}-title\">"
+            )),
+            "{section}"
+        );
+        assert!(
+            part.contains(&format!(
+                "<h2 id=\"{dialog}-title\" data-title-new=\"{title}\">{title}</h2>"
+            )),
+            "{section}"
+        );
+        assert!(!part.contains(&format!(">{title}</button>")), "{section}");
+    }
+    // The tabs still say which groups.
+    let tabs = between(&body, "<nav class=\"tabs\">", "</nav>");
+    for tab in ["User groups", "Account groups", "Access groups"] {
+        assert!(tabs.contains(&format!(">{tab}</a>")), "{tab}");
+    }
 }
 
 type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;
@@ -1703,7 +2025,10 @@ async fn every_option_is_in_the_page_once_however_many_records_there_are() {
     // One dialog per kind of record, whatever the number of records.
     for kind in ["user-group", "account-group", "access-group", "account"] {
         assert_eq!(
-            body.matches(&format!("<dialog id=\"{kind}\">")).count(),
+            body.matches(&format!(
+                "<dialog id=\"{kind}\" aria-labelledby=\"{kind}-title\">"
+            ))
+            .count(),
             1,
             "{kind}"
         );
@@ -2028,7 +2353,9 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
         ("access-group", "access-group-plugins", "plugin"),
     ] {
         let inside = body
-            .split(&format!("<dialog id=\"{dialog}\">"))
+            .split(&format!(
+                "<dialog id=\"{dialog}\" aria-labelledby=\"{dialog}-title\">"
+            ))
             .nth(1)
             .unwrap()
             .split("</dialog>")

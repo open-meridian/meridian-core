@@ -63,9 +63,14 @@ fn section(id: &str, title: &str, about: &str, action: &str, body: String) -> St
     )
 }
 
-fn new_button(dialog: &str, label: &str) -> String {
+/// What opens a section's dialog for a new record (the product owner,
+/// 2026-09-30: "+ Add" on every section). Named for a screen reader by
+/// what it adds, which the words it shows begin; the dialog it opens says
+/// the whole of it in its heading.
+fn add_button(dialog: &str, what: &str) -> String {
     format!(
-        "<button type=\"button\" class=\"primary\" data-dialog-open=\"{dialog}\">{label}</button>"
+        "<button type=\"button\" class=\"primary\" data-dialog-open=\"{dialog}\" \
+         aria-label=\"Add {what}\">+ Add</button>"
     )
 }
 
@@ -82,11 +87,12 @@ fn edit_button(dialog: &str, title: &str, fill: &serde_json::Value) -> String {
 
 /// One dialog per kind of record, for a new one and for each edit, which the
 /// page's script fills from the Edit pressed. Its heading and its button say
-/// which, from `data-title-new` and `data-label-new`.
+/// which, from `data-title-new` and `data-label-new`, and the heading names
+/// the dialog: "New access group", however short the button that opened it.
 fn dialog(id: &str, title: &str, action: &str, token: &str, fields: &str, submit: &str) -> String {
     format!(
-        "<dialog id=\"{id}\"><form method=\"post\" action=\"{action}\">{token}\
-         <div class=\"dialog-head\"><h2 data-title-new=\"{title}\">{title}</h2></div>\
+        "<dialog id=\"{id}\" aria-labelledby=\"{id}-title\"><form method=\"post\" action=\"{action}\">{token}\
+         <div class=\"dialog-head\"><h2 id=\"{id}-title\" data-title-new=\"{title}\">{title}</h2></div>\
          <div class=\"dialog-body\">{fields}</div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
          <button type=\"submit\" class=\"primary\" data-label-new=\"{submit}\">{submit}</button></div></form></dialog>"
@@ -343,11 +349,14 @@ pub fn render(
         "Permissions",
         "Who may do what: the people in a user group, using an access group's plugins, \
          on an account group's accounts.",
-        &new_button("new-permission", "Grant a permission"),
+        &add_button("new-permission", "a permission"),
         format!("{table}{grant}"),
     ));
 
     // ── User groups ─────────────────────────────────────────────────────────
+    // The three groups' sections are headed User, Account and Access (the
+    // product owner, 2026-09-30), "groups" understood from the tab each is
+    // reached by; a dialog still says "New user group" in full.
     // People are chosen by their user ID, then their login ID
     // (super::people); one typed in is taken as it always was.
     let person_of: HashMap<&str, &Person> = people.iter().map(|p| (p.login.as_str(), p)).collect();
@@ -456,9 +465,9 @@ pub fn render(
     };
     sections.push(section(
         "user-groups",
-        "User groups",
+        "User",
         "People, by the directory groups they are in or by their logins.",
-        &new_button("user-group", "New user group"),
+        &add_button("user-group", "a user group"),
         format!("{table}{dialogs}"),
     ));
 
@@ -565,9 +574,9 @@ pub fn render(
     };
     sections.push(section(
         "account-groups",
-        "Account groups",
+        "Account",
         "Accounts gathered, so a permission can name them together.",
-        &new_button("account-group", "New account group"),
+        &add_button("account-group", "an account group"),
         format!("{table}{dialogs}"),
     ));
 
@@ -710,9 +719,9 @@ pub fn render(
     };
     sections.push(section(
         "access-groups",
-        "Access groups",
+        "Access",
         "What a permission gives: plugins, each at read or write.",
-        &new_button("access-group", "New access group"),
+        &add_button("access-group", "an access group"),
         format!("{table}{dialogs}"),
     ));
 
@@ -827,7 +836,7 @@ pub fn render(
         "Accounts",
         "The firm's accounts, which permissions and plugins work on: where each is held, \
          what it is and who owns it. Closed, never deleted.",
-        &new_button("account", "New account"),
+        &add_button("account", "an account"),
         format!("{table}{dialogs}"),
     ));
 

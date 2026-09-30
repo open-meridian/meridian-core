@@ -398,13 +398,13 @@ with sync_playwright() as playwright:
         context, "/admin/account-groups",
         {"account_group_id": "", "name": "Custody copy accounts", "account_ids": account or ""},
     )
-    account_group = row_id(admin, "Account groups", "Custody copy accounts")
+    account_group = row_id(admin, "Account", "Custody copy accounts")
     admin = administer(
         context, "/admin/access-groups",
         {"access_group_id": "", "name": "Custody copy users", "entries": f"{CUSTODY} read"},
         patience=90,
     )
-    access_group = row_id(admin, "Access groups", "Custody copy users")
+    access_group = row_id(admin, "Access", "Custody copy users")
     # The user group the wizard made her deployment admin through: the one
     # permission there is before hers.
     admins = re.search(r'<tr data-id="[^"]+" data-user-group="([^"]+)"', admin)
@@ -576,7 +576,7 @@ with sync_playwright() as playwright:
         {"user_group_id": "", "name": "Stand-in administrators", "directory_groups": "",
          "logins": "local|nobody-e2e"},
     )
-    stand_in = row_id(admin, "User groups", "Stand-in administrators")
+    stand_in = row_id(admin, "User", "Stand-in administrators")
     admin = administer(
         context, "/admin/permissions",
         {"user_group_id": stand_in or "", "account_group_id": "", "access_group_id": "deployment-admin"},

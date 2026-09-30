@@ -236,28 +236,40 @@ background:var(--warn-wash);color:var(--warn-ink);font-size:.9rem;margin:.75rem 
 .admin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:0;border-radius:0;background:none;\
 color-scheme:light dark}.admin-frame[data-sized]{min-height:0}\
 html[data-om-mode=light] .admin-frame{color-scheme:light}html[data-om-mode=dark] .admin-frame{color-scheme:dark}\
-form.settings .setting{padding:1rem 0;border-top:1px solid var(--line-soft)}\
-form.settings .setting:first-of-type{border-top:0;padding-top:.25rem}\
-form.settings .setting .hint{margin:.3rem 0 0}\
-form.settings label.field{margin:0}\
-.setting-head{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem;margin-bottom:.35rem;font-size:.9rem}\
-.setting-head .setting-label{font-weight:600;color:var(--ink)}\
-.setting-head .id{display:inline;margin-left:auto}\
+form.settings{max-width:60rem}\
+form.settings .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem 1.25rem;align-items:start}\
+form.settings .setting{min-width:0}form.settings .setting.wide{grid-column:1/-1}\
+@media (max-width:40rem){form.settings .fields{grid-template-columns:minmax(0,1fr)}}\
+.setting-head{display:flex;align-items:center;flex-wrap:wrap;gap:.25rem .35rem;margin-bottom:.2rem;font-size:.86rem;line-height:1.35}\
+.setting-head .setting-label{display:inline;margin:0;font-size:inherit;font-weight:600;color:var(--ink)}\
+.setting-head .badge{padding:.02rem .45rem;font-size:.7rem}\
+.setting-head .id{display:inline;margin-left:auto}.setting-head button.note-mark{margin:0 .1rem 0 0}\
+form.settings:not(.js) button.note-mark{display:none}\
+form.settings input:not([type=checkbox]):not([type=radio]):not([type=hidden]),form.settings select{padding:.4rem .6rem}\
+form.settings .setting>select{display:block;width:100%}\
+.secret-row{display:flex;align-items:center;gap:.75rem}.secret-row input{flex:1 1 auto;min-width:0}\
+.secret-row label.check{margin:0;flex-shrink:0;white-space:nowrap}\
+form.settings .setting>input{display:block;width:100%}\
+form.settings .hint.about{margin:.2rem 0 0;font-size:.8rem;line-height:1.4}form.settings.js .hint.about{display:none}\
+.note-bubble.hints{pointer-events:none}\
 fieldset.choice{border:0;margin:0;padding:0;min-width:0}fieldset.choice legend{padding:0;width:100%}\
-.options{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.5rem}\
-label.option{display:flex;align-items:flex-start;gap:.6rem;margin:0;padding:.65rem .8rem;border:1px solid var(--line-strong);\
-border-radius:var(--radius);font-weight:400;cursor:pointer;background:var(--card)}\
+.options{display:flex;flex-wrap:wrap;gap:.4rem}\
+label.option{display:inline-flex;align-items:center;gap:.45rem;margin:0;padding:.4rem .8rem;border:1px solid var(--line-strong);\
+border-radius:var(--radius);font-size:.9rem;font-weight:400;cursor:pointer;background:var(--card)}\
 label.option:hover{background:var(--hover)}\
 label.option:has(input:checked){border-color:var(--accent);background:var(--accent-wash)}\
-label.option input{margin:.25rem 0 0;accent-color:var(--accent)}\
-label.option .option-label{display:block;font-weight:600}label.option .hint{margin:.1rem 0 0}\
-.with-unit{display:flex;align-items:stretch;margin-top:.3rem;max-width:20rem}\
+label.option input{margin:0;accent-color:var(--accent)}label.option .option-label{font-weight:550}\
+.with-unit{display:flex;align-items:stretch;max-width:20rem}\
 .with-unit input{margin:0!important;border-top-right-radius:0!important;border-bottom-right-radius:0!important;flex:1 1 auto;min-width:0}\
 .with-unit .unit{display:flex;align-items:center;padding:0 .75rem;border:1px solid var(--line-strong);border-left:0;\
 border-radius:0 var(--radius) var(--radius) 0;background:var(--accent-wash);color:var(--accent);font-weight:600;font-size:.86rem}\
-.hint.applies{color:var(--violet)}\
 label.check{display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.88rem;margin:.5rem 0 0}\
-.form-foot{display:flex;justify-content:flex-end;padding-top:1rem;border-top:1px solid var(--line-soft)}\
+details.developer{margin:.7rem 0 0;padding-top:.5rem;border-top:1px solid var(--line-soft)}\
+details.developer>summary{cursor:pointer;font-size:.86rem;font-weight:600;color:var(--ink-soft)}\
+details.developer .summary-note{margin-left:.35rem;font-weight:400;color:var(--ink-faint)}\
+details.developer>.fields{margin-top:.6rem}\
+.form-foot{position:sticky;bottom:0;z-index:5;display:flex;justify-content:flex-end;margin-top:.7rem;padding:.5rem 0;\
+border-top:1px solid var(--line-soft);background:var(--card)}\
 .form-foot button{margin:0}";
 
 /// Whether this deployment was installed for development
@@ -649,6 +661,23 @@ mod tests {
             escape(r#"<script>"x" & 'y'</script>"#),
             "&lt;script&gt;&quot;x&quot; &amp; &#39;y&#39;&lt;/script&gt;"
         );
+    }
+
+    #[test]
+    fn a_plugins_settings_form_is_two_columns_on_a_wide_screen_one_on_a_phone_and_keeps_save_in_view(
+    ) {
+        for rule in [
+            "form.settings .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));",
+            "form.settings .setting.wide{grid-column:1/-1}",
+            "@media (max-width:40rem){form.settings .fields{grid-template-columns:minmax(0,1fr)}}",
+            ".options{display:flex;flex-wrap:wrap;",
+            // A hint is a small line without script, and the bubble's with it.
+            "form.settings.js .hint.about{display:none}",
+            "form.settings:not(.js) button.note-mark{display:none}",
+            ".form-foot{position:sticky;bottom:0;",
+        ] {
+            assert!(STYLE.contains(rule), "{rule}");
+        }
     }
 
     #[test]

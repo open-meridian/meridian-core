@@ -463,11 +463,11 @@ def main():
     check('data-filter="accounts-table"' in page.body, "and the tab offers a search")
     page = administer(ada, "/admin/account-groups",
                       {"account_group_id": "", "name": "Plugin page accounts", "account_ids": account})
-    account_group = row_id(page, "Account groups", "Plugin page accounts")
+    account_group = row_id(page, "Account", "Plugin page accounts")
     page = administer(ada, "/admin/access-groups",
                       {"access_group_id": "", "name": "Plugin page readers",
                        "entries": f"{INSTANCE} read"}, patience=45)
-    access_group = row_id(page, "Access groups", "Plugin page readers")
+    access_group = row_id(page, "Access", "Plugin page readers")
     # The user group the claim made her deployment admin through: the one
     # permission there is before hers.
     admins = re.search(r'<tr data-id="[^"]+" data-user-group="([^"]+)"', page.body)
