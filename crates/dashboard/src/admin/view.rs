@@ -215,12 +215,19 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// The badge for a plugin's state.
-pub fn state_badge(state: &State) -> String {
-    format!(
-        "<span class=\"badge {}\">{}</span>",
-        if state.good { "good" } else { "warn" },
-        escape(state.word)
+/// The badge for a plugin's state, its detail the badge's note on hover
+/// ([`crate::html::noted_badge`]): the badge, then the note, whose id is
+/// `id`, for the caller to place.
+pub fn state_badge(state: &State, id: &str) -> (String, String) {
+    crate::html::noted_badge(
+        if state.good {
+            "badge good"
+        } else {
+            "badge warn"
+        },
+        state.word,
+        &state.detail,
+        id,
     )
 }
 
@@ -363,8 +370,20 @@ fn connections(instance: &str, custody: &Heard, records: &AccessRecords) -> Stri
         .sync
         .iter()
         .filter(|((held_by, _), _)| held_by == instance)
-        .map(|((_, external), status)| {
+        .enumerate()
+        .map(|(row, ((_, external), status))| {
             let (state, what_to_do) = remedy(status);
+            // What the plugin said of it, the state's note on hover.
+            let (pill, detail) = crate::html::noted_badge(
+                if quiet(status) {
+                    "pill good"
+                } else {
+                    "pill warn"
+                },
+                state,
+                &status.status_detail,
+                &format!("sync-note-{row}"),
+            );
             let account = if status.account_id.is_empty() {
                 "<span class=\"pill\">not linked</span>".to_string()
             } else {
@@ -376,12 +395,10 @@ fn connections(instance: &str, custody: &Heard, records: &AccessRecords) -> Stri
             };
             format!(
                 "<tr data-id=\"{id}\" data-state=\"{state}\"><td>{id}</td><td>{account}</td>\
-                 <td><span class=\"pill{tone}\">{state}</span></td><td class=\"remedy\">{what_to_do}</td>\
-                 <td>{holdings}</td><td>{detail}</td></tr>",
+                 <td>{pill}{detail}</td><td class=\"remedy\">{what_to_do}</td>\
+                 <td>{holdings}</td></tr>",
                 id = escape(external),
-                tone = if quiet(status) { " good" } else { " warn" },
                 holdings = escape(&utc(status.holdings_as_of_ns)),
-                detail = escape(&status.status_detail),
             )
         })
         .collect();
@@ -393,16 +410,14 @@ fn connections(instance: &str, custody: &Heard, records: &AccessRecords) -> Stri
          <p class=\"hint\">Each external account's sync state, as the plugin last said it, and \
          whose fix it is.</p><div class=\"scroll\"><table class=\"list sync\"><thead><tr>\
          <th>External account</th><th>Account</th><th>State</th><th>What to do</th>\
-         <th>Holdings as of</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></div></section>"
+         <th>Holdings as of</th></tr></thead><tbody>{rows}</tbody></table></div></section>"
     )
 }
 
 fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: &str) -> String {
-    let detail = if line.state.detail.is_empty() {
-        String::new()
-    } else {
-        format!("<p>{}</p>", escape(&line.state.detail))
-    };
+    // Why it is as it is, the badge's note: a line under the heading without
+    // script, and with it, in the bubble.
+    let (badge, detail) = state_badge(&line.state, "health-note");
     let facts = match report {
         None => String::new(),
         Some(report) => {
@@ -444,7 +459,6 @@ fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: &str) -
     format!(
         "<section class=\"panel padded\" id=\"health\"><div class=\"row\"><h2>Health</h2>{badge}</div>\
          {detail}{facts}{flags}</section>",
-        badge = state_badge(&line.state),
         flags = flags(line, Some(admin_pages)),
     )
 }
@@ -512,7 +526,7 @@ fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
             return format!(
                 "<iframe class=\"admin-frame\" id=\"admin-page\" data-page=\"{path}\" src=\"{}\" \
                  title=\"{title} &middot; {}\" data-plugin-frame data-seamless data-origin=\"{}\" \
-                 data-actions=\"{PAGE_ACTIONS}\"></iframe>",
+                 data-actions=\"{PAGE_ACTIONS}\" data-status=\"{PAGE_STATUS}\"></iframe>",
                 escape(src),
                 escape(&tab.title),
                 escape(origin)
@@ -536,6 +550,17 @@ fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
 /// The header's area for a framed page's own actions (meridian-ui's
 /// `meridian:actions`), which the chrome's script draws; its frame names it.
 const PAGE_ACTIONS: &str = "page-actions";
+
+/// Where a framed page's own status dot goes (meridian-ui's
+/// `meridian:status`, kit 0.7.0): beside the plugin's name in the
+/// breadcrumb, which the chrome's script draws it in; its frame names it.
+const PAGE_STATUS: &str = "page-status";
+
+/// The breadcrumb's place for a framed page's status, after the plugin's
+/// name: empty, and taking no room, until the page tells it a status.
+pub fn status_place() -> String {
+    format!("<span class=\"crumb-status\" id=\"{PAGE_STATUS}\"></span>")
+}
 
 pub fn render(view: &View) -> String {
     let line = view.line;

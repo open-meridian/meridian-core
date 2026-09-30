@@ -214,7 +214,12 @@ pub fn render(
         });
         let rows: String = sorted
             .iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(row, line)| {
+                // Why it is as it is, the badge's note on hover (the product
+                // owner, 2026-09-30), a line under it without script.
+                let (state, detail) =
+                    view::state_badge(&line.state, &format!("plugin-health-{row}"));
                 let settings = if line.missing.is_empty() {
                     "<span class=\"badge good\">ready</span>".to_string()
                 } else {
@@ -225,7 +230,7 @@ pub fn render(
                 };
                 format!(
                     "<tr data-id=\"{id}\"><td>{plugin}</td><td><code>{id}</code></td>\
-                     <td>{state}<span class=\"hint\">{detail}</span></td>\
+                     <td>{state}{detail}</td>\
                      <td>{settings}</td><td class=\"flags\">{flags}</td>\
                      <td class=\"actions\"><a class=\"button\" href=\"{href}\">Manage</a></td></tr>",
                     id = escape(&line.instance),
@@ -233,8 +238,6 @@ pub fn render(
                         Some(name) => format!("<span class=\"name\">{}</span>", escape(name)),
                         None => "<span class=\"faint\">not from the catalogue</span>".to_string(),
                     },
-                    state = view::state_badge(&line.state),
-                    detail = escape(&line.state.detail),
                     flags = view::flags(line, None),
                     href = escape(&view::path(&line.instance)),
                 )

@@ -1694,11 +1694,20 @@ async fn the_views_header_is_the_breadcrumb_and_a_framed_pages_own_actions() {
             .nth(1)
             .and_then(|rest| rest.split("</nav>").next())
             .expect("the crumbs");
+        // A framed page's status goes after the name, in a place kept empty
+        // until the page tells it one (kit 0.7.0's meridian:status).
+        let status = if std::ptr::eq(page, &framed) {
+            "<span class=\"crumb-status\" id=\"page-status\"></span>"
+        } else {
+            ""
+        };
         assert_eq!(
             crumbs,
-            "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
-             <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
-             <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade-1</span>",
+            format!(
+                "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+                 <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+                 <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade-1</span>{status}"
+            ),
             "the settings home, the plugins list, then this one by name, its ID on hover"
         );
         assert!(!head.contains(">Admin<"));
@@ -1724,9 +1733,88 @@ async fn the_views_header_is_the_breadcrumb_and_a_framed_pages_own_actions() {
         .next()
         .unwrap();
     assert!(
-        frame.contains(" data-seamless ") && frame.contains("data-actions=\"page-actions\""),
+        frame.contains(" data-seamless ")
+            && frame.contains("data-actions=\"page-actions\"")
+            && frame.contains("data-status=\"page-status\""),
         "{frame}"
     );
+}
+
+/// The product owner, 2026-09-30: "let's put 'Its sidecar has stopped
+/// reporting.' in note when hovering the silent button (similar concept for
+/// other 'notes')". A health badge is a button described by its detail,
+/// which is a line under it without script and, with it, the bubble's.
+#[tokio::test]
+async fn a_health_badge_carries_its_detail_as_its_note() {
+    let h = harness(with_settings(), None);
+    // Its sidecar last said so 91 seconds ago: three reports missed.
+    h.app.health.hear(
+        "snaptrade-1",
+        meridian_domain::v1::PluginReport {
+            reported_at_ns: T0 - 91_000_000_000,
+            ..declaring(&[])
+        },
+    );
+    let silent = "<button type=\"button\" class=\"badge warn\" data-note \
+                  aria-describedby=\"plugin-health-0\">Silent</button>\
+                  <span class=\"hint noted\" id=\"plugin-health-0\">Its sidecar has stopped reporting.</span>";
+    let (_, overview) = send(&h, get(&h, "/admin", true)).await;
+    let listed = table(&overview, "plugins");
+    assert!(listed.contains(silent), "{listed}");
+    // The note is not also a line of its own once the script runs, and the
+    // one bubble is drawn by the chrome's script, as text.
+    assert!(overview.contains("html[data-script] .noted{display:none}"));
+    assert!(overview.contains("bubble.textContent = text;"));
+
+    // The same in the view's Health panel, where the detail was a paragraph.
+    let (_, view) = send(&h, get(&h, VIEW, true)).await;
+    let health = view.split("id=\"health\"").nth(1).unwrap();
+    let health = health.split("</section>").next().unwrap();
+    assert!(
+        health.contains(
+            "<h2>Health</h2><button type=\"button\" class=\"badge warn\" data-note \
+             aria-describedby=\"health-note\">Silent</button></div>\
+             <span class=\"hint noted\" id=\"health-note\">Its sidecar has stopped reporting.</span>"
+        ),
+        "{health}"
+    );
+    assert!(!health.contains("<p>Its sidecar"), "{health}");
+
+    // Healthy, with nothing to say, the badge is only a badge.
+    h.app.health.hear("snaptrade-1", declaring(&[]));
+    let (_, view) = send(&h, get(&h, VIEW, true)).await;
+    assert!(view.contains("<span class=\"badge good\">Healthy</span>"));
+    assert!(
+        !view.contains("id=\"health-note\"")
+            && !view.contains("<button type=\"button\" class=\"badge"),
+        "no note to show"
+    );
+}
+
+#[tokio::test]
+async fn a_connections_state_carries_what_the_plugin_said_of_it_as_its_note() {
+    let h = harness(with_settings(), None);
+    h.app.custody.hear_sync(
+        "snaptrade-1",
+        SyncStatusEvent {
+            external_account_id: "SNAP-1".into(),
+            account_id: "ACC-1".into(),
+            state: SyncState::NeedsSignIn as i32,
+            status_detail: "the daily <sign-in> has lapsed".into(),
+            ..Default::default()
+        },
+    );
+    let (_, body) = send(&h, get(&h, VIEW, true)).await;
+    let sync = table(&body, "sync");
+    assert!(
+        sync.contains(
+            "<td><button type=\"button\" class=\"pill warn\" data-note aria-describedby=\"sync-note-0\">\
+             Needs sign-in</button><span class=\"hint noted\" id=\"sync-note-0\">the daily &lt;sign-in&gt; \
+             has lapsed</span></td>"
+        ),
+        "{sync}"
+    );
+    assert!(!sync.contains("<th>Detail</th>"), "the note, not a column");
 }
 
 #[tokio::test]

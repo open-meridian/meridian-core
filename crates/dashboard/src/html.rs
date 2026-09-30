@@ -154,6 +154,24 @@ button.note-mark:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wa
 .note-bubble{position:absolute;z-index:20;max-width:min(24rem,calc(100vw - 1rem));padding:.55rem .75rem;\
 background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:var(--radius);\
 box-shadow:var(--shadow-pop);font-size:.88rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}\
+.note-bubble.on-bar{position:fixed;z-index:31}html[data-script] .noted{display:none}\
+button.badge,button.pill{margin:0;border:0;font-family:inherit;line-height:inherit;vertical-align:middle}\
+html[data-script] [data-note]{cursor:help}\
+button.badge:focus-visible,button.pill:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
+header.bar .crumbs .crumb-status{display:inline-flex;align-items:center;flex-shrink:0}\
+header.bar .crumbs .crumb-status:empty{display:none}\
+.status-dot{display:inline-flex;align-items:center;justify-content:center;min-width:1.5rem;min-height:1.5rem;\
+margin:-.275rem;padding:0;border:0;border-radius:50%;background:none;flex-shrink:0}.status-dot:hover{background:none}\
+.status-dot:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
+.status-dot::before{content:\"\";display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;\
+width:.95rem;height:.95rem;border-radius:50%;background:var(--ink-faint);color:var(--card);font:800 .62rem/1 var(--sans)}\
+.status-dot[data-state=ok]::before{background:var(--good);content:\"\\2713\";content:\"\\2713\" / \"\"}\
+.status-dot[data-state=error]::before{background:var(--danger);content:\"!\";content:\"!\" / \"\"}\
+.status-dot[data-state=warn]::before{background:var(--warn-ink);content:\"!\";content:\"!\" / \"\";width:1.05rem;\
+border-radius:0;padding-top:.2rem;clip-path:polygon(50% 0,100% 100%,0 100%)}\
+.status-dot[data-state=busy]::before{background:transparent;border:2px solid var(--warn-ink);border-top-color:transparent;\
+animation:status-turn 1.4s linear infinite}@keyframes status-turn{to{transform:rotate(1turn)}}\
+@media (prefers-reduced-motion:reduce){.status-dot[data-state=busy]::before{animation:none}}\
 input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins td:first-child{white-space:nowrap}\
 .filter-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:0 0 .9rem}.filter-row input.filter{margin:0}\
 .filter-count{color:var(--ink-faint);font-size:.84rem}\
@@ -360,18 +378,50 @@ const DEVELOPMENT_BANNER: &str = "<p class=\"development\"><strong>Development \
 /// sets it from script; it holds nothing but the mode.
 pub const MODE_COOKIE: &str = "meridian_mode";
 
-/// Before first paint: the person's mode on `<html>`, as the kit reads it.
-const HEAD_SCRIPT: &str = "(function(){try{var m=document.cookie.match(\
+/// Before first paint: the person's mode on `<html>`, as the kit reads it;
+/// and `data-script`, which says the page's script runs, so what the chrome's
+/// script shows in a note ([`noted_badge`]) is not also a line of the page.
+const HEAD_SCRIPT: &str = "(function(){var r=document.documentElement;\
+r.setAttribute(\"data-script\",\"\");try{var m=document.cookie.match(\
 /(?:^|;\\s*)(?:__Host-)?meridian_mode=(light|dark)(?:;|$)/);\
-if(m)document.documentElement.setAttribute(\"data-om-mode\",m[1]);}catch(e){}})();";
+if(m)r.setAttribute(\"data-om-mode\",m[1]);}catch(e){}})();";
+
+/// A badge (or a pill: `class` says which, and its tone) whose why is a note
+/// on hover (the product owner, 2026-09-30: "let's put 'Its sidecar has
+/// stopped reporting.' in note when hovering the silent button (similar
+/// concept for other 'notes')"). With a note, the badge is a button, so a
+/// keyboard and a tap reach it, described by the note, which the chrome's
+/// script shows in the one bubble an account's note is shown in; the note is
+/// returned second, for the caller to place where it reads as a line without
+/// script, and with script it is not shown but in the bubble. `id` is the
+/// note's, unique on the page. Without a note, the badge alone, as it was.
+pub fn noted_badge(class: &str, word: &str, note: &str, id: &str) -> (String, String) {
+    let class = escape(class);
+    if note.trim().is_empty() {
+        return (
+            format!("<span class=\"{class}\">{}</span>", escape(word)),
+            String::new(),
+        );
+    }
+    let id = escape(id);
+    (
+        format!(
+            "<button type=\"button\" class=\"{class}\" data-note aria-describedby=\"{id}\">{}</button>",
+            escape(word)
+        ),
+        format!("<span class=\"hint noted\" id=\"{id}\">{}</span>", escape(note)),
+    )
+}
 
 /// The header's menu and every plugin frame on the page: choosing a mode
 /// applies it here, remembers it, and tells each framed page by the frame's
 /// message (meridian-ui's contract), as each frame's load does, so a
 /// navigation inside it keeps the person's theme. A seamless frame
 /// (`data-seamless`, the admin view's) is told version 3 with `framed: true`,
-/// and is as tall as its page says it is; the full-page frame is told
-/// version 2, which says nothing of framing.
+/// and is as tall as its page says it is, and its page's header actions and
+/// status dot are drawn by the dashboard; the full-page frame is told
+/// version 2, which says nothing of framing, so its page keeps its own. And
+/// a note on hover for whatever on the page carries one (`data-note`).
 const CHROME_SCRIPT: &str = r#"(function () {
   var root = document.documentElement;
   function mode() { return root.getAttribute("data-om-mode") || "system"; }
@@ -385,8 +435,11 @@ const CHROME_SCRIPT: &str = r#"(function () {
     frame.contentWindow.postMessage(message, origin);
   }
   var frames = Array.prototype.slice.call(document.querySelectorAll("iframe[data-plugin-frame]"));
-  // Each load is a new page: its header actions go until it offers its own.
-  frames.forEach(function (frame) { frame.addEventListener("load", function () { draw(frame, []); tell(frame); }); });
+  // Each load is a new page: its header actions and its status go until it
+  // offers its own.
+  frames.forEach(function (frame) {
+    frame.addEventListener("load", function () { draw(frame, []); status(frame, null); tell(frame); });
+  });
   // A seamless frame's height is its page's, by meridian:size (meridian-ui's
   // README, "The frame: seamless"): taken only from that frame's own window,
   // from exactly the origin its theme is told to, as a whole number of
@@ -454,6 +507,152 @@ const CHROME_SCRIPT: &str = r#"(function () {
       if (list) draw(frame, list);
     });
   });
+  // A seamless frame's header status, by meridian:status (kit 0.7.0;
+  // meridian-ui's README, "The frame: seamless"): the page's own status dot,
+  // drawn beside the plugin's name in the breadcrumb, in the place its frame
+  // names (data-status), so the page spends no line of its own on it (the
+  // product owner, 2026-09-30). Taken under the size's guards and only in the
+  // kit's shape, else not at all; state null takes the dot away, as a new
+  // load of the frame does. Its label is its name and its note's first line,
+  // its detail and moment its description; every word is text, never markup.
+  var STATES = ["ok", "busy", "warn", "error"];
+  var MOMENT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+  function words(v, least, most) { return typeof v === "string" && v.trim().length >= least && v.length <= most; }
+  function told(d) {
+    if (d.state === null) return null;
+    if (STATES.indexOf(d.state) === -1 || !words(d.label, 1, 80)) return undefined;
+    if (d.detail !== undefined && !words(d.detail, 0, 300)) return undefined;
+    if (d.at !== undefined && !(words(d.at, 1, 40) && MOMENT.test(d.at) && !isNaN(Date.parse(d.at)))) return undefined;
+    if (d.at_label !== undefined && !words(d.at_label, 1, 40)) return undefined;
+    return d;
+  }
+  function status(frame, said) {
+    var place = frame.hasAttribute("data-status") && document.getElementById(frame.getAttribute("data-status"));
+    if (!place) return;
+    if (noted && place.contains(noted)) unnote();
+    if (!said) { place.replaceChildren(); return; }
+    var about = [];
+    if (said.detail && said.detail.trim()) about.push(said.detail);
+    if (said.at) {
+      // As this dashboard shows every moment: to the minute, in UTC.
+      var at = new Date(said.at).toISOString();
+      about.push((said.at_label || "Updated") + " " + at.slice(0, 10) + " " + at.slice(11, 16) + " UTC");
+    }
+    var dot = document.createElement("button");
+    dot.type = "button";
+    dot.className = "status-dot";
+    dot.setAttribute("data-state", said.state);
+    dot.setAttribute("aria-label", said.label);
+    dot.setAttribute("data-note", said.label);
+    var lines = about.map(function (text, i) {
+      var line = document.createElement("span");
+      line.id = place.id + "-about-" + i;
+      line.hidden = true;
+      line.textContent = text;
+      return line;
+    });
+    if (lines.length) dot.setAttribute("aria-describedby", lines.map(function (l) { return l.id; }).join(" "));
+    place.replaceChildren.apply(place, [dot].concat(lines));
+  }
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    frames.forEach(function (frame) {
+      if (!frame.hasAttribute("data-seamless") || !frame.contentWindow) return;
+      if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;
+      if (!data || data.type !== "meridian:status" || data.version !== 1) return;
+      var said = told(data);
+      if (said !== undefined) status(frame, said);
+    });
+  });
+  // A note on hover (the product owner, 2026-09-30, "similar concept for
+  // other 'notes'"): an element marked data-note -- a badge with a why, the
+  // header's status dot -- shows its data-note's words, when it has some, and
+  // what describes it (aria-describedby), in the one bubble an account's note
+  // is shown in: under it, or over it when there is no room below. Pointing
+  // at it, focusing it or pressing it shows the note; it stays while the
+  // pointer is on it or on the bubble, and goes on leaving them, on Escape,
+  // on a press elsewhere, and when the window resizes, a list scrolls or a
+  // search is typed. The words reach the bubble as text, never as markup,
+  // and the bubble is hidden from a screen reader, which has the note as the
+  // element's description.
+  var bubble = null;
+  var noted = null;
+  var leaving = 0;
+  function unnote() {
+    window.clearTimeout(leaving);
+    noted = null;
+    if (bubble) bubble.hidden = true;
+  }
+  function unnoteLater() {
+    window.clearTimeout(leaving);
+    leaving = window.setTimeout(unnote, 150);
+  }
+  function note(el) {
+    window.clearTimeout(leaving);
+    if (el === noted) return;
+    var lines = [el.getAttribute("data-note")];
+    (el.getAttribute("aria-describedby") || "").split(/\s+/).forEach(function (id) {
+      var about = id && document.getElementById(id);
+      if (about) lines.push(about.textContent);
+    });
+    var text = lines.map(function (line) { return (line || "").trim(); }).filter(Boolean).join("\n");
+    if (!text) { unnote(); return; }
+    if (!bubble) {
+      bubble = document.createElement("div");
+      bubble.className = "note-bubble";
+      bubble.setAttribute("aria-hidden", "true");
+      bubble.addEventListener("mouseenter", function () { window.clearTimeout(leaving); });
+      bubble.addEventListener("mouseleave", function (event) {
+        if (!noted || !noted.contains(event.relatedTarget)) unnoteLater();
+      });
+      document.body.appendChild(bubble);
+    }
+    noted = el;
+    // In the header, which stays put as the page scrolls, the bubble stays
+    // with it, over it.
+    var onBar = !!el.closest("header.bar");
+    bubble.classList.toggle("on-bar", onBar);
+    bubble.textContent = text;
+    bubble.hidden = false;
+    var edge = 8;
+    var gap = 4;
+    var box = el.getBoundingClientRect();
+    var width = bubble.offsetWidth;
+    var height = bubble.offsetHeight;
+    var top = box.bottom + gap;
+    if (top + height > window.innerHeight - edge && box.top - height - gap >= edge) top = box.top - height - gap;
+    var left = Math.max(edge, Math.min(box.left, window.innerWidth - width - edge));
+    bubble.style.top = top + (onBar ? 0 : window.scrollY) + "px";
+    bubble.style.left = left + (onBar ? 0 : window.scrollX) + "px";
+  }
+  function notedAt(target) { return target && target.closest ? target.closest("[data-note]") : null; }
+  document.addEventListener("mouseover", function (event) {
+    var el = notedAt(event.target);
+    if (el) note(el);
+  });
+  document.addEventListener("mouseout", function (event) {
+    if (!noted || notedAt(event.target) !== noted) return;
+    if (noted.contains(event.relatedTarget) || (bubble && bubble.contains(event.relatedTarget))) return;
+    unnoteLater();
+  });
+  document.addEventListener("focusin", function (event) {
+    var el = notedAt(event.target);
+    if (el) note(el);
+  });
+  document.addEventListener("focusout", function (event) {
+    if (noted && notedAt(event.target) === noted) unnote();
+  });
+  document.addEventListener("click", function (event) {
+    var el = notedAt(event.target);
+    if (el) { note(el); return; }
+    if (noted && !(bubble && bubble.contains(event.target))) unnote();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && noted) unnote();
+  });
+  window.addEventListener("resize", function () { if (noted) unnote(); });
+  document.addEventListener("scroll", function (event) { if (noted && event.target !== document) unnote(); }, true);
+  document.addEventListener("input", function () { if (noted) unnote(); });
   function mark() {
     document.querySelectorAll("[data-mode]").forEach(function (a) {
       a.setAttribute("aria-current", a.getAttribute("data-mode") === mode() ? "true" : "false");
@@ -989,10 +1188,164 @@ mod tests {
         assert!(!CHROME_SCRIPT.contains("\"*\""), "never to any origin");
         // A new page in the frame is offered nothing until it says.
         assert!(CHROME_SCRIPT.contains(
-            "frame.addEventListener(\"load\", function () { draw(frame, []); tell(frame); });"
+            "frame.addEventListener(\"load\", function () { draw(frame, []); status(frame, null); tell(frame); });"
         ));
         // The tones the header can draw.
         assert!(STYLE.contains("button.danger{background:var(--danger-wash);border-color:var(--danger);color:var(--danger)}"));
+    }
+
+    /// The header-status listener, as it is written (kit 0.7.0's
+    /// `meridian:status`; the product owner, 2026-09-30: "put the green icon
+    /// ... next to the plugin name"): the size's guards, its own type at
+    /// version 1, then the kit's shape, before anything is drawn; drawn
+    /// beside the plugin's name as text; gone with state null or a new load.
+    #[test]
+    fn a_seamless_frames_status_is_taken_only_from_its_own_page_and_drawn_beside_the_name() {
+        let listener = CHROME_SCRIPT
+            .split("window.addEventListener(\"message\"")
+            .nth(3)
+            .expect("the status listener")
+            .split("\n  });\n")
+            .next()
+            .unwrap();
+        let guards = [
+            // Only a seamless frame, from its own window,
+            "if (!frame.hasAttribute(\"data-seamless\") || !frame.contentWindow) return;",
+            // from exactly the plugin's origin (another origin is ignored),
+            "if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;",
+            // as the status, at version 1 (another version is ignored),
+            "if (!data || data.type !== \"meridian:status\" || data.version !== 1) return;",
+            // in the kit's shape,
+            "var said = told(data);",
+            // or nothing is drawn, and the dot drawn before stays.
+            "if (said !== undefined) status(frame, said);",
+        ];
+        let mut at = Vec::new();
+        for guard in guards {
+            at.push(
+                listener
+                    .find(guard)
+                    .unwrap_or_else(|| panic!("{guard}\nnot in:{listener}")),
+            );
+        }
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "every check before anything is drawn"
+        );
+
+        // The shape, as the kit's README gives the host's half: state null,
+        // or a state it knows with a short label; a detail, a moment that
+        // parses and its label, each short, or not there at all.
+        let shape = CHROME_SCRIPT
+            .split("function told(d) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the shape");
+        for check in [
+            "if (d.state === null) return null;",
+            "if (STATES.indexOf(d.state) === -1 || !words(d.label, 1, 80)) return undefined;",
+            "if (d.detail !== undefined && !words(d.detail, 0, 300)) return undefined;",
+            "if (d.at !== undefined && !(words(d.at, 1, 40) && MOMENT.test(d.at) && !isNaN(Date.parse(d.at)))) return undefined;",
+            "if (d.at_label !== undefined && !words(d.at_label, 1, 40)) return undefined;",
+        ] {
+            assert!(shape.contains(check), "{check}\nnot in:{shape}");
+        }
+        assert!(CHROME_SCRIPT.contains("var STATES = [\"ok\", \"busy\", \"warn\", \"error\"];"));
+        assert!(CHROME_SCRIPT.contains(
+            "function words(v, least, most) { return typeof v === \"string\" && v.trim().length >= least && v.length <= most; }"
+        ));
+
+        // Drawn in the place the frame names, beside the plugin's name: a dot
+        // whose state is its mark, its label its name and its note's first
+        // line, its detail and moment what describes it; all of it as text.
+        let draw = CHROME_SCRIPT
+            .split("function status(frame, said) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the drawing");
+        for line in [
+            "var place = frame.hasAttribute(\"data-status\") && document.getElementById(frame.getAttribute(\"data-status\"));",
+            "if (!said) { place.replaceChildren(); return; }",
+            "dot.className = \"status-dot\";",
+            "dot.setAttribute(\"data-state\", said.state);",
+            "dot.setAttribute(\"aria-label\", said.label);",
+            "dot.setAttribute(\"data-note\", said.label);",
+            "line.textContent = text;",
+            "place.replaceChildren.apply(place, [dot].concat(lines));",
+        ] {
+            assert!(draw.contains(line), "{line}\nnot in:{draw}");
+        }
+        assert!(!CHROME_SCRIPT.contains("innerHTML"), "never markup");
+        assert!(!CHROME_SCRIPT.contains("\"*\""), "never to any origin");
+        // A mark for each state, never colour alone.
+        for rule in [
+            ".status-dot[data-state=ok]::before{background:var(--good);content:\"\\2713\"",
+            ".status-dot[data-state=error]::before{background:var(--danger);content:\"!\"",
+            ".status-dot[data-state=warn]::before{background:var(--warn-ink);content:\"!\"",
+            ".status-dot[data-state=busy]::before{background:transparent;border:2px solid var(--warn-ink)",
+            "@media (prefers-reduced-motion:reduce){.status-dot[data-state=busy]::before{animation:none}}",
+            // No room taken beside the name until there is a status.
+            "header.bar .crumbs .crumb-status:empty{display:none}",
+            // Its note over the header, which stays put as the page scrolls.
+            ".note-bubble.on-bar{position:fixed;z-index:31}",
+        ] {
+            assert!(STYLE.contains(rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn a_badge_with_a_why_is_a_button_described_by_its_note_and_one_without_is_a_badge() {
+        let (badge, note) = noted_badge(
+            "badge warn",
+            "Silent",
+            "Its sidecar has <stopped> reporting.",
+            "n-1",
+        );
+        assert_eq!(
+            badge,
+            "<button type=\"button\" class=\"badge warn\" data-note aria-describedby=\"n-1\">Silent</button>"
+        );
+        assert_eq!(
+            note,
+            "<span class=\"hint noted\" id=\"n-1\">Its sidecar has &lt;stopped&gt; reporting.</span>"
+        );
+        let (badge, note) = noted_badge("badge good", "Healthy", " ", "n-2");
+        assert_eq!(badge, "<span class=\"badge good\">Healthy</span>");
+        assert!(note.is_empty());
+
+        // Script says it runs before first paint, and the note is then the
+        // bubble's alone; without script it is a line under the badge.
+        assert!(HEAD_SCRIPT.starts_with(
+            "(function(){var r=document.documentElement;r.setAttribute(\"data-script\",\"\");try{"
+        ));
+        assert!(STYLE.contains("html[data-script] .noted{display:none}"));
+        assert!(STYLE.contains("button.badge,button.pill{margin:0;border:0;"));
+
+        // The one bubble, the accounts' note's: filled as text, hidden from a
+        // screen reader, which has the note as the badge's description; on
+        // pointing, focus or a press, and gone on Escape.
+        let script = CHROME_SCRIPT
+            .split("function note(el) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }\n").next())
+            .expect("the note");
+        for line in [
+            "var lines = [el.getAttribute(\"data-note\")];",
+            "(el.getAttribute(\"aria-describedby\") || \"\").split(/\\s+/).forEach(function (id) {",
+            "bubble.className = \"note-bubble\";",
+            "bubble.setAttribute(\"aria-hidden\", \"true\");",
+            "bubble.textContent = text;",
+        ] {
+            assert!(script.contains(line), "{line}\nnot in:{script}");
+        }
+        for listened in [
+            "document.addEventListener(\"mouseover\", function (event) {",
+            "document.addEventListener(\"focusin\", function (event) {",
+            "document.addEventListener(\"click\", function (event) {\n    var el = notedAt(event.target);",
+            "if (event.key === \"Escape\" && noted) unnote();",
+        ] {
+            assert!(CHROME_SCRIPT.contains(listened), "{listened}");
+        }
     }
 
     #[test]

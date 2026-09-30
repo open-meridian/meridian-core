@@ -39,7 +39,10 @@
 //! instead ([`crate::admin::view`]; meridian-ui's README, "The frame:
 //! seamless"): `om-framed=1` on the address, `framed: true` in a version-3
 //! message, and the frame as tall as the page says it is by `meridian:size`,
-//! so the dashboard's heading and tab row are the only ones.
+//! so the dashboard's heading and tab row are the only ones; the page's
+//! header actions (`meridian:actions`) are drawn in the view's head, and its
+//! status dot (`meridian:status`, kit 0.7.0) beside the plugin's name in the
+//! breadcrumb.
 //!
 //! **The kit** is served at `/.meridian/ui/<version>/` on every plugin host
 //! (Q2), on the plugin's own origin, to anybody: it is the same static files

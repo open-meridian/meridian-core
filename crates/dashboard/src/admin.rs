@@ -499,6 +499,10 @@ async fn plugin_view(
             },
             Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, page, &theme)),
         });
+    // A framed page's own status dot goes beside the plugin's name (the
+    // product owner, 2026-09-30: "put the green icon ... next to the plugin
+    // name so there's no extra line between the tabs and the form").
+    let framed = matches!(admin_page, Some(view::AdminPage::Framed { .. }));
     let body = view::render(&view::View {
         line,
         record: settings_of(&records, &instance),
@@ -514,12 +518,18 @@ async fn plugin_view(
     });
     let mut chrome = admin_chrome(&session);
     // The way back is the breadcrumb: the settings home, its plugins, then
-    // this one by its name, its instance ID on hover.
+    // this one by its name, its instance ID on hover; and after it, a framed
+    // page's status, once the page tells it.
     chrome.crumbs = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         crate::html::crumb_link("/admin", "Settings"),
         crate::html::crumb_link("/admin#plugins", "Plugins"),
         crate::html::crumb_here(line.name.as_deref().unwrap_or(&instance), Some(&instance)),
+        if framed {
+            view::status_place()
+        } else {
+            String::new()
+        },
     );
     Html(page_with(
         &format!("{} admin", line.name.as_deref().unwrap_or(&instance)),
