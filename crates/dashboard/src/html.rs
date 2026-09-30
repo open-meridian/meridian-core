@@ -200,8 +200,9 @@ ul.plugins.tiles .plugin-card{padding:.85rem}}\
 .flag{display:block;padding:.55rem .8rem;border-radius:var(--radius);\
 background:var(--warn-wash);color:var(--warn-ink);font-size:.9rem;margin:.75rem 0 0}\
 .flag a{color:inherit;text-decoration:underline}\
-.admin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:1px solid var(--line);\
-border-radius:var(--radius);background:var(--page)}\
+.admin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:0;border-radius:0;background:none;\
+color-scheme:light dark}.admin-frame[data-sized]{min-height:0}\
+html[data-om-mode=light] .admin-frame{color-scheme:light}html[data-om-mode=dark] .admin-frame{color-scheme:dark}\
 form.settings .setting{padding:1rem 0;border-top:1px solid var(--line-soft)}\
 form.settings .setting:first-of-type{border-top:0;padding-top:.25rem}\
 form.settings .setting .hint{margin:.3rem 0 0}\
@@ -272,19 +273,43 @@ if(m)document.documentElement.setAttribute(\"data-om-mode\",m[1]);}catch(e){}})(
 
 /// The header's menu and every plugin frame on the page: choosing a mode
 /// applies it here, remembers it, and tells each framed page by the frame's
-/// message (meridian-ui's contract, version 2), as each frame's load does,
-/// so a navigation inside it keeps the person's theme.
+/// message (meridian-ui's contract), as each frame's load does, so a
+/// navigation inside it keeps the person's theme. A seamless frame
+/// (`data-seamless`, the admin view's) is told version 3 with `framed: true`,
+/// and is as tall as its page says it is; the full-page frame is told
+/// version 2, which says nothing of framing.
 const CHROME_SCRIPT: &str = r#"(function () {
   var root = document.documentElement;
   function mode() { return root.getAttribute("data-om-mode") || "system"; }
   function tell(frame) {
     var origin = frame.getAttribute("data-origin");
     if (!origin || !frame.contentWindow) return;
-    frame.contentWindow.postMessage({ type: "meridian:theme", version: 2, scheme: "default",
-      mode: mode(), direction: "green-up" }, origin);
+    var seamless = frame.hasAttribute("data-seamless");
+    var message = { type: "meridian:theme", version: seamless ? 3 : 2, scheme: "default",
+      mode: mode(), direction: "green-up" };
+    if (seamless) message.framed = true;
+    frame.contentWindow.postMessage(message, origin);
   }
   var frames = Array.prototype.slice.call(document.querySelectorAll("iframe[data-plugin-frame]"));
   frames.forEach(function (frame) { frame.addEventListener("load", function () { tell(frame); }); });
+  // A seamless frame's height is its page's, by meridian:size (meridian-ui's
+  // README, "The frame: seamless"): taken only from that frame's own window,
+  // from exactly the origin its theme is told to, as a whole number of
+  // pixels, and never more than TALLEST, since a height is only the page's
+  // request. Until the first, the stylesheet's height holds, so a page on a
+  // kit without the message still shows and the frame is never 0 tall.
+  var TALLEST = 20000;
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    frames.forEach(function (frame) {
+      if (!frame.hasAttribute("data-seamless") || !frame.contentWindow) return;
+      if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;
+      if (!data || data.type !== "meridian:size" || data.version !== 1) return;
+      if (!Number.isInteger(data.height) || data.height < 0) return;
+      frame.style.height = Math.min(data.height, TALLEST) + "px";
+      frame.setAttribute("data-sized", "");
+    });
+  });
   function mark() {
     document.querySelectorAll("[data-mode]").forEach(function (a) {
       a.setAttribute("aria-current", a.getAttribute("data-mode") === mode() ? "true" : "false");
@@ -452,6 +477,82 @@ mod tests {
         assert!(marked.find("Development").unwrap() < marked.find("<h1>").unwrap());
         assert!(!document("Home", "<h1>Meridian</h1>", &chrome, false)
             .contains("class=\"development\""));
+    }
+
+    /// The size listener, as it is written: the workspace runs no script, so
+    /// what it takes is held here line by line (and was run in a browser
+    /// against a stand-in plugin page on another origin when written).
+    #[test]
+    fn a_seamless_frame_takes_its_height_only_from_its_own_page_as_a_whole_number() {
+        let listener = CHROME_SCRIPT
+            .split("window.addEventListener(\"message\"")
+            .nth(1)
+            .expect("the size listener")
+            .split("\n  });\n")
+            .next()
+            .unwrap();
+        for guard in [
+            // Only a seamless frame, and only from its own window,
+            "if (!frame.hasAttribute(\"data-seamless\") || !frame.contentWindow) return;",
+            // from exactly the plugin's origin its theme is told to,
+            "if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;",
+            // as the message it is, at the version it is,
+            "if (!data || data.type !== \"meridian:size\" || data.version !== 1) return;",
+            // and a whole number of pixels, none less than none;
+            "if (!Number.isInteger(data.height) || data.height < 0) return;",
+            // then no taller than the dashboard's cap.
+            "frame.style.height = Math.min(data.height, TALLEST) + \"px\";",
+        ] {
+            assert!(listener.contains(guard), "{guard}\nnot in:{listener}");
+        }
+        let guards = [
+            "hasAttribute",
+            "event.source",
+            "\"meridian:size\"",
+            "Number.isInteger",
+            "Math.min",
+        ];
+        let at: Vec<usize> = guards.iter().map(|g| listener.find(g).unwrap()).collect();
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "every check before the height is set"
+        );
+        assert!(CHROME_SCRIPT.contains("var TALLEST = 20000;"));
+
+        // A seamless frame is told it is framed, at version 3; the full-page
+        // frame is told version 2, which says nothing of framing.
+        assert!(CHROME_SCRIPT.contains("version: seamless ? 3 : 2,"));
+        assert!(CHROME_SCRIPT.contains("if (seamless) message.framed = true;"));
+        assert!(CHROME_SCRIPT.contains("postMessage(message, origin)"));
+        assert!(!CHROME_SCRIPT.contains("\"*\""), "never to any origin");
+    }
+
+    #[test]
+    fn a_seamless_frame_has_no_edge_of_its_own_and_a_height_until_its_page_says() {
+        let frame = STYLE
+            .split(".admin-frame{")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        for rule in [
+            "border:0",
+            "border-radius:0",
+            "background:none",
+            "width:100%",
+            "height:70vh",
+            "min-height:28rem",
+        ] {
+            assert!(frame.contains(rule), "{rule} not in {frame}");
+        }
+        // Once the page has said, its height alone, however small.
+        assert!(STYLE.contains(".admin-frame[data-sized]{min-height:0}"));
+        // The person's mode, as the page's, so the transparent page sits on
+        // the dashboard rather than on an opaque canvas.
+        assert!(frame.contains("color-scheme:light dark"));
+        assert!(STYLE.contains("html[data-om-mode=light] .admin-frame{color-scheme:light}"));
+        assert!(STYLE.contains("html[data-om-mode=dark] .admin-frame{color-scheme:dark}"));
     }
 
     #[test]

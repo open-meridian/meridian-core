@@ -405,8 +405,9 @@ async fn plugin_view(
     let report = reports.get(&instance);
     let tabs = view::tabs(report);
     let current = view::chosen(&tabs, field(&query, "tab"));
-    // One of the plugin's own admin pages, on its host, framed; the plugin
-    // serves it to deployment admins alone, by the claim (W6.9).
+    // One of the plugin's own admin pages, on its host, framed seamlessly
+    // under the tabs; the plugin serves it to deployment admins alone, by
+    // the claim (W6.9). In a window of its own, it is a page on its own.
     let theme = crate::plugins::Theme::of_mode(crate::web::mode_of(&app, &headers));
     let admin_page = current
         .page
@@ -419,7 +420,7 @@ async fn plugin_view(
                 "This instance's name cannot be a host, so its page cannot be framed.",
             ),
             Some(plugins) if plugins.frames() => view::AdminPage::Framed {
-                src: crate::plugins::entrance(&instance, page, &theme),
+                src: crate::plugins::entrance(&instance, page, &theme.clone().seamless()),
                 origin: plugins.origin(&instance),
             },
             Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, page, &theme)),

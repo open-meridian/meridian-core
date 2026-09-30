@@ -3,9 +3,9 @@
 //! in tabs (W6.9, the product owner, 2026-09-29): Overview, its health and
 //! what it still needs; Settings, its form; Access, who may use it; then one
 //! tab per admin page the plugin declared (W4.8), in its order, each framing
-//! that path on the plugin's host, which the plugin serves to deployment
-//! admins alone by the claim that says they are one. A plugin declaring none
-//! gets one tab framing its `/admin`.
+//! that path on the plugin's host seamlessly under the tab row, which the
+//! plugin serves to deployment admins alone by the claim that says they are
+//! one. A plugin declaring none gets one tab framing its `/admin`.
 //!
 //! A tab is a link, `?tab=settings` or, for a plugin's page, `?tab=` its
 //! title in lower case (`?tab=accounts`; the product owner, 2026-09-29), so
@@ -498,16 +498,25 @@ fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
     format!("<nav class=\"tabs view-tabs\" aria-label=\"The plugin's admin\">{links}</nav>")
 }
 
+/// One of the plugin's own pages, straight under the tab row. Framed, it is
+/// seamless (the product owner, 2026-09-29): no panel, heading or border of
+/// the dashboard's around it, `om-framed=1` on its address so the kit leaves
+/// out the page's own heading and tabs, and as tall as the page says it is
+/// (`data-seamless`, which the page's script sizes). The frame stays, so the
+/// plugin's script is kept from the administrator's session. Where it cannot
+/// be framed, a panel says why.
 fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
-    let shown = match &view.admin_page {
-        Some(AdminPage::Framed { src, origin }) => format!(
-            "<iframe class=\"admin-frame\" src=\"{}\" title=\"{} &middot; {}\" data-plugin-frame \
-             data-origin=\"{}\"></iframe>",
-            escape(src),
-            title,
-            escape(&tab.title),
-            escape(origin)
-        ),
+    let path = escape(tab.page.as_deref().unwrap_or_default());
+    let said = match &view.admin_page {
+        Some(AdminPage::Framed { src, origin }) => {
+            return format!(
+                "<iframe class=\"admin-frame\" id=\"admin-page\" data-page=\"{path}\" src=\"{}\" \
+                 title=\"{title} &middot; {}\" data-plugin-frame data-seamless data-origin=\"{}\"></iframe>",
+                escape(src),
+                escape(&tab.title),
+                escape(origin)
+            )
+        }
         Some(AdminPage::Linked(href)) => format!(
             "<p class=\"empty\">This dashboard's address has no domain, so a browser keeps no \
              framed page's session. <a href=\"{}\" target=\"_blank\" rel=\"noopener\">Open \
@@ -519,12 +528,7 @@ fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
         None => String::new(),
     };
     format!(
-        "<section class=\"panel padded\" id=\"admin-page\" data-page=\"{path}\">\
-         <div class=\"row\"><h2>{name}</h2><code>{path}</code></div>\
-         <p class=\"hint\">The plugin's own page, served to deployment admins alone.</p>\
-         {shown}</section>",
-        name = escape(&tab.title),
-        path = escape(tab.page.as_deref().unwrap_or_default()),
+        "<section class=\"panel padded\" id=\"admin-page\" data-page=\"{path}\">{said}</section>"
     )
 }
 

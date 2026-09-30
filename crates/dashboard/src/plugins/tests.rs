@@ -206,11 +206,11 @@ fn dashboard(
     (app, session)
 }
 
-/// A kit of one stylesheet, as the image's is laid out.
+/// A kit of one stylesheet, as the image's is laid out: one version.
 fn kit() -> crate::kit::Kit {
     let root = std::env::temp_dir().join(format!("meridian-kit-{}", token()));
-    std::fs::create_dir_all(root.join("0.1.0")).unwrap();
-    std::fs::write(root.join("0.1.0/meridian.css"), ":root{}").unwrap();
+    std::fs::create_dir_all(root.join("0.3.0")).unwrap();
+    std::fs::write(root.join("0.3.0/meridian.css"), ":root{}").unwrap();
     crate::kit::Kit::at(root).unwrap()
 }
 
@@ -1188,14 +1188,22 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
     );
     // The page below, entered through the dashboard with the theme on its
     // address, and told again by message on every load, to its origin alone.
-    assert!(frame.body.contains(
-        "<iframe src=\"/plugins/snaptrade-1/enter?path=%2F&amp;om-scheme=default&amp;om-mode=system\
-         &amp;om-direction=green-up\""
-    ), "{}", frame.body);
+    // It fills the window, and the page draws its own heading and tabs: a
+    // page on its own, said so on its address, and told nothing of framing.
+    assert!(
+        frame.body.contains(&format!(
+            "<iframe src=\"/plugins/snaptrade-1/enter?path=%2F&amp;om-scheme=default\
+             &amp;om-mode=system&amp;om-direction=green-up&amp;om-framed=0\" \
+             title=\"snaptrade (snaptrade-1)\" data-plugin-frame \
+             data-origin=\"https://{PLUGIN_HOST}\"></iframe>"
+        )),
+        "{}",
+        frame.body
+    );
+    assert!(!frame.body.contains("data-seamless "));
     assert!(frame
         .body
-        .contains(&format!("data-origin=\"https://{PLUGIN_HOST}\"")));
-    assert!(frame.body.contains("\"meridian:theme\", version: 2"));
+        .contains("{ type: \"meridian:theme\", version: seamless ? 3 : 2,"));
 
     // At a page of the plugin's, where the frame is asked for one.
     let at = get(
@@ -1237,7 +1245,7 @@ async fn the_frames_way_in_lands_on_the_page_asked_for_carrying_the_theme() {
         DASHBOARD,
         &format!(
             "/plugins/{INSTANCE}/enter?path=%2Fadmin%3Ftab%3D2&om-scheme=harbour&om-mode=dark\
-             &om-direction=red-up"
+             &om-direction=red-up&om-framed=1"
         ),
         &[dashboard_cookie(&h)],
     )
@@ -1249,7 +1257,7 @@ async fn the_frames_way_in_lands_on_the_page_asked_for_carrying_the_theme() {
     assert_eq!(redeemed.status, StatusCode::SEE_OTHER, "{}", redeemed.body);
     assert_eq!(
         redeemed.headers[LOCATION],
-        "/admin?tab=2&om-scheme=harbour&om-mode=dark&om-direction=red-up"
+        "/admin?tab=2&om-scheme=harbour&om-mode=dark&om-direction=red-up&om-framed=1"
     );
 
     // Nothing the kit would not take is carried onto the plugin's address,
@@ -1257,7 +1265,10 @@ async fn the_frames_way_in_lands_on_the_page_asked_for_carrying_the_theme() {
     let odd = get(
         &h.app,
         DASHBOARD,
-        &format!("/plugins/{INSTANCE}/enter?om-scheme=Evil%22Scheme&om-mode=sepia&om-direction=up"),
+        &format!(
+            "/plugins/{INSTANCE}/enter?om-scheme=Evil%22Scheme&om-mode=sepia&om-direction=up\
+             &om-framed=yes"
+        ),
         &[dashboard_cookie(&h)],
     )
     .await;
@@ -1266,7 +1277,7 @@ async fn the_frames_way_in_lands_on_the_page_asked_for_carrying_the_theme() {
     let redeemed = get(&h.app, PLUGIN_HOST, path, &[]).await;
     assert_eq!(
         redeemed.headers[LOCATION],
-        "/?om-scheme=default&om-mode=system&om-direction=green-up"
+        "/?om-scheme=default&om-mode=system&om-direction=green-up&om-framed=0"
     );
     for elsewhere in [
         "https%3A%2F%2Felsewhere.example",
@@ -1318,11 +1329,28 @@ async fn a_page_in_a_window_of_its_own_goes_back_to_the_frame_and_one_in_the_fra
 async fn the_kit_is_served_on_the_plugins_host_to_anybody_and_its_page_framed_by_the_dashboard_alone(
 ) {
     let h = harness(&[INSTANCE]).await;
-    // No session: the kit is the same files for everybody.
-    let kit = get(&h.app, PLUGIN_HOST, "/.meridian/ui/0.1.0/meridian.css", &[]).await;
-    assert_eq!(kit.status, StatusCode::OK, "{}", kit.body);
-    assert_eq!(kit.headers["content-type"], "text/css; charset=utf-8");
-    assert_eq!(kit.body, ":root{}");
+    // No session: the kit is the same files for everybody. The image
+    // carries 0.3.0, and a page that pinned 0.1.0 still gets it: any 0.x is
+    // the newest 0.x carried (the product owner, 2026-09-30).
+    for version in ["0.3.0", "0.1.0"] {
+        let kit = get(
+            &h.app,
+            PLUGIN_HOST,
+            &format!("/.meridian/ui/{version}/meridian.css"),
+            &[],
+        )
+        .await;
+        assert_eq!(kit.status, StatusCode::OK, "{version}: {}", kit.body);
+        assert_eq!(kit.headers["content-type"], "text/css; charset=utf-8");
+        assert_eq!(kit.body, ":root{}");
+    }
+    assert_eq!(
+        get(&h.app, PLUGIN_HOST, "/.meridian/ui/1.0.0/meridian.css", &[])
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "another major is not carried"
+    );
     assert_eq!(
         get(
             &h.app,

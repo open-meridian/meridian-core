@@ -236,7 +236,7 @@ def link_for(header, asked):
             "plugin_instance_id": linked.plugin_instance_id}
 
 
-KIT = "/.meridian/ui/0.1.0/meridian.css"
+KIT = "/.meridian/ui/0.3.0/meridian.css"
 
 
 def admin_page(path, header):

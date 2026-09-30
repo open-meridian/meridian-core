@@ -32,9 +32,20 @@
 //! may be framed by the dashboard and by nothing else, and the dashboard's
 //! own pages by nobody but the dashboard.
 //!
+//! This frame fills the window below the header, and the page in it is a
+//! page on its own, drawing its own heading and any tabs it needs: its
+//! address says `om-framed=0`, and its message (version 2) says nothing of
+//! framing. The admin view's tabs frame a plugin's admin page seamlessly
+//! instead ([`crate::admin::view`]; meridian-ui's README, "The frame:
+//! seamless"): `om-framed=1` on the address, `framed: true` in a version-3
+//! message, and the frame as tall as the page says it is by `meridian:size`,
+//! so the dashboard's heading and tab row are the only ones.
+//!
 //! **The kit** is served at `/.meridian/ui/<version>/` on every plugin host
 //! (Q2), on the plugin's own origin, to anybody: it is the same static files
-//! for everyone, and a page links it before anything else is asked.
+//! for everyone, and a page links it before anything else is asked. A page
+//! asking for any `0.x` is answered with the newest `0.x` the image carries
+//! ([`crate::kit`]).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -428,13 +439,18 @@ impl Plugins {
 }
 
 /// The person's theme, handed to a framed page on first load as meridian-ui
-/// reads it. Anything the kit would not take is dropped for its default, so
-/// nothing arbitrary is carried into a plugin's address.
+/// reads it, and whether the frame is seamless (`om-framed`). Anything the
+/// kit would not take is dropped for its default, so nothing arbitrary is
+/// carried into a plugin's address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Theme {
     scheme: String,
     mode: String,
     direction: String,
+    /// Said either way, never left out: the kit keeps the last word for the
+    /// tab, so a page on its own after a seamless one in the same tab would
+    /// otherwise be drawn without its heading.
+    framed: bool,
 }
 
 impl Theme {
@@ -442,6 +458,15 @@ impl Theme {
     /// kernel/colour-schemes), the person's mode, green-up.
     pub(crate) fn of_mode(mode: &str) -> Theme {
         Theme::from_pairs(&HashMap::from([("om-mode".to_string(), mode.to_string())]))
+    }
+
+    /// The same, for a frame the dashboard draws the page's heading and tabs
+    /// around (the admin view's), which the kit then leaves out.
+    pub(crate) fn seamless(self) -> Theme {
+        Theme {
+            framed: true,
+            ..self
+        }
     }
 
     fn from_pairs(asked: &HashMap<String, String>) -> Theme {
@@ -463,6 +488,7 @@ impl Theme {
                 _ => "green-up",
             }
             .to_string(),
+            framed: given("om-framed") == "1",
         }
     }
 
@@ -470,7 +496,8 @@ impl Theme {
         url.query_pairs_mut()
             .append_pair("om-scheme", &self.scheme)
             .append_pair("om-mode", &self.mode)
-            .append_pair("om-direction", &self.direction);
+            .append_pair("om-direction", &self.direction)
+            .append_pair("om-framed", if self.framed { "1" } else { "0" });
     }
 }
 

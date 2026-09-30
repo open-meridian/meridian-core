@@ -497,9 +497,16 @@ def main():
     check(again == 401, f"the same code again: {again}")
 
     kit = Browser()  # nobody: the kit is the same files for everybody
-    status, body, _, _ = on_plugin_host(kit, "/.meridian/ui/0.1.0/meridian.css")
+    status, body, _, _ = on_plugin_host(kit, "/.meridian/ui/0.3.0/meridian.css")
     check(status == 200 and "--space-4" in body,
           f"the UI kit is served on the plugin's own host: {status} {body[:120]!r}")
+    # Any 0.x is the newest 0.x the image carries: a page that pinned the
+    # first kit still gets one. Another major is none.
+    status, pinned, _, _ = on_plugin_host(kit, "/.meridian/ui/0.1.0/meridian.css")
+    check(status == 200 and pinned == body,
+          f"a page that pinned 0.1.0 gets the same kit: {status} {pinned[:120]!r}")
+    status, _, _, _ = on_plugin_host(kit, "/.meridian/ui/1.0.0/meridian.css")
+    check(status == 404, f"and another major none: {status}")
 
     say("E: the plugin is told who she is, by its sidecar, and nothing else")
     plugin.cookies["meridian_session"] = ada.cookies.get("meridian_session", "")

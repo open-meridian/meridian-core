@@ -1131,12 +1131,62 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
     let (_, accounts) = send(&h, get(&h, &format!("{VIEW}?tab=accounts"), true)).await;
     assert_eq!(tabs_of(&accounts).1, "Accounts");
     let frame = accounts.split("<iframe").nth(1).expect("the page, framed");
+    let frame = frame.split("</iframe>").next().unwrap();
     assert!(
-        frame.contains("src=\"/plugins/snaptrade-1/enter?path=%2Fadmin%2Faccounts"),
-        "{frame}"
+        frame.contains(
+            "src=\"/plugins/snaptrade-1/enter?path=%2Fadmin%2Faccounts&amp;om-scheme=default\
+             &amp;om-mode=system&amp;om-direction=green-up&amp;om-framed=1\""
+        ),
+        "seamless from its first paint: {frame}"
     );
     assert!(frame.contains("data-origin=\"https://snaptrade-1.plugins.meridian.example\""));
+    assert!(
+        frame.contains("class=\"admin-frame\"") && frame.contains(" data-seamless "),
+        "{frame}"
+    );
     assert_eq!(accounts.matches("<iframe").count(), 1, "one page at a time");
+    // Seamless (the product owner, 2026-09-29): straight under the tab row,
+    // with no panel, heading, path or hint of the dashboard's around it.
+    let under_tabs = accounts.split("</nav>").last().unwrap();
+    assert!(
+        under_tabs.starts_with("<div class=\"tab-body\" data-current=\"accounts\"><iframe "),
+        "{under_tabs}"
+    );
+    let body = under_tabs.split("</iframe>").next().unwrap();
+    for gone in [
+        "class=\"panel",
+        "<h2>",
+        "<code>/admin/accounts</code>",
+        "class=\"hint\"",
+    ] {
+        assert!(!body.contains(gone), "{gone} around the frame: {body}");
+    }
+
+    // A window of its own, where no frame could hold the page, is a page on
+    // its own.
+    let on_localhost = crate::plugins::Plugins::new(
+        "http://localhost:8080",
+        "http://{instance}.sidecars.invalid:9292",
+        crate::signing::Signer::holding(
+            "dashboard-test",
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        ),
+    )
+    .unwrap();
+    let linked = harness_serving(with_settings(), None, Some(Arc::new(on_localhost)));
+    linked
+        .app
+        .health
+        .hear("snaptrade-1", declaring(&[("/admin/accounts", "Accounts")]));
+    let (_, page) = send(&linked, get(&linked, &format!("{VIEW}?tab=accounts"), true)).await;
+    let panel = page
+        .split("id=\"admin-page\"")
+        .nth(1)
+        .expect("the panel saying why");
+    assert!(
+        panel.contains("&amp;om-framed=0\" target=\"_blank\"") && !page.contains("<iframe"),
+        "{panel}"
+    );
 }
 
 #[tokio::test]
