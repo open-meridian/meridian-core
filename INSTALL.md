@@ -297,7 +297,7 @@ A group that does not exist is a deployment nobody can administer. A
 first-admin code does not help then, since the misspelt group is still an
 administrator's permission and `/claim` answers **Already claimed**: getting
 back in means making a group in your directory with exactly the name you typed,
-signing in as a member of it, and correcting the group on the Administer page.
+signing in as a member of it, and correcting the group in Settings.
 
 **Address.** Where a browser reaches this deployment: the Ingress's name,
 which the wizard offers when there is one. This is the address your staff will
