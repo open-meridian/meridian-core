@@ -6,7 +6,7 @@
 //
 // The governing idea: access is three dimensions joined by a permission -- a
 // user group (who), an account group (which accounts), an access group (which
-// plugins, each at read or write) -- and a person's access is the
+// plugins, each at read, write or admin) -- and a person's access is the
 // union of their user groups' permissions, combined permission by permission.
 // None of it is read from a token, and none of it ever reaches the platform.
 //
@@ -18,8 +18,10 @@ syntax = "proto3";
 
 package meridian.v1;
 
-// What a plugin declares it needs (W4.1), which a settings form is built from.
-// Plugin-facing, and imported from there at the revision this repository pins.
+// What a plugin declares it needs (W4.1), which a settings form is built from,
+// and the levels of access (W6.7), which a plugin's pages and a person's
+// claims name too. Plugin-facing, and imported from there at the revision
+// this repository pins.
 import "meridian/v1/sidecar.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,8 +74,8 @@ message AccessRecords {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // The only thing holdings are recorded against. A plugin creates one only by
-// linking an external account to a new one, acting for a deployment admin
-// (W6.4).
+// linking an external account to a new one, acting for a deployment admin in
+// a session opened by Manage (W6.4).
 message AccountRecord {
   string account_id = 1;
   string name = 2;
@@ -125,9 +127,10 @@ message CloseAccountRequest {
 // Links an external account a plugin reported, or removes its link.
 // Names an existing account, or a new account's name for the conductor to
 // create and link in one step, or neither to remove the link; never both. Held
-// as one of that plugin's settings. Sent by the plugin from its own admin page,
-// acting for the deployment admin viewing it (W6.4); the plugin's sidecar
-// stamps plugin_instance_id.
+// as one of that plugin's settings. Sent by the plugin from one of its pages at
+// admin, acting for the admin of the plugin viewing it in a session opened by
+// Manage (W6.4, W6.9): any of them names an existing account, and only a
+// deployment admin a new one. The plugin's sidecar stamps plugin_instance_id.
 message LinkExternalAccountRequest {
   string plugin_instance_id = 1;
   string external_account_id = 2;
@@ -151,8 +154,10 @@ message ExternalAccountLink {
   string account_id = 3;
 }
 
-// The deployment's accounts, read by a plugin acting for a deployment admin
-// to offer the accounts an external account can be linked to (W6.4).
+// The deployment's accounts, read by a plugin acting for its admin
+// in a session opened by Manage, to offer the accounts an external account
+// can be linked to (W4.9, W6.4): every account, since a plugin admin is
+// account agnostic, and its identity alone.
 message AccountsRequest {}
 
 message Accounts {
@@ -198,21 +203,33 @@ message DefineUserGroupRequest {
   UserGroup user_group = 1;
 }
 
-// Which accounts. An explicit list: no nesting, no "all accounts", and an
-// empty group reaches nothing.
+// Which accounts. An explicit list: no nesting, and an empty group reaches
+// nothing. One group is built in, All accounts (W6.6).
 message AccountGroup {
   string account_group_id = 1;
   string name = 2;
+
+  // Empty for All accounts, whose accounts are read from the accounts as
+  // they are.
   repeated string account_ids = 3;
+
+  // True only for All accounts, which holds every account the deployment
+  // has -- those no other group lists and those opened after a permission
+  // names it included -- lists none of its own, and cannot be edited or
+  // deleted. A permission may name it like any other (W6.6, W6.8).
+  bool built_in = 4;
 }
 
 message DefineAccountGroupRequest {
   AccountGroup account_group = 1;
 }
 
-// Which plugin, at which level. One plugin per entry, so each plugin's users
-// can be counted on their own. The levels are the same for every plugin, and
-// a plugin names no parts of itself for access (decisions/026).
+// Which plugin, at which level: `read`, `write` or `admin`. One plugin per
+// entry, so each plugin's users can be counted on their own. The levels are
+// the same for every plugin, and a plugin names no parts of itself for access
+// (W6.7; decisions/026, 027). A group may name a plugin at `admin` and at one
+// data level; naming it at both `read` and `write`, or twice at one level, is
+// refused.
 message AccessEntry {
   string plugin_instance_id = 1;
   AccessLevel level = 3;
@@ -222,26 +239,17 @@ message AccessEntry {
   reserved "tag";
 }
 
-enum AccessLevel {
-  ACCESS_LEVEL_UNSPECIFIED = 0;
-
-  // What the plugin reads, which it may show the person, cut to the accounts
-  // they may read: queries and receiving events.
-  ACCESS_LEVEL_READ = 1;
-
-  // What the plugin publishes, which it may do for the person, acting for
-  // them, on the accounts they may write: commands, and everything read
-  // allows.
-  ACCESS_LEVEL_WRITE = 2;
-}
-
 message AccessGroup {
   string access_group_id = 1;
   string name = 2;
   repeated AccessEntry entries = 3;
 
-  // True only for deployment admin, which holds the dashboard's own
-  // capabilities and every account, and cannot be edited or deleted.
+  // True for the two built-in groups, neither of which can be edited or
+  // deleted, each known by its identifier. Deployment admin holds the
+  // dashboard's own capabilities, admin on no plugin and no account's data
+  // (W6.7). All plugins (admin) grants `admin` on every plugin, those launched
+  // later included, and no account's data; first run and a claim code link
+  // the deployment admins' user group to it (W6.2, W7.6).
   bool built_in = 4;
 }
 
@@ -249,8 +257,11 @@ message DefineAccessGroupRequest {
   AccessGroup access_group = 1;
 }
 
-// One user group, one account group, one access group. A permission to the
-// built-in deployment admin access group names no account group.
+// One user group, one account group, one access group. A permission to
+// deployment admin, to All plugins (admin), or to an access group whose
+// entries are all `admin` names no account group, since configuring a plugin
+// is not an act on an account; one to an access group with a `read` or
+// `write` entry names one, and its `admin` entries use none (W6.8).
 message Permission {
   string permission_id = 1;
   string user_group_id = 2;
@@ -265,7 +276,9 @@ message GrantPermissionRequest {
 }
 
 // Refused for the last permission to deployment admin, so a deployment is
-// never left without an administrator.
+// never left without an administrator. Any permission to All plugins (admin)
+// may be withdrawn, so a firm that separates the duties has deployment admins
+// who configure no plugin (W6.7).
 message WithdrawPermissionRequest {
   string permission_id = 1;
 }

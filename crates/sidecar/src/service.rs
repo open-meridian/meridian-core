@@ -42,7 +42,9 @@ pub struct Registration {
     /// makes it unhealthy while a required one has no value.
     pub settings: Vec<meridian_pb::v1::SettingDeclaration>,
     /// The interface it declared, if it serves one: its report carries it, so
-    /// the dashboard learns the plugin's admin pages (W4.8, W6.9).
+    /// the dashboard learns the plugin's pages and the levels each serves
+    /// (W4.8, W6.9); an older plugin's admin pages among them at `admin`
+    /// ([`crate::legacy`]).
     pub interface: Option<meridian_pb::v1::InterfaceDeclaration>,
 }
 
@@ -200,6 +202,29 @@ impl Sidecar {
     }
 }
 
+/// The first page declaring no level, or one outside `admin`, `write` and
+/// `read`, as the refusal naming it.
+fn unserved_page(interface: &meridian_pb::v1::InterfaceDeclaration) -> Option<String> {
+    use meridian_pb::v1::AccessLevel;
+    let served = |level: &i32| {
+        matches!(
+            AccessLevel::try_from(*level),
+            Ok(AccessLevel::Admin | AccessLevel::Write | AccessLevel::Read)
+        )
+    };
+    interface
+        .pages
+        .iter()
+        .find(|page| page.levels.is_empty() || !page.levels.iter().all(served))
+        .map(|page| {
+            format!(
+                "the page {} ({}) serves no level: each page names admin, write or read, \
+                 one or several",
+                page.path, page.title
+            )
+        })
+}
+
 type SettingsStream = Pin<Box<dyn Stream<Item = Result<SettingsDelivery, Status>> + Send>>;
 type ScopeStream = Pin<Box<dyn Stream<Item = Result<AccountScopeDelivery, Status>> + Send>>;
 
@@ -255,6 +280,17 @@ impl SidecarService for Sidecar {
                 }
             },
         };
+
+        // Each page serves one level or several, `admin`, `write` or `read`,
+        // and a page naming none is refused naming it (W4.1, W4.8): its tab
+        // would show under no button, and the plugin could serve it nobody.
+        if let Some(refusal_reason) = req.interface.as_ref().and_then(unserved_page) {
+            return Ok(Response::new(RegisterReply {
+                admitted: false,
+                refusal_reason,
+                ..Default::default()
+            }));
+        }
 
         // Grants come from what this sidecar was launched as, never from the
         // request. The request has nothing in it that could decide them.
@@ -494,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v5"] {
+        for declared in ["v1", "v6"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -503,7 +539,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v4"));
+            assert!(reply.refusal_reason.contains("v2 through v5"));
             assert!(sc.registration().is_none());
         }
     }

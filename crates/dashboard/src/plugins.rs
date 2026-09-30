@@ -21,28 +21,32 @@
 //! set could never come back to it, and could only be somebody's attempt to
 //! plant one. Who is asking is the assertion, every time.
 //!
-//! **The frame** (spec/plugin-pages-share-one-kit.md, Q3). `/plugins/{instance}`
-//! is a dashboard page drawing the one header -- the plugin's name and the
-//! instance's, the way back, and the person -- around the plugin's page in a
-//! frame, which enters the plugin's host through `/plugins/{instance}/enter`.
-//! The person's theme reaches the page as meridian-ui reads it: on first load
-//! as `om-scheme`, `om-mode` and `om-direction` on the page's address, and on
-//! change, and on every load of the frame, as the `meridian:theme` message
-//! the header's script sends to the plugin's origin alone. A plugin's page
-//! may be framed by the dashboard and by nothing else, and the dashboard's
-//! own pages by nobody but the dashboard.
+//! **A session carries the level chosen** (W6.9; the product owner,
+//! 2026-09-30: "manage for admin, open for write, view for read"). The home
+//! offers a button per level the person holds; `/plugins/{instance}?level=`
+//! opens the plugin's area at that level, refused for a level not held, and
+//! the plugin host's session carries it: every request there is asserted at
+//! that level alone, its accounts cut to it -- none under `admin`, the read
+//! and write sets under `write`, the read set under `read` -- after checking
+//! the person still holds it.
 //!
-//! This frame fills the window below the header, and the page in it is a
-//! page on its own, drawing its own heading and any tabs it needs: its
-//! address says `om-framed=0`, and its message (version 2) says nothing of
-//! framing. The admin view's tabs frame a plugin's admin page seamlessly
-//! instead ([`crate::admin::view`]; meridian-ui's README, "The frame:
-//! seamless"): `om-framed=1` on the address, `framed: true` in a version-3
-//! message, and the frame as tall as the page says it is by `meridian:size`,
-//! so the dashboard's heading and tab row are the only ones; the page's
-//! header actions (`meridian:actions`) are drawn in the view's head, and its
-//! status dot (`meridian:status`, kit 0.7.0) beside the plugin's name in the
-//! breadcrumb.
+//! **The area** ([`crate::area`]; spec/plugin-pages-share-one-kit.md, Q3 and
+//! Q5). `/plugins/{instance}` is a dashboard page drawing the one header --
+//! the plugin's name, the way back, the person -- and one tab row, the pages
+//! the plugin declared at the session's level, around the page in a seamless
+//! frame, which enters the plugin's host through `/plugins/{instance}/enter`:
+//! `om-framed=1` on the address, `framed: true` in a version-3 message, and
+//! the frame as tall as the page says it is by `meridian:size`, so the
+//! dashboard's heading and tab row are the only ones; the page's header
+//! actions (`meridian:actions`) are drawn in the area's head, and its status
+//! dot (`meridian:status`, kit 0.7.0) beside the plugin's name in the
+//! breadcrumb. The person's theme reaches the page as meridian-ui reads it:
+//! on first load as `om-scheme`, `om-mode` and `om-direction` on the page's
+//! address, and on change, and on every load of the frame, as the
+//! `meridian:theme` message the header's script sends to the plugin's origin
+//! alone. A plugin's page may be framed by the dashboard and by nothing else,
+//! and the dashboard's own pages by nobody but the dashboard. In a window of
+//! its own (`om-framed=0`), a page draws its own heading.
 //!
 //! **The kit** is served at `/.meridian/ui/<version>/` on every plugin host
 //! (Q2), on the plugin's own origin, to anybody: it is the same static files
@@ -63,6 +67,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use meridian_access::{button, level_name, parse_level, AccessLevel};
 use meridian_pb::v1::CallerClaims;
 use prost::Message;
 
@@ -142,15 +147,17 @@ impl Came {
 }
 
 /// What the plugin's host needs to know about a person who came from the
-/// dashboard or a terminal.
+/// dashboard or a terminal, and the level their session was opened at.
 struct Entered {
     came: Came,
     instance: String,
+    level: AccessLevel,
 }
 
 struct Code {
     came: Came,
     instance: String,
+    level: AccessLevel,
     expires_at_ns: i64,
 }
 
@@ -334,6 +341,8 @@ impl Plugins {
             // Only a deployment admin's terminal reaches a development path
             // (catalogue::admin), so this is said of every caller here.
             deployment_admin: true,
+            // And no level: developing a plugin opens none of its pages.
+            level: AccessLevel::Unspecified as i32,
         };
         let assertion = match self.signer.sign(&claims) {
             Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
@@ -388,47 +397,50 @@ impl Plugins {
         found.is_ok_and(|mut addresses| addresses.next().is_some())
     }
 
-    fn mint(&self, came: Came, instance: &str, now_ns: i64) -> String {
+    fn mint(&self, came: Came, instance: &str, level: AccessLevel, now_ns: i64) -> String {
         let code = token();
         self.codes.lock().expect("code lock poisoned").insert(
             code.clone(),
             Code {
                 came,
                 instance: instance.to_string(),
+                level,
                 expires_at_ns: now_ns + CODE_NS,
             },
         );
         code
     }
 
-    /// The session a code was minted for, if it is being presented on its
-    /// own instance's host, in time. Gone once presented, whatever the
-    /// answer: a code is tried once.
-    fn redeem(&self, code: &str, instance: &str, now_ns: i64) -> Option<Came> {
+    /// The session a code was minted for, and its level, if it is being
+    /// presented on its own instance's host, in time. Gone once presented,
+    /// whatever the answer: a code is tried once.
+    fn redeem(&self, code: &str, instance: &str, now_ns: i64) -> Option<(Came, AccessLevel)> {
         let held = self
             .codes
             .lock()
             .expect("code lock poisoned")
             .remove(code)?;
-        (held.instance == instance && now_ns <= held.expires_at_ns).then_some(held.came)
+        (held.instance == instance && now_ns <= held.expires_at_ns)
+            .then_some((held.came, held.level))
     }
 
-    fn enter(&self, came: Came, instance: &str) -> String {
+    fn enter(&self, came: Came, instance: &str, level: AccessLevel) -> String {
         let key = token();
         self.entered.lock().expect("entered lock poisoned").insert(
             key.clone(),
             Entered {
                 came,
                 instance: instance.to_string(),
+                level,
             },
         );
         key
     }
 
-    fn entered(&self, key: &str, instance: &str) -> Option<Came> {
+    fn entered(&self, key: &str, instance: &str) -> Option<(Came, AccessLevel)> {
         let entered = self.entered.lock().expect("entered lock poisoned");
         let held = entered.get(key)?;
-        (held.instance == instance).then(|| held.came.clone())
+        (held.instance == instance).then(|| (held.came.clone(), held.level))
     }
 
     fn leave(&self, key: &str) {
@@ -494,7 +506,7 @@ impl Theme {
     }
 
     /// The same, for a frame the dashboard draws the page's heading and tabs
-    /// around (the admin view's), which the kit then leaves out.
+    /// around (the plugin area's), which the kit then leaves out.
     pub(crate) fn seamless(self) -> Theme {
         Theme {
             framed: true,
@@ -534,13 +546,15 @@ impl Theme {
     }
 }
 
-/// Where the frame enters an instance's page, at `path` on its host, with
-/// the person's theme: the dashboard's own route, which mints the code only
-/// once the frame asks for it.
-pub(crate) fn entrance(instance: &str, path: &str, theme: &Theme) -> String {
+/// Where the frame enters an instance's page, at `path` on its host, at a
+/// level, with the person's theme: the dashboard's own route, which mints the
+/// code only once the frame asks for it.
+pub(crate) fn entrance(instance: &str, path: &str, level: AccessLevel, theme: &Theme) -> String {
     let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("a fixed address");
     url.set_path(&format!("/plugins/{instance}/enter"));
-    url.query_pairs_mut().append_pair("path", path);
+    url.query_pairs_mut()
+        .append_pair("path", path)
+        .append_pair("level", level_name(level));
     theme.append_to(&mut url);
     match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
@@ -559,17 +573,58 @@ fn said(status: StatusCode, title: &str, sentence: &str) -> Response {
         .into_response()
 }
 
-/// Who may open an instance's page from the dashboard, and the plugins that
-/// serve it; or the answer that refuses them. W6.9's checks, in its order.
+/// The level a session is opened at: the one named, if the person holds it,
+/// or when none is named the first they hold, Manage before Open before View;
+/// or the sentence refusing them. Nothing is minted for a level not held
+/// (W6.9).
+pub(crate) fn level_to_open(
+    held: &meridian_access::Held,
+    named: Option<&str>,
+    instance: &str,
+) -> Result<AccessLevel, String> {
+    let named = named.map(str::trim).filter(|named| !named.is_empty());
+    match named {
+        None => held
+            .levels()
+            .first()
+            .copied()
+            .ok_or_else(|| format!("You hold no access on {instance}.")),
+        Some(named) => match parse_level(named) {
+            None => Err(format!(
+                "`{named}` is not a level: it is admin, write or read (Manage, Open or View)."
+            )),
+            Some(level) if held.holds(level) => Ok(level),
+            Some(level) => Err(if held.holds_any() {
+                format!(
+                    "You do not hold {} on {instance}: you hold {}.",
+                    level_name(level),
+                    held.levels()
+                        .iter()
+                        .map(|l| format!("{} ({})", button(*l), level_name(*l)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!("You hold no access on {instance}.")
+            }),
+        },
+    }
+}
+
+/// Who may open an instance's page from the dashboard, at which level, and
+/// the plugins that serve it; or the answer that refuses them. W6.9's
+/// checks, in its order.
 async fn may_open<'a>(
     app: &'a App,
     instance: &str,
     headers: &HeaderMap,
+    named: Option<&str>,
 ) -> Result<
     (
         String,
         crate::session::Session,
         meridian_access::Access,
+        AccessLevel,
         &'a Plugins,
     ),
     Box<Response>,
@@ -600,13 +655,8 @@ async fn may_open<'a>(
     }
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    if opening(&access, instance).is_none() {
-        return Err(Box::new(said(
-            StatusCode::FORBIDDEN,
-            "No access",
-            &format!("You hold no access on {instance}."),
-        )));
-    }
+    let level = level_to_open(&access.held(instance), named, instance)
+        .map_err(|why| Box::new(said(StatusCode::FORBIDDEN, "No access", &why)))?;
     if !plugins.runs(instance).await {
         return Err(Box::new(said(
             StatusCode::NOT_FOUND,
@@ -614,47 +664,88 @@ async fn may_open<'a>(
             &format!("No plugin {instance} runs in this deployment."),
         )));
     }
-    Ok((key, session, access, plugins))
+    Ok((key, session, access, level, plugins))
 }
 
-/// `GET /plugins/{instance}` on the dashboard: the frame. The one header, and
-/// the plugin's page below it filling the window, at `path` on its host.
+/// `GET /plugins/{instance}?level=&tab=` on the dashboard: the plugin's
+/// area at the level chosen ([`crate::area`]). The one header and one tab
+/// row, the pages the plugin declared at that level, and the page asked for
+/// below them in a seamless frame.
 pub(crate) async fn frame(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
     Query(asked): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (_, session, access, plugins) = match may_open(&app, &instance, &headers).await {
-        Ok(allowed) => allowed,
-        Err(refusal) => return *refusal,
-    };
-    let path = asked
+    let named = asked.get("level").map(String::as_str);
+    let (_, session, access, level, plugins) =
+        match may_open(&app, &instance, &headers, named).await {
+            Ok(allowed) => allowed,
+            Err(refusal) => return *refusal,
+        };
+    let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
+    let reports = app.health.view();
+    let tabs = crate::area::tabs(reports.get(&instance), level);
+    // A path asked for directly is its tab's, or one of its own under the
+    // level's pages; otherwise the tab asked for, or the first.
+    let asked_path = asked
         .get("path")
         .map(String::as_str)
-        .filter(|path| page_path(path).is_ok())
-        .unwrap_or("/");
-    let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
+        .filter(|path| page_path(path).is_ok());
+    let current = asked
+        .get("tab")
+        .and_then(|key| tabs.iter().find(|tab| &tab.key == key))
+        .or_else(|| asked_path.and_then(|path| tabs.iter().find(|tab| tab.path == path)))
+        .or_else(|| tabs.first());
+    let path = asked_path
+        .or(current.map(|tab| tab.path.as_str()))
+        .map(str::to_string);
     // Where no frame can hold the page's session, its window is its own.
     if !plugins.frames() {
-        return redirect(&entrance(&instance, path, &theme));
+        if let Some(path) = &path {
+            return redirect(&entrance(&instance, path, level, &theme));
+        }
     }
     let name = crate::catalogue::plugin_name(&app, &instance).await;
+    let name = name.as_deref().unwrap_or(&instance);
+    let shown = match &path {
+        Some(path) => crate::area::Shown::Framed {
+            src: entrance(&instance, path, level, &theme.clone().seamless()),
+            origin: plugins.origin(&instance),
+        },
+        None => crate::area::Shown::Nothing(
+            "<p class=\"empty\">This plugin declares no page at admin: what there is to set up \
+             for it is its settings.</p>"
+                .into(),
+        ),
+    };
+    let administers = access.administers(&instance);
+    let portal =
+        (administers || access.deployment_admin).then(|| crate::admin::view::path(&instance));
+    let held = access.held(&instance);
+    let body = crate::area::render(&crate::area::Area {
+        instance: &instance,
+        name,
+        held: &held,
+        level,
+        tabs: &tabs,
+        current,
+        shown,
+        portal,
+    });
+    let framed = path.is_some();
     let crumbs = format!(
-        "{}{}<a class=\"own-window\" href=\"{}\" target=\"_blank\" rel=\"noopener\" \
-         title=\"Open it in a window of its own\">&#8599;</a>",
-        crate::html::crumb_link("/", "Plugins"),
-        crate::html::crumb_here(name.as_deref().unwrap_or(&instance), Some(&instance)),
-        escape(&entrance(&instance, path, &theme)),
-    );
-    let body = format!(
-        "<iframe src=\"{src}\" title=\"{title}\" data-plugin-frame data-origin=\"{origin}\"></iframe>",
-        src = escape(&entrance(&instance, path, &theme)),
-        title = escape(&format!("{} ({instance})", name.as_deref().unwrap_or(&instance))),
-        origin = escape(&plugins.origin(&instance)),
+        "{}{}{}",
+        crate::html::crumb_link("/", "Home"),
+        crate::html::crumb_here(name, Some(&instance)),
+        if framed {
+            crate::area::status_place()
+        } else {
+            String::new()
+        },
     );
     Html(crate::html::page_with(
-        name.as_deref().unwrap_or(&instance),
+        &format!("{name} · {}", button(level)),
         &body,
         &crate::html::Chrome {
             viewer: Some(crate::html::Viewer {
@@ -663,23 +754,25 @@ pub(crate) async fn frame(
                 admin: access.deployment_admin,
             }),
             crumbs,
-            main: "frame",
+            main: "page",
             in_admin: false,
         },
     ))
     .into_response()
 }
 
-/// `GET /plugins/{instance}/enter` on the dashboard: EnterPlugin. A one-time
-/// code for the instance's host, carrying on to `path` there with the theme,
-/// which is what the frame loads; opened on its own, the page unframed.
+/// `GET /plugins/{instance}/enter?path=&level=` on the dashboard:
+/// EnterPlugin. A one-time code for the instance's host, at the level named,
+/// carrying on to `path` there with the theme, which is what the frame
+/// loads; opened on its own, the page unframed.
 pub(crate) async fn open(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
     Query(asked): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (key, _, _, plugins) = match may_open(&app, &instance, &headers).await {
+    let named = asked.get("level").map(String::as_str);
+    let (key, _, _, level, plugins) = match may_open(&app, &instance, &headers, named).await {
         Ok(allowed) => allowed,
         Err(refusal) => return *refusal,
     };
@@ -687,7 +780,7 @@ pub(crate) async fn open(
     if let Err(why) = page_path(path) {
         return said(StatusCode::BAD_REQUEST, "Not a page", &why);
     }
-    let code = plugins.mint(Came::Browser(key), &instance, app.clock.now_ns());
+    let code = plugins.mint(Came::Browser(key), &instance, level, app.clock.now_ns());
     let mut url = match reqwest::Url::parse(&format!("{}{ENTER_PATH}", plugins.origin(&instance))) {
         Ok(url) => url,
         Err(failed) => return refused(&format!("{instance}'s address is not one: {failed}")),
@@ -721,18 +814,21 @@ pub fn pages_possible(public_url: &str) -> Result<(), String> {
     }
 }
 
-/// What a person carries onto a plugin's page.
+/// What a person carries onto a plugin's page: the level the session was
+/// opened at, and what that level reaches.
 pub(crate) struct Opening {
-    /// Their access on the plugin: the accounts they may read and the
-    /// accounts they may write through it (decisions/026).
+    /// The accounts the level reaches, cut to it: none under `admin`, the
+    /// read and write sets under `write`, the read set under `read`.
     pub access: meridian_access::Levels,
-    /// Whether they are a deployment admin, which the plugin serves its admin
-    /// page by (W6.9); asserted false for everybody else.
+    /// Whether they are a deployment admin, which a plugin's page at `admin`
+    /// asks when linking, a new account being theirs to name (W6.4).
     pub deployment_admin: bool,
+    pub level: AccessLevel,
 }
 
 impl Opening {
-    /// The assertion's claims, for this instance alone, for 60 seconds, once.
+    /// The assertion's claims, for this instance alone, at the session's
+    /// level, for 60 seconds, once.
     fn claims(self, who: &Who, instance: &str, now: i64) -> CallerClaims {
         CallerClaims {
             subject: who.subject.clone(),
@@ -744,22 +840,28 @@ impl Opening {
             expires_at_ns: now + ASSERTION_NS,
             assertion_id: token(),
             deployment_admin: self.deployment_admin,
+            level: self.level as i32,
         }
     }
 }
 
-/// What a person carries onto a plugin's page, if they may open it: their
-/// access on it; or, for a deployment admin, who opens any plugin's page,
-/// whatever they hold there, which may be nothing. Opening is not access, so
-/// an admin is asserted with nothing they do not hold
-/// (spec/deployment-dashboard-and-access, ruling 19), and with the one claim
-/// that says they are an admin.
-pub(crate) fn opening(access: &meridian_access::Access, instance: &str) -> Option<Opening> {
-    let held = access.on_plugin(instance);
-    (access.deployment_admin || !held.is_empty()).then_some(Opening {
-        access: held,
-        deployment_admin: access.deployment_admin,
-    })
+/// What a person carries onto a plugin's page at `level`, if they hold it
+/// there: the accounts it reaches and nothing more. A deployment admin holds
+/// on a plugin what their grants give them, as anybody (the product owner,
+/// 2026-09-30, superseding the spec's ruling 19).
+pub(crate) fn opening(
+    access: &meridian_access::Access,
+    instance: &str,
+    level: AccessLevel,
+) -> Option<Opening> {
+    access
+        .held(instance)
+        .session(level)
+        .map(|accounts| Opening {
+            access: accounts,
+            deployment_admin: access.deployment_admin,
+            level,
+        })
 }
 
 // ── From a terminal (W6.15) ─────────────────────────────────────────────
@@ -772,13 +874,16 @@ fn declined(status: StatusCode, reason: impl Into<String>) -> Response {
     answered(status, serde_json::json!({ "error": reason.into() }))
 }
 
-/// The person on a terminal session, what they hold on the plugin as opening
-/// it from the dashboard would find it (W6.9's checks, ruling 19 included),
-/// and the session a plugin-host session opened for them would end with.
+/// The person on a terminal session, what they hold on the plugin at the
+/// level the request names as opening it from the dashboard would find it
+/// (W6.9's checks; W6.15), and the session a plugin-host session opened for
+/// them would end with. A request naming no level opens at the first held,
+/// as the home's first button does.
 async fn from_terminal(
     app: &App,
     headers: &HeaderMap,
     instance: &str,
+    named: Option<&str>,
     now: i64,
 ) -> Result<(Who, Opening, Came), Box<Response>> {
     let person = crate::web::terminal_session_of(app, headers).await?;
@@ -799,7 +904,9 @@ async fn from_terminal(
         .map_err(|stale| Box::new(declined(StatusCode::SERVICE_UNAVAILABLE, stale.to_string())))?;
     let access =
         meridian_access::person_access(&records, &person.subject, &person.directory_groups);
-    let Some(opened) = opening(&access, instance) else {
+    let level = level_to_open(&access.held(instance), named, instance)
+        .map_err(|why| Box::new(declined(StatusCode::FORBIDDEN, why)))?;
+    let Some(opened) = opening(&access, instance, level) else {
         return Err(Box::new(declined(
             StatusCode::FORBIDDEN,
             format!("you hold no access on {instance}"),
@@ -830,29 +937,32 @@ async fn running<'a>(app: &'a App, instance: &str) -> Result<&'a Plugins, Box<Re
     Ok(plugins)
 }
 
-/// `POST /terminal/plugins/{instance}/open`: OpenPluginFromTerminal. The
-/// code `/plugins/{instance}` would mint, bound to the terminal session:
-/// whichever browser opens the link first enters that plugin's host alone,
-/// until the terminal session ends.
+/// `POST /terminal/plugins/{instance}/open?level=`: OpenPluginFromTerminal.
+/// The code `/plugins/{instance}` would mint at the level named, bound to the
+/// terminal session: whichever browser opens the link first enters that
+/// plugin's host alone, at that level, until the terminal session ends.
 pub(crate) async fn open_from_terminal(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
+    Query(asked): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     let now = app.clock.now_ns();
-    let came = match from_terminal(&app, &headers, &instance, now).await {
-        Ok((_, _, came)) => came,
+    let named = asked.get("level").map(String::as_str);
+    let (came, level) = match from_terminal(&app, &headers, &instance, named, now).await {
+        Ok((_, opened, came)) => (came, opened.level),
         Err(refusal) => return *refusal,
     };
     let plugins = match running(&app, &instance).await {
         Ok(plugins) => plugins,
         Err(refusal) => return *refusal,
     };
-    let code = plugins.mint(came, &instance, now);
+    let code = plugins.mint(came, &instance, level, now);
     answered(
         StatusCode::OK,
         serde_json::json!({
             "instance_id": instance,
+            "level": level_name(level),
             "url": format!("{}{ENTER_PATH}?code={code}", plugins.origin(&instance)),
         }),
     )
@@ -882,10 +992,11 @@ pub(crate) fn page_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `GET /terminal/plugins/{instance}/page?path=`: ReadPluginPageFromTerminal.
-/// The page as the person would be served it: asserted as them, forwarded
-/// as a browser's request is, no redirect followed, and handed back with
-/// the plugin's own status.
+/// `GET /terminal/plugins/{instance}/page?path=&level=`:
+/// ReadPluginPageFromTerminal. The page as the person would be served it at
+/// the level named: asserted as them, at that level, forwarded as a
+/// browser's request is, no redirect followed, and handed back with the
+/// plugin's own status.
 pub(crate) async fn page_from_terminal(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
@@ -893,7 +1004,8 @@ pub(crate) async fn page_from_terminal(
     headers: HeaderMap,
 ) -> Response {
     let now = app.clock.now_ns();
-    let (who, opened) = match from_terminal(&app, &headers, &instance, now).await {
+    let named = asked.get("level").map(String::as_str);
+    let (who, opened) = match from_terminal(&app, &headers, &instance, named, now).await {
         Ok((who, opened, _)) => (who, opened),
         Err(refusal) => return *refusal,
     };
@@ -905,6 +1017,7 @@ pub(crate) async fn page_from_terminal(
         Ok(plugins) => plugins,
         Err(refusal) => return *refusal,
     };
+    let level = opened.level;
     let claims = opened.claims(&who, &instance, now);
     let assertion = match plugins.signer.sign(&claims) {
         Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
@@ -962,6 +1075,7 @@ pub(crate) async fn page_from_terminal(
     }
     let mut said = serde_json::json!({
         "instance_id": instance, "status": status, "content_type": content_type,
+        "level": level_name(level),
     });
     match String::from_utf8(bytes) {
         Ok(text) => said["body"] = text.into(),
@@ -1037,29 +1151,34 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
     let came = key
         .as_deref()
         .and_then(|key| plugins.entered(key, instance));
+    let level = came.as_ref().map(|(_, level)| *level);
     let session = match came {
-        Some(came) => match came.who(app, now).await {
+        Some((came, _)) => match came.who(app, now).await {
             Ok(who) => who,
             Err(unavailable) => return refused(&unavailable.to_string()),
         },
         None => None,
     };
-    let Some(session) = session else {
+    let (Some(session), Some(level)) = (session, level) else {
         if let Some(key) = &key {
             plugins.leave(key);
         }
-        return again(plugins, instance, &request);
+        return again(plugins, instance, level, &request);
     };
 
-    // Evaluated now, from the records as they are now: access withdrawn a
-    // moment ago is withdrawn here.
+    // Evaluated now, from the records as they are now, at the session's
+    // level: access withdrawn a moment ago is withdrawn here, and a level no
+    // longer held opens nothing.
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    let Some(opened) = opening(&access, instance) else {
+    let Some(opened) = opening(&access, instance, level) else {
         return said(
             StatusCode::FORBIDDEN,
             "No access",
-            &format!("You hold no access on {instance}."),
+            &format!(
+                "You no longer hold {} on {instance}. Open it from the dashboard again.",
+                level_name(level)
+            ),
         );
     };
     let claims = opened.claims(&session, instance, now);
@@ -1081,7 +1200,12 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
 /// request cannot follow a sign-in. A page loaded in a window of its own goes
 /// back to the frame; one in the frame, to the frame's way in, so it comes
 /// back at the page it was on rather than the frame inside itself.
-fn again(plugins: &Plugins, instance: &str, request: &Request) -> Response {
+fn again(
+    plugins: &Plugins,
+    instance: &str,
+    level: Option<AccessLevel>,
+    request: &Request,
+) -> Response {
     let method = request.method();
     if method != Method::GET && method != Method::HEAD {
         return said(
@@ -1112,6 +1236,10 @@ fn again(plugins: &Plugins, instance: &str, request: &Request) -> Response {
     if path != "/" {
         url.query_pairs_mut().append_pair("path", path);
     }
+    if let Some(level) = level {
+        url.query_pairs_mut()
+            .append_pair("level", level_name(level));
+    }
     redirect(url.as_str())
 }
 
@@ -1127,14 +1255,14 @@ async fn enter(
         .unwrap_or_default();
     let code = asked.get("code").map(String::as_str).unwrap_or_default();
     let came = match plugins.redeem(code, instance, now) {
-        Some(came) => match came.is_live(&app.sessions, &app.terminals, now).await {
-            Ok(true) => Some(came),
+        Some((came, level)) => match came.is_live(&app.sessions, &app.terminals, now).await {
+            Ok(true) => Some((came, level)),
             Ok(false) => None,
             Err(unavailable) => return refused(&unavailable.to_string()),
         },
         None => None,
     };
-    let Some(came) = came else {
+    let Some((came, level)) = came else {
         return said(
             StatusCode::UNAUTHORIZED,
             "This link has been used",
@@ -1142,7 +1270,9 @@ async fn enter(
              plugin. Open the plugin from the dashboard again.",
         );
     };
-    let key = plugins.enter(came, instance);
+    // One session per plugin host in a browser: entering again, at any
+    // level, replaces the last.
+    let key = plugins.enter(came, instance, level);
     let mut response = redirect(&landing(&asked));
     response.headers_mut().insert(
         SET_COOKIE,

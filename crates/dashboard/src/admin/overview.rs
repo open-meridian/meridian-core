@@ -15,8 +15,9 @@
 
 use std::collections::HashMap;
 
+use meridian_access::{AccessLevel, ALL_PLUGINS_ADMIN, DEPLOYMENT_ADMIN};
 use meridian_domain::account;
-use meridian_domain::v1::{AccessLevel, AccessRecords, AccountRecord, AccountState};
+use meridian_domain::v1::{AccessEntry, AccessRecords, AccountRecord, AccountState};
 
 use std::collections::HashSet;
 
@@ -39,10 +40,36 @@ const TABS: [(&str, &str); 7] = [
 ];
 
 fn level_name(level: i32) -> &'static str {
-    if level == AccessLevel::Write as i32 {
-        "write"
+    match AccessLevel::try_from(level) {
+        Ok(AccessLevel::Write) => "write",
+        Ok(AccessLevel::Admin) => "admin",
+        _ => "read",
+    }
+}
+
+/// What an access group gives one plugin, as the form's one choice names it:
+/// `read`, `write` or `admin`, or `admin-read` or `admin-write` for admin
+/// beside a data level (W6.7).
+pub(crate) fn choice_of(entries: &[AccessEntry], plugin: &str) -> &'static str {
+    let on: Vec<i32> = entries
+        .iter()
+        .filter(|e| e.plugin_instance_id == plugin)
+        .map(|e| e.level)
+        .collect();
+    let admin = on.contains(&(AccessLevel::Admin as i32));
+    let data = if on.contains(&(AccessLevel::Write as i32)) {
+        Some("write")
+    } else if on.contains(&(AccessLevel::Read as i32)) {
+        Some("read")
     } else {
-        "read"
+        None
+    };
+    match (admin, data) {
+        (true, Some("write")) => "admin-write",
+        (true, Some(_)) => "admin-read",
+        (true, None) => "admin",
+        (false, Some("write")) => "write",
+        _ => "read",
     }
 }
 
@@ -273,8 +300,10 @@ pub fn render(
     });
     let mut rows = String::new();
     for p in permissions {
+        // A permission to a built-in access group, or to one giving only
+        // admin, names no account group: it reaches no account (W6.8).
         let accounts = if p.account_group_id.is_empty() {
-            "<span class=\"name\">every account</span>".to_string()
+            "<span class=\"name\">no account</span>".to_string()
         } else {
             named(
                 &name_of(&account_group_names, &p.account_group_id),
@@ -321,7 +350,7 @@ pub fn render(
     every_group.sort_by(|a, b| by_name(&a.1, &a.0).cmp(&by_name(&b.1, &b.0)));
     let mut account_groups = vec![(
         String::new(),
-        "Every account (deployment admin only)".to_string(),
+        "None (admin only, and the built-in access groups)".to_string(),
     )];
     account_groups.extend(every_group);
     let mut access_groups: Vec<(String, String)> = records
@@ -339,8 +368,9 @@ pub fn render(
             "<label>User group<select name=\"user_group_id\" required>{}</select></label>\
              <label>On accounts<select name=\"account_group_id\">{}</select></label>\
              <label>Access<select name=\"access_group_id\" required>{}</select></label>\
-             <p class=\"hint\">Deployment admin is granted on every account; any other access \
-             group, on an account group.</p>",
+             <p class=\"hint\">Deployment admin, All plugins (admin) and an access group \
+             giving only admin are granted on no account group: configuring is not an act on an \
+             account. Any other access group is granted on one, All accounts among them.</p>",
             options("", &user_groups),
             options("", &account_groups),
             options("", &access_groups),
@@ -535,24 +565,34 @@ pub fn render(
     });
     let mut rows = String::new();
     for g in groups {
-        let mut members: Vec<String> = g
-            .account_ids
-            .iter()
-            .map(|id| name_of(&account_names, id))
-            .collect();
-        members.sort_by_key(|m| m.to_lowercase());
-        let fill = serde_json::json!({
-            "fields": { "account_group_id": g.account_group_id, "name": g.name },
-            "checked": { "account_ids": g.account_ids },
-        });
+        // All accounts lists none of its own: it holds every account (W6.6).
+        let (members, edit) = if g.built_in {
+            (
+                "every account, those opened later included".to_string(),
+                "<span class=\"pill\">built in</span>".to_string(),
+            )
+        } else {
+            let mut members: Vec<String> = g
+                .account_ids
+                .iter()
+                .map(|id| name_of(&account_names, id))
+                .collect();
+            members.sort_by_key(|m| m.to_lowercase());
+            let fill = serde_json::json!({
+                "fields": { "account_group_id": g.account_group_id, "name": g.name },
+                "checked": { "account_ids": g.account_ids },
+            });
+            (
+                summary(&members, SHOWN_MEMBERS),
+                edit_button("account-group", &format!("Edit {}", g.name), &fill),
+            )
+        };
         rows.push_str(&format!(
             "<tr data-id=\"{id}\" data-name=\"{name}\"><td>{named}</td><td>{members}</td>\
              <td class=\"actions\">{edit}</td></tr>",
             id = escape(&g.account_group_id),
             name = escape(&g.name),
             named = named(&g.name, &g.account_group_id),
-            members = summary(&members, SHOWN_MEMBERS),
-            edit = edit_button("account-group", &format!("Edit {}", g.name), &fill),
         ));
     }
     let dialogs = dialog(
@@ -625,8 +665,10 @@ pub fn render(
     let access_group_fields = format!(
         "<input type=\"hidden\" name=\"access_group_id\" value=\"\" data-record-id>\
          <label>Name<input name=\"name\" value=\"\" required></label>{}\
-         <p class=\"hint\">Each plugin chosen is given at one level: read to see what it shows, \
-         write to act through it too, which includes read.</p>",
+         <p class=\"hint\">Each plugin chosen is given admin, to configure it and reach no \
+         account, and at most one data level: read to see what it shows, write to act through it \
+         too, which includes read. A person holding admin and a data level chooses Manage, Open or \
+         View on the home.</p>",
         if plugin_choices.is_empty() {
             "<p class=\"hint\">No plugins yet: launch one from the catalogue.</p>".to_string()
         } else {
@@ -651,8 +693,12 @@ pub fn render(
     });
     let mut rows = String::new();
     for g in groups {
-        let entries: Vec<String> = if g.built_in {
-            vec!["the dashboard, and every account".to_string()]
+        let entries: Vec<String> = if g.access_group_id == DEPLOYMENT_ADMIN {
+            vec!["the dashboard's own capabilities; no plugin and no account".to_string()]
+        } else if g.access_group_id == ALL_PLUGINS_ADMIN {
+            vec!["admin on every plugin, those launched later included; no account".to_string()]
+        } else if g.built_in {
+            vec!["built in".to_string()]
         } else {
             let mut entries: Vec<String> = g
                 .entries
@@ -677,14 +723,15 @@ pub fn render(
             for e in &g.entries {
                 fields.insert(
                     format!("level.{}", e.plugin_instance_id),
-                    level_name(e.level).into(),
+                    choice_of(&g.entries, &e.plugin_instance_id).into(),
                 );
             }
-            let chosen: Vec<&str> = g
+            let mut chosen: Vec<&str> = g
                 .entries
                 .iter()
                 .map(|e| e.plugin_instance_id.as_str())
                 .collect();
+            chosen.dedup();
             edit_button(
                 "access-group",
                 &format!("Edit {}", g.name),
@@ -723,7 +770,7 @@ pub fn render(
     sections.push(section(
         "access-groups",
         "Access",
-        "What a permission gives: plugins, each at read or write.",
+        "What a permission gives: plugins, each at admin, read or write, or admin and one of those.",
         &add_button("access-group", "an access group"),
         format!("{table}{dialogs}"),
     ));
@@ -927,12 +974,16 @@ pub fn render(
     )
 }
 
-/// A plugin's one level in an access group: read, or write, which includes
-/// read. One choice, so an entry can never name both.
+/// What an access group gives a plugin: admin, and at most one data level,
+/// read or write, which includes read. One choice, so an entry can never name
+/// read and write both (W6.7).
 fn level_select(instance: &str) -> String {
     format!(
         "<select name=\"level.{id}\" aria-label=\"Level on {id}\"><option value=\"read\">Read</option>\
-         <option value=\"write\">Write (includes read)</option></select>",
+         <option value=\"write\">Write (includes read)</option>\
+         <option value=\"admin\">Admin (configures it, no account)</option>\
+         <option value=\"admin-read\">Admin and read</option>\
+         <option value=\"admin-write\">Admin and write</option></select>",
         id = escape(instance)
     )
 }

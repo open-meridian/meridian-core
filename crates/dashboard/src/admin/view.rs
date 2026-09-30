@@ -1,26 +1,32 @@
 //! The admin view of one plugin instance, `/admin/plugins/{instance}`
-//! (kernel/a-plugins-admin-view; spec/plugin-pages-share-one-kit.md, Q5),
-//! in tabs (W6.9, the product owner, 2026-09-29): Overview, its health and
-//! what it still needs; Settings, its form; Access, who may use it; then one
-//! tab per admin page the plugin declared (W4.8), in its order, each framing
-//! that path on the plugin's host seamlessly under the tab row, which the
-//! plugin serves to deployment admins alone by the claim that says they are
-//! one. A plugin declaring none gets one tab framing its `/admin`.
+//! (kernel/a-plugins-admin-view; spec/plugin-pages-share-one-kit.md, Q5):
+//! the tabs every plugin has -- Overview, its health and what it still needs;
+//! Settings, its form; Access, who may use it; and Versions, Activity, Grants
+//! & scope, Usage and Diagnostics as they are built
+//! (kernel/the-admin-view-tracks-a-plugin) -- and a link to the plugin's own
+//! area, where its pages are (W6.9, sdk-contract/a-plugin-has-admins). It
+//! frames none of the plugin's pages: they moved to the area at
+//! `/plugins/{instance}`, reached from the home, one tab row per level.
 //!
-//! A tab is a link, `?tab=settings` or, for a plugin's page, `?tab=` its
-//! title in lower case (`?tab=accounts`; the product owner, 2026-09-29), so
-//! each opens directly and none needs script: the page holds only the tab
-//! asked for, and frames only that page.
+//! Shown to the plugin's admins -- a deployment admin being one through All
+//! plugins (admin) -- and to a deployment admin, who reaches what is theirs
+//! on it: its health, and granting on Access. Settings is an admin of the
+//! plugin's (W6.11); a plugin admin reads Access and changes nothing on it,
+//! since only a deployment admin grants (decisions/027).
+//!
+//! A tab is a link, `?tab=settings`, so each opens directly and none needs
+//! script: the page holds only the tab asked for.
 //!
 //! The admin overview's Plugins tab lists every instance with the same line
 //! this view heads with: its health, what its settings still need, and how
 //! many of its external accounts nothing links (W6.10). Each plugin links its
-//! own external accounts on its admin pages (W6.4); the count leads there.
+//! own external accounts on its pages at `admin` (W6.4); the count leads
+//! there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use meridian_access::DEPLOYMENT_ADMIN;
-use meridian_domain::v1::{AccessLevel, AccessRecords, PluginReport, PluginSettingsRecord};
+use meridian_access::{AccessLevel, ALL_PLUGINS_ADMIN};
+use meridian_domain::v1::{AccessRecords, PluginReport, PluginSettingsRecord};
 
 use crate::custody::{quiet, remedy, utc, Heard};
 use crate::health::{self, State};
@@ -34,100 +40,31 @@ pub fn path(instance: &str) -> String {
     format!("/admin/plugins/{instance}")
 }
 
-/// The view's own tabs, before the plugin's pages.
+/// The view's tabs.
 pub const OVERVIEW: &str = "overview";
 pub const SETTINGS: &str = "settings";
 pub const ACCESS: &str = "access";
-/// What a plugin declaring no admin page is framed at.
-const ADMIN: &str = "/admin";
 
-/// One tab: what the query names it by, what it is called, and for one of
-/// the plugin's pages, the path framed.
+/// One tab: what the query names it by, and what it is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
     pub key: String,
     pub title: String,
-    pub page: Option<String>,
 }
 
-/// The view's tabs, then the plugin's admin pages as its report declares
-/// them, in its order. A page whose path is not one on the plugin's host is
-/// left out, as is a second tab for a path already shown; none left, and the
-/// plugin's `/admin` is the one.
-pub fn tabs(report: Option<&PluginReport>) -> Vec<Tab> {
-    let own = |key: &str, title: &str| Tab {
+/// The tabs every plugin has, as far as they are built, for this viewer:
+/// Settings only for an admin of the plugin (W6.11).
+pub fn tabs(may_set: bool) -> Vec<Tab> {
+    let tab = |key: &str, title: &str| Tab {
         key: key.into(),
         title: title.into(),
-        page: None,
     };
-    let mut tabs = vec![
-        own(OVERVIEW, "Overview"),
-        own(SETTINGS, "Settings"),
-        own(ACCESS, "Access"),
-    ];
-    let declared = report
-        .and_then(|report| report.declared_interface.as_ref())
-        .map(|interface| interface.admin_pages.as_slice())
-        .unwrap_or_default();
-    let mut pages: Vec<Tab> = Vec::new();
-    for page in declared {
-        let path = page.path.trim();
-        if crate::plugins::page_path(path).is_err()
-            || pages.iter().any(|t| t.page.as_deref() == Some(path))
-        {
-            continue;
-        }
-        let title = page.title.trim();
-        let title = if title.is_empty() { path } else { title };
-        let key = unique(slug(title), &tabs, &pages);
-        pages.push(Tab {
-            key,
-            title: title.into(),
-            page: Some(path.into()),
-        });
+    let mut tabs = vec![tab(OVERVIEW, "Overview")];
+    if may_set {
+        tabs.push(tab(SETTINGS, "Settings"));
     }
-    if pages.is_empty() {
-        pages.push(Tab {
-            key: "admin".into(),
-            title: "Admin page".into(),
-            page: Some(ADMIN.into()),
-        });
-    }
-    tabs.extend(pages);
+    tabs.push(tab(ACCESS, "Access"));
     tabs
-}
-
-/// A title as the query names its tab: lower case, letters and digits, runs of
-/// anything else one hyphen. "Accounts" is `accounts`, "Cash ladder" is
-/// `cash-ladder`; a title with none of either is `page`.
-fn slug(title: &str) -> String {
-    let mut out = String::new();
-    for c in title.chars().flat_map(char::to_lowercase) {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let out = out.trim_end_matches('-');
-    if out.is_empty() {
-        "page".into()
-    } else {
-        out.into()
-    }
-}
-
-/// `key`, or `key-2`, `key-3` and on, whichever no tab already has, so a
-/// plugin page called "Settings" does not take the view's own.
-fn unique(key: String, own: &[Tab], pages: &[Tab]) -> String {
-    let taken = |k: &str| own.iter().chain(pages).any(|t| t.key == k);
-    if !taken(&key) {
-        return key;
-    }
-    (2..)
-        .map(|n| format!("{key}-{n}"))
-        .find(|k| !taken(k))
-        .expect("an unused key")
 }
 
 /// The tab asked for, or the first when none is, or one that is not there.
@@ -143,6 +80,12 @@ pub fn tab_href(instance: &str, key: &str) -> String {
     let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("a fixed address");
     url.query_pairs_mut().append_pair("tab", key);
     format!("{}?{}", path(instance), url.query().unwrap_or_default())
+}
+
+/// The plugin's area at Manage, where its pages at `admin` are, and where it
+/// links its external accounts (W6.4, W6.9).
+pub fn area_at_admin(instance: &str) -> String {
+    crate::area::href(instance, AccessLevel::Admin, None)
 }
 
 /// What is known of one instance, from wherever it is said: the conductor's
@@ -231,10 +174,10 @@ pub fn state_badge(state: &State, id: &str) -> (String, String) {
     )
 }
 
-/// What still needs a deployment admin, as flags linking to where it is
+/// What still needs an admin of the plugin, as flags linking to where it is
 /// done. The overview says what the settings need in a column of its own,
-/// so only the view flags them; in the view, `admin_pages` is where the
-/// plugin's own admin pages start, where it links its external accounts.
+/// so only the view flags them; in the view, `admin_pages` is the plugin's
+/// area at Manage, where its pages at `admin` link its external accounts.
 pub fn flags(line: &Line, admin_pages: Option<&str>) -> String {
     let view = path(&line.instance);
     let mut flags = String::new();
@@ -251,9 +194,9 @@ pub fn flags(line: &Line, admin_pages: Option<&str>) -> String {
             plural(line.unlinked, "external account", "external accounts")
         );
         let link = match admin_pages {
-            // Each plugin links its own, on its admin pages (W6.4).
+            // Each plugin links its own, on its pages at admin (W6.4).
             Some(pages) => format!(
-                "{}. <a href=\"{}\">Link {} on the plugin's admin pages</a>.",
+                "{}. <a href=\"{}\">Link {} on the plugin's pages, under Manage</a>.",
                 escape(&said),
                 escape(pages),
                 if line.unlinked == 1 { "it" } else { "them" }
@@ -269,10 +212,12 @@ pub fn flags(line: &Line, admin_pages: Option<&str>) -> String {
 }
 
 /// Who may use the instance: each user group an access group gives it to,
-/// at its level and on its accounts, `write` before `read`; and who opens it
-/// as a deployment admin. A level is the plugin's, the same two for every
-/// plugin, since a plugin declares no tags (decisions/026).
-fn access(records: &AccessRecords, instance: &str) -> String {
+/// at its level and, for `read` and `write`, on its accounts -- `admin`
+/// first, then `write`, then `read`; and the user groups linked to All
+/// plugins (admin), who administer it and every plugin. The levels are the
+/// plugin's, the same three for every plugin, since a plugin declares no tags
+/// (decisions/026, 027). A deployment admin is offered the way to grant.
+fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
     let name = |id: &str, of: &[(&str, &str)]| {
         of.iter()
             .find(|(held, _)| *held == id)
@@ -289,11 +234,31 @@ fn access(records: &AccessRecords, instance: &str) -> String {
         .iter()
         .map(|g| (g.account_group_id.as_str(), g.name.as_str()))
         .collect();
-    let mut rows: Vec<(bool, String)> = Vec::new();
-    let mut admins = Vec::new();
+    let row = |order: u8,
+               permission: &meridian_domain::v1::Permission,
+               through: &str,
+               level: &str| {
+        let accounts = if level == "admin" {
+            "<span class=\"id\">no account</span>".to_string()
+        } else {
+            escape(&name(&permission.account_group_id, &account_groups))
+        };
+        (
+            order,
+            format!(
+                "<tr data-user-group=\"{ug}\" data-level=\"{level}\">\
+                 <td><span class=\"name\">{user}</span><span class=\"id\">through {access}</span></td>\
+                 <td><span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
+                ug = escape(&permission.user_group_id),
+                user = escape(&name(&permission.user_group_id, &user_groups)),
+                access = escape(through),
+            ),
+        )
+    };
+    let mut rows: Vec<(u8, String)> = Vec::new();
     for permission in &records.permissions {
-        if permission.access_group_id == DEPLOYMENT_ADMIN {
-            admins.push(name(&permission.user_group_id, &user_groups));
+        if permission.access_group_id == ALL_PLUGINS_ADMIN {
+            rows.push(row(0, permission, "All plugins (admin)", "admin"));
             continue;
         }
         let Some(group) = records
@@ -308,24 +273,18 @@ fn access(records: &AccessRecords, instance: &str) -> String {
             .iter()
             .filter(|e| e.plugin_instance_id == instance)
         {
-            let writes = entry.level == AccessLevel::Write as i32;
-            let level = if writes { "write" } else { "read" };
-            rows.push((
-                writes,
-                format!(
-                    "<tr data-user-group=\"{ug}\" data-level=\"{level}\">\
-                     <td><span class=\"name\">{user}</span><span class=\"id\">through {access}</span></td>\
-                     <td><span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
-                    ug = escape(&permission.user_group_id),
-                    user = escape(&name(&permission.user_group_id, &user_groups)),
-                    access = escape(&group.name),
-                    accounts = escape(&name(&permission.account_group_id, &account_groups)),
-                ),
-            ));
+            let (order, level) = match AccessLevel::try_from(entry.level) {
+                Ok(AccessLevel::Admin) => (0, "admin"),
+                Ok(AccessLevel::Write) => (1, "write"),
+                Ok(AccessLevel::Read) => (2, "read"),
+                _ => continue,
+            };
+            rows.push(row(order, permission, &group.name, level));
         }
     }
-    // Write before read, and otherwise in the order the permissions are.
-    rows.sort_by_key(|(writes, _)| !writes);
+    // Admin, then write, then read, and otherwise in the order the
+    // permissions are.
+    rows.sort_by_key(|(order, _)| *order);
     let rows: String = rows.into_iter().map(|(_, row)| row).collect();
     let table = if rows.is_empty() {
         "<p class=\"empty\">No user group holds access to it yet.</p>".to_string()
@@ -335,21 +294,19 @@ fn access(records: &AccessRecords, instance: &str) -> String {
              <th>Level</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
-    let admins = if admins.is_empty() {
-        String::new()
-    } else {
-        admins.sort();
-        admins.dedup();
+    let hint = "<p class=\"hint\">Admin configures the plugin and reaches no account's data; \
+                write and read reach the accounts of the account group granted. A deployment \
+                admin holds nothing on it by being one.</p>";
+    let grant = if may_grant {
         format!(
-            "<p class=\"hint\">Deployment admins open it too, holding nothing on it by that: {}.</p>",
-            escape(&admins.join(", "))
+            "<p><a href=\"/admin#permissions\">Grant a user group access</a> through an \
+             access group naming <code>{}</code>.</p>",
+            escape(instance)
         )
+    } else {
+        "<p class=\"hint\">A deployment admin grants access.</p>".to_string()
     };
-    format!(
-        "{table}{admins}<p><a href=\"/admin#permissions\">Grant a user group access</a> through an \
-         access group naming <code>{}</code>.</p>",
-        escape(instance)
-    )
+    format!("{table}{hint}{grant}")
 }
 
 /// Each of the instance's external accounts with the sync state it last
@@ -414,7 +371,7 @@ fn connections(instance: &str, custody: &Heard, records: &AccessRecords) -> Stri
     )
 }
 
-fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: &str) -> String {
+fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: Option<&str>) -> String {
     // Why it is as it is, the badge's note: a line under the heading without
     // script, and with it, in the bubble.
     let (badge, detail) = state_badge(&line.state, "health-note");
@@ -459,12 +416,11 @@ fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: &str) -
     format!(
         "<section class=\"panel padded\" id=\"health\"><div class=\"row\"><h2>Health</h2>{badge}</div>\
          {detail}{facts}{flags}</section>",
-        flags = flags(line, Some(admin_pages)),
+        flags = flags(line, admin_pages),
     )
 }
 
-/// What the view shows: the tabs, the one asked for, and for one of the
-/// plugin's pages, how this dashboard can show it.
+/// What the view shows: the tabs, and the one asked for.
 pub struct View<'a> {
     pub line: &'a Line,
     pub record: Option<&'a PluginSettingsRecord>,
@@ -477,18 +433,10 @@ pub struct View<'a> {
     pub development: bool,
     pub tabs: &'a [Tab],
     pub current: &'a Tab,
-    /// The current tab's page, when it is one of the plugin's.
-    pub admin_page: Option<AdminPage>,
-}
-
-/// The plugin's own admin page, as this dashboard can show it.
-pub enum AdminPage {
-    /// Framed: the frame's way in, and the plugin's origin its theme goes to.
-    Framed { src: String, origin: String },
-    /// A link to it in a window of its own, where no frame keeps its session.
-    Linked(String),
-    /// Not at all, and why.
-    None(&'static str),
+    /// The plugin's area at Manage, for a viewer who administers it.
+    pub area: Option<String>,
+    /// Whether the viewer is a deployment admin, who grants.
+    pub may_grant: bool,
 }
 
 fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
@@ -512,56 +460,6 @@ fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
     format!("<nav class=\"tabs view-tabs\" aria-label=\"The plugin's admin\">{links}</nav>")
 }
 
-/// One of the plugin's own pages, straight under the tab row. Framed, it is
-/// seamless (the product owner, 2026-09-29): no panel, heading or border of
-/// the dashboard's around it, `om-framed=1` on its address so the kit leaves
-/// out the page's own heading and tabs, and as tall as the page says it is
-/// (`data-seamless`, which the page's script sizes). The frame stays, so the
-/// plugin's script is kept from the administrator's session. Where it cannot
-/// be framed, a panel says why.
-fn page_panel(view: &View, title: &str, tab: &Tab) -> String {
-    let path = escape(tab.page.as_deref().unwrap_or_default());
-    let said = match &view.admin_page {
-        Some(AdminPage::Framed { src, origin }) => {
-            return format!(
-                "<iframe class=\"admin-frame\" id=\"admin-page\" data-page=\"{path}\" src=\"{}\" \
-                 title=\"{title} &middot; {}\" data-plugin-frame data-seamless data-origin=\"{}\" \
-                 data-actions=\"{PAGE_ACTIONS}\" data-status=\"{PAGE_STATUS}\"></iframe>",
-                escape(src),
-                escape(&tab.title),
-                escape(origin)
-            )
-        }
-        Some(AdminPage::Linked(href)) => format!(
-            "<p class=\"empty\">This dashboard's address has no domain, so a browser keeps no \
-             framed page's session. <a href=\"{}\" target=\"_blank\" rel=\"noopener\">Open \
-             {}</a> in a window of its own.</p>",
-            escape(href),
-            escape(&tab.title)
-        ),
-        Some(AdminPage::None(why)) => format!("<p class=\"empty\">{}</p>", escape(why)),
-        None => String::new(),
-    };
-    format!(
-        "<section class=\"panel padded\" id=\"admin-page\" data-page=\"{path}\">{said}</section>"
-    )
-}
-
-/// The header's area for a framed page's own actions (meridian-ui's
-/// `meridian:actions`), which the chrome's script draws; its frame names it.
-const PAGE_ACTIONS: &str = "page-actions";
-
-/// Where a framed page's own status dot goes (meridian-ui's
-/// `meridian:status`, kit 0.7.0): beside the plugin's name in the
-/// breadcrumb, which the chrome's script draws it in; its frame names it.
-const PAGE_STATUS: &str = "page-status";
-
-/// The breadcrumb's place for a framed page's status, after the plugin's
-/// name: empty, and taking no room, until the page tells it a status.
-pub fn status_place() -> String {
-    format!("<span class=\"crumb-status\" id=\"{PAGE_STATUS}\"></span>")
-}
-
 pub fn render(view: &View) -> String {
     let line = view.line;
     let instance = escape(&line.instance);
@@ -571,12 +469,6 @@ pub fn render(view: &View) -> String {
     } else {
         format!("<p class=\"notice good\">{}</p>", escape(view.notice))
     };
-    let first_page = view
-        .tabs
-        .iter()
-        .find(|tab| tab.page.is_some())
-        .map(|tab| tab_href(&line.instance, &tab.key))
-        .unwrap_or_default();
     let body = match view.current.key.as_str() {
         SETTINGS => {
             let form = match view.record {
@@ -593,31 +485,28 @@ pub fn render(view: &View) -> String {
         }
         ACCESS => format!(
             "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
-            access(view.records, &line.instance)
+            access(view.records, &line.instance, view.may_grant)
         ),
-        _ if view.current.page.is_some() => page_panel(view, &title, view.current),
         _ => format!(
             "<div class=\"stack\">{}{}</div>",
-            health_panel(line, view.report, &first_page),
+            health_panel(line, view.report, view.area.as_deref()),
             connections(&line.instance, view.custody, view.records)
         ),
     };
-    // The header's buttons are the framed page's own, which it declares
-    // (the product owner, 2026-09-30): the way back is the breadcrumb, and a
-    // plugin's page is reached from the Dashboard.
-    let framed =
-        view.current.page.is_some() && matches!(view.admin_page, Some(AdminPage::Framed { .. }));
-    let actions = if framed {
-        format!(
-            "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"{} actions\"></div>",
-            escape(&view.current.title)
-        )
-    } else {
-        String::new()
-    };
+    // The plugin's own pages are in its area, from the home (W6.9).
+    let area = view
+        .area
+        .as_deref()
+        .map(|area| {
+            format!(
+                "<div class=\"actions\"><a class=\"button\" href=\"{}\" data-area>Its pages</a></div>",
+                escape(area)
+            )
+        })
+        .unwrap_or_default();
     format!(
         "<div class=\"plugin-view\"><div class=\"page-head\"><div><h1>{title}</h1><p><code>{instance}</code> &middot; \
-         the plugin's health, settings and access, and its own admin pages.</p></div>{actions}</div>\
+         the plugin's health, settings and access; its own pages are in its area.</p></div>{area}</div>\
          {nav}<div class=\"tab-body\" data-current=\"{current}\">{body}</div></div>",
         nav = nav(&line.instance, view.tabs, view.current),
         current = escape(&view.current.key),

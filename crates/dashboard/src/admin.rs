@@ -9,8 +9,12 @@
 //! next refresh.
 //!
 //! Every form carries the session's form token and is refused without it.
-//! Every page but the claim page is refused to anybody not holding deployment
-//! admin, checked against the records on each request.
+//! Every page but the claim page and a plugin's own tabs is refused to
+//! anybody not holding deployment admin, checked against the records on each
+//! request. A plugin's tabs, `/admin/plugins/{instance}`, are its admins' --
+//! a deployment admin being one through All plugins (admin) -- and a
+//! deployment admin's for what is theirs on it; its settings are its admins'
+//! alone (W6.9 to W6.11, decisions/027).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,11 +25,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use meridian_access::{person_access, DEPLOYMENT_ADMIN};
+use meridian_access::{person_access, Access, AccessLevel, DEPLOYMENT_ADMIN};
 use meridian_bus::BusError;
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, ClaimCodePurpose,
-    CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
+    AccessEntry, AccessGroup, AccessRecords, AccountGroup, ClaimCodePurpose, CloseAccountRequest,
+    DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, GrantPermissionRequest, PluginSettingsRecord, RedeemClaimCodeReply,
     RedeemClaimCodeRequest, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
@@ -134,6 +138,32 @@ fn gate(
         )));
     }
     Ok((session, records))
+}
+
+/// Who is asking about one plugin's tabs, what the records say now, and what
+/// they hold; or the response refusing anybody who neither administers the
+/// plugin nor the deployment. `settings`: only its admins.
+fn gate_plugin(
+    app: &App,
+    headers: &HeaderMap,
+    instance: &str,
+    settings: bool,
+) -> Result<(Session, AccessRecords, Access), Box<Response>> {
+    let (session, records) = gate(app, headers, false)?;
+    let access = person_access(&records, &session.subject, &session.directory_groups);
+    let administers = access.administers(instance);
+    if !(administers || (!settings && access.deployment_admin)) {
+        return Err(Box::new(status_page(
+            StatusCode::FORBIDDEN,
+            "Not permitted",
+            if settings {
+                "a plugin's settings are for its admins"
+            } else {
+                "this page is for the plugin's admins and deployment admins"
+            },
+        )));
+    }
+    Ok((session, records, access))
 }
 
 fn form_token_matches(session: &Session, fields: &Fields) -> Result<(), Box<Response>> {
@@ -459,7 +489,7 @@ async fn plugin_view(
     Path(instance): Path<String>,
     Query(query): Query<Fields>,
 ) -> Response {
-    let (session, records) = match gate(&app, &headers, true) {
+    let (session, records, access) = match gate_plugin(&app, &headers, &instance, false) {
         Ok(gated) => gated,
         Err(response) => return *response,
     };
@@ -473,36 +503,13 @@ async fn plugin_view(
         "none" => "Nothing was changed.",
         _ => "",
     };
-    // The tabs: the view's own, then the plugin's admin pages as its report
-    // declares them (W4.8, W6.9), and the one asked for.
+    // The tabs every plugin has; Settings for its admins (W6.11). Its own
+    // pages are in its area, which the view links to (W6.9).
+    let administers = access.administers(&instance);
     let reports = app.health.view();
     let report = reports.get(&instance);
-    let tabs = view::tabs(report);
+    let tabs = view::tabs(administers);
     let current = view::chosen(&tabs, field(&query, "tab"));
-    // One of the plugin's own admin pages, on its host, framed seamlessly
-    // under the tabs; the plugin serves it to deployment admins alone, by
-    // the claim (W6.9). In a window of its own, it is a page on its own.
-    let theme = crate::plugins::Theme::of_mode(crate::web::mode_of(&app, &headers));
-    let admin_page = current
-        .page
-        .as_deref()
-        .map(|page| match app.plugins.as_deref() {
-            None => view::AdminPage::None(
-                "This dashboard serves no plugin pages, so it cannot frame this one's.",
-            ),
-            Some(_) if !crate::plugins::is_instance(&instance) => view::AdminPage::None(
-                "This instance's name cannot be a host, so its page cannot be framed.",
-            ),
-            Some(plugins) if plugins.frames() => view::AdminPage::Framed {
-                src: crate::plugins::entrance(&instance, page, &theme.clone().seamless()),
-                origin: plugins.origin(&instance),
-            },
-            Some(_) => view::AdminPage::Linked(crate::plugins::entrance(&instance, page, &theme)),
-        });
-    // A framed page's own status dot goes beside the plugin's name (the
-    // product owner, 2026-09-30: "put the green icon ... next to the plugin
-    // name so there's no extra line between the tabs and the form").
-    let framed = matches!(admin_page, Some(view::AdminPage::Framed { .. }));
     let body = view::render(&view::View {
         line,
         record: settings_of(&records, &instance),
@@ -514,29 +521,32 @@ async fn plugin_view(
         development: crate::html::is_development(),
         tabs: &tabs,
         current,
-        admin_page,
+        area: administers.then(|| view::area_at_admin(&instance)),
+        may_grant: access.deployment_admin,
     });
+    // The way back is the breadcrumb: for a deployment admin the settings
+    // home, its plugins, then this one by its name, its instance ID on
+    // hover; for a plugin's admin, Home, then this one.
     let mut chrome = admin_chrome(&session);
-    // The way back is the breadcrumb: the settings home, its plugins, then
-    // this one by its name, its instance ID on hover; and after it, a framed
-    // page's status, once the page tells it.
-    chrome.crumbs = format!(
-        "{}{}{}{}",
-        crate::html::crumb_link("/admin", "Settings"),
-        crate::html::crumb_link("/admin#plugins", "Plugins"),
-        crate::html::crumb_here(line.name.as_deref().unwrap_or(&instance), Some(&instance)),
-        if framed {
-            view::status_place()
-        } else {
-            String::new()
-        },
-    );
-    Html(page_with(
-        &format!("{} admin", line.name.as_deref().unwrap_or(&instance)),
-        &body,
-        &chrome,
-    ))
-    .into_response()
+    let name = line.name.as_deref().unwrap_or(&instance);
+    if access.deployment_admin {
+        chrome.crumbs = format!(
+            "{}{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_link("/admin#plugins", "Plugins"),
+            crate::html::crumb_here(name, Some(&instance)),
+        );
+    } else {
+        chrome.crumbs = format!(
+            "{}{}",
+            crate::html::crumb_link("/", "Home"),
+            crate::html::crumb_here(name, Some(&instance)),
+        );
+        if let Some(viewer) = chrome.viewer.as_mut() {
+            viewer.admin = false;
+        }
+    }
+    Html(page_with(&format!("{name} admin"), &body, &chrome)).into_response()
 }
 
 // ── A plugin instance's settings (W6.11) ────────────────────────────────────
@@ -565,7 +575,7 @@ async fn settings_page(
     headers: HeaderMap,
     Path(instance): Path<String>,
 ) -> Response {
-    if let Err(response) = gate(&app, &headers, true) {
+    if let Err(response) = gate_plugin(&app, &headers, &instance, true) {
         return *response;
     }
     (
@@ -578,16 +588,17 @@ async fn settings_page(
         .into_response()
 }
 
-/// The form, as one command to the conductor. What was typed into a secret's
-/// field goes there and nowhere else: not into a log line, and not back into
-/// a page, including the one saying it was refused.
+/// The form, as one command to the conductor, from an admin of the plugin
+/// (W6.11). What was typed into a secret's field goes there and nowhere
+/// else: not into a log line, and not back into a page, including the one
+/// saying it was refused.
 async fn set_settings(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Path(instance): Path<String>,
     Form(fields): Form<Fields>,
 ) -> Response {
-    let (session, records) = match gate(&app, &headers, true) {
+    let (session, records, _) = match gate_plugin(&app, &headers, &instance, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
     };
@@ -775,6 +786,7 @@ async fn define_account_group(
                 account_group_id: field(&fields, "account_group_id").into(),
                 name: field(&fields, "name").into(),
                 account_ids: list(&fields, "account_ids"),
+                built_in: false,
             }),
         };
         command::<AccountGroup>(
@@ -789,8 +801,18 @@ async fn define_account_group(
     })
 }
 
-/// "plugin read|write", one per line: a plugin and a level, the same two
-/// levels for every plugin (decisions/026).
+/// A level as a typed entry or the form names it.
+fn level_named(level: &str) -> Option<AccessLevel> {
+    match level {
+        "read" => Some(AccessLevel::Read),
+        "write" => Some(AccessLevel::Write),
+        "admin" => Some(AccessLevel::Admin),
+        _ => None,
+    }
+}
+
+/// "plugin read|write|admin", one per line: a plugin and a level, the same
+/// three levels for every plugin (decisions/026, 027).
 pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
     text.lines()
         .map(str::trim)
@@ -800,19 +822,16 @@ pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
             let [plugin, level] = parts[..] else {
                 return Err(if parts.len() == 3 {
                     format!(
-                        "`{line}` names a tag; an entry is `plugin read|write`, since a \
-                         plugin declares no tags and access to it is read or write \
+                        "`{line}` names a tag; an entry is `plugin read|write|admin`, since a \
+                         plugin declares no tags and access to it is read, write or admin \
                          (decisions/026)"
                     )
                 } else {
-                    format!("`{line}` is not `plugin read|write`")
+                    format!("`{line}` is not `plugin read|write|admin`")
                 });
             };
-            let level = match level {
-                "read" => AccessLevel::Read,
-                "write" => AccessLevel::Write,
-                other => return Err(format!("`{other}` is not read or write")),
-            };
+            let level = level_named(level)
+                .ok_or_else(|| format!("`{level}` is not read, write or admin"))?;
             Ok(AccessEntry {
                 plugin_instance_id: plugin.into(),
                 level: level as i32,
@@ -822,35 +841,42 @@ pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
 }
 
 /// An access group's entries as the form sends them: each plugin chosen
-/// (`plugin`, one per box) at its one level (`level.{plugin}`, read or
-/// write), and any typed as `plugin read|write` lines (`entries`, as the
-/// form was before). A plugin named twice is refused: an access group gives
-/// each plugin one level, and write includes read (the product owner,
-/// 2026-09-30).
+/// (`plugin`, one per box) at its one choice (`level.{plugin}`): `read`,
+/// `write`, `admin`, or `admin-read` or `admin-write` for admin beside one
+/// data level; and any typed as `plugin read|write|admin` lines (`entries`,
+/// as the form was before). A plugin at both read and write, or twice at one
+/// level, is refused: write includes read (W6.7).
 pub fn entries_of(pairs: &[(String, String)]) -> Result<Vec<AccessEntry>, String> {
     let fields = once(pairs);
     let mut entries = Vec::new();
     for plugin in every(pairs, "plugin") {
-        let level = match field(&fields, &format!("level.{plugin}")) {
-            "read" => AccessLevel::Read,
-            "write" => AccessLevel::Write,
-            "" => return Err(format!("`{plugin}` has no level: choose read or write")),
-            other => return Err(format!("`{other}` is not read or write")),
+        let chosen = field(&fields, &format!("level.{plugin}"));
+        let levels: Vec<AccessLevel> = match chosen {
+            "admin-read" => vec![AccessLevel::Admin, AccessLevel::Read],
+            "admin-write" => vec![AccessLevel::Admin, AccessLevel::Write],
+            "" => {
+                return Err(format!(
+                    "`{plugin}` has no level: choose admin, read or write"
+                ))
+            }
+            other => vec![level_named(other)
+                .ok_or_else(|| format!("`{other}` is not admin, read or write"))?],
         };
-        entries.push(AccessEntry {
-            plugin_instance_id: plugin,
+        entries.extend(levels.into_iter().map(|level| AccessEntry {
+            plugin_instance_id: plugin.clone(),
             level: level as i32,
-        });
+        }));
     }
     for typed in every(pairs, "entries") {
         entries.extend(parse_entries(&typed)?);
     }
-    let mut seen = HashSet::new();
+    let data = |level: i32| level != AccessLevel::Admin as i32;
+    let mut seen: HashSet<(String, bool)> = HashSet::new();
     for entry in &entries {
-        if !seen.insert(entry.plugin_instance_id.clone()) {
+        if !seen.insert((entry.plugin_instance_id.clone(), data(entry.level))) {
             return Err(format!(
-                "`{}` is named twice; an access group gives each plugin one level, and write \
-                 includes read",
+                "`{}` is named twice at a data level, or twice at admin; an access group gives \
+                 each plugin admin and at most one of read and write, and write includes read",
                 entry.plugin_instance_id
             ));
         }

@@ -16,34 +16,62 @@
 //! make impossible: each permission contributes only its own accounts, at its
 //! own level, to the plugin its entry names.
 //!
-//! Per plugin, and nothing finer: a person's access to a plugin is `read` or
-//! `write`, the same for every plugin, and a plugin names no parts of itself
-//! for access (decisions/026).
+//! Per plugin, and nothing finer: a person's access to a plugin is `read`,
+//! `write` or `admin`, the same for every plugin, and a plugin names no parts
+//! of itself for access (decisions/026, 027).
 //!
-//! `write` includes `read`: every account a person may write is also one they
-//! may read.
+//! **Levels** (W6.7, the product owner's rulings of 2026-09-30). A person may
+//! hold `admin` on a plugin and, independently, one data level, the higher
+//! one granted: `write` includes `read`, so every account a person may write
+//! is also one they may read. The levels are agnostic of accounts -- holding
+//! `write` gives Open, whatever the account group -- and the account groups
+//! bound what each reaches. `admin` configures the plugin and reaches no
+//! account.
+//!
+//! **A session carries one level** (W6.9): Manage at `admin` with no account,
+//! Open at `write` with the read set and the write set, View at `read` with
+//! the read set alone. [`Access::session`] cuts the accounts to the level
+//! chosen, and holds nothing for a level the person does not hold.
 //!
 //! A closed account stays readable and is never writable. Its history remains,
 //! and nothing may change it.
 //!
-//! An account in no account group is reached by no permission, and so by
-//! nobody but deployment admins, whose built-in access group reaches every
-//! account without naming a group.
+//! **Built in** are deployment admin, which holds the dashboard's own
+//! capabilities and no plugin and no account; All plugins (admin), which
+//! grants `admin` on every plugin, those launched later included, and no
+//! account; and All accounts, an account group holding every account the
+//! records hold, those opened later included. An account no group lists is
+//! reached only by a permission naming All accounts, or by a plugin's link;
+//! nobody reaches it by being an admin.
 //!
 //! There are no deny rules. Access only adds up.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::v1::{
-    AccessLevel, AccessRecords, AccountRecord, AccountState, ExternalAccountLink, Permission,
-    UserGroup,
+    AccessRecords, AccountRecord, AccountState, ExternalAccountLink, Permission, UserGroup,
 };
+pub use meridian_pb::v1::AccessLevel;
 use meridian_pb::v1::{PersonAccess, PluginAccessReply, UserGroupAccess};
 
-/// The built-in access group. Holds the dashboard's own capabilities and
-/// reaches every account; cannot be edited, deleted, or left without a
+/// The built-in access group of the dashboard's own capabilities. Reaches no
+/// plugin and no account; cannot be edited, deleted, or left without a
 /// permission.
 pub const DEPLOYMENT_ADMIN: &str = "deployment-admin";
+
+/// The built-in access group granting `admin` on every plugin, those launched
+/// later included, and no account: All plugins (admin). First run and a claim
+/// code link the deployment admins' user group to it (W6.2, W7.6); any
+/// permission to it may be withdrawn.
+pub const ALL_PLUGINS_ADMIN: &str = "all-plugins-admin";
+
+/// The built-in account group holding every account: All accounts (W6.6).
+pub const ALL_ACCOUNTS: &str = "all-accounts";
+
+/// Whether an access group is one of the two built in.
+pub fn is_built_in_access_group(access_group_id: &str) -> bool {
+    access_group_id == DEPLOYMENT_ADMIN || access_group_id == ALL_PLUGINS_ADMIN
+}
 
 /// The login of an account this deployment holds itself (decisions/018).
 ///
@@ -84,28 +112,158 @@ impl Levels {
     }
 }
 
-/// Plugin instance, then the accounts at each level.
-pub type PluginLevels = BTreeMap<String, Levels>;
+/// What a person holds on one plugin: whether they administer it, their data
+/// level, and the accounts that level reaches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Held {
+    /// `admin`: configures the plugin, reaching no account.
+    pub admin: bool,
+    /// The data level, the higher one granted: `read` or `write`, or none.
+    pub data: Option<AccessLevel>,
+    /// The accounts the data level reaches, read and write.
+    pub accounts: Levels,
+}
+
+impl Held {
+    fn add(&mut self, other: &Held) {
+        self.admin |= other.admin;
+        self.data = higher(self.data, other.data);
+        self.accounts.add(&other.accounts);
+    }
+
+    /// Whether this holds any level at all.
+    pub fn holds_any(&self) -> bool {
+        self.admin || self.data.is_some()
+    }
+
+    /// The levels held, as the home's buttons offer them, in their order:
+    /// Manage for `admin`, Open for `write`, View for `read` -- a writer gets
+    /// View too, a read-only way in (W6.9).
+    pub fn levels(&self) -> Vec<AccessLevel> {
+        let mut levels = Vec::new();
+        if self.admin {
+            levels.push(AccessLevel::Admin);
+        }
+        if self.data == Some(AccessLevel::Write) {
+            levels.push(AccessLevel::Write);
+        }
+        if self.data.is_some() {
+            levels.push(AccessLevel::Read);
+        }
+        levels
+    }
+
+    /// Whether a session may be opened at `level`.
+    pub fn holds(&self, level: AccessLevel) -> bool {
+        self.levels().contains(&level)
+    }
+
+    /// The accounts a session at `level` carries, cut to it, or None when
+    /// the level is not held: under `admin` none, under `write` the read set
+    /// and the write set, under `read` the read set alone (W6.9).
+    pub fn session(&self, level: AccessLevel) -> Option<Levels> {
+        if !self.holds(level) {
+            return None;
+        }
+        Some(match level {
+            AccessLevel::Write => self.accounts.clone(),
+            AccessLevel::Read => Levels {
+                read: self.accounts.read.clone(),
+                write: BTreeSet::new(),
+            },
+            AccessLevel::Admin | AccessLevel::Unspecified => Levels::default(),
+        })
+    }
+}
+
+/// The higher of two data levels, write including read.
+fn higher(one: Option<AccessLevel>, other: Option<AccessLevel>) -> Option<AccessLevel> {
+    match (one, other) {
+        (Some(AccessLevel::Write), _) | (_, Some(AccessLevel::Write)) => Some(AccessLevel::Write),
+        (Some(AccessLevel::Read), _) | (_, Some(AccessLevel::Read)) => Some(AccessLevel::Read),
+        _ => None,
+    }
+}
+
+/// A level as the home's button names it, and as a request names it.
+pub fn button(level: AccessLevel) -> &'static str {
+    match level {
+        AccessLevel::Admin => "Manage",
+        AccessLevel::Write => "Open",
+        AccessLevel::Read => "View",
+        AccessLevel::Unspecified => "",
+    }
+}
+
+/// A level as it travels in an address or a terminal's request: `admin`,
+/// `write` or `read`.
+pub fn level_name(level: AccessLevel) -> &'static str {
+    match level {
+        AccessLevel::Admin => "admin",
+        AccessLevel::Write => "write",
+        AccessLevel::Read => "read",
+        AccessLevel::Unspecified => "",
+    }
+}
+
+/// A level from its name or its button's, in any case; None for anything
+/// else.
+pub fn parse_level(named: &str) -> Option<AccessLevel> {
+    match named.trim().to_ascii_lowercase().as_str() {
+        "admin" | "manage" => Some(AccessLevel::Admin),
+        "write" | "open" => Some(AccessLevel::Write),
+        "read" | "view" => Some(AccessLevel::Read),
+        _ => None,
+    }
+}
+
+/// Plugin instance, then what is held on it.
+pub type PluginLevels = BTreeMap<String, Held>;
 
 /// One person's access, as the dashboard evaluates it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Access {
-    /// Holds a permission to [`DEPLOYMENT_ADMIN`].
+    /// Holds a permission to [`DEPLOYMENT_ADMIN`]: the dashboard's own
+    /// capabilities, and nothing on any plugin by that.
     pub deployment_admin: bool,
+
+    /// Holds a permission to [`ALL_PLUGINS_ADMIN`]: `admin` on every plugin,
+    /// those launched later included.
+    pub all_plugins_admin: bool,
 
     pub user_group_ids: BTreeSet<String>,
 
+    /// What is held on each plugin an access entry names.
     pub plugins: PluginLevels,
 }
 
 impl Access {
-    /// What this person holds on one plugin, as the assertion carries it:
-    /// the accounts they may read and the accounts they may write through it.
-    pub fn on_plugin(&self, plugin_instance_id: &str) -> Levels {
-        self.plugins
+    /// What this person holds on one plugin, All plugins (admin) included.
+    pub fn held(&self, plugin_instance_id: &str) -> Held {
+        let mut held = self
+            .plugins
             .get(plugin_instance_id)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        held.admin |= self.all_plugins_admin;
+        held
+    }
+
+    /// The accounts this person's data level on one plugin reaches: what a
+    /// session under `write` carries (use [`Held::session`] for a session).
+    pub fn on_plugin(&self, plugin_instance_id: &str) -> Levels {
+        self.held(plugin_instance_id).accounts
+    }
+
+    /// Whether they administer the plugin.
+    pub fn administers(&self, plugin_instance_id: &str) -> bool {
+        self.held(plugin_instance_id).admin
+    }
+
+    /// Whether they administer any plugin: every plugin through All plugins
+    /// (admin), or one an entry names.
+    pub fn administers_any(&self) -> bool {
+        self.all_plugins_admin || self.plugins.values().any(|held| held.admin)
     }
 }
 
@@ -154,11 +312,11 @@ fn access_of_groups(records: &AccessRecords, user_group_ids: &BTreeSet<String>) 
         .iter()
         .filter(|permission| user_group_ids.contains(&permission.user_group_id))
     {
-        if permission.access_group_id == DEPLOYMENT_ADMIN {
-            access.deployment_admin = true;
-            continue;
+        match permission.access_group_id.as_str() {
+            DEPLOYMENT_ADMIN => access.deployment_admin = true,
+            ALL_PLUGINS_ADMIN => access.all_plugins_admin = true,
+            _ => fold(records, permission, &mut access.plugins),
         }
-        fold(records, permission, &mut access.plugins);
     }
     access
 }
@@ -166,7 +324,8 @@ fn access_of_groups(records: &AccessRecords, user_group_ids: &BTreeSet<String>) 
 /// One permission's contribution: its own accounts, at its own level, to the
 /// plugin each entry names. Nothing crosses from one permission to another,
 /// and two entries naming one plugin come to the higher of their levels,
-/// which is what the union of them is.
+/// which is what the union of them is. An `admin` entry marks the plugin
+/// administered and adds no account.
 fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevels) {
     let Some(access_group) = records
         .access_groups
@@ -178,23 +337,33 @@ fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevel
     let accounts = accounts_of_group(records, &permission.account_group_id);
 
     for entry in &access_group.entries {
-        let mut levels = Levels::default();
-        for account in &accounts {
-            levels.read.insert(account.account_id.clone());
-            let writable = entry.level == AccessLevel::Write as i32
-                && account.state != AccountState::Closed as i32;
-            if writable {
-                levels.write.insert(account.account_id.clone());
+        let mut held = Held::default();
+        match AccessLevel::try_from(entry.level) {
+            Ok(AccessLevel::Admin) => held.admin = true,
+            Ok(level @ (AccessLevel::Read | AccessLevel::Write)) => {
+                held.data = Some(level);
+                for account in &accounts {
+                    held.accounts.read.insert(account.account_id.clone());
+                    let writable =
+                        level == AccessLevel::Write && account.state != AccountState::Closed as i32;
+                    if writable {
+                        held.accounts.write.insert(account.account_id.clone());
+                    }
+                }
             }
+            // An entry naming no level holds nothing.
+            _ => continue,
         }
         into.entry(entry.plugin_instance_id.clone())
             .or_default()
-            .add(&levels);
+            .add(&held);
     }
 }
 
-/// The accounts an account group lists that exist. An identifier naming no
-/// account reaches nothing, rather than something that may be created later.
+/// The accounts an account group reaches that exist: every account the
+/// records hold for All accounts, and for any other the ones it lists. An
+/// identifier naming no account reaches nothing, rather than something that
+/// may be created later.
 fn accounts_of_group<'a>(
     records: &'a AccessRecords,
     account_group_id: &str,
@@ -206,6 +375,9 @@ fn accounts_of_group<'a>(
     else {
         return Vec::new();
     };
+    if group.built_in {
+        return records.accounts.iter().collect();
+    }
     group
         .account_ids
         .iter()
@@ -220,7 +392,7 @@ fn accounts_of_group<'a>(
 
 /// A plugin's account scope: every account anybody may read through it, and
 /// every account anybody may write through it; and every account one of its
-/// external accounts is linked to.
+/// external accounts is linked to. `admin` adds none.
 ///
 /// Derived from every permission, not from people: the deployment knows no
 /// directory, so it cannot ask who is in a group, only what the groups hold.
@@ -233,11 +405,14 @@ pub fn plugin_scope(
 ) -> Levels {
     let mut all = PluginLevels::new();
     for permission in &records.permissions {
-        if permission.access_group_id != DEPLOYMENT_ADMIN {
+        if !is_built_in_access_group(&permission.access_group_id) {
             fold(records, permission, &mut all);
         }
     }
-    let mut scope = all.remove(plugin_instance_id).unwrap_or_default();
+    let mut scope = all
+        .remove(plugin_instance_id)
+        .map(|held| held.accounts)
+        .unwrap_or_default();
     for link in links
         .iter()
         .filter(|link| link.plugin_instance_id == plugin_instance_id)

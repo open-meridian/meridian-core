@@ -642,14 +642,15 @@ message PluginReport {
 
   // The settings the plugin declared when it registered (W4.1): names, types,
   // and whether each is required or secret. Never a value. The conductor
-  // checks a deployment admin's settings against these and tells a secret by
-  // them (W6.11). Empty while the plugin is not registered, and the conductor
-  // then keeps what it last declared.
+  // checks the settings an admin of the plugin gives against these and tells
+  // a secret by them (W6.11). Empty while the plugin is not registered, and
+  // the conductor then keeps what it last declared.
   repeated SettingDeclaration declared_settings = 13;
 
   // The interface the plugin declared when it registered (W4.8, W6.9): its
-  // title and its admin pages, in order, which the dashboard's admin view of
-  // the instance shows as tabs. Unset while the plugin is not registered, or
+  // title and its pages, each with the levels it serves, in order, which the
+  // plugin's area shows as tabs under each button; an older plugin's admin
+  // pages as pages at `admin`. Unset while the plugin is not registered, or
   // when it serves no interface.
   InterfaceDeclaration declared_interface = 14;
 
@@ -668,7 +669,8 @@ enum ClaimCodePurpose {
   // Read as first admin: what every claim code was before first run existed.
   CLAIM_CODE_PURPOSE_UNSPECIFIED = 0;
 
-  // Makes the deployment's first deployment admin (W6.2).
+  // Makes the deployment's first deployment admin, and links them to All
+  // plugins (admin) as first run does (W6.2).
   CLAIM_CODE_PURPOSE_FIRST_ADMIN = 1;
 
   // Opens the deployment's first-run wizard (W7.3). Honouring one also issues

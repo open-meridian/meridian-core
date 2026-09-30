@@ -21,8 +21,8 @@ use meridian_pb::plugin::v1::{
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, Refusal, RefusalReason,
-    RegisterRequest,
+    AccessLevel, CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, Refusal,
+    RefusalReason, RegisterRequest,
 };
 use prost::Message;
 use tonic::{Code, Request};
@@ -735,13 +735,28 @@ struct Held {
     write: Vec<String>,
 }
 
-/// What the dashboard would have signed for a person holding `access`.
+/// What the dashboard would have signed for a person holding `access`, in a
+/// session opened by Open.
 fn assertion(key: &SigningKey, access: Held) -> CallerAssertion {
     signed(key, access, false)
 }
 
-/// The same, for a deployment admin when `admin`.
+/// The same, or when `admin`, a deployment admin's session opened by Manage,
+/// which carries no account.
 fn signed(key: &SigningKey, access: Held, admin: bool) -> CallerAssertion {
+    match admin {
+        true => claimed(key, Held::default(), AccessLevel::Admin, true),
+        false => claimed(key, access, AccessLevel::Write, false),
+    }
+}
+
+/// What the dashboard would have signed for a session at `level`.
+fn claimed(
+    key: &SigningKey,
+    access: Held,
+    level: AccessLevel,
+    deployment_admin: bool,
+) -> CallerAssertion {
     let issued = now();
     let claims = CallerClaims {
         subject: "local|ada".into(),
@@ -752,7 +767,8 @@ fn signed(key: &SigningKey, access: Held, admin: bool) -> CallerAssertion {
         issued_at_ns: issued,
         expires_at_ns: issued + 60_000_000_000,
         assertion_id: "a-1".into(),
-        deployment_admin: admin,
+        deployment_admin,
+        level: level as i32,
     }
     .encode_to_vec();
     CallerAssertion {
@@ -1105,8 +1121,26 @@ async fn a_link_is_refused_without_a_deployment_admins_assertion() {
     let (sidecar, key, heard, _) = linking(&["ext-new"]).await;
     for (by, said) in [
         (None, "carries no assertion"),
-        // A person who writes the account, and does not administer.
-        (Some(signed(&key, writing(&["ACC-1"]), false)), "is not one"),
+        // A person who writes the account, in a session opened by Open.
+        (
+            Some(signed(&key, writing(&["ACC-1"]), false)),
+            "Open (write)",
+        ),
+        // A deployment admin, in a session opened by View.
+        (
+            Some(claimed(&key, reading(&["ACC-1"]), AccessLevel::Read, true)),
+            "View (read)",
+        ),
+        // One naming no level holds nothing.
+        (
+            Some(claimed(
+                &key,
+                Held::default(),
+                AccessLevel::Unspecified,
+                true,
+            )),
+            "level-less",
+        ),
     ] {
         let refused = sidecar
             .link_external_account(Request::new(link("ext-new", "ACC-1", "", by)))
@@ -1114,7 +1148,7 @@ async fn a_link_is_refused_without_a_deployment_admins_assertion() {
             .unwrap_err();
         assert_eq!(refused.code(), Code::PermissionDenied);
         assert!(refused.message().contains(said), "{}", refused.message());
-        assert!(refused.message().contains("deployment admin"));
+        assert!(refused.message().contains("admin of the plugin"));
     }
     // One the dashboard did not sign is not an admin's however it reads.
     let forged = signed(
@@ -1133,8 +1167,8 @@ async fn a_link_is_refused_without_a_deployment_admins_assertion() {
     );
     assert_eq!(
         sidecar.report(0).refused_grants,
-        2,
-        "the report counts both"
+        4,
+        "the report counts each"
     );
 }
 
@@ -1231,7 +1265,8 @@ async fn the_deployments_accounts_are_read_only_for_a_deployment_admin() {
 
 #[tokio::test]
 async fn the_report_carries_the_interface_the_plugin_declared() {
-    // W4.8: its admin pages, in its order, for the dashboard's tabs (W6.9).
+    // W4.8: its pages, each with the levels it serves, in its order, for the
+    // plugin area's tab rows (W6.9).
     let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
     let sidecar = Sidecar::under(
         &contract(),
@@ -1246,13 +1281,18 @@ async fn the_report_carries_the_interface_the_plugin_declared() {
     let declared = InterfaceDeclaration {
         loopback_port: 8000,
         title: "SnapTrade".into(),
-        admin_pages: ["Connections", "Accounts", "Holdings"]
-            .iter()
-            .map(|title| PageDeclaration {
-                path: format!("/admin/{}", title.to_lowercase()),
-                title: title.to_string(),
-            })
-            .collect(),
+        pages: vec![
+            PageDeclaration {
+                path: "/admin/connections".into(),
+                title: "Connections".into(),
+                levels: vec![AccessLevel::Admin as i32],
+            },
+            PageDeclaration {
+                path: "/statements".into(),
+                title: "Statements".into(),
+                levels: vec![AccessLevel::Write as i32, AccessLevel::Read as i32],
+            },
+        ],
     };
     sidecar
         .register(Request::new(RegisterRequest {
@@ -1271,4 +1311,105 @@ async fn the_report_carries_the_interface_the_plugin_declared() {
         sidecar.report(0).declared_interface.is_none(),
         "gone when it leaves"
     );
+}
+
+// ── A session's level (W4.9, W6.9; 2026-09-30) ────────────────────────────
+
+#[tokio::test]
+async fn a_plugin_admin_links_to_an_existing_account_and_never_names_a_new_one() {
+    let (sidecar, key, heard, _) = linking(&["ext-new", "st-2"]).await;
+    let manage = || Some(claimed(&key, Held::default(), AccessLevel::Admin, false));
+    sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-9", "", manage())))
+        .await
+        .expect("any existing account, whatever they may read");
+    let refused = sidecar
+        .link_external_account(Request::new(link(
+            "st-2",
+            "",
+            "Fidelity Brokerage",
+            manage(),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused
+            .message()
+            .contains("only a deployment admin names a new one"),
+        "{}",
+        refused.message()
+    );
+    assert_eq!(heard.lock().unwrap().len(), 1, "the refusal reached nobody");
+    sidecar
+        .read_accounts_for_linking(Request::new(ReadAccountsForLinkingParams {
+            acting_for: manage(),
+        }))
+        .await
+        .expect("and reads every account's identity to offer");
+}
+
+#[tokio::test]
+async fn a_command_is_sent_for_a_person_only_in_a_session_opened_by_open() {
+    let (sidecar, key, subjects) = for_people().await;
+    for (level, said) in [
+        (AccessLevel::Admin, "Manage (admin)"),
+        (AccessLevel::Read, "View (read)"),
+        (AccessLevel::Unspecified, "level-less"),
+    ] {
+        // Carrying a write set does not make it Open: the level does.
+        let refused = sidecar
+            .record_holding(Request::new(for_person(
+                "ext-1",
+                claimed(&key, writing(&["ACC-1"]), level, false),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(refused.message().contains(said), "{}", refused.message());
+    }
+    assert!(subjects.lock().unwrap().is_empty());
+    sidecar
+        .record_holding(Request::new(for_person(
+            "ext-1",
+            claimed(&key, writing(&["ACC-1"]), AccessLevel::Write, false),
+        )))
+        .await
+        .expect("admitted under Open");
+}
+
+#[tokio::test]
+async fn a_page_serving_no_level_is_refused_at_registration_naming_it() {
+    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let sidecar = Sidecar::under(
+        &contract(),
+        bus,
+        "DEP-test",
+        Identity::new("snaptrade-1", vec!["custody".into()]),
+    );
+    for levels in [vec![], vec![AccessLevel::Unspecified as i32], vec![9]] {
+        let reply = sidecar
+            .register(Request::new(RegisterRequest {
+                schema_version: "v5".into(),
+                interface: Some(InterfaceDeclaration {
+                    loopback_port: 8000,
+                    title: "SnapTrade".into(),
+                    pages: vec![PageDeclaration {
+                        path: "/statements".into(),
+                        title: "Statements".into(),
+                        levels,
+                    }],
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.admitted);
+        assert!(
+            reply.refusal_reason.contains("/statements (Statements)"),
+            "{}",
+            reply.refusal_reason
+        );
+    }
 }

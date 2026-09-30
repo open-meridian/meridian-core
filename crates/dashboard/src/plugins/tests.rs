@@ -10,8 +10,8 @@ use axum::Router;
 use ed25519_dalek::SigningKey;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, AccountRecord,
-    AccountState, Permission, UserGroup,
+    AccessEntry, AccessGroup, AccessRecords, AccountGroup, AccountRecord, AccountState, Permission,
+    UserGroup,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{CallerAssertion, InterfaceDeclaration, RegisterRequest};
@@ -44,6 +44,7 @@ fn records(instances: &[&str]) -> AccessRecords {
             account_group_id: "AcG-1".into(),
             name: "Growth".into(),
             account_ids: vec!["ACC-1".into()],
+            built_in: false,
         }],
         user_groups: vec![UserGroup {
             user_group_id: "UG-1".into(),
@@ -129,11 +130,11 @@ async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> H
     ));
     let reply = sidecar
         .register(tonic::Request::new(RegisterRequest {
-            schema_version: "v2".into(),
+            schema_version: "v5".into(),
             interface: Some(InterfaceDeclaration {
                 loopback_port: plugin_port.into(),
                 title: "Holdings".into(),
-                admin_pages: vec![],
+                pages: vec![],
             }),
             ..Default::default()
         }))
@@ -344,6 +345,11 @@ async fn a_person_with_access_opens_the_plugin_and_it_is_told_who_they_are() {
         !claims.deployment_admin,
         "somebody who does not administer the deployment is asserted as not doing so (W6.9)"
     );
+    assert_eq!(
+        claims.level,
+        AccessLevel::Read as i32,
+        "opened at the one level she holds, View"
+    );
 }
 
 #[tokio::test]
@@ -393,7 +399,12 @@ async fn a_code_is_redeemed_once_on_its_own_host_within_its_minute() {
 
     let plugins = h.app.plugins.as_ref().unwrap();
     let now = h.app.clock.now_ns();
-    let code = plugins.mint(Came::Browser(h.session.clone()), INSTANCE, now);
+    let code = plugins.mint(
+        Came::Browser(h.session.clone()),
+        INSTANCE,
+        AccessLevel::Read,
+        now,
+    );
     assert_eq!(
         plugins.redeem(&code, INSTANCE, now + CODE_NS + 1),
         None,
@@ -565,13 +576,21 @@ async fn a_plugin_session_opens_its_own_instance_alone() {
 async fn home_links_each_plugin_a_person_may_open() {
     let h = harness(&[INSTANCE]).await;
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    // Not launched through the catalogue, so named by its instance alone.
+    // Not launched through the catalogue, so named by its instance alone;
+    // and a button for the one level she holds, View (W6.9).
     assert!(
         home.body.contains(
-            "<li data-instance=\"snaptrade-1\"><a class=\"plugin-card\" href=\"/plugins/snaptrade-1\">"
+            "<li data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
+             <a class=\"plugin-main\" href=\"/plugins/snaptrade-1?level=read\">"
         ),
         "{}",
         home.body
+    );
+    assert!(home.body.contains(
+        "<a class=\"plugin-level\" data-level=\"read\" href=\"/plugins/snaptrade-1?level=read\">View</a>"
+    ));
+    assert!(
+        !home.body.contains("data-level=\"write\"") && !home.body.contains("data-level=\"admin\"")
     );
     assert!(home
         .body
@@ -659,7 +678,12 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     let plugins = h.app.plugins.as_ref().unwrap();
     let now = h.app.clock.now_ns();
     entered(&h).await;
-    let kept = plugins.mint(Came::Browser(h.session.clone()), INSTANCE, now);
+    let kept = plugins.mint(
+        Came::Browser(h.session.clone()),
+        INSTANCE,
+        AccessLevel::Read,
+        now,
+    );
 
     plugins.sweep(&h.app.sessions, &h.app.terminals, now).await;
     assert_eq!(
@@ -728,8 +752,22 @@ async fn a_request_leaves_the_dashboard_carrying_the_assertion_and_nothing_it_ar
     assert_eq!(headers["x-requested-with"], "the-page");
 }
 
-/// Ada as a deployment admin, holding no access entry on any plugin.
+/// Ada as a deployment admin linked to All plugins (admin), as first run
+/// links her, holding no data grant on any plugin.
 fn admin_records() -> AccessRecords {
+    let mut held = deployment_admin_alone();
+    held.permissions.push(Permission {
+        permission_id: "P-all-plugins".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: String::new(),
+        access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
+    });
+    held
+}
+
+/// Ada as a deployment admin whose link to All plugins (admin) was
+/// withdrawn: the deployment's capabilities, and nothing on any plugin.
+fn deployment_admin_alone() -> AccessRecords {
     let mut held = records(&[]);
     held.permissions.push(Permission {
         permission_id: "P-admin".into(),
@@ -753,56 +791,141 @@ fn claims_reaching(h: &Harness) -> CallerClaims {
     CallerClaims::decode(assertion.claims.as_slice()).unwrap()
 }
 
-#[tokio::test]
-async fn a_deployment_admin_opens_any_plugin_asserted_with_only_what_they_hold() {
-    // Ruling 19: a plugin with nothing to grant is still opened by the
-    // people who administer the deployment, and opening is not access.
-    let h = harness(&[]).await;
-    h.app.records.store(admin_records(), h.app.clock.now_ns());
-    let plugin_session = entered(&h).await;
+/// Open the plugin at `level` and send one request on its host.
+async fn at_level(h: &Harness, level: &str) -> Answer {
     let answer = get(
         &h.app,
-        PLUGIN_HOST,
-        "/",
-        std::slice::from_ref(&plugin_session),
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}/enter?level={level}"),
+        &[dashboard_cookie(h)],
     )
     .await;
+    if answer.status != StatusCode::SEE_OTHER {
+        return answer;
+    }
+    let location = answer.headers[LOCATION].to_str().unwrap().to_string();
+    let path = &location[format!("https://{PLUGIN_HOST}").len()..];
+    let redeemed = get(&h.app, PLUGIN_HOST, path, &[]).await;
+    let cookie = redeemed.headers[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    get(&h.app, PLUGIN_HOST, "/", &[cookie]).await
+}
+
+#[tokio::test]
+async fn a_deployment_admin_linked_to_all_plugins_admin_opens_any_plugin_at_manage_with_no_account()
+{
+    // The product owner, 2026-09-30, superseding ruling 19: a deployment
+    // admin is admin on a plugin through All plugins (admin), and reaches no
+    // account's data by it.
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    let answer = at_level(&h, "admin").await;
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
     let claims = claims_reaching(&h);
     assert_eq!(claims.subject, ADA);
+    assert_eq!(claims.level, AccessLevel::Admin as i32, "Manage");
     assert!(
         claims.read_account_ids.is_empty() && claims.write_account_ids.is_empty(),
         "{claims:?}"
     );
-    // And said to be one, so the plugin serves its admin page to them (W6.9).
+    // Said to be a deployment admin, which names a new account when linking.
     assert!(claims.deployment_admin);
+    // And nothing at a data level she does not hold.
+    let refused = at_level(&h, "read").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    assert!(
+        refused.body.contains("You do not hold read"),
+        "{}",
+        refused.body
+    );
 }
 
 #[tokio::test]
-async fn an_admin_asserted_with_what_they_hold_where_they_hold_something() {
+async fn a_deployment_admin_alone_holds_nothing_on_a_plugin() {
+    let h = harness(&[]).await;
+    h.app
+        .records
+        .store(deployment_admin_alone(), h.app.clock.now_ns());
+    let refused = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(
+        refused.body.contains("no access on snaptrade-1"),
+        "{}",
+        refused.body
+    );
+    assert!(h.reached.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_person_holding_admin_and_a_data_level_chooses_and_each_session_carries_its_level_alone()
+{
     let h = harness(&[INSTANCE]).await;
     let mut held = admin_records();
     held.access_groups = records(&[INSTANCE]).access_groups;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
     h.app.records.store(held, h.app.clock.now_ns());
-    let plugin_session = entered(&h).await;
-    get(
-        &h.app,
-        PLUGIN_HOST,
-        "/",
-        std::slice::from_ref(&plugin_session),
-    )
-    .await;
-    let claims = claims_reaching(&h);
-    assert_eq!(claims.read_account_ids, vec!["ACC-1".to_string()]);
-    assert!(claims.write_account_ids.is_empty());
+
+    at_level(&h, "admin").await;
+    let manage = claims_reaching(&h);
+    assert_eq!(manage.level, AccessLevel::Admin as i32);
+    assert!(manage.read_account_ids.is_empty() && manage.write_account_ids.is_empty());
+
+    at_level(&h, "view").await;
+    let view = claims_reaching(&h);
+    assert_eq!(view.level, AccessLevel::Read as i32);
+    assert_eq!(view.read_account_ids, vec!["ACC-1".to_string()]);
+    assert!(view.write_account_ids.is_empty());
+
+    let refused = at_level(&h, "write").await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "she reads, and writes nothing"
+    );
+    let odd = at_level(&h, "owner").await;
+    assert_eq!(odd.status, StatusCode::FORBIDDEN);
+    assert!(odd.body.contains("is not a level"), "{}", odd.body);
 }
 
 #[tokio::test]
-async fn an_admin_who_stops_being_one_is_refused_on_the_next_request() {
+async fn a_writer_opens_by_open_and_by_view_each_cut_to_its_level() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = records(&[INSTANCE]);
+    held.access_groups[0].entries[0].level = AccessLevel::Write as i32;
+    h.app.records.store(held, h.app.clock.now_ns());
+    at_level(&h, "write").await;
+    let open = claims_reaching(&h);
+    assert_eq!(open.level, AccessLevel::Write as i32);
+    assert_eq!(open.write_account_ids, vec!["ACC-1".to_string()]);
+    at_level(&h, "read").await;
+    let view = claims_reaching(&h);
+    assert_eq!(view.level, AccessLevel::Read as i32);
+    assert!(view.write_account_ids.is_empty(), "View acts on nothing");
+    assert!(
+        at_level(&h, "admin").await.status == StatusCode::FORBIDDEN,
+        "no Manage without admin"
+    );
+}
+
+#[tokio::test]
+async fn an_admin_whose_link_is_withdrawn_is_refused_on_the_next_request() {
     let h = harness(&[]).await;
     h.app.records.store(admin_records(), h.app.clock.now_ns());
     let plugin_session = entered(&h).await;
-    h.app.records.store(records(&[]), h.app.clock.now_ns());
+    h.app
+        .records
+        .store(deployment_admin_alone(), h.app.clock.now_ns());
     let answer = get(
         &h.app,
         PLUGIN_HOST,
@@ -811,6 +934,11 @@ async fn an_admin_who_stops_being_one_is_refused_on_the_next_request() {
     )
     .await;
     assert_eq!(answer.status, StatusCode::FORBIDDEN);
+    assert!(
+        answer.body.contains("no longer hold admin"),
+        "{}",
+        answer.body
+    );
     assert!(h.reached.lock().unwrap().is_empty());
 }
 
@@ -854,11 +982,21 @@ async fn an_admins_home_links_every_plugin_launched() {
         .split("</li>")
         .next()
         .unwrap();
-    // Opened in the frame, named by the plugin and the instance both.
-    assert!(card.contains("href=\"/plugins/snaptrade-1\""), "{card}");
+    // Through All plugins (admin): Manage alone, into its area, named by
+    // the plugin and the instance both.
+    assert!(
+        card.contains("href=\"/plugins/snaptrade-1?level=admin\""),
+        "{card}"
+    );
+    assert!(
+        card.contains("data-level=\"admin\" href=\"/plugins/snaptrade-1?level=admin\">Manage</a>")
+    );
+    assert!(
+        !card.contains(">Open</a>") && !card.contains(">View</a>"),
+        "{card}"
+    );
     assert!(card.contains("<span class=\"plugin-name\">snaptrade</span>"));
     assert!(card.contains("<span class=\"plugin-instance\">snaptrade-1</span>"));
-    assert!(card.contains("as admin"), "holding nothing on it: {card}");
     assert!(!home.body.contains("stopped-1"), "{}", home.body);
     // Both views, the list first; the tiles a switch away.
     assert!(home
@@ -923,7 +1061,12 @@ async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search
 
 #[tokio::test]
 async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
+    // A deployment admin whose link to All plugins (admin) is withdrawn
+    // included: being one lists no plugin.
     let h = harness(&[]).await;
+    h.app
+        .records
+        .store(deployment_admin_alone(), h.app.clock.now_ns());
     serving_launched(&h);
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     assert!(
@@ -1148,6 +1291,40 @@ async fn a_terminal_reads_the_page_as_the_person_is_served_it() {
 }
 
 #[tokio::test]
+async fn a_terminal_names_the_level_to_open_at_and_is_refused_one_not_held() {
+    // W6.15: as the home's buttons do; she holds read alone.
+    let h = harness(&[INSTANCE]).await;
+    let session = terminal(&h.app).await;
+    let read = develop(
+        &h.app,
+        Method::GET,
+        &format!("/terminal/plugins/{INSTANCE}/page?path=%2F&level=view"),
+        &session,
+        "",
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    let said: serde_json::Value = serde_json::from_str(&read.body).unwrap();
+    assert_eq!(said["level"], "read");
+    assert_eq!(claims_reaching(&h).level, AccessLevel::Read as i32);
+    for (method, path) in [
+        (
+            Method::GET,
+            format!("/terminal/plugins/{INSTANCE}/page?path=%2F&level=admin"),
+        ),
+        (
+            Method::POST,
+            format!("/terminal/plugins/{INSTANCE}/open?level=write"),
+        ),
+    ] {
+        let refused = develop(&h.app, method, &path, &session, "").await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{path}");
+        assert!(refused.body.contains("You do not hold"), "{}", refused.body);
+    }
+    assert_eq!(h.reached.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_terminal_is_held_to_what_opening_the_page_is_held_to() {
     let h = harness(&["another-plugin"]).await;
     let session = terminal(&h.app).await;
@@ -1221,7 +1398,7 @@ fn a_page_path_is_a_path_on_the_plugins_host_and_nothing_else() {
 // ── The frame, the theme and the kit (spec/plugin-pages-share-one-kit.md) ──
 
 #[tokio::test]
-async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_theme() {
+async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamless_frame() {
     let h = harness(&[INSTANCE]).await;
     serving_launched(&h);
     let frame = get(
@@ -1233,42 +1410,64 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
     .await;
     assert_eq!(frame.status, StatusCode::OK, "{}", frame.body);
     let head = frame.body.split("</header>").next().unwrap();
-    // The plugin's name, its instance on hover, the way back, and the person.
+    // The plugin's name, its instance on hover, then the place its page's
+    // status dot goes; the way back, and the person.
     assert!(
         head.contains(
-            "<span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade</span>"
+            "<span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade</span>\
+             <span class=\"crumb-status\" id=\"page-status\"></span>"
         ),
         "{head}"
     );
-    assert!(!head.contains("<code>") && !head.contains("<strong>snaptrade"));
     assert!(
-        head.contains("<a href=\"/\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>")
+        head.contains("<a href=\"/\">Home</a><span class=\"sep\" aria-hidden=\"true\">/</span>")
     );
     assert!(head.contains("Ada") && head.contains("/sign-out"));
     assert!(
         !head.contains("href=\"/admin\""),
         "Ada administers nothing here"
     );
-    // The page below, entered through the dashboard with the theme on its
-    // address, and told again by message on every load, to its origin alone.
-    // It fills the window, and the page draws its own heading and tabs: a
-    // page on its own, said so on its address, and told nothing of framing.
+    // She holds read alone: View, the plugin's `/` its one tab, since it
+    // declares no page at read (W4.8).
+    let body = frame.body.split("</header>").nth(1).unwrap();
     assert!(
-        frame.body.contains(&format!(
-            "<iframe src=\"/plugins/snaptrade-1/enter?path=%2F&amp;om-scheme=default\
-             &amp;om-mode=system&amp;om-direction=green-up&amp;om-framed=0\" \
-             title=\"snaptrade (snaptrade-1)\" data-plugin-frame \
-             data-origin=\"https://{PLUGIN_HOST}\"></iframe>"
-        )),
-        "{}",
-        frame.body
+        body.contains("<div class=\"plugin-area\" data-level=\"read\">"),
+        "{body}"
     );
-    assert!(!frame.body.contains("data-seamless "));
+    assert!(body.contains("data-level=\"read\">View</span>"), "{body}");
+    assert_eq!(
+        body.matches("<nav class=\"tabs view-tabs\"").count(),
+        1,
+        "one tab row"
+    );
+    assert!(body.contains(
+        "href=\"/plugins/snaptrade-1?level=read&amp;tab=home\" data-tab=\"home\" data-page=\"/\""
+    ));
+    assert!(
+        !body.contains("data-portal"),
+        "no way to the admin portal for somebody who administers nothing"
+    );
+    // The page below, entered through the dashboard at the session's level
+    // with the theme on its address, seamless: framed, told so by message on
+    // every load to its origin alone, as tall as it says, its header actions
+    // and status drawn by the dashboard.
+    assert!(
+        body.contains(&format!(
+            "<iframe class=\"plugin-frame\" id=\"plugin-page\" data-page=\"/\" \
+             src=\"/plugins/snaptrade-1/enter?path=%2F&amp;level=read&amp;om-scheme=default\
+             &amp;om-mode=system&amp;om-direction=green-up&amp;om-framed=1\" \
+             title=\"snaptrade &middot; Home\" data-plugin-frame data-seamless \
+             data-origin=\"https://{PLUGIN_HOST}\" data-actions=\"page-actions\" \
+             data-status=\"page-status\"></iframe>"
+        )),
+        "{body}"
+    );
+    assert!(body.contains("<div class=\"actions\" id=\"page-actions\""));
     assert!(frame
         .body
         .contains("{ type: \"meridian:theme\", version: seamless ? 3 : 2,"));
 
-    // At a page of the plugin's, where the frame is asked for one.
+    // At a page of the plugin's, where the area is asked for one.
     let at = get(
         &h.app,
         DASHBOARD,
@@ -1277,7 +1476,8 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
     )
     .await;
     assert!(
-        at.body.contains("enter?path=%2Fholdings%3Fpage%3D2&amp;"),
+        at.body
+            .contains("enter?path=%2Fholdings%3Fpage%3D2&amp;level=read&amp;"),
         "{}",
         at.body
     );
@@ -1298,6 +1498,73 @@ async fn the_frame_draws_the_header_around_the_plugins_page_and_hands_it_the_the
         frame.headers["content-security-policy"],
         "frame-ancestors 'self'"
     );
+}
+
+#[tokio::test]
+async fn each_button_shows_the_pages_at_its_level_and_an_admin_the_way_to_the_portal() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    h.app.records.store(held, h.app.clock.now_ns());
+    h.app.health.hear(
+        INSTANCE,
+        meridian_domain::v1::PluginReport {
+            plugin_instance_id: INSTANCE.into(),
+            registered: true,
+            declared_interface: Some(InterfaceDeclaration {
+                loopback_port: 8000,
+                title: "SnapTrade".into(),
+                pages: vec![
+                    meridian_pb::v1::PageDeclaration {
+                        path: "/admin/connections".into(),
+                        title: "Connections".into(),
+                        levels: vec![AccessLevel::Admin as i32],
+                    },
+                    meridian_pb::v1::PageDeclaration {
+                        path: "/statements".into(),
+                        title: "Statements".into(),
+                        levels: vec![AccessLevel::Write as i32, AccessLevel::Read as i32],
+                    },
+                ],
+            }),
+            ..Default::default()
+        },
+    );
+    let area = |level: &'static str| {
+        let h = &h;
+        async move {
+            get(
+                &h.app,
+                DASHBOARD,
+                &format!("/plugins/{INSTANCE}?level={level}"),
+                &[dashboard_cookie(h)],
+            )
+            .await
+            .body
+        }
+    };
+    let manage = area("admin").await;
+    assert!(
+        manage.contains(
+            "data-page=\"/admin/connections\" class=\"here\" aria-current=\"page\">Connections</a>"
+        ),
+        "{manage}"
+    );
+    assert!(!manage.contains("Statements"), "{manage}");
+    assert!(manage.contains("href=\"/admin/plugins/snaptrade-1\" data-portal"));
+    assert!(manage.contains("enter?path=%2Fadmin%2Fconnections&amp;level=admin&amp;"));
+    // Manage and View, the two she holds, to move between.
+    assert!(manage.contains("<nav class=\"level-switch\""), "{manage}");
+    let view = area("read").await;
+    assert!(
+        view.contains(
+            "data-page=\"/statements\" class=\"here\" aria-current=\"page\">Statements</a>"
+        ),
+        "{view}"
+    );
+    assert!(!view.contains("Connections"), "{view}");
+    assert!(view.contains("enter?path=%2Fstatements&amp;level=read&amp;"));
 }
 
 #[tokio::test]

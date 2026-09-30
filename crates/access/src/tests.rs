@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccountGroup, AccountRecord,
-    AccountState, Permission, SignInRecord, UserGroup,
+    AccessEntry, AccessGroup, AccessRecords, AccountGroup, AccountRecord, AccountState, Permission,
+    SignInRecord, UserGroup,
 };
 
 use super::*;
@@ -25,6 +25,7 @@ fn account_group(id: &str, accounts: &[&str]) -> AccountGroup {
         account_group_id: id.into(),
         name: id.into(),
         account_ids: accounts.iter().map(|a| a.to_string()).collect(),
+        built_in: false,
     }
 }
 
@@ -102,7 +103,7 @@ fn trader() -> Access {
 
 #[test]
 fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
-    let levels = &trader().plugins[OMS];
+    let levels = &trader().plugins[OMS].accounts;
     assert_eq!(levels.write, set(&["ACC-GROWTH"]));
     assert_eq!(levels.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
     assert!(
@@ -113,7 +114,7 @@ fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
 
 #[test]
 fn write_includes_read() {
-    let levels = &trader().plugins[OMS];
+    let levels = &trader().plugins[OMS].accounts;
     assert!(levels.write.is_subset(&levels.read));
 }
 
@@ -137,7 +138,7 @@ fn a_closed_account_stays_readable_and_is_never_writable() {
     let mut records = records();
     records.accounts[0].state = AccountState::Closed as i32;
     let access = person_access(&records, "someone", &["trading-desk".into()]);
-    let levels = &access.plugins[OMS];
+    let levels = &access.plugins[OMS].accounts;
     assert!(levels.read.contains("ACC-GROWTH"));
     assert!(!levels.write.contains("ACC-GROWTH"));
 }
@@ -317,4 +318,158 @@ fn a_plugin_the_person_holds_nothing_on_is_empty_levels() {
     let held = trader().on_plugin(OMS);
     assert_eq!(held.read_account_ids(), ["ACC-GROWTH", "ACC-INCOME"]);
     assert_eq!(held.write_account_ids(), ["ACC-GROWTH"]);
+}
+
+// ── Admin, the data level, and the built-in groups (2026-09-30) ──────────
+
+fn entry(plugin: &str, level: AccessLevel) -> AccessEntry {
+    AccessEntry {
+        plugin_instance_id: plugin.into(),
+        level: level as i32,
+    }
+}
+
+fn with_group(records: &mut AccessRecords, id: &str, entries: Vec<AccessEntry>) {
+    records.access_groups.push(AccessGroup {
+        access_group_id: id.into(),
+        name: id.into(),
+        entries,
+        built_in: false,
+    });
+}
+
+#[test]
+fn admin_alone_configures_and_reaches_no_account() {
+    let mut records = records();
+    with_group(
+        &mut records,
+        "AX-ADMIN",
+        vec![entry(OMS, AccessLevel::Admin)],
+    );
+    records.permissions = vec![permission("P-9", "UG-TRADERS", "", "AX-ADMIN")];
+    let held = person_access(&records, "someone", &["trading-desk".into()]).held(OMS);
+    assert!(held.admin);
+    assert_eq!(held.data, None);
+    assert!(held.accounts.is_empty());
+    assert_eq!(held.levels(), [AccessLevel::Admin], "Manage alone");
+    assert_eq!(held.session(AccessLevel::Admin), Some(Levels::default()));
+    assert_eq!(held.session(AccessLevel::Read), None, "no data level held");
+    assert!(
+        plugin_scope(&records, &[], OMS).is_empty(),
+        "admin adds nothing to the plugin's scope"
+    );
+}
+
+#[test]
+fn admin_and_write_give_three_buttons_each_session_cut_to_its_level() {
+    let mut records = records();
+    with_group(
+        &mut records,
+        "AX-ADMIN",
+        vec![entry(OMS, AccessLevel::Admin)],
+    );
+    records
+        .permissions
+        .push(permission("P-9", "UG-TRADERS", "", "AX-ADMIN"));
+    let held = person_access(&records, "someone", &["trading-desk".into()]).held(OMS);
+    assert_eq!(
+        held.levels(),
+        [AccessLevel::Admin, AccessLevel::Write, AccessLevel::Read],
+        "Manage, Open and View"
+    );
+    assert_eq!(held.session(AccessLevel::Admin), Some(Levels::default()));
+    let open = held.session(AccessLevel::Write).unwrap();
+    assert_eq!(open.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
+    assert_eq!(
+        open.write,
+        set(&["ACC-GROWTH"]),
+        "acting only on the write set"
+    );
+    let view = held.session(AccessLevel::Read).unwrap();
+    assert_eq!(view.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
+    assert!(view.write.is_empty(), "View acts on nothing");
+}
+
+#[test]
+fn a_reader_holds_view_alone() {
+    let mut records = records();
+    records.permissions = vec![permission("P-2", "UG-TRADERS", "AG-INCOME", "AX-READ")];
+    let held = person_access(&records, "someone", &["trading-desk".into()]).held(OMS);
+    assert_eq!(held.levels(), [AccessLevel::Read]);
+    assert_eq!(held.session(AccessLevel::Write), None);
+    assert_eq!(held.session(AccessLevel::Admin), None);
+}
+
+#[test]
+fn levels_are_agnostic_of_accounts() {
+    // Write on an empty account group still gives Open, acting on nothing.
+    let mut records = records();
+    records.permissions = vec![permission("P-9", "UG-TRADERS", "AG-EMPTY", "AX-WRITE")];
+    let held = person_access(&records, "someone", &["trading-desk".into()]).held(OMS);
+    assert_eq!(held.levels(), [AccessLevel::Write, AccessLevel::Read]);
+    assert!(held.session(AccessLevel::Write).unwrap().is_empty());
+}
+
+#[test]
+fn all_plugins_admin_administers_every_plugin_and_reaches_no_account() {
+    let mut records = records();
+    records
+        .permissions
+        .push(permission("P-9", "UG-ADMINS", "", ALL_PLUGINS_ADMIN));
+    let ada = person_access(&records, ADA, &[]);
+    assert!(ada.deployment_admin && ada.all_plugins_admin);
+    assert!(ada.administers(OMS));
+    assert!(
+        ada.administers("launched-tomorrow"),
+        "a plugin launched later included"
+    );
+    assert_eq!(ada.held(OMS).levels(), [AccessLevel::Admin]);
+    assert!(ada.on_plugin(OMS).is_empty());
+    assert_eq!(
+        plugin_scope(&records, &[], OMS),
+        plugin_scope(&self::records(), &[], OMS),
+        "and nothing to any plugin's scope"
+    );
+}
+
+#[test]
+fn deployment_admin_alone_administers_no_plugin() {
+    let ada = person_access(&records(), ADA, &[]);
+    assert!(ada.deployment_admin);
+    assert!(!ada.administers(OMS));
+    assert!(!ada.held(OMS).holds_any());
+}
+
+#[test]
+fn all_accounts_reaches_every_account_those_in_no_group_included() {
+    let mut records = records();
+    records.account_groups.push(AccountGroup {
+        account_group_id: ALL_ACCOUNTS.into(),
+        name: "All accounts".into(),
+        account_ids: vec![],
+        built_in: true,
+    });
+    records.permissions = vec![permission("P-9", "UG-TRADERS", ALL_ACCOUNTS, "AX-READ")];
+    let held = person_access(&records, "someone", &["trading-desk".into()]).held(OMS);
+    assert_eq!(
+        held.accounts.read,
+        set(&["ACC-GROWTH", "ACC-INCOME", "ACC-LONELY"])
+    );
+    records
+        .accounts
+        .push(account("ACC-LATER", AccountState::Open));
+    assert!(
+        plugin_scope(&records, &[], OMS).read.contains("ACC-LATER"),
+        "an account opened later is in it"
+    );
+}
+
+#[test]
+fn a_level_is_named_by_its_button_or_its_name() {
+    for level in [AccessLevel::Admin, AccessLevel::Write, AccessLevel::Read] {
+        assert_eq!(parse_level(level_name(level)), Some(level));
+        assert_eq!(parse_level(button(level)), Some(level));
+    }
+    assert_eq!(parse_level("owner"), None);
+    assert_eq!(parse_level(""), None);
 }

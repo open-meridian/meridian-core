@@ -738,6 +738,8 @@ e2e-plugin-page: network
 	$(E2E_PLUGIN_PAGE) run --rm -T conductor meridian-conductor migrate >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T street meridian-street migrate >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T dashboard meridian-dashboard migrate >>.e2e-plugin-page.log 2>&1; \
+	printf '%s\n' "INSERT INTO dashboard_local_account (name, display_name, password_hash, created_at_ns) VALUES ('bea', 'Bea Stone', :'hash', 0);" \
+		| $(E2E_PLUGIN_PAGE) exec -T postgres psql -v ON_ERROR_STOP=1 -v 'hash=$(E2E_ACCOUNT_HASH)' -U meridian -d meridian >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) up -d conductor street dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 	status=0; $(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner || status=$$?; \
 	if [ $$status -ne 0 ]; then $(E2E_PLUGIN_PAGE) logs dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
@@ -747,6 +749,11 @@ e2e-plugin-page: network
 	grep -q "plugin settings changed" .e2e-plugin-page.components.log \
 		|| { echo "e2e-plugin-page FAILED: the conductor logged no settings change, so the grep below would prove nothing" >&2; \
 		     $(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+	for level in admin write; do \
+		grep -E "sent for a person.*at_level.{0,16}$$level" .e2e-plugin-page.components.log >/dev/null \
+		|| { echo "e2e-plugin-page FAILED: the sidecar recorded no act sent for a person at $$level (W6.9: the level an act was done under)" >&2; \
+		     $(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+	done; \
 	if grep -qF "$(E2E_SETTING_SECRET)" .e2e-plugin-page.components.log; then \
 		echo "e2e-plugin-page FAILED: the secret setting is in a component's log; see .e2e-plugin-page.components.log" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi; \
@@ -757,7 +764,7 @@ e2e-plugin-page: network
 		echo "e2e-plugin-page FAILED: the secret is not held sealed in the configuration store" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a signed-in person opens a plugin on its own host, is told to it by its sidecar alone, and links the accounts it reaches on its admin page -- to an account, to a new one, and unlinked -- while the plugin as itself, an unreported account and both names are refused; the plugin's overview shows the sync state with what to do, its admin view tabs its declared pages, and it writes for them only what they may write; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log"
+	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; and each act sent for a person is logged with its level"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

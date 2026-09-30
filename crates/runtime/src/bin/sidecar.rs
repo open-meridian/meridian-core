@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
 use meridian_sidecar::{
-    Identity, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
+    Identity, OlderPagesRead, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
 };
 
 /// Where the chart mounts the dashboard's public keys, one file per key id.
@@ -153,7 +153,11 @@ fn run() -> Result<(), String> {
             };
 
             let serving = tonic::transport::Server::builder()
-                .add_service(SidecarServiceServer::from_arc(Arc::clone(&sidecar)))
+                // An older plugin's admin pages, read as pages at `admin`
+                // while its contract is accepted (W4.8).
+                .add_service(OlderPagesRead::new(SidecarServiceServer::from_arc(
+                    Arc::clone(&sidecar),
+                )))
                 // The typed operations (spec/typed-sidecar-operations).
                 .add_service(PluginOperationsServer::from_arc(sidecar))
                 .serve(listening);

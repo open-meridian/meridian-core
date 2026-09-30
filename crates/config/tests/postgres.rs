@@ -11,11 +11,13 @@ use std::sync::Arc;
 use meridian_config::store::{Ending, Held, KnownPlugin, SettingChange, Store, Withdrawal};
 use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccountGroup, AccountRecord, AccountState,
-    ExternalAccountLink, Permission, PluginLaunch, PluginLaunchState, PluginMetadata,
-    PluginVersion, SignInRecord, UserGroup,
+    AccessEntry, AccessGroup, AccountGroup, AccountRecord, AccountState, ExternalAccountLink,
+    Permission, PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion, SignInRecord,
+    UserGroup,
 };
-use meridian_pb::v1::{SettingChoice, SettingCondition, SettingDeclaration, SettingType};
+use meridian_pb::v1::{
+    AccessLevel, SettingChoice, SettingCondition, SettingDeclaration, SettingType,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -78,9 +80,26 @@ fn admin_permission(id: &str, group: &str) -> Permission {
 fn a_fresh_store_has_deployment_admin_and_nobody_holding_it() {
     let store = store("fresh");
     let snapshot = store.snapshot().unwrap();
-    let admin = &snapshot.records.access_groups[0];
-    assert_eq!(admin.access_group_id, DEPLOYMENT_ADMIN);
-    assert!(admin.built_in);
+    let built_in = |id: &str| {
+        snapshot
+            .records
+            .access_groups
+            .iter()
+            .find(|g| g.access_group_id == id)
+            .is_some_and(|g| g.built_in)
+    };
+    assert!(built_in(DEPLOYMENT_ADMIN));
+    assert!(built_in(meridian_access::ALL_PLUGINS_ADMIN));
+    assert!(
+        snapshot
+            .records
+            .account_groups
+            .iter()
+            .any(|g| g.account_group_id == meridian_access::ALL_ACCOUNTS
+                && g.built_in
+                && g.account_ids.is_empty()),
+        "All accounts, listing none of its own"
+    );
     assert!(snapshot.records.permissions.is_empty());
 }
 
@@ -107,6 +126,7 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         account_group_id: "AG-1".into(),
         name: "Growth".into(),
         account_ids: vec!["ACC-1".into()],
+        built_in: false,
     };
     store.put_account_group(&accounts).unwrap();
     let access = AccessGroup {
@@ -153,7 +173,11 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         "none of the four given, none held"
     );
     assert_eq!(snapshot.records.user_groups, [group]);
-    assert_eq!(snapshot.records.account_groups, [accounts]);
+    assert_eq!(
+        snapshot.records.account_groups,
+        [accounts, meridian_config::all_accounts()],
+        "beside All accounts, built in"
+    );
     assert!(
         snapshot.records.access_groups.contains(&access),
         "entries in order"
@@ -218,6 +242,7 @@ fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
             account_group_id: "AG-1".into(),
             name: "g".into(),
             account_ids: vec![],
+            built_in: false,
         })
         .unwrap();
     let with_accounts = Permission {
@@ -257,7 +282,7 @@ fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
                 store
                     .install_first_admin(
                         &group,
-                        &admin_permission(&format!("PRM-{n}"), &group.user_group_id),
+                        &[admin_permission(&format!("PRM-{n}"), &group.user_group_id)],
                     )
                     .unwrap()
             })
@@ -918,4 +943,94 @@ fn an_account_from_before_its_attributes_reads_back_with_none() {
             ..AccountRecord::default()
         }]
     );
+}
+
+/// sdk-contract/a-plugin-has-admins: a deployment set up before admin was a
+/// level had its deployment admins administer every plugin by being one.
+/// Upgrading links their user groups to All plugins (admin), as first run
+/// and a claim code now do, so nothing is taken away; and a permission to
+/// either built-in access group still names no account group.
+#[test]
+fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("config_upgrade_{nanos}_{seq}");
+    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .unwrap();
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+
+    // The release before: migrations 1 to 8, and a deployment admin.
+    let mut before = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    before
+        .batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 8)
+    {
+        let mut tx = before.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        meridian_config::migrations::record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    before
+        .batch_execute(
+            "INSERT INTO config_user_group (user_group_id, name, logins) VALUES ('UG-1', 'Admins', '{ada}');
+             INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
+             VALUES ('PRM-1', 'UG-1', NULL, 'deployment-admin');",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate().expect("migrates to this release");
+    let records = store.snapshot().unwrap().records;
+    let linked: Vec<(&str, &str)> = records
+        .permissions
+        .iter()
+        .map(|p| (p.user_group_id.as_str(), p.access_group_id.as_str()))
+        .collect();
+    assert!(
+        linked.contains(&("UG-1", meridian_access::ALL_PLUGINS_ADMIN)),
+        "{linked:?}"
+    );
+    let ada = meridian_access::person_access(&records, "ada", &[]);
+    assert!(ada.deployment_admin && ada.administers("any-plugin"));
+
+    // Its level column takes admin now, and either built-in access group
+    // still names no account group, whoever writes it.
+    store
+        .put_account_group(&AccountGroup {
+            account_group_id: "AG-1".into(),
+            name: "g".into(),
+            account_ids: vec![],
+            built_in: false,
+        })
+        .unwrap();
+    let naming = Permission {
+        permission_id: "PRM-2".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: "AG-1".into(),
+        access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
+    };
+    assert!(store.add_permission(&naming).is_err());
+    store
+        .put_access_group(&AccessGroup {
+            access_group_id: "AX-ADMIN".into(),
+            name: "Admins of oms".into(),
+            entries: vec![AccessEntry {
+                plugin_instance_id: "oms-1".into(),
+                level: AccessLevel::Admin as i32,
+            }],
+            built_in: false,
+        })
+        .expect("an admin entry is kept");
+    let held = store.snapshot().unwrap().records.access_groups;
+    assert!(held.iter().any(
+        |g| g.access_group_id == "AX-ADMIN" && g.entries[0].level == AccessLevel::Admin as i32
+    ));
 }

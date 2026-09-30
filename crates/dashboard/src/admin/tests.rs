@@ -40,12 +40,22 @@ fn admin_records() -> AccessRecords {
             directory_groups: vec![],
             logins: vec![ADA.into()],
         }],
-        permissions: vec![Permission {
-            permission_id: "P-1".into(),
-            user_group_id: "UG-1".into(),
-            account_group_id: String::new(),
-            access_group_id: DEPLOYMENT_ADMIN.into(),
-        }],
+        // As first run writes them: deployment admin, and All plugins
+        // (admin), so the admins configure every plugin (W7.6).
+        permissions: vec![
+            Permission {
+                permission_id: "P-1".into(),
+                user_group_id: "UG-1".into(),
+                account_group_id: String::new(),
+                access_group_id: DEPLOYMENT_ADMIN.into(),
+            },
+            Permission {
+                permission_id: "P-0".into(),
+                user_group_id: "UG-1".into(),
+                account_group_id: String::new(),
+                access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
+            },
+        ],
         ..Default::default()
     }
 }
@@ -729,9 +739,13 @@ fn entries_are_plugin_and_level_one_per_line() {
     assert_eq!(parsed[0].level, AccessLevel::Write as i32);
     assert_eq!(parsed[1].plugin_instance_id, "snaptrade-1");
     assert_eq!(parsed[1].level, AccessLevel::Read as i32);
-    assert!(parse_entries("oms-1 admin")
+    assert_eq!(
+        parse_entries("oms-1 admin").unwrap()[0].level,
+        AccessLevel::Admin as i32
+    );
+    assert!(parse_entries("oms-1 owner")
         .unwrap_err()
-        .contains("not read or write"));
+        .contains("not read, write or admin"));
     assert!(parse_entries("oms-1").is_err());
     // decisions/026: a plugin declares no tags, so an entry naming one is
     // refused and says why, rather than read as something else.
@@ -1375,16 +1389,11 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     // Tabs, each a link of its own; the view opens on the first.
     let (tabs, here) = tabs_of(&body);
     let names: Vec<&str> = tabs.iter().map(|(_, name)| name.as_str()).collect();
-    assert_eq!(names, ["Overview", "Settings", "Access", "Admin page"]);
+    assert_eq!(names, ["Overview", "Settings", "Access"]);
     assert_eq!(here, "Overview");
     assert_eq!(tabs[0].0, VIEW);
-    assert_eq!(tabs[3].0, format!("{VIEW}?tab=admin"));
     assert!(body.contains("id=\"health\""));
-    for (part, tab) in [
-        ("id=\"settings\"", "settings"),
-        ("id=\"access\"", "access"),
-        ("id=\"admin-page\"", "admin"),
-    ] {
+    for (part, tab) in [("id=\"settings\"", "settings"), ("id=\"access\"", "access")] {
         assert!(!body.contains(part), "{part} is only on its own tab");
         let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={tab}"), true)).await;
         assert!(page.contains(part), "{part} is not on ?tab={tab}");
@@ -1397,10 +1406,6 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
         body.contains(&format!("value=\"{}\"", h.form_token)),
         "the form token"
     );
-    // This harness serves no plugin pages, and the view says so rather than
-    // framing something that is not there.
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=admin"), true)).await;
-    assert!(page.contains("cannot frame this one"));
     // A tab that is not one is the first.
     let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=secret"), true)).await;
     assert_eq!(tabs_of(&page).1, "Overview");
@@ -1472,6 +1477,7 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
             account_group_id: "AcG-1".into(),
             name: "Growth accounts".into(),
             account_ids: vec![],
+            built_in: false,
         });
     records
         .access_groups
@@ -1480,7 +1486,7 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
             name: "Custody readers".into(),
             entries: vec![meridian_domain::v1::AccessEntry {
                 plugin_instance_id: "snaptrade-1".into(),
-                level: meridian_domain::v1::AccessLevel::Read as i32,
+                level: meridian_access::AccessLevel::Read as i32,
             }],
             built_in: false,
         });
@@ -1520,13 +1526,13 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     let health = body.split("id=\"health\"").nth(1).unwrap();
     assert!(health.contains("Not healthy"), "{health}");
     assert!(health.contains("required setting snaptrade_consumer_key is not set"));
-    // The count leads to the plugin's own admin pages, where it links them
-    // (W6.4, W6.10), and to nothing of the dashboard's.
+    // The count leads to the plugin's pages under Manage, where it links
+    // them (W6.4, W6.10), and to nothing of the dashboard's.
     assert!(
-        health.contains(&format!(
-            "5 external accounts not linked. <a href=\"{VIEW}?tab=admin\">Link them on the \
-             plugin's admin pages</a>."
-        )),
+        health.contains(
+            "5 external accounts not linked. <a href=\"/plugins/snaptrade-1?level=admin\">Link them \
+             on the plugin's pages, under Manage</a>."
+        ),
         "{health}"
     );
     assert!(!health.contains("/admin#external-accounts"));
@@ -1538,7 +1544,15 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     assert!(access.contains("Operations") && access.contains("Custody readers"));
     assert!(access.contains("Growth accounts") && access.contains(">read<"));
     assert!(access.contains("<th>Level</th>") && !access.contains("Tag"));
-    assert!(body.contains("Deployment admins open it too"));
+    // Ada's link to All plugins (admin) is a row of its own, at admin, on
+    // no account; and she is offered the way to grant, being a deployment
+    // admin.
+    assert!(
+        access.contains("through All plugins (admin)") && access.contains(">admin<"),
+        "{access}"
+    );
+    assert!(body.contains("A deployment admin holds nothing on it by being one."));
+    assert!(body.contains("href=\"/admin#permissions\""));
 
     // The same flag on the overview, leading to the view (W6.10).
     let (_, overview) = send(&h, get(&h, "/admin", true)).await;
@@ -1561,11 +1575,12 @@ fn declaring(pages: &[(&str, &str)]) -> meridian_domain::v1::PluginReport {
         declared_interface: Some(meridian_pb::v1::InterfaceDeclaration {
             loopback_port: 8000,
             title: "SnapTrade".into(),
-            admin_pages: pages
+            pages: pages
                 .iter()
                 .map(|(path, title)| meridian_pb::v1::PageDeclaration {
                     path: path.to_string(),
                     title: title.to_string(),
+                    levels: vec![meridian_access::AccessLevel::Admin as i32],
                 })
                 .collect(),
         }),
@@ -1573,17 +1588,17 @@ fn declaring(pages: &[(&str, &str)]) -> meridian_domain::v1::PluginReport {
     }
 }
 
+/// W6.9, sdk-contract/a-plugin-has-admins: the admin view keeps the tabs
+/// every plugin has and frames none of the plugin's pages, which are in its
+/// area; it links there.
 #[tokio::test]
-async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its_path() {
-    // W6.9, the product owner, 2026-09-29: Overview, Settings, Access, then
-    // one tab per admin page the plugin declared (W4.8), in its order.
+async fn the_view_keeps_the_tabs_every_plugin_has_and_links_to_the_plugins_area() {
     let h = framing(with_settings());
     h.app.health.hear(
         "snaptrade-1",
         declaring(&[
             ("/admin/connections", "Connections"),
-            ("/admin/accounts", "Accounts"),
-            ("/admin/holdings", "Holdings"),
+            ("/admin/accounts", "Account links"),
         ]),
     );
     let (status, body) = send(&h, get(&h, VIEW, true)).await;
@@ -1595,149 +1610,128 @@ async fn the_plugins_declared_admin_pages_are_tabs_in_its_order_each_framing_its
             (VIEW.to_string(), "Overview".to_string()),
             (format!("{VIEW}?tab=settings"), "Settings".into()),
             (format!("{VIEW}?tab=access"), "Access".into()),
-            (format!("{VIEW}?tab=connections"), "Connections".into()),
-            (format!("{VIEW}?tab=accounts"), "Accounts".into()),
-            (format!("{VIEW}?tab=holdings"), "Holdings".into()),
         ]
     );
     assert_eq!(here, "Overview");
+    assert!(!body.contains("<iframe"), "none of the plugin's pages");
     assert!(
-        !body.contains("<iframe"),
-        "a page is framed only on its own tab"
-    );
-
-    let (_, accounts) = send(&h, get(&h, &format!("{VIEW}?tab=accounts"), true)).await;
-    assert_eq!(tabs_of(&accounts).1, "Accounts");
-    let frame = accounts.split("<iframe").nth(1).expect("the page, framed");
-    let frame = frame.split("</iframe>").next().unwrap();
-    assert!(
-        frame.contains(
-            "src=\"/plugins/snaptrade-1/enter?path=%2Fadmin%2Faccounts&amp;om-scheme=default\
-             &amp;om-mode=system&amp;om-direction=green-up&amp;om-framed=1\""
+        body.contains(
+            "<a class=\"button\" href=\"/plugins/snaptrade-1?level=admin\" data-area>Its pages</a>"
         ),
-        "seamless from its first paint: {frame}"
+        "{body}"
     );
-    assert!(frame.contains("data-origin=\"https://snaptrade-1.plugins.meridian.example\""));
-    assert!(
-        frame.contains("class=\"admin-frame\"") && frame.contains(" data-seamless "),
-        "{frame}"
-    );
-    assert_eq!(accounts.matches("<iframe").count(), 1, "one page at a time");
-    // Seamless (the product owner, 2026-09-29): straight under the tab row,
-    // with no panel, heading, path or hint of the dashboard's around it.
-    let under_tabs = accounts.split("</nav>").last().unwrap();
-    assert!(
-        under_tabs.starts_with("<div class=\"tab-body\" data-current=\"accounts\"><iframe "),
-        "{under_tabs}"
-    );
-    let body = under_tabs.split("</iframe>").next().unwrap();
-    for gone in [
-        "class=\"panel",
-        "<h2>",
-        "<code>/admin/accounts</code>",
-        "class=\"hint\"",
-    ] {
-        assert!(!body.contains(gone), "{gone} around the frame: {body}");
-    }
+    // The flag for its unlinked accounts leads there too, under Manage.
+    let (_, asked) = send(&h, get(&h, &format!("{VIEW}?tab=connections"), true)).await;
+    assert_eq!(tabs_of(&asked).1, "Overview", "no tab of the plugin's own");
 
-    // A window of its own, where no frame could hold the page, is a page on
-    // its own.
-    let on_localhost = crate::plugins::Plugins::new(
-        "http://localhost:8080",
-        "http://{instance}.sidecars.invalid:9292",
-        crate::signing::Signer::holding(
-            "dashboard-test",
-            ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-        ),
-    )
-    .unwrap();
-    let linked = harness_serving(with_settings(), None, Some(Arc::new(on_localhost)));
-    linked
-        .app
-        .health
-        .hear("snaptrade-1", declaring(&[("/admin/accounts", "Accounts")]));
-    let (_, page) = send(&linked, get(&linked, &format!("{VIEW}?tab=accounts"), true)).await;
-    let panel = page
-        .split("id=\"admin-page\"")
-        .nth(1)
-        .expect("the panel saying why");
+    // The breadcrumb: the settings home, its plugins, then this one.
+    let head = body.split("</header>").next().unwrap();
     assert!(
-        panel.contains("&amp;om-framed=0\" target=\"_blank\"") && !page.contains("<iframe"),
-        "{panel}"
+        head.contains(
+            "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+         <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
+         <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade-1</span>"
+        ),
+        "{head}"
     );
 }
 
-/// The product owner, 2026-09-30: the view's header holds no buttons of its
-/// own ("All plugins" and "Open its page" are gone); the way back is the
-/// breadcrumb, Settings then Plugins, and a framed page's own actions are
-/// drawn in the header, in the area its frame names.
+/// Ada in a user group granted SnapTrade's `admin` alone, and not a
+/// deployment admin.
+fn plugin_admin_alone() -> AccessRecords {
+    let mut records = with_settings();
+    records.permissions = vec![Permission {
+        permission_id: "P-9".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: String::new(),
+        access_group_id: "AG-ADMIN".into(),
+    }];
+    records.access_groups = vec![meridian_domain::v1::AccessGroup {
+        access_group_id: "AG-ADMIN".into(),
+        name: "SnapTrade admins".into(),
+        entries: vec![meridian_domain::v1::AccessEntry {
+            plugin_instance_id: "snaptrade-1".into(),
+            level: meridian_access::AccessLevel::Admin as i32,
+        }],
+        built_in: false,
+    }];
+    records
+}
+
 #[tokio::test]
-async fn the_views_header_is_the_breadcrumb_and_a_framed_pages_own_actions() {
-    let h = framing(with_settings());
-    h.app.health.hear(
-        "snaptrade-1",
-        declaring(&[("/admin/connections", "Connections")]),
+async fn a_plugin_admin_reaches_its_tabs_and_settings_and_nothing_else_of_the_portal() {
+    let h = harness(plugin_admin_alone(), None);
+    let (status, body) = send(&h, get(&h, VIEW, true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(tabs_of(&body).0.len(), 3, "Overview, Settings and Access");
+    let (status, settings) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        settings.contains(&format!("action=\"{SETTINGS}\"")),
+        "{settings}"
     );
-    let (_, overview) = send(&h, get(&h, VIEW, true)).await;
-    let (_, framed) = send(&h, get(&h, &format!("{VIEW}?tab=connections"), true)).await;
-    for page in [&overview, &framed] {
-        for gone in [
-            "All plugins",
-            "Open its page",
-            "href=\"/plugins/snaptrade-1\"",
-        ] {
-            assert!(!page.contains(gone), "{gone}");
-        }
-        let head = page.split("</header>").next().unwrap();
-        let crumbs = head
-            .split("<nav class=\"crumbs\" aria-label=\"Where you are\">")
-            .nth(1)
-            .and_then(|rest| rest.split("</nav>").next())
-            .expect("the crumbs");
-        // A framed page's status goes after the name, in a place kept empty
-        // until the page tells it one (kit 0.7.0's meridian:status).
-        let status = if std::ptr::eq(page, &framed) {
-            "<span class=\"crumb-status\" id=\"page-status\"></span>"
-        } else {
-            ""
-        };
-        assert_eq!(
-            crumbs,
-            format!(
-                "<a href=\"/admin\">Settings</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
-                 <a href=\"/admin#plugins\">Plugins</a><span class=\"sep\" aria-hidden=\"true\">/</span>\
-                 <span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade-1</span>{status}"
-            ),
-            "the settings home, the plugins list, then this one by name, its ID on hover"
-        );
-        assert!(!head.contains(">Admin<"));
+    // Access she reads, and changes nothing on: only a deployment admin grants.
+    let (_, access) = send(&h, get(&h, &format!("{VIEW}?tab=access"), true)).await;
+    assert!(
+        access.contains("A deployment admin grants access."),
+        "{access}"
+    );
+    assert!(!access.contains("href=\"/admin#permissions\""));
+    // Her way back is Home, and there is no way to the deployment's settings.
+    let head = body.split("</header>").next().unwrap();
+    assert!(
+        head.contains("<a href=\"/\">Home</a>") && !head.contains("href=\"/admin\""),
+        "{head}"
+    );
+    for page in ["/admin", "/admin/plugins/another-1"] {
+        let (status, _) = send(&h, get(&h, page, true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
     }
-    // Only a framed page has actions to draw, and its frame names the area.
-    assert!(!overview.contains("id=\"page-actions\""));
-    let page_head = framed
-        .split("<div class=\"plugin-view\"><div class=\"page-head\">")
-        .nth(1)
-        .and_then(|rest| rest.split("<nav").next())
-        .expect("the view's head");
-    assert!(
-        page_head.ends_with(
-            "<div class=\"actions\" id=\"page-actions\" role=\"group\" aria-label=\"Connections actions\"></div></div>"
+    // Her settings reach the conductor as hers.
+    let asked = conductor_setting(&h, None);
+    let (status, _) = send(
+        &h,
+        post(
+            &h,
+            SETTINGS,
+            &format!("form_token={}&value.poll_seconds=600", h.form_token),
         ),
-        "empty until the page offers its own: {page_head}"
-    );
-    let frame = framed
-        .split("<iframe")
-        .nth(1)
-        .unwrap()
-        .split('>')
-        .next()
-        .unwrap();
-    assert!(
-        frame.contains(" data-seamless ")
-            && frame.contains("data-actions=\"page-actions\"")
-            && frame.contains("data-status=\"page-status\""),
-        "{frame}"
-    );
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_deployment_admin_whose_link_is_withdrawn_reaches_no_plugins_settings() {
+    let mut records = with_settings();
+    records
+        .permissions
+        .retain(|p| p.access_group_id == DEPLOYMENT_ADMIN);
+    let h = harness(records, None);
+    // What is theirs on it: its health and granting.
+    let (status, body) = send(&h, get(&h, VIEW, true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<String> = tabs_of(&body).0.into_iter().map(|(_, name)| name).collect();
+    assert_eq!(names, ["Overview", "Access"]);
+    assert!(!body.contains("data-area"), "no pages of its to open");
+    let (_, access) = send(&h, get(&h, &format!("{VIEW}?tab=access"), true)).await;
+    assert!(access.contains("href=\"/admin#permissions\""));
+    // And not its settings.
+    let (status, _) = send(&h, get(&h, SETTINGS, true)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let asked = conductor_setting(&h, None);
+    let (status, _) = send(
+        &h,
+        post(
+            &h,
+            SETTINGS,
+            &format!("form_token={}&value.poll_seconds=600", h.form_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(asked.lock().unwrap().is_empty());
 }
 
 /// The product owner, 2026-09-30: "let's put 'Its sidecar has stopped
@@ -1815,46 +1809,6 @@ async fn a_connections_state_carries_what_the_plugin_said_of_it_as_its_note() {
         "{sync}"
     );
     assert!(!sync.contains("<th>Detail</th>"), "the note, not a column");
-}
-
-#[tokio::test]
-async fn a_page_that_is_not_one_on_the_plugins_host_is_no_tab() {
-    let h = framing(with_settings());
-    h.app.health.hear(
-        "snaptrade-1",
-        declaring(&[
-            ("//evil.example/x", "Elsewhere"),
-            ("https://evil.example/", "Absolute"),
-            ("/.meridian/ui/0.1.0/", "The kit"),
-            ("/admin/accounts", ""),
-            ("/admin/accounts", "Twice"),
-        ]),
-    );
-    let (_, body) = send(&h, get(&h, VIEW, true)).await;
-    let names: Vec<String> = tabs_of(&body).0.into_iter().map(|(_, name)| name).collect();
-    // Untitled, it is called by its path; the second of a path is dropped.
-    assert_eq!(names, ["Overview", "Settings", "Access", "/admin/accounts"]);
-    assert_eq!(
-        tabs_of(&body).0[3].0,
-        format!("{VIEW}?tab=admin-accounts"),
-        "named in the query by its path, made a word"
-    );
-    for asked in ["%2F%2Fevil.example%2Fx", "https%3A%2F%2Fevil.example%2F"] {
-        let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab={asked}"), true)).await;
-        assert_eq!(tabs_of(&page).1, "Overview", "{asked} is framed nowhere");
-        assert!(!page.contains("<iframe"));
-    }
-
-    // Declaring none, the plugin's /admin is the one page tab.
-    h.app.health.hear("snaptrade-1", declaring(&[]));
-    let (_, body) = send(&h, get(&h, VIEW, true)).await;
-    let (tabs, _) = tabs_of(&body);
-    assert_eq!(
-        tabs.last().unwrap(),
-        &(format!("{VIEW}?tab=admin"), "Admin page".to_string())
-    );
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=admin"), true)).await;
-    assert!(page.contains("src=\"/plugins/snaptrade-1/enter?path=%2Fadmin&amp;"));
 }
 
 #[tokio::test]
@@ -1987,34 +1941,6 @@ fn a_form_asks_for_what_changed_and_clears_only_what_it_was_told_to() {
 }
 
 #[tokio::test]
-async fn a_plugin_page_titled_as_one_of_the_views_own_does_not_take_its_tab() {
-    let h = framing(with_settings());
-    h.app.health.hear(
-        "snaptrade-1",
-        declaring(&[
-            ("/admin/settings", "Settings"),
-            ("/admin/ladder", "Cash ladder"),
-            ("/admin/other", "Cash  ladder!"),
-        ]),
-    );
-    let (_, body) = send(&h, get(&h, VIEW, true)).await;
-    let hrefs: Vec<String> = tabs_of(&body).0.into_iter().map(|(href, _)| href).collect();
-    assert_eq!(
-        hrefs[3..],
-        [
-            format!("{VIEW}?tab=settings-2"),
-            format!("{VIEW}?tab=cash-ladder"),
-            format!("{VIEW}?tab=cash-ladder-2"),
-        ]
-    );
-    let (_, page) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
-    assert!(
-        page.contains(&format!("action=\"{SETTINGS}\"")),
-        "?tab=settings is still the view's own"
-    );
-}
-
-#[tokio::test]
 async fn the_plugins_tab_names_the_instance_apart_and_offers_a_search() {
     let h = harness(admin_records(), None);
     h.app.custody.hear_accounts(
@@ -2083,6 +2009,7 @@ fn a_firm() -> AccessRecords {
             account_group_id: format!("AcG-{g:02}"),
             name: format!("Book {g:02}"),
             account_ids: (0..50).map(|k| format!("ACC-{:04}", g * 10 + k)).collect(),
+            built_in: false,
         })
         .collect();
     records.access_groups = (0..GROUPS)
@@ -2354,9 +2281,26 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
         .unwrap_err()
         .contains("no level"));
     assert!(
-        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "admin")]))
+        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "owner")]))
             .unwrap_err()
-            .contains("not read or write")
+            .contains("not admin, read or write")
+    );
+    // Admin, alone or beside one data level (W6.7).
+    let levels = |choice: &str| -> Vec<i32> {
+        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", choice)]))
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.level)
+            .collect()
+    };
+    assert_eq!(levels("admin"), [AccessLevel::Admin as i32]);
+    assert_eq!(
+        levels("admin-read"),
+        [AccessLevel::Admin as i32, AccessLevel::Read as i32]
+    );
+    assert_eq!(
+        levels("admin-write"),
+        [AccessLevel::Admin as i32, AccessLevel::Write as i32]
     );
 }
 
@@ -2472,10 +2416,14 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
             "{dialog}: a new one chooses nothing"
         );
     }
-    // An access entry's level: one choice, read or write.
+    // An access entry's level: one choice, admin, a data level, or admin
+    // beside one, never read and write both.
     assert!(body.contains(
         "<select name=\"level.plugin-00\" aria-label=\"Level on plugin-00\"><option value=\"read\">Read</option>\
-         <option value=\"write\">Write (includes read)</option></select>"
+         <option value=\"write\">Write (includes read)</option>\
+         <option value=\"admin\">Admin (configures it, no account)</option>\
+         <option value=\"admin-read\">Admin and read</option>\
+         <option value=\"admin-write\">Admin and write</option></select>"
     ));
     let fill = fill_of(&body, "AG-00");
     assert_eq!(fill["fields"]["level.plugin-00"], "write");

@@ -132,7 +132,7 @@ impl Store for PostgresStore {
 
         for row in tx
             .query(
-                "SELECT account_group_id, name, account_ids FROM config_account_group
+                "SELECT account_group_id, name, account_ids, built_in FROM config_account_group
                   ORDER BY account_group_id",
                 &[],
             )
@@ -142,6 +142,7 @@ impl Store for PostgresStore {
                 account_group_id: row.get(0),
                 name: row.get(1),
                 account_ids: row.get(2),
+                built_in: row.get(3),
             });
         }
 
@@ -536,7 +537,7 @@ impl Store for PostgresStore {
         Ok(Withdrawal::Withdrawn)
     }
 
-    fn install_first_admin(&self, group: &UserGroup, permission: &Permission) -> Result<bool> {
+    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute("LOCK TABLE config_permission IN SHARE ROW EXCLUSIVE MODE")
@@ -562,7 +563,9 @@ impl Store for PostgresStore {
             ],
         )
         .map_err(unavailable)?;
-        insert_permission(&mut tx, permission)?;
+        for permission in permissions {
+            insert_permission(&mut tx, permission)?;
+        }
         tx.commit().map_err(unavailable)?;
         Ok(true)
     }

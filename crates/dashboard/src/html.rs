@@ -136,6 +136,12 @@ nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:60
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
 .plugin-view nav.tabs{margin-bottom:1rem}.plugin-view .stack>*+*{margin-top:1.25rem}\
+.plugin-area nav.tabs{margin-bottom:0}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
+.level-switch{display:inline-flex;border:1px solid var(--line-strong);border-radius:var(--radius);overflow:hidden}\
+.level-switch a{padding:.3rem .75rem;font-size:.86rem;color:var(--ink-soft);background:var(--card)}\
+.level-switch a+a{border-left:1px solid var(--line-strong)}\
+.level-switch a:hover{text-decoration:none;background:var(--hover)}\
+.level-switch a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
 .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin:0 0 .5rem}\
 .section-head h2{margin:0 0 .15rem}.section-head .hint{margin:0}.section-head button{margin:0;flex-shrink:0}\
 .scroll{overflow-x:auto}table.list td{vertical-align:middle}\
@@ -233,6 +239,12 @@ background:var(--accent-wash);color:var(--accent);font-weight:700;font-size:1.05
 .plugin-meta{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
 .plugin-open{color:var(--accent);font-weight:550;white-space:nowrap}\
 .plugin-card:not(a) .plugin-open{color:var(--ink-faint);font-weight:400}\
+a.plugin-main{display:flex;align-items:center;gap:.9rem;min-width:0;flex:1 1 auto;color:inherit}\
+a.plugin-main:hover{text-decoration:none}a.plugin-main:hover .plugin-name{color:var(--accent)}\
+.plugin-levels{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
+a.plugin-level{padding:.28rem .7rem;border:1px solid var(--line-strong);border-radius:var(--radius);\
+font-size:.86rem;font-weight:550;color:var(--accent);background:var(--card);white-space:nowrap}\
+a.plugin-level:hover{text-decoration:none;background:var(--accent-wash);border-color:var(--accent)}\
 ul.plugins.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:.9rem}\
 ul.plugins.tiles .plugin-card{flex-direction:column;align-items:flex-start;gap:.75rem;height:100%;padding:1.1rem;\
 background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow)}\
@@ -251,9 +263,9 @@ ul.plugins.tiles .plugin-card{padding:.85rem}}\
 .flag{display:block;padding:.55rem .8rem;border-radius:var(--radius);\
 background:var(--warn-wash);color:var(--warn-ink);font-size:.9rem;margin:.75rem 0 0}\
 .flag a{color:inherit;text-decoration:underline}\
-.admin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:0;border-radius:0;background:none;\
-color-scheme:light dark}.admin-frame[data-sized]{min-height:0}\
-html[data-om-mode=light] .admin-frame{color-scheme:light}html[data-om-mode=dark] .admin-frame{color-scheme:dark}\
+.plugin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:0;border-radius:0;background:none;\
+color-scheme:light dark}.plugin-frame[data-sized]{min-height:0}\
+html[data-om-mode=light] .plugin-frame{color-scheme:light}html[data-om-mode=dark] .plugin-frame{color-scheme:dark}\
 form.settings{max-width:60rem}\
 form.settings .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem 1.25rem;align-items:start}\
 form.settings .setting{min-width:0}form.settings .setting.wide{grid-column:1/-1}\
@@ -417,7 +429,7 @@ pub fn noted_badge(class: &str, word: &str, note: &str, id: &str) -> (String, St
 /// applies it here, remembers it, and tells each framed page by the frame's
 /// message (meridian-ui's contract), as each frame's load does, so a
 /// navigation inside it keeps the person's theme. A seamless frame
-/// (`data-seamless`, the admin view's) is told version 3 with `framed: true`,
+/// (`data-seamless`, the plugin area's) is told version 3 with `framed: true`,
 /// and is as tall as its page says it is, and its page's header actions and
 /// status dot are drawn by the dashboard; the full-page frame is told
 /// version 2, which says nothing of framing, so its page keeps its own. And
@@ -940,7 +952,7 @@ mod tests {
     #[test]
     fn a_seamless_frame_has_no_edge_of_its_own_and_a_height_until_its_page_says() {
         let frame = STYLE
-            .split(".admin-frame{")
+            .split(".plugin-frame{")
             .nth(1)
             .unwrap()
             .split('}')
@@ -957,12 +969,12 @@ mod tests {
             assert!(frame.contains(rule), "{rule} not in {frame}");
         }
         // Once the page has said, its height alone, however small.
-        assert!(STYLE.contains(".admin-frame[data-sized]{min-height:0}"));
+        assert!(STYLE.contains(".plugin-frame[data-sized]{min-height:0}"));
         // The person's mode, as the page's, so the transparent page sits on
         // the dashboard rather than on an opaque canvas.
         assert!(frame.contains("color-scheme:light dark"));
-        assert!(STYLE.contains("html[data-om-mode=light] .admin-frame{color-scheme:light}"));
-        assert!(STYLE.contains("html[data-om-mode=dark] .admin-frame{color-scheme:dark}"));
+        assert!(STYLE.contains("html[data-om-mode=light] .plugin-frame{color-scheme:light}"));
+        assert!(STYLE.contains("html[data-om-mode=dark] .plugin-frame{color-scheme:dark}"));
     }
 
     #[test]

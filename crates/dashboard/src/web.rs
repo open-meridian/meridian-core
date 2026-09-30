@@ -291,12 +291,19 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 
     let access =
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
-    // W6.9: the instances the person holds access on, and for a deployment
-    // admin, who opens any plugin's page (ruling 19), every one launched.
+    // W6.9: the instances the person holds any level on, `admin` included;
+    // through All plugins (admin), every one running -- launched from the
+    // catalogue, or reporting.
     let launches = crate::catalogue::launches(&app).await;
-    let mut listed: std::collections::BTreeSet<String> = access.plugins.keys().cloned().collect();
-    if access.deployment_admin {
+    let mut listed: std::collections::BTreeSet<String> = access
+        .plugins
+        .iter()
+        .filter(|(_, held)| held.holds_any())
+        .map(|(instance, _)| instance.clone())
+        .collect();
+    if access.all_plugins_admin {
         listed.extend(launches.iter().map(|launch| launch.instance_id.clone()));
+        listed.extend(app.health.view().into_keys());
     }
     let name_of = |instance: &str| {
         launches
@@ -342,16 +349,17 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         }
         body.push_str("<ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
         for instance in listed.iter().map(|i| i.as_str()) {
-            // Linked when it can be opened: access to no account yet is
-            // listed, and would be refused at the door.
-            let openable = app.plugins.is_some()
-                && crate::plugins::opening(&access, instance).is_some()
-                && crate::plugins::is_instance(instance);
+            // A button per level held (W6.9), where a page can be opened.
+            let openable = app.plugins.is_some() && crate::plugins::is_instance(instance);
+            let levels = if openable {
+                access.held(instance).levels()
+            } else {
+                Vec::new()
+            };
             body.push_str(&plugin_card(
                 instance,
                 name_of(instance).as_deref(),
-                openable,
-                access.deployment_admin && access.on_plugin(instance).is_empty(),
+                &levels,
             ));
         }
         body.push_str(
@@ -380,8 +388,14 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 const SEARCH_FROM: usize = 8;
 
 /// One plugin instance on the home page: the plugin's name and the
-/// instance's, opening it in the frame.
-fn plugin_card(instance: &str, name: Option<&str>, openable: bool, as_admin: bool) -> String {
+/// instance's, and a button per level the person holds on it, each opening
+/// its area at that level (W6.9; the product owner, 2026-09-30: "manage for
+/// admin, open for write, view for read"). The name opens the first.
+fn plugin_card(
+    instance: &str,
+    name: Option<&str>,
+    levels: &[meridian_access::AccessLevel],
+) -> String {
     // The plugin's name where the catalogue launched it; one installed
     // otherwise is known by its instance alone.
     let (title, sub) = match name {
@@ -399,34 +413,37 @@ fn plugin_card(instance: &str, name: Option<&str>, openable: bool, as_admin: boo
         .find(|c| c.is_alphanumeric())
         .map(String::from)
         .unwrap_or_default();
-    let meta = if as_admin {
-        "<span class=\"plugin-meta\"><span class=\"badge accent\">as admin</span></span>"
-    } else {
-        ""
-    };
-    let inner = format!(
+    let text = format!(
         "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>\
-         {meta}<span class=\"plugin-open\">{open}</span>",
+         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
         initial = escape(&initial),
         title = escape(title),
-        open = if openable {
-            "Open"
-        } else {
-            "Not open to you yet"
-        },
     );
-    if openable {
-        format!(
-            "<li data-instance=\"{id}\"><a class=\"plugin-card\" href=\"/plugins/{id}\">{inner}</a></li>",
+    let Some(first) = levels.first() else {
+        return format!(
+            "<li data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
+             <span class=\"plugin-open\">Not open to you yet</span></div></li>",
             id = escape(instance)
-        )
-    } else {
-        format!(
-            "<li data-instance=\"{id}\"><div class=\"plugin-card\">{inner}</div></li>",
-            id = escape(instance)
-        )
-    }
+        );
+    };
+    let buttons: String = levels
+        .iter()
+        .map(|level| {
+            format!(
+                "<a class=\"plugin-level\" data-level=\"{name}\" href=\"{href}\">{said}</a>",
+                name = meridian_access::level_name(*level),
+                href = escape(&crate::area::href(instance, *level, None)),
+                said = meridian_access::button(*level),
+            )
+        })
+        .collect();
+    format!(
+        "<li data-instance=\"{id}\"><div class=\"plugin-card\"><a class=\"plugin-main\" href=\"{href}\">{text}</a>\
+         <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
+        id = escape(instance),
+        href = escape(&crate::area::href(instance, *first, None)),
+        label = escape(title),
+    )
 }
 
 /// The list and the tiles, and the person's choice between them remembered

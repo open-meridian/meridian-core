@@ -316,7 +316,7 @@ async fn front_door_live(
             interface: port.map(|loopback_port| InterfaceDeclaration {
                 loopback_port,
                 title: "Holdings".into(),
-                admin_pages: vec![],
+                pages: vec![],
             }),
             ..Default::default()
         }))
@@ -484,7 +484,7 @@ async fn an_interface_on_a_port_that_is_not_one_is_refused_at_registration() {
                 interface: Some(InterfaceDeclaration {
                     loopback_port,
                     title: "Holdings".into(),
-                    admin_pages: vec![],
+                    pages: vec![],
                 }),
                 ..Default::default()
             }))

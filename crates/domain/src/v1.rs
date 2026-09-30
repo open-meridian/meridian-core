@@ -1266,16 +1266,17 @@ pub struct PluginReport {
     pub reported_at_ns: i64,
     /// The settings the plugin declared when it registered (W4.1): names, types,
     /// and whether each is required or secret. Never a value. The conductor
-    /// checks a deployment admin's settings against these and tells a secret by
-    /// them (W6.11). Empty while the plugin is not registered, and the conductor
-    /// then keeps what it last declared.
+    /// checks the settings an admin of the plugin gives against these and tells
+    /// a secret by them (W6.11). Empty while the plugin is not registered, and
+    /// the conductor then keeps what it last declared.
     #[prost(message, repeated, tag = "13")]
     pub declared_settings: ::prost::alloc::vec::Vec<
         ::meridian_pb::v1::SettingDeclaration,
     >,
     /// The interface the plugin declared when it registered (W4.8, W6.9): its
-    /// title and its admin pages, in order, which the dashboard's admin view of
-    /// the instance shows as tabs. Unset while the plugin is not registered, or
+    /// title and its pages, each with the levels it serves, in order, which the
+    /// plugin's area shows as tabs under each button; an older plugin's admin
+    /// pages as pages at `admin`. Unset while the plugin is not registered, or
     /// when it serves no interface.
     #[prost(message, optional, tag = "14")]
     pub declared_interface: ::core::option::Option<
@@ -1748,7 +1749,8 @@ impl DeploymentState {
 pub enum ClaimCodePurpose {
     /// Read as first admin: what every claim code was before first run existed.
     Unspecified = 0,
-    /// Makes the deployment's first deployment admin (W6.2).
+    /// Makes the deployment's first deployment admin, and links them to All
+    /// plugins (admin) as first run does (W6.2).
     FirstAdmin = 1,
     /// Opens the deployment's first-run wizard (W7.3). Honouring one also issues
     /// the first administrator's code, in the same act.
@@ -1890,8 +1892,8 @@ pub struct AccessRecords {
     pub plugin_settings: ::prost::alloc::vec::Vec<PluginSettingsRecord>,
 }
 /// The only thing holdings are recorded against. A plugin creates one only by
-/// linking an external account to a new one, acting for a deployment admin
-/// (W6.4).
+/// linking an external account to a new one, acting for a deployment admin in
+/// a session opened by Manage (W6.4).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountRecord {
     #[prost(string, tag = "1")]
@@ -1942,9 +1944,10 @@ pub struct CloseAccountRequest {
 /// Links an external account a plugin reported, or removes its link.
 /// Names an existing account, or a new account's name for the conductor to
 /// create and link in one step, or neither to remove the link; never both. Held
-/// as one of that plugin's settings. Sent by the plugin from its own admin page,
-/// acting for the deployment admin viewing it (W6.4); the plugin's sidecar
-/// stamps plugin_instance_id.
+/// as one of that plugin's settings. Sent by the plugin from one of its pages at
+/// admin, acting for the admin of the plugin viewing it in a session opened by
+/// Manage (W6.4, W6.9): any of them names an existing account, and only a
+/// deployment admin a new one. The plugin's sidecar stamps plugin_instance_id.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LinkExternalAccountRequest {
     #[prost(string, tag = "1")]
@@ -1977,8 +1980,10 @@ pub struct ExternalAccountLink {
     #[prost(string, tag = "3")]
     pub account_id: ::prost::alloc::string::String,
 }
-/// The deployment's accounts, read by a plugin acting for a deployment admin
-/// to offer the accounts an external account can be linked to (W6.4).
+/// The deployment's accounts, read by a plugin acting for its admin
+/// in a session opened by Manage, to offer the accounts an external account
+/// can be linked to (W4.9, W6.4): every account, since a plugin admin is
+/// account agnostic, and its identity alone.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct AccountsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2030,30 +2035,41 @@ pub struct DefineUserGroupRequest {
     #[prost(message, optional, tag = "1")]
     pub user_group: ::core::option::Option<UserGroup>,
 }
-/// Which accounts. An explicit list: no nesting, no "all accounts", and an
-/// empty group reaches nothing.
+/// Which accounts. An explicit list: no nesting, and an empty group reaches
+/// nothing. One group is built in, All accounts (W6.6).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountGroup {
     #[prost(string, tag = "1")]
     pub account_group_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
+    /// Empty for All accounts, whose accounts are read from the accounts as
+    /// they are.
     #[prost(string, repeated, tag = "3")]
     pub account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// True only for All accounts, which holds every account the deployment
+    /// has -- those no other group lists and those opened after a permission
+    /// names it included -- lists none of its own, and cannot be edited or
+    /// deleted. A permission may name it like any other (W6.6, W6.8).
+    #[prost(bool, tag = "4")]
+    pub built_in: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DefineAccountGroupRequest {
     #[prost(message, optional, tag = "1")]
     pub account_group: ::core::option::Option<AccountGroup>,
 }
-/// Which plugin, at which level. One plugin per entry, so each plugin's users
-/// can be counted on their own. The levels are the same for every plugin, and
-/// a plugin names no parts of itself for access (decisions/026).
+/// Which plugin, at which level: `read`, `write` or `admin`. One plugin per
+/// entry, so each plugin's users can be counted on their own. The levels are
+/// the same for every plugin, and a plugin names no parts of itself for access
+/// (W6.7; decisions/026, 027). A group may name a plugin at `admin` and at one
+/// data level; naming it at both `read` and `write`, or twice at one level, is
+/// refused.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessEntry {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
-    #[prost(enumeration = "AccessLevel", tag = "3")]
+    #[prost(enumeration = "::meridian_pb::v1::AccessLevel", tag = "3")]
     pub level: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2064,8 +2080,12 @@ pub struct AccessGroup {
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]
     pub entries: ::prost::alloc::vec::Vec<AccessEntry>,
-    /// True only for deployment admin, which holds the dashboard's own
-    /// capabilities and every account, and cannot be edited or deleted.
+    /// True for the two built-in groups, neither of which can be edited or
+    /// deleted, each known by its identifier. Deployment admin holds the
+    /// dashboard's own capabilities, admin on no plugin and no account's data
+    /// (W6.7). All plugins (admin) grants `admin` on every plugin, those launched
+    /// later included, and no account's data; first run and a claim code link
+    /// the deployment admins' user group to it (W6.2, W7.6).
     #[prost(bool, tag = "4")]
     pub built_in: bool,
 }
@@ -2074,8 +2094,11 @@ pub struct DefineAccessGroupRequest {
     #[prost(message, optional, tag = "1")]
     pub access_group: ::core::option::Option<AccessGroup>,
 }
-/// One user group, one account group, one access group. A permission to the
-/// built-in deployment admin access group names no account group.
+/// One user group, one account group, one access group. A permission to
+/// deployment admin, to All plugins (admin), or to an access group whose
+/// entries are all `admin` names no account group, since configuring a plugin
+/// is not an act on an account; one to an access group with a `read` or
+/// `write` entry names one, and its `admin` entries use none (W6.8).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Permission {
     #[prost(string, tag = "1")]
@@ -2097,7 +2120,9 @@ pub struct GrantPermissionRequest {
     pub access_group_id: ::prost::alloc::string::String,
 }
 /// Refused for the last permission to deployment admin, so a deployment is
-/// never left without an administrator.
+/// never left without an administrator. Any permission to All plugins (admin)
+/// may be withdrawn, so a firm that separates the duties has deployment admins
+/// who configure no plugin (W6.7).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WithdrawPermissionRequest {
     #[prost(string, tag = "1")]
@@ -2209,40 +2234,6 @@ impl AccountState {
             "ACCOUNT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
             "ACCOUNT_STATE_OPEN" => Some(Self::Open),
             "ACCOUNT_STATE_CLOSED" => Some(Self::Closed),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum AccessLevel {
-    Unspecified = 0,
-    /// What the plugin reads, which it may show the person, cut to the accounts
-    /// they may read: queries and receiving events.
-    Read = 1,
-    /// What the plugin publishes, which it may do for the person, acting for
-    /// them, on the accounts they may write: commands, and everything read
-    /// allows.
-    Write = 2,
-}
-impl AccessLevel {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "ACCESS_LEVEL_UNSPECIFIED",
-            Self::Read => "ACCESS_LEVEL_READ",
-            Self::Write => "ACCESS_LEVEL_WRITE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "ACCESS_LEVEL_UNSPECIFIED" => Some(Self::Unspecified),
-            "ACCESS_LEVEL_READ" => Some(Self::Read),
-            "ACCESS_LEVEL_WRITE" => Some(Self::Write),
             _ => None,
         }
     }
@@ -2471,9 +2462,10 @@ pub struct AddressesAnswer {
 /// holds the account, the wizard was already asking for that administrator's
 /// login and password, so the same fact was established twice.
 ///
-/// What is written is an ordinary permission -- a user group naming this, and
-/// a permission from it to the built-in deployment-admin access group -- so it
-/// is audited by reading the same table as every other grant.
+/// What is written is ordinary permissions -- a user group naming this, a
+/// permission from it to the built-in deployment-admin access group, and one to
+/// the built-in All plugins (admin) (W7.6) -- so it is audited by reading the
+/// same table as every other grant.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AdministratorAnswer {
     #[prost(oneof = "administrator_answer::Named", tags = "1, 2")]

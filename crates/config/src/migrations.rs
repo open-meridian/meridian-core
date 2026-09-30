@@ -61,6 +61,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "account_attributes",
         sql: include_str!("../migrations/0008_account_attributes.sql"),
     },
+    Migration {
+        version: 9,
+        name: "a_plugin_has_admins",
+        sql: include_str!("../migrations/0009_a_plugin_has_admins.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

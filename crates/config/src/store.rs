@@ -157,9 +157,10 @@ pub trait Store: Send + Sync {
     /// Atomic: refuses the last permission to deployment admin.
     fn withdraw_permission(&self, permission_id: &str) -> Result<Withdrawal>;
 
-    /// Atomic: writes the group and the permission only if no permission to
-    /// deployment admin exists, and says whether it did.
-    fn install_first_admin(&self, group: &UserGroup, permission: &Permission) -> Result<bool>;
+    /// Atomic: writes the group and its permissions -- to deployment admin
+    /// and to All plugins (admin) -- only if no permission to deployment
+    /// admin exists, and says whether it did.
+    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool>;
 
     /// The latest sign-in stands; groups are never merged across sign-ins.
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;

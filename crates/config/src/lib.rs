@@ -41,8 +41,8 @@ pub use plugins::serve_plugins;
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{
-    configuration, deployment_admin, install_named_administrator, serve, Clock, SystemClock,
-    Upstream,
+    all_accounts, all_plugins_admin, configuration, deployment_admin, install_named_administrator,
+    serve, Clock, SystemClock, Upstream,
 };
 pub use store::{
     Ending, Held, KnownPlugin, SettingChange, Snapshot, Store, StoreError, StoredSetting,

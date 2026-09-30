@@ -67,6 +67,7 @@ fn claims() -> CallerClaims {
         expires_at_ns: T0 + 60_000_000_000,
         assertion_id: "a-1".into(),
         deployment_admin: true,
+        level: meridian_pb::v1::AccessLevel::Admin as i32,
     }
 }
 

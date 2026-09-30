@@ -231,9 +231,10 @@ message AddressesAnswer {
 // holds the account, the wizard was already asking for that administrator's
 // login and password, so the same fact was established twice.
 //
-// What is written is an ordinary permission -- a user group naming this, and
-// a permission from it to the built-in deployment-admin access group -- so it
-// is audited by reading the same table as every other grant.
+// What is written is ordinary permissions -- a user group naming this, a
+// permission from it to the built-in deployment-admin access group, and one to
+// the built-in All plugins (admin) (W7.6) -- so it is audited by reading the
+// same table as every other grant.
 message AdministratorAnswer {
   oneof named {
     // A directory group whose members hold deployment admin. Onboarding then

@@ -9,8 +9,17 @@
 //! The deployment's configuration is the exception to a plugin acting as
 //! itself: a command or query in the `config` domain -- linking an external
 //! account, reading the deployment's accounts to link it to (W6.4) -- is
-//! admitted only acting for a deployment admin, and a link only for an
-//! external account the plugin itself reported (W2.8).
+//! admitted only acting for an admin of the plugin, in a session opened by
+//! Manage (the claims' level `admin`), a link only for an external account the
+//! plugin itself reported (W2.8), and one naming a new account only for a
+//! deployment admin.
+//!
+//! **A session's level decides what is sent for the person** (W4.9, W6.9).
+//! Under `write` (Open), a command on an account in the write set; under
+//! `admin` (Manage), the accounts read and the link, and nothing else, since
+//! `admin` reaches no account's data; under `read` (View), nothing. An
+//! assertion naming no level holds nothing. Each act admitted for a person is
+//! logged with the level it was done under.
 //!
 //! A refusal is the call's gRPC status, chosen by what the caller should do
 //! about it: `permission_denied` for a topic none of the plugin's roles
@@ -31,7 +40,7 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1 as domain;
 use meridian_domain::v1::{ExternalAccountsEvent, LinkExternalAccountRequest};
 use meridian_pb::plugin::v1 as plugin;
-use meridian_pb::v1::{CallerAssertion, Refusal, RefusalReason};
+use meridian_pb::v1::{AccessLevel, CallerAssertion, CallerClaims, Refusal, RefusalReason};
 use prost::Message;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Response, Status};
@@ -39,7 +48,7 @@ use tonic::{Code, Response, Status};
 use crate::service::Sidecar;
 
 /// The deployment's configuration: what a plugin sends here it sends only for
-/// a deployment admin (W6.4).
+/// an admin of the plugin (W6.4).
 const CONFIGURATION: &str = "platform.config.";
 const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
 /// Where a plugin says which external accounts its connection reaches (W2.8).
@@ -181,7 +190,15 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let subject = if topic.starts_with(CONFIGURATION) {
-            self.vouched_admin(&topic, acting_for.as_ref(), now_ns())?
+            let claims = self.vouched_admin(&topic, acting_for.as_ref(), now_ns())?;
+            tracing::info!(
+                instance = self.instance_id(),
+                topic,
+                by = claims.subject,
+                at_level = "admin",
+                "read for a person"
+            );
+            claims.subject
         } else {
             String::new()
         };
@@ -218,15 +235,28 @@ impl Sidecar {
         self.granted(&topic)?;
         let now = now_ns();
         if topic.starts_with(CONFIGURATION) {
-            // A deployment admin's act on the deployment's configuration, not
-            // a write to an account: a link names an account nothing may write
-            // through this plugin yet, since the link is what grants it (W4.11).
-            let subject = self.vouched_admin(&topic, acting_for.as_ref(), now)?;
+            // An admin's act on the deployment's configuration, not a write
+            // to an account: a link names an account nothing may write through
+            // this plugin yet, since the link is what grants it (W4.11).
+            let claims = self.vouched_admin(&topic, acting_for.as_ref(), now)?;
             if topic == LINK_EXTERNAL_ACCOUNT {
                 self.reported_by_this_plugin(&message.encode_to_vec(), now)
                     .await?;
+                self.names_a_new_account_only_for_a_deployment_admin(
+                    &message.encode_to_vec(),
+                    &claims,
+                )?;
             }
-            return self.ask_for(&topic, payload_type, message, &subject).await;
+            tracing::info!(
+                instance = self.instance_id(),
+                topic,
+                by = claims.subject,
+                at_level = "admin",
+                "sent for a person"
+            );
+            return self
+                .ask_for(&topic, payload_type, message, &claims.subject)
+                .await;
         }
         if let Some(account) = &account {
             let configuration = self.configuration(now).await?;
@@ -241,7 +271,17 @@ impl Sidecar {
         }
         let subject = match acting_for {
             None => String::new(),
-            Some(assertion) => self.vouched_writer(&assertion, account.as_deref(), now)?,
+            Some(assertion) => {
+                let subject = self.vouched_writer(&assertion, account.as_deref(), now)?;
+                tracing::info!(
+                    instance = self.instance_id(),
+                    topic,
+                    by = subject,
+                    at_level = "write",
+                    "sent for a person"
+                );
+                subject
+            }
         };
         self.ask_for(&topic, payload_type, message, &subject).await
     }
@@ -270,15 +310,16 @@ impl Sidecar {
         mirrored(payload)
     }
 
-    /// The deployment admin an assertion vouches for, or the refusal: the
-    /// deployment's configuration is sent to only for one (W6.4), and never
-    /// by the plugin as itself.
+    /// The claims of an admin of this plugin an assertion vouches for, in a
+    /// session opened by Manage, or the refusal: the deployment's
+    /// configuration is sent to only for one (W4.9, W6.4), and never by the
+    /// plugin as itself.
     fn vouched_admin(
         &self,
         topic: &str,
         acting_for: Option<&CallerAssertion>,
         now_ns: i64,
-    ) -> Result<String, Status> {
+    ) -> Result<CallerClaims, Status> {
         let refuse = |refusal: String| {
             self.note_refusal(&refusal);
             Err(Status::permission_denied(refusal))
@@ -286,7 +327,7 @@ impl Sidecar {
         let Some(assertion) = acting_for else {
             return refuse(format!(
                 "{topic} is the deployment's configuration: a plugin sends it only acting for \
-                 a deployment admin, and this carries no assertion"
+                 an admin of the plugin, and this carries no assertion"
             ));
         };
         let verifier = self.verifier.as_ref().ok_or_else(|| {
@@ -297,14 +338,36 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
-        if !claims.deployment_admin {
+        if claims.level != AccessLevel::Admin as i32 {
             return refuse(format!(
                 "{topic} is the deployment's configuration: a plugin sends it only acting for \
-                 a deployment admin, and {} is not one",
-                claims.subject
+                 an admin of the plugin in a session opened by Manage, and {}'s is {}",
+                claims.subject,
+                session_named(claims.level)
             ));
         }
-        Ok(claims.subject)
+        Ok(claims)
+    }
+
+    /// A link naming a new account, rather than an existing one, is a
+    /// deployment admin's: creating an account stays theirs (W6.3, W6.4).
+    fn names_a_new_account_only_for_a_deployment_admin(
+        &self,
+        link: &[u8],
+        claims: &CallerClaims,
+    ) -> Result<(), Status> {
+        let link = LinkExternalAccountRequest::decode(link)
+            .map_err(|failed| Status::internal(format!("the link did not read: {failed}")))?;
+        if link.new_account_name.is_empty() || claims.deployment_admin {
+            return Ok(());
+        }
+        let refusal = format!(
+            "{} is an admin of this plugin and not a deployment admin: a link names an \
+             existing account, and only a deployment admin names a new one",
+            claims.subject
+        );
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
     }
 
     /// A link names an external account this plugin said its connection
@@ -359,9 +422,22 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        // A command only in a session opened by Open: one under Manage
+        // reaches no account's data, and one under View acts on nothing
+        // (W6.9).
+        if claims.level != AccessLevel::Write as i32 {
+            let refusal = format!(
+                "{} sent this in a {} session, and a command is sent for a person only in \
+                 a session at write, opened by Open",
+                claims.subject,
+                session_named(claims.level)
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::permission_denied(refusal));
+        }
         // The accounts the person may write through this plugin, whole: a
-        // person's access to a plugin is read or write, with nothing finer
-        // (decisions/026).
+        // person's access to a plugin is read, write or admin, with nothing
+        // finer (decisions/026, 027).
         let may_write = &claims.write_account_ids;
         match account {
             Some(account) if !may_write.iter().any(|held| held == account) => {
@@ -374,6 +450,16 @@ impl Sidecar {
             )),
             _ => Ok(claims.subject),
         }
+    }
+}
+
+/// A session as the person chose it, for a refusal: by its button.
+fn session_named(level: i32) -> &'static str {
+    match AccessLevel::try_from(level) {
+        Ok(AccessLevel::Admin) => "Manage (admin)",
+        Ok(AccessLevel::Write) => "Open (write)",
+        Ok(AccessLevel::Read) => "View (read)",
+        _ => "level-less",
     }
 }
 

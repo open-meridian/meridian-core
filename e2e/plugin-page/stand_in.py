@@ -17,12 +17,19 @@ counts the unlinked on its health, and shows the sync state with what to do.
 Its admin pages link them (W6.4), as a plugin's own admin page does: a GET of
 /accounts reads the deployment's accounts, and a POST to /link sends a link
 -- to an existing account, a new one named, or neither to remove it -- each
-acting for the person the request came from, whom the sidecar admits only
-when they administer the deployment. /link with "as_itself" sends it as the
-plugin, which the sidecar refuses. It declares three admin pages, which the
-dashboard's admin view of it shows as tabs (W4.8, W6.9); a GET of one is a
-small page on the UI kit saying which it is and who asked, and the Accounts
-page what it would offer to link.
+acting for the person the request came from, whom the sidecar admits only in
+a session opened by Manage, and a new account only for a deployment admin.
+/link with "as_itself" sends it as the plugin, which the sidecar refuses.
+
+It is a plugin built before contract v5: it registers declaring v4 and two
+admin pages in the list v5 retired (`admin_pages`, field 3), written on the
+wire by hand so it does not matter which bindings the SDK's image carries.
+The sidecar reads them as pages at `admin`, in order, which the dashboard's
+plugin area shows under Manage (W4.8, W6.9); its `/` is its page at `write`
+and `read`, since it declares none. A GET of an admin page is a small page on
+the UI kit saying which it is and who asked, and the Accounts page what it
+would offer to link; it is served only in a session at `admin`, as the SDK
+checks a page's levels where it is declared, and refused otherwise.
 
 It declares two settings at registration (W4.1): a required secret, the way a
 venue's API key is, and a number. It watches them on the stream its sidecar
@@ -55,12 +62,14 @@ EXTERNAL_ACCOUNT = "ext-e2e"
 OTHER_ACCOUNT = "ext-e2e-roth"
 
 STARTED_AT_NS = time.time_ns()
-# Its admin pages, in the order the dashboard's admin view shows them as tabs.
+# Its admin pages, in the order the plugin area shows them under Manage.
 ADMIN_PAGES = [
-    sidecar_pb2.PageDeclaration(path="/admin/connections", title="Connections"),
-    sidecar_pb2.PageDeclaration(path="/admin/accounts", title="Accounts"),
-    sidecar_pb2.PageDeclaration(path="/admin/holdings", title="Holdings"),
+    ("/admin/connections", "Connections"),
+    ("/admin/accounts", "Account links"),
 ]
+# The claims' level (CallerClaims field 11), read off the wire whatever the
+# bindings in the image know of it.
+ADMIN = 3
 DECLARED = [
     sidecar_pb2.SettingDeclaration(
         name="api_key", type=sidecar_pb2.SETTING_TYPE_STRING, required=True, secret=True,
@@ -74,17 +83,45 @@ HELD = {"deliveries": 0, "values": {}, "missing_required": [], "registrations": 
 HELD_LOCK = threading.Lock()
 
 
+def put_varint(value):
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def put(number, value):
+    """A length-delimited field."""
+    return put_varint(number << 3 | 2) + put_varint(len(value)) + value
+
+
+def older_registration():
+    """What a plugin built on an SDK declaring v4 sends: its admin pages as
+    InterfaceDeclaration field 3, which v5 reserved."""
+    interface = put_varint(1 << 3) + put_varint(PORT) + put(2, b"Plugin page")
+    for path, title in ADMIN_PAGES:
+        interface += put(3, put(1, path.encode()) + put(2, title.encode()))
+    request = put(4, b"v4") + put(5, interface)
+    for setting in DECLARED:
+        request += put(6, setting.SerializeToString())
+    return request
+
+
 def register():
-    stub = sidecar_pb2_grpc.SidecarServiceStub(grpc.insecure_channel(SIDECAR))
-    request = sidecar_pb2.RegisterRequest(
-        schema_version="v2",
-        interface=sidecar_pb2.InterfaceDeclaration(
-            loopback_port=PORT, title="Plugin page", admin_pages=ADMIN_PAGES),
-        settings=DECLARED,
+    register_call = grpc.insecure_channel(SIDECAR).unary_unary(
+        "/meridian.v1.SidecarService/Register",
+        request_serializer=lambda raw: raw,
+        response_deserializer=sidecar_pb2.RegisterReply.FromString,
     )
+    request = older_registration()
     for _ in range(60):
         try:
-            reply = stub.Register(request, timeout=2)
+            reply = register_call(request, timeout=2)
         except grpc.RpcError:
             time.sleep(1)
             continue
@@ -243,7 +280,7 @@ def admin_page(path, header):
     """One of its admin pages, on the kit: which it is, for whom, and on the
     Accounts page what it reaches and the deployment's accounts it offers."""
     import html
-    title = next(page.title for page in ADMIN_PAGES if page.path == path)
+    title = next(title for page, title in ADMIN_PAGES if page == path)
     caller = decoded(header) if header else {}
     rows = ""
     if path == "/admin/accounts":
@@ -261,10 +298,44 @@ def admin_page(path, header):
             f"{'yes' if caller.get('deployment_admin') else 'no'}.</p>{rows}</main></body></html>")
 
 
+def level_of(claims):
+    """CallerClaims field 11, the session's level: 0 when absent."""
+    at = 0
+    while at < len(claims):
+        key, at = varint_at(claims, at)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, at = varint_at(claims, at)
+            if number == 11:
+                return value
+        elif wire == 2:
+            length, at = varint_at(claims, at)
+            at += length
+        elif wire == 1:
+            at += 8
+        elif wire == 5:
+            at += 4
+        else:
+            return 0
+    return 0
+
+
+def varint_at(data, at):
+    shift = value = 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, at
+
+
 def decoded(header):
     assertion = assertion_of(header)
     claims = sidecar_pb2.CallerClaims.FromString(assertion.claims)
     return {
+        "level": level_of(assertion.claims),
         "key_id": assertion.key_id,
         "subject": claims.subject,
         "display_name": claims.display_name,
@@ -288,7 +359,16 @@ class Page(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path.split("?", 1)[0] in {page.path for page in ADMIN_PAGES}:
+        if self.path.split("?", 1)[0] in {page for page, _ in ADMIN_PAGES}:
+            # Declared at admin, and served there alone.
+            if not callers or level_of(assertion_of(callers[0]).claims) != ADMIN:
+                body = b"this page is served in a session opened by Manage"
+                self.send_response(403)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = admin_page(self.path.split("?", 1)[0], callers[0] if callers else None).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

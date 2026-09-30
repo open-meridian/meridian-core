@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccessLevel, AccessRecords, AccessRecordsRequest, AccountGroup,
-    AccountRecord, AccountState, Accounts, AccountsRequest, ClaimCodePurpose, CloseAccountRequest,
+    AccessEntry, AccessGroup, AccessRecords, AccessRecordsRequest, AccountGroup, AccountRecord,
+    AccountState, Accounts, AccountsRequest, ClaimCodePurpose, CloseAccountRequest,
     DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
     DefineUserGroupRequest, DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink,
     GrantPermissionRequest, LinkExternalAccountRequest, Permission, PluginConfiguration,
@@ -14,7 +14,7 @@ use meridian_domain::v1::{
     PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest,
     SignInRecord, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
-use meridian_pb::v1::{SettingChoice, SettingDeclaration, SettingType};
+use meridian_pb::v1::{AccessLevel, SettingChoice, SettingDeclaration, SettingType};
 use prost::Message;
 
 use crate::service::*;
@@ -469,7 +469,7 @@ async fn an_access_entry_names_a_plugin_that_has_reported_and_a_level() {
     let no_level = access_group(&h, vec![entry(AccessLevel::Unspecified)])
         .await
         .unwrap_err();
-    assert!(no_level.contains("read or write"), "{no_level}");
+    assert!(no_level.contains("read, write or admin"), "{no_level}");
 
     let mut unknown = entry(AccessLevel::Read);
     unknown.plugin_instance_id = "never-reported".into();
@@ -1265,7 +1265,11 @@ fn it_is_written_once_however_often_the_conductor_restarts() {
     assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
 
     let records = store.snapshot().unwrap().records;
-    assert_eq!(records.permissions.len(), 1);
+    assert_eq!(
+        records.permissions.len(),
+        2,
+        "deployment admin and All plugins (admin), once"
+    );
 }
 
 #[test]
@@ -1286,7 +1290,9 @@ fn an_administrator_who_arrived_another_way_is_left_alone() {
         account_group_id: String::new(),
         access_group_id: DEPLOYMENT_ADMIN.into(),
     };
-    store.install_first_admin(&group, &permission).unwrap();
+    store
+        .install_first_admin(&group, std::slice::from_ref(&permission))
+        .unwrap();
 
     assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
     assert_eq!(store.snapshot().unwrap().records.permissions.len(), 1);
@@ -1671,4 +1677,208 @@ async fn a_secret_that_no_longer_opens_is_withheld_rather_than_sent_sealed() {
         records(&h).await.plugin_settings[0].secrets_set,
         ["api_key"]
     );
+}
+
+// ── A plugin has admins; the built-in groups (2026-09-30) ─────────────────
+
+#[tokio::test]
+async fn an_access_group_names_a_plugin_at_admin_and_one_data_level_at_most() {
+    let h = harness("dashboard-1");
+    assert!(access_group(&h, vec![entry(AccessLevel::Admin)])
+        .await
+        .is_ok());
+    assert!(
+        access_group(
+            &h,
+            vec![entry(AccessLevel::Write), entry(AccessLevel::Admin)]
+        )
+        .await
+        .is_ok(),
+        "admin beside a data level"
+    );
+    let both = access_group(
+        &h,
+        vec![entry(AccessLevel::Read), entry(AccessLevel::Write)],
+    )
+    .await
+    .unwrap_err();
+    assert!(both.contains("both read and write"), "{both}");
+    let twice = access_group(
+        &h,
+        vec![entry(AccessLevel::Admin), entry(AccessLevel::Admin)],
+    )
+    .await
+    .unwrap_err();
+    assert!(twice.contains("twice"), "{twice}");
+    let none = access_group(&h, vec![entry(AccessLevel::Unspecified)])
+        .await
+        .unwrap_err();
+    assert!(none.contains("read, write or admin"), "{none}");
+}
+
+#[tokio::test]
+async fn a_permission_granting_only_admin_names_no_account_group() {
+    let h = harness("dashboard-1");
+    let people = user_group(&h).await;
+    let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
+    let admins = access_group(&h, vec![entry(AccessLevel::Admin)])
+        .await
+        .unwrap();
+    let refused = grant(
+        &h,
+        &people.user_group_id,
+        &growth.account_group_id,
+        &admins.access_group_id,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("names no account group"), "{refused}");
+    assert!(
+        grant(&h, &people.user_group_id, "", &admins.access_group_id)
+            .await
+            .is_ok()
+    );
+
+    // And the group, granted so, cannot gain a data entry, which would need
+    // an account group it has none of.
+    let mut widened = admins.clone();
+    widened.entries.push(entry(AccessLevel::Read));
+    let refused: Result<AccessGroup, String> = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(widened),
+        },
+    )
+    .await;
+    assert!(refused.unwrap_err().contains("needs one"));
+
+    // A group with a data entry beside admin still names one.
+    let operators = access_group(
+        &h,
+        vec![entry(AccessLevel::Write), entry(AccessLevel::Admin)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        grant(&h, &people.user_group_id, "", &operators.access_group_id)
+            .await
+            .is_err()
+    );
+    assert!(grant(
+        &h,
+        &people.user_group_id,
+        &growth.account_group_id,
+        &operators.access_group_id
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn all_plugins_admin_and_all_accounts_are_built_in() {
+    let h = harness("dashboard-1");
+    let people = user_group(&h).await;
+    let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
+    let before = records(&h).await;
+    assert!(before
+        .access_groups
+        .iter()
+        .any(|g| g.access_group_id == meridian_access::ALL_PLUGINS_ADMIN && g.built_in));
+    assert!(before
+        .account_groups
+        .iter()
+        .any(|g| g.account_group_id == meridian_access::ALL_ACCOUNTS && g.built_in));
+
+    // Neither is edited.
+    let edited: Result<AccessGroup, String> = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(AccessGroup {
+                access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
+                name: "Everything".into(),
+                ..Default::default()
+            }),
+        },
+    )
+    .await;
+    assert!(edited.unwrap_err().contains("built in"));
+    let edited: Result<AccountGroup, String> = ask(
+        &h,
+        DEFINE_ACCOUNT_GROUP,
+        "meridian.v1.DefineAccountGroupRequest",
+        DefineAccountGroupRequest {
+            account_group: Some(AccountGroup {
+                account_group_id: meridian_access::ALL_ACCOUNTS.into(),
+                name: "Some accounts".into(),
+                ..Default::default()
+            }),
+        },
+    )
+    .await;
+    assert!(edited.unwrap_err().contains("built in"));
+
+    // All plugins (admin) names no account group, and may be withdrawn.
+    assert!(grant(
+        &h,
+        &people.user_group_id,
+        &growth.account_group_id,
+        meridian_access::ALL_PLUGINS_ADMIN
+    )
+    .await
+    .is_err());
+    let linked = grant(
+        &h,
+        &people.user_group_id,
+        "",
+        meridian_access::ALL_PLUGINS_ADMIN,
+    )
+    .await
+    .unwrap();
+    let withdrawn: WithdrawPermissionReply = ask(
+        &h,
+        WITHDRAW_PERMISSION,
+        "meridian.v1.WithdrawPermissionRequest",
+        WithdrawPermissionRequest {
+            permission_id: linked.permission_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(withdrawn.withdrawn);
+
+    // All accounts is named like any other.
+    let readers = access_group(&h, vec![entry(AccessLevel::Read)])
+        .await
+        .unwrap();
+    assert!(grant(
+        &h,
+        &people.user_group_id,
+        meridian_access::ALL_ACCOUNTS,
+        &readers.access_group_id
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn a_claim_code_links_the_first_deployment_admin_to_all_plugins_admin() {
+    let h = harness("dashboard-1");
+    *h.platform.redeem.lock().unwrap() = true;
+    assert!(redeem(&h, ADA).await.redeemed);
+    let after = records(&h).await;
+    let granted: Vec<&str> = after
+        .permissions
+        .iter()
+        .map(|p| p.access_group_id.as_str())
+        .collect();
+    assert_eq!(
+        granted,
+        [DEPLOYMENT_ADMIN, meridian_access::ALL_PLUGINS_ADMIN]
+    );
+    let ada = meridian_access::person_access(&after, ADA, &[]);
+    assert!(ada.deployment_admin && ada.administers("oms-1"));
 }

@@ -355,15 +355,19 @@ with sync_playwright() as playwright:
     if BY == "password":
         signed_in_at_the_form(page)
     page.goto(f"{DASHBOARD}/")
-    link = page.locator(f"a[href='/plugins/{INSTANCE}']")
-    check(link.count() == 1, f"home links {INSTANCE} for its administrator, who holds no access on it")
+    # First run linked the administrators to All plugins (admin) (W7.6): the
+    # home offers her Manage on it, and no data level (W6.9).
+    link = page.locator(f"a.plugin-level[data-level='admin'][href='/plugins/{INSTANCE}?level=admin']")
+    check(link.count() == 1, f"home offers Manage on {INSTANCE} to its administrator, who holds no data on it")
     if link.count() == 1:
         link.click()
         page.wait_for_load_state()
-        # The dashboard's frame, under its header; the page itself is read
-        # through the frame's way in, which opens it in a window of its own.
-        check(page.locator("iframe[data-plugin-frame]").count() == 1,
-              "opened in the dashboard's frame")
+        # The plugin's area under Manage, its admin page in the dashboard's
+        # seamless frame -- a plugin built before v5, declaring none, has its
+        # /admin -- the page itself read through the frame's way in, which
+        # opens it in a window of its own.
+        check(page.locator("iframe[data-plugin-frame][data-seamless]").count() == 1,
+              "opened in the plugin's area, seamlessly framed")
         # A pod's first seconds are refused by the cluster's policy engine,
         # and the plugin's sidecar may still be joining: once more if so.
         for _ in range(10):
@@ -422,9 +426,10 @@ with sync_playwright() as playwright:
 
     # The permission reaches the plugin's sidecar after the dashboard says it
     # was granted, not with it: looked for again until it has.
+    # Opened by View, the level she now holds on it besides Manage (W6.9).
     deadline = time.monotonic() + 60
     while True:
-        page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter")
+        page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter?level=read")
         page.wait_for_load_state()
         shown = "<td>custody</td>" in page.content()
         if shown or time.monotonic() > deadline:
@@ -437,8 +442,8 @@ with sync_playwright() as playwright:
     )
     said = statement(page, CUSTODY)
     check(
-        said.startswith("Refused") and "may write nothing" in said,
-        f"while she only reads, the sidecar refuses the statement she asked for: {said}",
+        said.startswith("Refused") and "View (read)" in said,
+        f"while she only reads, the sidecar refuses the statement she asked for under View: {said}",
     )
 
     administer(
@@ -446,7 +451,10 @@ with sync_playwright() as playwright:
         {"access_group_id": access_group or "", "name": "Custody copy users",
          "entries": f"{CUSTODY} write"},
     )
-    # The sidecar reads the plugin's write scope again within 30 seconds.
+    # Opened by Open now she writes; the sidecar reads the plugin's write
+    # scope again within 30 seconds.
+    page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter?level=write")
+    page.wait_for_load_state()
     deadline = time.monotonic() + 90
     said = statement(page, CUSTODY)
     while not said.startswith("Opened statement") and time.monotonic() < deadline:

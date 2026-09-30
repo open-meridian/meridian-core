@@ -2,18 +2,21 @@
 //!
 //! Each returns a sentence naming what was wrong, because the person reading
 //! it is a deployment admin at a form, and "invalid request" tells them
-//! nothing. Refusals are the spec's: deployment admin is built in; an access
-//! entry names a plugin that has reported and a level, and no tag
-//! (decisions/026); a permission to deployment admin
-//! names no account group and every other names one; a setting is one its
-//! plugin declared, in a form its declared type reads.
+//! nothing. Refusals are the spec's: deployment admin, All plugins (admin)
+//! and All accounts are built in; an access entry names a plugin that has
+//! reported and a level, `read`, `write` or `admin`, and no tag (decisions/026,
+//! 027), and a group names a plugin at `admin` and at one data level at most;
+//! a permission to a built-in access group, or to one granting only `admin`,
+//! names no account group, and every other names one (W6.8); a setting is one
+//! its plugin declared, in a form its declared type reads.
 
 use std::collections::BTreeSet;
 
+use meridian_access::{is_built_in_access_group, AccessLevel, ALL_ACCOUNTS};
 use meridian_domain::account;
 use meridian_domain::v1::{
-    AccessGroup, AccessLevel, AccountGroup, AccountState, DefineAccountRequest,
-    GrantPermissionRequest, LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
+    AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
+    LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
 };
 use meridian_pb::v1::{SettingDeclaration, SettingType};
 
@@ -157,6 +160,16 @@ pub fn user_group(snapshot: &Snapshot, group: &UserGroup) -> Verdict {
 }
 
 pub fn account_group(snapshot: &Snapshot, group: &AccountGroup) -> Verdict {
+    let built_in = group.built_in
+        || group.account_group_id == ALL_ACCOUNTS
+        || snapshot
+            .records
+            .account_groups
+            .iter()
+            .any(|g| g.account_group_id == group.account_group_id && g.built_in);
+    if built_in {
+        return Err("All accounts is built in, holds every account, and cannot be edited".into());
+    }
     required(&group.name, "an account group's name")?;
     if !group.account_group_id.is_empty() {
         exists(
@@ -178,8 +191,18 @@ pub fn account_group(snapshot: &Snapshot, group: &AccountGroup) -> Verdict {
 }
 
 pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
-    if group.access_group_id == DEPLOYMENT_ADMIN || group.built_in {
+    if group.access_group_id == DEPLOYMENT_ADMIN {
         return Err("deployment admin is built in, and cannot be edited".into());
+    }
+    if is_built_in_access_group(&group.access_group_id)
+        || group.built_in
+        || snapshot
+            .records
+            .access_groups
+            .iter()
+            .any(|g| g.access_group_id == group.access_group_id && g.built_in)
+    {
+        return Err("All plugins (admin) is built in, and cannot be edited".into());
     }
     required(&group.name, "an access group's name")?;
     if !group.access_group_id.is_empty() {
@@ -201,15 +224,66 @@ pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
                 entry.plugin_instance_id
             ));
         }
-        let known = [AccessLevel::Read as i32, AccessLevel::Write as i32];
+        let known = [
+            AccessLevel::Read as i32,
+            AccessLevel::Write as i32,
+            AccessLevel::Admin as i32,
+        ];
         if !known.contains(&entry.level) {
             return Err(format!(
-                "an access entry for {} names no level; it is read or write",
+                "an access entry for {} names no level; it is read, write or admin",
                 entry.plugin_instance_id
             ));
         }
     }
+    // A plugin at `admin` and at one data level at most: write already
+    // includes read, and one level twice says nothing more (W6.7).
+    for (at, entry) in group.entries.iter().enumerate() {
+        for earlier in &group.entries[..at] {
+            if earlier.plugin_instance_id != entry.plugin_instance_id {
+                continue;
+            }
+            if earlier.level == entry.level {
+                return Err(format!(
+                    "{} is named twice at one level",
+                    entry.plugin_instance_id
+                ));
+            }
+            let data = |level: i32| level != AccessLevel::Admin as i32;
+            if data(earlier.level) && data(entry.level) {
+                return Err(format!(
+                    "{} is named at both read and write; write already includes read",
+                    entry.plugin_instance_id
+                ));
+            }
+        }
+    }
+    // A group already granted without an account group -- one granting only
+    // admin -- cannot gain a read or write entry, which would need one (W6.8).
+    if !group.access_group_id.is_empty() && reaches_data(group) {
+        if let Some(granted) =
+            snapshot.records.permissions.iter().find(|p| {
+                p.access_group_id == group.access_group_id && p.account_group_id.is_empty()
+            })
+        {
+            return Err(format!(
+                "permission {} grants this group with no account group, and a read or \
+                 write entry needs one: withdraw it, or grant the data level in another group",
+                granted.permission_id
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether an access group has a `read` or `write` entry, which a permission
+/// to it joins to an account group; one granting only `admin` reaches no
+/// account, and a permission to it names none (W6.8).
+fn reaches_data(group: &AccessGroup) -> bool {
+    group
+        .entries
+        .iter()
+        .any(|entry| entry.level != AccessLevel::Admin as i32)
 }
 
 /// An access entry names a plugin and a level, and nothing else: a plugin
@@ -243,8 +317,8 @@ pub fn names_no_tag(define_access_group: &[u8]) -> Verdict {
     match (read, named) {
         (None, _) => Err("an access group that does not decode".into()),
         (Some(()), true) => Err(
-            "an access entry names a plugin and a level, `read` or `write`, and no tag: \
-             a plugin declares no tags (decisions/026)"
+            "an access entry names a plugin and a level, `read`, `write` or `admin`, and no \
+             tag: a plugin declares no tags (decisions/026)"
                 .into(),
         ),
         (Some(()), false) => Ok(()),
@@ -307,12 +381,20 @@ pub fn grant(snapshot: &Snapshot, request: &GrantPermissionRequest) -> Verdict {
         "access group",
     )?;
 
-    if request.access_group_id == DEPLOYMENT_ADMIN {
+    let access_group = records
+        .access_groups
+        .iter()
+        .find(|g| g.access_group_id == request.access_group_id)
+        .expect("checked to exist above");
+    let admin_only = !access_group.entries.is_empty() && !reaches_data(access_group);
+    if is_built_in_access_group(&request.access_group_id) || admin_only {
+        // Configuring a plugin, or the deployment, is not an act on an
+        // account (decisions/027, W6.8).
         if !request.account_group_id.is_empty() {
-            return Err(
-                "a permission to deployment admin names no account group; it reaches every account"
-                    .into(),
-            );
+            return Err(format!(
+                "a permission to {} names no account group: it reaches no account's data",
+                access_group.name
+            ));
         }
     } else {
         required(&request.account_group_id, "the account group")?;

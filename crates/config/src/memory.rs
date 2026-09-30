@@ -21,14 +21,18 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
-    /// Starts as a fresh deployment does: deployment admin exists, and nobody
-    /// holds it.
+    /// Starts as a fresh deployment does: deployment admin, All plugins
+    /// (admin) and All accounts exist, and nobody holds any of them.
     pub fn new() -> Self {
         let mut snapshot = Snapshot::default();
+        snapshot.records.access_groups.extend([
+            crate::deployment_admin(),
+            crate::service::all_plugins_admin(),
+        ]);
         snapshot
             .records
-            .access_groups
-            .push(crate::deployment_admin());
+            .account_groups
+            .push(crate::service::all_accounts());
         Self {
             state: Mutex::new(snapshot),
         }
@@ -140,7 +144,7 @@ impl Store for MemoryStore {
         Ok(Withdrawal::Withdrawn)
     }
 
-    fn install_first_admin(&self, group: &UserGroup, permission: &Permission) -> Result<bool> {
+    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool> {
         let mut state = self.state.lock().expect("store lock poisoned");
         if state
             .records
@@ -151,7 +155,10 @@ impl Store for MemoryStore {
             return Ok(false);
         }
         state.records.user_groups.push(group.clone());
-        state.records.permissions.push(permission.clone());
+        state
+            .records
+            .permissions
+            .extend(permissions.iter().cloned());
         Ok(true)
     }
 

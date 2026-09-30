@@ -1,8 +1,8 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
 //! Eleven commands and queries from the dashboard, two queries from sidecars,
-//! a command and a query from a plugin acting for a deployment admin, two
-//! events heard, one announced. Every change is written the same way:
+//! a command and a query from a plugin acting for its admin, two events
+//! heard, one announced. Every change is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
 //! again only when something it would be told has changed.
@@ -32,12 +32,13 @@
 //!
 //! # A plugin's own external accounts
 //!
-//! A plugin links its external accounts from its own admin page, and reads
-//! the deployment's accounts to offer, each acting for the deployment admin
-//! viewing it (W6.4). Its sidecar admits either only with an assertion saying
-//! the person is one, and stamps them; here, a link or a read naming nobody is
-//! refused, a plugin links only its own external accounts, and a link naming
-//! a new account creates and links it in one step.
+//! A plugin links its external accounts from one of its pages at `admin`, and
+//! reads the deployment's accounts to offer, each acting for the admin of the
+//! plugin viewing it (W6.4). Its sidecar admits either only with an assertion
+//! whose level is `admin`, a session opened by Manage, a new account only for
+//! a deployment admin, and stamps the person; here, a link or a read naming
+//! nobody is refused, a plugin links only its own external accounts, and a
+//! link naming a new account creates and links it in one step.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -116,7 +117,8 @@ pub trait Upstream: Send + Sync {
     ) -> Result<DiagnosticBundleReceipt, String>;
 }
 
-/// The built-in access group, as the store seeds it.
+/// The built-in access group of the dashboard's own capabilities, as the
+/// store seeds it.
 pub fn deployment_admin() -> meridian_domain::v1::AccessGroup {
     meridian_domain::v1::AccessGroup {
         access_group_id: DEPLOYMENT_ADMIN.into(),
@@ -124,6 +126,43 @@ pub fn deployment_admin() -> meridian_domain::v1::AccessGroup {
         entries: Vec::new(),
         built_in: true,
     }
+}
+
+/// The built-in access group granting `admin` on every plugin, as the store
+/// seeds it (W6.7).
+pub fn all_plugins_admin() -> meridian_domain::v1::AccessGroup {
+    meridian_domain::v1::AccessGroup {
+        access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
+        name: "All plugins (admin)".into(),
+        entries: Vec::new(),
+        built_in: true,
+    }
+}
+
+/// The built-in account group holding every account, as the store seeds it
+/// (W6.6).
+pub fn all_accounts() -> meridian_domain::v1::AccountGroup {
+    meridian_domain::v1::AccountGroup {
+        account_group_id: meridian_access::ALL_ACCOUNTS.into(),
+        name: "All accounts".into(),
+        account_ids: Vec::new(),
+        built_in: true,
+    }
+}
+
+/// The permissions that make a user group the deployment's administrators:
+/// one to deployment admin, and one to All plugins (admin), as first run and a
+/// claim code both write them (W6.2, W7.6).
+fn administrators(user_group_id: &str, now: i64) -> Vec<Permission> {
+    [DEPLOYMENT_ADMIN, meridian_access::ALL_PLUGINS_ADMIN]
+        .into_iter()
+        .map(|access_group| Permission {
+            permission_id: ids::permission(now),
+            user_group_id: user_group_id.to_string(),
+            account_group_id: String::new(),
+            access_group_id: access_group.into(),
+        })
+        .collect()
 }
 
 /// A plugin's settings as stored: the ones it declared, secrets still sealed.
@@ -352,15 +391,10 @@ pub fn install_named_administrator(
             false => vec![login.to_string()],
         },
     };
-    let permission = Permission {
-        permission_id: ids::permission(now),
-        user_group_id: group.user_group_id.clone(),
-        account_group_id: String::new(),
-        access_group_id: DEPLOYMENT_ADMIN.into(),
-    };
+    let permissions = administrators(&group.user_group_id, now);
 
     store
-        .install_first_admin(&group, &permission)
+        .install_first_admin(&group, &permissions)
         .map_err(|failed| failed.to_string())
 }
 
@@ -372,14 +406,15 @@ pub(crate) fn subject(envelope: &Envelope) -> String {
         .unwrap_or_default()
 }
 
-/// The deployment admin a plugin's sidecar vouched for and stamped, or the
-/// refusal: a plugin reaches the deployment's configuration only acting for
-/// one (W6.4), and what it does there is recorded as theirs.
-fn deployment_admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
+/// The admin of the plugin its sidecar vouched for, in a session opened by
+/// Manage, and stamped; or the refusal: a plugin reaches the deployment's
+/// configuration only acting for one (W4.9, W6.4), and what it does there is
+/// recorded as theirs.
+fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
     let by = subject(envelope);
     if by.is_empty() {
         return Err(format!(
-            "{what} is a deployment admin's to ask for, and this is sent for nobody"
+            "{what} is an admin of the plugin's to ask for, and this is sent for nobody"
         ));
     }
     Ok(by)
@@ -624,7 +659,7 @@ pub fn serve(
             "meridian.v1.ExternalAccountLink",
         ),
         |cx, request: LinkExternalAccountRequest, envelope| {
-            let by = deployment_admin_acting(envelope, "a link")?;
+            let by = admin_acting(envelope, "a link")?;
             if publisher(envelope) != request.plugin_instance_id {
                 return Err(format!(
                     "a plugin links only its own external accounts, and this names {}",
@@ -681,7 +716,7 @@ pub fn serve(
         ACCOUNTS,
         ("meridian.v1.AccountsRequest", "meridian.v1.Accounts"),
         |cx, _: AccountsRequest, envelope| {
-            deployment_admin_acting(envelope, "the deployment's accounts")?;
+            admin_acting(envelope, "the deployment's accounts")?;
             // Each account as the configuration holds it, its custodian,
             // type, owner and note with it: nothing of who may read them,
             // and no holdings, which are not the configuration's.
@@ -898,15 +933,10 @@ pub fn serve(
                 directory_groups: Vec::new(),
                 logins: vec![redeemer.clone()],
             };
-            let permission = Permission {
-                permission_id: ids::permission(now),
-                user_group_id: group.user_group_id.clone(),
-                account_group_id: String::new(),
-                access_group_id: DEPLOYMENT_ADMIN.into(),
-            };
+            let permissions = administrators(&group.user_group_id, now);
             let installed = cx
                 .store
-                .install_first_admin(&group, &permission)
+                .install_first_admin(&group, &permissions)
                 .map_err(|f| f.to_string())?;
             if !installed {
                 // Another redemption won between the check and now. The code

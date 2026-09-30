@@ -325,8 +325,8 @@ where
         .expect("a delivery, not a refusal")
 }
 
-/// What the dashboard signs for a deployment admin opening the plugin's page,
-/// which the page hands back to act for them (W4.9).
+/// What the dashboard signs for a deployment admin opening the plugin's page
+/// by Manage, which the page hands back to act for them (W4.9, W6.9).
 fn deployment_admin(key: &SigningKey) -> CallerAssertion {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -340,6 +340,7 @@ fn deployment_admin(key: &SigningKey) -> CallerAssertion {
         expires_at_ns: issued + 60_000_000_000,
         assertion_id: "a-link-1".into(),
         deployment_admin: true,
+        level: meridian_pb::v1::AccessLevel::Admin as i32,
         ..Default::default()
     }
     .encode_to_vec();
