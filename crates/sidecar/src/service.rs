@@ -439,7 +439,7 @@ mod tests {
 
     fn register_req() -> RegisterRequest {
         RegisterRequest {
-            schema_version: "v2".into(),
+            schema_version: "v3".into(),
             ..Default::default()
         }
     }
@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v3"] {
+        for declared in ["v1", "v4"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -503,9 +503,23 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v2"));
+            assert!(reply.refusal_reason.contains("v2 through v3"));
             assert!(sc.registration().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_built_on_the_last_contract_still_registers() {
+        // The current version rose and the floor stayed: a plugin built on an
+        // SDK declaring v2 is admitted, and reported with the version it gave.
+        let sc = sidecar();
+        let mut req = register_req();
+        req.schema_version = "v2".into();
+
+        let reply = sc.register(Request::new(req)).await.unwrap().into_inner();
+        assert!(reply.admitted, "{}", reply.refusal_reason);
+        let registered = sc.registration().expect("registered");
+        assert_eq!(registered.contract_version, "v2");
     }
 
     #[tokio::test]

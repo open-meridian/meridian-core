@@ -30,9 +30,23 @@
 /// repositories.
 pub const CONTRACT_FLOOR: u32 = 2;
 
-/// The contract this sidecar implements. v2 is typed operations, acting-for,
-/// and the settings, access and scope streams (spec/typed-sidecar-operations).
-pub const CONTRACT_CURRENT: u32 = 2;
+/// The contract this sidecar implements.
+///
+/// Raised by every revision that adds something a plugin can depend on -- an
+/// operation, a field on a stream or a response, a refusal code -- while the
+/// floor stays, so older plugins keep registering and a plugin built for the
+/// newer contract is refused by an older sidecar rather than running without
+/// what it was built to read (sdk-contract/an-addition-raises-the-contract-version,
+/// ruled 2026-09-30, after a plugin reading its links from the account-scope
+/// stream registered with a sidecar that sent none).
+///
+/// v2 is typed operations, acting-for, and the settings, access and scope
+/// streams (spec/typed-sidecar-operations). v3 is everything a plugin gained
+/// after v2 was cut: reporting its external accounts and linking them, the
+/// account side's fields, the caller's deployment-admin flag, what a setting
+/// and an admin page declare, its links on the account-scope stream, and the
+/// refusal code beside a refusal.
+pub const CONTRACT_CURRENT: u32 = 3;
 
 /// Admit a plugin's declared contract version, or say why not.
 ///
@@ -46,12 +60,9 @@ pub fn admit(declared: &str) -> Result<u32, String> {
 
 /// The rule itself, over any range.
 ///
-/// Separate from [`admit`] so the rule can be tested over a range that spans
-/// versions. Today the floor and the current version are both 1, so there is
-/// no older version to admit and no way to prove the property this module
-/// exists for using the real constants. The day typed operations raise the
-/// current version to 2, `admit` starts exercising exactly what is proved
-/// below.
+/// Separate from [`admit`] so the rule can be tested over any range, including
+/// the one an older sidecar holds: a plugin built for this sidecar's contract
+/// meeting one still at the last.
 pub fn admit_within(floor: u32, current: u32, declared: &str) -> Result<u32, String> {
     let accepts = format!("v{floor} through v{current}");
 
@@ -98,18 +109,34 @@ mod tests {
     // what the contract promises they will see.
 
     #[test]
-    fn the_current_contract_is_admitted() {
-        assert_eq!(admit("v2"), Ok(2));
+    fn a_plugin_built_for_the_current_contract_is_admitted() {
+        assert_eq!(admit("v3"), Ok(3));
     }
 
     #[test]
-    fn an_older_contract_inside_the_range_is_admitted() {
-        // The property this module exists for, and the one an equality check
-        // fails: a plugin built against v1 keeps registering with a sidecar
-        // that has moved on to v2. Under `declared == current` this is refused.
+    fn a_plugin_built_before_the_last_addition_still_registers() {
+        // The floor stays when the current version rises: a plugin built on
+        // an SDK declaring v2 keeps registering with this sidecar. Under
+        // `declared == current` it would be refused.
+        assert_eq!(admit("v2"), Ok(2));
         assert_eq!(admit_within(1, 2, "v1"), Ok(1));
-        assert_eq!(admit_within(1, 2, "v2"), Ok(2));
-        assert_ne!("v1", "v2", "an equality check would have refused the first");
+    }
+
+    #[test]
+    fn a_plugin_built_for_this_contract_is_refused_by_a_sidecar_at_the_last() {
+        // On 2026-09-30 a plugin built to read its links from the
+        // account-scope stream met a sidecar from before links, registered,
+        // and ran with none, because both said v2. Declaring v3, it is refused
+        // by a sidecar still at v2, naming both.
+        assert_eq!(
+            admit_within(2, 2, "v3"),
+            Err(
+                "the plugin was built against contract v3, newer than this sidecar \
+                 (v2 through v2); upgrade the runtime, or rebuild the plugin against \
+                 v2 or earlier"
+                    .into()
+            )
+        );
     }
 
     #[test]
@@ -127,7 +154,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v2); rebuild it against v2 or later"
+                 (v2 through v3); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -136,11 +163,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v3"),
+            admit("v4"),
             Err(
-                "the plugin was built against contract v3, newer than this sidecar \
-                 (v2 through v2); upgrade the runtime, or rebuild the plugin against \
-                 v2 or earlier"
+                "the plugin was built against contract v4, newer than this sidecar \
+                 (v2 through v3); upgrade the runtime, or rebuild the plugin against \
+                 v3 or earlier"
                     .into()
             )
         );
@@ -151,7 +178,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v2"
+                "the plugin declared no contract version; this sidecar accepts v2 through v3"
                     .into()
             )
         );
