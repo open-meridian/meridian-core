@@ -6,15 +6,15 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
-    ExternalAccountLink, PluginConfigurationChangedEvent, PluginReport, PluginSettingValue,
-    UnlinkedExternalAccountsEvent,
+    AccountRecord, ExternalAccountLink, PluginConfigurationChangedEvent, PluginReport,
+    PluginSettingValue, UnlinkedExternalAccountsEvent,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::RecordHoldingParams;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    PluginAccessReply, RegisterRequest, SettingChoice, SettingCondition, SettingType,
-    UserGroupAccess, WatchAccountScopeRequest, WatchSettingsRequest,
+    LinkedExternalAccount, PluginAccessReply, RegisterRequest, SettingChoice, SettingCondition,
+    SettingType, UserGroupAccess, WatchAccountScopeRequest, WatchSettingsRequest,
 };
 use tokio_stream::StreamExt;
 use tonic::{Code, Request};
@@ -318,6 +318,94 @@ async fn the_account_scope_arrives_at_once_and_again_when_it_changes() {
     announce(&bus);
     let changed = next(&mut scope).await;
     assert_eq!(changed.write_account_ids, vec!["ACC-1"]);
+}
+
+fn linked(external: &str, account: &str) -> ExternalAccountLink {
+    ExternalAccountLink {
+        plugin_instance_id: "snaptrade-1".into(),
+        external_account_id: external.into(),
+        account_id: account.into(),
+    }
+}
+
+fn account(account: &str, name: &str) -> AccountRecord {
+    AccountRecord {
+        account_id: account.into(),
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_plugins_links_arrive_beside_its_scope_each_with_its_accounts_name() {
+    // W4.11: sent at once, so a plugin that has just started has them.
+    let (sidecar, bus, held) = registered().await;
+    {
+        let mut held = held.lock().unwrap();
+        held.links = vec![linked("st-4471", "ACC-1")];
+        held.linked_accounts = vec![account("ACC-1", "Individual Brokerage")];
+    }
+    let mut scope = sidecar
+        .watch_account_scope(Request::new(WatchAccountScopeRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = next(&mut scope).await;
+    assert_eq!(
+        first.links,
+        vec![LinkedExternalAccount {
+            external_account_id: "st-4471".into(),
+            account_id: "ACC-1".into(),
+            account_name: "Individual Brokerage".into(),
+        }]
+    );
+
+    // A link made, and the account it names renamed: one delivery with both.
+    {
+        let mut held = held.lock().unwrap();
+        held.links.push(linked("st-9902", "ACC-3"));
+        held.linked_accounts = vec![
+            account("ACC-1", "Brokerage (joint)"),
+            account("ACC-3", "Roth IRA"),
+        ];
+    }
+    announce(&bus);
+    let changed = next(&mut scope).await;
+    let named: Vec<(&str, &str, &str)> = changed
+        .links
+        .iter()
+        .map(|link| {
+            (
+                link.external_account_id.as_str(),
+                link.account_id.as_str(),
+                link.account_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("st-4471", "ACC-1", "Brokerage (joint)"),
+            ("st-9902", "ACC-3", "Roth IRA")
+        ]
+    );
+
+    // Removed: the next delivery no longer names it.
+    held.lock().unwrap().links.remove(0);
+    announce(&bus);
+    let removed = next(&mut scope).await;
+    assert_eq!(removed.links.len(), 1);
+    assert_eq!(removed.links[0].external_account_id, "st-9902");
+}
+
+#[test]
+fn a_link_whose_account_the_conductor_did_not_name_is_still_delivered_unnamed() {
+    let delivered = scope(&PluginConfiguration {
+        links: vec![linked("st-4471", "ACC-GONE")],
+        ..Default::default()
+    });
+    assert_eq!(delivered.links[0].account_id, "ACC-GONE");
+    assert_eq!(delivered.links[0].account_name, "");
 }
 
 #[tokio::test]

@@ -21,7 +21,8 @@ use meridian_pb::plugin::v1::{
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, RegisterRequest,
+    CallerAssertion, CallerClaims, InterfaceDeclaration, PageDeclaration, Refusal, RefusalReason,
+    RegisterRequest,
 };
 use prost::Message;
 use tonic::{Code, Request};
@@ -295,8 +296,22 @@ async fn an_unlinked_external_account_is_refused_and_nothing_recorded() {
             "{}",
             refused.message()
         );
+        assert_eq!(
+            reason(&refused),
+            Some(RefusalReason::ExternalAccountNotLinked),
+            "{external}: the code a plugin matches, beside the status"
+        );
     }
     assert!(recorded.lock().unwrap().is_empty());
+}
+
+/// The reason code a refusal carries beside its status, if any
+/// (spec/typed-sidecar-operations, section 7).
+fn reason(refused: &tonic::Status) -> Option<RefusalReason> {
+    let carried = refused.metadata().get_bin(crate::REFUSAL_METADATA)?;
+    let bytes = carried.to_bytes().expect("the code is base64 on the wire");
+    let refusal = Refusal::decode(bytes.as_ref()).expect("a Refusal");
+    RefusalReason::try_from(refusal.reason).ok()
 }
 
 #[tokio::test]
@@ -531,6 +546,11 @@ async fn nothing_is_served_before_registration() {
         "{}",
         refused.message()
     );
+    assert_eq!(
+        reason(&refused),
+        None,
+        "the same status as an unlinked account, told apart by carrying no code"
+    );
 }
 
 #[tokio::test]
@@ -605,6 +625,7 @@ async fn a_linked_account_nobody_may_write_through_the_plugin_is_refused() {
         "{}",
         refused.message()
     );
+    assert_eq!(reason(&refused), None, "linked, so not this code");
     assert!(recorded.lock().unwrap().is_empty());
     assert_eq!(
         sidecar.report(0).refused_grants,

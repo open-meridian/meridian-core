@@ -12,21 +12,28 @@
 
 use std::sync::Arc;
 
+use ed25519_dalek::{Signer as _, SigningKey};
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    ExternalAccountLink, ListCustodialPositionsReply, ListCustodialPositionsRequest,
-    PluginConfiguration,
+    DiagnosticBundle, DiagnosticBundleReceipt, ExternalAccountLink, ListCustodialPositionsReply,
+    ListCustodialPositionsRequest, PluginConfiguration, RedeemClaimCodeReply,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
-    Decimal, HoldingSide, Identifier, Money, RecordHoldingParams, RecordHoldingsStatementParams,
+    Decimal, ExternalAccount, HoldingSide, Identifier, LinkExternalAccountParams, Money,
+    RecordHoldingParams, RecordHoldingsStatementParams, ReportExternalAccountsParams,
     ResolveIdentifierParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::RegisterRequest;
+use meridian_pb::v1::{
+    AccountScopeDelivery, CallerAssertion, CallerClaims, LinkedExternalAccount, Refusal,
+    RefusalReason, RegisterRequest, WatchAccountScopeRequest,
+};
+use meridian_sidecar::front_door::Verifier;
 use meridian_sidecar::{Contract, Identity, Sidecar};
 use prost::Message;
+use tokio_stream::StreamExt;
 use tonic::Request;
 
 const NOW: i64 = 1_757_376_000_000_000_000;
@@ -283,6 +290,193 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
     assert_eq!(listed.positions.len(), 1);
     assert_eq!(listed.positions[0].instrument_id, resolved.instrument_id);
     assert!(listed.unresolved.is_empty());
+}
+
+// ── W4.11, W6.4: a link reaches the plugin that made it ─────────────────────
+
+/// Nothing upstream: this conductor is asked for configuration alone.
+struct NoPlatform;
+
+impl meridian_config::Upstream for NoPlatform {
+    fn honour_claim_code(&self, _: &str, _: i32) -> Result<RedeemClaimCodeReply, String> {
+        Err("no platform in this test".into())
+    }
+
+    fn submit_diagnostic_bundle(
+        &self,
+        _: &DiagnosticBundle,
+    ) -> Result<DiagnosticBundleReceipt, String> {
+        Err("no platform in this test".into())
+    }
+}
+
+const DASHBOARD_KEY: &str = "dashboard-2026-09";
+
+/// The stream's next delivery, or a failure rather than a wait that never
+/// ends.
+async fn next<S>(scope: &mut S) -> AccountScopeDelivery
+where
+    S: tokio_stream::Stream<Item = Result<AccountScopeDelivery, tonic::Status>> + Unpin,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(5), scope.next())
+        .await
+        .expect("a delivery within five seconds")
+        .expect("the stream is open")
+        .expect("a delivery, not a refusal")
+}
+
+/// What the dashboard signs for a deployment admin opening the plugin's page,
+/// which the page hands back to act for them (W4.9).
+fn deployment_admin(key: &SigningKey) -> CallerAssertion {
+    let issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let claims = CallerClaims {
+        subject: "local|ada".into(),
+        display_name: "Ada".into(),
+        audience_instance_id: "custody-snaptrade-1".into(),
+        issued_at_ns: issued,
+        expires_at_ns: issued + 60_000_000_000,
+        assertion_id: "a-link-1".into(),
+        deployment_admin: true,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    CallerAssertion {
+        signature: key.sign(&claims).to_bytes().to_vec(),
+        claims,
+        key_id: DASHBOARD_KEY.into(),
+    }
+}
+
+/// The conductor's configuration store as it runs, on the bus the plugin's
+/// sidecar is on: a link made through the plugin's own operation, acting for
+/// a deployment admin, reaches that plugin's scope stream with the account's
+/// name, and a row for the external account is refused with its code until
+/// then. No stand-in answers for the conductor here.
+#[tokio::test]
+async fn a_link_made_through_the_operation_reaches_the_plugins_scope_stream() {
+    // One bus, as `runtime` has: the memory bus answers a call from its own
+    // handlers, and every envelope on it names the plugin, as its sidecar's
+    // would, which is whom the conductor answers for.
+    let bus = Arc::new(Bus::single(
+        "custody-snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+    ));
+    let store = Arc::new(meridian_config::MemoryStore::new());
+    meridian_config::serve(
+        Arc::clone(&bus),
+        store.clone(),
+        Arc::new(meridian_config::SystemClock),
+        Arc::new(NoPlatform),
+        Arc::new(meridian_config::SettingsKey::holding(&[7u8; 32])),
+    );
+    // The plugin has reported to the conductor, as its sidecar does (W4.8).
+    meridian_config::Store::record_plugin(
+        store.as_ref(),
+        &meridian_config::KnownPlugin {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            roles: vec!["custody".into()],
+            last_reported_at_ns: NOW,
+        },
+    )
+    .unwrap();
+
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let sidecar = Sidecar::new(
+        bus,
+        "DEP-test",
+        Identity::new("custody-snaptrade-1", vec!["custody".to_string()]),
+    )
+    .with_verifier(Arc::new(Verifier::holding(
+        "custody-snaptrade-1",
+        DASHBOARD_KEY,
+        key.verifying_key(),
+    )));
+    admitted(&sidecar, "custody").await;
+
+    // Seeded on start: the stream opens with the scope and no links.
+    let mut scope = sidecar
+        .watch_account_scope(Request::new(WatchAccountScopeRequest {}))
+        .await
+        .expect("the scope is served")
+        .into_inner();
+    let first = next(&mut scope).await;
+    assert!(first.links.is_empty());
+
+    // The connection reaches ext-7 (W2.8); a row for it is refused, by code.
+    sidecar
+        .report_external_accounts(Request::new(ReportExternalAccountsParams {
+            accounts: vec![ExternalAccount {
+                external_account_id: "ext-7".into(),
+                name: "Individual Brokerage 1234".into(),
+                venue_account_type: "Individual".into(),
+            }],
+        }))
+        .await
+        .expect("reported");
+    let refused = sidecar
+        .record_holding(Request::new(RecordHoldingParams {
+            statement_id: "S-1".into(),
+            instrument_id: "INS-1".into(),
+            quantity: Some(Decimal {
+                high: 0,
+                low: 1,
+                scale: 0,
+            }),
+            external_account_id: "ext-7".into(),
+            side: HoldingSide::Long as i32,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("nothing links ext-7");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    let carried = refused
+        .metadata()
+        .get_bin(meridian_sidecar::REFUSAL_METADATA)
+        .expect("the refusal carries its code")
+        .to_bytes()
+        .unwrap();
+    assert_eq!(
+        Refusal::decode(carried.as_ref()).unwrap().reason,
+        RefusalReason::ExternalAccountNotLinked as i32
+    );
+
+    // A deployment admin links it to a new account from the plugin's page.
+    let linked = sidecar
+        .link_external_account(Request::new(LinkExternalAccountParams {
+            external_account_id: "ext-7".into(),
+            new_account_name: "Individual Brokerage".into(),
+            acting_for: Some(deployment_admin(&key)),
+            ..Default::default()
+        }))
+        .await
+        .expect("linked by the conductor")
+        .into_inner();
+    assert!(!linked.account_id.is_empty());
+
+    // The conductor's announcement reaches the stream: the link, named, and
+    // the account it grants in both scopes.
+    let changed = next(&mut scope).await;
+    assert_eq!(
+        changed.links,
+        vec![LinkedExternalAccount {
+            external_account_id: "ext-7".into(),
+            account_id: linked.account_id.clone(),
+            account_name: "Individual Brokerage".into(),
+        }]
+    );
+    assert!(changed.read_account_ids.contains(&linked.account_id));
+    assert!(changed.write_account_ids.contains(&linked.account_id));
+
+    // A plugin started now, on a stream of its own, has the same at once.
+    let mut restarted = sidecar
+        .watch_account_scope(Request::new(WatchAccountScopeRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(next(&mut restarted).await.links, changed.links);
 }
 
 /// The contract is what grants, so a revision of it that took away what a

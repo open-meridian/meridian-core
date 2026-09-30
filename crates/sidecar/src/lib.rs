@@ -28,6 +28,7 @@ mod typed;
 pub use contract::{admit_within, CONTRACT_CURRENT, CONTRACT_FLOOR};
 pub use grants::{Contract, Grants};
 pub use service::{Identity, Registration, Sidecar};
+pub use typed::REFUSAL_METADATA;
 
 /// The address a plugin expects its sidecar on.
 ///

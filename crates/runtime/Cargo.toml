@@ -71,3 +71,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
+# Signing a deployment admin's assertion, as the dashboard does, and reading
+# the plugin's scope stream, in the wiring test.
+ed25519-dalek.workspace = true
+tokio-stream.workspace = true

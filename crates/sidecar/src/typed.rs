@@ -19,15 +19,22 @@
 //! `failed_precondition` for an external account nobody has linked,
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
 //! did not answer in time, `aborted` when it answered with a refusal.
+//!
+//! Where one status covers refusals a plugin must tell apart, the refusal
+//! carries a reason code beside it, from the typed-operations refusal
+//! catalogue (spec/typed-sidecar-operations, section 7): a `Refusal`, encoded,
+//! in the trailing metadata [`REFUSAL_METADATA`]. A plugin acts on the code;
+//! the words are for a person reading a log, and may change.
 
 use meridian_bus::BusError;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1 as domain;
 use meridian_domain::v1::{ExternalAccountsEvent, LinkExternalAccountRequest};
 use meridian_pb::plugin::v1 as plugin;
-use meridian_pb::v1::CallerAssertion;
+use meridian_pb::v1::{CallerAssertion, Refusal, RefusalReason};
 use prost::Message;
-use tonic::{Response, Status};
+use tonic::metadata::{MetadataMap, MetadataValue};
+use tonic::{Code, Response, Status};
 
 use crate::service::Sidecar;
 
@@ -369,6 +376,24 @@ pub(crate) fn now_ns() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// Where a refusal's reason code travels, beside its status.
+pub const REFUSAL_METADATA: &str = "meridian-refusal-bin";
+
+/// A refusal with its reason code from the catalogue beside the status.
+pub(crate) fn refused_for(code: Code, words: String, reason: RefusalReason) -> Status {
+    let mut metadata = MetadataMap::new();
+    metadata.insert_bin(
+        REFUSAL_METADATA,
+        MetadataValue::from_bytes(
+            &Refusal {
+                reason: reason as i32,
+            }
+            .encode_to_vec(),
+        ),
+    );
+    Status::with_metadata(code, words, metadata)
 }
 
 pub(crate) fn refused(failed: BusError) -> Status {

@@ -792,6 +792,76 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     assert_eq!(read.links[0].account_id, growth_account.account_id);
 }
 
+#[tokio::test]
+async fn a_sidecar_is_told_the_accounts_its_links_name_and_when_one_is_renamed() {
+    // W4.11: the plugin's links reach it with each account's name, so a
+    // rename is a change to its configuration, announced like any other.
+    let h = harness("oms-1");
+    let linked_account = account(&h, "Growth").await;
+    let other = account(&h, "Income").await;
+    link_for(
+        &h,
+        link_request("oms-1", &linked_account.account_id, ""),
+        ADA,
+    )
+    .await
+    .unwrap();
+
+    async fn told(h: &Harness) -> PluginConfiguration {
+        ask(
+            h,
+            PLUGIN_CONFIGURATION,
+            "meridian.v1.PluginConfigurationRequest",
+            PluginConfigurationRequest {},
+        )
+        .await
+        .unwrap()
+    }
+    let configured = told(&h).await;
+    assert_eq!(
+        configured.linked_accounts,
+        std::slice::from_ref(&linked_account),
+        "the account its link names, and no other"
+    );
+
+    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let rename = |account_id: &str, name: &str| DefineAccountRequest {
+        account_id: account_id.into(),
+        name: name.into(),
+        ..Default::default()
+    };
+    let _: AccountRecord = ask(
+        &h,
+        DEFINE_ACCOUNT,
+        "meridian.v1.DefineAccountRequest",
+        rename(&other.account_id, "Income Fund"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), announced.recv())
+            .await
+            .is_err(),
+        "an account no link names moves no plugin"
+    );
+
+    let _: AccountRecord = ask(
+        &h,
+        DEFINE_ACCOUNT,
+        "meridian.v1.DefineAccountRequest",
+        rename(&linked_account.account_id, "Growth (joint)"),
+    )
+    .await
+    .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), announced.recv())
+        .await
+        .expect("announced")
+        .unwrap();
+    let event = PluginConfigurationChangedEvent::decode(&event.envelope.payload[..]).unwrap();
+    assert_eq!(event.plugin_instance_id, "oms-1");
+    assert_eq!(told(&h).await.linked_accounts[0].name, "Growth (joint)");
+}
+
 fn link_request(plugin: &str, account: &str, new_name: &str) -> LinkExternalAccountRequest {
     LinkExternalAccountRequest {
         plugin_instance_id: plugin.into(),

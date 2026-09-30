@@ -147,17 +147,33 @@ fn stored_settings<'a>(
 fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
     let scope =
         meridian_access::plugin_scope(&snapshot.records, &snapshot.links, plugin_instance_id);
+    let links: Vec<ExternalAccountLink> = snapshot
+        .links
+        .iter()
+        .filter(|link| link.plugin_instance_id == plugin_instance_id)
+        .cloned()
+        .collect();
+    // The accounts those links name, each once, so the sidecar can name them
+    // beside the plugin's scope (W4.11); a rename or a close of one is then a
+    // change to this plugin's configuration, and announced.
+    let linked_accounts = snapshot
+        .records
+        .accounts
+        .iter()
+        .filter(|account| {
+            links
+                .iter()
+                .any(|link| link.account_id == account.account_id)
+        })
+        .cloned()
+        .collect();
     PluginConfiguration {
         plugin_instance_id: plugin_instance_id.to_string(),
         settings: Vec::new(),
-        links: snapshot
-            .links
-            .iter()
-            .filter(|link| link.plugin_instance_id == plugin_instance_id)
-            .cloned()
-            .collect(),
+        links,
         read_account_ids: scope.read.into_iter().collect(),
         write_account_ids: scope.write.into_iter().collect(),
+        linked_accounts,
     }
 }
 

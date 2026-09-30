@@ -328,6 +328,12 @@ message PluginConfiguration {
   // The plugin's account scope, derived from permissions (decisions/014).
   repeated string read_account_ids = 4;
   repeated string write_account_ids = 5;
+
+  // The accounts this plugin's links name, each once, as the configuration
+  // holds them: for the sidecar to give its plugin each link's account name
+  // beside its scope (W4.11). A rename or a close of one is a change to the
+  // plugin's configuration, announced as any other.
+  repeated AccountRecord linked_accounts = 6;
 }
 
 // Something in a plugin's configuration changed; its sidecar asks again.

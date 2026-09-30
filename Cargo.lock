@@ -1857,7 +1857,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=840b0933782878db55f904b6d9c28e0fb5edb9b9#840b0933782878db55f904b6d9c28e0fb5edb9b9"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=418e8a54e14482edd2f586dedf85bd7766d77c8a#418e8a54e14482edd2f586dedf85bd7766d77c8a"
 dependencies = [
  "prost",
  "tonic",
@@ -1869,6 +1869,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bcrypt",
+ "ed25519-dalek",
  "libc",
  "meridian-bus",
  "meridian-conductor",
@@ -1885,6 +1886,7 @@ dependencies = [
  "rand 0.8.8",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

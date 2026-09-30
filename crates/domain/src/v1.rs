@@ -1411,6 +1411,12 @@ pub struct PluginConfiguration {
     pub read_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "5")]
     pub write_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The accounts this plugin's links name, each once, as the configuration
+    /// holds them: for the sidecar to give its plugin each link's account name
+    /// beside its scope (W4.11). A rename or a close of one is a change to the
+    /// plugin's configuration, announced as any other.
+    #[prost(message, repeated, tag = "6")]
+    pub linked_accounts: ::prost::alloc::vec::Vec<AccountRecord>,
 }
 /// Something in a plugin's configuration changed; its sidecar asks again.
 /// Carries no setting, so every sidecar may hear it.

@@ -1,5 +1,5 @@
 //! What a plugin learns from the deployment: its settings (W4.7), who may use
-//! it (W4.10) and its account scope (W4.11).
+//! it (W4.10) and its account scope with its links beside it (W4.11).
 //!
 //! The settings and the scope are streams: sent at once, and again whenever
 //! they change -- on the conductor's announcement, or at the latest when the
@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use meridian_domain::v1::PluginConfiguration;
 use meridian_pb::v1::{
-    AccountScopeDelivery, PluginAccessReply, PluginAccessRequest, SettingDeclaration, SettingValue,
-    SettingsDelivery,
+    AccountScopeDelivery, LinkedExternalAccount, PluginAccessReply, PluginAccessRequest,
+    SettingDeclaration, SettingValue, SettingsDelivery,
 };
 use prost::Message;
 use tokio_stream::Stream;
@@ -132,10 +132,28 @@ pub(crate) fn settings(
     }
 }
 
+/// The plugin's scope, and its links beside it (W4.11): each external account
+/// it links, the account that is, and that account's name as the conductor
+/// holds it. Only this plugin's, which the configuration already is.
 pub(crate) fn scope(configuration: &PluginConfiguration) -> AccountScopeDelivery {
+    let links = configuration
+        .links
+        .iter()
+        .map(|link| LinkedExternalAccount {
+            external_account_id: link.external_account_id.clone(),
+            account_id: link.account_id.clone(),
+            account_name: configuration
+                .linked_accounts
+                .iter()
+                .find(|account| account.account_id == link.account_id)
+                .map(|account| account.name.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
     AccountScopeDelivery {
         read_account_ids: configuration.read_account_ids.clone(),
         write_account_ids: configuration.write_account_ids.clone(),
+        links,
     }
 }
 

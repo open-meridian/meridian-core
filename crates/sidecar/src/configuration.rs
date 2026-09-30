@@ -22,6 +22,7 @@ use meridian_bus::Bus;
 use meridian_domain::v1::{
     PluginConfiguration, PluginConfigurationChangedEvent, PluginConfigurationRequest,
 };
+use meridian_pb::v1::RefusalReason;
 use prost::Message;
 use tokio::sync::{watch, Mutex};
 use tonic::Status;
@@ -179,7 +180,9 @@ impl Sidecar {
 
     /// The account an external account is linked to (W6.4), or the refusal
     /// that names what to do: a row for an unlinked account is refused, not
-    /// guessed at, and recorded once somebody links it.
+    /// guessed at, and recorded once somebody links it. The refusal carries
+    /// REFUSAL_REASON_EXTERNAL_ACCOUNT_NOT_LINKED, which a plugin matches
+    /// rather than the words.
     pub(crate) async fn linked_account(&self, external_account_id: &str) -> Result<String, Status> {
         if external_account_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -210,11 +213,15 @@ impl Sidecar {
                 seen.last_seen_at_ns = now;
                 drop(unlinked);
                 self.changed.notify_one();
-                Err(Status::failed_precondition(format!(
-                    "external account {external_account_id} is not linked to an account; a \
-                     deployment admin links it on the plugin's admin page (W6.4), and the next \
-                     statement records it"
-                )))
+                Err(crate::typed::refused_for(
+                    tonic::Code::FailedPrecondition,
+                    format!(
+                        "external account {external_account_id} is not linked to an account; a \
+                         deployment admin links it on the plugin's admin page (W6.4), and the \
+                         next statement records it"
+                    ),
+                    RefusalReason::ExternalAccountNotLinked,
+                ))
             }
         }
     }
