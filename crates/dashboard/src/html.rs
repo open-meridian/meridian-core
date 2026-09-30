@@ -304,11 +304,11 @@ const HOUSE: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\
      stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
 /// A deployment admin's way between the two sides: a gear to Settings from
-/// the dashboard, a house to the Dashboard from Settings. Named for a screen
+/// the dashboard, a house Home from Settings. Named for a screen
 /// reader and a pointer alike, since it has no words.
 fn side_button(in_admin: bool) -> String {
     let (href, name, icon) = if in_admin {
-        ("/", "Dashboard", HOUSE)
+        ("/", "Home", HOUSE)
     } else {
         ("/admin", "Settings", GEAR)
     };
@@ -565,11 +565,11 @@ pub fn page_with(title: &str, body: &str, chrome: &Chrome) -> String {
 }
 
 fn header(chrome: &Chrome) -> String {
-    // Home is the Dashboard: a crumb as any other page's last one.
+    // Home: a crumb as any other page's last one.
     let crumbs = format!(
         "<nav class=\"crumbs\" aria-label=\"Where you are\">{}</nav>",
         if chrome.crumbs.is_empty() {
-            crumb_here("Dashboard", None)
+            crumb_here("Home", None)
         } else {
             chrome.crumbs.clone()
         }
@@ -773,7 +773,7 @@ mod tests {
         );
         assert!(side.contains(GEAR) && !side.contains(HOUSE), "{side}");
         assert!(
-            !head.contains("aria-label=\"Dashboard\""),
+            !head.contains("aria-label=\"Home\""),
             "and not the side they are on"
         );
         let in_admin = page_with(
@@ -788,7 +788,7 @@ mod tests {
         let head = in_admin.split("</header>").next().unwrap();
         assert!(
             head.contains(&format!(
-                "<a class=\"bar-link side\" href=\"/\" aria-label=\"Dashboard\" title=\"Dashboard\">{HOUSE}</a>"
+                "<a class=\"bar-link side\" href=\"/\" aria-label=\"Home\" title=\"Home\">{HOUSE}</a>"
             )) && !head.contains("aria-label=\"Settings\""),
             "in Settings, a house back to the Dashboard, and only that: {head}"
         );
@@ -843,11 +843,11 @@ mod tests {
                 .expect("the crumbs")
                 .to_string()
         };
-        // Home: the Dashboard, as any page's last crumb.
+        // Home, as any page's last crumb.
         let home = crumbs(&Chrome::default());
         assert_eq!(
             home,
-            "<span class=\"here\" aria-current=\"page\">Dashboard</span>"
+            "<span class=\"here\" aria-current=\"page\">Home</span>"
         );
         assert!(!STYLE.contains(".where"), "no crumb of a style of its own");
         // Deeper: links back, then where the person is, named, its ID on hover.
