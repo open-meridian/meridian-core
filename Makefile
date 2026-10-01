@@ -1406,7 +1406,13 @@ interop: network
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop up -d --build street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
+	@# --no-deps: everything the suite reaches is up already, and the three
+	@# sidecars share the custody one's network namespace. A run that started
+	@# its dependencies could recreate that sidecar -- Compose 2.37.1 to 2.38.x
+	@# leave a Bake-built container's image label empty and recreate it on the
+	@# next convergence (docker/compose#13047) -- and the suite would join the
+	@# new namespace, where 9191 answers and 9192 and 9193 never do.
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm --no-deps -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
 		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
