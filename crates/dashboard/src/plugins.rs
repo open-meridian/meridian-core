@@ -40,8 +40,9 @@
 //! dashboard's heading and tab row are the only ones; the page's header
 //! actions (`meridian:actions`) are drawn in the area's head, and its status
 //! dot (`meridian:status`, kit 0.7.0) right after the plugin's name title.
-//! Under Manage, the dashboard draws one tab itself, first: the plugin's
-//! status and its settings form (`crate::admin::manage_tab`), not framed.
+//! Under Manage, the dashboard draws two tabs itself, first, not framed:
+//! Summary, the plugin's status (`crate::admin::summary_tab`), where Manage
+//! opens, and Settings, its settings form (`crate::admin::settings_tab`).
 //! The person's theme reaches the page as meridian-ui reads it: on first load
 //! as `om-scheme`, `om-mode` and `om-direction` on the page's address, and on
 //! change, and on every load of the frame, as the `meridian:theme` message
@@ -690,7 +691,7 @@ pub(crate) async fn frame(
     let tabs = crate::area::tabs(reports.get(&instance), level);
     // A path asked for directly is its tab's, or one of its own under the
     // level's pages; otherwise the tab asked for, or the first: under Manage,
-    // the dashboard's own Settings, drawn here rather than framed. A path
+    // the dashboard's own Summary, drawn here rather than framed. A path
     // asked for is always framed, under the first of the plugin's tabs when
     // it is none of theirs.
     let asked_path = asked
@@ -729,9 +730,9 @@ pub(crate) async fn frame(
             src: entrance(&instance, path, level, &theme.clone().seamless()),
             origin: plugins.origin(&instance),
         },
-        // The dashboard's Settings, under Manage alone: may_open has held
-        // the session to a level the person holds, and only `admin` has the
-        // tab.
+        // The dashboard's Summary or Settings, under Manage alone: may_open
+        // has held the session to a level the person holds, and only `admin`
+        // has the tabs.
         None => {
             let now = app.clock.now_ns();
             let records = match app.records.current(now) {
@@ -743,7 +744,7 @@ pub(crate) async fn frame(
                 Some("none") => "Nothing was changed.",
                 _ => "",
             };
-            crate::area::Shown::Drawn(crate::admin::manage_tab(&crate::admin::Manage {
+            let manage = crate::admin::Manage {
                 instance: &instance,
                 records: &records,
                 report: reports.get(&instance),
@@ -751,7 +752,14 @@ pub(crate) async fn frame(
                 session: &session,
                 notice,
                 now,
-            }))
+            };
+            crate::area::Shown::Drawn(
+                if current.is_some_and(|tab| tab.key == crate::area::SETTINGS) {
+                    crate::admin::settings_tab(&manage)
+                } else {
+                    crate::admin::summary_tab(&manage)
+                },
+            )
         }
     };
     let held = access.held(&instance);
@@ -788,9 +796,9 @@ pub(crate) async fn frame(
 
 /// Where a person entering at `level` with no page named lands: the first
 /// page the plugin declares at that level, the area's first framed tab
-/// there (under Manage, the one after the dashboard's own Settings), and
-/// its `/` only where it declares none. A `/` serving Open and View alone
-/// would refuse Manage with the plugin's 403.
+/// there (under Manage, the one after the dashboard's own Summary and
+/// Settings), and its `/` only where it declares none. A `/` serving Open
+/// and View alone would refuse Manage with the plugin's 403.
 fn first_page(app: &App, instance: &str, level: AccessLevel) -> String {
     crate::area::tabs(app.health.view().get(instance), level)
         .into_iter()

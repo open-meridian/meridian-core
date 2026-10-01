@@ -138,6 +138,7 @@ section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display
 .plugin-view nav.tabs{margin-bottom:1rem}.plugin-view .stack>*+*{margin-top:1.25rem}\
 .plugin-area nav.tabs{margin-bottom:var(--space-5)}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
+.figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
 color:var(--ink-faint);font-size:.88rem}\
 .plugin-area .area-title{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-area .area-title h1{min-width:0}\

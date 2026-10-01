@@ -362,12 +362,14 @@ with sync_playwright() as playwright:
     if link.count() == 1:
         link.click()
         page.wait_for_load_state()
-        # The plugin's area under Manage, its admin page in the dashboard's
-        # seamless frame -- a plugin built before v5, declaring none, has its
-        # /admin -- the page itself read through the frame's way in, which
-        # opens it in a window of its own.
-        check(page.locator("iframe[data-plugin-frame][data-seamless]").count() == 1,
-              "opened in the plugin's area, seamlessly framed")
+        # The plugin's area under Manage, opened on the dashboard's own
+        # Summary tab, its status drawn there and nothing framed; its admin
+        # page then read through the frame's way in, which opens it in a
+        # window of its own.
+        check(page.locator("a[data-tab='summary'][aria-current='page']").count() == 1
+              and page.locator("#plugin-page #status").count() == 1
+              and page.locator("iframe[data-plugin-frame]").count() == 0,
+              "opened in the plugin's area, on its Summary")
         # A pod's first seconds are refused by the cluster's policy engine,
         # and the plugin's sidecar may still be joining: once more if so.
         for _ in range(10):

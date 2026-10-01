@@ -14,10 +14,10 @@
 //! request. A plugin's tabs, `/admin/plugins/{instance}`, are its admins' --
 //! a deployment admin being one through All plugins (admin) -- and a
 //! deployment admin's for what is theirs on it; its settings are its admins'
-//! alone (W6.9 to W6.11, decisions/027). The same settings form, and the
-//! plugin's status, are drawn in the plugin's area under Manage too
-//! ([`manage_tab`]), posted to `/plugins/{instance}/settings` under the same
-//! guard.
+//! alone (W6.9 to W6.11, decisions/027). The plugin's status is drawn in the
+//! plugin's area under Manage, on its Summary ([`summary_tab`]), and the same
+//! settings form on its Settings ([`settings_tab`]), posted to
+//! `/plugins/{instance}/settings` under the same guard.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -604,7 +604,7 @@ async fn set_settings(
 }
 
 /// `POST /plugins/{instance}/settings`: the form, from the plugin's area
-/// under Manage ([`manage_tab`]), back to its Settings tab there.
+/// under Manage ([`settings_tab`]), back to its Settings tab there.
 async fn set_settings_in_area(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -652,7 +652,7 @@ async fn save_settings(
     after_to(outcome, &format!("{back}&saved=1"), back)
 }
 
-/// What the dashboard's Settings tab in a plugin's area under Manage shows.
+/// What the dashboard's own tabs in a plugin's area under Manage show.
 pub(crate) struct Manage<'a> {
     pub instance: &'a str,
     pub records: &'a AccessRecords,
@@ -664,15 +664,20 @@ pub(crate) struct Manage<'a> {
     pub now: i64,
 }
 
-/// The dashboard's Settings tab in a plugin's area under Manage (the product
-/// owner, 2026-10-01: "build Settings and the status panel under Manage"):
+/// The id of the place on Summary where the figures the plugin reports will
+/// be drawn as tiles (sdk-contract/a-plugin-reports-its-figures). Until the
+/// contract carries them it is empty, unlabelled and takes no room: nothing
+/// a person would read as missing.
+pub(crate) const FIGURES: &str = "figures";
+
+/// The dashboard's Summary tab in a plugin's area under Manage, where Manage
+/// opens (the product owner, 2026-10-01: "think Status, Connections, Account
+/// Reached, and Last Read can be their own Summary page", core drawing it):
 /// its status -- health, its why the badge's note, the version running and
 /// the contract it registered with, and the place kept for what will change
-/// them -- then the admin portal's settings form, posted to the area's own
-/// address. Nothing of the deployment's and no account's data: a plugin
-/// admin's, of this plugin alone.
-pub(crate) fn manage_tab(manage: &Manage) -> String {
-    let instance = manage.instance;
+/// them -- then the place for the figures it reports ([`FIGURES`]). What is
+/// core's to say, so a plugin cannot misreport it.
+pub(crate) fn summary_tab(manage: &Manage) -> String {
     let state = crate::health::state(manage.report, manage.now);
     let (badge, why) = view::state_badge(&state, "status-note");
     let said = |value: Option<&str>, otherwise: &str| {
@@ -691,13 +696,23 @@ pub(crate) fn manage_tab(manage: &Manage) -> String {
         manage.report.map(|report| report.contract_version.as_str()),
         "not said",
     );
-    let status = format!(
+    format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
          <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
-         holding it at one will be here. They are not built yet.</p></section>"
-    );
+         holding it at one will be here. They are not built yet.</p></section>\
+         <section class=\"figures\" id=\"{FIGURES}\"></section>"
+    )
+}
+
+/// The dashboard's Settings tab in a plugin's area under Manage (the product
+/// owner, 2026-10-01: "build Settings and the status panel under Manage"):
+/// the admin portal's settings form alone, posted to the area's own address.
+/// Nothing of the deployment's and no account's data: a plugin admin's, of
+/// this plugin alone.
+pub(crate) fn settings_tab(manage: &Manage) -> String {
+    let instance = manage.instance;
     let form = match settings_of(manage.records, instance) {
         Some(record) => settings::form_to(
             record,
@@ -715,7 +730,7 @@ pub(crate) fn manage_tab(manage: &Manage) -> String {
         format!("<p class=\"notice good\">{}</p>", escape(manage.notice))
     };
     format!(
-        "{notice}{status}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
+        "{notice}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
          <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
          once set: type a new value to replace it.</p>{form}</section>"
     )

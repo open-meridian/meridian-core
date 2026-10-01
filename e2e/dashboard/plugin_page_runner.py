@@ -563,12 +563,18 @@ def main():
     check(frame.status == 303
           and (frame.location or "").startswith(f"/plugins/{INSTANCE}/enter?path=%2F&level=read&om-scheme=default"),
           f"View: its / , declaring no page at read (W4.8): {frame.status} {frame.location!r}")
-    # Manage opens on the dashboard's own Settings tab, drawn by the
-    # dashboard and so in this window, whatever the frames.
+    # Manage opens on the dashboard's own Summary tab, drawn by the
+    # dashboard and so in this window, whatever the frames: the plugin's
+    # status, with its settings on the Settings tab after it.
     frame = ada.get(dash(f"/plugins/{INSTANCE}?level=admin"))
     check(frame.status == 200 and 'id="status"' in frame.body
-          and 'id="settings"' in frame.body and "<iframe" not in frame.body,
-          f"Manage: the dashboard's Settings tab first: {frame.status} {sentence(frame)}")
+          and 'id="settings"' not in frame.body and "<iframe" not in frame.body
+          and 'data-tab="summary" data-drawn class="here"' in frame.body,
+          f"Manage: the dashboard's Summary tab first: {frame.status} {sentence(frame)}")
+    frame = ada.get(dash(f"/plugins/{INSTANCE}?level=admin&tab=settings"))
+    check(frame.status == 200 and 'id="settings"' in frame.body
+          and 'id="status"' not in frame.body and "<iframe" not in frame.body,
+          f"Manage: the dashboard's Settings tab, the form alone: {frame.status} {sentence(frame)}")
     frame = ada.get(dash(f"/plugins/{INSTANCE}?level=admin&tab=connections"))
     check(frame.status == 303
           and (frame.location or "").startswith(

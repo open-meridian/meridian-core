@@ -28,6 +28,10 @@
 //! 2026-09-30: "Remove 'its settings and access' link"); a deployment admin
 //! reaches them from Settings, whose Plugins tab lists every instance.
 //!
+//! Under Manage the dashboard draws two tabs itself, before the plugin's:
+//! **Summary**, where Manage opens, and **Settings** (the product owner,
+//! 2026-10-01).
+//!
 //! A tab is a link, `?level=` the session's and `&tab=` the page's title in
 //! lower case, so each opens directly and none needs script.
 
@@ -47,9 +51,15 @@ pub struct Tab {
     pub drawn: bool,
 }
 
-/// The tab the dashboard draws first under Manage: the plugin's status and
-/// its settings form, the admin portal's, drawn here (the product owner,
-/// 2026-10-01: "build Settings and the status panel under Manage").
+/// The tab the dashboard draws first under Manage, and where Manage opens:
+/// the plugin's status, and the place for the figures it reports (the
+/// product owner, 2026-10-01: "think Status, Connections, Account Reached,
+/// and Last Read can be their own Summary page", core drawing it).
+pub const SUMMARY: &str = "summary";
+
+/// The tab the dashboard draws second under Manage: the plugin's settings
+/// form, the admin portal's, drawn here (the product owner, 2026-10-01:
+/// "build Settings and the status panel under Manage").
 pub const SETTINGS: &str = "settings";
 
 /// Where the dashboard's Settings tab posts the form, coming back to the
@@ -77,9 +87,9 @@ impl Tab {
 /// `/admin` is the one, as the admin view framed it then, so a plugin built
 /// before keeps its admin page; from a plugin built for v5, there is none.
 ///
-/// At `admin`, before them all, the dashboard's own Settings tab
-/// ([`SETTINGS`]): a page of the plugin's titled "Settings" is then
-/// `settings-2` in the query.
+/// At `admin`, before them all, the dashboard's own Summary and Settings tabs
+/// ([`SUMMARY`], [`SETTINGS`]): a page of the plugin's titled "Summary" or
+/// "Settings" is then `summary-2` or `settings-2` in the query.
 pub fn tabs(report: Option<&PluginReport>, level: AccessLevel) -> Vec<Tab> {
     let interface = report.and_then(|report| report.declared_interface.as_ref());
     let declared = interface
@@ -87,12 +97,14 @@ pub fn tabs(report: Option<&PluginReport>, level: AccessLevel) -> Vec<Tab> {
         .unwrap_or_default();
     let mut tabs: Vec<Tab> = Vec::new();
     if level == AccessLevel::Admin {
-        tabs.push(Tab {
-            key: SETTINGS.into(),
-            title: "Settings".into(),
-            path: String::new(),
-            drawn: true,
-        });
+        for (key, title) in [(SUMMARY, "Summary"), (SETTINGS, "Settings")] {
+            tabs.push(Tab {
+                key: key.into(),
+                title: title.into(),
+                path: String::new(),
+                drawn: true,
+            });
+        }
     }
     for page in declared
         .iter()
@@ -185,7 +197,7 @@ pub enum Shown {
     /// Framed seamlessly: the frame's way in, and the plugin's origin its
     /// theme goes to.
     Framed { src: String, origin: String },
-    /// A tab the dashboard draws itself ([`SETTINGS`]), as HTML.
+    /// A tab the dashboard draws itself ([`SUMMARY`], [`SETTINGS`]), as HTML.
     Drawn(String),
 }
 
@@ -349,24 +361,26 @@ mod tests {
                 .map(|tab| format!("{} {}", tab.key, tab.path))
                 .collect()
         };
-        // Under Manage, the dashboard's Settings first, then the plugin's
-        // own pages at admin (the product owner, 2026-10-01).
+        // Under Manage, the dashboard's Summary and Settings first, then the
+        // plugin's own pages at admin (the product owner, 2026-10-01).
         assert_eq!(
             titles(AccessLevel::Admin),
             [
+                "summary ",
                 "settings ",
                 "connections /admin/connections",
                 "account-links /admin/accounts"
             ]
         );
         let manage = tabs(Some(&snaptrade), AccessLevel::Admin);
-        assert!(manage[0].drawn && manage[0].title == "Settings");
-        assert!(manage[1..].iter().all(|tab| !tab.drawn));
+        assert!(manage[0].drawn && manage[0].title == "Summary");
+        assert!(manage[1].drawn && manage[1].title == "Settings");
+        assert!(manage[2..].iter().all(|tab| !tab.drawn));
         assert!(
             [AccessLevel::Write, AccessLevel::Read]
                 .into_iter()
                 .all(|level| tabs(Some(&snaptrade), level).iter().all(|tab| !tab.drawn)),
-            "no Settings under Open or View"
+            "no Summary or Settings under Open or View"
         );
         assert_eq!(titles(AccessLevel::Write), ["statements /statements"]);
         assert_eq!(
@@ -377,7 +391,8 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_with_no_page_at_write_or_read_has_its_root_and_none_at_admin_its_settings_alone() {
+    fn a_plugin_with_no_page_at_write_or_read_has_its_root_and_none_at_admin_the_dashboards_tabs_alone(
+    ) {
         let only_admin = report(&[("/admin", "Admin", ADMIN)]);
         let open = tabs(Some(&only_admin), AccessLevel::Write);
         assert_eq!(open.len(), 1);
@@ -386,9 +401,14 @@ mod tests {
             ("/", "SnapTrade")
         );
         let only_data = report(&[("/", "Home", DATA)]);
-        let manage = tabs(Some(&only_data), AccessLevel::Admin);
-        assert_eq!(manage.len(), 1);
-        assert!(manage[0].drawn && manage[0].key == SETTINGS);
+        let keys: Vec<(String, bool)> = tabs(Some(&only_data), AccessLevel::Admin)
+            .into_iter()
+            .map(|tab| (tab.key, tab.drawn))
+            .collect();
+        assert_eq!(
+            keys,
+            [(SUMMARY.to_string(), true), (SETTINGS.to_string(), true)]
+        );
         assert_eq!(tabs(None, AccessLevel::Read)[0].path, "/");
     }
 
@@ -399,10 +419,10 @@ mod tests {
             ..report(&[])
         };
         let manage = tabs(Some(&older), AccessLevel::Admin);
-        assert_eq!(manage.len(), 2);
-        assert!(manage[0].drawn);
+        assert_eq!(manage.len(), 3);
+        assert!(manage[0].drawn && manage[1].drawn);
         assert_eq!(
-            (manage[1].path.as_str(), manage[1].title.as_str()),
+            (manage[2].path.as_str(), manage[2].title.as_str()),
             ("/admin", "Admin page")
         );
         let newer = PluginReport {
@@ -410,7 +430,10 @@ mod tests {
             ..report(&[])
         };
         let manage = tabs(Some(&newer), AccessLevel::Admin);
-        assert!(manage.len() == 1 && manage[0].drawn, "its settings alone");
+        assert!(
+            manage.len() == 2 && manage.iter().all(|tab| tab.drawn),
+            "the dashboard's tabs alone"
+        );
     }
 
     #[test]
@@ -421,13 +444,24 @@ mod tests {
             ("/a", "Settings", ADMIN),
             ("/a", "Again", ADMIN),
             ("/b", "Settings", ADMIN),
+            ("/c", "Summary", ADMIN),
         ]);
         let keys: Vec<String> = tabs(Some(&odd), AccessLevel::Admin)
             .into_iter()
             .map(|tab| tab.key)
             .collect();
-        // The dashboard's Settings keeps its name; the plugin's are numbered.
-        assert_eq!(keys, ["settings", "settings-2", "settings-3"]);
+        // The dashboard's Summary and Settings keep their names; the
+        // plugin's are numbered.
+        assert_eq!(
+            keys,
+            [
+                "summary",
+                "settings",
+                "settings-2",
+                "settings-3",
+                "summary-2"
+            ]
+        );
     }
 
     #[test]
@@ -519,12 +553,12 @@ mod tests {
         assert_eq!(page.matches("<svg").count(), 1);
     }
 
-    /// The dashboard's own Settings tab sits in the one tab row with the
-    /// plugin's framed pages, first, and is drawn in the area's page, not
-    /// framed: no frame, no page to tell a status or actions, and no place
-    /// for either.
+    /// The dashboard's own Summary and Settings tabs sit in the one tab row
+    /// with the plugin's framed pages, first, and are drawn in the area's
+    /// page, not framed: no frame, no page to tell a status or actions, and
+    /// no place for either.
     #[test]
-    fn the_dashboards_settings_tab_is_drawn_in_the_area_first_in_the_one_tab_row() {
+    fn the_dashboards_tabs_are_drawn_in_the_area_first_in_the_one_tab_row() {
         let report = report(&[
             ("/admin/connections", "Connections", ADMIN),
             ("/admin/accounts", "Account links", ADMIN),
@@ -541,7 +575,7 @@ mod tests {
             level: AccessLevel::Admin,
             tabs: &manage,
             current: Some(&manage[0]),
-            shown: Shown::Drawn("<section id=\"settings\">the form</section>".into()),
+            shown: Shown::Drawn("<section id=\"status\">the status</section>".into()),
         });
         let nav = page
             .split("<nav class=\"tabs view-tabs\"")
@@ -551,16 +585,18 @@ mod tests {
         assert_eq!(
             nav,
             " aria-label=\"The plugin's pages\">\
-             <a href=\"/plugins/snaptrade?level=admin&amp;tab=settings\" data-tab=\"settings\" data-drawn \
-             class=\"here\" aria-current=\"page\">Settings</a>\
+             <a href=\"/plugins/snaptrade?level=admin&amp;tab=summary\" data-tab=\"summary\" data-drawn \
+             class=\"here\" aria-current=\"page\">Summary</a>\
+             <a href=\"/plugins/snaptrade?level=admin&amp;tab=settings\" data-tab=\"settings\" data-drawn>\
+             Settings</a>\
              <a href=\"/plugins/snaptrade?level=admin&amp;tab=connections\" data-tab=\"connections\" \
              data-page=\"/admin/connections\">Connections</a>\
              <a href=\"/plugins/snaptrade?level=admin&amp;tab=account-links\" data-tab=\"account-links\" \
              data-page=\"/admin/accounts\">Account links</a>"
         );
         assert!(page.contains(
-            "<div class=\"tab-body\" data-current=\"settings\"><div class=\"area-drawn\" id=\"plugin-page\">\
-             <section id=\"settings\">the form</section></div></div>"
+            "<div class=\"tab-body\" data-current=\"summary\"><div class=\"area-drawn\" id=\"plugin-page\">\
+             <section id=\"status\">the status</section></div></div>"
         ));
         for framed in ["<iframe", PAGE_STATUS, PAGE_ACTIONS] {
             assert!(!page.contains(framed), "{framed} in {page}");

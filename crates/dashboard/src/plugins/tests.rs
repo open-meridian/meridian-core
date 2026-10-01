@@ -1563,12 +1563,12 @@ async fn each_button_shows_the_pages_at_its_level_and_no_way_to_the_portal_even_
             .body
         }
     };
-    // Manage opens on the dashboard's own Settings, first in the tab row,
+    // Manage opens on the dashboard's own Summary, first in the tab row,
     // drawn here and not framed; the plugin's page at admin a tab away.
     let manage = area("admin").await;
     assert!(
         manage.contains(
-            "data-tab=\"settings\" data-drawn class=\"here\" aria-current=\"page\">Settings</a>"
+            "data-tab=\"summary\" data-drawn class=\"here\" aria-current=\"page\">Summary</a>"
         ),
         "{manage}"
     );
@@ -1719,15 +1719,17 @@ async fn post_form(h: &Harness, path: &str, form: &str) -> Answer {
     }
 }
 
-/// Under Manage the dashboard draws its own Settings tab first in the one
-/// tab row -- Settings, Connections, Account links for SnapTrade -- and the
-/// area opens on it (the product owner, 2026-10-01): the plugin's status
-/// above the admin portal's settings form, which posts to the area's own
-/// address, reaches the conductor as the person's, and comes back to the
-/// tab. A secret's field is always empty, and what was typed into it is in
-/// no page after.
+/// Under Manage the dashboard draws its own Summary and Settings tabs first
+/// in the one tab row -- Summary, Settings, Connections, Account links for
+/// SnapTrade -- and the area opens on Summary (the product owner,
+/// 2026-10-01): the plugin's status, and an empty place for the figures it
+/// will report. Settings is the admin portal's settings form alone, which
+/// posts to the area's own address, reaches the conductor as the person's,
+/// and comes back to the tab. A secret's field is always empty, and what was
+/// typed into it is in no page after.
 #[tokio::test]
-async fn under_manage_the_dashboard_draws_settings_and_status_first_and_never_shows_a_secret() {
+async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary_and_never_shows_a_secret(
+) {
     let h = harness(&[INSTANCE]).await;
     let mut held = admin_records();
     held.access_groups = records(&[INSTANCE]).access_groups;
@@ -1750,14 +1752,26 @@ async fn under_manage_the_dashboard_draws_settings_and_status_first_and_never_sh
         tab_row(body),
         (
             vec![
+                "summary".into(),
                 "settings".into(),
                 "connections".into(),
                 "account-links".into()
             ],
-            "settings".into()
+            "summary".into()
         )
     );
     assert!(!body.contains("<iframe"), "drawn, not framed: {body}");
+    // Named, it is the same Summary.
+    let named = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=admin&tab=summary"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(named.status, StatusCode::OK, "{}", named.body);
+    assert_eq!(tab_row(&named.body).1, "summary");
+    assert!(named.body.contains("id=\"status\""), "{}", named.body);
     // The status: its health, its why on hover, the version the catalogue
     // launched and the contract it registered with, and the place kept for
     // restarting and moving versions, which are not built yet.
@@ -1774,27 +1788,55 @@ async fn under_manage_the_dashboard_draws_settings_and_status_first_and_never_sh
     assert!(status.contains("<dd data-contract>v5</dd>"), "{status}");
     assert!(status.contains("data-reserved=\"lifecycle\""), "{status}");
     assert!(!status.contains("<button"), "a place kept, not buttons yet");
-    // Then the form, posted here, its secret's field empty.
-    assert!(body.find("id=\"status\"").unwrap() < body.find("id=\"settings\"").unwrap());
+    // Then the place for the plugin's figures: empty, and unlabelled, until
+    // the contract carries them. No settings form on Summary.
     assert!(
-        body.contains(&format!("action=\"/plugins/{INSTANCE}/settings\"")),
+        body.contains("</section><section class=\"figures\" id=\"figures\"></section></div>"),
         "{body}"
     );
+    assert!(!body.contains("id=\"settings\""), "{body}");
+    assert!(!body.contains("<form"), "{body}");
+
+    // Settings: the form alone, posted here, its secret's field empty.
+    let settings = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=admin&tab=settings"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(settings.status, StatusCode::OK, "{}", settings.body);
+    let settings = settings.body.split("</header>").nth(1).unwrap();
+    assert_eq!(tab_row(settings).1, "settings");
+    for summary in [
+        "id=\"status\"",
+        "id=\"figures\"",
+        "data-reserved",
+        "data-version",
+    ] {
+        assert!(!settings.contains(summary), "{summary} in {settings}");
+    }
     assert!(
-        body.contains("type=\"password\" name=\"secret.client_id\" value=\"\""),
-        "{body}"
+        settings.contains(&format!("action=\"/plugins/{INSTANCE}/settings\"")),
+        "{settings}"
+    );
+    assert!(
+        settings.contains("type=\"password\" name=\"secret.client_id\" value=\"\""),
+        "{settings}"
     );
     // Of this plugin alone: nothing of the deployment's, no account's data,
     // no Access tab, and no way into the admin portal.
-    for elsewhere in [
-        "Growth",
-        "ACC-1",
-        "Operations",
-        "id=\"access\"",
-        "/admin/plugins/",
-        "/admin#",
-    ] {
-        assert!(!body.contains(elsewhere), "{elsewhere} in {body}");
+    for page in [body, settings] {
+        for elsewhere in [
+            "Growth",
+            "ACC-1",
+            "Operations",
+            "id=\"access\"",
+            "/admin/plugins/",
+            "/admin#",
+        ] {
+            assert!(!page.contains(elsewhere), "{elsewhere} in {page}");
+        }
     }
 
     // Saved: to the conductor as Ada's, the secret with it and nowhere else,
@@ -1872,12 +1914,12 @@ async fn under_manage_the_dashboard_draws_settings_and_status_first_and_never_sh
     assert_eq!(asked.lock().unwrap().len(), 1);
 }
 
-/// The dashboard's Settings are the plugin's admins' alone, a deployment
-/// admin being one through All plugins (admin): a reader or a writer sees no
-/// Settings tab under the buttons they hold and is refused it under Manage
-/// and its form, as is the admin of another plugin.
+/// The dashboard's Summary and Settings are the plugin's admins' alone, a
+/// deployment admin being one through All plugins (admin): a reader or a
+/// writer sees neither tab under the buttons they hold and is refused both
+/// under Manage, and the form, as is the admin of another plugin.
 #[tokio::test]
-async fn the_dashboards_settings_are_for_the_plugins_admins_alone() {
+async fn the_dashboards_summary_and_settings_are_for_the_plugins_admins_alone() {
     let h = harness(&[INSTANCE]).await;
     snaptrade_reporting(&h);
     let settings_of = |level: AccessLevel, on: &str| {
@@ -1918,24 +1960,32 @@ async fn the_dashboards_settings_are_for_the_plugins_admins_alone() {
         )
         .await;
         assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+        let drawn = ["id=\"status\"", "id=\"figures\"", "id=\"settings\""];
+        let row = tab_row(&own.body).0;
         assert!(
-            !tab_row(&own.body).0.contains(&"settings".to_string())
-                && !own.body.contains("id=\"settings\""),
+            !row.contains(&"summary".to_string())
+                && !row.contains(&"settings".to_string())
+                && drawn.iter().all(|part| !own.body.contains(part)),
             "{level:?} on {on}: {}",
             own.body
         );
-        for asked in [
-            format!("/plugins/{INSTANCE}?level=admin&tab=settings"),
-            format!("/plugins/{INSTANCE}?level={holding}&tab=settings"),
-        ] {
-            let page = get(&h.app, DASHBOARD, &asked, &[dashboard_cookie(&h)]).await;
-            assert!(
-                !page.body.contains("id=\"settings\""),
-                "{asked}: {}",
-                page.body
-            );
-            if asked.contains("level=admin") {
-                assert_eq!(page.status, StatusCode::FORBIDDEN, "{asked}");
+        for tab in ["summary", "settings"] {
+            for asked in [
+                format!("/plugins/{INSTANCE}?level=admin&tab={tab}"),
+                format!("/plugins/{INSTANCE}?level=admin"),
+                format!("/plugins/{INSTANCE}?level={holding}&tab={tab}"),
+            ] {
+                let page = get(&h.app, DASHBOARD, &asked, &[dashboard_cookie(&h)]).await;
+                for part in drawn {
+                    assert!(
+                        !page.body.contains(part),
+                        "{asked}: {part} in {}",
+                        page.body
+                    );
+                }
+                if asked.contains("level=admin") {
+                    assert_eq!(page.status, StatusCode::FORBIDDEN, "{asked}");
+                }
             }
         }
         let posted = post_form(
