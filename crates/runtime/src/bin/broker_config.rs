@@ -210,7 +210,7 @@ mod serve {
 
     async fn serve(args: Args) -> Result<(), String> {
         let chart = chart_instances(&args.instances)?;
-        let api = ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let api = ApiServer::in_cluster(meridian_runtime::clock()).map_err(|failed| failed.0)?;
         let mut hashes = Hashes::new();
 
         // The broker starts whatever the cluster's API says, with the chart's

@@ -60,4 +60,4 @@ pub use assertions::{DeploymentKey, SigningError};
 pub use platform::{
     ComponentReport, Config, Enrolment, HttpTransport, Platform, PlatformError, Reaction, Transport,
 };
-pub use reactor::{Carried, Clock, Conductor, SystemClock, INSTRUMENT_MISSING, INSTRUMENT_PULLED};
+pub use reactor::{Carried, Clock, Conductor, INSTRUMENT_MISSING, INSTRUMENT_PULLED};

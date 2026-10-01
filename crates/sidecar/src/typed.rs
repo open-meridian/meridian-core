@@ -194,7 +194,7 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let subject = if topic.starts_with(CONFIGURATION) {
-            let claims = self.vouched_admin(&topic, acting_for.as_ref(), now_ns())?;
+            let claims = self.vouched_admin(&topic, acting_for.as_ref(), self.clock.now_ns())?;
             tracing::info!(
                 instance = self.instance_id(),
                 topic,
@@ -237,7 +237,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
-        let now = now_ns();
+        let now = self.clock.now_ns();
         if topic.starts_with(CONFIGURATION) {
             // An admin's act on the deployment's configuration, not a write
             // to an account: a link names an account nothing may write through
@@ -475,13 +475,6 @@ fn mirrored<R: Message + Default>(payload: Vec<u8>) -> Result<Response<R>, Statu
         .map_err(|failed| {
             Status::internal(format!("the reply did not read as its mirror: {failed}"))
         })
-}
-
-pub(crate) fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 /// Where a refusal's reason code travels, beside its status.

@@ -18,10 +18,9 @@
 use std::sync::Arc;
 
 use meridian_runtime::{
-    bus_from_env, now_ns, on_runtime, report_inward_forever, required, shutdown, var,
+    bus_from_env, clock, now_ns, on_runtime, report_inward_forever, required, shutdown, var,
     wait_for_store, Ready, Wait,
 };
-use meridian_street::service::SystemClock;
 use meridian_street::store::StoreError;
 use meridian_street::PostgresStore;
 
@@ -47,7 +46,11 @@ fn run() -> Result<(), String> {
             "the street store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| store.migrate().map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .migrate(&*clock())
+                    .map_err(|failed| failed.to_string())
+            },
         )
         .map(|()| {
             tracing::info!(
@@ -91,7 +94,7 @@ fn run() -> Result<(), String> {
         // Registered before anything can call them. A component that
         // announces itself and then cannot answer is worse than one that
         // has not arrived.
-        meridian_street::service::serve(bus.clone(), Arc::clone(&store), Arc::new(SystemClock));
+        meridian_street::service::serve(bus.clone(), Arc::clone(&store), clock());
 
         // W3.9. Subscribed before this returns, like the handlers above;
         // only the moving is spawned.
@@ -105,7 +108,7 @@ fn run() -> Result<(), String> {
         tokio::spawn(meridian_street::service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
-            Arc::new(SystemClock),
+            clock(),
             meridian_street::service::SWEEP_EVERY,
         ));
 

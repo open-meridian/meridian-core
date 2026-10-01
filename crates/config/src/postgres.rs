@@ -53,11 +53,13 @@ impl PostgresStore {
 
     /// Apply every migration not yet recorded, under a lock. Run once per
     /// release by `meridian-conductor migrate`, never by a starting process.
-    pub fn migrate(&self) -> Result<()> {
+    ///
+    /// Each migration is recorded at the deployment's time, from `clock`.
+    pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
         let mut conn = self.conn()?;
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let outcome = apply_migrations(&mut conn);
+        let outcome = apply_migrations(&mut conn, clock);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome
     }
@@ -820,7 +822,7 @@ fn insert_permission(
     Ok(())
 }
 
-fn apply_migrations(conn: &mut Connection) -> Result<()> {
+fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {
     conn.batch_execute(migrations::HISTORY)
         .map_err(unavailable)?;
     let applied = applied_version(conn)?;
@@ -831,7 +833,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         // The migration and the row recording it commit together.
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
-        migrations::record(&mut tx, migration, now_ns())?;
+        migrations::record(&mut tx, migration, clock.now_ns())?;
         tx.commit().map_err(unavailable)?;
     }
     Ok(())
@@ -842,13 +844,6 @@ fn applied_version(conn: &mut Connection) -> Result<Option<i64>> {
         .query_opt("SELECT max(version) FROM config_schema_migration", &[])
         .map_err(unavailable)?;
     Ok(row.and_then(|row| row.get::<_, Option<i64>>(0)))
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as i64)
-        .unwrap_or_default()
 }
 
 fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {

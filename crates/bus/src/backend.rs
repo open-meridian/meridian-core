@@ -1,5 +1,6 @@
 //! What a bus backend has to provide.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,13 +38,43 @@ pub struct Delivery {
     pub sequence: u64,
 }
 
+/// How many messages one subscription has lost.
+///
+/// A handle rather than a number, so whoever forwards a subscription's
+/// deliveries -- a sidecar handing them to its plugin -- can keep reading the
+/// count after the subscription itself has become a stream. A count that has
+/// risen since it was last read is a loss the subscriber did not see happen,
+/// and the only way it can find out.
+#[derive(Debug, Clone, Default)]
+pub struct DropCount(Arc<AtomicU64>);
+
+impl DropCount {
+    /// Messages lost so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn add(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A live subscription. Dropping it unsubscribes.
 pub struct Subscription {
     pub(crate) rx: mpsc::Receiver<Delivery>,
     pub(crate) pattern: String,
+    pub(crate) dropped: DropCount,
 }
 
 impl Subscription {
+    pub(crate) fn new(rx: mpsc::Receiver<Delivery>, pattern: &str, dropped: DropCount) -> Self {
+        Self {
+            rx,
+            pattern: pattern.to_string(),
+            dropped,
+        }
+    }
+
     /// The next message, or `None` once the bus has shut down.
     pub async fn recv(&mut self) -> Option<Delivery> {
         self.rx.recv().await
@@ -51,6 +82,17 @@ impl Subscription {
 
     pub fn pattern(&self) -> &str {
         &self.pattern
+    }
+
+    /// Messages this subscription has lost: its queue was full when they
+    /// arrived, or they were not envelopes. Every backend counts the same way.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.get()
+    }
+
+    /// The same count, as a handle that outlives [`Subscription::into_stream`].
+    pub fn drop_count(&self) -> DropCount {
+        self.dropped.clone()
     }
 
     /// Consume this subscription as a stream.
@@ -67,6 +109,7 @@ impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Subscription")
             .field("pattern", &self.pattern)
+            .field("dropped", &self.dropped.get())
             .finish()
     }
 }
@@ -138,7 +181,9 @@ pub trait Backend: Send + Sync {
         delivered.notify_one();
     }
 
-    /// Messages dropped because a subscriber's queue was full.
+    /// Messages dropped across every subscription on this backend: a
+    /// subscriber's queue was full, or what arrived was not an envelope. Each
+    /// subscription's own share is [`Subscription::dropped`].
     ///
     /// Exposed because at-most-once delivery is only defensible if the losses
     /// are observable. A silent drop is indistinguishable from a message that

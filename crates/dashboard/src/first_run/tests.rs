@@ -56,8 +56,12 @@ fn app_with(
     default_timeout: Duration,
 ) -> Arc<App> {
     let bus = Arc::new(
-        Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))
-            .with_default_timeout(default_timeout),
+        Bus::single(
+            "dashboard-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        )
+        .with_default_timeout(default_timeout),
     );
     bus.serve(ENROLMENT_STATE, move |_| {
         Ok((

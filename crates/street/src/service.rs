@@ -77,21 +77,9 @@ pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrumen
 /// certain.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
 
-/// Where the time comes from, so a test does not wait for it.
-pub trait Clock: Send + Sync {
-    fn now_ns(&self) -> i64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ns(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos() as i64)
-            .unwrap_or_default()
-    }
-}
+/// Where the time comes from: the deployment's one clock (decisions/024),
+/// given by whoever wires this up, so a test does not wait for it.
+pub use meridian_clock::Clock;
 
 /// Register every handler the street store serves.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
@@ -418,7 +406,11 @@ mod tests {
     }
 
     fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
-        let bus = Arc::new(Bus::single("street-1", Arc::new(MemoryBackend::new())));
+        let bus = Arc::new(Bus::single(
+            "street-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
         let store = Arc::new(MemoryStore::new());
         serve(
             bus.clone(),

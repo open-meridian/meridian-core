@@ -36,7 +36,7 @@ pub mod signing;
 pub mod terminal;
 pub mod web;
 
-pub use clock::{Clock, SystemClock};
+pub use clock::Clock;
 pub use first_run::WizardSession;
 pub use records::{refresh, refresh_forever, RecordsCache, Stale};
 pub use session::{Session, Sessions};

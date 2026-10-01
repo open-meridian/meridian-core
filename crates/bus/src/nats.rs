@@ -17,7 +17,9 @@
 //!
 //! A publish hands the bytes to the client and does not wait for them to
 //! leave. A subscriber whose queue is full loses the message, alone, exactly
-//! as in memory. What changes is that a message can also be lost between
+//! as in memory: the newest is dropped and counted, on the subscription and
+//! on the backend, and the broker's stream for that subscription keeps being
+//! drained so nothing backs up behind it. What changes is that a message can also be lost between
 //! processes, which is the same guarantee said out loud rather than a weaker
 //! one.
 
@@ -32,7 +34,7 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
-use crate::backend::{Answer, Backend, BusError, Delivery, Handler, Subscription};
+use crate::backend::{Answer, Backend, BusError, Delivery, DropCount, Handler, Subscription};
 use crate::topic;
 
 /// Same bound as the in-memory backend, and for the same reason: a subscriber
@@ -52,7 +54,10 @@ pub struct NatsBackend {
     handle: tokio::runtime::Handle,
 
     sequences: Mutex<HashMap<String, u64>>,
-    dropped: AtomicU64,
+
+    /// Shared with every subscription's forwarding task, which is where a
+    /// drop happens.
+    dropped: Arc<AtomicU64>,
 }
 
 impl NatsBackend {
@@ -82,7 +87,7 @@ impl NatsBackend {
             client,
             handle: tokio::runtime::Handle::current(),
             sequences: Mutex::new(HashMap::new()),
-            dropped: AtomicU64::new(0),
+            dropped: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -169,6 +174,9 @@ impl Backend for NatsBackend {
         let subject = Self::subject(pattern);
         let client = self.client.clone();
         let owned = pattern.to_string();
+        let dropped = DropCount::default();
+        let counted = dropped.clone();
+        let total = Arc::clone(&self.dropped);
 
         self.handle.spawn(async move {
             let mut messages = match client.subscribe(subject.clone()).await {
@@ -179,6 +187,11 @@ impl Backend for NatsBackend {
                 }
             };
 
+            let lose = || {
+                counted.add();
+                total.fetch_add(1, Ordering::Relaxed);
+            };
+
             let mut sequence = 0u64;
             while let Some(message) = futures_util::StreamExt::next(&mut messages).await {
                 let envelope = match Envelope::decode(message.payload) {
@@ -187,24 +200,31 @@ impl Backend for NatsBackend {
                         // Something on our subjects that is not ours. Dropped
                         // and counted rather than passed up: a consumer cannot
                         // do anything with bytes that are not an envelope.
+                        lose();
                         tracing::warn!(pattern = owned, %failed, "undecodable message");
                         continue;
                     }
                 };
 
                 sequence += 1;
-                if tx.send(Delivery { envelope, sequence }).await.is_err() {
+                // Never waits for room. Waiting here backed the broker's
+                // stream up behind one slow consumer and lost nothing that
+                // anyone could count; dropping loses this message for this
+                // subscriber alone, and says so.
+                match tx.try_send(Delivery { envelope, sequence }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        lose();
+                        tracing::warn!(pattern = owned, "subscriber queue full; message dropped");
+                    }
                     // The subscription was dropped. Ending the task is what
                     // unsubscribes at the broker, since the client goes with it.
-                    break;
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
 
-        Subscription {
-            rx,
-            pattern: pattern.to_string(),
-        }
+        Subscription::new(rx, pattern, dropped)
     }
 
     /// Ask whoever serves this topic, wherever they are.

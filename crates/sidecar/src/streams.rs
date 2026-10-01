@@ -22,7 +22,7 @@ use tonic::Status;
 
 use crate::configuration::{Configuration, REFRESH_NS};
 use crate::service::Sidecar;
-use crate::typed::{now_ns, refused};
+use crate::typed::refused;
 
 pub const PLUGIN_ACCESS: &str = "platform.config.query.plugin-access";
 
@@ -43,7 +43,7 @@ where
     tokio::spawn(async move {
         let mut last: Option<T> = None;
         loop {
-            match configuration.current(now_ns()).await {
+            match configuration.current(configuration.now_ns()).await {
                 Ok(current) => {
                     let item = render(&current);
                     if last.as_ref() != Some(&item) {
@@ -190,7 +190,7 @@ impl Sidecar {
         if !registration.settings.iter().any(|s| s.required) {
             return Vec::new();
         }
-        match self.configuration(now_ns()).await {
+        match self.configuration(self.clock.now_ns()).await {
             Ok(configuration) => settings(&registration.settings, &configuration).missing_required,
             Err(_) => Vec::new(),
         }

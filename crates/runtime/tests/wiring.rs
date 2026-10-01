@@ -41,17 +41,21 @@ const NOW: i64 = 1_757_376_000_000_000_000;
 /// The wiring `main` does, minus the platform client and the two Postgres
 /// stores, which need a network and a database.
 fn runtime() -> (Arc<Bus>, Sidecar) {
-    let bus = Arc::new(Bus::single("runtime-test", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "runtime-test",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
 
     meridian_street::service::serve(
         bus.clone(),
         Arc::new(meridian_street::MemoryStore::new()),
-        Arc::new(meridian_street::service::SystemClock),
+        bus.clock(),
     );
     meridian_instrument::service::serve_queries(
         &bus,
         Arc::new(meridian_instrument::MemoryStore::new()),
-        Arc::new(meridian_instrument::SystemClock),
+        bus.clock(),
     );
     // The conductor's part, stood in for: this plugin's external account
     // `ext-1` is linked to ACC-1, which somebody may write through it.
@@ -364,12 +368,13 @@ async fn a_link_made_through_the_operation_reaches_the_plugins_scope_stream() {
     let bus = Arc::new(Bus::single(
         "custody-snaptrade-1",
         Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
     ));
     let store = Arc::new(meridian_config::MemoryStore::new());
     meridian_config::serve(
         Arc::clone(&bus),
         store.clone(),
-        Arc::new(meridian_config::SystemClock),
+        bus.clock(),
         Arc::new(NoPlatform),
         Arc::new(meridian_config::SettingsKey::holding(&[7u8; 32])),
     );
@@ -523,7 +528,11 @@ async fn a_components_report_reaches_the_one_holding_the_key() {
     // publishes, and what the instrument store would send carries it.
     use meridian_runtime::{collect_inward, report_inward_forever, COMPONENT_REPORT_TOPIC};
 
-    let bus = Arc::new(Bus::single("instrument-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "instrument-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let heard = collect_inward(Arc::clone(&bus));
 
     let publishing = Arc::clone(&bus);

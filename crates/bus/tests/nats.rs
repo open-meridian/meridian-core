@@ -181,7 +181,11 @@ use std::sync::Arc;
 use meridian_bus::{Bus, BusError};
 
 async fn bus(instance: &str) -> Bus {
-    Bus::single(instance, Arc::new(backend().await))
+    Bus::single(
+        instance,
+        Arc::new(backend().await),
+        Arc::new(meridian_clock::SystemClock),
+    )
 }
 
 #[tokio::test]
@@ -623,4 +627,110 @@ async fn an_answer_is_announced_only_once_it_has_reached_the_broker() {
     tokio::time::timeout(Duration::from_secs(5), delivered.notified())
         .await
         .expect("the answer reached the broker but was never announced");
+}
+
+// ── A slow subscriber loses messages alone, and the loss is counted ─────────
+//
+// decisions/004: at-most-once, with a bounded queue per subscriber that drops
+// and counts on overflow. The forwarding task once waited for room instead,
+// so a slow subscriber backed its stream up and the count every reader of
+// losses relies on stayed at zero. The memory backend behaved as documented,
+// so nothing that ran without a broker noticed.
+
+/// The backend's per-subscriber bound, which these tests overflow on purpose.
+const QUEUE: usize = 1024;
+
+/// Wait for a count to reach what it should, or give up and report it.
+async fn reaches(count: impl Fn() -> u64, wanted: u64) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while count() < wanted && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    count()
+}
+
+#[tokio::test]
+async fn a_full_subscriber_queue_drops_and_counts_and_a_healthy_one_hears_everything() {
+    const OVER: usize = 50;
+    let publisher = backend().await;
+    // Both on one connection, so the slow one is in a position to stall the
+    // other if it backs up rather than drops.
+    let subscriber = backend().await;
+    let topic = topic("event.flood");
+
+    let slow = subscriber.subscribe(&topic);
+    let mut healthy = subscriber.subscribe(&topic);
+    settle().await;
+
+    let reading = tokio::spawn(async move {
+        let mut heard = 0;
+        while heard < QUEUE + OVER {
+            match next(&mut healthy).await {
+                Some(_) => heard += 1,
+                None => break,
+            }
+        }
+        (heard, healthy)
+    });
+
+    for sent in 0..(QUEUE + OVER) {
+        publisher
+            .publish(&topic, envelope(&format!("flood-{sent}")))
+            .unwrap();
+    }
+
+    let (heard, healthy) = reading.await.expect("the reader finished");
+    assert_eq!(
+        heard,
+        QUEUE + OVER,
+        "the healthy subscriber missed messages"
+    );
+    assert_eq!(
+        healthy.dropped(),
+        0,
+        "the healthy subscriber counted a loss"
+    );
+
+    let lost = reaches(|| slow.dropped(), OVER as u64).await;
+    assert_eq!(
+        lost, OVER as u64,
+        "the slow subscriber's overflow was not counted"
+    );
+    assert_eq!(
+        subscriber.dropped(),
+        OVER as u64,
+        "the backend's total disagrees"
+    );
+}
+
+#[tokio::test]
+async fn bytes_that_are_not_an_envelope_are_dropped_and_counted() {
+    let subscriber = backend().await;
+    let topic = topic("event.not-ours");
+    let mut subscription = subscriber.subscribe(&topic);
+    settle().await;
+
+    // Straight onto the broker, past the backend, which only ever sends
+    // envelopes. The credential is in the URL, as the backend reads it.
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL").unwrap();
+    let (scheme, rest) = url.split_once("://").unwrap();
+    let (credential, host) = rest.rsplit_once('@').unwrap();
+    let (user, password) = credential.split_once(':').unwrap();
+    let raw = async_nats::ConnectOptions::with_user_and_password(user.into(), password.into())
+        .connect(format!("{scheme}://{host}"))
+        .await
+        .expect("could not reach the test broker directly");
+    raw.publish(topic.clone(), vec![0xff, 0xff, 0xff].into())
+        .await
+        .unwrap();
+    raw.flush().await.unwrap();
+
+    assert_eq!(reaches(|| subscription.dropped(), 1).await, 1);
+    assert_eq!(subscriber.dropped(), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), subscription.recv())
+            .await
+            .is_err(),
+        "something that was not an envelope was delivered"
+    );
 }

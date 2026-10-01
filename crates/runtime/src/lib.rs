@@ -15,10 +15,11 @@ pub mod launched;
 pub mod launcher;
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use meridian_bus::{Backend, Bus, MemoryBackend, NatsBackend};
+use meridian_clock::{Clock, SystemClock};
 use meridian_conductor::platform::ComponentReport;
 use meridian_conductor::{DeploymentKey, Platform};
 
@@ -401,7 +402,7 @@ pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
         }
     };
 
-    Ok(Arc::new(Bus::single(instance_id, backend)))
+    Ok(Arc::new(Bus::single(instance_id, backend, clock())))
 }
 
 /// The platform client, for a component that talks to the platform.
@@ -549,11 +550,19 @@ pub async fn report_forever(
     }
 }
 
+/// The deployment's clock, as this process reads it (decisions/024).
+///
+/// Chosen here, once, and handed to the bus and to every component the
+/// process wires up, so everything in it reads one clock. A component never
+/// constructs one: `make check-one-clock` refuses that outside this crate.
+pub fn clock() -> Arc<dyn Clock> {
+    static CLOCK: OnceLock<Arc<dyn Clock>> = OnceLock::new();
+    Arc::clone(CLOCK.get_or_init(|| Arc::new(SystemClock)))
+}
+
+/// The time now, by [`clock`].
 pub fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as i64)
-        .unwrap_or_default()
+    clock().now_ns()
 }
 
 /// Names from one comma-separated value, blanks dropped: a sidecar's roles.

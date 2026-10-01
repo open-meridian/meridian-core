@@ -8,7 +8,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page \
-        build test test-store check-image-version chart-check check-crate-boundaries check-test-targets check-local-storage \
+        build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
@@ -21,6 +21,7 @@ help:
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
+	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make up             bring up Postgres and the runtime"
@@ -31,7 +32,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -46,6 +47,14 @@ ci-mirror-check:
 # dependency for convenience and nothing objects. This objects.
 check-crate-boundaries:
 	@$(PY) tools/check_crate_boundaries.py --repo-root .
+
+# decisions/024: time is the deployment's. Five components once defined a Clock
+# each and the bus and the sidecar read the wall clock, so one journal's times
+# came from as many sources as there were components and none could be
+# replayed. A sixth arrives as one convenient SystemTime::now(); this refuses it.
+check-one-clock:
+	@$(PY) tools/check_one_clock.py --self-test
+	@$(PY) tools/check_one_clock.py --repo-root .
 
 # A tests/ file compiles into its own binary and runs only when a target names
 # it. The runtime's wiring test was named by nothing and never ran, while both

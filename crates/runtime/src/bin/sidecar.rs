@@ -122,6 +122,7 @@ fn run() -> Result<(), String> {
             if let Some(live) = meridian_sidecar::live::Live::from_env(
                 var("MERIDIAN_LIVE_DIR"),
                 var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true"),
+                sidecar.clock(),
             ) {
                 sidecar.go_live(Arc::new(live));
                 tracing::info!("live: the development endpoint is on");

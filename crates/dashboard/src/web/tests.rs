@@ -29,7 +29,11 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         sessions: Arc::new(Sessions::default()),
         terminals: Arc::new(crate::terminal::Terminals::default()),
         clock: Arc::new(At(now)),
-        bus: Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))),
+        bus: Arc::new(Bus::single(
+            "dashboard-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        )),
         oidc: None,
         directory: None,
         accounts: None,

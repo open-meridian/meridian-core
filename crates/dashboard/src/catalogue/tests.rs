@@ -210,7 +210,11 @@ async fn terminal_session(terminals: &Terminals, subject: &str) -> String {
 
 async fn harness() -> Harness {
     let (base, reached) = registry().await;
-    let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "dashboard-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     conductor(&bus);
     let cache = Arc::new(RecordsCache::default());
     cache.store(records(), T0);

@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use meridian_clock::Clock;
 use meridian_domain::v1::Envelope;
 use meridian_pb::v1::MessageMeta;
 use tokio::sync::Notify;
@@ -34,12 +35,21 @@ pub struct Bus {
     handlers: RwLock<HashMap<String, Handler>>,
     instance_id: String,
     default_timeout: Duration,
+
+    /// The deployment's clock, which stamps every message's time. Given, not
+    /// read from the wall: a bus that read its own would stamp a replay with
+    /// the time it was replayed.
+    clock: Arc<dyn Clock>,
 }
 
 impl Bus {
     /// A bus with one backend and no routing rules, which is the shape of a
     /// single-host deployment.
-    pub fn single(instance_id: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
+    pub fn single(
+        instance_id: impl Into<String>,
+        backend: Arc<dyn Backend>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let mut backends = HashMap::new();
         backends.insert("default".to_string(), backend);
         Self {
@@ -49,6 +59,7 @@ impl Bus {
             handlers: RwLock::new(HashMap::new()),
             instance_id: instance_id.into(),
             default_timeout: Duration::from_secs(5),
+            clock,
         }
     }
 
@@ -261,6 +272,12 @@ impl Bus {
         &self.instance_id
     }
 
+    /// The clock this bus stamps with, which is the deployment's: a component
+    /// handed the bus reads the same time the messages it publishes carry.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     /// Identity, time and the message id, stamped here and never by a caller.
     fn meta(
         &self,
@@ -279,7 +296,7 @@ impl Bus {
             publisher_instance_id: self.instance_id.clone(),
             topic: topic.to_string(),
             schema_version: "v1".to_string(),
-            published_at_ns: now_ns(),
+            published_at_ns: self.clock.now_ns(),
             acting_for_subject: acting_for_subject.to_string(),
             // A read's scope is the sidecar's to stamp, for a plugin; a core
             // component reads as itself.
@@ -288,20 +305,56 @@ impl Bus {
     }
 }
 
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MemoryBackend;
+    use meridian_clock::ManualClock;
+
+    /// A fixed time, so a stamp can be checked exactly.
+    const NOW: i64 = 1_790_553_600_000_000_000;
 
     fn bus() -> Bus {
-        Bus::single("core-1", Arc::new(MemoryBackend::new()))
+        Bus::single(
+            "core-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(ManualClock::at(NOW)),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_time_stamped_is_the_clocks_it_was_given() {
+        let clock = Arc::new(ManualClock::at(NOW));
+        let bus = Bus::single("core-1", Arc::new(MemoryBackend::new()), clock.clone());
+        let mut sub = bus.subscribe("platform.street.**");
+
+        bus.publish(
+            "platform.street.event.position-updated",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        clock.advance(1_000);
+        bus.publish(
+            "platform.street.event.position-updated",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let first = sub.recv().await.unwrap().envelope.meta.unwrap();
+        let second = sub.recv().await.unwrap().envelope.meta.unwrap();
+        assert_eq!(first.published_at_ns, NOW);
+        assert_eq!(second.published_at_ns, NOW + 1_000);
+        assert_eq!(
+            bus.clock().now_ns(),
+            NOW + 1_000,
+            "the bus hands out the same clock"
+        );
     }
 
     #[tokio::test]
@@ -320,7 +373,7 @@ mod tests {
         let meta = sub.recv().await.unwrap().envelope.meta.unwrap();
         assert_eq!(meta.publisher_instance_id, "core-1");
         assert_eq!(meta.topic, "platform.street.event.position-updated");
-        assert!(meta.published_at_ns > 0);
+        assert_eq!(meta.published_at_ns, NOW);
         assert!(!meta.message_id.is_empty());
     }
 
@@ -483,6 +536,7 @@ mod tests {
             handlers: RwLock::new(HashMap::new()),
             instance_id: "core-1".into(),
             default_timeout: Duration::from_secs(5),
+            clock: Arc::new(ManualClock::at(NOW)),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");
@@ -526,7 +580,11 @@ mod acting_for {
 
     /// The subject the answering component sees, when asked with and without one.
     async fn subject_seen(acting_for: Option<&str>) -> String {
-        let bus = Bus::single("dashboard-1", Arc::new(MemoryBackend::new()));
+        let bus = Bus::single(
+            "dashboard-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        );
         bus.serve("platform.config.command.define-account", |envelope| {
             let meta = envelope.meta.unwrap_or_default();
             Ok((String::new(), meta.acting_for_subject.into_bytes()))

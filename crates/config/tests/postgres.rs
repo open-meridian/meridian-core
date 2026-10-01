@@ -52,8 +52,12 @@ fn store_at(tag: &str) -> (PostgresStore, String) {
         store.verify().is_err(),
         "an empty schema is refused before migrating"
     );
-    store.migrate().expect("migrates");
-    store.migrate().expect("migrating twice is a no-op");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrating twice is a no-op");
     store.verify().expect("recognised after migrating");
     (store, url)
 }
@@ -778,7 +782,9 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
 
     let store = PostgresStore::connect(&url, 2).expect("connects");
     assert!(store.verify().is_err(), "migrations behind");
-    store.migrate().expect("migrates");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates");
     store.verify().expect("recognised after migrating");
 
     let snapshot = store.snapshot().unwrap();
@@ -930,7 +936,9 @@ fn an_account_from_before_its_attributes_reads_back_with_none() {
 
     let store = PostgresStore::connect(&url, 2).expect("connects");
     assert!(store.verify().is_err(), "one migration behind");
-    store.migrate().expect("migrates");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates");
     store.verify().expect("recognised after migrating");
 
     assert_eq!(
@@ -987,7 +995,9 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
         .unwrap();
 
     let store = PostgresStore::connect(&url, 2).unwrap();
-    store.migrate().expect("migrates to this release");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates to this release");
     let records = store.snapshot().unwrap().records;
     let linked: Vec<(&str, &str)> = records
         .permissions

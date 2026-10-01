@@ -81,7 +81,11 @@ fn harness(instance: &str) -> Harness {
 
 fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
     let backend = Arc::new(MemoryBackend::new());
-    let bus = Arc::new(Bus::single(instance, backend.clone()));
+    let bus = Arc::new(Bus::single(
+        instance,
+        backend.clone(),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let store = Arc::new(MemoryStore::new());
     let platform = Arc::new(FakePlatform::default());
     serve(
@@ -1361,7 +1365,11 @@ async fn reported_by(
     declared: Vec<SettingDeclaration>,
     at: i64,
 ) {
-    let sidecar = Bus::single(publisher, h.backend.clone());
+    let sidecar = Bus::single(
+        publisher,
+        h.backend.clone(),
+        Arc::new(meridian_clock::SystemClock),
+    );
     let report = PluginReport {
         plugin_instance_id: "oms-1".into(),
         roles: vec!["oms".into()],

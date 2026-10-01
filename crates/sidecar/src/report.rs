@@ -136,7 +136,7 @@ pub async fn report_forever(sidecar: Arc<Sidecar>) {
     }
     let mut configuration = sidecar.configuration.changes();
     loop {
-        let report = sidecar.report_now(now_ns()).await;
+        let report = sidecar.report_now(sidecar.clock.now_ns()).await;
         if let Err(failed) = sidecar.bus.publish(
             PLUGIN_REPORT,
             "meridian.v1.PluginReport",
@@ -163,13 +163,6 @@ pub async fn report_forever(sidecar: Arc<Sidecar>) {
             _ = configuration.changed() => {}
         }
     }
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

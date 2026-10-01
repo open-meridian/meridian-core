@@ -61,7 +61,11 @@ async fn registered_with(
     roles: &[&str],
     verifier: Option<Arc<Verifier>>,
 ) -> (Sidecar, Arc<Bus>, Arc<Mutex<Vec<RecordHoldingRequest>>>) {
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let keeping = Arc::clone(&recorded);
     bus.serve(RECORD_HOLDING, move |envelope| {
@@ -565,7 +569,11 @@ async fn an_operation_no_role_grants_is_refused_naming_the_grant() {
 
 #[tokio::test]
 async fn nothing_is_served_before_registration() {
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let sidecar = Sidecar::under(
         &contract(),
         bus,
@@ -724,7 +732,8 @@ async fn the_configuration_is_read_again_after_30_seconds_and_trusted_for_10_min
 const KEY_ID: &str = "dashboard-2026-09-0a1b2c3d";
 
 fn now() -> i64 {
-    super::now_ns()
+    use meridian_clock::Clock as _;
+    meridian_clock::SystemClock.now_ns()
 }
 
 /// What a person holds on the plugin: the accounts they may read and the
@@ -1267,7 +1276,11 @@ async fn the_deployments_accounts_are_read_only_for_a_deployment_admin() {
 async fn the_report_carries_the_interface_the_plugin_declared() {
     // W4.8: its pages, each with the levels it serves, in its order, for the
     // plugin area's tab rows (W6.9).
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let sidecar = Sidecar::under(
         &contract(),
         bus,
@@ -1380,7 +1393,11 @@ async fn a_command_is_sent_for_a_person_only_in_a_session_opened_by_open() {
 
 #[tokio::test]
 async fn a_page_serving_no_level_is_refused_at_registration_naming_it() {
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let sidecar = Sidecar::under(
         &contract(),
         bus,

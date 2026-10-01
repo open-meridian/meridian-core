@@ -36,7 +36,11 @@ fn sidecar(bus: Arc<Bus>) -> Arc<Sidecar> {
 }
 
 fn memory() -> Arc<Bus> {
-    Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())))
+    Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ))
 }
 
 async fn register(sidecar: &Sidecar) {

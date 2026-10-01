@@ -23,12 +23,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use meridian_conductor::{Conductor, SystemClock, INSTRUMENT_MISSING};
+use meridian_conductor::{Conductor, INSTRUMENT_MISSING};
 use meridian_config::store::StoreError;
 use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
-    bus_from_env, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
+    bus_from_env, clock, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
     shutdown, var, wait_for_store, PlatformUpstream, Ready, Wait,
 };
 
@@ -65,7 +65,11 @@ fn run() -> Result<(), String> {
             "the configuration store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| store.migrate().map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .migrate(&*clock())
+                    .map_err(|failed| failed.to_string())
+            },
         )
         .map(|()| {
             tracing::info!(
@@ -84,8 +88,8 @@ fn run() -> Result<(), String> {
     if command.as_deref() == Some("settings-key") {
         let secret = required("MERIDIAN_SETTINGS_KEY_SECRET")?;
         let binding = required("MERIDIAN_SETTINGS_KEY_BINDING")?;
-        let cluster =
-            meridian_first_run::cluster::ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let cluster = meridian_first_run::cluster::ApiServer::in_cluster(clock())
+            .map_err(|failed| failed.0)?;
         let done = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -195,7 +199,7 @@ fn run() -> Result<(), String> {
         meridian_config::serve(
             Arc::clone(&bus),
             Arc::clone(&store),
-            Arc::new(meridian_config::SystemClock),
+            clock(),
             Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
             // Read when first needed and kept once found, so the Job
             // finishing after this starts needs no restart.
@@ -210,12 +214,12 @@ fn run() -> Result<(), String> {
         meridian_config::serve_plugins(
             Arc::clone(&bus),
             Arc::clone(&store),
-            Arc::new(meridian_config::SystemClock),
+            clock(),
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
         );
 
         let carrying = Arc::clone(&bus);
-        let conductor = Conductor::new(carrying, Arc::clone(&platform), Arc::new(SystemClock));
+        let conductor = Conductor::new(carrying, Arc::clone(&platform), clock());
         let running = tokio::spawn(conductor.consume(misses));
 
         // W5.19 outward, W5.20 inward: this component holds the key, so it
@@ -443,12 +447,7 @@ fn install_named_administrator(store: &dyn meridian_config::Store) {
     let group = var("MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP").unwrap_or_default();
     let login = var("MERIDIAN_ADMINISTRATOR_LOGIN").unwrap_or_default();
 
-    match meridian_config::install_named_administrator(
-        store,
-        &meridian_config::SystemClock,
-        &group,
-        &login,
-    ) {
+    match meridian_config::install_named_administrator(store, &*clock(), &group, &login) {
         // Every start after the first, and every deployment whose
         // administrator arrived another way. The write refuses itself when one
         // exists, which is what makes this safe to call unconditionally.

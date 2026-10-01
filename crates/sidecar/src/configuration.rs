@@ -43,6 +43,8 @@ type Read = (PluginConfiguration, i64);
 #[derive(Clone)]
 pub struct Configuration {
     bus: Arc<Bus>,
+    /// The bus's clock, which is the deployment's.
+    clock: Arc<dyn meridian_clock::Clock>,
     instance: String,
     held: Arc<Mutex<Option<Read>>>,
     watching: Arc<AtomicBool>,
@@ -57,12 +59,18 @@ pub struct Configuration {
 impl Configuration {
     pub(crate) fn new(bus: Arc<Bus>, instance: String) -> Configuration {
         Configuration {
+            clock: bus.clock(),
             bus,
             instance,
             held: Arc::default(),
             watching: Arc::default(),
             changed: Arc::new(watch::channel(0).0),
         }
+    }
+
+    /// The time now, by the deployment's clock.
+    pub(crate) fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
     }
 
     /// Woken on each announced change. Taken before reading, so a change
@@ -169,7 +177,7 @@ impl Sidecar {
                 "external_account_id is required: the account as the rail knows it",
             ));
         }
-        let configuration = self.configuration(crate::typed::now_ns()).await?;
+        let configuration = self.configuration(self.clock.now_ns()).await?;
         Ok(configuration
             .links
             .iter()
@@ -189,7 +197,7 @@ impl Sidecar {
                 "external_account_id is required: the account as the rail knows it",
             ));
         }
-        let configuration = self.configuration(crate::typed::now_ns()).await?;
+        let configuration = self.configuration(self.clock.now_ns()).await?;
         let linked = configuration
             .links
             .iter()
@@ -202,7 +210,7 @@ impl Sidecar {
                 Ok(account)
             }
             None => {
-                let now = crate::typed::now_ns();
+                let now = self.clock.now_ns();
                 let seen = unlinked.entry(external_account_id.to_string()).or_insert(
                     crate::service::Unlinked {
                         first_seen_at_ns: now,

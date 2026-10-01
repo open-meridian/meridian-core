@@ -461,7 +461,11 @@ mod tests {
 
     #[tokio::test]
     async fn what_the_connectors_publish_is_heard_under_the_instance_that_said_it() {
-        let bus = Bus::single("dashboard-1", Arc::new(MemoryBackend::new()));
+        let bus = Bus::single(
+            "dashboard-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        );
         let custody = Arc::new(Custody::default());
         listen(&bus, Arc::clone(&custody));
 

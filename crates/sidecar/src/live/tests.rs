@@ -1,5 +1,12 @@
 use super::*;
 
+/// 1_790_000_000.5 seconds after the epoch, held there.
+const AT_NS: i64 = 1_790_000_000_500_000_000;
+
+fn clock() -> Arc<dyn meridian_clock::Clock> {
+    Arc::new(meridian_clock::ManualClock::at(AT_NS))
+}
+
 fn folder(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("meridian-live-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -37,7 +44,7 @@ fn a_path_is_held_to_the_plugin_and_out_of_its_bookkeeping() {
 #[test]
 fn a_change_is_written_then_its_revision_and_a_bad_one_writes_nothing() {
     let dir = folder("apply");
-    let live = Live::new(&dir);
+    let live = Live::new(&dir, clock());
     assert_eq!(live.revision(), 0);
     let revision = live
         .apply(change(
@@ -94,7 +101,7 @@ fn a_change_is_written_then_its_revision_and_a_bad_one_writes_nothing() {
 #[test]
 fn output_and_events_are_what_came_after_a_revision_in_order() {
     let dir = folder("read");
-    let live = Live::new(&dir);
+    let live = Live::new(&dir, clock());
     std::fs::create_dir_all(dir.join(".meridian")).unwrap();
     std::fs::write(
         dir.join(".meridian/output.jsonl"),
@@ -132,7 +139,7 @@ fn output_and_events_are_what_came_after_a_revision_in_order() {
 #[test]
 fn a_refusal_is_recorded_against_the_revision_running() {
     let dir = folder("refused");
-    let live = Live::new(&dir);
+    let live = Live::new(&dir, clock());
     live.apply(change(&[("a.py", "x")], &[])).unwrap();
     live.refused(
         "no grant for platform.street.command.record-statement: this plugin holds no role",
@@ -144,21 +151,25 @@ fn a_refusal_is_recorded_against_the_revision_running() {
     let refused = events.iter().find(|e| e["event"] == "refused").unwrap();
     assert_eq!(refused["revision"], 1);
     assert!(refused["reason"].as_str().unwrap().contains("no grant"));
+    assert_eq!(
+        refused["at"], 1_790_000_000.5,
+        "recorded at the deployment's time, in seconds"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn only_both_make_an_endpoint() {
-    assert!(Live::from_env(Some("/plugin/live".into()), true).is_some());
-    assert!(Live::from_env(Some("/plugin/live".into()), false).is_none());
-    assert!(Live::from_env(None, true).is_none());
-    assert!(Live::from_env(Some(String::new()), true).is_none());
+    assert!(Live::from_env(Some("/plugin/live".into()), true, clock()).is_some());
+    assert!(Live::from_env(Some("/plugin/live".into()), false, clock()).is_none());
+    assert!(Live::from_env(None, true, clock()).is_none());
+    assert!(Live::from_env(Some(String::new()), true, clock()).is_none());
 }
 
 #[test]
 fn asked_for_nothing_in_particular_it_is_everything_kept() {
     let dir = folder("all");
-    let live = Live::new(&dir);
+    let live = Live::new(&dir, clock());
     live.record(0, "restarted", serde_json::json!({}));
     assert_eq!(
         live.events_since(None)["events"].as_array().unwrap().len(),

@@ -194,7 +194,11 @@ async fn registered() -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>
 async fn registered_declaring(
     settings: Vec<SettingDeclaration>,
 ) -> (Arc<Sidecar>, Arc<Bus>, Arc<Mutex<PluginConfiguration>>) {
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let held = Arc::new(Mutex::new(PluginConfiguration {
         plugin_instance_id: "snaptrade-1".into(),
         read_account_ids: vec!["ACC-1".into()],
@@ -421,7 +425,11 @@ async fn the_access_table_is_the_conductors_asked_as_the_plugin() {
 
 #[tokio::test]
 async fn nothing_is_learned_before_registering() {
-    let bus = Arc::new(Bus::single("snaptrade-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "snaptrade-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let sidecar = Sidecar::under(
         &Contract::parse("topic\tkind\tpublisher\tsubscriber\n", "name\tkind\n").unwrap(),
         bus,

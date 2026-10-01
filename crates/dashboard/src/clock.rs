@@ -1,19 +1,7 @@
-//! Where the time comes from, so a test of a bound does not wait for it.
+//! Where the time comes from: the deployment's one clock (decisions/024),
+//! given by whoever wires this up, so a test of a bound does not wait for it.
 
-pub trait Clock: Send + Sync {
-    fn now_ns(&self) -> i64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ns(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos() as i64)
-            .unwrap_or_default()
-    }
-}
+pub use meridian_clock::Clock;
 
 pub const SECOND_NS: i64 = 1_000_000_000;
 pub const MINUTE_NS: i64 = 60 * SECOND_NS;

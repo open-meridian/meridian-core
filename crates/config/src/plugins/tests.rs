@@ -33,7 +33,11 @@ struct Launcher {
 }
 
 fn harness() -> (Arc<Bus>, Arc<Launcher>) {
-    let bus = Arc::new(Bus::single("conductor-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "conductor-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     serve_plugins(
         Arc::clone(&bus),
         Arc::new(MemoryStore::new()),

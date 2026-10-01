@@ -93,6 +93,8 @@ pub struct ApiServer {
     base: String,
     namespace: String,
     token: String,
+    /// The deployment's clock, which a restart is stamped with.
+    clock: std::sync::Arc<dyn meridian_clock::Clock>,
 }
 
 /// Where a pod finds its own credentials, which is also what makes this
@@ -107,7 +109,9 @@ impl ApiServer {
     /// The CA is read rather than skipped: a Job that accepted any certificate
     /// would accept anything that got in front of the API, and it is writing
     /// credentials.
-    pub fn in_cluster() -> Result<Self, ClusterError> {
+    pub fn in_cluster(
+        clock: std::sync::Arc<dyn meridian_clock::Clock>,
+    ) -> Result<Self, ClusterError> {
         let host = std::env::var("KUBERNETES_SERVICE_HOST").map_err(|_| {
             ClusterError(
                 "KUBERNETES_SERVICE_HOST is not set: this runs in a pod or not at all".into(),
@@ -135,6 +139,7 @@ impl ApiServer {
             base: format!("https://{host}:{port}"),
             namespace: namespace.trim().to_string(),
             token: token.trim().to_string(),
+            clock,
         })
     }
 
@@ -360,10 +365,7 @@ impl Cluster for ApiServer {
         // The annotation `kubectl rollout restart` writes, for the same
         // reason: it changes the pod template, and changing the pod template
         // is what a rollout is.
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or_default();
+        let at = self.clock.now_ns() / 1_000_000_000;
 
         self.patch(
             &format!(

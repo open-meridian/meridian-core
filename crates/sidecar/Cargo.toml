@@ -7,6 +7,7 @@ license.workspace = true
 description = "The surface a Meridian plugin binds to"
 
 [dependencies]
+meridian-clock.workspace = true
 meridian-pb.workspace = true
 meridian-domain.workspace = true
 meridian-bus = { path = "../bus" }

@@ -49,7 +49,7 @@ pub use apply::{apply, Outcome};
 pub use memory::MemoryStore;
 pub use postgres::PostgresStore;
 pub use resolve::{missing_instrument, resolve_identifier, resolve_instrument, Resolution};
-pub use service::{Handled, Reactor, SystemClock};
+pub use service::{Clock, Handled, Reactor};
 pub use store::{
     Applied, Identifier, IdentifierSet, Instrument, Placeholder, Replaced, Stood, Store, StoreError,
 };

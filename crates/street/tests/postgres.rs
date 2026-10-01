@@ -46,7 +46,9 @@ fn store() -> PostgresStore {
          run them with `make test-store`.",
     );
     let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
-    store.migrate().expect("could not create the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
     store
 }
 
@@ -638,7 +640,9 @@ fn a_read_of_every_account_across_pages_sees_each_position_once() {
     // account is every account in it.
     let (url, _client) = own_schema("paging");
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
-    store.migrate().expect("could not apply the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not apply the schema");
     let statement = opened(&store);
 
     let rows = [
@@ -729,7 +733,9 @@ fn migration_four_reads_an_existing_rows_side_from_its_sign_and_its_silence_as_n
         .unwrap();
 
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
-    store.migrate().expect("migration 4 did not apply");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migration 4 did not apply");
     store.verify().expect("and the database is current");
 
     let long = store
@@ -892,7 +898,9 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
 
     let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
     let store = PostgresStore::connect(&scoped, 1).unwrap();
-    store.migrate().expect("the rename did not apply");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("the rename did not apply");
 
     let carried = store.custodial_position("ACC", "INS", Side::Long).unwrap();
     let carried = carried.expect("the row was left behind under the old table name");
@@ -1106,7 +1114,9 @@ fn migrating_applies_every_version_and_then_verifies() {
     let (url, mut client) = own_schema("fresh");
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
 
-    store.migrate().expect("could not apply the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not apply the schema");
 
     let versions = applied_versions(&mut client);
     let expected: Vec<i64> = meridian_street::migrations::MIGRATIONS
@@ -1122,7 +1132,9 @@ fn migrating_twice_changes_nothing() {
     let (url, mut client) = own_schema("twice");
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
 
-    store.migrate().expect("could not apply the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not apply the schema");
     let first: Vec<(i64, i64)> = client
         .query("SELECT version, applied_at_ns FROM schema_migration", &[])
         .expect("could not read the history")
@@ -1130,7 +1142,9 @@ fn migrating_twice_changes_nothing() {
         .map(|row| (row.get(0), row.get(1)))
         .collect();
 
-    store.migrate().expect("migrating again must be a no-op");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrating again must be a no-op");
 
     let second: Vec<(i64, i64)> = client
         .query("SELECT version, applied_at_ns FROM schema_migration", &[])
@@ -1170,7 +1184,9 @@ fn a_database_made_before_the_history_is_adopted_with_its_rows_intact() {
         .expect("could not write a statement");
 
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
-    store.migrate().expect("could not adopt and migrate");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not adopt and migrate");
 
     let kept: i64 = client
         .query_one(
@@ -1215,7 +1231,9 @@ fn a_database_ahead_of_this_binary_is_refused() {
     // changed and its queries may already be wrong.
     let (url, mut client) = own_schema("ahead");
     let store = PostgresStore::connect(&url, 1).expect("could not connect");
-    store.migrate().expect("could not apply the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not apply the schema");
 
     client
         .execute(

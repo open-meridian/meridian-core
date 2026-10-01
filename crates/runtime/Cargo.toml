@@ -44,6 +44,7 @@ path = "src/bin/launcher.rs"
 
 
 [dependencies]
+meridian-clock.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-instrument = { path = "../instrument" }
 meridian-street = { path = "../street" }

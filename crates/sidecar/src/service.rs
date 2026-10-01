@@ -8,7 +8,6 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use meridian_bus::Bus;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
@@ -88,6 +87,11 @@ impl Identity {
 
 pub struct Sidecar {
     pub(crate) bus: Arc<Bus>,
+
+    /// The deployment's clock, as the bus was given it: every time this
+    /// sidecar reads -- a heartbeat, an assertion's age, a report -- is the
+    /// same time the messages it publishes are stamped with.
+    pub(crate) clock: Arc<dyn meridian_clock::Clock>,
     deployment_id: String,
     pub(crate) identity: Identity,
 
@@ -138,6 +142,12 @@ impl Sidecar {
         self.live.get()
     }
 
+    /// The deployment's clock this sidecar reads, for whatever else the
+    /// process hands it to.
+    pub fn clock(&self) -> Arc<dyn meridian_clock::Clock> {
+        Arc::clone(&self.clock)
+    }
+
     pub fn new(bus: Arc<Bus>, deployment_id: impl Into<String>, identity: Identity) -> Self {
         Self::under(Contract::embedded(), bus, deployment_id, identity)
     }
@@ -162,6 +172,7 @@ impl Sidecar {
             identity.instance_id.clone(),
         );
         Self {
+            clock: bus.clock(),
             bus,
             deployment_id: deployment_id.into(),
             identity,
@@ -313,7 +324,7 @@ impl SidecarService for Sidecar {
             roles: self.identity.roles.clone(),
             grants: grants.clone(),
             healthy: true,
-            last_heartbeat_ns: now_ns(),
+            last_heartbeat_ns: self.clock.now_ns(),
             departed: false,
             interface_port,
             health_detail: String::new(),
@@ -375,7 +386,7 @@ impl SidecarService for Sidecar {
                 || state.health_detail != detail
                 || state.figures != figures;
             state.healthy = healthy;
-            state.last_heartbeat_ns = now_ns();
+            state.last_heartbeat_ns = self.clock.now_ns();
             state.health_detail = detail;
             state.figures = figures;
         }
@@ -453,13 +464,6 @@ impl SidecarService for Sidecar {
     }
 }
 
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +499,7 @@ mod tests {
         let bus = Arc::new(Bus::single(
             "sidecar-custody-1",
             Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
         ));
         Sidecar::under(&contract(), bus, "dep-local-1", identity)
     }
@@ -523,6 +528,37 @@ mod tests {
             .into_inner();
         assert!(reply.admitted);
         sc
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_reads_the_clock_its_bus_was_given() {
+        // decisions/024: one clock for the deployment. A heartbeat stamped
+        // from the wall clock would disagree with the messages this sidecar
+        // publishes, which the bus stamps from the deployment's.
+        let clock = Arc::new(meridian_clock::ManualClock::at(1_790_000_000_000_000_000));
+        let bus = Arc::new(Bus::single(
+            "sidecar-custody-1",
+            Arc::new(MemoryBackend::new()),
+            clock.clone(),
+        ));
+        let sc = Sidecar::under(
+            &contract(),
+            bus,
+            "dep-local-1",
+            Identity::new("custody-snaptrade-1", roles(&["custody"])),
+        );
+        let reply = sc
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.admitted);
+        assert_eq!(
+            sc.registration().unwrap().last_heartbeat_ns,
+            1_790_000_000_000_000_000
+        );
+        clock.advance(5);
+        assert_eq!(sc.clock().now_ns(), 1_790_000_000_000_000_005);
     }
 
     #[tokio::test]

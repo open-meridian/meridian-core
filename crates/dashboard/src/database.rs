@@ -16,8 +16,6 @@
 //! other stores' rule, for the same reason -- the role the dashboard serves
 //! as may not create a table.
 
-use crate::clock::Clock as _;
-
 type Pool = r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>;
 pub(crate) type Connection =
     r2d2::PooledConnection<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>;
@@ -100,12 +98,13 @@ impl Database {
     }
 
     /// Apply every migration not yet recorded, under an advisory lock, each
-    /// in one transaction with the row recording it.
-    pub fn migrate(&self) -> Result<(), String> {
+    /// in one transaction with the row recording it, at the deployment's time
+    /// from `clock`.
+    pub fn migrate(&self, clock: &dyn crate::Clock) -> Result<(), String> {
         let mut conn = self.conn()?;
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(said)?;
-        let outcome = apply(&mut conn);
+        let outcome = apply(&mut conn, clock);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome.map_err(|failed| format!("the dashboard's tables could not be made: {failed}"))
     }
@@ -152,7 +151,7 @@ impl Database {
     }
 }
 
-fn apply(conn: &mut Connection) -> Result<(), String> {
+fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> {
     conn.batch_execute(HISTORY).map_err(said)?;
     let at = applied(conn)?;
     for migration in MIGRATIONS {
@@ -164,11 +163,7 @@ fn apply(conn: &mut Connection) -> Result<(), String> {
         tx.execute(
             "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
              VALUES ($1, $2, $3)",
-            &[
-                &migration.version,
-                &migration.name,
-                &crate::clock::SystemClock.now_ns(),
-            ],
+            &[&migration.version, &migration.name, &clock.now_ns()],
         )
         .map_err(said)?;
         tx.commit().map_err(said)?;

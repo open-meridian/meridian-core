@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run"]
+members = ["crates/clock", "crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run"]
 
 [workspace.package]
 edition = "2021"
@@ -18,6 +18,9 @@ meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", re
 # The domain messages, generated here from proto/ rather than taken from the
 # schema: they are the runtime's own traffic past the sidecar.
 meridian-domain = { path = "crates/domain" }
+# The deployment's one clock (decisions/024), which every component reads time
+# through and the runtime's composition roots construct.
+meridian-clock = { path = "crates/clock" }
 meridian-access = { path = "crates/access" }
 meridian-config = { path = "crates/config" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

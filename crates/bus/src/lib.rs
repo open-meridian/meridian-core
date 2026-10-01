@@ -28,7 +28,9 @@ mod memory;
 mod nats;
 mod router;
 
-pub use backend::{Answer, Backend, BusError, Delivery, Handler, HandlerReply, Subscription};
+pub use backend::{
+    Answer, Backend, BusError, Delivery, DropCount, Handler, HandlerReply, Subscription,
+};
 pub use memory::MemoryBackend;
 pub use nats::NatsBackend;
 pub use router::{Bus, RouteRule};

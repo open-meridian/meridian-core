@@ -74,7 +74,10 @@ fn run() -> Result<(), String> {
         // failing to read it.
         key: SealingKey::new(instance_id.clone()),
         names,
-        cluster: Box::new(ApiServer::in_cluster().map_err(|failed| failed.to_string())?),
+        cluster: Box::new(
+            ApiServer::in_cluster(meridian_runtime::clock())
+                .map_err(|failed| failed.to_string())?,
+        ),
         probe: Box::new(Postgres),
         directory_probe: Box::new(Ldap),
         provider_probe: Box::new(Provider),

@@ -62,12 +62,14 @@ impl PostgresStore {
     /// process: N replicas starting together would race to apply the same
     /// migration, and a process that migrates on start changes a customer's
     /// database because somebody restarted a pod.
-    pub fn migrate(&self) -> Result<()> {
+    ///
+    /// Each migration is recorded at the deployment's time, from `clock`.
+    pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
         let mut conn = self.conn()?;
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let outcome = apply_migrations(&mut conn);
+        let outcome = apply_migrations(&mut conn, clock);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
         outcome
@@ -832,10 +834,10 @@ fn from_json(text: String) -> Vec<Identifier> {
 
 /// The history table, the baseline for a database that predates it, and then
 /// everything outstanding in order.
-fn apply_migrations(conn: &mut Connection) -> Result<()> {
+fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {
     conn.batch_execute(migrations::HISTORY)
         .map_err(unavailable)?;
-    adopt_existing_schema(conn)?;
+    adopt_existing_schema(conn, clock)?;
 
     let applied = applied_version(conn)?;
     for migration in migrations::MIGRATIONS {
@@ -849,7 +851,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         // repeats.
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
-        migrations::record(&mut tx, migration, now_ns())?;
+        migrations::record(&mut tx, migration, clock.now_ns())?;
         tx.commit().map_err(unavailable)?;
     }
     Ok(())
@@ -868,7 +870,7 @@ const LEDGER_TABLES: &[&str] = &["statement", "holding", "custodial_position", "
 ///
 /// Recognised by the tables themselves rather than by a flag, because a flag
 /// would have to have been written by the code that did not have one.
-fn adopt_existing_schema(conn: &mut Connection) -> Result<()> {
+fn adopt_existing_schema(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {
     if applied_version(conn)?.is_some() {
         return Ok(());
     }
@@ -886,7 +888,7 @@ fn adopt_existing_schema(conn: &mut Connection) -> Result<()> {
 
     let baseline = &migrations::MIGRATIONS[0];
     let mut tx = conn.transaction().map_err(unavailable)?;
-    migrations::record(&mut tx, baseline, now_ns())?;
+    migrations::record(&mut tx, baseline, clock.now_ns())?;
     tx.commit().map_err(unavailable)?;
     Ok(())
 }
@@ -896,13 +898,6 @@ fn applied_version(conn: &mut Connection) -> Result<Option<i64>> {
         .query_opt("SELECT max(version) FROM schema_migration", &[])
         .map_err(unavailable)?;
     Ok(row.and_then(|row| row.get::<_, Option<i64>>(0)))
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as i64)
-        .unwrap_or_default()
 }
 
 fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {

@@ -11,7 +11,7 @@ use std::sync::{Mutex, RwLock};
 use meridian_domain::v1::Envelope;
 use tokio::sync::mpsc;
 
-use crate::backend::{Backend, BusError, Delivery, Subscription};
+use crate::backend::{Backend, BusError, Delivery, DropCount, Subscription};
 use crate::topic;
 
 /// How many messages a subscriber may fall behind before it starts losing them.
@@ -24,6 +24,7 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 struct Subscriber {
     pattern: String,
     tx: mpsc::Sender<Delivery>,
+    dropped: DropCount,
 }
 
 pub struct MemoryBackend {
@@ -81,8 +82,11 @@ impl Backend for MemoryBackend {
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // At-most-once: this subscriber loses the message. The
                         // publisher and every other subscriber are unaffected,
-                        // which is the whole point of not blocking here.
+                        // which is the whole point of not blocking here. The
+                        // newest message is the one lost: what is queued stays
+                        // queued, in order.
                         self.dropped.fetch_add(1, Ordering::Relaxed);
+                        subscriber.dropped.add();
                         tracing::warn!(
                             topic = topic,
                             pattern = subscriber.pattern,
@@ -104,17 +108,16 @@ impl Backend for MemoryBackend {
 
     fn subscribe(&self, pattern: &str) -> Subscription {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+        let dropped = DropCount::default();
         self.subscribers
             .write()
             .expect("subscriber lock poisoned")
             .push(Subscriber {
                 pattern: pattern.to_string(),
                 tx,
+                dropped: dropped.clone(),
             });
-        Subscription {
-            rx,
-            pattern: pattern.to_string(),
-        }
+        Subscription::new(rx, pattern, dropped)
     }
 
     fn dropped(&self) -> u64 {
@@ -237,6 +240,44 @@ mod tests {
         // blocked: every publish returned.
         assert!(healthy.recv().await.is_some());
         assert!(bus.dropped() > 0);
+    }
+
+    #[tokio::test]
+    async fn each_subscription_counts_its_own_losses_and_keeps_its_oldest() {
+        let bus = MemoryBackend::new();
+        let slow = bus.subscribe("platform.street.**");
+        let mut healthy = bus.subscribe("platform.street.**");
+
+        // The healthy subscriber keeps up; the slow one never reads.
+        let mut heard = 0;
+        for _ in 0..(SUBSCRIBER_QUEUE + 7) {
+            bus.publish("platform.street.event.position-updated", envelope("x"))
+                .unwrap();
+            while healthy.rx.try_recv().is_ok() {
+                heard += 1;
+            }
+        }
+
+        assert_eq!(
+            heard,
+            SUBSCRIBER_QUEUE + 7,
+            "the healthy subscriber lost nothing"
+        );
+        assert_eq!(healthy.dropped(), 0);
+        assert_eq!(
+            slow.dropped(),
+            7,
+            "the slow subscriber lost the overflow alone"
+        );
+        assert_eq!(bus.dropped(), 7);
+
+        // The count is readable after the subscription has become a stream,
+        // and what was queued is the oldest of what was sent.
+        let count = slow.drop_count();
+        let mut stream = slow.into_stream();
+        let first = tokio_stream::StreamExt::next(&mut stream).await.unwrap();
+        assert_eq!(first.sequence, 1, "the newest is dropped, not the oldest");
+        assert_eq!(count.get(), 7);
     }
 
     #[tokio::test]

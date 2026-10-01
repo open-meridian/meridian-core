@@ -81,21 +81,9 @@ pub const PLUGIN_CONFIGURATION_CHANGED: &str = "platform.config.event.plugin-con
 pub const PLUGIN_ACCESS: &str = "platform.config.query.plugin-access";
 pub const PLUGIN_REPORT: &str = "platform.deployment.event.plugin-report";
 
-/// Where the time comes from, so a test does not wait for it.
-pub trait Clock: Send + Sync {
-    fn now_ns(&self) -> i64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ns(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos() as i64)
-            .unwrap_or_default()
-    }
-}
+/// Where the time comes from: the deployment's one clock (decisions/024),
+/// given by whoever wires this up, so a test does not wait for it.
+pub use meridian_clock::Clock;
 
 /// The platform, as far as the configuration store needs it: the two acts a
 /// deployment admin can send outward. The conductor implements it with the

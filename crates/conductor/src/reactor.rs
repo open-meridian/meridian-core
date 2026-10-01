@@ -18,26 +18,11 @@ pub const INSTRUMENT_MISSING: &str = "platform.reference.event.instrument-missin
 /// Two topics would be two things to keep in step for no reader's benefit.
 pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
 
-/// Where the time comes from.
-///
-/// Injectable because every duration here is a decision -- assertion lifetimes,
-/// backoff, the throttle -- and a test that waits for one is a test people stop
-/// running.
-pub trait Clock: Send + Sync {
-    fn now_ns(&self) -> i64;
-}
-
-/// The wall clock.
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ns(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos() as i64)
-            .unwrap_or_default()
-    }
-}
+/// Where the time comes from: the deployment's one clock (decisions/024),
+/// given by whoever wires this up. Injected because every duration here is a
+/// decision -- assertion lifetimes, backoff, the throttle -- and a test that
+/// waits for one is a test people stop running.
+pub use meridian_clock::Clock;
 
 /// What one delivery came to.
 #[derive(Debug, Clone, PartialEq)]
@@ -201,7 +186,11 @@ mod tests {
     }
 
     fn bus() -> Arc<Bus> {
-        Arc::new(Bus::single("conductor-1", Arc::new(MemoryBackend::new())))
+        Arc::new(Bus::single(
+            "conductor-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ))
     }
 
     fn miss_event() -> MissingInstrumentDetectedEvent {

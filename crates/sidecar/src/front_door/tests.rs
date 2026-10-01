@@ -21,6 +21,12 @@ use crate::service::Identity;
 const INSTANCE: &str = "snaptrade-1";
 const KEY_ID: &str = "dashboard-2026-09-0a1b2c3d";
 const SECOND: i64 = 1_000_000_000;
+
+/// The time the sidecars here read: their buses are given the wall clock.
+fn now_ns() -> i64 {
+    use meridian_clock::Clock as _;
+    meridian_clock::SystemClock.now_ns()
+}
 const NOW: i64 = 1_790_000_000 * SECOND;
 
 fn key() -> SigningKey {
@@ -303,7 +309,11 @@ async fn front_door_live(
     port: Option<u32>,
     live: Option<std::path::PathBuf>,
 ) -> String {
-    let bus = Arc::new(Bus::single(INSTANCE, Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        INSTANCE,
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let sidecar = Arc::new(Sidecar::under(
         &contract(),
         bus,
@@ -325,7 +335,7 @@ async fn front_door_live(
         .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
     if let Some(dir) = live {
-        sidecar.go_live(Arc::new(crate::live::Live::new(dir)));
+        sidecar.go_live(Arc::new(crate::live::Live::new(dir, sidecar.clock.clone())));
     }
 
     let door = router(
@@ -471,7 +481,11 @@ async fn a_plugin_that_serves_no_page_is_not_found_and_one_that_is_down_is_said_
 #[tokio::test]
 async fn an_interface_on_a_port_that_is_not_one_is_refused_at_registration() {
     for loopback_port in [0, 65_536] {
-        let bus = Arc::new(Bus::single(INSTANCE, Arc::new(MemoryBackend::new())));
+        let bus = Arc::new(Bus::single(
+            INSTANCE,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
         let sidecar = Sidecar::under(
             &contract(),
             bus,

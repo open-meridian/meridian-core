@@ -286,7 +286,8 @@ pub fn router(front_door: FrontDoor) -> Router {
 }
 
 async fn pass(State(front_door): State<FrontDoor>, request: Request) -> Response {
-    match through(&front_door, request, now_ns()).await {
+    let now_ns = front_door.sidecar.clock.now_ns();
+    match through(&front_door, request, now_ns).await {
         Ok(response) => response,
         Err(refusal) => refusal.into_response(),
     }
@@ -358,13 +359,6 @@ async fn through(
     response
         .body(Body::from_stream(answer.bytes_stream()))
         .map_err(|failed| Refusal::PluginUnreachable(failed.to_string()))
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

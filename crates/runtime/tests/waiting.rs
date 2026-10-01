@@ -240,7 +240,7 @@ fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
     // dashboard pointed at a port where nothing answers yet.
     let schema = scratch_schema("dashboard");
     meridian_dashboard::database::Database::connect(&url_for(&schema, None), 1)
-        .and_then(|database| database.migrate())
+        .and_then(|database| database.migrate(&meridian_clock::SystemClock))
         .expect("could not make the dashboard's tables");
     let database = free_port();
     let through = url_for(&schema, Some(&format!("127.0.0.1:{database}")));
@@ -325,7 +325,7 @@ fn a_store_started_before_its_migration_waits_for_it_and_is_ready_after() {
 
     // The migration Job, arriving.
     meridian_street::PostgresStore::connect(&url, 1)
-        .and_then(|store| store.migrate())
+        .and_then(|store| store.migrate(&meridian_clock::SystemClock))
         .expect("could not migrate");
 
     street.until_said("the street store is serving", Duration::from_secs(30));
@@ -344,7 +344,7 @@ fn a_store_whose_schema_is_newer_than_it_refuses_rather_than_waits() {
     // exits, saying so, where the one above waits.
     let url = url_for(&scratch_schema("ahead"), None);
     meridian_street::PostgresStore::connect(&url, 1)
-        .and_then(|store| store.migrate())
+        .and_then(|store| store.migrate(&meridian_clock::SystemClock))
         .expect("could not migrate");
     postgres::Client::connect(&url, postgres::NoTls)
         .unwrap()

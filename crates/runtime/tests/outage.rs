@@ -141,7 +141,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
     assert!(placeholder.starts_with("LCL-"), "{placeholder}");
 
     let street = meridian_street::PostgresStore::connect(&url, 2).unwrap();
-    street.migrate().unwrap();
+    street.migrate(&meridian_clock::SystemClock).unwrap();
     let (statement, _, _) = street
         .open(Statement {
             statement_id: format!("STMT-outage-{stamp}"),

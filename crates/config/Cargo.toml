@@ -7,6 +7,7 @@ license.workspace = true
 description = "The conductor's configuration store: accounts, access and plugin settings a deployment admin authors"
 
 [dependencies]
+meridian-clock.workspace = true
 rand.workspace = true
 # Secret settings are sealed before they are written (crate::sealing).
 chacha20poly1305.workspace = true

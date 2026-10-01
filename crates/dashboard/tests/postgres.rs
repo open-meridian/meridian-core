@@ -47,8 +47,12 @@ fn migrated(tag: &str) -> (Database, String) {
         matches!(database.verify(), Err(Unverified::NotYet(_))),
         "an empty schema is waited for, not served"
     );
-    database.migrate().expect("migrates");
-    database.migrate().expect("migrating twice is a no-op");
+    database
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates");
+    database
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrating twice is a no-op");
     database.verify().expect("recognised after migrating");
     (database, url)
 }
@@ -122,7 +126,9 @@ fn a_database_from_before_the_history_is_brought_up_to_date() {
         "no history is a schema to migrate"
     );
 
-    database.migrate().expect("migrates");
+    database
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrates");
     database.verify().expect("recognised");
     assert!(
         accounts::InPostgres::on(database)

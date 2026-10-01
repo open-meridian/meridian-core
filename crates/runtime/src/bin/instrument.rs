@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use meridian_instrument::{InstrumentService, PostgresStore, SystemClock};
+use meridian_instrument::{InstrumentService, PostgresStore};
 use meridian_runtime::{
-    bus_from_env, on_runtime, report_inward_forever, required, shutdown, var, wait_for_store,
-    Ready, Wait,
+    bus_from_env, clock, on_runtime, report_inward_forever, required, shutdown, var,
+    wait_for_store, Ready, Wait,
 };
 
 fn main() {
@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
         let reporting_bus = Arc::clone(&bus);
 
-        let service = InstrumentService::new(bus, Arc::clone(&store), Arc::new(SystemClock));
+        let service = InstrumentService::new(bus, Arc::clone(&store), clock());
 
         // Registered and subscribed before this returns, so nothing is
         // published into the gap between starting and listening.

@@ -21,10 +21,7 @@ use prost::Message;
 use tokio::runtime::Runtime;
 
 use meridian_bus::{Bus, MemoryBackend, Subscription};
-use meridian_conductor::{
-    Conductor, Config, DeploymentKey, HttpTransport, Platform, Reaction,
-    SystemClock as ConductorClock,
-};
+use meridian_conductor::{Conductor, Config, DeploymentKey, HttpTransport, Platform, Reaction};
 use meridian_domain::v1::{
     Identifier as PbIdentifier, InstrumentLifecycleState, InstrumentReplacedEvent,
     PullInstrumentReply, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
@@ -36,7 +33,7 @@ use meridian_instrument::service::{
     RESOLVE_INSTRUMENT,
 };
 use meridian_instrument::store::Store;
-use meridian_instrument::{resolve_identifier, PostgresStore, Reactor, SystemClock};
+use meridian_instrument::{resolve_identifier, PostgresStore, Reactor};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -154,22 +151,22 @@ fn a_placeholder_is_paired_with_an_ins_id_that_replaces_it_everywhere() {
     };
 
     let (placeholder, record) = runtime().block_on(async {
-        let bus = Arc::new(Bus::single("instrument-1", Arc::new(MemoryBackend::new())));
+        let bus = Arc::new(Bus::single(
+            "instrument-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
         let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
         let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
 
         // Wired as the two processes wire themselves, less the announcing
         // loop, which would carry every placeholder earlier runs left in this
         // database to the platform before this one.
-        serve_queries(&bus, store.clone(), Arc::new(SystemClock));
+        serve_queries(&bus, store.clone(), bus.clock());
         let applying = bus.subscribe(INSTRUMENT_PULLED);
-        tokio::spawn(
-            Reactor::new(bus.clone(), store.clone(), Arc::new(SystemClock)).consume(applying),
-        );
+        tokio::spawn(Reactor::new(bus.clone(), store.clone(), bus.clock()).consume(applying));
         let misses = bus.subscribe(INSTRUMENT_MISSING);
-        tokio::spawn(
-            Conductor::new(bus.clone(), platform.clone(), Arc::new(ConductorClock)).consume(misses),
-        );
+        tokio::spawn(Conductor::new(bus.clone(), platform.clone(), bus.clock()).consume(misses));
 
         let first: ResolveIdentifierReply = ask(&bus, RESOLVE_IDENTIFIER, &asking).await;
         assert!(

@@ -25,7 +25,8 @@ use tower::ServiceExt;
 use super::*;
 use crate::records::RecordsCache;
 use crate::web::router;
-use crate::{Clock, SystemClock};
+use crate::Clock;
+use meridian_clock::SystemClock;
 
 const INSTANCE: &str = "snaptrade-1";
 const KEY_ID: &str = "dashboard-2026-09-0a1b2c3d";
@@ -123,7 +124,11 @@ async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> H
     tokio::spawn(async move { axum::serve(listener, plugin).await.unwrap() });
 
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
-    let bus = Arc::new(Bus::single(INSTANCE, Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        INSTANCE,
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let contract = Contract::parse("topic\tkind\tpublisher\tsubscriber\n", "name\tkind\n").unwrap();
     let sidecar = Arc::new(Sidecar::under(
         &contract,
@@ -146,7 +151,10 @@ async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> H
         .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
     if let Some(dir) = live {
-        sidecar.go_live(Arc::new(meridian_sidecar::live::Live::new(dir)));
+        sidecar.go_live(Arc::new(meridian_sidecar::live::Live::new(
+            dir,
+            Arc::new(meridian_clock::SystemClock),
+        )));
     }
     let door = front_door::router(
         FrontDoor::new(
@@ -195,7 +203,11 @@ fn dashboard(
         sessions,
         terminals: Arc::new(crate::terminal::Terminals::default()),
         clock: Arc::new(clock),
-        bus: Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new()))),
+        bus: Arc::new(Bus::single(
+            "dashboard-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        )),
         oidc: None,
         directory: None,
         accounts: None,

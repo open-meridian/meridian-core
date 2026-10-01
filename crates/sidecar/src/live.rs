@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::body::to_bytes;
 use axum::extract::Request;
@@ -43,6 +43,8 @@ const EVENTS_KEPT: usize = 2000;
 
 pub struct Live {
     dir: PathBuf,
+    /// The deployment's clock, which the events here are recorded at.
+    clock: Arc<dyn meridian_clock::Clock>,
     /// One change at a time, so two cannot interleave their files and both
     /// claim the next revision.
     writing: Mutex<()>,
@@ -82,18 +84,23 @@ pub fn held(path: &str) -> Result<PathBuf, String> {
 }
 
 impl Live {
-    pub fn new(dir: impl Into<PathBuf>) -> Live {
+    pub fn new(dir: impl Into<PathBuf>, clock: Arc<dyn meridian_clock::Clock>) -> Live {
         Live {
             dir: dir.into(),
+            clock,
             writing: Mutex::new(()),
         }
     }
 
     /// Only both: the live folder, and a deployment installed for
     /// development. Either alone is no endpoint.
-    pub fn from_env(dir: Option<String>, development: bool) -> Option<Live> {
+    pub fn from_env(
+        dir: Option<String>,
+        development: bool,
+        clock: Arc<dyn meridian_clock::Clock>,
+    ) -> Option<Live> {
         match (dir, development) {
-            (Some(dir), true) if !dir.is_empty() => Some(Live::new(dir)),
+            (Some(dir), true) if !dir.is_empty() => Some(Live::new(dir, clock)),
             _ => None,
         }
     }
@@ -158,7 +165,8 @@ impl Live {
         let mut line = serde_json::json!({
             "revision": revision,
             "event": event,
-            "at": now_seconds(),
+            // Seconds, as the development tool reads them.
+            "at": self.clock.now_ns() as f64 / 1e9,
             "by": "sidecar",
         });
         if let (Some(line), serde_json::Value::Object(more)) = (line.as_object_mut(), detail) {
@@ -322,13 +330,6 @@ fn append_kept(path: &Path, line: &str, kept: usize) -> std::io::Result<()> {
         )?;
     }
     Ok(())
-}
-
-fn now_seconds() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

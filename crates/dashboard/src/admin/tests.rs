@@ -105,7 +105,11 @@ fn harness_holding(
     plugins: Option<Arc<crate::plugins::Plugins>>,
     accounts: Option<Arc<dyn crate::accounts::Accounts>>,
 ) -> Harness {
-    let bus = Arc::new(Bus::single("dashboard-1", Arc::new(MemoryBackend::new())));
+    let bus = Arc::new(Bus::single(
+        "dashboard-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
     let seen: Seen = Arc::default();
     let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     for topic in [

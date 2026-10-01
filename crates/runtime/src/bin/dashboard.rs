@@ -26,10 +26,10 @@ use meridian_dashboard::plugins::Plugins;
 use meridian_dashboard::signing::Signer;
 use meridian_dashboard::terminal::{self, TerminalSessions, Terminals};
 use meridian_dashboard::{
-    refresh, refresh_forever, router, App, RecordsCache, Sessions, SystemClock, WizardSession,
+    refresh, refresh_forever, router, App, RecordsCache, Sessions, WizardSession,
 };
 use meridian_runtime::{
-    bus_from_env, now_ns, on_runtime, required, shutdown, var, wait_for_store, Wait,
+    bus_from_env, clock, now_ns, on_runtime, required, shutdown, var, wait_for_store, Wait,
 };
 
 /// Where the chart mounts the dashboard's signing key.
@@ -60,7 +60,7 @@ fn run() -> Result<(), String> {
             "the dashboard's database",
             &url,
             |url| Database::connect(url, 1),
-            |database| database.migrate(),
+            |database| database.migrate(&*clock()),
         )
         .map_err(|failed| format!("the dashboard's schema could not be applied: {failed}"))?;
         tracing::info!("the dashboard's schema is applied");
@@ -79,8 +79,8 @@ fn run() -> Result<(), String> {
         let secret = required("MERIDIAN_DASHBOARD_SIGNING_SECRET")?;
         let config_map = required("MERIDIAN_DASHBOARD_KEYS_CONFIG_MAP")?;
         let binding = required("MERIDIAN_DASHBOARD_KEY_BINDING")?;
-        let cluster =
-            meridian_first_run::cluster::ApiServer::in_cluster().map_err(|failed| failed.0)?;
+        let cluster = meridian_first_run::cluster::ApiServer::in_cluster(clock())
+            .map_err(|failed| failed.0)?;
         let done = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -377,7 +377,7 @@ fn run() -> Result<(), String> {
         let records = Arc::new(RecordsCache::default());
         let sessions = Arc::new(Sessions::default());
         let terminals = Arc::new(Terminals::keeping(terminal_sessions.clone()));
-        let clock = Arc::new(SystemClock);
+        let clock = clock();
 
         // Once before listening, so the first request finds records when
         // the conductor is up. When it is not, the dashboard still

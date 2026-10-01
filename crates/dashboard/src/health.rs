@@ -176,18 +176,26 @@ mod tests {
     #[tokio::test]
     async fn what_a_sidecar_publishes_is_heard() {
         let backend = Arc::new(MemoryBackend::new());
-        let dashboard = Bus::single("dashboard-1", backend.clone());
+        let dashboard = Bus::single(
+            "dashboard-1",
+            backend.clone(),
+            Arc::new(meridian_clock::SystemClock),
+        );
         let health = Arc::new(Health::default());
         listen(&dashboard, Arc::clone(&health));
-        Bus::single("snaptrade-1", backend)
-            .publish(
-                PLUGIN_REPORT,
-                "meridian.v1.PluginReport",
-                report("snaptrade-1", true).encode_to_vec(),
-                None,
-                None,
-            )
-            .unwrap();
+        Bus::single(
+            "snaptrade-1",
+            backend,
+            Arc::new(meridian_clock::SystemClock),
+        )
+        .publish(
+            PLUGIN_REPORT,
+            "meridian.v1.PluginReport",
+            report("snaptrade-1", true).encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while health.view().is_empty() {
             assert!(tokio::time::Instant::now() < deadline, "nothing was heard");
