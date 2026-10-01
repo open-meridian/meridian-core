@@ -390,7 +390,9 @@ const SEARCH_FROM: usize = 8;
 /// One plugin instance on the home page: the plugin's name and the
 /// instance's, and a button per level the person holds on it, each opening
 /// its area at that level (W6.9; the product owner, 2026-09-30: "manage for
-/// admin, open for write, view for read"). The name opens the first.
+/// admin, open for write, view for read"). The name is only the plugin's:
+/// the buttons are the ways in (the product owner, 2026-09-30: "the plugin
+/// name is linked to the admin page (it shouldn't)").
 fn plugin_card(
     instance: &str,
     name: Option<&str>,
@@ -419,13 +421,13 @@ fn plugin_card(
         initial = escape(&initial),
         title = escape(title),
     );
-    let Some(first) = levels.first() else {
+    if levels.is_empty() {
         return format!(
             "<li data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
              <span class=\"plugin-open\">Not open to you yet</span></div></li>",
             id = escape(instance)
         );
-    };
+    }
     let buttons: String = levels
         .iter()
         .map(|level| {
@@ -438,10 +440,9 @@ fn plugin_card(
         })
         .collect();
     format!(
-        "<li data-instance=\"{id}\"><div class=\"plugin-card\"><a class=\"plugin-main\" href=\"{href}\">{text}</a>\
+        "<li data-instance=\"{id}\"><div class=\"plugin-card\"><span class=\"plugin-main\">{text}</span>\
          <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
         id = escape(instance),
-        href = escape(&crate::area::href(instance, *first, None)),
         label = escape(title),
     )
 }

@@ -39,14 +39,16 @@
 //! the frame as tall as the page says it is by `meridian:size`, so the
 //! dashboard's heading and tab row are the only ones; the page's header
 //! actions (`meridian:actions`) are drawn in the area's head, and its status
-//! dot (`meridian:status`, kit 0.7.0) beside the plugin's name in the
-//! breadcrumb. The person's theme reaches the page as meridian-ui reads it:
-//! on first load as `om-scheme`, `om-mode` and `om-direction` on the page's
-//! address, and on change, and on every load of the frame, as the
-//! `meridian:theme` message the header's script sends to the plugin's origin
-//! alone. A plugin's page may be framed by the dashboard and by nothing else,
-//! and the dashboard's own pages by nobody but the dashboard. In a window of
-//! its own (`om-framed=0`), a page draws its own heading.
+//! dot (`meridian:status`, kit 0.7.0) right after the plugin's name title.
+//! Under Manage, the dashboard draws one tab itself, first: the plugin's
+//! status and its settings form (`crate::admin::manage_tab`), not framed.
+//! The person's theme reaches the page as meridian-ui reads it: on first load
+//! as `om-scheme`, `om-mode` and `om-direction` on the page's address, and on
+//! change, and on every load of the frame, as the `meridian:theme` message
+//! the header's script sends to the plugin's origin alone. A plugin's page
+//! may be framed by the dashboard and by nothing else, and the dashboard's
+//! own pages by nobody but the dashboard. In a window of its own
+//! (`om-framed=0`), a page draws its own heading.
 //!
 //! **The kit** is served at `/.meridian/ui/<version>/` on every plugin host
 //! (Q2), on the plugin's own origin, to anybody: it is the same static files
@@ -687,41 +689,71 @@ pub(crate) async fn frame(
     let reports = app.health.view();
     let tabs = crate::area::tabs(reports.get(&instance), level);
     // A path asked for directly is its tab's, or one of its own under the
-    // level's pages; otherwise the tab asked for, or the first.
+    // level's pages; otherwise the tab asked for, or the first: under Manage,
+    // the dashboard's own Settings, drawn here rather than framed. A path
+    // asked for is always framed, under the first of the plugin's tabs when
+    // it is none of theirs.
     let asked_path = asked
         .get("path")
         .map(String::as_str)
         .filter(|path| page_path(path).is_ok());
+    let frameable = |tab: &&crate::area::Tab| !(tab.drawn && asked_path.is_some());
     let current = asked
         .get("tab")
         .and_then(|key| tabs.iter().find(|tab| &tab.key == key))
+        .filter(frameable)
         .or_else(|| asked_path.and_then(|path| tabs.iter().find(|tab| tab.path == path)))
+        .or_else(|| tabs.iter().find(frameable))
         .or_else(|| tabs.first());
-    let path = asked_path
-        .or(current.map(|tab| tab.path.as_str()))
-        .map(str::to_string);
+    let drawn = asked_path.is_none() && current.is_some_and(|tab| tab.drawn);
+    let path = if drawn {
+        None
+    } else {
+        asked_path
+            .or(current.map(|tab| tab.path.as_str()))
+            .map(str::to_string)
+    };
     // Where no frame can hold the page's session, its window is its own.
     if !plugins.frames() {
         if let Some(path) = &path {
             return redirect(&entrance(&instance, path, level, &theme));
         }
     }
-    let name = crate::catalogue::plugin_name(&app, &instance).await;
-    let name = name.as_deref().unwrap_or(&instance);
+    let launches = crate::catalogue::launches(&app).await;
+    let launch = launches
+        .iter()
+        .find(|launch| launch.instance_id == instance);
+    let name = launch.map_or(instance.as_str(), |launch| launch.name.as_str());
     let shown = match &path {
         Some(path) => crate::area::Shown::Framed {
             src: entrance(&instance, path, level, &theme.clone().seamless()),
             origin: plugins.origin(&instance),
         },
-        None => crate::area::Shown::Nothing(
-            "<p class=\"empty\">This plugin declares no page at admin: what there is to set up \
-             for it is its settings.</p>"
-                .into(),
-        ),
+        // The dashboard's Settings, under Manage alone: may_open has held
+        // the session to a level the person holds, and only `admin` has the
+        // tab.
+        None => {
+            let now = app.clock.now_ns();
+            let records = match app.records.current(now) {
+                Ok(records) => records,
+                Err(stale) => return refused(&stale.to_string()),
+            };
+            let notice = match asked.get("saved").map(String::as_str) {
+                Some("1") => "Saved.",
+                Some("none") => "Nothing was changed.",
+                _ => "",
+            };
+            crate::area::Shown::Drawn(crate::admin::manage_tab(&crate::admin::Manage {
+                instance: &instance,
+                records: &records,
+                report: reports.get(&instance),
+                version: launch.map(|launch| launch.version.as_str()),
+                session: &session,
+                notice,
+                now,
+            }))
+        }
     };
-    let administers = access.administers(&instance);
-    let portal =
-        (administers || access.deployment_admin).then(|| crate::admin::view::path(&instance));
     let held = access.held(&instance);
     let body = crate::area::render(&crate::area::Area {
         instance: &instance,
@@ -731,18 +763,11 @@ pub(crate) async fn frame(
         tabs: &tabs,
         current,
         shown,
-        portal,
     });
-    let framed = path.is_some();
     let crumbs = format!(
-        "{}{}{}",
+        "{}{}",
         crate::html::crumb_link("/", "Home"),
         crate::html::crumb_here(name, Some(&instance)),
-        if framed {
-            crate::area::status_place()
-        } else {
-            String::new()
-        },
     );
     Html(crate::html::page_with(
         &format!("{name} · {}", button(level)),
@@ -761,10 +786,40 @@ pub(crate) async fn frame(
     .into_response()
 }
 
+/// Where a person entering at `level` with no page named lands: the first
+/// page the plugin declares at that level, the area's first framed tab
+/// there (under Manage, the one after the dashboard's own Settings), and
+/// its `/` only where it declares none. A `/` serving Open and View alone
+/// would refuse Manage with the plugin's 403.
+fn first_page(app: &App, instance: &str, level: AccessLevel) -> String {
+    crate::area::tabs(app.health.view().get(instance), level)
+        .into_iter()
+        .find(|tab| !tab.drawn)
+        .map(|tab| tab.path)
+        .unwrap_or_else(|| "/".into())
+}
+
+/// The plugin's host's way in for a code, carrying on to `path` there.
+fn enter_url(
+    plugins: &Plugins,
+    instance: &str,
+    code: &str,
+    path: &str,
+) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(&format!("{}{ENTER_PATH}", plugins.origin(instance)))
+        .map_err(|failed| format!("{instance}'s address is not one: {failed}"))?;
+    url.query_pairs_mut().append_pair("code", code);
+    if path != "/" {
+        url.query_pairs_mut().append_pair("path", path);
+    }
+    Ok(url)
+}
+
 /// `GET /plugins/{instance}/enter?path=&level=` on the dashboard:
 /// EnterPlugin. A one-time code for the instance's host, at the level named,
-/// carrying on to `path` there with the theme, which is what the frame
-/// loads; opened on its own, the page unframed.
+/// carrying on to `path` there -- with none named, the first page at that
+/// level ([`first_page`]) -- with the theme, which is what the frame loads;
+/// opened on its own, the page unframed.
 pub(crate) async fn open(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
@@ -776,19 +831,18 @@ pub(crate) async fn open(
         Ok(allowed) => allowed,
         Err(refusal) => return *refusal,
     };
-    let path = asked.get("path").map(String::as_str).unwrap_or("/");
-    if let Err(why) = page_path(path) {
+    let path = match asked.get("path") {
+        Some(path) => path.clone(),
+        None => first_page(&app, &instance, level),
+    };
+    if let Err(why) = page_path(&path) {
         return said(StatusCode::BAD_REQUEST, "Not a page", &why);
     }
     let code = plugins.mint(Came::Browser(key), &instance, level, app.clock.now_ns());
-    let mut url = match reqwest::Url::parse(&format!("{}{ENTER_PATH}", plugins.origin(&instance))) {
+    let mut url = match enter_url(plugins, &instance, &code, &path) {
         Ok(url) => url,
-        Err(failed) => return refused(&format!("{instance}'s address is not one: {failed}")),
+        Err(why) => return refused(&why),
     };
-    url.query_pairs_mut().append_pair("code", &code);
-    if path != "/" {
-        url.query_pairs_mut().append_pair("path", path);
-    }
     if asked.keys().any(|name| name.starts_with("om-")) {
         Theme::from_pairs(&asked).append_to(&mut url);
     }
@@ -940,7 +994,8 @@ async fn running<'a>(app: &'a App, instance: &str) -> Result<&'a Plugins, Box<Re
 /// `POST /terminal/plugins/{instance}/open?level=`: OpenPluginFromTerminal.
 /// The code `/plugins/{instance}` would mint at the level named, bound to the
 /// terminal session: whichever browser opens the link first enters that
-/// plugin's host alone, at that level, until the terminal session ends.
+/// plugin's host alone, at that level, until the terminal session ends,
+/// landing where the area would at that level ([`first_page`]).
 pub(crate) async fn open_from_terminal(
     State(app): State<Arc<App>>,
     Path(instance): Path<String>,
@@ -958,12 +1013,17 @@ pub(crate) async fn open_from_terminal(
         Err(refusal) => return *refusal,
     };
     let code = plugins.mint(came, &instance, level, now);
+    let landing = first_page(&app, &instance, level);
+    let url = match enter_url(plugins, &instance, &code, &landing) {
+        Ok(url) => url,
+        Err(why) => return declined(StatusCode::SERVICE_UNAVAILABLE, why),
+    };
     answered(
         StatusCode::OK,
         serde_json::json!({
             "instance_id": instance,
             "level": level_name(level),
-            "url": format!("{}{ENTER_PATH}?code={code}", plugins.origin(&instance)),
+            "url": url.as_str(),
         }),
     )
 }

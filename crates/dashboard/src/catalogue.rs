@@ -402,16 +402,6 @@ pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
     }
 }
 
-/// The plugin an instance runs, as the catalogue names it, if it was
-/// launched through it.
-pub(crate) async fn plugin_name(app: &App, instance: &str) -> Option<String> {
-    launches(app)
-        .await
-        .into_iter()
-        .find(|launch| launch.instance_id == instance)
-        .map(|launch| launch.name)
-}
-
 async fn catalogue_within(app: &App, within: Duration) -> Result<PluginCatalogue, String> {
     let (_, bytes) = app
         .bus

@@ -530,6 +530,23 @@ fn field(
 /// developer's settings under a closed "Developer", opened while one of them
 /// is required and missing; and the Save button kept in view.
 pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> String {
+    form_to(
+        record,
+        token,
+        development,
+        &path(&record.plugin_instance_id),
+    )
+}
+
+/// The same form, posted to `action`: the plugin's area under Manage posts
+/// it to its own address, which comes back to the area
+/// ([`crate::area::settings_path`]).
+pub fn form_to(
+    record: &PluginSettingsRecord,
+    token: &str,
+    development: bool,
+    action: &str,
+) -> String {
     let declared = &record.declared_settings;
     let (developer, settings): (Vec<_>, Vec<_>) = in_order(declared)
         .into_iter()
@@ -573,7 +590,7 @@ pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> St
          {main}{developer}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button></div>\
          </form><div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>\
          <script>{SCRIPT}</script>",
-        action = escape(&path(&record.plugin_instance_id)),
+        action = escape(action),
     )
 }
 

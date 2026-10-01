@@ -14,7 +14,10 @@
 //! request. A plugin's tabs, `/admin/plugins/{instance}`, are its admins' --
 //! a deployment admin being one through All plugins (admin) -- and a
 //! deployment admin's for what is theirs on it; its settings are its admins'
-//! alone (W6.9 to W6.11, decisions/027).
+//! alone (W6.9 to W6.11, decisions/027). The same settings form, and the
+//! plugin's status, are drawn in the plugin's area under Manage too
+//! ([`manage_tab`]), posted to `/plugins/{instance}/settings` under the same
+//! guard.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -59,6 +62,7 @@ pub fn routes() -> Router<Arc<App>> {
             "/admin/plugins/{instance}/settings",
             get(settings_page).post(set_settings),
         )
+        .route("/plugins/{instance}/settings", post(set_settings_in_area))
 }
 
 fn field<'a>(fields: &'a Fields, name: &str) -> &'a str {
@@ -588,32 +592,56 @@ async fn settings_page(
         .into_response()
 }
 
-/// The form, as one command to the conductor, from an admin of the plugin
-/// (W6.11). What was typed into a secret's field goes there and nowhere
-/// else: not into a log line, and not back into a page, including the one
-/// saying it was refused.
+/// The form, from the admin portal's Settings tab, back to it.
 async fn set_settings(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Path(instance): Path<String>,
     Form(fields): Form<Fields>,
 ) -> Response {
-    let (session, records, _) = match gate_plugin(&app, &headers, &instance, true) {
+    let back = view::tab_href(&instance, view::SETTINGS);
+    save_settings(&app, &headers, &instance, &fields, &back).await
+}
+
+/// `POST /plugins/{instance}/settings`: the form, from the plugin's area
+/// under Manage ([`manage_tab`]), back to its Settings tab there.
+async fn set_settings_in_area(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = crate::area::href(&instance, AccessLevel::Admin, Some(crate::area::SETTINGS));
+    save_settings(&app, &headers, &instance, &fields, &back).await
+}
+
+/// The form, as one command to the conductor, from an admin of the plugin
+/// (W6.11), whichever page it came from: its admins alone, a deployment
+/// admin being one through All plugins (admin). What was typed into a
+/// secret's field goes there and nowhere else: not into a log line, and not
+/// back into a page, including the one saying it was refused.
+async fn save_settings(
+    app: &App,
+    headers: &HeaderMap,
+    instance: &str,
+    fields: &Fields,
+    back: &str,
+) -> Response {
+    let (session, records, _) = match gate_plugin(app, headers, instance, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
     };
-    if let Err(response) = form_token_matches(&session, &fields) {
+    if let Err(response) = form_token_matches(&session, fields) {
         return *response;
     }
-    let Some(record) = settings_of(&records, &instance) else {
-        return no_such_plugin(&instance);
+    let Some(record) = settings_of(&records, instance) else {
+        return no_such_plugin(instance);
     };
-    let back = view::tab_href(&instance, view::SETTINGS);
-    let Some(request) = settings::request(record, &fields, crate::html::is_development()) else {
-        return after_to(Ok(()), &format!("{back}&saved=none"), &back);
+    let Some(request) = settings::request(record, fields, crate::html::is_development()) else {
+        return after_to(Ok(()), &format!("{back}&saved=none"), back);
     };
     let outcome = command::<PluginSettingsRecord>(
-        &app,
+        app,
         &session,
         "platform.config.command.set-plugin-settings",
         "meridian.v1.SetPluginSettingsRequest",
@@ -621,7 +649,76 @@ async fn set_settings(
     )
     .await
     .map(|_| ());
-    after_to(outcome, &format!("{back}&saved=1"), &back)
+    after_to(outcome, &format!("{back}&saved=1"), back)
+}
+
+/// What the dashboard's Settings tab in a plugin's area under Manage shows.
+pub(crate) struct Manage<'a> {
+    pub instance: &'a str,
+    pub records: &'a AccessRecords,
+    pub report: Option<&'a meridian_domain::v1::PluginReport>,
+    /// The version the catalogue launched, where it launched the plugin.
+    pub version: Option<&'a str>,
+    pub session: &'a Session,
+    pub notice: &'a str,
+    pub now: i64,
+}
+
+/// The dashboard's Settings tab in a plugin's area under Manage (the product
+/// owner, 2026-10-01: "build Settings and the status panel under Manage"):
+/// its status -- health, its why the badge's note, the version running and
+/// the contract it registered with, and the place kept for what will change
+/// them -- then the admin portal's settings form, posted to the area's own
+/// address. Nothing of the deployment's and no account's data: a plugin
+/// admin's, of this plugin alone.
+pub(crate) fn manage_tab(manage: &Manage) -> String {
+    let instance = manage.instance;
+    let state = crate::health::state(manage.report, manage.now);
+    let (badge, why) = view::state_badge(&state, "status-note");
+    let said = |value: Option<&str>, otherwise: &str| {
+        escape(
+            value
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or(otherwise),
+        )
+    };
+    let version = said(
+        manage.version,
+        "not known: it was not launched from the catalogue",
+    );
+    let contract = said(
+        manage.report.map(|report| report.contract_version.as_str()),
+        "not said",
+    );
+    let status = format!(
+        "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
+         <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
+         <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
+         <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
+         holding it at one will be here. They are not built yet.</p></section>"
+    );
+    let form = match settings_of(manage.records, instance) {
+        Some(record) => settings::form_to(
+            record,
+            &token_input(manage.session),
+            crate::html::is_development(),
+            &crate::area::settings_path(instance),
+        ),
+        None => "<p class=\"empty\">Its settings are not known yet: the plugin has not \
+                 reported what it needs.</p>"
+            .to_string(),
+    };
+    let notice = if manage.notice.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"notice good\">{}</p>", escape(manage.notice))
+    };
+    format!(
+        "{notice}{status}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
+         <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
+         once set: type a new value to replace it.</p>{form}</section>"
+    )
 }
 
 // ── The commands ────────────────────────────────────────────────────────────

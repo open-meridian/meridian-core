@@ -577,15 +577,24 @@ async fn home_links_each_plugin_a_person_may_open() {
     let h = harness(&[INSTANCE]).await;
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     // Not launched through the catalogue, so named by its instance alone;
-    // and a button for the one level she holds, View (W6.9).
+    // and a button for the one level she holds, View (W6.9). The name is no
+    // link: the button is the way in.
     assert!(
         home.body.contains(
             "<li data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
-             <a class=\"plugin-main\" href=\"/plugins/snaptrade-1?level=read\">"
+             <span class=\"plugin-main\"><span class=\"plugin-icon\" aria-hidden=\"true\">s</span>\
+             <span class=\"plugin-text\"><span class=\"plugin-name\">snaptrade-1</span></span></span>\
+             <span class=\"plugin-levels\""
         ),
         "{}",
         home.body
     );
+    assert_eq!(
+        home.body.matches("href=\"/plugins/snaptrade-1").count(),
+        1,
+        "one way in, View's"
+    );
+    assert!(!home.body.contains("/admin/plugins/"));
     assert!(home.body.contains(
         "<a class=\"plugin-level\" data-level=\"read\" href=\"/plugins/snaptrade-1?level=read\">View</a>"
     ));
@@ -1410,15 +1419,16 @@ async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamles
     .await;
     assert_eq!(frame.status, StatusCode::OK, "{}", frame.body);
     let head = frame.body.split("</header>").next().unwrap();
-    // The plugin's name, its instance on hover, then the place its page's
-    // status dot goes; the way back, and the person.
+    // The plugin's name, its instance on hover, the last crumb: its page's
+    // status dot is beside the name title below, not here; the way back, and
+    // the person.
     assert!(
         head.contains(
-            "<span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade</span>\
-             <span class=\"crumb-status\" id=\"page-status\"></span>"
+            "<span class=\"here\" aria-current=\"page\" title=\"snaptrade-1\">snaptrade</span></nav>"
         ),
         "{head}"
     );
+    assert!(!head.contains("page-status"), "{head}");
     assert!(
         head.contains("<a href=\"/\">Home</a><span class=\"sep\" aria-hidden=\"true\">/</span>")
     );
@@ -1444,8 +1454,17 @@ async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamles
         "href=\"/plugins/snaptrade-1?level=read&amp;tab=home\" data-tab=\"home\" data-page=\"/\""
     ));
     assert!(
-        !body.contains("data-portal"),
+        !body.contains("/admin/plugins/"),
         "no way to the admin portal for somebody who administers nothing"
+    );
+    // Before the plugin's name, a house Home.
+    assert!(
+        body.contains(
+            "<div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\"><svg"
+        ) && body.contains(
+            "</svg></a><h1>snaptrade</h1><span class=\"title-status\" id=\"page-status\"></span></div>"
+        ),
+        "{body}"
     );
     // The page below, entered through the dashboard at the session's level
     // with the theme on its address, seamless: framed, told so by message on
@@ -1501,7 +1520,7 @@ async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamles
 }
 
 #[tokio::test]
-async fn each_button_shows_the_pages_at_its_level_and_an_admin_the_way_to_the_portal() {
+async fn each_button_shows_the_pages_at_its_level_and_no_way_to_the_portal_even_to_an_admin() {
     let h = harness(&[INSTANCE]).await;
     let mut held = admin_records();
     held.access_groups = records(&[INSTANCE]).access_groups;
@@ -1544,16 +1563,28 @@ async fn each_button_shows_the_pages_at_its_level_and_an_admin_the_way_to_the_po
             .body
         }
     };
+    // Manage opens on the dashboard's own Settings, first in the tab row,
+    // drawn here and not framed; the plugin's page at admin a tab away.
     let manage = area("admin").await;
     assert!(
         manage.contains(
-            "data-page=\"/admin/connections\" class=\"here\" aria-current=\"page\">Connections</a>"
+            "data-tab=\"settings\" data-drawn class=\"here\" aria-current=\"page\">Settings</a>"
         ),
         "{manage}"
     );
+    assert!(!manage.contains("<iframe"), "{manage}");
     assert!(!manage.contains("Statements"), "{manage}");
-    assert!(manage.contains("href=\"/admin/plugins/snaptrade-1\" data-portal"));
-    assert!(manage.contains("enter?path=%2Fadmin%2Fconnections&amp;level=admin&amp;"));
+    // Its admin, a deployment admin too, is shown no way from here to its
+    // tabs in the admin portal (the product owner, 2026-09-30).
+    assert!(!manage.contains("/admin/plugins/"), "{manage}");
+    let connections = area("admin&tab=connections").await;
+    assert!(
+        connections.contains(
+            "data-page=\"/admin/connections\" class=\"here\" aria-current=\"page\">Connections</a>"
+        ),
+        "{connections}"
+    );
+    assert!(connections.contains("enter?path=%2Fadmin%2Fconnections&amp;level=admin&amp;"));
     // Manage and View, the two she holds, to move between.
     assert!(manage.contains("<nav class=\"level-switch\""), "{manage}");
     let view = area("read").await;
@@ -1565,6 +1596,466 @@ async fn each_button_shows_the_pages_at_its_level_and_an_admin_the_way_to_the_po
     );
     assert!(!view.contains("Connections"), "{view}");
     assert!(view.contains("enter?path=%2Fstatements&amp;level=read&amp;"));
+}
+
+// ── Settings and status under Manage, drawn by the dashboard ─────────────
+
+/// Obviously not a real credential, and long enough to find in a page.
+const TYPED_SECRET: &str = "sk-test-typed-into-the-area-5c1e";
+
+/// SnapTrade's settings as the conductor keeps them: a secret that is set,
+/// and how often to read, held at 900.
+fn snaptrade_settings() -> meridian_domain::v1::PluginSettingsRecord {
+    use meridian_pb::v1::{SettingDeclaration, SettingType};
+    meridian_domain::v1::PluginSettingsRecord {
+        plugin_instance_id: INSTANCE.into(),
+        values: vec![meridian_domain::v1::PluginSettingValue {
+            name: "poll_seconds".into(),
+            value: "900".into(),
+        }],
+        secrets_set: vec!["client_id".into()],
+        declared_settings: vec![
+            SettingDeclaration {
+                name: "client_id".into(),
+                label: "Client ID".into(),
+                r#type: SettingType::String as i32,
+                required: true,
+                secret: true,
+                ..Default::default()
+            },
+            SettingDeclaration {
+                name: "poll_seconds".into(),
+                label: "Read every".into(),
+                r#type: SettingType::Integer as i32,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// SnapTrade as its sidecar reports it now: healthy, at contract v5, its
+/// two pages at admin and Statements at write and read.
+fn snaptrade_reporting(h: &Harness) {
+    fn page(path: &str, title: &str, levels: &[AccessLevel]) -> meridian_pb::v1::PageDeclaration {
+        meridian_pb::v1::PageDeclaration {
+            path: path.into(),
+            title: title.into(),
+            levels: levels.iter().map(|l| *l as i32).collect(),
+        }
+    }
+    h.app.health.hear(
+        INSTANCE,
+        meridian_domain::v1::PluginReport {
+            plugin_instance_id: INSTANCE.into(),
+            registered: true,
+            healthy: true,
+            contract_version: "v5".into(),
+            reported_at_ns: h.app.clock.now_ns(),
+            declared_interface: Some(InterfaceDeclaration {
+                loopback_port: 8000,
+                title: "SnapTrade".into(),
+                pages: vec![
+                    page("/admin/connections", "Connections", &[AccessLevel::Admin]),
+                    page("/admin/accounts", "Account links", &[AccessLevel::Admin]),
+                    page(
+                        "/statements",
+                        "Statements",
+                        &[AccessLevel::Write, AccessLevel::Read],
+                    ),
+                ],
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// The tab row's keys, in order, and the one the page is on.
+fn tab_row(body: &str) -> (Vec<String>, String) {
+    let nav = body
+        .split("<nav class=\"tabs view-tabs\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</nav>").next())
+        .unwrap_or_default();
+    let mut keys = Vec::new();
+    let mut here = String::new();
+    for link in nav.split(" data-tab=\"").skip(1) {
+        let key = link.split('"').next().unwrap().to_string();
+        if link
+            .split('>')
+            .next()
+            .unwrap()
+            .contains("aria-current=\"page\"")
+        {
+            here = key.clone();
+        }
+        keys.push(key);
+    }
+    (keys, here)
+}
+
+/// A form posted to the dashboard as Ada.
+async fn post_form(h: &Harness, path: &str, form: &str) -> Answer {
+    let response = router(Arc::clone(&h.app))
+        .oneshot(
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(HOST, DASHBOARD)
+                .header(COOKIE, dashboard_cookie(h))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+/// Under Manage the dashboard draws its own Settings tab first in the one
+/// tab row -- Settings, Connections, Account links for SnapTrade -- and the
+/// area opens on it (the product owner, 2026-10-01): the plugin's status
+/// above the admin portal's settings form, which posts to the area's own
+/// address, reaches the conductor as the person's, and comes back to the
+/// tab. A secret's field is always empty, and what was typed into it is in
+/// no page after.
+#[tokio::test]
+async fn under_manage_the_dashboard_draws_settings_and_status_first_and_never_shows_a_secret() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    held.plugin_settings = vec![snaptrade_settings()];
+    h.app.records.store(held, h.app.clock.now_ns());
+    snaptrade_reporting(&h);
+    serving_launched(&h);
+
+    let manage = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=admin"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(manage.status, StatusCode::OK, "{}", manage.body);
+    let body = manage.body.split("</header>").nth(1).unwrap();
+    assert_eq!(
+        tab_row(body),
+        (
+            vec![
+                "settings".into(),
+                "connections".into(),
+                "account-links".into()
+            ],
+            "settings".into()
+        )
+    );
+    assert!(!body.contains("<iframe"), "drawn, not framed: {body}");
+    // The status: its health, its why on hover, the version the catalogue
+    // launched and the contract it registered with, and the place kept for
+    // restarting and moving versions, which are not built yet.
+    let status = body
+        .split("<section class=\"panel padded\" id=\"status\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</section>").next())
+        .expect("the status panel");
+    assert!(
+        status.contains("<span class=\"badge good\">Healthy</span>"),
+        "{status}"
+    );
+    assert!(status.contains("<dd data-version>0.1.0</dd>"), "{status}");
+    assert!(status.contains("<dd data-contract>v5</dd>"), "{status}");
+    assert!(status.contains("data-reserved=\"lifecycle\""), "{status}");
+    assert!(!status.contains("<button"), "a place kept, not buttons yet");
+    // Then the form, posted here, its secret's field empty.
+    assert!(body.find("id=\"status\"").unwrap() < body.find("id=\"settings\"").unwrap());
+    assert!(
+        body.contains(&format!("action=\"/plugins/{INSTANCE}/settings\"")),
+        "{body}"
+    );
+    assert!(
+        body.contains("type=\"password\" name=\"secret.client_id\" value=\"\""),
+        "{body}"
+    );
+    // Of this plugin alone: nothing of the deployment's, no account's data,
+    // no Access tab, and no way into the admin portal.
+    for elsewhere in [
+        "Growth",
+        "ACC-1",
+        "Operations",
+        "id=\"access\"",
+        "/admin/plugins/",
+        "/admin#",
+    ] {
+        assert!(!body.contains(elsewhere), "{elsewhere} in {body}");
+    }
+
+    // Saved: to the conductor as Ada's, the secret with it and nowhere else,
+    // and back to the tab, saying so.
+    let asked: Arc<Mutex<Vec<(meridian_domain::v1::SetPluginSettingsRequest, String)>>> =
+        Arc::default();
+    let keeping = Arc::clone(&asked);
+    h.app.bus.serve(
+        "platform.config.command.set-plugin-settings",
+        move |envelope| {
+            let request =
+                meridian_domain::v1::SetPluginSettingsRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+            keeping.lock().unwrap().push((request, by));
+            Ok(("".into(), snaptrade_settings().encode_to_vec()))
+        },
+    );
+    let token = h
+        .app
+        .sessions
+        .find(&h.session, h.app.clock.now_ns())
+        .unwrap()
+        .form_token;
+    let saved = post_form(
+        &h,
+        &format!("/plugins/{INSTANCE}/settings"),
+        &format!("form_token={token}&secret.client_id={TYPED_SECRET}&value.poll_seconds=600"),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    assert_eq!(
+        saved.headers[LOCATION],
+        format!("/plugins/{INSTANCE}?level=admin&tab=settings&saved=1").as_str()
+    );
+    assert!(!saved.body.contains(TYPED_SECRET));
+    {
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        let (request, by) = &asked[0];
+        assert_eq!(by, ADA);
+        let named: Vec<(&str, &str)> = request
+            .values
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [("client_id", TYPED_SECRET), ("poll_seconds", "600")]
+        );
+    }
+    let back = get(
+        &h.app,
+        DASHBOARD,
+        saved.headers[LOCATION].to_str().unwrap(),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert!(
+        back.body.contains("<p class=\"notice good\">Saved.</p>"),
+        "{}",
+        back.body
+    );
+    assert_eq!(tab_row(&back.body).1, "settings");
+    assert!(!back.body.contains(TYPED_SECRET));
+    // Without the session's token, nothing is sent.
+    let forged = post_form(
+        &h,
+        &format!("/plugins/{INSTANCE}/settings"),
+        &format!("secret.client_id={TYPED_SECRET}"),
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::BAD_REQUEST);
+    assert!(!forged.body.contains(TYPED_SECRET));
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+/// The dashboard's Settings are the plugin's admins' alone, a deployment
+/// admin being one through All plugins (admin): a reader or a writer sees no
+/// Settings tab under the buttons they hold and is refused it under Manage
+/// and its form, as is the admin of another plugin.
+#[tokio::test]
+async fn the_dashboards_settings_are_for_the_plugins_admins_alone() {
+    let h = harness(&[INSTANCE]).await;
+    snaptrade_reporting(&h);
+    let settings_of = |level: AccessLevel, on: &str| {
+        let mut held = records(&[INSTANCE]);
+        held.access_groups[0].entries = vec![AccessEntry {
+            plugin_instance_id: on.into(),
+            level: level as i32,
+        }];
+        if on != INSTANCE {
+            // Reading this one too, so only Manage is refused.
+            held.access_groups[0].entries.push(AccessEntry {
+                plugin_instance_id: INSTANCE.into(),
+                level: AccessLevel::Read as i32,
+            });
+        }
+        held.plugin_settings = vec![snaptrade_settings()];
+        held
+    };
+    let token = h
+        .app
+        .sessions
+        .find(&h.session, h.app.clock.now_ns())
+        .unwrap()
+        .form_token;
+    for (level, on, holding) in [
+        (AccessLevel::Read, INSTANCE, "read"),
+        (AccessLevel::Write, INSTANCE, "write"),
+        (AccessLevel::Admin, "snaptrade-2", "read"),
+    ] {
+        h.app
+            .records
+            .store(settings_of(level, on), h.app.clock.now_ns());
+        let own = get(
+            &h.app,
+            DASHBOARD,
+            &format!("/plugins/{INSTANCE}?level={holding}"),
+            &[dashboard_cookie(&h)],
+        )
+        .await;
+        assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+        assert!(
+            !tab_row(&own.body).0.contains(&"settings".to_string())
+                && !own.body.contains("id=\"settings\""),
+            "{level:?} on {on}: {}",
+            own.body
+        );
+        for asked in [
+            format!("/plugins/{INSTANCE}?level=admin&tab=settings"),
+            format!("/plugins/{INSTANCE}?level={holding}&tab=settings"),
+        ] {
+            let page = get(&h.app, DASHBOARD, &asked, &[dashboard_cookie(&h)]).await;
+            assert!(
+                !page.body.contains("id=\"settings\""),
+                "{asked}: {}",
+                page.body
+            );
+            if asked.contains("level=admin") {
+                assert_eq!(page.status, StatusCode::FORBIDDEN, "{asked}");
+            }
+        }
+        let posted = post_form(
+            &h,
+            &format!("/plugins/{INSTANCE}/settings"),
+            &format!("form_token={token}&value.poll_seconds=600"),
+        )
+        .await;
+        assert_eq!(posted.status, StatusCode::FORBIDDEN, "{level:?} on {on}");
+    }
+}
+
+/// Entered at a level with no page named -- a Home button's way in, or
+/// `meridian plugin open --level` from a terminal -- the person lands on the
+/// first page the plugin declares at that level, the area's first tab
+/// there, and on its `/` only where it declares none at that level: a `/`
+/// serving Open and View alone (the 0.10.0 scaffold's Accounts) would refuse
+/// Manage with the plugin's 403.
+#[tokio::test]
+async fn entered_with_no_page_named_it_lands_on_the_first_page_at_that_level() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    h.app.records.store(held, h.app.clock.now_ns());
+    let declare = |pages: &[(&str, &str, &[AccessLevel])]| {
+        h.app.health.hear(
+            INSTANCE,
+            meridian_domain::v1::PluginReport {
+                plugin_instance_id: INSTANCE.into(),
+                registered: true,
+                declared_interface: Some(InterfaceDeclaration {
+                    loopback_port: 8000,
+                    title: "Accounts".into(),
+                    pages: pages
+                        .iter()
+                        .map(|(path, title, levels)| meridian_pb::v1::PageDeclaration {
+                            path: path.to_string(),
+                            title: title.to_string(),
+                            levels: levels.iter().map(|l| *l as i32).collect(),
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            },
+        )
+    };
+    // Where the way in lands on the plugin's host, once redeemed.
+    let lands = |entrance: String| {
+        let h = &h;
+        async move {
+            let prefix = format!("https://{PLUGIN_HOST}");
+            let path = entrance
+                .strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("{entrance}"))
+                .to_string();
+            let redeemed = get(&h.app, PLUGIN_HOST, &path, &[]).await;
+            assert_eq!(redeemed.status, StatusCode::SEE_OTHER, "{}", redeemed.body);
+            redeemed.headers[LOCATION].to_str().unwrap().to_string()
+        }
+    };
+    let from_home = |level: &'static str| {
+        let h = &h;
+        async move {
+            let answer = get(
+                &h.app,
+                DASHBOARD,
+                &format!("/plugins/{INSTANCE}/enter?level={level}"),
+                &[dashboard_cookie(h)],
+            )
+            .await;
+            assert_eq!(answer.status, StatusCode::SEE_OTHER, "{}", answer.body);
+            answer.headers[LOCATION].to_str().unwrap().to_string()
+        }
+    };
+    let session = terminal(&h.app).await;
+    let from_terminal = |level: &'static str| {
+        let h = &h;
+        let session = session.clone();
+        async move {
+            let opened = develop(
+                &h.app,
+                Method::POST,
+                &format!("/terminal/plugins/{INSTANCE}/open?level={level}"),
+                &session,
+                "",
+            )
+            .await;
+            assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
+            let said: serde_json::Value = serde_json::from_str(&opened.body).unwrap();
+            said["url"].as_str().unwrap().to_string()
+        }
+    };
+    const ADMIN: &[AccessLevel] = &[AccessLevel::Admin];
+    const DATA: &[AccessLevel] = &[AccessLevel::Write, AccessLevel::Read];
+    declare(&[
+        ("/", "Accounts", DATA),
+        ("/setup", "Setup", ADMIN),
+        ("/admin/links", "Links", ADMIN),
+    ]);
+    assert_eq!(lands(from_home("admin").await).await, "/setup");
+    assert_eq!(lands(from_terminal("admin").await).await, "/setup");
+    assert_eq!(lands(from_home("read").await).await, "/");
+    assert_eq!(lands(from_terminal("read").await).await, "/");
+    // A page named is the page entered, whatever the level's first.
+    let named = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}/enter?level=admin&path=%2Fadmin%2Flinks"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(
+        lands(named.headers[LOCATION].to_str().unwrap().to_string()).await,
+        "/admin/links"
+    );
+    // Declaring no page at Manage, its `/`.
+    declare(&[("/", "Accounts", DATA)]);
+    assert_eq!(lands(from_home("admin").await).await, "/");
+    assert_eq!(lands(from_terminal("admin").await).await, "/");
 }
 
 #[tokio::test]

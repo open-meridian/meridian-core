@@ -136,7 +136,14 @@ nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:60
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
 .plugin-view nav.tabs{margin-bottom:1rem}.plugin-view .stack>*+*{margin-top:1.25rem}\
-.plugin-area nav.tabs{margin-bottom:0}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
+.plugin-area nav.tabs{margin-bottom:var(--space-5)}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
+.plugin-area .area-drawn>*+*{margin-top:1.25rem}\
+.reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
+color:var(--ink-faint);font-size:.88rem}\
+.plugin-area .area-title{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-area .area-title h1{min-width:0}\
+a.home-link{display:inline-flex;flex-shrink:0;padding:.3rem;border-radius:var(--radius);color:var(--ink-soft)}\
+a.home-link:hover{background:var(--hover);color:var(--ink);text-decoration:none}\
+a.home-link:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}a.home-link svg{display:block;width:22px;height:22px}\
 .level-switch{display:inline-flex;border:1px solid var(--line-strong);border-radius:var(--radius);overflow:hidden}\
 .level-switch a{padding:.3rem .75rem;font-size:.86rem;color:var(--ink-soft);background:var(--card)}\
 .level-switch a+a{border-left:1px solid var(--line-strong)}\
@@ -164,8 +171,8 @@ box-shadow:var(--shadow-pop);font-size:.88rem;line-height:1.45;white-space:pre-w
 button.badge,button.pill{margin:0;border:0;font-family:inherit;line-height:inherit;vertical-align:middle}\
 html[data-script] [data-note]{cursor:help}\
 button.badge:focus-visible,button.pill:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
-header.bar .crumbs .crumb-status{display:inline-flex;align-items:center;flex-shrink:0}\
-header.bar .crumbs .crumb-status:empty{display:none}\
+.plugin-area .title-status{display:inline-flex;align-items:center;flex-shrink:0}\
+.plugin-area .title-status:empty{display:none}\
 .status-dot{display:inline-flex;align-items:center;justify-content:center;min-width:1.5rem;min-height:1.5rem;\
 margin:-.275rem;padding:0;border:0;border-radius:50%;background:none;flex-shrink:0}.status-dot:hover{background:none}\
 .status-dot:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
@@ -239,8 +246,7 @@ background:var(--accent-wash);color:var(--accent);font-weight:700;font-size:1.05
 .plugin-meta{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
 .plugin-open{color:var(--accent);font-weight:550;white-space:nowrap}\
 .plugin-card:not(a) .plugin-open{color:var(--ink-faint);font-weight:400}\
-a.plugin-main{display:flex;align-items:center;gap:.9rem;min-width:0;flex:1 1 auto;color:inherit}\
-a.plugin-main:hover{text-decoration:none}a.plugin-main:hover .plugin-name{color:var(--accent)}\
+.plugin-main{display:flex;align-items:center;gap:.9rem;min-width:0;flex:1 1 auto;color:inherit}\
 .plugin-levels{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
 a.plugin-level{padding:.28rem .7rem;border:1px solid var(--line-strong);border-radius:var(--radius);\
 font-size:.86rem;font-weight:550;color:var(--accent);background:var(--card);white-space:nowrap}\
@@ -341,7 +347,8 @@ const GEAR: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"
      stroke-linejoin=\"round\"/><circle cx=\"12\" cy=\"12\" r=\"3\" fill=\"none\" stroke=\"currentColor\" \
      stroke-width=\"1.7\"/></svg>";
 
-const HOUSE: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M3.5 11.2 \
+/// The house: Home, from Settings and from a plugin's area, before its name.
+pub const HOUSE: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M3.5 11.2 \
      12 4l8.5 7.2M5.8 9.4V20h12.4V9.4M10 20v-5.5h4V20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" \
      stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
@@ -521,9 +528,9 @@ const CHROME_SCRIPT: &str = r#"(function () {
   });
   // A seamless frame's header status, by meridian:status (kit 0.7.0;
   // meridian-ui's README, "The frame: seamless"): the page's own status dot,
-  // drawn beside the plugin's name in the breadcrumb, in the place its frame
-  // names (data-status), so the page spends no line of its own on it (the
-  // product owner, 2026-09-30). Taken under the size's guards and only in the
+  // drawn right after the plugin's name title in the area's heading, in the
+  // place its frame names (data-status), so the page spends no line of its
+  // own on it (the product owner, 2026-09-30). Taken under the size's guards and only in the
   // kit's shape, else not at all; state null takes the dot away, as a new
   // load of the frame does. Its label is its name and its note's first line,
   // its detail and moment its description; every word is text, never markup.
@@ -977,6 +984,20 @@ mod tests {
         assert!(STYLE.contains("html[data-om-mode=dark] .plugin-frame{color-scheme:dark}"));
     }
 
+    /// The area owns the gap between its tab row and the framed page (the
+    /// product owner, 2026-09-30: "can we have consistent spacing"): the kit
+    /// drops a framed page's own padding, so a page whose first element is a
+    /// card sits as far below the tabs as one opening with a paragraph, and
+    /// as the dashboard's other tab rows sit above what they show.
+    #[test]
+    fn the_areas_page_sits_one_space_below_its_tab_row_as_under_every_tab_row() {
+        assert!(STYLE.contains(".plugin-area nav.tabs{margin-bottom:var(--space-5)}"));
+        // --space-5 is the kit's 20px, the 1.25rem every other tab row keeps.
+        assert!(STYLE
+            .contains("nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;"));
+        assert!(!STYLE.contains(".plugin-area nav.tabs{margin-bottom:0}"));
+    }
+
     #[test]
     fn a_title_cannot_inject_markup() {
         assert!(page("<b>", "").contains("<title>&lt;b&gt; · Open Meridian</title>"));
@@ -1210,7 +1231,9 @@ mod tests {
     /// `meridian:status`; the product owner, 2026-09-30: "put the green icon
     /// ... next to the plugin name"): the size's guards, its own type at
     /// version 1, then the kit's shape, before anything is drawn; drawn
-    /// beside the plugin's name as text; gone with state null or a new load.
+    /// right after the plugin's name title as text (the product owner,
+    /// 2026-09-30: "green check circle should be next to plugin name title of
+    /// the form"); gone with state null or a new load.
     #[test]
     fn a_seamless_frames_status_is_taken_only_from_its_own_page_and_drawn_beside_the_name() {
         let listener = CHROME_SCRIPT
@@ -1267,7 +1290,7 @@ mod tests {
             "function words(v, least, most) { return typeof v === \"string\" && v.trim().length >= least && v.length <= most; }"
         ));
 
-        // Drawn in the place the frame names, beside the plugin's name: a dot
+        // Drawn in the place the frame names, after the plugin's name: a dot
         // whose state is its mark, its label its name and its note's first
         // line, its detail and moment what describes it; all of it as text.
         let draw = CHROME_SCRIPT
@@ -1296,9 +1319,12 @@ mod tests {
             ".status-dot[data-state=warn]::before{background:var(--warn-ink);content:\"!\"",
             ".status-dot[data-state=busy]::before{background:transparent;border:2px solid var(--warn-ink)",
             "@media (prefers-reduced-motion:reduce){.status-dot[data-state=busy]::before{animation:none}}",
-            // No room taken beside the name until there is a status.
-            "header.bar .crumbs .crumb-status:empty{display:none}",
-            // Its note over the header, which stays put as the page scrolls.
+            // Beside the name title, centred on it, and taking no room
+            // until there is a status.
+            ".plugin-area .area-title{display:flex;align-items:center;",
+            ".plugin-area .title-status{display:inline-flex;align-items:center;flex-shrink:0}",
+            ".plugin-area .title-status:empty{display:none}",
+            // A note on the header stays with it as the page scrolls.
             ".note-bubble.on-bar{position:fixed;z-index:31}",
         ] {
             assert!(STYLE.contains(rule), "{rule}");
