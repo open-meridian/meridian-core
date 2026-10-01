@@ -17,8 +17,9 @@ syntax = "proto3";
 
 package meridian.v1;
 
-// The settings and the interface a plugin declares at registration, which its
-// report carries onward (W4.8). Plugin-facing, and imported from there at the revision this
+// The settings and the interface a plugin declares at registration, and the
+// figures it reports on its heartbeat, which its report carries onward
+// (W4.8). Plugin-facing, and imported from there at the revision this
 // repository pins.
 import "meridian/v1/sidecar.proto";
 
@@ -653,6 +654,12 @@ message PluginReport {
   // pages as pages at `admin`. Unset while the plugin is not registered, or
   // when it serves no interface.
   InterfaceDeclaration declared_interface = 14;
+
+  // The figures the plugin last reported (W4.5), as its last accepted
+  // heartbeat gave them, in its order. Empty while it is not registered,
+  // and after a refused heartbeat, which is reported not healthy with the
+  // refusal as health_detail. The conductor carries none of them on.
+  repeated PluginFigure figures = 15;
 
   // A single role, before a plugin could hold several.
   reserved 2;

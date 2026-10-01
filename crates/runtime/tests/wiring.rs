@@ -188,7 +188,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
 
     assert_eq!(listed.positions.len(), 1);
     let position = &listed.positions[0];
-    let read = |wire: Option<&meridian_domain::v1::Decimal>| {
+    let read = |wire: Option<&meridian_pb::v1::Decimal>| {
         Exact::from_wire(wire.expect("a number"))
             .unwrap()
             .to_string()

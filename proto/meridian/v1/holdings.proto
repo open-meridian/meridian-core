@@ -9,7 +9,8 @@
 // vocabulary here yet.
 //
 // Every quantity is a Decimal and every amount of currency a Money, an integer
-// that carries its own scale (amounts.proto, decisions/023). No field below is
+// that carries its own scale (meridian-schema's sidecar.proto and amounts.proto,
+// decisions/023). No field below is
 // a float, at any layer, because a rounding error here becomes a position
 // break, and a break costs more to investigate than the discipline costs to
 // keep.
@@ -29,7 +30,10 @@ syntax = "proto3";
 
 package meridian.v1;
 
+// Money; and the Decimal, plugin-facing since a plugin's figure may be one,
+// imported from meridian-schema at the revision this repository pins.
 import "meridian/v1/amounts.proto";
+import "meridian/v1/sidecar.proto";
 import "meridian/v1/reference.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────

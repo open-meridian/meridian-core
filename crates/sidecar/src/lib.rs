@@ -13,6 +13,7 @@
 //! above this layer.
 
 pub mod contract;
+pub mod figures;
 pub mod front_door;
 pub mod grants;
 pub mod legacy;

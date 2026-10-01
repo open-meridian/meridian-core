@@ -86,7 +86,11 @@ impl Sidecar {
     /// anything is stamped, so a malformed row never reaches the conductor or
     /// the street store. Nothing is rounded. An unset number is not checked
     /// here: whether one is required is the receiving component's to say.
-    pub(crate) fn exact(&self, field: &str, value: Option<&domain::Decimal>) -> Result<(), Status> {
+    pub(crate) fn exact(
+        &self,
+        field: &str,
+        value: Option<&meridian_pb::v1::Decimal>,
+    ) -> Result<(), Status> {
         let Some(value) = value else {
             return Ok(());
         };

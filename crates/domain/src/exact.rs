@@ -23,7 +23,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
-use crate::v1::Decimal;
+use meridian_pb::v1::Decimal;
 
 /// The most decimal places a value carries.
 pub const MAX_SCALE: u32 = 18;

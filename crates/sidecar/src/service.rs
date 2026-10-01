@@ -46,6 +46,10 @@ pub struct Registration {
     /// (W4.8, W6.9); an older plugin's admin pages among them at `admin`
     /// ([`crate::legacy`]).
     pub interface: Option<meridian_pb::v1::InterfaceDeclaration>,
+    /// The figures of its last accepted heartbeat, in its order (W4.5): what
+    /// its report carries for the dashboard to draw (W4.8). None after a
+    /// heartbeat that was refused.
+    pub figures: Vec<meridian_pb::v1::PluginFigure>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -316,6 +320,7 @@ impl SidecarService for Sidecar {
             contract_version: req.schema_version.clone(),
             settings: req.settings.clone(),
             interface: req.interface.clone(),
+            figures: Vec::new(),
         });
         self.changed.notify_one();
 
@@ -348,16 +353,45 @@ impl SidecarService for Sidecar {
         self.admitted()?;
         let req = request.into_inner();
 
+        // Its figures past a bound refuse the heartbeat whole, never cut
+        // (W4.5). It still says the plugin is alive: reported not healthy,
+        // the refusal as the reason, and no figures rather than stale ones,
+        // so a malformed figure is seen on the Summary and never taken for
+        // silence.
+        let refused = crate::figures::check(&req.figures).err();
+        let (healthy, detail, figures) = match &refused {
+            Some(refusal) => (
+                false,
+                format!("the plugin's heartbeat was refused: {refusal}"),
+                Vec::new(),
+            ),
+            None if req.healthy => (true, String::new(), req.figures),
+            None => (false, req.detail.clone(), req.figures),
+        };
+
+        let mut changed = false;
         if let Some(state) = self.state.write().expect("state lock poisoned").as_mut() {
-            state.healthy = req.healthy;
+            changed = state.healthy != healthy
+                || state.health_detail != detail
+                || state.figures != figures;
+            state.healthy = healthy;
             state.last_heartbeat_ns = now_ns();
-            state.health_detail = if req.healthy {
-                String::new()
-            } else {
-                req.detail.clone()
-            };
+            state.health_detail = detail;
+            state.figures = figures;
+        }
+        // What the report says moved, so it goes out now rather than at the
+        // next interval; a heartbeat repeating the last says nothing new.
+        if changed {
+            self.changed.notify_one();
         }
 
+        if let Some(refusal) = refused {
+            tracing::warn!(refusal, "the plugin's heartbeat was refused");
+            if let Some(live) = self.live.get() {
+                live.refused(&format!("its heartbeat: {refusal}"));
+            }
+            return Err(Status::invalid_argument(refusal));
+        }
         if !req.healthy {
             tracing::warn!(detail = req.detail, "plugin reports itself unhealthy");
         }
@@ -530,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v6"] {
+        for declared in ["v1", "v7"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -539,7 +573,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v5"));
+            assert!(reply.refusal_reason.contains("v2 through v6"));
             assert!(sc.registration().is_none());
         }
     }
@@ -695,6 +729,7 @@ mod tests {
         sc.heartbeat(Request::new(HeartbeatRequest {
             healthy: false,
             detail: "brokerage credentials rejected".into(),
+            ..Default::default()
         }))
         .await
         .unwrap();

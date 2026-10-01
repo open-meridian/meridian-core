@@ -38,6 +38,14 @@ still missing, and a digest of the secret -- never the secret, which a page
 must not carry -- and when this process started and how often it registered,
 so the runner can tell it was not restarted to get it.
 
+A POST to /figures heartbeats with the figures SnapTrade reports (W4.5,
+sdk-contract/a-plugin-reports-its-figures) -- Connections with how many need
+attention, Accounts reached and Last read -- which core draws on the plugin's
+Summary under Manage (W6.9); with "nine", nine figures, which its sidecar
+refuses whole, naming the bound. Written on the wire by hand, like its
+registration, so it does not matter which bindings the SDK's image carries.
+The sidecar reads figures from any heartbeat it accepts.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -110,6 +118,51 @@ def older_registration():
     for setting in DECLARED:
         request += put(6, setting.SerializeToString())
     return request
+
+
+# What SnapTrade reports (the plugin-report fixture's figures): a count with
+# a state and its why, a count, and a time.
+LAST_READ_NS = 1_790_380_500_000_000_000
+FIGURE_STATE_WARN = 2
+FIGURES = [
+    {"label": "Connections", "count": 3, "state": FIGURE_STATE_WARN,
+     "why": "1 connection needs attention: the brokerage asked to reconnect"},
+    {"label": "Accounts reached", "count": 7},
+    {"label": "Last read", "at_ns": LAST_READ_NS},
+]
+
+
+def figure_bytes(figure):
+    """A PluginFigure: label 1, count 2, at_ns 5, state 7, why 8."""
+    out = put(1, figure["label"].encode())
+    if "count" in figure:
+        out += put_varint(2 << 3) + put_varint(figure["count"])
+    if "at_ns" in figure:
+        out += put_varint(5 << 3) + put_varint(figure["at_ns"])
+    if figure.get("state"):
+        out += put_varint(7 << 3) + put_varint(figure["state"])
+    if figure.get("why"):
+        out += put(8, figure["why"].encode())
+    return out
+
+
+def heartbeat(nine=False):
+    """A heartbeat saying it is healthy, with SnapTrade's figures, or with
+    nine well-formed figures, one past the bound."""
+    figures = ([{"label": f"Figure {i}", "count": i} for i in range(9)] if nine else FIGURES)
+    request = put_varint(1 << 3) + put_varint(1)
+    for figure in figures:
+        request += put(3, figure_bytes(figure))
+    beat = grpc.insecure_channel(SIDECAR).unary_unary(
+        "/meridian.v1.SidecarService/Heartbeat",
+        request_serializer=lambda raw: raw,
+        response_deserializer=lambda raw: raw,
+    )
+    try:
+        beat(request, timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True}
 
 
 def register():
@@ -398,6 +451,8 @@ class Page(http.server.BaseHTTPRequestHandler):
         sent = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.path == "/report":
             done = report()
+        elif self.path == "/figures":
+            done = heartbeat(nine=json.loads(sent or b"{}").get("nine", False))
         elif self.path == "/link":
             done = link_for(callers[0], json.loads(sent or b"{}"))
         else:

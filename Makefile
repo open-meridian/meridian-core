@@ -708,6 +708,11 @@ e2e-dashboard-accounts: network
 # dashboard lists beside its link action and shows with what to do (W2.8,
 # W2.1, W6.4).
 #
+# The stand-in heartbeats with SnapTrade's figures, which its sidecar carries
+# on its report and the dashboard draws as tiles on its Summary under Manage,
+# and with nine, which its sidecar refuses naming the bound, reporting it
+# alive, not healthy and with no figures (W4.5, W4.8, W6.9).
+#
 # The stand-in declares a required secret, and a deployment admin sets it in
 # the plugin's settings form: its sidecar's report turns healthy with the
 # plugin never restarted (W6.11, W4.7). The secret is then looked for where it
@@ -765,7 +770,7 @@ e2e-plugin-page: network
 		echo "e2e-plugin-page FAILED: the secret is not held sealed in the configuration store" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; and each act sent for a person is logged with its level"
+	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

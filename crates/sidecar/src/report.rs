@@ -5,7 +5,9 @@
 //! when it last said so, the contract version it registered with, the grants
 //! it was refused, and the settings and the interface it declared -- which is
 //! how the conductor learns what a settings form holds and which of it is
-//! secret, and the dashboard which admin pages to show as tabs. The sidecar
+//! secret, and the dashboard which admin pages to show as tabs -- and the
+//! figures of its last accepted heartbeat, which the dashboard draws on its
+//! Summary (W4.5, W6.9). The sidecar
 //! speaks for the plugin because it is the one that sees refusals and silence,
 //! which the plugin cannot report about itself.
 //!
@@ -114,6 +116,13 @@ impl Sidecar {
             // Its admin pages among them, which the dashboard's admin view of
             // the instance shows as tabs (W6.9).
             declared_interface: registration.as_ref().and_then(|r| r.interface.clone()),
+            // The figures of its last accepted heartbeat (W4.5), drawn on its
+            // Summary below core's own status; none while it is not
+            // registered or after a refused heartbeat.
+            figures: registration
+                .as_ref()
+                .map(|r| r.figures.clone())
+                .unwrap_or_default(),
         }
     }
 }

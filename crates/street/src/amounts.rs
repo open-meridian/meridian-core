@@ -29,7 +29,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use meridian_domain::v1::{Decimal, Money as WireMoney};
+use meridian_domain::v1::Money as WireMoney;
+use meridian_pb::v1::Decimal;
 
 pub use meridian_domain::exact::{Exact, OutOfRange};
 
@@ -164,7 +165,8 @@ impl fmt::Display for Money {
 /// wire the way a sender would, and read back off it.
 #[cfg(test)]
 pub(crate) mod testing {
-    use meridian_domain::v1::{Decimal, Money as WireMoney};
+    use meridian_domain::v1::Money as WireMoney;
+    use meridian_pb::v1::Decimal;
 
     use super::{Exact, Money};
 

@@ -29,7 +29,12 @@ plugin area opens under Manage, and the plugin serves them there alone.
 Granted write, she finds Manage, Open and View; a command sent for her is
 admitted under Open alone. The plugin declares a required secret, which she
 sets on its Settings tab as its admin, and the report turns healthy with the
-plugin never restarted (W6.11, W4.7, W4.8). Bea, in a user group granted the
+plugin never restarted (W6.11, W4.7, W4.8). The plugin reports SnapTrade's
+figures on its heartbeat, which its report carries and core draws as tiles
+on its Summary under Manage, below the status; a heartbeat with nine is
+refused naming the bound, and the plugin is then reported alive, not healthy
+with the refusal as the reason, and with no figures (W4.5, W4.8, W6.9).
+Bea, in a user group granted the
 plugin's `admin` alone, finds Manage alone, sets its settings, links an
 external account to an existing account and is refused naming a new one, and
 sees no account data; granted read on All accounts, the built-in group, her
@@ -202,6 +207,8 @@ class Reports:
                 for interface in report.get(14, [])
                 for page in fields_of(interface).get(4, [])
             ],
+            # Field 15, the figures it last reported (W4.5): each label, in order.
+            "figures": [fields_of(f).get(1, [b""])[0].decode() for f in report.get(15, [])],
         }
         with self.lock:
             self.plugins.append(said)
@@ -445,6 +452,59 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
           f"the view keeps the tabs every plugin has: {tabs}")
     check(f'href="/plugins/{INSTANCE}?level=admin" data-area' in view.body and "<iframe" not in view.body,
           "and links to the plugin's area under Manage, framing nothing")
+
+
+SUMMARY = f"/plugins/{INSTANCE}?level=admin"
+REFUSED_NINE = "the plugin's heartbeat was refused: 9 figures; a plugin reports at most 8"
+
+
+def figures_on(page):
+    """The Summary's figures, as the section's HTML, or "" when none are drawn."""
+    found = page.body.split('<section class="figures" id="figures"', 1)
+    return found[1].split("</section>", 1)[0] if len(found) > 1 else ""
+
+
+def figures_are_drawn_on_summary(ada, manager, reports):
+    """W4.5, W4.8, W6.9: SnapTrade's figures, on its heartbeat, carried on
+    its report and drawn by core as tiles on its Summary; nine refused."""
+    status, body = post_on_plugin_host(manager, "/figures", {"nine": True})
+    nine = json.loads(body) if status == 200 else {}
+    check(nine.get("code") == "INVALID_ARGUMENT"
+          and nine.get("detail") == "9 figures; a plugin reports at most 8",
+          f"a heartbeat with nine figures is refused, naming the bound: {status} {nine}")
+    refused = reports.until(lambda r: r["detail"] == REFUSED_NINE)
+    check(refused.get("registered") is True and refused.get("healthy") is False
+          and refused.get("figures") == [],
+          f"and the plugin is reported alive, not healthy, with no figures: {refused}")
+    page = admin_until(ada, lambda page: "a plugin reports at most 8" in page.body, path=SUMMARY)
+    check(page.status == 200, f"Summary: {page.status} {sentence(page)}")
+    status_panel = page.body.split('id="status"', 1)[-1].split("</section>", 1)[0]
+    check("Not healthy" in status_panel and REFUSED_NINE.replace("'", "&#39;") in status_panel
+          and 'class="figure"' not in figures_on(page),
+          f"Summary says why, and draws no figures: {status_panel[:400]}")
+
+    mark = reports.mark()
+    status, body = post_on_plugin_host(manager, "/figures", {})
+    check(status == 200 and json.loads(body).get("ok"), f"its figures are accepted: {status} {body[:200]}")
+    carried = reports.until(lambda r: r["healthy"] and r["figures"], since=mark)
+    check(carried.get("figures") == ["Connections", "Accounts reached", "Last read"],
+          f"its report carries them, in its order (W4.8): {carried}")
+    page = admin_until(ada, lambda page: 'class="figure"' in figures_on(page), path=SUMMARY)
+    drawn = figures_on(page)
+    labels = re.findall(r'<span class="figure-label">([^<]+)</span>', drawn)
+    check(labels == ["Connections", "Accounts reached", "Last read"],
+          f"Summary draws them as tiles, in its order, after the status: {labels}")
+    check(page.body.find('id="status"') < page.body.find('id="figures"'),
+          "below core's own status")
+    connections = drawn.split('data-figure="Connections"', 1)[-1].split('data-figure="Accounts reached"', 1)[0]
+    check('class="status-dot" data-state="warn"' in connections
+          and 'aria-describedby="figures-0-why"' in connections
+          and "1 connection needs attention: the brokerage asked to reconnect" in connections
+          and '<p class="figure-value">3</p>' in connections,
+          f"Connections, 3, marked warn with its why as the note: {connections[:500]}")
+    check('<p class="figure-value">7</p>' in drawn, f"Accounts reached, 7: {drawn[:600]}")
+    check('<p class="figure-value">2026-09-25 23:55 UTC</p>' in drawn,
+          f"Last read, a time as every moment here is shown: {drawn[:600]}")
 
 
 def buttons(browser, instance=INSTANCE, seconds=45):
@@ -742,6 +802,9 @@ def main():
     say("K: a required secret set in the dashboard reaches the running plugin (W6.11)")
     settings_reach_the_running_plugin(ada, viewer, reports)
     ada.get(dash("/admin"))
+
+    say("P: the plugin's figures are drawn on its Summary by core; nine are refused (W4.5, W6.9)")
+    figures_are_drawn_on_summary(ada, manager, reports)
 
     say("M: Bea, granted the plugin's admin alone, configures it and sees no account's data")
     page = administer(ada, "/admin/user-groups",

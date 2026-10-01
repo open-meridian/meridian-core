@@ -664,19 +664,14 @@ pub(crate) struct Manage<'a> {
     pub now: i64,
 }
 
-/// The id of the place on Summary where the figures the plugin reports will
-/// be drawn as tiles (sdk-contract/a-plugin-reports-its-figures). Until the
-/// contract carries them it is empty, unlabelled and takes no room: nothing
-/// a person would read as missing.
-pub(crate) const FIGURES: &str = "figures";
-
 /// The dashboard's Summary tab in a plugin's area under Manage, where Manage
 /// opens (the product owner, 2026-10-01: "think Status, Connections, Account
 /// Reached, and Last Read can be their own Summary page", core drawing it):
 /// its status -- health, its why the badge's note, the version running and
 /// the contract it registered with, and the place kept for what will change
-/// them -- then the place for the figures it reports ([`FIGURES`]). What is
-/// core's to say, so a plugin cannot misreport it.
+/// them -- then the figures it reports, as tiles ([`crate::figures`]). The
+/// status is core's to say, so a plugin cannot misreport it, and the figures
+/// are only ever drawn as the plugin's, below it.
 pub(crate) fn summary_tab(manage: &Manage) -> String {
     let state = crate::health::state(manage.report, manage.now);
     let (badge, why) = view::state_badge(&state, "status-note");
@@ -696,13 +691,13 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         manage.report.map(|report| report.contract_version.as_str()),
         "not said",
     );
+    let figures = crate::figures::section(manage.report, manage.now);
     format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
          <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
-         holding it at one will be here. They are not built yet.</p></section>\
-         <section class=\"figures\" id=\"{FIGURES}\"></section>"
+         holding it at one will be here. They are not built yet.</p></section>{figures}"
     )
 }
 

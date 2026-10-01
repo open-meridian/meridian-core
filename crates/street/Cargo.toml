@@ -8,6 +8,7 @@ description = "The deployment's street store: holdings statements, holdings and 
 
 [dependencies]
 meridian-domain.workspace = true
+meridian-pb.workspace = true
 meridian-bus = { path = "../bus" }
 prost.workspace = true
 thiserror.workspace = true

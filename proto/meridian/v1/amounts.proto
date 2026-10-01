@@ -10,35 +10,18 @@
 // today and a low-latency order path later. Logs, fixtures and pages show the
 // value as a decimal (`1.5`); only the wire is binary.
 //
-// Nothing is rounded anywhere. A value outside the range below is refused,
+// Nothing is rounded anywhere. A value outside the Decimal's range is refused,
 // by the SDK before it is sent and by the sidecar and every store after.
 
 syntax = "proto3";
 
 package meridian.v1;
 
-// A number: a 128-bit two's-complement integer and its scale. The value is the
-// integer times 10^-scale, so 1.50 is 150 at scale 2 and stays 1.50.
-//
-// The scale travels with the value rather than being fixed for the contract,
-// because the venues disagree: Alpaca takes nine decimal places, a crypto
-// asset eighteen, and a cheap token's holding runs past what 64 bits hold at
-// any fixed scale that serves them both. The scale is the one the value was
-// stated with; nothing normalises it.
-//
-// The integer's magnitude is below 10^38, which is at most 38 significant
-// digits, and the scale is 0 to 18. The widest value the broker survey found,
-// 100 billion units at 18 decimals, is well inside it.
-message Decimal {
-  // The integer's upper 64 bits, signed: negative for a negative value.
-  sfixed64 high = 1;
-
-  // Its lower 64 bits, unsigned. The integer is high * 2^64 + low.
-  fixed64 low = 2;
-
-  // How many decimal places the integer carries, 0 to 18.
-  uint32 scale = 3;
-}
+// The Decimal itself: an integer and its scale. Plugin-facing since a
+// plugin's figure may be one (W4.5), so declared in meridian-schema's
+// sidecar.proto, same package, name and numbers, and imported from there at
+// the revision this repository pins.
+import "meridian/v1/sidecar.proto";
 
 // An amount of currency: a Decimal and the currency it is in.
 //

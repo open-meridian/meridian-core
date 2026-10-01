@@ -13,8 +13,11 @@ use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessRecords, AccountGroup, AccountRecord, AccountState, Permission,
     UserGroup,
 };
+use meridian_pb::v1::plugin_figure::Value as FigureValue;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
-use meridian_pb::v1::{CallerAssertion, InterfaceDeclaration, RegisterRequest};
+use meridian_pb::v1::{
+    CallerAssertion, FigureState, InterfaceDeclaration, PluginFigure, RegisterRequest,
+};
 use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
 use meridian_sidecar::{Contract, Identity, Sidecar};
 use tower::ServiceExt;
@@ -1634,8 +1637,9 @@ fn snaptrade_settings() -> meridian_domain::v1::PluginSettingsRecord {
     }
 }
 
-/// SnapTrade as its sidecar reports it now: healthy, at contract v5, its
-/// two pages at admin and Statements at write and read.
+/// SnapTrade as its sidecar reports it now: healthy, at contract v6, its
+/// two pages at admin and Statements at write and read, and the figures it
+/// reports, as the plugin-report fixture carries them.
 fn snaptrade_reporting(h: &Harness) {
     fn page(path: &str, title: &str, levels: &[AccessLevel]) -> meridian_pb::v1::PageDeclaration {
         meridian_pb::v1::PageDeclaration {
@@ -1650,8 +1654,27 @@ fn snaptrade_reporting(h: &Harness) {
             plugin_instance_id: INSTANCE.into(),
             registered: true,
             healthy: true,
-            contract_version: "v5".into(),
+            contract_version: "v6".into(),
             reported_at_ns: h.app.clock.now_ns(),
+            figures: vec![
+                PluginFigure {
+                    label: "Connections".into(),
+                    value: Some(FigureValue::Count(3)),
+                    state: FigureState::Warn as i32,
+                    why: "1 connection needs attention: the brokerage asked to reconnect".into(),
+                    ..Default::default()
+                },
+                PluginFigure {
+                    label: "Accounts reached".into(),
+                    value: Some(FigureValue::Count(7)),
+                    ..Default::default()
+                },
+                PluginFigure {
+                    label: "Last read".into(),
+                    value: Some(FigureValue::AtNs(1_790_380_500_000_000_000)),
+                    ..Default::default()
+                },
+            ],
             declared_interface: Some(InterfaceDeclaration {
                 loopback_port: 8000,
                 title: "SnapTrade".into(),
@@ -1722,8 +1745,9 @@ async fn post_form(h: &Harness, path: &str, form: &str) -> Answer {
 /// Under Manage the dashboard draws its own Summary and Settings tabs first
 /// in the one tab row -- Summary, Settings, Connections, Account links for
 /// SnapTrade -- and the area opens on Summary (the product owner,
-/// 2026-10-01): the plugin's status, and an empty place for the figures it
-/// will report. Settings is the admin portal's settings form alone, which
+/// 2026-10-01): the plugin's status, then the figures it reports as tiles,
+/// in its order, a figure's state the tile's mark and its why the note.
+/// Settings is the admin portal's settings form alone, which
 /// posts to the area's own address, reaches the conductor as the person's,
 /// and comes back to the tab. A secret's field is always empty, and what was
 /// typed into it is in no page after.
@@ -1785,14 +1809,38 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
         "{status}"
     );
     assert!(status.contains("<dd data-version>0.1.0</dd>"), "{status}");
-    assert!(status.contains("<dd data-contract>v5</dd>"), "{status}");
+    assert!(status.contains("<dd data-contract>v6</dd>"), "{status}");
     assert!(status.contains("data-reserved=\"lifecycle\""), "{status}");
     assert!(!status.contains("<button"), "a place kept, not buttons yet");
-    // Then the place for the plugin's figures: empty, and unlabelled, until
-    // the contract carries them. No settings form on Summary.
+    // Then the plugin's figures, below core's status, as tiles in its order:
+    // Connections marked warn, its why the note beside it; Last read a time
+    // as every moment here is shown. No settings form on Summary.
+    let figures = body
+        .split("</section><section class=\"figures\" id=\"figures\" aria-label=\"What the plugin reports\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</section>").next())
+        .expect("the figures, after the status");
+    let labels: Vec<&str> = figures
+        .split("<span class=\"figure-label\">")
+        .skip(1)
+        .map(|rest| rest.split('<').next().unwrap())
+        .collect();
+    assert_eq!(labels, ["Connections", "Accounts reached", "Last read"]);
     assert!(
-        body.contains("</section><section class=\"figures\" id=\"figures\"></section></div>"),
-        "{body}"
+        figures.contains(
+            "<button type=\"button\" class=\"status-dot\" data-state=\"warn\" \
+             aria-label=\"Needs attention\" data-note=\"Needs attention\" \
+             aria-describedby=\"figures-0-why\"></button>"
+        ),
+        "{figures}"
+    );
+    assert!(
+        figures.contains("id=\"figures-0-why\">1 connection needs attention"),
+        "{figures}"
+    );
+    assert!(
+        figures.contains("<p class=\"figure-value\">2026-09-25 23:55 UTC</p>"),
+        "{figures}"
     );
     assert!(!body.contains("id=\"settings\""), "{body}");
     assert!(!body.contains("<form"), "{body}");

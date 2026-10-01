@@ -139,6 +139,13 @@ section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display
 .plugin-area nav.tabs{margin-bottom:var(--space-5)}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
+.figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\
+box-shadow:var(--shadow)}.figure-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}\
+.figure-label{min-width:0;color:var(--ink-soft);font-size:.86rem;font-weight:550;overflow-wrap:anywhere}\
+.figure-head .status-dot{margin:-.275rem -.275rem -.275rem 0}.figure-head button.note-mark{margin:0}\
+.figure-value{margin:.35rem 0 0;font-size:1.45rem;font-weight:650;line-height:1.2;font-variant-numeric:tabular-nums;\
+overflow-wrap:anywhere}.figure[data-kind=text] .figure-value,.figure[data-kind=time] .figure-value{font-size:1.05rem}\
+.figure-as-of{margin:.3rem 0 0;color:var(--ink-faint);font-size:.8rem}.figure .noted{display:block;margin:.35rem 0 0}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
 color:var(--ink-faint);font-size:.88rem}\
 .plugin-area .area-title{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-area .area-title h1{min-width:0}\

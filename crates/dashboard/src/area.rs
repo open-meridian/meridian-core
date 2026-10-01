@@ -52,7 +52,7 @@ pub struct Tab {
 }
 
 /// The tab the dashboard draws first under Manage, and where Manage opens:
-/// the plugin's status, and the place for the figures it reports (the
+/// the plugin's status, and the figures it reports as tiles (the
 /// product owner, 2026-10-01: "think Status, Connections, Account Reached,
 /// and Last Read can be their own Summary page", core drawing it).
 pub const SUMMARY: &str = "summary";

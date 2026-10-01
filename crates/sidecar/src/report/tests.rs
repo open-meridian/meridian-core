@@ -7,9 +7,11 @@ use meridian_bus::{Bus, MemoryBackend, Subscription};
 use meridian_domain::v1::PluginReport;
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::RecordHoldingsStatementParams;
+use meridian_pb::v1::plugin_figure::Value;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    HeartbeatRequest, LeaveRequest, RegisterRequest, SettingDeclaration, SettingType,
+    FigureState, HeartbeatRequest, LeaveRequest, PluginFigure, RegisterRequest, SettingDeclaration,
+    SettingType,
 };
 use prost::Message;
 use tonic::Request;
@@ -66,6 +68,7 @@ async fn what_the_plugin_said_and_what_it_was_refused_are_reported() {
         .heartbeat(Request::new(HeartbeatRequest {
             healthy: false,
             detail: "required setting api_key is not set".into(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -170,4 +173,161 @@ async fn a_report_goes_out_at_start_and_again_at_once_when_the_plugin_registers(
     register(&sidecar).await;
     let second = PluginReport::decode(&next(&mut reports).await.envelope.payload[..]).unwrap();
     assert!(second.registered);
+}
+
+/// SnapTrade's figures, as the plugin-report fixture carries them.
+fn snaptrade() -> Vec<PluginFigure> {
+    vec![
+        PluginFigure {
+            label: "Connections".into(),
+            value: Some(Value::Count(3)),
+            state: FigureState::Warn as i32,
+            why: "1 connection needs attention: the brokerage asked to reconnect".into(),
+            ..Default::default()
+        },
+        PluginFigure {
+            label: "Accounts reached".into(),
+            value: Some(Value::Count(7)),
+            ..Default::default()
+        },
+        PluginFigure {
+            label: "Last read".into(),
+            value: Some(Value::AtNs(1_790_380_500_000_000_000)),
+            ..Default::default()
+        },
+    ]
+}
+
+async fn beat(sidecar: &Sidecar, figures: Vec<PluginFigure>) -> Result<(), tonic::Status> {
+    sidecar
+        .heartbeat(Request::new(HeartbeatRequest {
+            healthy: true,
+            figures,
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn the_report_carries_the_last_accepted_heartbeats_figures_in_its_order() {
+    let sidecar = sidecar(memory());
+    assert!(
+        sidecar.report(1).figures.is_empty(),
+        "none while not registered"
+    );
+    register(&sidecar).await;
+    assert!(
+        sidecar.report(2).figures.is_empty(),
+        "none until it reports"
+    );
+
+    beat(&sidecar, snaptrade()).await.unwrap();
+    let report = sidecar.report(3);
+    assert!(report.healthy);
+    assert_eq!(report.figures, snaptrade());
+
+    // Each heartbeat replaces the last, and one with none clears them.
+    beat(&sidecar, snaptrade()[1..].to_vec()).await.unwrap();
+    assert_eq!(sidecar.report(4).figures, snaptrade()[1..].to_vec());
+    beat(&sidecar, vec![]).await.unwrap();
+    assert!(sidecar.report(5).figures.is_empty());
+
+    beat(&sidecar, snaptrade()).await.unwrap();
+    sidecar
+        .leave(Request::new(LeaveRequest {
+            reason: "redeploy".into(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        sidecar.report(6).figures.is_empty(),
+        "none once it has left"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_heartbeat_is_alive_not_healthy_with_the_refusal_and_no_figures() {
+    let sidecar = sidecar(memory());
+    register(&sidecar).await;
+    beat(&sidecar, snaptrade()).await.unwrap();
+    let before = sidecar.report(1).last_heartbeat_at_ns;
+
+    let nine = (0..9)
+        .map(|i| PluginFigure {
+            label: format!("Figure {i}"),
+            value: Some(Value::Count(i)),
+            ..Default::default()
+        })
+        .collect();
+    let refused = beat(&sidecar, nine).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "9 figures; a plugin reports at most 8");
+
+    // The fixture's case: alive, so not silent; not healthy with the refusal
+    // as its reason; no figures rather than stale ones.
+    let report = sidecar.report(2);
+    assert!(report.registered);
+    assert!(!report.healthy);
+    assert_eq!(
+        report.health_detail,
+        "the plugin's heartbeat was refused: 9 figures; a plugin reports at most 8"
+    );
+    assert!(report.figures.is_empty());
+    assert!(report.last_heartbeat_at_ns >= before);
+
+    // Until a heartbeat is accepted.
+    beat(&sidecar, snaptrade()).await.unwrap();
+    let report = sidecar.report(3);
+    assert!(report.healthy && report.health_detail.is_empty());
+    assert_eq!(report.figures, snaptrade());
+}
+
+#[tokio::test]
+async fn a_refused_label_names_the_figure_the_field_and_the_bound() {
+    let sidecar = sidecar(memory());
+    register(&sidecar).await;
+    let long = PluginFigure {
+        label: "Connections that need the admin to reconnect".into(),
+        value: Some(Value::Count(1)),
+        ..Default::default()
+    };
+    let refused = beat(&sidecar, vec![long]).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        refused.message(),
+        "figures[0].label is 44 characters; a label is at most 40"
+    );
+    let undefined = PluginFigure {
+        state: 7,
+        ..snaptrade().remove(0)
+    };
+    let refused = beat(&sidecar, vec![undefined]).await.unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "figures[0].state is 7, which the contract does not define"
+    );
+}
+
+#[tokio::test]
+async fn a_report_goes_out_at_once_when_the_figures_change_and_not_for_a_repeat() {
+    let bus = memory();
+    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let sidecar = sidecar(Arc::clone(&bus));
+    tokio::spawn(report_forever(Arc::clone(&sidecar)));
+    next(&mut reports).await;
+    register(&sidecar).await;
+    next(&mut reports).await;
+
+    beat(&sidecar, snaptrade()).await.unwrap();
+    let report = PluginReport::decode(&next(&mut reports).await.envelope.payload[..]).unwrap();
+    assert_eq!(report.figures, snaptrade());
+
+    beat(&sidecar, snaptrade()).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), reports.recv())
+            .await
+            .is_err(),
+        "a heartbeat repeating the last sends no report of its own"
+    );
 }

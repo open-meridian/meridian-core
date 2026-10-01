@@ -1282,6 +1282,12 @@ pub struct PluginReport {
     pub declared_interface: ::core::option::Option<
         ::meridian_pb::v1::InterfaceDeclaration,
     >,
+    /// The figures the plugin last reported (W4.5), as its last accepted
+    /// heartbeat gave them, in its order. Empty while it is not registered,
+    /// and after a refused heartbeat, which is reported not healthy with the
+    /// refusal as health_detail. The conductor carries none of them on.
+    #[prost(message, repeated, tag = "15")]
+    pub figures: ::prost::alloc::vec::Vec<::meridian_pb::v1::PluginFigure>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -1785,30 +1791,6 @@ impl ClaimCodePurpose {
         }
     }
 }
-/// A number: a 128-bit two's-complement integer and its scale. The value is the
-/// integer times 10^-scale, so 1.50 is 150 at scale 2 and stays 1.50.
-///
-/// The scale travels with the value rather than being fixed for the contract,
-/// because the venues disagree: Alpaca takes nine decimal places, a crypto
-/// asset eighteen, and a cheap token's holding runs past what 64 bits hold at
-/// any fixed scale that serves them both. The scale is the one the value was
-/// stated with; nothing normalises it.
-///
-/// The integer's magnitude is below 10^38, which is at most 38 significant
-/// digits, and the scale is 0 to 18. The widest value the broker survey found,
-/// 100 billion units at 18 decimals, is well inside it.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct Decimal {
-    /// The integer's upper 64 bits, signed: negative for a negative value.
-    #[prost(sfixed64, tag = "1")]
-    pub high: i64,
-    /// Its lower 64 bits, unsigned. The integer is high * 2^64 + low.
-    #[prost(fixed64, tag = "2")]
-    pub low: u64,
-    /// How many decimal places the integer carries, 0 to 18.
-    #[prost(uint32, tag = "3")]
-    pub scale: u32,
-}
 /// An amount of currency: a Decimal and the currency it is in.
 ///
 /// One message rather than an amount with its currency beside it, so a message
@@ -1820,7 +1802,7 @@ pub struct Decimal {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Money {
     #[prost(message, optional, tag = "1")]
-    pub amount: ::core::option::Option<Decimal>,
+    pub amount: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// ISO 4217, e.g. "USD".
     #[prost(string, tag = "2")]
     pub currency_code: ::prost::alloc::string::String,
@@ -2716,7 +2698,7 @@ pub struct RecordHoldingRequest {
     /// The trade-date quantity: what is held counting every trade executed,
     /// settled or not. Required. Signed to match `side`: negative is short.
     #[prost(message, optional, tag = "9")]
-    pub quantity: ::core::option::Option<Decimal>,
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// The rail's valuation of the holding, in its currency. Recorded as
     /// reported, not recomputed: this is the custodian's belief, and rederiving it
     /// would discard the thing that makes a later comparison meaningful. Unset
@@ -2742,7 +2724,7 @@ pub struct RecordHoldingRequest {
     /// where the venue reports it, and unset where it does not. For cash, the
     /// settled cash.
     #[prost(message, optional, tag = "12")]
-    pub settle_date_quantity: ::core::option::Option<Decimal>,
+    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// True when the venue stated no currency and the one here is the
     /// connector's stated assumption (E*TRADE, Schwab and Public state none),
     /// rather than something the venue said: the market value's currency, and
@@ -2801,7 +2783,7 @@ pub struct CustodialPositionUpdatedEvent {
     /// The previous quantity, so a subscriber can render a delta without holding
     /// its own history.
     #[prost(message, optional, tag = "4")]
-    pub previous_quantity: ::core::option::Option<Decimal>,
+    pub previous_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
 }
 /// What the custodian says an account holds of an instrument, on one side,
 /// right now. Keyed by all three: an account may hold an instrument long and
@@ -2825,7 +2807,7 @@ pub struct CustodialPosition {
     pub instrument_id: ::prost::alloc::string::String,
     /// The trade-date quantity, signed to match `side`.
     #[prost(message, optional, tag = "9")]
-    pub quantity: ::core::option::Option<Decimal>,
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// Unset where the custodian reported no value, which is not zero.
     #[prost(message, optional, tag = "10")]
     pub market_value: ::core::option::Option<Money>,
@@ -2841,7 +2823,7 @@ pub struct CustodialPosition {
     pub side: i32,
     /// The settle-date quantity, where the custodian reported one.
     #[prost(message, optional, tag = "12")]
-    pub settle_date_quantity: ::core::option::Option<Decimal>,
+    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// This position's value is also included in the account's cash holding as
     /// the custodian reports it; both are kept as reported.
     #[prost(bool, tag = "13")]
@@ -2886,7 +2868,7 @@ pub struct UnresolvedHolding {
     pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
     /// Signed, as the row stated it: negative is a short row.
     #[prost(message, optional, tag = "10")]
-    pub quantity: ::core::option::Option<Decimal>,
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// Unset where the custodian reported no value.
     #[prost(message, optional, tag = "11")]
     pub market_value: ::core::option::Option<Money>,

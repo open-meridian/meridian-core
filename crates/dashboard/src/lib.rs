@@ -23,6 +23,7 @@ pub mod clock;
 pub mod custody;
 pub mod database;
 pub mod directory;
+pub mod figures;
 pub mod first_run;
 pub mod health;
 pub mod html;
