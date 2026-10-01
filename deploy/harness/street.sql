@@ -19,7 +19,10 @@
 -- empty, never zero. <in-cash> is `in-cash` for a position the venue also
 -- counts in cash.
 --
--- A position is the account's custodial position. An `assumed` line is a row
+-- A position is the account's custodial position; one a placeholder's
+-- replacement removed is kept by the store as a tombstone, and not printed.
+-- A statement's figures are those of its set with no segment, the account's
+-- as a whole (contract v7 keeps them per margin segment). An `assumed` line is a row
 -- of a latest statement whose currency the connector assumed. A statement is
 -- the latest each source recorded for each account, by its rows' account: a
 -- statement none of whose rows was recorded -- every one refused, its account
@@ -44,7 +47,8 @@ named AS (
 latest AS (
     -- The latest statement of each source for each account its rows name.
     SELECT DISTINCT ON (held.account_id, s.source)
-           held.account_id, s.*
+           held.account_id, s.statement_id, s.source, s.expected_rows, s.completed_at_ns,
+           s.currency_assumed
       FROM statement s
       JOIN (SELECT DISTINCT account_id, statement_id FROM holding) held USING (statement_id)
      -- Read at the same moment, the one recorded last: an ID begins with
@@ -62,6 +66,7 @@ lines AS (
       FROM custodial_position p
       LEFT JOIN named n USING (account_id)
       LEFT JOIN shown i USING (instrument_id)
+     WHERE NOT p.removed
     UNION
     SELECT 'assumed|' || coalesce(n.name, h.account_id)
            || '|' || coalesce(i.instrument, h.instrument_id)
@@ -76,11 +81,12 @@ lines AS (
            || '|' || l.source
            || '|' || l.expected_rows::text
            || '|' || CASE WHEN l.completed_at_ns IS NULL THEN 'open' ELSE 'complete' END
-           || '|' || coalesce(l.buying_power::text || ' ' || l.buying_power_currency, '')
-           || '|' || coalesce(l.margin_requirement::text || ' ' || l.margin_requirement_currency, '')
-           || '|' || coalesce(l.maintenance_excess::text || ' ' || l.maintenance_excess_currency, '')
+           || '|' || coalesce(f.buying_power::text || ' ' || f.buying_power_currency, '')
+           || '|' || coalesce(f.margin_requirement::text || ' ' || f.margin_requirement_currency, '')
+           || '|' || coalesce(f.maintenance_excess::text || ' ' || f.maintenance_excess_currency, '')
            || '|' || l.currency_assumed::text
       FROM latest l
       LEFT JOIN named n USING (account_id)
+      LEFT JOIN statement_figures f ON f.statement_id = l.statement_id AND f.segment = ''
 )
 SELECT line FROM lines ORDER BY line COLLATE "C";

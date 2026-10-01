@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use meridian_street::amounts::{Exact, Money, Quantity};
 use meridian_street::store::{
-    Completion, Counts, Figures, Holding, Identifier, Opened, Settled, Side, Statement, Store,
+    Cause, Collateral, Completion, Counts, Direction, Figures, Holding, Identifier, Opened, Read,
+    Scope, Settled, Side, Statement, Store,
 };
 use meridian_street::PostgresStore;
 
@@ -52,24 +53,71 @@ fn store() -> PostgresStore {
     store
 }
 
-fn opened(store: &PostgresStore) -> Statement {
-    let statement = Statement {
+/// A change made at `now` by the custody plugin.
+fn at(now: i64) -> Cause {
+    Cause {
+        instance_id: "custody-snaptrade-1".into(),
+        correlation_id: unique("corr"),
+        causation_id: unique("msg"),
+        committed_at_ns: now,
+        ..Default::default()
+    }
+}
+
+/// A statement as a test opens it: of an account of its own, which every row
+/// `resolved` makes for it names, since a statement is one account's (W2.2).
+fn statement(account_id: &str) -> Statement {
+    Statement {
         statement_id: unique("STMT"),
         source: "snaptrade".into(),
         external_statement_id: unique("st"),
         as_of_date: "2026-09-08".into(),
         read_at_ns: NOW,
         expected_rows: 1_000,
-        figures: Figures::default(),
-    };
-    store.open(statement).unwrap().0
+        account_id: account_id.to_string(),
+        external_account_id: String::new(),
+        institution: String::new(),
+        figures: Vec::new(),
+        currency_assumed: false,
+        completed: None,
+    }
+}
+
+/// A read of every account, as a core component makes one.
+fn page(
+    store: &PostgresStore,
+    account_id: &str,
+    include_unresolved: bool,
+    limit: usize,
+    cursor: &str,
+) -> meridian_street::store::Page {
+    store
+        .page(&Read {
+            scope: Scope::Everything,
+            account_id: account_id.to_string(),
+            include_unresolved,
+            limit,
+            cursor: cursor.to_string(),
+            since: None,
+        })
+        .unwrap()
+}
+
+/// A statement naming no account, as one from a plugin before v7 does: its
+/// first row gives it one (W2.2).
+fn opened(store: &PostgresStore) -> Statement {
+    store.open(statement(""), &at(NOW)).unwrap().0
 }
 
 fn resolved(statement: &Statement, instrument_id: &str) -> Holding {
     Holding {
         holding_id: unique("HLD"),
         statement_id: statement.statement_id.clone(),
-        account_id: unique("ACC"),
+        account_id: if statement.account_id.is_empty() {
+            unique("ACC")
+        } else {
+            statement.account_id.clone()
+        },
         instrument_id: Some(instrument_id.to_string()),
         unresolved_identifiers: vec![],
         side: Side::Long,
@@ -78,6 +126,7 @@ fn resolved(statement: &Statement, instrument_id: &str) -> Holding {
         market_value: Some(usd("2812.50")),
         currency_assumed: false,
         also_counted_in_cash: false,
+        cost: Default::default(),
         escalated: false,
     }
 }
@@ -85,23 +134,15 @@ fn resolved(statement: &Statement, instrument_id: &str) -> Holding {
 #[test]
 fn a_statement_is_opened_once_and_recognised_after_that() {
     let store = store();
-    let statement = Statement {
-        statement_id: unique("STMT"),
-        source: "snaptrade".into(),
-        external_statement_id: unique("st"),
-        as_of_date: "2026-09-08".into(),
-        read_at_ns: NOW,
-        expected_rows: 1_000,
-        figures: Figures::default(),
-    };
+    let statement = statement(&unique("ACC"));
 
-    let (first, opened, _) = store.open(statement.clone()).unwrap();
+    let (first, opened, _) = store.open(statement.clone(), &at(NOW)).unwrap();
     assert_eq!(opened, Opened::Opened);
 
     // A redelivery mints a new candidate identifier and must not use it.
     let mut again = statement.clone();
     again.statement_id = unique("STMT");
-    let (second, opened, _) = store.open(again).unwrap();
+    let (second, opened, _) = store.open(again, &at(NOW)).unwrap();
 
     assert_eq!(opened, Opened::AlreadyRecorded);
     assert_eq!(second.statement_id, first.statement_id);
@@ -115,7 +156,7 @@ fn a_resolved_row_moves_a_position_and_says_what_it_was() {
     let holding = resolved(&statement, &instrument);
     let account = holding.account_id.clone();
 
-    match store.record(holding, NOW).unwrap().0 {
+    match store.record(holding, &at(NOW)).unwrap().0 {
         Settled::Changed {
             previous_quantity, ..
         } => assert_eq!(previous_quantity, Quantity::ZERO),
@@ -138,14 +179,14 @@ fn a_second_statement_replaces_the_position_rather_than_adding_to_it() {
     let first = opened(&store);
     let holding = resolved(&first, &instrument);
     let account = holding.account_id.clone();
-    store.record(holding, NOW).unwrap();
+    store.record(holding, &at(NOW)).unwrap();
 
     let second = opened(&store);
     let mut grown = resolved(&second, &instrument);
     grown.account_id = account.clone();
     grown.quantity = units("20");
 
-    match store.record(grown, NOW + 1).unwrap().0 {
+    match store.record(grown, &at(NOW + 1)).unwrap().0 {
         Settled::Changed {
             previous_quantity,
             position,
@@ -171,14 +212,14 @@ fn a_row_saying_what_the_position_already_held_is_not_a_change() {
     let first = opened(&store);
     let holding = resolved(&first, &instrument);
     let account = holding.account_id.clone();
-    store.record(holding, NOW).unwrap();
+    store.record(holding, &at(NOW)).unwrap();
 
     let second = opened(&store);
     let mut same = resolved(&second, &instrument);
     same.account_id = account;
 
     assert!(matches!(
-        store.record(same, NOW + 1).unwrap().0,
+        store.record(same, &at(NOW + 1)).unwrap().0,
         Settled::Unchanged { .. }
     ));
 }
@@ -204,7 +245,7 @@ fn the_smallest_and_largest_holdings_read_back_exactly() {
         row.account_id = account.clone();
         row.quantity = units(quantity);
         row.market_value = Some(usd("41230.50"));
-        store.record(row, NOW).unwrap();
+        store.record(row, &at(NOW)).unwrap();
 
         let held = store
             .custodial_position(&account, &instrument, Side::Long)
@@ -223,10 +264,10 @@ fn the_smallest_and_largest_holdings_read_back_exactly() {
             source: "snaptrade".into(),
         }];
         unresolved.quantity = units(quantity);
-        store.record(unresolved, NOW).unwrap();
+        store.record(unresolved, &at(NOW)).unwrap();
     }
 
-    let page = store.page(&account, true, 100, "").unwrap();
+    let page = page(&store, &account, true, 100, "");
     let rows: Vec<String> = page
         .unresolved
         .iter()
@@ -252,7 +293,7 @@ fn a_restatement_at_another_scale_is_the_same_number_and_keeps_its_own_scale() {
     let first = opened(&store);
     let holding = resolved(&first, &instrument);
     let account = holding.account_id.clone();
-    store.record(holding, NOW).unwrap();
+    store.record(holding, &at(NOW)).unwrap();
 
     let second = opened(&store);
     let mut restated = resolved(&second, &instrument);
@@ -261,7 +302,7 @@ fn a_restatement_at_another_scale_is_the_same_number_and_keeps_its_own_scale() {
     restated.market_value = Some(usd("2812.5"));
 
     assert!(matches!(
-        store.record(restated, NOW + 1).unwrap().0,
+        store.record(restated, &at(NOW + 1)).unwrap().0,
         Settled::Unchanged { .. }
     ));
     let held = store
@@ -312,11 +353,11 @@ fn an_unresolved_row_is_kept_and_moves_nothing() {
     let account = unresolved.account_id.clone();
 
     assert!(matches!(
-        store.record(unresolved, NOW).unwrap().0,
+        store.record(unresolved, &at(NOW)).unwrap().0,
         Settled::Unresolved
     ));
 
-    let page = store.page(&account, true, 100, "").unwrap();
+    let page = page(&store, &account, true, 100, "");
     assert!(page.positions.is_empty());
     assert_eq!(page.unresolved.len(), 1);
     assert_eq!(page.unresolved[0].identifiers_value(), symbol);
@@ -335,11 +376,11 @@ fn the_database_refuses_a_row_that_names_both_or_neither() {
         value: "AAPL".into(),
         source: "snaptrade".into(),
     }];
-    assert!(store.record(both, NOW).is_err());
+    assert!(store.record(both, &at(NOW)).is_err());
 
     let mut neither = resolved(&statement, &unique("INS"));
     neither.instrument_id = None;
-    assert!(store.record(neither, NOW).is_err());
+    assert!(store.record(neither, &at(NOW)).is_err());
 }
 
 #[test]
@@ -357,9 +398,10 @@ fn a_row_for_a_statement_nobody_opened_is_refused() {
         market_value: Some(usd("1")),
         currency_assumed: false,
         also_counted_in_cash: false,
+        cost: Default::default(),
         escalated: false,
     };
-    assert!(store.record(orphan, NOW).is_err());
+    assert!(store.record(orphan, &at(NOW)).is_err());
 }
 
 #[test]
@@ -371,7 +413,7 @@ fn the_counts_add_up() {
     for n in 0..3 {
         let mut row = resolved(&statement, &format!("{}-{n}", unique("INS")));
         row.account_id = account.clone();
-        store.record(row, NOW).unwrap();
+        store.record(row, &at(NOW)).unwrap();
     }
 
     let mut missing = resolved(&statement, "unused");
@@ -382,7 +424,7 @@ fn the_counts_add_up() {
         value: unique("ZZ"),
         source: "snaptrade".into(),
     }];
-    store.record(missing, NOW).unwrap();
+    store.record(missing, &at(NOW)).unwrap();
 
     let counts = store.counts(&statement.statement_id).unwrap();
     assert_eq!(
@@ -412,14 +454,14 @@ fn concurrent_rows_for_one_position_leave_one_row_and_no_lost_update() {
             let mut row = resolved(&statement, &instrument);
             row.account_id = account;
             row.quantity = Quantity::new(Exact::new(n.into(), 0).unwrap());
-            store.record(row, NOW + n).unwrap()
+            store.record(row, &at(NOW + n)).unwrap()
         }));
     }
     for thread in racing {
         thread.join().unwrap();
     }
 
-    let page = store.page(&account, false, 100, "").unwrap();
+    let page = page(&store, &account, false, 100, "");
     assert_eq!(
         page.positions.len(),
         1,
@@ -443,8 +485,8 @@ fn long_and_short_of_one_instrument_are_two_positions_keyed_by_side() {
     short.account_id = account.clone();
     short.side = Side::Short;
     short.quantity = units("-50");
-    store.record(long, NOW).unwrap();
-    store.record(short, NOW).unwrap();
+    store.record(long, &at(NOW)).unwrap();
+    store.record(short, &at(NOW)).unwrap();
 
     let long = store
         .custodial_position(&account, &instrument, Side::Long)
@@ -456,14 +498,7 @@ fn long_and_short_of_one_instrument_are_two_positions_keyed_by_side() {
         .unwrap();
     assert_eq!(long.quantity.to_string(), "12.5");
     assert_eq!(short.quantity.to_string(), "-50");
-    assert_eq!(
-        store
-            .page(&account, false, 100, "")
-            .unwrap()
-            .positions
-            .len(),
-        2
-    );
+    assert_eq!(page(&store, &account, false, 100, "").positions.len(), 2);
 }
 
 #[test]
@@ -482,7 +517,7 @@ fn what_the_venue_did_not_report_is_kept_absent_and_what_it_did_exactly() {
     cash.currency_assumed = true;
     let cash_instrument = cash.instrument_id.clone().unwrap();
     let holding_id = cash.holding_id.clone();
-    store.record(cash, NOW).unwrap();
+    store.record(cash, &at(NOW)).unwrap();
 
     let held = store
         .custodial_position(&account, &cash_instrument, Side::Long)
@@ -521,7 +556,7 @@ fn a_fund_also_counted_in_cash_is_marked_on_its_row_and_its_position() {
     fund.also_counted_in_cash = true;
     let (account, instrument) = (fund.account_id.clone(), fund.instrument_id.clone().unwrap());
     let holding_id = fund.holding_id.clone();
-    store.record(fund, NOW).unwrap();
+    store.record(fund, &at(NOW)).unwrap();
 
     let held = store
         .custodial_position(&account, &instrument, Side::Long)
@@ -545,24 +580,46 @@ fn a_fund_also_counted_in_cash_is_marked_on_its_row_and_its_position() {
 fn a_statements_figures_are_kept_as_reported_and_read_back() {
     let store = store();
     let statement = Statement {
-        statement_id: unique("STMT"),
         source: "etrade".into(),
         external_statement_id: unique("84001234"),
-        as_of_date: "2026-09-08".into(),
-        read_at_ns: NOW,
         expected_rows: 1,
-        figures: Figures {
-            buying_power: Some(usd("41250.00")),
-            margin_requirement: Some(usd("18250.00")),
-            maintenance_excess: None,
-            currency_assumed: true,
-        },
+        figures: vec![
+            Figures {
+                segment: "securities".into(),
+                buying_power: Some(usd("41250.00")),
+                margin_requirement: Some(usd("18250.00")),
+                maintenance_excess: None,
+                net_liquidation: Some(usd("93550.00")),
+                collateral: vec![Collateral {
+                    direction: Direction::Posted,
+                    instrument_id: Some("INS-UST10Y".into()),
+                    unresolved_identifiers: vec![],
+                    quantity: units("500000"),
+                    value: Some(usd("487500.00")),
+                    haircut: Some(units("0.02")),
+                    value_after_haircut: None,
+                    held_at: "the prime broker".into(),
+                }],
+                ..Default::default()
+            },
+            Figures {
+                segment: "commodities".into(),
+                initial_margin: Some(usd("8800.00")),
+                ..Default::default()
+            },
+        ],
+        currency_assumed: true,
+        ..statement(&unique("ACC"))
     };
-    let (opened, _, _) = store.open(statement.clone()).unwrap();
+    let (opened, _, _) = store.open(statement.clone(), &at(NOW)).unwrap();
     let read = store.statement(&opened.statement_id).unwrap().unwrap();
-    assert_eq!(read.figures, statement.figures);
     assert_eq!(
-        read.figures.buying_power.unwrap().to_string(),
+        read.figures, statement.figures,
+        "in the order given, collateral too"
+    );
+    assert!(read.currency_assumed);
+    assert_eq!(
+        read.figures[0].buying_power.as_ref().unwrap().to_string(),
         "41250.00 USD",
         "at the scale it was stated with"
     );
@@ -570,9 +627,10 @@ fn a_statements_figures_are_kept_as_reported_and_read_back() {
     // And a redelivery hands back the figures first recorded.
     let mut again = statement;
     again.statement_id = unique("STMT");
-    let (redelivered, opened, _) = store.open(again).unwrap();
+    let (redelivered, opened, _) = store.open(again, &at(NOW)).unwrap();
     assert_eq!(opened, Opened::AlreadyRecorded);
-    assert_eq!(redelivered.figures.maintenance_excess, None);
+    assert_eq!(redelivered.figures[0].maintenance_excess, None);
+    assert_eq!(redelivered.figures, read.figures);
 }
 
 #[test]
@@ -643,7 +701,12 @@ fn a_read_of_every_account_across_pages_sees_each_position_once() {
     store
         .migrate(&meridian_clock::SystemClock)
         .expect("could not apply the schema");
-    let statement = opened(&store);
+    // A statement each, since a statement is one account's (W2.2).
+    let mut statements = std::collections::HashMap::new();
+    for account in ["ACC-A", "ACC-B", "ACC-C"] {
+        let opened = store.open(statement(account), &at(NOW)).unwrap().0;
+        statements.insert(account, opened);
+    }
 
     let rows = [
         ("ACC-A", "INS-Z", Side::Long, "1"),
@@ -653,13 +716,13 @@ fn a_read_of_every_account_across_pages_sees_each_position_once() {
         ("ACC-C", "INS-A", Side::Short, "-5"),
     ];
     for (account, instrument, side, held) in rows {
-        let mut row = resolved(&statement, instrument);
+        let mut row = resolved(&statements[account], instrument);
         row.account_id = account.into();
         row.side = side;
         row.quantity = units(held);
-        store.record(row, NOW).unwrap();
+        store.record(row, &at(NOW)).unwrap();
     }
-    let mut unresolved = resolved(&statement, "unused");
+    let mut unresolved = resolved(&statements["ACC-B"], "unused");
     unresolved.account_id = "ACC-B".into();
     unresolved.instrument_id = None;
     unresolved.unresolved_identifiers = vec![Identifier {
@@ -667,14 +730,14 @@ fn a_read_of_every_account_across_pages_sees_each_position_once() {
         value: "ZZTOP".into(),
         source: "snaptrade".into(),
     }];
-    store.record(unresolved, NOW).unwrap();
+    store.record(unresolved, &at(NOW)).unwrap();
 
     for size in 1..=6 {
         let mut keys = Vec::new();
         let mut gaps = 0;
         let mut cursor = String::new();
         loop {
-            let page = store.page("", true, size, &cursor).unwrap();
+            let page = page(&store, "", true, size, &cursor);
             keys.extend(
                 page.positions
                     .iter()
@@ -756,11 +819,8 @@ fn migration_four_reads_an_existing_rows_side_from_its_sign_and_its_silence_as_n
     other_side.account_id = "ACC".into();
     other_side.side = Side::Short;
     other_side.quantity = units("-1");
-    store.record(other_side, NOW).unwrap();
-    assert_eq!(
-        store.page("ACC", false, 100, "").unwrap().positions.len(),
-        3
-    );
+    store.record(other_side, &at(NOW)).unwrap();
+    assert_eq!(page(&store, "ACC", false, 100, "").positions.len(), 3);
 }
 
 #[test]
@@ -780,9 +840,9 @@ d	e"#;
         source: "snap\"trade".into(),
     }];
     let account = row.account_id.clone();
-    store.record(row, NOW).unwrap();
+    store.record(row, &at(NOW)).unwrap();
 
-    let page = store.page(&account, true, 100, "").unwrap();
+    let page = page(&store, &account, true, 100, "");
     assert_eq!(page.unresolved[0].unresolved_identifiers[0].value, awkward);
     assert_eq!(
         page.unresolved[0].unresolved_identifiers[0].source,
@@ -810,17 +870,12 @@ fn a_statement_completes_once_and_only_once_under_concurrency() {
     // eight. Exactly one of them is the row that completed it, because two
     // announcements would make a subscriber's arithmetic depend on timing.
     let store = Arc::new(store());
-    let statement = Statement {
-        statement_id: unique("STMT"),
-        source: "snaptrade".into(),
-        external_statement_id: unique("st"),
-        as_of_date: "2026-09-08".into(),
-        read_at_ns: NOW,
-        expected_rows: 8,
-        figures: Figures::default(),
-    };
-    let statement = store.open(statement).unwrap().0;
     let account = unique("ACC");
+    let statement = Statement {
+        expected_rows: 8,
+        ..statement(&account)
+    };
+    let statement = store.open(statement, &at(NOW)).unwrap().0;
 
     let mut racing = Vec::new();
     for n in 0..8 {
@@ -830,7 +885,7 @@ fn a_statement_completes_once_and_only_once_under_concurrency() {
         racing.push(std::thread::spawn(move || {
             let mut row = resolved(&statement, &format!("INS-{n}"));
             row.account_id = account;
-            store.record(row, NOW + n).unwrap().1
+            store.record(row, &at(NOW + n)).unwrap().1
         }));
     }
 
@@ -838,7 +893,7 @@ fn a_statement_completes_once_and_only_once_under_concurrency() {
         .into_iter()
         .filter(|_| true)
         .map(|thread| thread.join().unwrap())
-        .filter(|completion| *completion == Completion::JustCompleted)
+        .filter(|completion| matches!(completion, Completion::JustCompleted(_)))
         .count();
 
     assert_eq!(
@@ -852,19 +907,17 @@ fn a_statement_completes_once_and_only_once_under_concurrency() {
 fn a_statement_promising_no_rows_completes_when_it_opens() {
     let store = store();
     let (_, opened, completion) = store
-        .open(Statement {
-            statement_id: unique("STMT"),
-            source: "snaptrade".into(),
-            external_statement_id: unique("st"),
-            as_of_date: "2026-09-08".into(),
-            read_at_ns: NOW,
-            expected_rows: 0,
-            figures: Figures::default(),
-        })
+        .open(
+            Statement {
+                expected_rows: 0,
+                ..statement(&unique("ACC"))
+            },
+            &at(NOW),
+        )
         .unwrap();
 
     assert_eq!(opened, Opened::Opened);
-    assert_eq!(completion, Completion::JustCompleted);
+    assert!(matches!(completion, Completion::JustCompleted(_)));
 }
 
 #[test]
@@ -924,20 +977,15 @@ fn stated(
     quantity: &str,
 ) -> Holding {
     let statement = Statement {
-        statement_id: unique("STMT"),
-        source: "snaptrade".into(),
-        external_statement_id: unique("st"),
         as_of_date: as_of_date.into(),
-        read_at_ns: NOW,
-        expected_rows: 1_000,
-        figures: Figures::default(),
+        ..statement(account)
     };
-    let statement = store.open(statement).unwrap().0;
+    let statement = store.open(statement, &at(NOW)).unwrap().0;
 
     let mut holding = resolved(&statement, instrument_id);
     holding.account_id = account.to_string();
     holding.quantity = units(quantity);
-    store.record(holding.clone(), NOW).unwrap();
+    store.record(holding.clone(), &at(NOW)).unwrap();
     holding
 }
 
@@ -953,17 +1001,27 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
         .unwrap()
         .contains(&placeholder));
 
-    let settled = store.move_positions(&placeholder, &instrument).unwrap();
+    let settled = store
+        .move_positions(&placeholder, &instrument, &at(NOW))
+        .unwrap();
     match settled.as_slice() {
         [Settled::Changed {
             position,
             previous_quantity,
+        }, Settled::Changed {
+            position: removed,
+            previous_quantity: was,
         }] => {
             assert_eq!(position.instrument_id, instrument);
             assert_eq!(position.quantity.to_string(), "5");
             assert_eq!(*previous_quantity, Quantity::ZERO);
+            // The placeholder's, a tombstone numbered after it.
+            assert_eq!(removed.instrument_id, placeholder);
+            assert!(removed.removed);
+            assert_eq!(was.to_string(), "5");
+            assert_eq!(removed.last_change.previous, position.last_change.sequence);
         }
-        other => panic!("expected one moved position, got {other:?}"),
+        other => panic!("expected one moved position and its removal, got {other:?}"),
     }
 
     assert!(store
@@ -999,7 +1057,7 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
 
     // And hearing it again moves nothing.
     assert!(store
-        .move_positions(&placeholder, &instrument)
+        .move_positions(&placeholder, &instrument, &at(NOW))
         .unwrap()
         .is_empty());
 }
@@ -1013,11 +1071,16 @@ fn where_both_are_held_a_later_placeholder_statement_stands() {
     stated(&store, &account, "2026-09-08", &instrument, "2");
     stated(&store, &account, "2026-09-09", &placeholder, "5");
 
-    let settled = store.move_positions(&placeholder, &instrument).unwrap();
+    let settled = store
+        .move_positions(&placeholder, &instrument, &at(NOW))
+        .unwrap();
     match settled.as_slice() {
         [Settled::Changed {
             previous_quantity, ..
-        }] => assert_eq!(previous_quantity.to_string(), "2"),
+        }, Settled::Changed { position, .. }] => {
+            assert_eq!(previous_quantity.to_string(), "2");
+            assert!(position.removed, "and the placeholder's removed");
+        }
         other => panic!("expected the placeholder's to stand, got {other:?}"),
     }
 
@@ -1042,10 +1105,13 @@ fn where_both_are_held_a_later_instrument_statement_stands() {
     stated(&store, &account, "2026-09-08", &placeholder, "5");
     stated(&store, &account, "2026-09-09", &instrument, "2");
 
-    assert!(store
-        .move_positions(&placeholder, &instrument)
-        .unwrap()
-        .is_empty());
+    let settled = store
+        .move_positions(&placeholder, &instrument, &at(NOW))
+        .unwrap();
+    match settled.as_slice() {
+        [Settled::Changed { position, .. }] => assert!(position.removed, "only the removal"),
+        other => panic!("expected only the placeholder's removal, got {other:?}"),
+    }
 
     let standing = store
         .custodial_position(&account, &instrument, Side::Long)
@@ -1255,4 +1321,319 @@ fn a_database_ahead_of_this_binary_is_refused() {
         matches!(refused, meridian_street::store::StoreError::SchemaAhead(_)),
         "a schema ahead of this binary is not one waiting fixes: {refused:?}"
     );
+}
+
+// ── Every change numbered, read within a scope since a watermark (v7) ───────
+
+fn read(
+    store: &PostgresStore,
+    scope: Scope,
+    account: &str,
+    since: Option<u64>,
+) -> Vec<(String, u64, u64, bool)> {
+    store
+        .page(&Read {
+            scope,
+            account_id: account.to_string(),
+            include_unresolved: false,
+            limit: 500,
+            cursor: String::new(),
+            since,
+        })
+        .unwrap()
+        .positions
+        .into_iter()
+        .map(|p| {
+            (
+                p.instrument_id,
+                p.last_change.sequence,
+                p.last_change.previous,
+                p.removed,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn concurrent_changes_take_distinct_numbers_and_each_names_its_accounts_last() {
+    // The head's row orders every change, so eight rows racing into one
+    // account's positions take eight numbers, and the account's chain runs
+    // through all eight with no gap: each names the one before it.
+    let store = Arc::new(store());
+    let account = unique("ACC");
+    let statement = store
+        .open(
+            Statement {
+                expected_rows: 100,
+                ..statement(&account)
+            },
+            &at(NOW),
+        )
+        .unwrap()
+        .0;
+    let mut racing = Vec::new();
+    for n in 0..8 {
+        let store = store.clone();
+        let statement = statement.clone();
+        racing.push(std::thread::spawn(move || {
+            match store
+                .record(resolved(&statement, &format!("INS-{n}")), &at(NOW))
+                .unwrap()
+                .0
+            {
+                Settled::Changed { position, .. } => position.last_change,
+                other => panic!("a new position is a change: {other:?}"),
+            }
+        }));
+    }
+    let mut changes: Vec<_> = racing.into_iter().map(|t| t.join().unwrap()).collect();
+    changes.sort_by_key(|change| change.sequence);
+    assert_eq!(changes[0].previous, 0, "the account's first");
+    for pair in changes.windows(2) {
+        assert!(pair[1].sequence > pair[0].sequence);
+        assert_eq!(
+            pair[1].previous, pair[0].sequence,
+            "chained, whatever others used between"
+        );
+    }
+}
+
+#[test]
+fn a_read_since_a_watermark_answers_what_changed_a_removal_included() {
+    let store = store();
+    let account = unique("ACC");
+    let placeholder = format!("LCL-{}", unique("p"));
+    let instrument = unique("INS");
+    stated(&store, &account, "2026-09-08", &placeholder, "5");
+    let before = store
+        .page(&Read {
+            scope: Scope::Everything,
+            account_id: account.clone(),
+            include_unresolved: false,
+            limit: 10,
+            cursor: String::new(),
+            since: None,
+        })
+        .unwrap()
+        .as_of;
+
+    store
+        .move_positions(&placeholder, &instrument, &at(NOW))
+        .unwrap();
+
+    let now = read(&store, Scope::Everything, &account, None);
+    assert_eq!(now.len(), 1, "no tombstone without a watermark: {now:?}");
+    let since = read(&store, Scope::Everything, &account, Some(before));
+    let removed: Vec<_> = since.iter().filter(|p| p.3).map(|p| p.0.clone()).collect();
+    assert_eq!(
+        removed,
+        std::slice::from_ref(&placeholder),
+        "the removal, as a tombstone"
+    );
+    assert!(since.iter().all(|p| p.1 > before));
+    assert!(store
+        .custodial_position(&account, &placeholder, Side::Long)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_plugins_read_answers_its_scope_an_empty_one_nothing_and_another_account_is_refused() {
+    let store = store();
+    let mine = unique("ACC");
+    let theirs = unique("ACC");
+    stated(&store, &mine, "2026-09-08", &unique("INS"), "1");
+    stated(&store, &theirs, "2026-09-08", &unique("INS"), "2");
+
+    let within =
+        |accounts: &[&str]| Scope::Within(accounts.iter().map(|a| a.to_string()).collect());
+    assert_eq!(read(&store, within(&[&mine]), "", None).len(), 1);
+    assert!(
+        read(&store, within(&[]), "", None).is_empty(),
+        "never every account"
+    );
+    let refused = store
+        .page(&Read {
+            scope: within(&[&mine]),
+            account_id: theirs.clone(),
+            include_unresolved: false,
+            limit: 10,
+            cursor: String::new(),
+            since: None,
+        })
+        .unwrap_err();
+    assert!(refused
+        .to_string()
+        .contains("not in this plugin's read scope"));
+}
+
+#[test]
+fn completed_statements_are_read_with_their_cause_figures_and_account() {
+    let store = store();
+    let account = unique("ACC");
+    let cause = at(NOW);
+    let (opened, _, completion) = store
+        .open(
+            Statement {
+                expected_rows: 0,
+                external_account_id: "SNAP-ACC-1".into(),
+                institution: "Interactive Brokers".into(),
+                figures: vec![Figures {
+                    segment: String::new(),
+                    buying_power: Some(usd("25000.00")),
+                    ..Default::default()
+                }],
+                ..statement(&account)
+            },
+            &cause,
+        )
+        .unwrap();
+    let Completion::JustCompleted(change) = completion else {
+        panic!("no rows: complete at once")
+    };
+    // And one still open, which is not listed.
+    store.open(statement(&account), &at(NOW)).unwrap();
+
+    let page = store
+        .statements(&meridian_street::store::StatementsRead {
+            scope: Scope::Within([account.clone()].into_iter().collect()),
+            account_id: String::new(),
+            as_of_date: String::new(),
+            limit: 10,
+            cursor: String::new(),
+            since: Some(change.sequence - 1),
+        })
+        .unwrap();
+    let [(read, counts)] = page.statements.as_slice() else {
+        panic!("one completed statement: {:?}", page.statements)
+    };
+    assert_eq!(read.statement_id, opened.statement_id);
+    assert_eq!(read.institution, "Interactive Brokers");
+    assert_eq!(read.figures[0].buying_power, Some(usd("25000.00")));
+    assert_eq!(*counts, Counts::default());
+    let completed = read.completed.as_ref().unwrap();
+    assert_eq!(completed.change, change);
+    assert_eq!(completed.cause, cause);
+    assert!(page.as_of >= change.sequence);
+}
+
+#[test]
+fn a_holdings_cost_and_lots_are_kept_on_the_row_and_the_position() {
+    let store = store();
+    let statement = opened(&store);
+    let mut holding = resolved(&statement, &unique("INS"));
+    holding.cost = meridian_street::Cost {
+        cost_basis: None,
+        average_cost: Some(usd("150.00")),
+        lots: vec![
+            meridian_street::Lot {
+                quantity: units("10"),
+                cost: Some(usd("-1500.00")),
+                acquired_date: "2024-03-11".into(),
+            },
+            meridian_street::Lot {
+                quantity: units("2.5"),
+                cost: None,
+                acquired_date: String::new(),
+            },
+        ],
+        margin_requirement: Some(usd("703.13")),
+    };
+    let account = holding.account_id.clone();
+    let instrument = holding.instrument_id.clone().unwrap();
+    store.record(holding.clone(), &at(NOW)).unwrap();
+
+    let held = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.cost, holding.cost,
+        "as reported, the sign and the order kept"
+    );
+}
+
+#[test]
+fn migration_five_numbers_nothing_old_and_moves_a_statements_figures_into_a_set() {
+    // A database at version 4: a completed statement with its flat figures,
+    // and its row, which gives it its account.
+    let (url, mut client) = own_schema("five");
+    client
+        .batch_execute(meridian_street::migrations::HISTORY)
+        .unwrap();
+    for migration in &meridian_street::migrations::MIGRATIONS[..4] {
+        client.batch_execute(migration.sql).unwrap();
+        client
+            .execute(
+                "INSERT INTO schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+                &[&migration.version, &migration.name],
+            )
+            .unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO statement (statement_id, source, external_statement_id, as_of_date,
+                                    read_at_ns, expected_rows, completed_at_ns, buying_power,
+                                    buying_power_currency, currency_assumed)
+             VALUES ('STMT-4', 'etrade', 'st-4', '2026-09-08', 1, 1, 2, 41250.00, 'USD', true);
+             INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
+                                  quantity, market_value, currency)
+             VALUES ('HLD-4', 'STMT-4', 'ACC-4', 'INS', 'long', 12.5, 2812.50, 'USD');
+             INSERT INTO custodial_position (account_id, instrument_id, side, quantity,
+                                             market_value, currency, last_statement_id,
+                                             as_of_date, updated_at_ns)
+             VALUES ('ACC-4', 'INS', 'long', 12.5, 2812.50, 'USD', 'STMT-4', '2026-09-08', 1);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 1).expect("could not connect");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migration 5 did not apply");
+    store.verify().expect("and the database is current");
+
+    let statement = store.statement("STMT-4").unwrap().unwrap();
+    assert_eq!(statement.account_id, "ACC-4", "taken from its rows");
+    assert!(statement.currency_assumed);
+    let [figures] = statement.figures.as_slice() else {
+        panic!("one set: {:?}", statement.figures)
+    };
+    assert_eq!(figures.segment, "");
+    assert_eq!(figures.buying_power, Some(usd("41250.00")));
+    let completed = statement.completed.expect("still complete");
+    assert_eq!(completed.change.sequence, 0, "numbered before nothing");
+
+    let position = store
+        .custodial_position("ACC-4", "INS", Side::Long)
+        .unwrap()
+        .unwrap();
+    assert_eq!(position.last_change.sequence, 0);
+    let page = store
+        .page(&Read {
+            scope: Scope::Everything,
+            account_id: String::new(),
+            include_unresolved: false,
+            limit: 10,
+            cursor: String::new(),
+            since: None,
+        })
+        .unwrap();
+    assert_eq!(page.as_of, 0);
+
+    // The next change is the partition's first, chained to nothing.
+    let mut moved = resolved(&statement_open(&store, "ACC-4"), "INS");
+    moved.quantity = units("13");
+    match store.record(moved, &at(NOW)).unwrap().0 {
+        Settled::Changed { position, .. } => {
+            assert_eq!(
+                (position.last_change.sequence, position.last_change.previous),
+                (1, 0)
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn statement_open(store: &PostgresStore, account: &str) -> Statement {
+    store.open(statement(account), &at(NOW)).unwrap().0
 }

@@ -9,8 +9,9 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    Completion, Counts, CustodialPosition, Holding, Key, Opened, Page, Result, Settled, Side,
-    Statement, Store, StoreError,
+    from_statement_cursor, statement_cursor, Cause, Chain, Change, Completed, Completion, Counts,
+    CustodialPosition, Holding, Key, Opened, Page, Read, Result, Settled, Side, Statement,
+    StatementPage, StatementsRead, Store, StoreError,
 };
 
 #[derive(Debug, Default)]
@@ -37,31 +38,28 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
-    fn open(&self, statement: Statement) -> Result<(Statement, Opened, Completion)> {
-        Ok(self.write()?.open(statement))
+    fn open(&self, statement: Statement, cause: &Cause) -> Result<(Statement, Opened, Completion)> {
+        Ok(self.write()?.open(statement, cause))
     }
 
     fn statement(&self, statement_id: &str) -> Result<Option<Statement>> {
         Ok(self.read()?.statements.get(statement_id).cloned())
     }
 
-    fn record(&self, holding: Holding, now_ns: i64) -> Result<(Settled, Completion)> {
-        self.write()?.record(holding, now_ns)
+    fn record(&self, holding: Holding, cause: &Cause) -> Result<(Settled, Completion)> {
+        self.write()?.record(holding, cause)
     }
 
     fn counts(&self, statement_id: &str) -> Result<Counts> {
         self.read()?.counts(statement_id)
     }
 
-    fn page(
-        &self,
-        account_id: &str,
-        include_unresolved: bool,
-        limit: usize,
-        cursor: &str,
-    ) -> Result<Page> {
-        self.read()?
-            .page(account_id, include_unresolved, limit, cursor)
+    fn page(&self, read: &Read) -> Result<Page> {
+        self.read()?.page(read)
+    }
+
+    fn statements(&self, read: &StatementsRead) -> Result<StatementPage> {
+        self.read()?.statements_page(read)
     }
 
     fn custodial_position(
@@ -78,19 +76,28 @@ impl Store for MemoryStore {
                 instrument_id: instrument_id.to_string(),
                 side,
             })
+            .filter(|position| !position.removed)
             .cloned())
     }
 
-    fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>> {
-        Ok(self.write()?.move_positions(replaced_id, instrument_id))
+    fn move_positions(
+        &self,
+        replaced_id: &str,
+        instrument_id: &str,
+        cause: &Cause,
+    ) -> Result<Vec<Settled>> {
+        Ok(self
+            .write()?
+            .move_positions(replaced_id, instrument_id, cause))
     }
 
     fn placeholder_instruments(&self) -> Result<Vec<String>> {
         let held = self.read()?;
         let mut placeholders: Vec<String> = held
             .positions
-            .keys()
-            .map(|key| &key.instrument_id)
+            .iter()
+            .filter(|(_, position)| !position.removed)
+            .map(|(key, _)| &key.instrument_id)
             .filter(|instrument_id| instrument_id.starts_with(crate::ids::PLACEHOLDER_PREFIX))
             .cloned()
             .collect();
@@ -114,16 +121,36 @@ pub(crate) struct Held {
 
     pub(crate) holdings: Vec<Holding>,
 
-    /// Ordered by key, which is the order a read pages through them in.
+    /// Ordered by key, which is the order a read pages through them in. A
+    /// removed one stays, a tombstone.
     pub(crate) positions: BTreeMap<Key, CustodialPosition>,
 
-    /// Statements that have already announced themselves, so a row beyond the
-    /// count does not announce a second time.
-    pub(crate) completed: std::collections::HashSet<String>,
+    /// The partition's last number, and the last of each kind for each
+    /// account: what the next change takes and names as its previous.
+    pub(crate) head: u64,
+    pub(crate) chains: HashMap<(Chain, String), u64>,
 }
 
 impl Held {
-    pub(crate) fn open(&mut self, statement: Statement) -> (Statement, Opened, Completion) {
+    /// The partition's next number, chained to the last of `chain` for the
+    /// account. No holes: nothing here can roll back.
+    fn next(&mut self, chain: Chain, account_id: &str) -> Change {
+        self.head += 1;
+        let previous = self
+            .chains
+            .insert((chain, account_id.to_string()), self.head)
+            .unwrap_or(0);
+        Change {
+            sequence: self.head,
+            previous,
+        }
+    }
+
+    pub(crate) fn open(
+        &mut self,
+        statement: Statement,
+        cause: &Cause,
+    ) -> (Statement, Opened, Completion) {
         let external = (
             statement.source.clone(),
             statement.external_statement_id.clone(),
@@ -135,19 +162,23 @@ impl Held {
             }
         }
 
+        let mut statement = statement;
+        // Nothing is coming, so nothing is outstanding.
+        let completion = if statement.expected_rows == 0 && statement.completed.is_none() {
+            let change = self.next(Chain::Statement, &statement.account_id);
+            statement.completed = Some(Completed {
+                change,
+                cause: cause.clone(),
+            });
+            Completion::JustCompleted(change)
+        } else {
+            Completion::Nothing
+        };
+
         self.by_external
             .insert(external, statement.statement_id.clone());
         self.statements
             .insert(statement.statement_id.clone(), statement.clone());
-
-        // Nothing is coming, so nothing is outstanding.
-        let completion = if statement.expected_rows == 0
-            && self.completed.insert(statement.statement_id.clone())
-        {
-            Completion::JustCompleted
-        } else {
-            Completion::Nothing
-        };
 
         (statement, Opened::Opened, completion)
     }
@@ -155,17 +186,29 @@ impl Held {
     pub(crate) fn record(
         &mut self,
         holding: Holding,
-        now_ns: i64,
+        cause: &Cause,
     ) -> Result<(Settled, Completion)> {
         holding.validate()?;
 
         let Some(statement) = self.statements.get(&holding.statement_id).cloned() else {
             return Err(StoreError::UnknownStatement(holding.statement_id.clone()));
         };
+        // A statement is one account's: one from a plugin before v7 takes its
+        // first row's, and a row naming another is refused (W2.2).
+        if statement.account_id.is_empty() {
+            if let Some(held) = self.statements.get_mut(&holding.statement_id) {
+                held.account_id = holding.account_id.clone();
+            }
+        } else if statement.account_id != holding.account_id {
+            return Err(StoreError::AnotherAccount {
+                row: holding.account_id.clone(),
+                statement: statement.account_id.clone(),
+            });
+        }
 
         let settled = match holding.instrument_id.clone() {
             None => Settled::Unresolved,
-            Some(instrument_id) => self.settle(&holding, instrument_id, now_ns)?,
+            Some(instrument_id) => self.settle(&holding, instrument_id, cause)?,
         };
 
         let statement_id = holding.statement_id.clone();
@@ -177,16 +220,27 @@ impl Held {
             .filter(|held| held.statement_id == statement_id)
             .count() as u32;
 
-        // Once, at the row that reaches the count. `insert` returning true is
-        // what makes it once: a later row finds it already there.
-        let completion = if received >= statement.expected_rows
-            && statement.expected_rows > 0
-            && self.completed.insert(statement_id)
-        {
-            Completion::JustCompleted
-        } else {
-            Completion::Nothing
-        };
+        // Once, at the row that reaches the count: a later row finds it
+        // already completed.
+        let held = self
+            .statements
+            .get(&statement_id)
+            .cloned()
+            .expect("checked above");
+        let completion =
+            if received >= held.expected_rows && held.expected_rows > 0 && held.completed.is_none()
+            {
+                let change = self.next(Chain::Statement, &held.account_id);
+                if let Some(statement) = self.statements.get_mut(&statement_id) {
+                    statement.completed = Some(Completed {
+                        change,
+                        cause: cause.clone(),
+                    });
+                }
+                Completion::JustCompleted(change)
+            } else {
+                Completion::Nothing
+            };
 
         Ok((settled, completion))
     }
@@ -194,7 +248,12 @@ impl Held {
     /// A holding row states a quantity as of a date, not a change to one, so
     /// the position is replaced rather than added to. Accumulating would double
     /// anything that appeared in two statements.
-    fn settle(&mut self, holding: &Holding, instrument_id: String, now_ns: i64) -> Result<Settled> {
+    fn settle(
+        &mut self,
+        holding: &Holding,
+        instrument_id: String,
+        cause: &Cause,
+    ) -> Result<Settled> {
         let key = Key {
             account_id: holding.account_id.clone(),
             instrument_id: instrument_id.clone(),
@@ -211,7 +270,7 @@ impl Held {
             .map(|position| position.quantity)
             .unwrap_or(Quantity::ZERO);
 
-        let position = CustodialPosition {
+        let mut position = CustodialPosition {
             account_id: holding.account_id.clone(),
             instrument_id,
             side: holding.side,
@@ -219,15 +278,24 @@ impl Held {
             settle_date_quantity: holding.settle_date_quantity,
             market_value: holding.market_value.clone(),
             also_counted_in_cash: holding.also_counted_in_cash,
+            cost: holding.cost.clone(),
             last_statement_id: holding.statement_id.clone(),
             as_of_date: statement.as_of_date.clone(),
-            updated_at_ns: now_ns,
+            updated_at_ns: cause.committed_at_ns,
+            last_change: previous
+                .as_ref()
+                .map(|before| before.last_change)
+                .unwrap_or_default(),
+            removed: false,
         };
 
         let moved = match &previous {
             None => true,
             Some(before) => position.differs_from(before),
         };
+        if moved {
+            position.last_change = self.next(Chain::Position, &holding.account_id);
+        }
 
         self.positions.insert(key, position.clone());
 
@@ -245,49 +313,70 @@ impl Held {
         &mut self,
         replaced_id: &str,
         instrument_id: &str,
+        cause: &Cause,
     ) -> Vec<Settled> {
         // In key order, which is account then side.
         let held: Vec<Key> = self
             .positions
-            .keys()
-            .filter(|key| key.instrument_id == replaced_id)
-            .cloned()
+            .iter()
+            .filter(|(key, position)| key.instrument_id == replaced_id && !position.removed)
+            .map(|(key, _)| key.clone())
             .collect();
 
         let mut settled = Vec::new();
         for placeholder_key in held {
-            let Some(placeholder) = self.positions.remove(&placeholder_key) else {
+            let Some(placeholder) = self.positions.get(&placeholder_key).cloned() else {
                 continue;
             };
-            let moved = CustodialPosition {
+            let mut moved = CustodialPosition {
                 instrument_id: instrument_id.to_string(),
-                ..placeholder
+                ..placeholder.clone()
             };
             let key = moved.key();
 
             match self.positions.get(&key).cloned() {
-                None => {
-                    self.positions.insert(key, moved.clone());
-                    settled.push(Settled::Changed {
-                        position: moved,
-                        previous_quantity: Quantity::ZERO,
-                    });
+                Some(standing) if !standing.removed && !moved.stated_later_than(&standing) => {
+                    // The one already under the instrument was stated later,
+                    // so it stands and the placeholder's is gone.
                 }
-                Some(standing) if moved.stated_later_than(&standing) => {
+                standing => {
+                    let changed = match &standing {
+                        None => true,
+                        Some(standing) => standing.removed || moved.differs_from(standing),
+                    };
+                    let previous_quantity = standing
+                        .as_ref()
+                        .filter(|standing| !standing.removed)
+                        .map(|standing| standing.quantity)
+                        .unwrap_or(Quantity::ZERO);
+                    moved.updated_at_ns = cause.committed_at_ns;
+                    if changed {
+                        moved.last_change = self.next(Chain::Position, &moved.account_id);
+                    } else if let Some(standing) = &standing {
+                        moved.last_change = standing.last_change;
+                    }
                     self.positions.insert(key, moved.clone());
-                    settled.push(if moved.differs_from(&standing) {
+                    settled.push(if changed {
                         Settled::Changed {
                             position: moved,
-                            previous_quantity: standing.quantity,
+                            previous_quantity,
                         }
                     } else {
                         Settled::Unchanged { position: moved }
                     });
                 }
-                // The one already under the instrument was stated later, so it
-                // stands and the placeholder's is gone.
-                Some(_) => {}
             }
+
+            // The placeholder's stays as a tombstone, numbered, so a reader
+            // of changes learns it is gone (W2.6, W3.9).
+            let mut removed = placeholder.tombstone();
+            removed.updated_at_ns = cause.committed_at_ns;
+            removed.last_change = self.next(Chain::Position, &removed.account_id);
+            self.positions.insert(placeholder_key, removed.clone());
+            settled.push(Settled::Changed {
+                position: removed,
+                previous_quantity: placeholder.quantity,
+            });
         }
         settled
     }
@@ -313,17 +402,12 @@ impl Held {
         Ok(counts)
     }
 
-    pub(crate) fn page(
-        &self,
-        account_id: &str,
-        include_unresolved: bool,
-        limit: usize,
-        cursor: &str,
-    ) -> Result<Page> {
-        let after = if cursor.is_empty() {
+    pub(crate) fn page(&self, read: &Read) -> Result<Page> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
             None
         } else {
-            Some(Key::from_cursor(cursor)?)
+            Some(Key::from_cursor(&read.cursor)?)
         };
 
         // The map is in key order already; after the cursor's key, whole, so
@@ -333,13 +417,17 @@ impl Held {
             .iter()
             .filter(|(key, _)| after.as_ref().is_none_or(|after| *key > after))
             .map(|(_, position)| position)
-            .filter(|position| account_id.is_empty() || position.account_id == account_id)
-            .take(limit + 1)
+            .filter(|position| read.scope.answers(&read.account_id, &position.account_id))
+            .filter(|position| match read.since {
+                None => !position.removed,
+                Some(since) => position.last_change.sequence > since,
+            })
+            .take(read.limit + 1)
             .cloned()
             .collect();
 
-        let more = positions.len() > limit;
-        positions.truncate(limit);
+        let more = positions.len() > read.limit;
+        positions.truncate(read.limit);
 
         let next_cursor = match positions.last() {
             Some(last) if more => last.key().cursor(),
@@ -350,12 +438,12 @@ impl Held {
         // postcondition says so, a reader who did not ask for gaps should not
         // be handed them silently, and one reading page by page should see
         // each once.
-        let unresolved = if include_unresolved && after.is_none() {
+        let unresolved = if read.include_unresolved && after.is_none() {
             let mut rows: Vec<Holding> = self
                 .holdings
                 .iter()
                 .filter(|holding| !holding.resolved())
-                .filter(|holding| account_id.is_empty() || holding.account_id == account_id)
+                .filter(|holding| read.scope.answers(&read.account_id, &holding.account_id))
                 .cloned()
                 .collect();
             rows.sort_by(|left, right| left.holding_id.cmp(&right.holding_id));
@@ -368,6 +456,71 @@ impl Held {
             positions,
             unresolved,
             next_cursor,
+            as_of: self.head,
+        })
+    }
+
+    pub(crate) fn statements_page(&self, read: &StatementsRead) -> Result<StatementPage> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
+            None
+        } else {
+            Some(from_statement_cursor(&read.cursor)?)
+        };
+        let mut completed: Vec<&Statement> = self
+            .statements
+            .values()
+            .filter(|statement| statement.completed.is_some())
+            .filter(|statement| read.scope.answers(&read.account_id, &statement.account_id))
+            .filter(|statement| {
+                read.as_of_date.is_empty() || statement.as_of_date == read.as_of_date
+            })
+            .filter(|statement| {
+                let sequence = statement
+                    .completed
+                    .as_ref()
+                    .map(|c| c.change.sequence)
+                    .unwrap_or(0);
+                read.since.is_none_or(|since| sequence > since)
+            })
+            .collect();
+        completed.sort_by_key(|statement| {
+            (
+                statement
+                    .completed
+                    .as_ref()
+                    .map(|c| c.change.sequence)
+                    .unwrap_or(0),
+                statement.statement_id.clone(),
+            )
+        });
+        let mut page: Vec<&Statement> = completed
+            .into_iter()
+            .filter(|statement| {
+                after.as_ref().is_none_or(|(sequence, statement_id)| {
+                    let at = statement
+                        .completed
+                        .as_ref()
+                        .map(|c| c.change.sequence)
+                        .unwrap_or(0);
+                    (at, &statement.statement_id) > (*sequence, statement_id)
+                })
+            })
+            .take(read.limit + 1)
+            .collect();
+        let more = page.len() > read.limit;
+        page.truncate(read.limit);
+        let next_cursor = match page.last() {
+            Some(last) if more => statement_cursor(last),
+            _ => String::new(),
+        };
+        Ok(StatementPage {
+            statements: page
+                .into_iter()
+                .map(|statement| Ok(((*statement).clone(), self.counts(&statement.statement_id)?)))
+                .collect::<Result<_>>()?,
+            next_cursor,
+            as_of: self.head,
         })
     }
 }
@@ -383,15 +536,23 @@ mod tests {
         // placeholder.
         let store = MemoryStore::new();
         let (statement, _, _) = store
-            .open(Statement {
-                statement_id: "STMT-1".into(),
-                source: "snaptrade".into(),
-                external_statement_id: "st-1".into(),
-                as_of_date: "2026-09-08".into(),
-                read_at_ns: 1,
-                expected_rows: 1,
-                figures: Default::default(),
-            })
+            .open(
+                Statement {
+                    statement_id: "STMT-1".into(),
+                    source: "snaptrade".into(),
+                    external_statement_id: "st-1".into(),
+                    as_of_date: "2026-09-08".into(),
+                    read_at_ns: 1,
+                    expected_rows: 1,
+                    account_id: String::new(),
+                    external_account_id: String::new(),
+                    institution: String::new(),
+                    figures: Vec::new(),
+                    currency_assumed: false,
+                    completed: None,
+                },
+                &Cause::default(),
+            )
             .unwrap();
         store
             .record(
@@ -407,13 +568,16 @@ mod tests {
                     market_value: Some(Money::new("1".parse().unwrap(), "USD")),
                     currency_assumed: false,
                     also_counted_in_cash: false,
+                    cost: Default::default(),
                     escalated: false,
                 },
-                1,
+                &Cause::default(),
             )
             .unwrap();
 
-        store.move_positions("LCL-1", "INS-1").unwrap();
+        store
+            .move_positions("LCL-1", "INS-1", &Cause::default())
+            .unwrap();
 
         let held = store.read().unwrap();
         assert_eq!(held.holdings[0].instrument_id.as_deref(), Some("LCL-1"));

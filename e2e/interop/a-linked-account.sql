@@ -2,7 +2,7 @@
 -- can land (W6.4, W4.11), written straight into the configuration store for
 -- the interop suite, which has no admin: an open account, the interop
 -- plugin's external account linked to it, and a permission that puts it in
--- the plugin's write scope.
+-- the plugin's write scope, and in an operations plugin's read scope.
 --
 -- Applied by `make interop` after the schema and before anything starts, so
 -- the conductor's first answer already holds it; and harmless to apply to a
@@ -26,6 +26,12 @@ ON CONFLICT DO NOTHING;
 -- AccessLevel 2: write.
 INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
 VALUES ('grp-interop', 0, 'custody-test-1', 2)
+ON CONFLICT DO NOTHING;
+-- AccessLevel 1: read. The interop account in operations-test-1's read
+-- scope, so it reads and hears what the street records of it (contract v7);
+-- operations-test-2 is named by no entry, and its scope is empty.
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
+VALUES ('grp-interop', 1, 'operations-test-1', 1)
 ON CONFLICT DO NOTHING;
 INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
 VALUES ('perm-interop', 'ug-interop', 'ag-interop', 'grp-interop')

@@ -13,7 +13,7 @@ use meridian_domain::v1::{
 };
 use meridian_instrument::{apply, resolve_identifier, PostgresStore};
 use meridian_street::amounts::{Money, Quantity};
-use meridian_street::store::{Holding, Settled, Side, Statement, Store as _};
+use meridian_street::store::{Cause, Holding, Settled, Side, Statement, Store as _};
 use tokio::runtime::Runtime;
 
 fn required(name: &str) -> String {
@@ -143,15 +143,26 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
     let street = meridian_street::PostgresStore::connect(&url, 2).unwrap();
     street.migrate(&meridian_clock::SystemClock).unwrap();
     let (statement, _, _) = street
-        .open(Statement {
-            statement_id: format!("STMT-outage-{stamp}"),
-            source: "snaptrade".into(),
-            external_statement_id: format!("st-outage-{stamp}"),
-            as_of_date: "2026-09-28".into(),
-            read_at_ns: stamp,
-            expected_rows: 1,
-            figures: Default::default(),
-        })
+        .open(
+            Statement {
+                statement_id: format!("STMT-outage-{stamp}"),
+                source: "snaptrade".into(),
+                external_statement_id: format!("st-outage-{stamp}"),
+                as_of_date: "2026-09-28".into(),
+                read_at_ns: stamp,
+                expected_rows: 1,
+                account_id: String::new(),
+                external_account_id: String::new(),
+                institution: String::new(),
+                figures: Vec::new(),
+                currency_assumed: false,
+                completed: None,
+            },
+            &Cause {
+                committed_at_ns: now_ns(),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let account = format!("ACC-outage-{stamp}");
@@ -169,9 +180,13 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
                 market_value: Some(Money::new(Default::default(), "USD")),
                 currency_assumed: false,
                 also_counted_in_cash: false,
+                cost: Default::default(),
                 escalated: false,
             },
-            now_ns(),
+            &Cause {
+                committed_at_ns: now_ns(),
+                ..Default::default()
+            },
         )
         .unwrap();
 

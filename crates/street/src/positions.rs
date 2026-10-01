@@ -1,4 +1,4 @@
-//! Reading the street store. W2.7.
+//! Reading the street store. W2.7 and W2.9.
 //!
 //! One request answers two questions, and that is the design rather than a
 //! convenience. "What do I hold" and "what could I not account for" have to be
@@ -10,14 +10,22 @@
 //! instrument alone skipped every row in a later account whose instrument
 //! sorted before it. The unresolved rows come with the first page and no
 //! other, so a reader going page by page sees each once.
+//!
+//! Within the reader's scope (W4.11): a plugin's read, marked by its sidecar,
+//! answers only the accounts in its scope, none when it is empty, and is
+//! refused naming one outside it; a core component's reads every account.
+//! Each page answers the watermark it was read at, and a read given one
+//! answers what changed since, removed positions as tombstones: how a plugin
+//! catches up (spec/plugins-hear-and-read, Q1).
 
 use meridian_domain::v1::{
-    ListCustodialPositionsReply, ListCustodialPositionsRequest, UnresolvedHolding,
+    ListCustodialPositionsReply, ListCustodialPositionsRequest, ListStatementsReply,
+    ListStatementsRequest, PartitionSequence, UnresolvedHolding, Watermark,
 };
 
 use crate::amounts::Money;
-use crate::record::{to_wire_identifier, to_wire_position};
-use crate::store::{Holding, Result, Store};
+use crate::record::{statement_recorded, to_wire_identifier, to_wire_position};
+use crate::store::{Holding, Read, Result, Scope, StatementsRead, Store, PARTITION};
 
 /// The most rows one reply will carry, whatever was asked for.
 ///
@@ -27,26 +35,80 @@ use crate::store::{Holding, Result, Store};
 const MAX_PAGE: usize = 500;
 const DEFAULT_PAGE: usize = 100;
 
+fn limit(page_size: i32) -> usize {
+    match page_size {
+        size if size <= 0 => DEFAULT_PAGE,
+        size => (size as usize).min(MAX_PAGE),
+    }
+}
+
+/// The street's sequence in a watermark a reader gave: everything when it
+/// names none.
+fn since(watermark: Option<&Watermark>) -> Option<u64> {
+    watermark.map(|watermark| {
+        watermark
+            .partitions
+            .iter()
+            .find(|held| held.partition == PARTITION)
+            .map(|held| held.sequence)
+            .unwrap_or(0)
+    })
+}
+
+fn as_of(sequence: u64) -> Watermark {
+    Watermark {
+        partitions: vec![PartitionSequence {
+            partition: PARTITION.to_string(),
+            sequence,
+        }],
+    }
+}
+
 pub fn list_positions(
     store: &dyn Store,
     request: &ListCustodialPositionsRequest,
+    scope: &Scope,
 ) -> Result<ListCustodialPositionsReply> {
-    let limit = match request.page_size {
-        size if size <= 0 => DEFAULT_PAGE,
-        size => (size as usize).min(MAX_PAGE),
-    };
-
-    let page = store.page(
-        &request.account_id,
-        request.include_unresolved,
-        limit,
-        &request.cursor,
-    )?;
+    let page = store.page(&Read {
+        scope: scope.clone(),
+        account_id: request.account_id.clone(),
+        include_unresolved: request.include_unresolved,
+        limit: limit(request.page_size),
+        cursor: request.cursor.clone(),
+        since: since(request.since.as_ref()),
+    })?;
 
     Ok(ListCustodialPositionsReply {
         positions: page.positions.iter().map(to_wire_position).collect(),
         unresolved: page.unresolved.iter().map(to_wire_unresolved).collect(),
         next_cursor: page.next_cursor,
+        as_of: Some(as_of(page.as_of)),
+    })
+}
+
+/// W2.9: completed statements, each as it was announced (W2.5).
+pub fn list_statements(
+    store: &dyn Store,
+    request: &ListStatementsRequest,
+    scope: &Scope,
+) -> Result<ListStatementsReply> {
+    let page = store.statements(&StatementsRead {
+        scope: scope.clone(),
+        account_id: request.account_id.clone(),
+        as_of_date: request.as_of_date.clone(),
+        limit: limit(request.page_size),
+        cursor: request.cursor.clone(),
+        since: since(request.since.as_ref()),
+    })?;
+
+    Ok(ListStatementsReply {
+        statements: page
+            .statements
+            .iter()
+            .map(|(statement, counts)| statement_recorded(statement, *counts))
+            .collect(),
+        next_cursor: page.next_cursor,
+        as_of: Some(as_of(page.as_of)),
     })
 }
 
@@ -77,9 +139,17 @@ mod tests {
     use super::*;
     use crate::amounts::testing::{quantity, read, usd};
     use crate::record::{open_statement, record_holding};
+    use crate::store::Scope;
     use crate::MemoryStore;
 
     const NOW: i64 = 1_757_376_000_000_000_000;
+
+    fn at(now: i64) -> crate::store::Cause {
+        crate::store::Cause {
+            committed_at_ns: now,
+            ..Default::default()
+        }
+    }
 
     fn street() -> (MemoryStore, String) {
         let store = MemoryStore::new();
@@ -93,7 +163,7 @@ mod tests {
                 expected_rows: 2,
                 ..Default::default()
             },
-            NOW,
+            &at(NOW),
         )
         .unwrap()
         .reply
@@ -110,7 +180,7 @@ mod tests {
                 side: HoldingSide::Long as i32,
                 ..Default::default()
             },
-            NOW,
+            &at(NOW),
         )
         .unwrap();
 
@@ -130,11 +200,32 @@ mod tests {
                 side: HoldingSide::Long as i32,
                 ..Default::default()
             },
-            NOW,
+            &at(NOW),
         )
         .unwrap();
 
         (store, statement_id)
+    }
+
+    /// A statement of its own for `account`, which a row of it lands in: a
+    /// statement is one account's (W2.2).
+    fn statement_of(store: &MemoryStore, account: &str) -> String {
+        open_statement(
+            store,
+            &RecordHoldingsStatementRequest {
+                source: "snaptrade".into(),
+                external_statement_id: format!("st-{account}"),
+                as_of_date: "2026-09-08".into(),
+                read_at_ns: NOW,
+                expected_rows: 100,
+                account_id: account.into(),
+                ..Default::default()
+            },
+            &at(NOW),
+        )
+        .unwrap()
+        .reply
+        .statement_id
     }
 
     fn asking(include_unresolved: bool) -> ListCustodialPositionsRequest {
@@ -143,13 +234,14 @@ mod tests {
             include_unresolved,
             page_size: 100,
             cursor: String::new(),
+            since: None,
         }
     }
 
     #[test]
     fn one_request_answers_what_is_held_and_what_could_not_be_accounted_for() {
         let (store, _) = street();
-        let reply = list_positions(&store, &asking(true)).unwrap();
+        let reply = list_positions(&store, &asking(true), &Scope::Everything).unwrap();
 
         assert_eq!(reply.positions.len(), 1);
         assert_eq!(read(&reply.positions[0].quantity), "12.5");
@@ -165,7 +257,7 @@ mod tests {
         // The reply's postcondition. A reader who did not ask is not handed
         // them silently.
         let (store, _) = street();
-        let reply = list_positions(&store, &asking(false)).unwrap();
+        let reply = list_positions(&store, &asking(false), &Scope::Everything).unwrap();
 
         assert_eq!(reply.positions.len(), 1);
         assert!(reply.unresolved.is_empty());
@@ -173,7 +265,8 @@ mod tests {
 
     #[test]
     fn another_accounts_holdings_are_not_in_the_answer() {
-        let (store, statement_id) = street();
+        let (store, _) = street();
+        let statement_id = statement_of(&store, "SNAP-ACC-2");
         record_holding(
             &store,
             &RecordHoldingRequest {
@@ -185,11 +278,11 @@ mod tests {
                 side: HoldingSide::Long as i32,
                 ..Default::default()
             },
-            NOW,
+            &at(NOW),
         )
         .unwrap();
 
-        let reply = list_positions(&store, &asking(true)).unwrap();
+        let reply = list_positions(&store, &asking(true), &Scope::Everything).unwrap();
         assert_eq!(reply.positions.len(), 1);
         assert!(reply
             .positions
@@ -214,19 +307,25 @@ mod tests {
                     side: HoldingSide::Long as i32,
                     ..Default::default()
                 },
-                NOW,
+                &at(NOW),
             )
             .unwrap();
         }
 
         let mut greedy = asking(false);
         greedy.page_size = 100_000;
-        let reply = list_positions(&store, &greedy).unwrap();
+        let reply = list_positions(&store, &greedy, &Scope::Everything).unwrap();
         assert!(reply.positions.len() <= MAX_PAGE);
 
         let mut absent = asking(false);
         absent.page_size = 0;
-        assert!(list_positions(&store, &absent).unwrap().positions.len() <= DEFAULT_PAGE);
+        assert!(
+            list_positions(&store, &absent, &Scope::Everything)
+                .unwrap()
+                .positions
+                .len()
+                <= DEFAULT_PAGE
+        );
     }
 
     #[test]
@@ -244,21 +343,21 @@ mod tests {
                     side: HoldingSide::Long as i32,
                     ..Default::default()
                 },
-                NOW,
+                &at(NOW),
             )
             .unwrap();
         }
 
         let mut small = asking(false);
         small.page_size = 2;
-        let first = list_positions(&store, &small).unwrap();
+        let first = list_positions(&store, &small, &Scope::Everything).unwrap();
         assert_eq!(first.positions.len(), 2);
         assert!(!first.next_cursor.is_empty());
 
         let mut rest = asking(false);
         rest.page_size = 100;
         rest.cursor = first.next_cursor.clone();
-        let second = list_positions(&store, &rest).unwrap();
+        let second = list_positions(&store, &rest, &Scope::Everything).unwrap();
 
         assert!(second.next_cursor.is_empty());
         let mut seen: Vec<String> = first
@@ -287,7 +386,9 @@ mod tests {
                     include_unresolved: true,
                     page_size: size,
                     cursor: cursor.clone(),
+                    since: None,
                 },
+                &Scope::Everything,
             )
             .unwrap();
             everything.positions.extend(page.positions);
@@ -305,7 +406,7 @@ mod tests {
         // alone, so ACC-B's INS-A, sorting before ACC-A's INS-Z, was skipped
         // by the page after ACC-A's. And both sides of one instrument are two
         // rows, which a page boundary may fall between.
-        let (store, statement_id) = street();
+        let (store, first) = street();
         let rows = [
             ("SNAP-ACC-1", "INS-Z", HoldingSide::Long, "1"),
             ("SNAP-ACC-2", "INS-A", HoldingSide::Long, "2"),
@@ -314,6 +415,11 @@ mod tests {
             ("SNAP-ACC-3", "INS-A", HoldingSide::Short, "-5"),
         ];
         for (account, instrument, side, held) in rows {
+            let statement_id = if account == "SNAP-ACC-1" {
+                first.clone()
+            } else {
+                statement_of(&store, account)
+            };
             record_holding(
                 &store,
                 &RecordHoldingRequest {
@@ -324,7 +430,7 @@ mod tests {
                     side: side as i32,
                     ..Default::default()
                 },
-                NOW,
+                &at(NOW),
             )
             .unwrap();
         }
@@ -355,8 +461,245 @@ mod tests {
         let mut forged = asking(false);
         forged.cursor = "INS-01J8XQ4M7K0000000000AAPL".into();
         assert!(matches!(
-            list_positions(&store, &forged),
+            list_positions(&store, &forged, &Scope::Everything),
             Err(crate::StoreError::UnreadableCursor(_))
         ));
+    }
+
+    // ── Within the reader's scope, at a watermark (W2.7, W2.9, W4.11) ─────
+
+    fn within(accounts: &[&str]) -> Scope {
+        Scope::Within(accounts.iter().map(|a| a.to_string()).collect())
+    }
+
+    fn every_account() -> ListCustodialPositionsRequest {
+        ListCustodialPositionsRequest {
+            account_id: String::new(),
+            include_unresolved: true,
+            page_size: 100,
+            cursor: String::new(),
+            since: None,
+        }
+    }
+
+    #[test]
+    fn a_plugins_read_answers_its_scope_and_an_empty_one_nothing() {
+        let (store, _) = street();
+        let elsewhere = statement_of(&store, "SNAP-ACC-2");
+        record_holding(
+            &store,
+            &RecordHoldingRequest {
+                statement_id: elsewhere,
+                account_id: "SNAP-ACC-2".into(),
+                instrument_id: "INS-OTHER".into(),
+                quantity: quantity("1"),
+                side: HoldingSide::Long as i32,
+                ..Default::default()
+            },
+            &at(NOW),
+        )
+        .unwrap();
+
+        let scoped = list_positions(&store, &every_account(), &within(&["SNAP-ACC-1"])).unwrap();
+        assert_eq!(scoped.positions.len(), 1);
+        assert_eq!(scoped.unresolved.len(), 1);
+
+        let none = list_positions(&store, &every_account(), &within(&[])).unwrap();
+        assert!(
+            none.positions.is_empty() && none.unresolved.is_empty(),
+            "never everything"
+        );
+
+        let everything = list_positions(&store, &every_account(), &Scope::Everything).unwrap();
+        assert_eq!(
+            everything.positions.len(),
+            2,
+            "a core component reads every account"
+        );
+    }
+
+    #[test]
+    fn a_plugins_read_naming_an_account_outside_its_scope_is_refused() {
+        let (store, _) = street();
+        assert!(matches!(
+            list_positions(&store, &asking(true), &within(&["ACC-2"])),
+            Err(crate::StoreError::OutOfScope(account)) if account == "SNAP-ACC-1"
+        ));
+    }
+
+    #[test]
+    fn a_read_answers_its_watermark_and_a_read_since_one_what_changed() {
+        let (store, statement_id) = street();
+        let first = list_positions(&store, &every_account(), &Scope::Everything).unwrap();
+        let at_first = first.as_of.unwrap().partitions[0].sequence;
+        assert_eq!(
+            at_first, 2,
+            "the resolved row's position, and the statement's completion"
+        );
+
+        let mut moved = every_account();
+        moved.since = Some(as_of(at_first));
+        assert!(list_positions(&store, &moved, &Scope::Everything)
+            .unwrap()
+            .positions
+            .is_empty());
+
+        record_holding(
+            &store,
+            &RecordHoldingRequest {
+                statement_id,
+                account_id: "SNAP-ACC-1".into(),
+                instrument_id: "INS-NEW".into(),
+                quantity: quantity("3"),
+                side: HoldingSide::Long as i32,
+                ..Default::default()
+            },
+            &at(NOW),
+        )
+        .unwrap();
+        let since = list_positions(&store, &moved, &Scope::Everything).unwrap();
+        let changed: Vec<_> = since
+            .positions
+            .iter()
+            .map(|p| p.instrument_id.as_str())
+            .collect();
+        assert_eq!(changed, ["INS-NEW"]);
+        let journal = since.positions[0].last_change.as_ref().unwrap();
+        assert_eq!(
+            (journal.sequence, journal.previous_sequence),
+            (3, 1),
+            "chained to the account's last position, not its statement"
+        );
+    }
+
+    #[test]
+    fn a_removed_position_is_read_only_since_a_watermark() {
+        let store = MemoryStore::new();
+        let statement_id = open_statement(
+            &store,
+            &RecordHoldingsStatementRequest {
+                source: "snaptrade".into(),
+                external_statement_id: "st".into(),
+                as_of_date: "2026-09-08".into(),
+                expected_rows: 1,
+                ..Default::default()
+            },
+            &at(NOW),
+        )
+        .unwrap()
+        .reply
+        .statement_id;
+        record_holding(
+            &store,
+            &RecordHoldingRequest {
+                statement_id,
+                account_id: "ACC-1".into(),
+                instrument_id: "LCL-1".into(),
+                quantity: quantity("5"),
+                side: HoldingSide::Long as i32,
+                ..Default::default()
+            },
+            &at(NOW),
+        )
+        .unwrap();
+        crate::record::move_positions(
+            &store,
+            &meridian_domain::v1::InstrumentReplacedEvent {
+                replaced_instrument_id: "LCL-1".into(),
+                instrument: Some(meridian_domain::v1::InstrumentRecord {
+                    instrument_id: "INS-1".into(),
+                    ..Default::default()
+                }),
+                replaced_at_ns: NOW,
+            },
+            &at(NOW),
+        )
+        .unwrap();
+
+        let now = list_positions(&store, &every_account(), &Scope::Everything).unwrap();
+        let held: Vec<_> = now
+            .positions
+            .iter()
+            .map(|p| p.instrument_id.as_str())
+            .collect();
+        assert_eq!(held, ["INS-1"], "no tombstone without a watermark");
+
+        let mut since = every_account();
+        since.since = Some(as_of(1));
+        let changed = list_positions(&store, &since, &Scope::Everything).unwrap();
+        let removed: Vec<_> = changed
+            .positions
+            .iter()
+            .map(|p| (p.instrument_id.as_str(), p.removed))
+            .collect();
+        assert_eq!(removed, [("INS-1", false), ("LCL-1", true)]);
+    }
+
+    fn statements(scope: &Scope, request: ListStatementsRequest) -> ListStatementsReply {
+        let store = MemoryStore::new();
+        for (n, (account, rows)) in [("ACC-1", 0), ("ACC-2", 0), ("ACC-1", 1)]
+            .iter()
+            .enumerate()
+        {
+            open_statement(
+                &store,
+                &RecordHoldingsStatementRequest {
+                    source: "snaptrade".into(),
+                    external_statement_id: format!("st-{n}"),
+                    as_of_date: format!("2026-09-0{}", n + 1),
+                    expected_rows: *rows,
+                    account_id: (*account).into(),
+                    ..Default::default()
+                },
+                &at(NOW + n as i64),
+            )
+            .unwrap();
+        }
+        list_statements(&store, &request, scope).unwrap()
+    }
+
+    #[test]
+    fn completed_statements_are_read_within_the_scope_in_the_order_they_completed() {
+        let all = statements(&Scope::Everything, ListStatementsRequest::default());
+        let read: Vec<_> = all
+            .statements
+            .iter()
+            .map(|s| s.account_id.as_str())
+            .collect();
+        assert_eq!(read, ["ACC-1", "ACC-2"], "the open one is not listed");
+        assert_eq!(all.as_of.unwrap().partitions[0].sequence, 2);
+
+        let scoped = statements(&within(&["ACC-2"]), ListStatementsRequest::default());
+        assert_eq!(scoped.statements.len(), 1);
+        assert_eq!(scoped.statements[0].account_id, "ACC-2");
+
+        let since = statements(
+            &Scope::Everything,
+            ListStatementsRequest {
+                since: Some(as_of(1)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(since.statements.len(), 1);
+        assert_eq!(since.statements[0].journal.as_ref().unwrap().sequence, 2);
+
+        let dated = statements(
+            &Scope::Everything,
+            ListStatementsRequest {
+                as_of_date: "2026-09-02".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dated.statements.len(), 1);
+
+        let paged = statements(
+            &Scope::Everything,
+            ListStatementsRequest {
+                page_size: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(paged.statements.len(), 1);
+        assert!(!paged.next_cursor.is_empty());
     }
 }

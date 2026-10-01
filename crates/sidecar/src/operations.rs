@@ -4,9 +4,14 @@
 //! One method per operation: the plugin's params read as the domain
 //! message, which they are on the wire, the stamped fields set, and the
 //! message sent through the sidecar's one path onto the bus.
+//!
+//! And the stream of what the plugin's roles hear (W4.3): the rows, and
+//! how each one's message is read, filtered by the account
+//! matrix/scoped.tsv names and delivered, in `DELIVERED`.
 
 use meridian_domain::v1 as domain;
 use meridian_pb::plugin::v1 as plugin;
+use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::service::Sidecar;
@@ -40,11 +45,27 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<plugin::RecordHoldingsStatementResult>, Status> {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
-        let message: domain::RecordHoldingsStatementRequest = self.as_domain(params)?;
+        let mut message: domain::RecordHoldingsStatementRequest = self.as_domain(params)?;
         self.exact_money("buying_power", message.buying_power.as_ref())?;
         self.exact_money("margin_requirement", message.margin_requirement.as_ref())?;
         self.exact_money("maintenance_excess", message.maintenance_excess.as_ref())?;
-        let account = None;
+        for (i0, held0) in message.figures.iter().enumerate() {
+            self.exact_money(&format!("figures[{i0}].buying_power"), held0.buying_power.as_ref())?;
+            self.exact_money(&format!("figures[{i0}].margin_requirement"), held0.margin_requirement.as_ref())?;
+            self.exact_money(&format!("figures[{i0}].maintenance_excess"), held0.maintenance_excess.as_ref())?;
+            self.exact_money(&format!("figures[{i0}].initial_margin"), held0.initial_margin.as_ref())?;
+            self.exact_money(&format!("figures[{i0}].variation_margin"), held0.variation_margin.as_ref())?;
+            self.exact_money(&format!("figures[{i0}].net_liquidation"), held0.net_liquidation.as_ref())?;
+            for (i1, held1) in held0.collateral.iter().enumerate() {
+                self.known(&format!("figures[{i0}].collateral[{i1}].direction"), held1.direction, domain::CollateralDirection::try_from(held1.direction).is_ok())?;
+                self.exact(&format!("figures[{i0}].collateral[{i1}].quantity"), held1.quantity.as_ref())?;
+                self.exact_money(&format!("figures[{i0}].collateral[{i1}].value"), held1.value.as_ref())?;
+                self.exact(&format!("figures[{i0}].collateral[{i1}].haircut"), held1.haircut.as_ref())?;
+                self.exact_money(&format!("figures[{i0}].collateral[{i1}].value_after_haircut"), held1.value_after_haircut.as_ref())?;
+            }
+        }
+        message.account_id = self.linked_account("meridian.v1.RecordHoldingsStatementRequest", &message.external_account_id).await?;
+        let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message, account, acting_for).await
     }
 
@@ -59,10 +80,37 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.exact("quantity", message.quantity.as_ref())?;
         self.exact_money("market_value", message.market_value.as_ref())?;
         self.exact("settle_date_quantity", message.settle_date_quantity.as_ref())?;
+        self.exact_money("cost_basis", message.cost_basis.as_ref())?;
+        for (i0, held0) in message.lots.iter().enumerate() {
+            self.exact(&format!("lots[{i0}].quantity"), held0.quantity.as_ref())?;
+            self.exact_money(&format!("lots[{i0}].cost"), held0.cost.as_ref())?;
+        }
+        self.exact_money("margin_requirement", message.margin_requirement.as_ref())?;
+        self.exact_money("average_cost", message.average_cost.as_ref())?;
         self.known("side", message.side, domain::HoldingSide::try_from(message.side).is_ok())?;
-        message.account_id = self.linked_account(&message.external_account_id).await?;
+        message.account_id = self.linked_account("meridian.v1.RecordHoldingRequest", &message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
+    }
+
+    /// W2.7: `platform.street.query.list-custodial-positions`.
+    async fn list_custodial_positions(
+        &self,
+        request: Request<plugin::ListCustodialPositionsParams>,
+    ) -> Result<Response<plugin::ListCustodialPositionsResult>, Status> {
+        let message: domain::ListCustodialPositionsRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.street.query.list-custodial-positions", "meridian.v1.ListCustodialPositionsRequest", message, account, None).await
+    }
+
+    /// W2.9: `platform.street.query.list-statements`.
+    async fn list_statements(
+        &self,
+        request: Request<plugin::ListStatementsParams>,
+    ) -> Result<Response<plugin::ListStatementsResult>, Status> {
+        let message: domain::ListStatementsRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.street.query.list-statements", "meridian.v1.ListStatementsRequest", message, account, None).await
     }
 
     /// W3.1: `platform.reference.query.resolve-identifier`.
@@ -71,7 +119,8 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
         let message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
-        self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, None).await
+        let account = None;
+        self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, account, None).await
     }
 
     /// W3.2: `platform.reference.event.instrument-missing`.
@@ -108,6 +157,59 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let message: domain::AccountsRequest = self.as_domain(params)?;
-        self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, acting_for).await
+        let account = None;
+        self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, account, acting_for).await
     }
+
+    type ReceiveStream = crate::receive::Deliveries;
+
+    /// W4.3: every row this plugin's roles hear, within its read scope.
+    async fn receive(
+        &self,
+        request: Request<plugin::ReceiveRequest>,
+    ) -> Result<Response<Self::ReceiveStream>, Status> {
+        self.receive_typed(request.into_inner(), DELIVERED).await
+    }
+}
+
+/// The rows a plugin's roles may hear (W4.3), each with how its message is
+/// read: the account matrix/scoped.tsv names, its journal and cause, and
+/// its arm.
+pub(crate) const DELIVERED: &[crate::receive::Row] = &[
+    crate::receive::Row {
+        name: "StatementRecorded",
+        step: "W2.5",
+        topic: "platform.street.event.statement-recorded",
+        payload_type: "meridian.v1.StatementRecordedEvent",
+        read: statement_recorded,
+    },
+    crate::receive::Row {
+        name: "CustodialPositionUpdated",
+        step: "W2.6",
+        topic: "platform.street.event.custodial-position-updated",
+        payload_type: "meridian.v1.CustodialPositionUpdatedEvent",
+        read: custodial_position_updated,
+    },
+];
+
+/// W2.5: a StatementRecordedEvent, its account at `account_id`.
+fn statement_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::StatementRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.account_id.clone()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::StatementRecorded(message),
+    })
+}
+
+/// W2.6: a CustodialPositionUpdatedEvent, its account at `position.account_id`.
+fn custodial_position_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::CustodialPositionUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.position.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::CustodialPositionUpdated(message),
+    })
 }

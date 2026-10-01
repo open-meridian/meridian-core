@@ -1,0 +1,60 @@
+// Where a change sits in its store's record, who caused it, and a point in
+// that record a read answers at or reads since.
+//
+// Derived from W2.4 to W2.7 and W2.9, and W4.3 (spec/plugins-hear-and-read, Q1
+// and Q3, as clarified 2026-10-01; plans/the-book-holds-positions, design
+// decisions 1, 4 and 5). Shared by every store that feeds plugins: the street
+// store's one partition now, the book's partitions with revision B.
+//
+// A plugin never sees a number: the SDK reads these to tell a gap from the
+// numbers other accounts used, and to catch up from the store, never from the
+// bus.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// Where a change sits in its store's record (spec/plugins-hear-and-read, Q1
+// as clarified 2026-10-01).
+message JournalRef {
+  // The partition the change was made in: the street store's one, or a
+  // book partition.
+  string partition = 1;
+
+  // Its number there: the partition's next, taken in the change's own
+  // transaction, so the numbers have no holes.
+  uint64 sequence = 2;
+
+  // The number of the previous change the same row made for the same
+  // account, 0 for its first: what a plugin hearing only some accounts
+  // checks for a gap in its own.
+  uint64 previous_sequence = 3;
+}
+
+// Who caused a change, as the store recorded it when it committed (Q3).
+message ChangeCause {
+  // The instance that sent the command, as its sidecar stamped it.
+  string instance_id = 1;
+
+  // The person it was sent for (W4.9); empty when the plugin acted as itself.
+  string acting_for_subject = 2;
+
+  string correlation_id = 3;
+
+  // The command's message_id.
+  string causation_id = 4;
+
+  int64 committed_at_ns = 5;
+}
+
+// A point in a store's record: a sequence per partition. What a read
+// answers it was read at, and what a read of changes since takes.
+message Watermark {
+  repeated PartitionSequence partitions = 1;
+}
+
+// One partition's sequence within a watermark.
+message PartitionSequence {
+  string partition = 1;
+  uint64 sequence = 2;
+}

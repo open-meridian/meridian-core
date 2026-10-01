@@ -32,7 +32,7 @@
 //! rule. What happens is that somebody adds a dependency for convenience and
 //! nothing objects.
 //!
-//! # Five rules that are easy to get quietly wrong
+//! # Six rules that are easy to get quietly wrong
 //!
 //! **A position is replaced, not accumulated.** A holding row states a quantity
 //! as of a date; it is not a change to one. Adding rows up would double
@@ -48,6 +48,13 @@
 //! the only evidence that something was held. Guessing at the instrument would
 //! be worse. So it is kept, it updates no position, and [`positions`] hands it
 //! back beside the positions so the gap is visible where the holdings are.
+//!
+//! **Every change is numbered, and none is lost.** A change a reader hears
+//! takes the street partition's next number in its own transaction and names
+//! the previous of its kind for its account, so a reader that heard only some
+//! accounts tells a gap in its own; a reader catches up by reading what
+//! changed since a number, and a removed position stays as a tombstone so it
+//! is read too. Every read answers within the reader's scope (W4.11).
 //!
 //! **What was not reported stays unreported.** A market value, a settle-date
 //! quantity or a margin figure the venue did not give is absent, never zero:
@@ -87,10 +94,11 @@ mod memory;
 
 pub use amounts::{Money, Quantity};
 pub use memory::MemoryStore;
-pub use positions::list_positions;
+pub use positions::{list_positions, list_statements};
 pub use postgres::PostgresStore;
 pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
-    Completion, Counts, CustodialPosition, Figures, Holding, Key, Opened, Settled, Side, Statement,
-    Store, StoreError,
+    Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts, CustodialPosition,
+    Direction, Figures, Holding, Key, Lot, Opened, Scope, Settled, Side, Statement, Store,
+    StoreError, PARTITION,
 };

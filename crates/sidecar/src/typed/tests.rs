@@ -44,8 +44,12 @@ fn contract() -> Contract {
          platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n\
          platform.street.command.record-statement\tcommand\tcustody\tstreet\n\
          platform.config.command.link-external-account\tcommand\tcustody\tconductor\n\
-         platform.config.query.accounts\tquery\tcustody\tconductor\n",
-        "name\tkind\ncustody\trole\nstreet\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
+         platform.config.query.accounts\tquery\tcustody\tconductor\n\
+         platform.reference.query.resolve-identifier\tquery\tcustody\tinstrument\n\
+         platform.street.query.list-custodial-positions\tquery\toperations\tstreet\n\
+         platform.street.query.list-statements\tquery\toperations\tstreet\n",
+        "name\tkind\ncustody\trole\noperations\trole\nstreet\tcomponent\nsidecar\tcomponent\n\
+         conductor\tcomponent\ninstrument\tcomponent\n",
     )
     .unwrap()
 }
@@ -60,6 +64,15 @@ async fn registered(roles: &[&str]) -> (Sidecar, Arc<Bus>, Arc<Mutex<Vec<RecordH
 async fn registered_with(
     roles: &[&str],
     verifier: Option<Arc<Verifier>>,
+) -> (Sidecar, Arc<Bus>, Arc<Mutex<Vec<RecordHoldingRequest>>>) {
+    registered_at(roles, verifier, "v2").await
+}
+
+/// As `registered_with`, by a plugin built against `version`.
+async fn registered_at(
+    roles: &[&str],
+    verifier: Option<Arc<Verifier>>,
+    version: &str,
 ) -> (Sidecar, Arc<Bus>, Arc<Mutex<Vec<RecordHoldingRequest>>>) {
     let bus = Arc::new(Bus::single(
         "snaptrade-1",
@@ -124,7 +137,7 @@ async fn registered_with(
     }
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v2".into(),
+            schema_version: version.into(),
             ..Default::default()
         }))
         .await
@@ -174,6 +187,7 @@ fn holding(external: &str) -> RecordHoldingParams {
         currency_assumed: false,
         also_counted_in_cash: false,
         acting_for: None,
+        ..Default::default()
     }
 }
 
@@ -1429,4 +1443,250 @@ async fn a_page_serving_no_level_is_refused_at_registration_naming_it() {
             reply.refusal_reason
         );
     }
+}
+
+// ── Contract v7: a statement's account and figures, reads within a scope ────
+
+const RECORD_STATEMENT: &str = "platform.street.command.record-statement";
+
+/// A street store that keeps each statement it is asked to open.
+fn opening(bus: &Bus) -> Arc<Mutex<Vec<meridian_domain::v1::RecordHoldingsStatementRequest>>> {
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&opened);
+    bus.serve(RECORD_STATEMENT, move |envelope| {
+        keeping.lock().unwrap().push(
+            meridian_domain::v1::RecordHoldingsStatementRequest::decode(&envelope.payload[..])
+                .unwrap(),
+        );
+        Ok((
+            "meridian.v1.RecordHoldingsStatementReply".into(),
+            meridian_domain::v1::RecordHoldingsStatementReply {
+                statement_id: "S-1".into(),
+                already_recorded: false,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    opened
+}
+
+fn statement(external: &str) -> RecordHoldingsStatementParams {
+    RecordHoldingsStatementParams {
+        source: "snaptrade".into(),
+        external_account_id: external.into(),
+        institution: "Interactive Brokers".into(),
+        expected_rows: 1,
+        figures: vec![meridian_pb::plugin::v1::StatementFigures {
+            segment: String::new(),
+            buying_power: Some(Money {
+                amount: Some(wire("25000.00")),
+                currency_code: "USD".into(),
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_statement_from_a_v7_plugin_is_recorded_against_its_external_accounts_link() {
+    let (sidecar, bus, _) = registered_at(&["custody"], None, "v7").await;
+    let opened = opening(&bus);
+    sidecar
+        .record_holdings_statement(Request::new(statement("ext-1")))
+        .await
+        .expect("recorded");
+    {
+        let opened = opened.lock().unwrap();
+        assert_eq!(opened[0].account_id, "ACC-1", "stamped from the link");
+        assert_eq!(opened[0].institution, "Interactive Brokers");
+    }
+
+    let unlinked = sidecar
+        .record_holdings_statement(Request::new(statement("ext-9")))
+        .await
+        .unwrap_err();
+    assert_eq!(unlinked.code(), Code::FailedPrecondition);
+    assert_eq!(
+        reason(&unlinked),
+        Some(RefusalReason::ExternalAccountNotLinked)
+    );
+
+    let none = sidecar
+        .record_holdings_statement(Request::new(statement("")))
+        .await
+        .unwrap_err();
+    assert_eq!(none.code(), Code::InvalidArgument);
+    assert!(none.message().contains("external_account_id is required"));
+}
+
+#[tokio::test]
+async fn a_statement_from_a_plugin_before_v7_is_admitted_with_no_account() {
+    let (sidecar, bus, _) = registered_at(&["custody"], None, "v6").await;
+    let opened = opening(&bus);
+    sidecar
+        .record_holdings_statement(Request::new(RecordHoldingsStatementParams {
+            source: "snaptrade".into(),
+            expected_rows: 1,
+            buying_power: Some(Money {
+                amount: Some(wire("25000.00")),
+                currency_code: "USD".into(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("admitted, as before v7");
+    assert_eq!(
+        opened.lock().unwrap()[0].account_id,
+        "",
+        "its rows will give it one"
+    );
+}
+
+#[tokio::test]
+async fn a_statements_figures_that_cannot_stand_are_refused_naming_the_field() {
+    let (sidecar, bus, _) = registered_at(&["custody"], None, "v7").await;
+    let opened = opening(&bus);
+    let mut both = statement("ext-1");
+    both.buying_power = Some(Money {
+        amount: Some(wire("1")),
+        currency_code: "USD".into(),
+    });
+    let refused = sidecar
+        .record_holdings_statement(Request::new(both))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert_eq!(
+        refused.message(),
+        "buying_power is read from a plugin before v7; send it in figures"
+    );
+
+    let mut far = statement("ext-1");
+    far.figures[0].collateral = vec![meridian_pb::plugin::v1::ReportedCollateral {
+        direction: meridian_pb::plugin::v1::CollateralDirection::Posted as i32,
+        instrument_id: "INS-1".into(),
+        quantity: Some(wire("1")),
+        haircut: Some(Decimal {
+            high: 0,
+            low: 1,
+            scale: 19,
+        }),
+        ..Default::default()
+    }];
+    let refused = sidecar
+        .record_holdings_statement(Request::new(far))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .starts_with("figures[0].collateral[0].haircut"),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        opened.lock().unwrap().is_empty(),
+        "nothing reached the street store"
+    );
+}
+
+#[tokio::test]
+async fn a_number_inside_a_lot_is_refused_naming_its_path() {
+    let (sidecar, _, recorded) = registered(&["custody"]).await;
+    let mut row = holding("ext-1");
+    row.lots = vec![meridian_pb::plugin::v1::ReportedLot {
+        quantity: Some(Decimal {
+            high: 0,
+            low: 1,
+            scale: 19,
+        }),
+        ..Default::default()
+    }];
+    let refused = sidecar.record_holding(Request::new(row)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused.message().starts_with("lots[0].quantity"),
+        "{}",
+        refused.message()
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_read_is_stamped_with_the_scope_marked_and_one_outside_it_refused_first() {
+    let (sidecar, bus, _) = registered(&["operations"]).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&seen);
+    bus.serve(
+        "platform.street.query.list-custodial-positions",
+        move |envelope| {
+            let meta = envelope.meta.clone().unwrap_or_default();
+            keeping
+                .lock()
+                .unwrap()
+                .push((meta.account_scope_applies, meta.account_scope));
+            Ok((
+                "meridian.v1.ListCustodialPositionsReply".into(),
+                meridian_domain::v1::ListCustodialPositionsReply::default().encode_to_vec(),
+            ))
+        },
+    );
+
+    sidecar
+        .list_custodial_positions(Request::new(
+            meridian_pb::plugin::v1::ListCustodialPositionsParams::default(),
+        ))
+        .await
+        .expect("the whole scope");
+    let refused = sidecar
+        .list_custodial_positions(Request::new(
+            meridian_pb::plugin::v1::ListCustodialPositionsParams {
+                account_id: "ACC-9".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert_eq!(
+        refused.message(),
+        "ACC-9 is not in this plugin's read scope"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the refused read never left");
+    assert!(seen[0].0, "marked as applying");
+    assert_eq!(seen[0].1, ["ACC-1", "ACC-3", "ACC-R"]);
+}
+
+#[tokio::test]
+async fn an_unscoped_read_is_stamped_too_and_answered_whatever_the_scope() {
+    let (sidecar, bus, _) = registered(&["custody"]).await;
+    let marked = Arc::new(Mutex::new(None));
+    let keeping = Arc::clone(&marked);
+    bus.serve(
+        "platform.reference.query.resolve-identifier",
+        move |envelope| {
+            *keeping.lock().unwrap() = Some(
+                envelope
+                    .meta
+                    .clone()
+                    .unwrap_or_default()
+                    .account_scope_applies,
+            );
+            Ok((
+                "meridian.v1.ResolveIdentifierReply".into(),
+                meridian_domain::v1::ResolveIdentifierReply::default().encode_to_vec(),
+            ))
+        },
+    );
+    sidecar
+        .resolve_identifier(Request::new(
+            meridian_pb::plugin::v1::ResolveIdentifierParams::default(),
+        ))
+        .await
+        .expect("answered");
+    assert_eq!(*marked.lock().unwrap(), Some(true));
 }

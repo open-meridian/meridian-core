@@ -480,6 +480,23 @@ pub fn serve(
         key,
     });
 
+    // Links made before an account held one external account at most are
+    // kept, and said, for a deployment admin to separate (W6.4). Off the
+    // runtime, since the store blocks on its socket.
+    let reading = Arc::clone(&context);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(snapshot) = reading.snapshot() {
+            for (account, links) in rules::accounts_linked_twice(&snapshot) {
+                tracing::warn!(
+                    account,
+                    links = links.join(", "),
+                    "an account holds more than one external account, linked before an \
+                     account held one; kept, and a new second link is refused"
+                );
+            }
+        }
+    });
+
     answer(
         &context,
         ACCESS_RECORDS,

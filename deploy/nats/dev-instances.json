@@ -1,9 +1,11 @@
 {
-  "_note": "What this repository's harness launches, for the credentials its tests present. Not what a deployment runs: that is instances.example.json plus the plugins an administrator launched. `reference-1` is the reference plugin, holding no role; the two `custody-test` instances hold custody, whose topics W2 names, and are two so a test can show one cannot publish as the other.",
+  "_note": "What this repository's harness launches, for the credentials its tests present. Not what a deployment runs: that is instances.example.json plus the plugins an administrator launched. `reference-1` is the reference plugin, holding no role; the two `custody-test` instances hold custody, whose topics W2 names, and are two so a test can show one cannot publish as the other; the two `operations-test` instances read and hear what the street records, the first with the interop account in its read scope and the second with none (contract v7).",
   "instances": [
     {"instance_id": "reference-1", "roles": []},
     {"instance_id": "custody-test-1", "roles": ["custody"]},
     {"instance_id": "custody-test-2", "roles": ["custody"]},
+    {"instance_id": "operations-test-1", "roles": ["operations"]},
+    {"instance_id": "operations-test-2", "roles": ["operations"]},
     {"instance_id": "dashboard-1", "component": "dashboard"}
   ]
 }

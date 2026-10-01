@@ -187,11 +187,20 @@ impl Sidecar {
     }
 
     /// The account an external account is linked to (W6.4), or the refusal
-    /// that names what to do: a row for an unlinked account is refused, not
-    /// guessed at, and recorded once somebody links it. The refusal carries
-    /// REFUSAL_REASON_EXTERNAL_ACCOUNT_NOT_LINKED, which a plugin matches
-    /// rather than the words.
-    pub(crate) async fn linked_account(&self, external_account_id: &str) -> Result<String, Status> {
+    /// that names what to do: a row or a statement for an unlinked account is
+    /// refused, not guessed at, and recorded once somebody links it. The
+    /// refusal carries REFUSAL_REASON_EXTERNAL_ACCOUNT_NOT_LINKED, which a
+    /// plugin matches rather than the words. `payload_type` is the message
+    /// it is stamped on: a statement from a plugin built before v7 names no
+    /// external account and is admitted with no account (W2.2).
+    pub(crate) async fn linked_account(
+        &self,
+        payload_type: &str,
+        external_account_id: &str,
+    ) -> Result<String, Status> {
+        if external_account_id.is_empty() && self.names_none_before_v7(payload_type) {
+            return Ok(String::new());
+        }
         if external_account_id.is_empty() {
             return Err(Status::invalid_argument(
                 "external_account_id is required: the account as the rail knows it",

@@ -21,9 +21,16 @@
 //! assertion naming no level holds nothing. Each act admitted for a person is
 //! logged with the level it was done under.
 //!
+//! **A read is within the plugin's read scope** (W4.4, W4.11). Every query is
+//! stamped with the scope, marked as applying, so the store answers an empty
+//! one with nothing; and one naming an account outside it -- the field
+//! matrix/scoped.tsv names, which the generated operation hands here -- is
+//! refused before it leaves.
+//!
 //! A refusal is the call's gRPC status, chosen by what the caller should do
 //! about it: `permission_denied` for a topic none of the plugin's roles
-//! grants, or the deployment's configuration without a deployment admin,
+//! grants, an account outside the read scope, or the deployment's
+//! configuration without a deployment admin,
 //! `invalid_argument` for a number the wire does not carry,
 //! `failed_precondition` for an external account nobody has linked,
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
@@ -35,7 +42,7 @@
 //! in the trailing metadata [`REFUSAL_METADATA`]. A plugin acts on the code;
 //! the words are for a person reading a log, and may change.
 
-use meridian_bus::BusError;
+use meridian_bus::{BusError, Stamp};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1 as domain;
 use meridian_domain::v1::{ExternalAccountsEvent, LinkExternalAccountRequest};
@@ -183,12 +190,17 @@ impl Sidecar {
     /// A query: checked, asked, and the domain reply handed back as its
     /// plugin-facing mirror, which it is on the wire. One of the deployment's
     /// configuration is asked only for a deployment admin, who is stamped on
-    /// it (W6.4); any other carries no person (decisions/014).
+    /// it (W6.4); any other carries no person (decisions/014). Every one
+    /// carries the plugin's read scope, marked as applying, and one naming
+    /// `account` outside it is refused here, first (W4.4, W4.11); `account`
+    /// is `None` for a query matrix/scoped.tsv declares unscoped, and empty
+    /// for one naming none, which the store answers for the whole scope.
     pub(crate) async fn call_typed<D: Message, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
         message: D,
+        account: Option<String>,
         acting_for: Option<CallerAssertion>,
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
@@ -206,15 +218,30 @@ impl Sidecar {
         } else {
             String::new()
         };
+        let scope = self
+            .configuration(self.clock.now_ns())
+            .await?
+            .read_account_ids;
+        if let Some(account) = account.filter(|account| !account.is_empty()) {
+            if !scope.contains(&account) {
+                let refusal = format!("{account} is not in this plugin's read scope");
+                self.note_refusal(&refusal);
+                return Err(Status::permission_denied(refusal));
+            }
+        }
+        let stamp = Stamp {
+            acting_for_subject: subject,
+            account_scope: Some(scope),
+        };
         let (_, payload) = self
             .bus
-            .call_for(
+            .call_stamped(
                 &topic,
                 payload_type,
                 message.encode_to_vec(),
                 None,
                 None,
-                &subject,
+                &stamp,
             )
             .await
             .map_err(refused)?;
@@ -237,6 +264,10 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        self.statement_stands(payload_type, &message.encode_to_vec())?;
+        // A command naming no account names none: a statement from a plugin
+        // built before v7 is admitted with no account (crate::older).
+        let account = account.filter(|account| !account.is_empty());
         let now = self.clock.now_ns();
         if topic.starts_with(CONFIGURATION) {
             // An admin's act on the deployment's configuration, not a write

@@ -1331,7 +1331,7 @@ migrate: network
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
-	@$(COMPOSE) run --rm -T street meridian-street migrate
+	@$(COMPOSE) run --rm --build -T street meridian-street migrate
 	@$(COMPOSE) run --rm --build -T conductor meridian-conductor migrate
 
 up: migrate
@@ -1365,6 +1365,12 @@ down:
 # the rows whose currency was the connector's assumption; the positions the
 # venue also counts in cash; and each venue shape's statement figures as sent
 # (spec/the-account-side-fits-every-venue).
+#
+# Two `operations` plugins' sidecars run beside the custody one (contract v7):
+# the suite reads and hears the street through the first, whose read scope
+# holds the interop account, and through the second, whose scope is empty,
+# reads and hears nothing.
+#
 # Read by the plugin harness's street.sql, the one statement of the format a
 # plugin's e2e compares against, so this holds it too. Ordered bytewise, so
 # the file does not depend on the database's collation. Only the suite's
@@ -1383,7 +1389,9 @@ interop: network
 		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
-	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
+	@# Each with --build: a service's image is its own tag, and one left from
+	@# an earlier run would apply an earlier release's migrations.
+	@{ $(COMPOSE) run --rm --build -T street meridian-street migrate \
 	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
@@ -1396,7 +1404,7 @@ interop: network
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) up -d --build street instrument conductor sidecar >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop up -d --build street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
@@ -1405,7 +1413,7 @@ interop: network
 			<deploy/harness/street.sql 2>>.interop.log \
 			| awk -F'|' '$$2 == "Interop" && !($$1 == "statement" && $$3 == "interop")' \
 			>.interop.positions; \
-		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) down -v >/dev/null 2>&1; \
+		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \
 			echo "interop FAILED. The last 40 lines, and the whole of it in .interop.log:" >&2; \
 			tail -40 .interop.log >&2; exit 1; \

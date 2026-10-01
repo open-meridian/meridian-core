@@ -1890,3 +1890,82 @@ async fn a_claim_code_links_the_first_deployment_admin_to_all_plugins_admin() {
     let ada = meridian_access::person_access(&after, ADA, &[]);
     assert!(ada.deployment_admin && ada.administers("oms-1"));
 }
+
+#[tokio::test]
+async fn an_account_has_one_external_account_and_two_of_one_connection_are_two_accounts() {
+    // W6.4; the product owner, 2026-10-01: "Two custodians are considered two
+    // accounts", and "nothing preclude a fund to have two accounts at the
+    // same custodian for different purpose".
+    let h = harness("oms-1");
+    let growth = account(&h, "Growth").await;
+    let income = account(&h, "Income").await;
+    link_for(&h, link_request("oms-1", &growth.account_id, ""), ADA)
+        .await
+        .expect("the first");
+    link_for(&h, link_request("oms-1", &growth.account_id, ""), ADA)
+        .await
+        .expect("the same link again");
+
+    let second = LinkExternalAccountRequest {
+        external_account_id: "st-2".into(),
+        ..link_request("oms-1", &growth.account_id, "")
+    };
+    let refused = link_for(&h, second.clone(), ADA).await.unwrap_err();
+    assert!(
+        refused.contains(&format!(
+            "{} already has external account st-1 linked (oms-1); an account has one external \
+             account: link st-2 to another account, or a new one",
+            growth.account_id
+        )),
+        "{refused}"
+    );
+    assert_eq!(records(&h).await.links.len(), 1, "nothing was linked");
+
+    // Another external account of the same connection, to another account.
+    let admitted = link_for(
+        &h,
+        LinkExternalAccountRequest {
+            account_id: income.account_id.clone(),
+            ..second
+        },
+        ADA,
+    )
+    .await
+    .expect("admitted");
+    assert_eq!(admitted.account_id, income.account_id);
+    assert_eq!(records(&h).await.links.len(), 2);
+}
+
+#[test]
+fn accounts_linked_twice_before_the_rule_are_reported_and_kept() {
+    let snapshot = crate::store::Snapshot {
+        links: vec![
+            ExternalAccountLink {
+                plugin_instance_id: "snaptrade-1".into(),
+                external_account_id: "st-1".into(),
+                account_id: "ACC-1".into(),
+            },
+            ExternalAccountLink {
+                plugin_instance_id: "snaptrade-1".into(),
+                external_account_id: "st-2".into(),
+                account_id: "ACC-1".into(),
+            },
+            ExternalAccountLink {
+                plugin_instance_id: "snaptrade-1".into(),
+                external_account_id: "st-3".into(),
+                account_id: "ACC-2".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::rules::accounts_linked_twice(&snapshot),
+        vec![(
+            "ACC-1".to_string(),
+            vec![
+                "st-1 (snaptrade-1)".to_string(),
+                "st-2 (snaptrade-1)".to_string()
+            ]
+        )]
+    );
+}

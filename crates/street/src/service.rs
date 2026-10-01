@@ -1,11 +1,21 @@
 //! Where the street store meets the bus.
 //!
-//! Two commands in, one query in, one event heard, one query asked, one event
-//! out. W2.2 and W2.3 arrive as commands from a connector, W2.7 as a query
-//! from a dashboard, a placeholder's replacement (W3.8) as an event from the
-//! instrument store, W3.6 is asked of the instrument store by the sweep below,
-//! and W2.6 leaves as an event whenever a position actually moved, whether a
-//! statement moved it or a replacement did (W3.9).
+//! Two commands in, two queries in, one event heard, one query asked, two
+//! events out. W2.2 and W2.3 arrive as commands from a connector, W2.7 and
+//! W2.9 as queries from the dashboard or an `operations` plugin, a
+//! placeholder's replacement (W3.8) as an event from the instrument store,
+//! W3.6 is asked of the instrument store by the sweep below, W2.5 leaves when
+//! a statement completes, and W2.6 whenever a position actually moved,
+//! whether a statement moved it or a replacement did (W3.9).
+//!
+//! # Who caused it, and whose read it is
+//!
+//! Every change is recorded with its cause (Q3), read here off the command's
+//! envelope: the instance that sent it, which its sidecar stamped as the
+//! publisher, the person it was sent for, its correlation and its own
+//! identifier. A query's envelope says whose read it is: a plugin's, its
+//! scope marked as applying by its sidecar, answered only within it; or a
+//! core component's, unmarked, answered for every account (W4.11).
 //!
 //! # A replacement is heard, and also asked about
 //!
@@ -36,16 +46,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_bus::{Bus, Delivery};
+use meridian_bus::{Bus, Delivery, Envelope};
 use meridian_domain::v1::{
-    InstrumentReplacedEvent, ListCustodialPositionsRequest, RecordHoldingRequest,
-    RecordHoldingsStatementRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    InstrumentReplacedEvent, ListCustodialPositionsRequest, ListStatementsRequest,
+    RecordHoldingRequest, RecordHoldingsStatementRequest, ResolveInstrumentReply,
+    ResolveInstrumentRequest,
 };
 use prost::Message;
 
-use crate::positions::list_positions;
+use crate::positions::{list_positions, list_statements};
 use crate::record::{move_positions, open_statement, record_holding};
-use crate::store::Store;
+use crate::store::{Cause, Scope, Store};
 
 /// W2.2. A connector opening a statement.
 pub const RECORD_STATEMENT: &str = "platform.street.command.record-statement";
@@ -59,8 +70,11 @@ pub const CUSTODIAL_POSITION_UPDATED: &str = "platform.street.event.custodial-po
 /// W2.5. A statement has every row it said was coming.
 pub const STATEMENT_RECORDED: &str = "platform.street.event.statement-recorded";
 
-/// W2.7. A dashboard asking what is held.
+/// W2.7. The dashboard, or an `operations` plugin, asking what is held.
 pub const LIST_CUSTODIAL_POSITIONS: &str = "platform.street.query.list-custodial-positions";
+
+/// W2.9. An `operations` plugin asking for completed statements.
+pub const LIST_STATEMENTS: &str = "platform.street.query.list-statements";
 
 /// W3.8, heard. A placeholder's `INS-` ID arrived, and what was held under the
 /// placeholder moves onto it (W3.9).
@@ -81,6 +95,31 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
 /// given by whoever wires this up, so a test does not wait for it.
 pub use meridian_clock::Clock;
 
+/// Who caused a change, read off the envelope of what caused it (Q3): the
+/// sender, stamped by the bus as the publisher -- a plugin's sidecar is on
+/// the bus as its plugin -- the person, the chain and the message.
+pub fn cause_of(envelope: &Envelope, committed_at_ns: i64) -> Cause {
+    let meta = envelope.meta.clone().unwrap_or_default();
+    Cause {
+        instance_id: meta.publisher_instance_id,
+        acting_for_subject: meta.acting_for_subject,
+        correlation_id: meta.correlation_id,
+        causation_id: meta.message_id,
+        committed_at_ns,
+    }
+}
+
+/// Whose read a query is: a plugin's, which its sidecar marked as scoped, or
+/// a core component's (W4.11).
+pub fn scope_of(envelope: &Envelope) -> Scope {
+    match envelope.meta.as_ref() {
+        Some(meta) if meta.account_scope_applies => {
+            Scope::Within(meta.account_scope.iter().cloned().collect())
+        }
+        _ => Scope::Everything,
+    }
+}
+
 /// Register every handler the street store serves.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     let statements = store.clone();
@@ -95,8 +134,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let request = RecordHoldingsStatementRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable statement: {failed}"))?;
 
-        let now_ns = statement_clock.now_ns();
-        let opening = open_statement(statements.as_ref(), &request, now_ns)
+        let cause = cause_of(&envelope, statement_clock.now_ns());
+        let opening = open_statement(statements.as_ref(), &request, &cause)
             .map_err(|failed| failed.to_string())?;
 
         // A statement promising no rows is complete at once, so W2.5 can fire
@@ -131,7 +170,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let request = RecordHoldingRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable holding: {failed}"))?;
 
-        let recorded = record_holding(holdings.as_ref(), &request, holding_clock.now_ns())
+        let cause = cause_of(&envelope, holding_clock.now_ns());
+        let recorded = record_holding(holdings.as_ref(), &request, &cause)
             .map_err(|failed| failed.to_string())?;
 
         let meta = envelope.meta.as_ref();
@@ -169,7 +209,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         ))
     });
 
-    let reading = store;
+    let reading = store.clone();
     bus.serve(LIST_CUSTODIAL_POSITIONS, move |envelope| {
         expect(
             &envelope.payload_type,
@@ -179,11 +219,27 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let request = ListCustodialPositionsRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable query: {failed}"))?;
 
-        let reply =
-            list_positions(reading.as_ref(), &request).map_err(|failed| failed.to_string())?;
+        let reply = list_positions(reading.as_ref(), &request, &scope_of(&envelope))
+            .map_err(|failed| failed.to_string())?;
 
         Ok((
             "meridian.v1.ListCustodialPositionsReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
+
+    let completed = store;
+    bus.serve(LIST_STATEMENTS, move |envelope| {
+        expect(&envelope.payload_type, "meridian.v1.ListStatementsRequest")?;
+
+        let request = ListStatementsRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("undecodable query: {failed}"))?;
+
+        let reply = list_statements(completed.as_ref(), &request, &scope_of(&envelope))
+            .map_err(|failed| failed.to_string())?;
+
+        Ok((
+            "meridian.v1.ListStatementsReply".to_string(),
             reply.encode_to_vec(),
         ))
     });
@@ -235,12 +291,15 @@ pub async fn move_onto_replacement(
         .map_err(|failed| format!("undecodable replacement: {failed}"))?;
 
     // In the replacement's chain, so a position's move reads back to the
-    // placeholder's announcement and the escalation that answered it.
+    // placeholder's announcement and the escalation that answered it; and
+    // caused by it, as the store records it.
+    let cause = cause_of(&envelope, bus.clock().now_ns());
     let meta = envelope.meta.as_ref();
     move_and_announce(
         bus,
         store,
         event,
+        &cause,
         meta.map(|meta| meta.correlation_id.as_str()),
         meta.map(|meta| meta.message_id.as_str()),
     )
@@ -297,7 +356,13 @@ pub async fn sweep_placeholders(
             continue;
         }
 
-        // A chain of its own: nothing caused it but the time.
+        // A chain of its own: nothing caused it but the time, and the store
+        // itself made the change.
+        let cause = Cause {
+            instance_id: bus.instance_id().to_string(),
+            committed_at_ns: now_ns,
+            ..Default::default()
+        };
         announced += move_and_announce(
             bus,
             store,
@@ -306,6 +371,7 @@ pub async fn sweep_placeholders(
                 instrument: Some(instrument),
                 replaced_at_ns: now_ns,
             },
+            &cause,
             None,
             None,
         )
@@ -339,6 +405,7 @@ async fn move_and_announce(
     bus: &Bus,
     store: &Arc<dyn Store>,
     event: InstrumentReplacedEvent,
+    cause: &Cause,
     correlation: Option<&str>,
     causation: Option<&str>,
 ) -> Result<usize, String> {
@@ -346,8 +413,9 @@ async fn move_and_announce(
     // blocks on a socket; calling it here aborts the process rather than
     // merely blocking a worker. The instrument store learned that first.
     let moving = Arc::clone(store);
+    let cause = cause.clone();
     let announcements =
-        tokio::task::spawn_blocking(move || move_positions(moving.as_ref(), &event))
+        tokio::task::spawn_blocking(move || move_positions(moving.as_ref(), &event, &cause))
             .await
             .map_err(|failed| format!("the move task failed: {failed}"))?
             .map_err(|failed| failed.to_string())?;
@@ -614,6 +682,7 @@ mod tests {
                     include_unresolved: true,
                     page_size: 100,
                     cursor: String::new(),
+                    since: None,
                 }
                 .encode_to_vec(),
                 None,
@@ -625,6 +694,131 @@ mod tests {
         assert_eq!(payload_type, "meridian.v1.ListCustodialPositionsReply");
         let reply = ListCustodialPositionsReply::decode(&payload[..]).unwrap();
         assert_eq!(reply.positions.len(), 1);
+    }
+
+    /// A plugin's read, as its sidecar sends it: the scope stamped and marked.
+    async fn read_as_a_plugin(
+        bus: &Bus,
+        topic: &str,
+        payload_type: &str,
+        payload: Vec<u8>,
+        scope: &[&str],
+    ) -> Result<Vec<u8>, meridian_bus::BusError> {
+        let stamp = meridian_bus::Stamp {
+            acting_for_subject: String::new(),
+            account_scope: Some(scope.iter().map(|a| a.to_string()).collect()),
+        };
+        bus.call_stamped(topic, payload_type, payload, None, None, &stamp)
+            .await
+            .map(|(_, payload)| payload)
+    }
+
+    #[tokio::test]
+    async fn a_plugins_read_is_answered_within_its_scope() {
+        // W4.11: the store's second line, behind the sidecar's own check.
+        let (bus, _) = wired();
+        let statement_id = open(&bus).await;
+        record(&bus, row(&statement_id)).await;
+        let everything = ListCustodialPositionsRequest::default().encode_to_vec();
+        let positions = "meridian.v1.ListCustodialPositionsRequest";
+
+        let within = read_as_a_plugin(
+            &bus,
+            LIST_CUSTODIAL_POSITIONS,
+            positions,
+            everything.clone(),
+            &["SNAP-ACC-1"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ListCustodialPositionsReply::decode(&within[..])
+                .unwrap()
+                .positions
+                .len(),
+            1
+        );
+
+        let none = read_as_a_plugin(&bus, LIST_CUSTODIAL_POSITIONS, positions, everything, &[])
+            .await
+            .unwrap();
+        assert!(
+            ListCustodialPositionsReply::decode(&none[..])
+                .unwrap()
+                .positions
+                .is_empty(),
+            "an empty scope marked as applying reads nothing"
+        );
+
+        let outside = read_as_a_plugin(
+            &bus,
+            LIST_CUSTODIAL_POSITIONS,
+            positions,
+            ListCustodialPositionsRequest {
+                account_id: "SNAP-ACC-1".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            &["ACC-2"],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            outside
+                .to_string()
+                .contains("not in this plugin's read scope"),
+            "{outside}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_statements_are_read_with_their_cause() {
+        let (bus, _) = wired();
+        let mut statement = RecordHoldingsStatementRequest {
+            source: "snaptrade".into(),
+            external_statement_id: "st-empty".into(),
+            as_of_date: "2026-09-08".into(),
+            expected_rows: 0,
+            account_id: "ACC-1".into(),
+            external_account_id: "SNAP-ACC-1".into(),
+            institution: "Interactive Brokers".into(),
+            ..Default::default()
+        };
+        bus.call(
+            RECORD_STATEMENT,
+            "meridian.v1.RecordHoldingsStatementRequest",
+            statement.encode_to_vec(),
+            Some("CORR-STATEMENT"),
+            None,
+        )
+        .await
+        .unwrap();
+        statement.external_statement_id = "st-open".into();
+        statement.expected_rows = 3;
+        open(&bus).await;
+
+        let read = read_as_a_plugin(
+            &bus,
+            LIST_STATEMENTS,
+            "meridian.v1.ListStatementsRequest",
+            ListStatementsRequest::default().encode_to_vec(),
+            &["ACC-1"],
+        )
+        .await
+        .unwrap();
+        let reply = meridian_domain::v1::ListStatementsReply::decode(&read[..]).unwrap();
+        let [completed] = reply.statements.as_slice() else {
+            panic!("one completed statement in scope: {:?}", reply.statements)
+        };
+        assert_eq!(completed.external_account_id, "SNAP-ACC-1");
+        assert_eq!(completed.institution, "Interactive Brokers");
+        let cause = completed.cause.as_ref().unwrap();
+        assert_eq!(
+            cause.instance_id, "street-1",
+            "the sender, as its bus stamped it"
+        );
+        assert_eq!(cause.correlation_id, "CORR-STATEMENT");
+        assert_eq!(completed.journal.as_ref().unwrap().sequence, 1);
     }
 
     #[tokio::test]
@@ -723,7 +917,10 @@ mod tests {
         let moved = sweep_placeholders(&bus, &store, &Stopped(AtomicI64::new(NOW)))
             .await
             .unwrap();
-        assert_eq!(moved, 1);
+        assert_eq!(
+            moved, 2,
+            "what stands under the instrument, and the removal"
+        );
 
         let event =
             CustodialPositionUpdatedEvent::decode(&next(&mut announced).await.envelope.payload[..])

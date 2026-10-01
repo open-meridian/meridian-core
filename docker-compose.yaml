@@ -47,6 +47,8 @@ services:
       MERIDIAN_NATS_REFERENCE_1: reference-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_1: custody-test-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_2: custody-test-2-dev-only
+      MERIDIAN_NATS_OPERATIONS_TEST_1: operations-test-1-dev-only
+      MERIDIAN_NATS_OPERATIONS_TEST_2: operations-test-2-dev-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-dev-only
       MERIDIAN_NATS_FIRST_RUN: first-run-dev-only
       MERIDIAN_NATS_TESTS: tests-dev-only
@@ -221,6 +223,50 @@ services:
         # dashboard finds an instance's front door.
         aliases: ["sidecar-${MERIDIAN_PLUGIN_INSTANCE_ID:-custody-test-1}"]
 
+  # Two `operations` plugins' sidecars, in the custody sidecar's network
+  # namespace on ports of their own, so the interop suite reaches all three on
+  # loopback, as a plugin reaches its own (contract v7): the first reads and
+  # hears the interop account, which a_linked_account.sql puts in its read
+  # scope; the second has nothing in its scope, and so reads and hears
+  # nothing. Each speaks to the bus as its own instance.
+  sidecar-operations:
+    profiles: [interop]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      sidecar:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://operations-test-1:operations-test-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: operations-test-1
+      MERIDIAN_PLUGIN_ROLES: operations
+      MERIDIAN_INSTANCE_ID: sidecar-operations-test-1
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9192
+      RUST_LOG: ${RUST_LOG:-info}
+    network_mode: "service:sidecar"
+
+  sidecar-operations-unscoped:
+    profiles: [interop]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      sidecar:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://operations-test-2:operations-test-2-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: operations-test-2
+      MERIDIAN_PLUGIN_ROLES: operations
+      MERIDIAN_INSTANCE_ID: sidecar-operations-test-2
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9193
+      RUST_LOG: ${RUST_LOG:-info}
+    network_mode: "service:sidecar"
+
   # The Python SDK against a sidecar, which is the only check that the two
   # implementations of the sidecar surface agree.
   #
@@ -237,6 +283,8 @@ services:
         condition: service_started
     environment:
       MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
+      MERIDIAN_OPERATIONS_SIDECAR_ADDRESS: 127.0.0.1:9192
+      MERIDIAN_UNSCOPED_SIDECAR_ADDRESS: 127.0.0.1:9193
     network_mode: "service:sidecar"
 
   # The gates that need services. Not a build stage, because a build stage has

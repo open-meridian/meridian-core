@@ -33,7 +33,7 @@ pub use backend::{
 };
 pub use memory::MemoryBackend;
 pub use nats::NatsBackend;
-pub use router::{Bus, RouteRule};
+pub use router::{Bus, RouteRule, Stamp};
 
 /// Envelope and metadata, re-exported so consumers need not depend on the
 /// generated crates directly to use the bus. The envelope is the runtime's own

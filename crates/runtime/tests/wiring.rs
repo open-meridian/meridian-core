@@ -181,6 +181,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
                 include_unresolved: true,
                 page_size: 100,
                 cursor: String::new(),
+                since: None,
             }
             .encode_to_vec(),
             None,
@@ -283,6 +284,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
                 include_unresolved: true,
                 page_size: 100,
                 cursor: String::new(),
+                since: None,
             }
             .encode_to_vec(),
             None,

@@ -23,14 +23,16 @@
 //! carried, 18 places and 38 digits, whoever writes it.
 
 use postgres::types::ToSql;
-use postgres::{NoTls, Row, Transaction};
+use postgres::{GenericClient, IsolationLevel, NoTls, Row, Transaction};
 use r2d2_postgres::PostgresConnectionManager;
 
 use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
-    Completion, Counts, CustodialPosition, Figures, Holding, Identifier, Key, Opened, Page, Result,
-    Settled, Side, Statement, Store, StoreError,
+    from_statement_cursor, statement_cursor, Cause, Chain, Change, Collateral, Completed,
+    Completion, Cost, Counts, CustodialPosition, Direction, Figures, Holding, Identifier, Key, Lot,
+    Opened, Page, Read, Result, Scope, Settled, Side, Statement, StatementPage, StatementsRead,
+    Store, StoreError, PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -99,76 +101,72 @@ impl PostgresStore {
 
 /// A statement's columns, in the order [`statement_of`] reads them.
 const STATEMENT_COLUMNS: &str = "statement_id, source, external_statement_id, as_of_date,
-        read_at_ns, expected_rows, buying_power::text, buying_power_currency,
-        margin_requirement::text, margin_requirement_currency, maintenance_excess::text,
-        maintenance_excess_currency, currency_assumed";
+        read_at_ns, expected_rows, account_id, external_account_id, institution,
+        currency_assumed, completed_at_ns, completion_sequence, completion_previous,
+        cause_instance_id, cause_acting_for_subject, cause_correlation_id, cause_causation_id";
 
 /// A custodial position's columns, in the order [`position_of`] reads them.
 const POSITION_COLUMNS: &str = "account_id, instrument_id, side, quantity::text,
         settle_date_quantity::text, market_value::text, currency, last_statement_id,
-        as_of_date, updated_at_ns, also_counted_in_cash";
+        as_of_date, updated_at_ns, also_counted_in_cash, cost_basis::text, cost_basis_currency,
+        average_cost::text, average_cost_currency, margin_requirement::text,
+        margin_requirement_currency, sequence, previous_sequence, removed, last_holding_id";
+
+/// A held position, and the row whose lots it carries.
+type Held = (CustodialPosition, Option<String>);
 
 impl Store for PostgresStore {
-    fn open(&self, statement: Statement) -> Result<(Statement, Opened, Completion)> {
+    fn open(&self, statement: Statement, cause: &Cause) -> Result<(Statement, Opened, Completion)> {
         let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
 
         // Inserted first and conditionally, so the decision is Postgres' under
         // the unique index rather than ours across a read and a write. Two
         // connectors sending the same statement at once cannot both open it.
-        let figures = &statement.figures;
-        let (buying_power, buying_power_currency) = money_columns(&figures.buying_power);
-        let (margin_requirement, margin_requirement_currency) =
-            money_columns(&figures.margin_requirement);
-        let (maintenance_excess, maintenance_excess_currency) =
-            money_columns(&figures.maintenance_excess);
-        let parameters: [&(dyn ToSql + Sync); 13] = [
-            &statement.statement_id,
-            &statement.source,
-            &statement.external_statement_id,
-            &statement.as_of_date,
-            &statement.read_at_ns,
-            &(statement.expected_rows as i32),
-            &buying_power,
-            &buying_power_currency,
-            &margin_requirement,
-            &margin_requirement_currency,
-            &maintenance_excess,
-            &maintenance_excess_currency,
-            &figures.currency_assumed,
-        ];
-        let inserted = conn
+        let inserted = tx
             .execute(
                 "INSERT INTO statement
                         (statement_id, source, external_statement_id, as_of_date, read_at_ns,
-                         expected_rows, buying_power, buying_power_currency, margin_requirement,
-                         margin_requirement_currency, maintenance_excess,
-                         maintenance_excess_currency, currency_assumed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8, $9::text::numeric, $10,
-                         $11::text::numeric, $12, $13)
+                         expected_rows, account_id, external_account_id, institution,
+                         currency_assumed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT (source, external_statement_id) DO NOTHING",
-                &parameters,
+                &[
+                    &statement.statement_id,
+                    &statement.source,
+                    &statement.external_statement_id,
+                    &statement.as_of_date,
+                    &statement.read_at_ns,
+                    &(statement.expected_rows as i32),
+                    &statement.account_id,
+                    &statement.external_account_id,
+                    &statement.institution,
+                    &statement.currency_assumed,
+                ],
             )
             .map_err(unavailable)?;
 
         if inserted == 1 {
+            insert_figures(&mut tx, &statement)?;
+            let mut statement = statement;
             // Nothing is coming, so nothing is outstanding. Marked here, in the
-            // same statement that decides it, so a redelivery finds it done.
+            // same transaction that decides it, so a redelivery finds it done.
             let completion = if statement.expected_rows == 0 {
-                conn.execute(
-                    "UPDATE statement SET completed_at_ns = $1
-                      WHERE statement_id = $2 AND completed_at_ns IS NULL",
-                    &[&statement.read_at_ns, &statement.statement_id],
-                )
-                .map_err(unavailable)?;
-                Completion::JustCompleted
+                let change = next_change(&mut tx, Chain::Statement, &statement.account_id)?;
+                complete(&mut tx, &statement.statement_id, change, cause)?;
+                statement.completed = Some(Completed {
+                    change,
+                    cause: cause.clone(),
+                });
+                Completion::JustCompleted(change)
             } else {
                 Completion::Nothing
             };
-
+            tx.commit().map_err(unavailable)?;
             return Ok((statement, Opened::Opened, completion));
         }
 
-        let row = conn
+        let row = tx
             .query_one(
                 &format!(
                     "SELECT {STATEMENT_COLUMNS}
@@ -177,27 +175,30 @@ impl Store for PostgresStore {
                 &[&statement.source, &statement.external_statement_id],
             )
             .map_err(unavailable)?;
+        let mut held = statement_of(&row)?;
+        held.figures = figures_of(&mut tx, &held.statement_id)?;
+        tx.commit().map_err(unavailable)?;
 
-        Ok((
-            statement_of(&row)?,
-            Opened::AlreadyRecorded,
-            Completion::Nothing,
-        ))
+        Ok((held, Opened::AlreadyRecorded, Completion::Nothing))
     }
 
     fn statement(&self, statement_id: &str) -> Result<Option<Statement>> {
-        let row = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let row = conn
             .query_opt(
                 &format!("SELECT {STATEMENT_COLUMNS} FROM statement WHERE statement_id = $1"),
                 &[&statement_id],
             )
             .map_err(unavailable)?;
-
-        row.as_ref().map(statement_of).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut statement = statement_of(&row)?;
+        statement.figures = figures_of(&mut *conn, statement_id)?;
+        Ok(Some(statement))
     }
 
-    fn record(&self, holding: Holding, now_ns: i64) -> Result<(Settled, Completion)> {
+    fn record(&self, holding: Holding, cause: &Cause) -> Result<(Settled, Completion)> {
         holding.validate()?;
 
         let mut conn = self.conn()?;
@@ -207,7 +208,7 @@ impl Store for PostgresStore {
         // once cannot both see themselves as the one that completed it.
         let statement = tx
             .query_opt(
-                "SELECT as_of_date, expected_rows, completed_at_ns
+                "SELECT as_of_date, expected_rows, completed_at_ns, account_id
                    FROM statement WHERE statement_id = $1 FOR UPDATE",
                 &[&holding.statement_id],
             )
@@ -217,11 +218,32 @@ impl Store for PostgresStore {
         let as_of: String = statement.get(0);
         let expected: i32 = statement.get(1);
         let already_completed: Option<i64> = statement.get(2);
+        let mut account_id: String = statement.get(3);
+
+        // A statement is one account's: one from a plugin before v7 takes its
+        // first row's, and a row naming another is refused (W2.2).
+        if account_id.is_empty() {
+            tx.execute(
+                "UPDATE statement SET account_id = $1 WHERE statement_id = $2",
+                &[&holding.account_id, &holding.statement_id],
+            )
+            .map_err(unavailable)?;
+            account_id = holding.account_id.clone();
+        } else if account_id != holding.account_id {
+            return Err(StoreError::AnotherAccount {
+                row: holding.account_id.clone(),
+                statement: account_id,
+            });
+        }
 
         let identifiers = to_json(&holding.unresolved_identifiers);
         let (market_value, currency) = money_columns(&holding.market_value);
+        let (cost_basis, cost_basis_currency) = money_columns(&holding.cost.cost_basis);
+        let (average_cost, average_cost_currency) = money_columns(&holding.cost.average_cost);
+        let (margin_requirement, margin_requirement_currency) =
+            money_columns(&holding.cost.margin_requirement);
         let settle_date_quantity = holding.settle_date_quantity.map(|q| q.to_string());
-        let parameters: [&(dyn ToSql + Sync); 13] = [
+        let parameters: [&(dyn ToSql + Sync); 19] = [
             &holding.holding_id,
             &holding.statement_id,
             &holding.account_id,
@@ -235,20 +257,47 @@ impl Store for PostgresStore {
             &holding.escalated,
             &identifiers,
             &holding.also_counted_in_cash,
+            &cost_basis,
+            &cost_basis_currency,
+            &average_cost,
+            &average_cost_currency,
+            &margin_requirement,
+            &margin_requirement_currency,
         ];
         tx.execute(
             "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
                                   quantity, settle_date_quantity, market_value, currency,
-                                  currency_assumed, escalated, identifiers, also_counted_in_cash)
+                                  currency_assumed, escalated, identifiers, also_counted_in_cash,
+                                  cost_basis, cost_basis_currency, average_cost,
+                                  average_cost_currency, margin_requirement,
+                                  margin_requirement_currency)
              VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7::text::numeric,
-                     $8::text::numeric, $9, $10, $11, $12::text::jsonb, $13)",
+                     $8::text::numeric, $9, $10, $11, $12::text::jsonb, $13,
+                     $14::text::numeric, $15, $16::text::numeric, $17, $18::text::numeric, $19)",
             &parameters,
         )
         .map_err(unavailable)?;
+        for (ordinal, lot) in holding.cost.lots.iter().enumerate() {
+            let (cost, cost_currency) = money_columns(&lot.cost);
+            tx.execute(
+                "INSERT INTO holding_lot (holding_id, ordinal, quantity, cost, cost_currency,
+                                          acquired_date)
+                 VALUES ($1, $2, $3::text::numeric, $4::text::numeric, $5, $6)",
+                &[
+                    &holding.holding_id,
+                    &(ordinal as i32),
+                    &lot.quantity.to_string(),
+                    &cost,
+                    &cost_currency,
+                    &lot.acquired_date,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
 
         let settled = match holding.instrument_id.clone() {
             None => Settled::Unresolved,
-            Some(instrument_id) => settle(&mut tx, &holding, instrument_id, &as_of, now_ns)?,
+            Some(instrument_id) => settle(&mut tx, &holding, instrument_id, &as_of, cause)?,
         };
 
         let received: i64 = tx
@@ -261,12 +310,9 @@ impl Store for PostgresStore {
 
         let completion =
             if already_completed.is_none() && expected > 0 && received >= expected as i64 {
-                tx.execute(
-                    "UPDATE statement SET completed_at_ns = $1 WHERE statement_id = $2",
-                    &[&now_ns, &holding.statement_id],
-                )
-                .map_err(unavailable)?;
-                Completion::JustCompleted
+                let change = next_change(&mut tx, Chain::Statement, &account_id)?;
+                complete(&mut tx, &holding.statement_id, change, cause)?;
+                Completion::JustCompleted(change)
             } else {
                 Completion::Nothing
             };
@@ -289,41 +335,28 @@ impl Store for PostgresStore {
             return Err(StoreError::UnknownStatement(statement_id.to_string()));
         }
 
-        let row = conn
-            .query_one(
-                "SELECT count(*),
-                        count(*) FILTER (WHERE instrument_id IS NOT NULL),
-                        count(*) FILTER (WHERE instrument_id IS NULL)
-                   FROM holding WHERE statement_id = $1",
-                &[&statement_id],
-            )
-            .map_err(unavailable)?;
-
-        let received: i64 = row.get(0);
-        let resolved: i64 = row.get(1);
-        let unresolved: i64 = row.get(2);
-
-        Ok(Counts {
-            received: received as u32,
-            resolved: resolved as u32,
-            unresolved: unresolved as u32,
-        })
+        counts_of(&mut *conn, statement_id)
     }
 
-    fn page(
-        &self,
-        account_id: &str,
-        include_unresolved: bool,
-        limit: usize,
-        cursor: &str,
-    ) -> Result<Page> {
-        let after = if cursor.is_empty() {
+    fn page(&self, read: &Read) -> Result<Page> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
             None
         } else {
-            Some(Key::from_cursor(cursor)?)
+            Some(Key::from_cursor(&read.cursor)?)
         };
         let mut conn = self.conn()?;
-        let wanted = (limit as i64) + 1;
+        // One snapshot, so the page and the number it answers agree.
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let as_of = head(&mut tx)?;
+        let wanted = (read.limit as i64) + 1;
+        let within = within(&read.scope);
+        let since = read.since.map(|since| since as i64);
 
         // After the cursor's whole key, compared as a row, which is the order
         // the rows come back in: a cursor of the instrument alone skipped every
@@ -336,32 +369,36 @@ impl Store for PostgresStore {
                 key.side.as_str().to_string(),
             ),
         };
-        let rows = conn
+        let rows = tx
             .query(
                 &format!(
                     "SELECT {POSITION_COLUMNS}
                        FROM custodial_position
                       WHERE ($1 = '' OR account_id = $1)
+                        AND ($7::text[] IS NULL OR account_id = ANY($7))
+                        AND (($8::bigint IS NULL AND NOT removed) OR sequence > $8)
                         AND (NOT $2 OR (account_id, instrument_id, side) > ($3, $4, $5))
                       ORDER BY account_id, instrument_id, side
                       LIMIT $6"
                 ),
                 &[
-                    &account_id,
+                    &read.account_id,
                     &after.is_some(),
                     &after_account,
                     &after_instrument,
                     &after_side,
                     &wanted,
+                    &within,
+                    &since,
                 ],
             )
             .map_err(unavailable)?;
 
-        let mut positions: Vec<CustodialPosition> =
-            rows.iter().map(position_of).collect::<Result<_>>()?;
+        let held: Vec<Held> = rows.iter().map(position_of).collect::<Result<_>>()?;
+        let mut positions = with_lots(&mut tx, held)?;
 
-        let more = positions.len() > limit;
-        positions.truncate(limit);
+        let more = positions.len() > read.limit;
+        positions.truncate(read.limit);
         let next_cursor = match positions.last() {
             Some(last) if more => last.key().cursor(),
             _ => String::new(),
@@ -369,15 +406,16 @@ impl Store for PostgresStore {
 
         // With the first page only, so a reader going page by page sees each
         // once.
-        let unresolved = if include_unresolved && after.is_none() {
-            conn.query(
+        let unresolved = if read.include_unresolved && after.is_none() {
+            tx.query(
                 "SELECT holding_id, statement_id, account_id, side, quantity::text,
                         settle_date_quantity::text, market_value::text, currency,
                         currency_assumed, escalated, identifiers::text, also_counted_in_cash
                    FROM holding
                   WHERE instrument_id IS NULL AND ($1 = '' OR account_id = $1)
+                    AND ($2::text[] IS NULL OR account_id = ANY($2))
                   ORDER BY holding_id",
-                &[&account_id],
+                &[&read.account_id, &within],
             )
             .map_err(unavailable)?
             .iter()
@@ -394,6 +432,7 @@ impl Store for PostgresStore {
                     market_value: money_of(row, 6, 7)?,
                     currency_assumed: row.get(8),
                     also_counted_in_cash: row.get(11),
+                    cost: Cost::default(),
                     escalated: row.get(9),
                 })
             })
@@ -401,11 +440,78 @@ impl Store for PostgresStore {
         } else {
             Vec::new()
         };
+        tx.commit().map_err(unavailable)?;
 
         Ok(Page {
             positions,
             unresolved,
             next_cursor,
+            as_of,
+        })
+    }
+
+    fn statements(&self, read: &StatementsRead) -> Result<StatementPage> {
+        read.scope.admit(&read.account_id)?;
+        let (after_sequence, after_statement) = if read.cursor.is_empty() {
+            (-1_i64, String::new())
+        } else {
+            let (sequence, statement_id) = from_statement_cursor(&read.cursor)?;
+            (sequence as i64, statement_id)
+        };
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let as_of = head(&mut tx)?;
+        let wanted = (read.limit as i64) + 1;
+        let since = read.since.map(|since| since as i64);
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT {STATEMENT_COLUMNS}
+                       FROM statement
+                      WHERE completed_at_ns IS NOT NULL
+                        AND ($1 = '' OR account_id = $1)
+                        AND ($2::text[] IS NULL OR account_id = ANY($2))
+                        AND ($3 = '' OR as_of_date = $3)
+                        AND ($4::bigint IS NULL OR completion_sequence > $4)
+                        AND (completion_sequence, statement_id) > ($5, $6)
+                      ORDER BY completion_sequence, statement_id
+                      LIMIT $7"
+                ),
+                &[
+                    &read.account_id,
+                    &within(&read.scope),
+                    &read.as_of_date,
+                    &since,
+                    &after_sequence,
+                    &after_statement,
+                    &wanted,
+                ],
+            )
+            .map_err(unavailable)?;
+        let mut statements: Vec<Statement> =
+            rows.iter().map(statement_of).collect::<Result<_>>()?;
+        let more = statements.len() > read.limit;
+        statements.truncate(read.limit);
+        let next_cursor = match statements.last() {
+            Some(last) if more => statement_cursor(last),
+            _ => String::new(),
+        };
+        let mut page = Vec::with_capacity(statements.len());
+        for mut statement in statements {
+            statement.figures = figures_of(&mut tx, &statement.statement_id)?;
+            let counts = counts_of(&mut tx, &statement.statement_id)?;
+            page.push((statement, counts));
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(StatementPage {
+            statements: page,
+            next_cursor,
+            as_of,
         })
     }
 
@@ -415,58 +521,68 @@ impl Store for PostgresStore {
         instrument_id: &str,
         side: Side,
     ) -> Result<Option<CustodialPosition>> {
-        let row = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let row = conn
             .query_opt(
                 &format!(
                     "SELECT {POSITION_COLUMNS}
                        FROM custodial_position
-                      WHERE account_id = $1 AND instrument_id = $2 AND side = $3"
+                      WHERE account_id = $1 AND instrument_id = $2 AND side = $3
+                        AND NOT removed"
                 ),
                 &[&account_id, &instrument_id, &side.as_str()],
             )
             .map_err(unavailable)?;
-
-        row.as_ref().map(position_of).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(with_lots(&mut *conn, vec![position_of(&row)?])?.pop())
     }
 
-    fn move_positions(&self, replaced_id: &str, instrument_id: &str) -> Result<Vec<Settled>> {
+    fn move_positions(
+        &self,
+        replaced_id: &str,
+        instrument_id: &str,
+        cause: &Cause,
+    ) -> Result<Vec<Settled>> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
 
         // Locked, so a row recorded against the placeholder while this runs
         // waits for it rather than landing beside a position already moved.
-        let placeholders: Vec<CustodialPosition> = tx
+        let rows = tx
             .query(
                 &format!(
                     "SELECT {POSITION_COLUMNS}
-                       FROM custodial_position WHERE instrument_id = $1
+                       FROM custodial_position WHERE instrument_id = $1 AND NOT removed
                       ORDER BY account_id, side
                         FOR UPDATE"
                 ),
                 &[&replaced_id],
             )
-            .map_err(unavailable)?
-            .iter()
-            .map(|row| {
-                Ok(CustodialPosition {
-                    instrument_id: instrument_id.to_string(),
-                    ..position_of(row)?
-                })
-            })
-            .collect::<Result<_>>()?;
+            .map_err(unavailable)?;
+        let held: Vec<Held> = rows.iter().map(position_of).collect::<Result<_>>()?;
+        let placeholders = with_lots(&mut tx, held.clone())?
+            .into_iter()
+            .zip(held.into_iter().map(|(_, holding)| holding))
+            .collect::<Vec<_>>();
 
         let mut settled = Vec::new();
-        for moved in placeholders {
+        for (placeholder, holding_id) in placeholders {
+            let mut moved = CustodialPosition {
+                instrument_id: instrument_id.to_string(),
+                updated_at_ns: cause.committed_at_ns,
+                ..placeholder.clone()
+            };
+
             // Inserted first and conditionally, as `settle` does, so whether
             // the account already holds the instrument on that side is
             // Postgres' decision under the key rather than ours across a read
             // and a write.
-            let fresh = insert_position(&mut tx, &moved)?;
-
-            if fresh {
+            if insert_position(&mut tx, &moved, holding_id.as_deref(), cause)? {
+                moved.last_change = number(&mut tx, &moved, cause)?;
                 settled.push(Settled::Changed {
-                    position: moved.clone(),
+                    position: moved,
                     previous_quantity: Quantity::ZERO,
                 });
             } else {
@@ -485,29 +601,39 @@ impl Store for PostgresStore {
                         ],
                     )
                     .map_err(unavailable)?;
-                let standing = position_of(&row)?;
+                let standing = with_lots(&mut tx, vec![position_of(&row)?])?
+                    .pop()
+                    .expect("one position read");
 
-                if moved.stated_later_than(&standing) {
-                    update_position(&mut tx, &moved)?;
-                    settled.push(if moved.differs_from(&standing) {
-                        Settled::Changed {
-                            position: moved.clone(),
-                            previous_quantity: standing.quantity,
-                        }
+                if standing.removed || moved.stated_later_than(&standing) {
+                    moved.last_change = standing.last_change;
+                    update_position(&mut tx, &moved, holding_id.as_deref())?;
+                    if standing.removed || moved.differs_from(&standing) {
+                        moved.last_change = number(&mut tx, &moved, cause)?;
+                        settled.push(Settled::Changed {
+                            position: moved,
+                            previous_quantity: if standing.removed {
+                                Quantity::ZERO
+                            } else {
+                                standing.quantity
+                            },
+                        });
                     } else {
-                        Settled::Unchanged {
-                            position: moved.clone(),
-                        }
-                    });
+                        settled.push(Settled::Unchanged { position: moved });
+                    }
                 }
             }
 
-            tx.execute(
-                "DELETE FROM custodial_position
-                  WHERE account_id = $1 AND instrument_id = $2 AND side = $3",
-                &[&moved.account_id, &replaced_id, &moved.side.as_str()],
-            )
-            .map_err(unavailable)?;
+            // The placeholder's stays as a tombstone, numbered, so a reader of
+            // changes learns it is gone (W2.6, W3.9).
+            let mut removed = placeholder.tombstone();
+            removed.updated_at_ns = cause.committed_at_ns;
+            update_position(&mut tx, &removed, None)?;
+            removed.last_change = number(&mut tx, &removed, cause)?;
+            settled.push(Settled::Changed {
+                position: removed,
+                previous_quantity: placeholder.quantity,
+            });
         }
 
         tx.commit().map_err(unavailable)?;
@@ -520,7 +646,7 @@ impl Store for PostgresStore {
             .conn()?
             .query(
                 "SELECT DISTINCT instrument_id FROM custodial_position
-                  WHERE instrument_id LIKE $1
+                  WHERE instrument_id LIKE $1 AND NOT removed
                   ORDER BY instrument_id",
                 &[&pattern],
             )
@@ -531,21 +657,317 @@ impl Store for PostgresStore {
     }
 }
 
+/// The partition's number now.
+fn head(client: &mut impl GenericClient) -> Result<u64> {
+    let row = client
+        .query_one(
+            "SELECT sequence FROM partition_head WHERE partition = $1",
+            &[&PARTITION],
+        )
+        .map_err(unavailable)?;
+    Ok(row.get::<_, i64>(0).max(0) as u64)
+}
+
+/// The partition's next number, and the previous change of `chain` for the
+/// account, both taken in the change's own transaction: the head's row lock
+/// orders every change, and a rollback takes its number back with it, so
+/// there are no holes (design decision 5).
+fn next_change(tx: &mut Transaction<'_>, chain: Chain, account_id: &str) -> Result<Change> {
+    let sequence: i64 = tx
+        .query_one(
+            "UPDATE partition_head SET sequence = sequence + 1 WHERE partition = $1
+             RETURNING sequence",
+            &[&PARTITION],
+        )
+        .map_err(unavailable)?
+        .get(0);
+    let previous: i64 = tx
+        .query_opt(
+            "SELECT sequence FROM account_chain WHERE chain = $1 AND account_id = $2 FOR UPDATE",
+            &[&chain.as_str(), &account_id],
+        )
+        .map_err(unavailable)?
+        .map(|row| row.get(0))
+        .unwrap_or(0);
+    tx.execute(
+        "INSERT INTO account_chain (chain, account_id, sequence) VALUES ($1, $2, $3)
+         ON CONFLICT (chain, account_id) DO UPDATE SET sequence = EXCLUDED.sequence",
+        &[&chain.as_str(), &account_id, &sequence],
+    )
+    .map_err(unavailable)?;
+    Ok(Change {
+        sequence: sequence as u64,
+        previous: previous as u64,
+    })
+}
+
+/// A position's change numbered, and recorded on it with who made it.
+fn number(tx: &mut Transaction<'_>, position: &CustodialPosition, cause: &Cause) -> Result<Change> {
+    let change = next_change(tx, Chain::Position, &position.account_id)?;
+    tx.execute(
+        "UPDATE custodial_position
+            SET sequence = $1, previous_sequence = $2, changed_by_instance = $3,
+                changed_for_subject = $4
+          WHERE account_id = $5 AND instrument_id = $6 AND side = $7",
+        &[
+            &(change.sequence as i64),
+            &(change.previous as i64),
+            &cause.instance_id,
+            &cause.acting_for_subject,
+            &position.account_id,
+            &position.instrument_id,
+            &position.side.as_str(),
+        ],
+    )
+    .map_err(unavailable)?;
+    Ok(change)
+}
+
+/// A statement marked complete, with its change and who caused it.
+fn complete(
+    tx: &mut Transaction<'_>,
+    statement_id: &str,
+    change: Change,
+    cause: &Cause,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE statement
+            SET completed_at_ns = $1, completion_sequence = $2, completion_previous = $3,
+                cause_instance_id = $4, cause_acting_for_subject = $5,
+                cause_correlation_id = $6, cause_causation_id = $7
+          WHERE statement_id = $8 AND completed_at_ns IS NULL",
+        &[
+            &cause.committed_at_ns,
+            &(change.sequence as i64),
+            &(change.previous as i64),
+            &cause.instance_id,
+            &cause.acting_for_subject,
+            &cause.correlation_id,
+            &cause.causation_id,
+            &statement_id,
+        ],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+/// A statement's figures and their collateral, as it was opened.
+fn insert_figures(tx: &mut Transaction<'_>, statement: &Statement) -> Result<()> {
+    for (place, figures) in statement.figures.iter().enumerate() {
+        let (buying_power, buying_power_currency) = money_columns(&figures.buying_power);
+        let (margin_requirement, margin_requirement_currency) =
+            money_columns(&figures.margin_requirement);
+        let (maintenance_excess, maintenance_excess_currency) =
+            money_columns(&figures.maintenance_excess);
+        let (initial_margin, initial_margin_currency) = money_columns(&figures.initial_margin);
+        let (variation_margin, variation_margin_currency) =
+            money_columns(&figures.variation_margin);
+        let (net_liquidation, net_liquidation_currency) = money_columns(&figures.net_liquidation);
+        let parameters: [&(dyn ToSql + Sync); 15] = [
+            &statement.statement_id,
+            &figures.segment,
+            &(place as i32),
+            &buying_power,
+            &buying_power_currency,
+            &margin_requirement,
+            &margin_requirement_currency,
+            &maintenance_excess,
+            &maintenance_excess_currency,
+            &initial_margin,
+            &initial_margin_currency,
+            &variation_margin,
+            &variation_margin_currency,
+            &net_liquidation,
+            &net_liquidation_currency,
+        ];
+        tx.execute(
+            "INSERT INTO statement_figures
+                    (statement_id, segment, ordinal, buying_power, buying_power_currency,
+                     margin_requirement, margin_requirement_currency, maintenance_excess,
+                     maintenance_excess_currency, initial_margin, initial_margin_currency,
+                     variation_margin, variation_margin_currency, net_liquidation,
+                     net_liquidation_currency)
+             VALUES ($1, $2, $3, $4::text::numeric, $5, $6::text::numeric, $7,
+                     $8::text::numeric, $9, $10::text::numeric, $11, $12::text::numeric, $13,
+                     $14::text::numeric, $15)",
+            &parameters,
+        )
+        .map_err(unavailable)?;
+        for (ordinal, balance) in figures.collateral.iter().enumerate() {
+            let (value, value_currency) = money_columns(&balance.value);
+            let (after, after_currency) = money_columns(&balance.value_after_haircut);
+            let haircut = balance.haircut.map(|haircut| haircut.to_string());
+            let identifiers = to_json(&balance.unresolved_identifiers);
+            let parameters: [&(dyn ToSql + Sync); 13] = [
+                &statement.statement_id,
+                &figures.segment,
+                &(ordinal as i32),
+                &balance.direction.as_str(),
+                &balance.instrument_id,
+                &identifiers,
+                &balance.quantity.to_string(),
+                &value,
+                &value_currency,
+                &haircut,
+                &after,
+                &after_currency,
+                &balance.held_at,
+            ];
+            tx.execute(
+                "INSERT INTO statement_collateral
+                        (statement_id, segment, ordinal, direction, instrument_id, identifiers,
+                         quantity, value, value_currency, haircut, value_after_haircut,
+                         value_after_haircut_currency, held_at)
+                 VALUES ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::numeric,
+                         $8::text::numeric, $9, $10::text::numeric, $11::text::numeric, $12, $13)",
+                &parameters,
+            )
+            .map_err(unavailable)?;
+        }
+    }
+    Ok(())
+}
+
+/// A statement's figures, by segment, each with its collateral in order.
+fn figures_of(client: &mut impl GenericClient, statement_id: &str) -> Result<Vec<Figures>> {
+    let mut figures: Vec<Figures> = client
+        .query(
+            "SELECT segment, buying_power::text, buying_power_currency,
+                    margin_requirement::text, margin_requirement_currency,
+                    maintenance_excess::text, maintenance_excess_currency,
+                    initial_margin::text, initial_margin_currency,
+                    variation_margin::text, variation_margin_currency,
+                    net_liquidation::text, net_liquidation_currency
+               FROM statement_figures WHERE statement_id = $1 ORDER BY ordinal, segment",
+            &[&statement_id],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| {
+            Ok(Figures {
+                segment: row.get(0),
+                buying_power: money_of(row, 1, 2)?,
+                margin_requirement: money_of(row, 3, 4)?,
+                maintenance_excess: money_of(row, 5, 6)?,
+                initial_margin: money_of(row, 7, 8)?,
+                variation_margin: money_of(row, 9, 10)?,
+                net_liquidation: money_of(row, 11, 12)?,
+                collateral: Vec::new(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    for row in client
+        .query(
+            "SELECT segment, direction, instrument_id, identifiers::text, quantity::text,
+                    value::text, value_currency, haircut::text, value_after_haircut::text,
+                    value_after_haircut_currency, held_at
+               FROM statement_collateral WHERE statement_id = $1 ORDER BY segment, ordinal",
+            &[&statement_id],
+        )
+        .map_err(unavailable)?
+    {
+        let segment: String = row.get(0);
+        let direction: String = row.get(1);
+        let balance = Collateral {
+            direction: Direction::parse(&direction).ok_or_else(|| {
+                StoreError::Unavailable(format!(
+                    "a stored direction, {direction}, is neither posted nor received"
+                ))
+            })?,
+            instrument_id: row.get(2),
+            unresolved_identifiers: from_json(row.get(3)),
+            quantity: quantity_of(&row, 4)?,
+            value: money_of(&row, 5, 6)?,
+            haircut: reported_quantity_of(&row, 7)?,
+            value_after_haircut: money_of(&row, 8, 9)?,
+            held_at: row.get(10),
+        };
+        if let Some(figures) = figures.iter_mut().find(|f| f.segment == segment) {
+            figures.collateral.push(balance);
+        }
+    }
+    // In the order the statement gave them.
+    Ok(figures)
+}
+
+fn counts_of(client: &mut impl GenericClient, statement_id: &str) -> Result<Counts> {
+    let row = client
+        .query_one(
+            "SELECT count(*),
+                    count(*) FILTER (WHERE instrument_id IS NOT NULL),
+                    count(*) FILTER (WHERE instrument_id IS NULL)
+               FROM holding WHERE statement_id = $1",
+            &[&statement_id],
+        )
+        .map_err(unavailable)?;
+
+    let received: i64 = row.get(0);
+    let resolved: i64 = row.get(1);
+    let unresolved: i64 = row.get(2);
+
+    Ok(Counts {
+        received: received as u32,
+        resolved: resolved as u32,
+        unresolved: unresolved as u32,
+    })
+}
+
+/// A plugin's scope as a parameter: the accounts, or NULL for every account.
+fn within(scope: &Scope) -> Option<Vec<String>> {
+    match scope {
+        Scope::Everything => None,
+        Scope::Within(accounts) => Some(accounts.iter().cloned().collect()),
+    }
+}
+
+/// Positions with the lots of the rows that last stated them, read in one go.
+fn with_lots(client: &mut impl GenericClient, held: Vec<Held>) -> Result<Vec<CustodialPosition>> {
+    let holding_ids: Vec<String> = held.iter().filter_map(|(_, id)| id.clone()).collect();
+    let mut lots: std::collections::HashMap<String, Vec<Lot>> = std::collections::HashMap::new();
+    if !holding_ids.is_empty() {
+        for row in client
+            .query(
+                "SELECT holding_id, quantity::text, cost::text, cost_currency, acquired_date
+                   FROM holding_lot WHERE holding_id = ANY($1) ORDER BY holding_id, ordinal",
+                &[&holding_ids],
+            )
+            .map_err(unavailable)?
+        {
+            lots.entry(row.get(0)).or_default().push(Lot {
+                quantity: quantity_of(&row, 1)?,
+                cost: money_of(&row, 2, 3)?,
+                acquired_date: row.get(4),
+            });
+        }
+    }
+    Ok(held
+        .into_iter()
+        .map(|(mut position, holding_id)| {
+            if let Some(found) = holding_id.and_then(|id| lots.remove(&id)) {
+                position.cost.lots = found;
+            }
+            position
+        })
+        .collect())
+}
+
 /// Replace the position, and say what it was.
 ///
 /// Three statements rather than one clever one. The insert makes the row exist
 /// and does nothing if it already did; the select then locks a row that is
 /// certainly there and reads what it held; the update replaces it. A single
 /// upsert would be shorter and could not report the previous value under
-/// concurrency, and the previous value is what the event carries.
+/// concurrency, and the previous value is what the event carries. A change
+/// is numbered in the same transaction; a row saying what was held takes no
+/// number, so the numbers have no holes.
 fn settle(
     tx: &mut Transaction<'_>,
     holding: &Holding,
     instrument_id: String,
     as_of_date: &str,
-    now_ns: i64,
+    cause: &Cause,
 ) -> Result<Settled> {
-    let position = CustodialPosition {
+    let mut position = CustodialPosition {
         account_id: holding.account_id.clone(),
         instrument_id,
         side: holding.side,
@@ -553,12 +975,16 @@ fn settle(
         settle_date_quantity: holding.settle_date_quantity,
         market_value: holding.market_value.clone(),
         also_counted_in_cash: holding.also_counted_in_cash,
+        cost: holding.cost.clone(),
         last_statement_id: holding.statement_id.clone(),
         as_of_date: as_of_date.to_string(),
-        updated_at_ns: now_ns,
+        updated_at_ns: cause.committed_at_ns,
+        last_change: Change::default(),
+        removed: false,
     };
 
-    if insert_position(tx, &position)? {
+    if insert_position(tx, &position, Some(&holding.holding_id), cause)? {
+        position.last_change = number(tx, &position, cause)?;
         return Ok(Settled::Changed {
             position,
             previous_quantity: Quantity::ZERO,
@@ -580,16 +1006,24 @@ fn settle(
             ],
         )
         .map_err(unavailable)?;
-    let before = position_of(&before)?;
+    let before = with_lots(&mut *tx, vec![position_of(&before)?])?
+        .pop()
+        .expect("one position read");
 
-    update_position(tx, &position)?;
+    position.last_change = before.last_change;
+    update_position(tx, &position, Some(&holding.holding_id))?;
 
     // Compared as numbers, so a statement restating 12.5 as 12.50 announces no
     // change; the row still takes the scale it was restated with.
     Ok(if position.differs_from(&before) {
+        position.last_change = number(tx, &position, cause)?;
         Settled::Changed {
             position,
-            previous_quantity: before.quantity,
+            previous_quantity: if before.removed {
+                Quantity::ZERO
+            } else {
+                before.quantity
+            },
         }
     } else {
         Settled::Unchanged { position }
@@ -598,10 +1032,19 @@ fn settle(
 
 /// Make the position exist, unless one is already held under its key. True
 /// when this made it.
-fn insert_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Result<bool> {
+fn insert_position(
+    tx: &mut Transaction<'_>,
+    position: &CustodialPosition,
+    holding_id: Option<&str>,
+    cause: &Cause,
+) -> Result<bool> {
     let (market_value, currency) = money_columns(&position.market_value);
+    let (cost_basis, cost_basis_currency) = money_columns(&position.cost.cost_basis);
+    let (average_cost, average_cost_currency) = money_columns(&position.cost.average_cost);
+    let (margin_requirement, margin_requirement_currency) =
+        money_columns(&position.cost.margin_requirement);
     let settle_date_quantity = position.settle_date_quantity.map(|q| q.to_string());
-    let parameters: [&(dyn ToSql + Sync); 11] = [
+    let parameters: [&(dyn ToSql + Sync); 20] = [
         &position.account_id,
         &position.instrument_id,
         &position.side.as_str(),
@@ -613,15 +1056,27 @@ fn insert_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Re
         &position.as_of_date,
         &position.updated_at_ns,
         &position.also_counted_in_cash,
+        &cost_basis,
+        &cost_basis_currency,
+        &average_cost,
+        &average_cost_currency,
+        &margin_requirement,
+        &margin_requirement_currency,
+        &holding_id,
+        &cause.instance_id,
+        &cause.acting_for_subject,
     ];
     Ok(tx
         .execute(
             "INSERT INTO custodial_position
                     (account_id, instrument_id, side, quantity, settle_date_quantity,
                      market_value, currency, last_statement_id, as_of_date, updated_at_ns,
-                     also_counted_in_cash)
+                     also_counted_in_cash, cost_basis, cost_basis_currency, average_cost,
+                     average_cost_currency, margin_requirement, margin_requirement_currency,
+                     last_holding_id, changed_by_instance, changed_for_subject)
              VALUES ($1, $2, $3, $4::text::numeric, $5::text::numeric, $6::text::numeric, $7,
-                     $8, $9, $10, $11)
+                     $8, $9, $10, $11, $12::text::numeric, $13, $14::text::numeric, $15,
+                     $16::text::numeric, $17, $18, $19, $20)
              ON CONFLICT (account_id, instrument_id, side) DO NOTHING",
             &parameters,
         )
@@ -629,11 +1084,20 @@ fn insert_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Re
         == 1)
 }
 
-/// Replace what the position under this key says with what `position` says.
-fn update_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Result<()> {
+/// Replace what the position under this key says with what `position` says,
+/// its lots being `holding_id`'s.
+fn update_position(
+    tx: &mut Transaction<'_>,
+    position: &CustodialPosition,
+    holding_id: Option<&str>,
+) -> Result<()> {
     let (market_value, currency) = money_columns(&position.market_value);
+    let (cost_basis, cost_basis_currency) = money_columns(&position.cost.cost_basis);
+    let (average_cost, average_cost_currency) = money_columns(&position.cost.average_cost);
+    let (margin_requirement, margin_requirement_currency) =
+        money_columns(&position.cost.margin_requirement);
     let settle_date_quantity = position.settle_date_quantity.map(|q| q.to_string());
-    let parameters: [&(dyn ToSql + Sync); 11] = [
+    let parameters: [&(dyn ToSql + Sync); 19] = [
         &position.quantity.to_string(),
         &settle_date_quantity,
         &market_value,
@@ -645,13 +1109,24 @@ fn update_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Re
         &position.instrument_id,
         &position.side.as_str(),
         &position.also_counted_in_cash,
+        &cost_basis,
+        &cost_basis_currency,
+        &average_cost,
+        &average_cost_currency,
+        &margin_requirement,
+        &margin_requirement_currency,
+        &holding_id,
+        &position.removed,
     ];
     tx.execute(
         "UPDATE custodial_position
             SET quantity = $1::text::numeric, settle_date_quantity = $2::text::numeric,
                 market_value = $3::text::numeric, currency = $4,
                 last_statement_id = $5, as_of_date = $6, updated_at_ns = $7,
-                also_counted_in_cash = $11
+                also_counted_in_cash = $11, cost_basis = $12::text::numeric,
+                cost_basis_currency = $13, average_cost = $14::text::numeric,
+                average_cost_currency = $15, margin_requirement = $16::text::numeric,
+                margin_requirement_currency = $17, last_holding_id = $18, removed = $19
           WHERE account_id = $8 AND instrument_id = $9 AND side = $10",
         &parameters,
     )
@@ -659,8 +1134,10 @@ fn update_position(tx: &mut Transaction<'_>, position: &CustodialPosition) -> Re
     Ok(())
 }
 
-/// A statement from a row selected as [`STATEMENT_COLUMNS`] lists it.
+/// A statement from a row selected as [`STATEMENT_COLUMNS`] lists it, its
+/// figures read apart.
 fn statement_of(row: &Row) -> Result<Statement> {
+    let completed_at: Option<i64> = row.get(10);
     Ok(Statement {
         statement_id: row.get(0),
         source: row.get(1),
@@ -668,29 +1145,56 @@ fn statement_of(row: &Row) -> Result<Statement> {
         as_of_date: row.get(3),
         read_at_ns: row.get(4),
         expected_rows: row.get::<_, i32>(5).max(0) as u32,
-        figures: Figures {
-            buying_power: money_of(row, 6, 7)?,
-            margin_requirement: money_of(row, 8, 9)?,
-            maintenance_excess: money_of(row, 10, 11)?,
-            currency_assumed: row.get(12),
-        },
+        account_id: row.get(6),
+        external_account_id: row.get(7),
+        institution: row.get(8),
+        figures: Vec::new(),
+        currency_assumed: row.get(9),
+        completed: completed_at.map(|committed_at_ns| Completed {
+            change: Change {
+                sequence: row.get::<_, i64>(11).max(0) as u64,
+                previous: row.get::<_, i64>(12).max(0) as u64,
+            },
+            cause: Cause {
+                instance_id: row.get(13),
+                acting_for_subject: row.get(14),
+                correlation_id: row.get(15),
+                causation_id: row.get(16),
+                committed_at_ns,
+            },
+        }),
     })
 }
 
-/// A custodial position from a row selected as [`POSITION_COLUMNS`] lists it.
-fn position_of(row: &Row) -> Result<CustodialPosition> {
-    Ok(CustodialPosition {
-        account_id: row.get(0),
-        instrument_id: row.get(1),
-        side: side_of(row, 2)?,
-        quantity: quantity_of(row, 3)?,
-        settle_date_quantity: reported_quantity_of(row, 4)?,
-        market_value: money_of(row, 5, 6)?,
-        last_statement_id: row.get(7),
-        as_of_date: row.get(8),
-        updated_at_ns: row.get(9),
-        also_counted_in_cash: row.get(10),
-    })
+/// A custodial position from a row selected as [`POSITION_COLUMNS`] lists
+/// it, and the row whose lots it carries, read apart.
+fn position_of(row: &Row) -> Result<Held> {
+    Ok((
+        CustodialPosition {
+            account_id: row.get(0),
+            instrument_id: row.get(1),
+            side: side_of(row, 2)?,
+            quantity: quantity_of(row, 3)?,
+            settle_date_quantity: reported_quantity_of(row, 4)?,
+            market_value: money_of(row, 5, 6)?,
+            last_statement_id: row.get(7),
+            as_of_date: row.get(8),
+            updated_at_ns: row.get(9),
+            also_counted_in_cash: row.get(10),
+            cost: Cost {
+                cost_basis: money_of(row, 11, 12)?,
+                average_cost: money_of(row, 13, 14)?,
+                lots: Vec::new(),
+                margin_requirement: money_of(row, 15, 16)?,
+            },
+            last_change: Change {
+                sequence: row.get::<_, i64>(17).max(0) as u64,
+                previous: row.get::<_, i64>(18).max(0) as u64,
+            },
+            removed: row.get(19),
+        },
+        row.get(20),
+    ))
 }
 
 fn side_of(row: &Row, column: usize) -> Result<Side> {

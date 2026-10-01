@@ -24,6 +24,21 @@ pub struct RouteRule {
 use crate::backend::Handler;
 pub use crate::backend::HandlerReply;
 
+/// What a sidecar stamps on a question it asks for its plugin, and a core
+/// component never does (decisions/014): the person it is asked for, and the
+/// plugin's read scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stamp {
+    /// The person a command is sent for; empty when the plugin acts as itself.
+    pub acting_for_subject: String,
+
+    /// The accounts the plugin may read, stamped with the mark that they
+    /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
+    /// a store answers only within, and an empty one with nothing. `None` is
+    /// a core component reading as itself.
+    pub account_scope: Option<Vec<String>>,
+}
+
 /// The bus.
 ///
 /// Owns routing, identity stamping and request-reply. Backends own transport
@@ -118,7 +133,13 @@ impl Bus {
     ) -> crate::Result<String> {
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
-            meta: Some(self.meta(&message_id, topic, correlation_id, causation_id, "")),
+            meta: Some(self.meta(
+                &message_id,
+                topic,
+                correlation_id,
+                causation_id,
+                &Stamp::default(),
+            )),
             payload_type: payload_type.to_string(),
             payload,
         };
@@ -213,6 +234,33 @@ impl Bus {
         timeout: Option<Duration>,
         acting_for_subject: &str,
     ) -> crate::Result<(String, Vec<u8>)> {
+        let stamp = Stamp {
+            acting_for_subject: acting_for_subject.to_string(),
+            account_scope: None,
+        };
+        self.call_stamped(
+            topic,
+            payload_type,
+            payload,
+            correlation_id,
+            timeout,
+            &stamp,
+        )
+        .await
+    }
+
+    /// [`Bus::call`], with what a sidecar stamps for its plugin: the person,
+    /// and the plugin's read scope marked as applying (W4.11), so the
+    /// answering store reads within it and an empty one as nothing.
+    pub async fn call_stamped(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        payload: Vec<u8>,
+        correlation_id: Option<&str>,
+        timeout: Option<Duration>,
+        stamp: &Stamp,
+    ) -> crate::Result<(String, Vec<u8>)> {
         let handler = self
             .handlers
             .read()
@@ -222,7 +270,7 @@ impl Bus {
 
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
-            meta: Some(self.meta(&message_id, topic, correlation_id, None, acting_for_subject)),
+            meta: Some(self.meta(&message_id, topic, correlation_id, None, stamp)),
             payload_type: payload_type.to_string(),
             payload,
         };
@@ -285,7 +333,7 @@ impl Bus {
         topic: &str,
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
-        acting_for_subject: &str,
+        stamp: &Stamp,
     ) -> MessageMeta {
         MessageMeta {
             message_id: message_id.to_string(),
@@ -297,10 +345,11 @@ impl Bus {
             topic: topic.to_string(),
             schema_version: "v1".to_string(),
             published_at_ns: self.clock.now_ns(),
-            acting_for_subject: acting_for_subject.to_string(),
-            // A read's scope is the sidecar's to stamp, for a plugin; a core
-            // component reads as itself.
-            account_scope: Vec::new(),
+            acting_for_subject: stamp.acting_for_subject.clone(),
+            // A read's scope is the sidecar's to stamp, for a plugin, marked
+            // as applying; a core component reads as itself, unmarked.
+            account_scope: stamp.account_scope.clone().unwrap_or_default(),
+            account_scope_applies: stamp.account_scope.is_some(),
         }
     }
 }
@@ -600,6 +649,52 @@ mod acting_for {
         }
         .expect("answered");
         String::from_utf8(subject).expect("utf-8")
+    }
+
+    /// The scope and its mark the answering store sees, asked with a stamp
+    /// or without one.
+    async fn scope_seen(scope: Option<Vec<String>>) -> (String, String) {
+        let bus = Bus::single(
+            "sidecar-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        );
+        let topic = "platform.street.query.list-custodial-positions";
+        bus.serve(topic, |envelope| {
+            let meta = envelope.meta.unwrap_or_default();
+            Ok((
+                meta.account_scope_applies.to_string(),
+                meta.account_scope.join(",").into_bytes(),
+            ))
+        });
+        let (applies, scope) = match scope {
+            Some(accounts) => {
+                let stamp = super::Stamp {
+                    acting_for_subject: String::new(),
+                    account_scope: Some(accounts),
+                };
+                bus.call_stamped(topic, "", Vec::new(), None, None, &stamp)
+                    .await
+            }
+            None => bus.call(topic, "", Vec::new(), None, None).await,
+        }
+        .expect("answered");
+        (applies, String::from_utf8(scope).expect("utf-8"))
+    }
+
+    #[tokio::test]
+    async fn a_plugins_read_carries_its_scope_marked_and_an_empty_one_still_applies() {
+        // W4.11: without the mark an empty scope and a core component's read
+        // of everything would look the same to a store.
+        assert_eq!(
+            scope_seen(Some(vec!["ACC-1".into(), "ACC-2".into()])).await,
+            ("true".into(), "ACC-1,ACC-2".into())
+        );
+        assert_eq!(
+            scope_seen(Some(vec![])).await,
+            ("true".into(), String::new())
+        );
+        assert_eq!(scope_seen(None).await, ("false".into(), String::new()));
     }
 
     #[tokio::test]

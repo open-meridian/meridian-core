@@ -54,8 +54,27 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// before keeps its admin pages, read as pages at `admin` ([`crate::legacy`]).
 /// v6 is the figures a plugin reports on its heartbeat, which its report
 /// carries for the dashboard's Summary (sdk-contract/a-plugin-reports-its-figures);
-/// a plugin built before reports none.
-pub const CONTRACT_CURRENT: u32 = 6;
+/// a plugin built before reports none. v7 is typed delivery, the stream of
+/// what a plugin's roles hear with its loss marker; reads within a scope that
+/// is nothing when empty, refused naming an account outside it; the street
+/// read since a watermark and its completed statements; and a statement
+/// naming its external account and institution, its figures per margin
+/// segment with their collateral, and a holding its cost, average cost, lots
+/// and margin requirement (sdk-contract/plugins-read-positions-and-prices,
+/// kernel/reads-are-scoped, sdk-contract/a-holding-carries-its-cost). A
+/// plugin built before names no external account on a statement, which is
+/// admitted with none, and sends its figures flat ([`crate::older`]).
+pub const CONTRACT_CURRENT: u32 = 7;
+
+/// The contract version a plugin registered with, as a number: what the
+/// rules for a plugin built before an addition read. Zero for one that does
+/// not read, which registration has refused already.
+pub fn declared(version: &str) -> u32 {
+    version
+        .strip_prefix('v')
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Admit a plugin's declared contract version, or say why not.
 ///
@@ -119,7 +138,7 @@ mod tests {
 
     #[test]
     fn a_plugin_built_for_the_current_contract_is_admitted() {
-        assert_eq!(admit("v6"), Ok(6));
+        assert_eq!(admit("v7"), Ok(7));
     }
 
     #[test]
@@ -131,6 +150,7 @@ mod tests {
         assert_eq!(admit("v3"), Ok(3));
         assert_eq!(admit("v4"), Ok(4));
         assert_eq!(admit("v5"), Ok(5));
+        assert_eq!(admit("v6"), Ok(6));
         assert_eq!(admit_within(1, 2, "v1"), Ok(1));
     }
 
@@ -201,6 +221,30 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_receiving_typed_deliveries_is_refused_by_a_sidecar_at_v6() {
+        // A plugin built on an SDK declaring v7 opens Receive, reads within
+        // a scope and names its statement's external account; a sidecar at
+        // v6 has no Receive and would read its statement's account from its
+        // rows. Refused at the door, in the fixture's words.
+        assert_eq!(
+            admit_within(2, 6, "v7"),
+            Err(
+                "the plugin was built against contract v7, newer than this sidecar \
+                 (v2 through v6); upgrade the runtime, or rebuild the plugin against \
+                 v6 or earlier"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_version_is_read_as_its_number() {
+        assert_eq!(declared("v6"), 6);
+        assert_eq!(declared("v7"), 7);
+        assert_eq!(declared("seven"), 0);
+    }
+
+    #[test]
     fn a_range_refuses_on_both_sides_of_it() {
         assert!(admit_within(2, 3, "v1").unwrap_err().contains("older than"));
         assert!(admit_within(2, 3, "v4").unwrap_err().contains("newer than"));
@@ -215,7 +259,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v6); rebuild it against v2 or later"
+                 (v2 through v7); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -224,11 +268,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v7"),
+            admit("v8"),
             Err(
-                "the plugin was built against contract v7, newer than this sidecar \
-                 (v2 through v6); upgrade the runtime, or rebuild the plugin against \
-                 v6 or earlier"
+                "the plugin was built against contract v8, newer than this sidecar \
+                 (v2 through v7); upgrade the runtime, or rebuild the plugin against \
+                 v7 or earlier"
                     .into()
             )
         );
@@ -239,7 +283,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v6"
+                "the plugin declared no contract version; this sidecar accepts v2 through v7"
                     .into()
             )
         );

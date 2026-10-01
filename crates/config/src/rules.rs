@@ -143,7 +143,54 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
             request.account_id
         ));
     }
-    Ok(())
+    one_external_account(snapshot, request)
+}
+
+/// An account has one external account linked to it, through whichever
+/// plugin (W2, W6.4; the product owner, 2026-10-01: "Two custodians are
+/// considered two accounts ... an account is the most granular unit of
+/// "book" each with its own statement"). The rule is between an external
+/// account and an account alone: another external account of the same
+/// connection, institution or owner links to another account ("nothing
+/// preclude a fund to have two accounts at the same custodian for different
+/// purpose"). Linking the same one again is the same link.
+fn one_external_account(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdict {
+    let held = snapshot.links.iter().find(|link| {
+        link.account_id == request.account_id
+            && !(link.plugin_instance_id == request.plugin_instance_id
+                && link.external_account_id == request.external_account_id)
+    });
+    match held {
+        None => Ok(()),
+        Some(held) => Err(format!(
+            "{} already has external account {} linked ({}); an account has one external \
+             account: link {} to another account, or a new one",
+            request.account_id,
+            held.external_account_id,
+            held.plugin_instance_id,
+            request.external_account_id
+        )),
+    }
+}
+
+/// Accounts more than one external account is linked to: links made before
+/// an account held one at most, kept and never removed, and reported for a
+/// deployment admin to separate. Each account once, with its links.
+pub fn accounts_linked_twice(snapshot: &Snapshot) -> Vec<(String, Vec<String>)> {
+    let mut by_account: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for link in &snapshot.links {
+        by_account
+            .entry(link.account_id.clone())
+            .or_default()
+            .push(format!(
+                "{} ({})",
+                link.external_account_id, link.plugin_instance_id
+            ));
+    }
+    by_account
+        .into_iter()
+        .filter(|(account, links)| !account.is_empty() && links.len() > 1)
+        .collect()
 }
 
 pub fn user_group(snapshot: &Snapshot, group: &UserGroup) -> Verdict {

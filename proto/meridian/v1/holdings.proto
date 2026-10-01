@@ -33,6 +33,7 @@ package meridian.v1;
 // Money; and the Decimal, plugin-facing since a plugin's figure may be one,
 // imported from meridian-schema at the revision this repository pins.
 import "meridian/v1/amounts.proto";
+import "meridian/v1/journal.proto";
 import "meridian/v1/sidecar.proto";
 import "meridian/v1/reference.proto";
 
@@ -164,18 +165,96 @@ message RecordHoldingsStatementRequest {
   // knows this without reading anything twice.
   int32 expected_rows = 5;
 
-  // The account's buying power and margin figures, as the venue reported
-  // them, and unset where it reported none. Never derived: a figure computed
-  // here from the holdings would be ours presented as the custodian's, and
-  // margin is where that difference costs money.
+  // Superseded from contract v7 by `figures` (W2.2): read from a plugin
+  // before v7 as the set with no segment, refused from one at v7 sent
+  // beside `figures`. Kept, never reused.
   optional Money buying_power = 6;
   optional Money margin_requirement = 7;
   optional Money maintenance_excess = 8;
 
-  // True when the venue stated no currency for these figures and the
+  // True when the venue stated no currency for the figures and the
   // connector's is its own stated assumption (E*TRADE's balances carry none),
-  // rather than something the venue said.
+  // rather than something the venue said. Of every set in `figures`.
   bool currency_assumed = 9;
+
+  // The account as the rail knows it; the sidecar sets account_id from its
+  // link and refuses the statement when there is none (stamped.tsv). A
+  // statement is one account's, and a row naming another is refused.
+  string external_account_id = 10;
+  string account_id = 11;
+
+  // One set per margin segment the venue reports (Q6, Q12); no two name
+  // the same segment. Never derived: a figure computed here from the
+  // holdings would be ours presented as the custodian's, and margin is
+  // where that difference costs money.
+  repeated StatementFigures figures = 12;
+
+  // The institution holding the external account, as the connector names
+  // it: the brokerage behind an aggregator, or the venue itself for a
+  // direct connector. Empty where it does not say.
+  string institution = 13;
+}
+
+// A statement's figures for one margin segment, each as the venue reported
+// it and unset where it reported none; never derived.
+message StatementFigures {
+  // The segment as the venue names it, verbatim ("securities",
+  // "commodities", an FCM's class); empty for the account as a whole.
+  string segment = 1;
+
+  optional Money buying_power = 2;
+  optional Money margin_requirement = 3;
+
+  // Negative is a deficit.
+  optional Money maintenance_excess = 4;
+
+  optional Money initial_margin = 5;
+  optional Money variation_margin = 6;
+
+  // A brokerage's own total account value, as it reports it (Q-B); never a
+  // sum of the holdings.
+  optional Money net_liquidation = 7;
+
+  // The collateral held under this segment, as reported (W2.2; Q12, Q13).
+  // A balance moves nothing: posted collateral the custodian also lists as a
+  // holding is a holding row too, and collateral received under a security
+  // interest is never one.
+  repeated ReportedCollateral collateral = 8;
+}
+
+// One collateral balance under a margin segment, each field as the venue
+// reports it and unset where it does not; never derived.
+message ReportedCollateral {
+  // Posted by the account, or received by it. Unspecified is refused.
+  CollateralDirection direction = 1;
+
+  // Resolved as a holding's instrument is (W3.1): an instrument or the
+  // deployment's placeholder, the currency's cash instrument for cash; or,
+  // when the resolve was ambiguous, the identifiers the connector held.
+  // Exactly one of the two, as on RecordHoldingRequest.
+  string instrument_id = 2;
+  repeated Identifier unresolved_identifiers = 3;
+
+  Decimal quantity = 4;
+  optional Money value = 5;
+
+  // A fraction of the value: 0.15 is 15%, a venue's percentage written as
+  // its fraction.
+  optional Decimal haircut = 6;
+
+  optional Money value_after_haircut = 7;
+
+  // Where it is held, as the venue names it: the FCM, the dealer, a
+  // third-party custodian. Empty where it does not say.
+  string held_at = 8;
+}
+
+// Whether a collateral balance was posted by the account or received by it.
+enum CollateralDirection {
+  // Not said. Refused: collateral is posted or received.
+  COLLATERAL_DIRECTION_UNSPECIFIED = 0;
+  COLLATERAL_DIRECTION_POSTED = 1;
+  COLLATERAL_DIRECTION_RECEIVED = 2;
 }
 
 message RecordHoldingsStatementReply {
@@ -259,10 +338,40 @@ message RecordHoldingRequest {
   // deducts it from cash.
   bool also_counted_in_cash = 14;
 
+  // As the venue reports them, unset or empty where it reports none, never
+  // derived (W2.3; sdk-contract/a-holding-carries-its-cost). The holding's
+  // total cost.
+  optional Money cost_basis = 15;
+
+  // Its lots as the custodian lists them; none is not one lot, and lots
+  // whose quantities do not sum to the holding's are recorded as reported.
+  repeated ReportedLot lots = 16;
+
+  optional Money margin_requirement = 17;
+
+  // The venue's average cost per unit, in the venue's unit (SnapTrade: per
+  // share, for an option whose quantity counts contracts). Never computed
+  // from cost_basis, nor cost_basis from it: nothing multiplies it by the
+  // quantity or a multiplier (Q-A, 2026-10-01).
+  optional Money average_cost = 18;
+
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
   reserved 5, 6, 7;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// One lot of a holding, as the custodian lists it.
+message ReportedLot {
+  // Signed as the holding's quantity: negative is short.
+  Decimal quantity = 1;
+
+  // The lot's total cost, unset where not reported; its sign as reported,
+  // never flipped (Q-D, 2026-10-01).
+  optional Money cost = 2;
+
+  // ISO 8601; empty where not reported.
+  string acquired_date = 3;
 }
 
 // Which side of an instrument a holding or a custodial position is on.
@@ -302,6 +411,27 @@ message StatementRecordedEvent {
   int32 rows_resolved = 5;
   int32 rows_unresolved = 6;
   int64 recorded_at_ns = 7;
+
+  // The account the statement is of: its external account's, or, from a
+  // plugin before v7, its rows' (W2.2).
+  string account_id = 8;
+
+  // The statement's figures as recorded, one set per segment (W2.2).
+  repeated StatementFigures figures = 9;
+  bool currency_assumed = 10;
+
+  // The completion's number in the street's partition, chained per account
+  // with the statements before it, and who caused it: the row whose landing
+  // completed it (W2.5, W4.3).
+  JournalRef journal = 11;
+  ChangeCause cause = 12;
+
+  // The account as the rail knows it, and the institution holding it, as
+  // the statement named them: with the source and a segment, what a margin
+  // agreement is keyed by and an opening balance names as its source. Empty
+  // from a plugin before v7.
+  string external_account_id = 13;
+  string institution = 14;
 }
 
 // A custodial position that changed, and the statement that changed it.
@@ -315,6 +445,11 @@ message CustodialPositionUpdatedEvent {
   // The previous quantity, so a subscriber can render a delta without holding
   // its own history.
   Decimal previous_quantity = 4;
+
+  // The change's number in the street's partition, chained per account with
+  // the positions changed before it, and who caused it (W2.4, W4.3).
+  JournalRef journal = 5;
+  ChangeCause cause = 6;
 
   // The int64 at 1e8 (decisions/023).
   reserved 3;
@@ -361,6 +496,22 @@ message CustodialPosition {
   // the custodian reports it; both are kept as reported.
   bool also_counted_in_cash = 13;
 
+  // As the custodian reported them on the row that last stated this, unset
+  // or empty where it reported none (W2.3).
+  Money cost_basis = 14;
+  repeated ReportedLot lots = 15;
+  Money margin_requirement = 16;
+
+  // Its last change: a delivery at or below it is already in it.
+  JournalRef last_change = 17;
+
+  // A tombstone (W2.6, W3.9): returned only to a read since a watermark,
+  // and delivered once.
+  bool removed = 18;
+
+  // As on RecordHoldingRequest (Q-A).
+  Money average_cost = 19;
+
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
   reserved 3, 4, 5;
@@ -371,8 +522,10 @@ message CustodialPosition {
 // W2.7 — reading it back
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Read custodial positions, and the unresolved holdings beside them (W2.7).
 message ListCustodialPositionsRequest {
-  // Empty means every account.
+  // Empty means every account in the reader's scope for a plugin, every
+  // account for a core component (W4.11).
   string account_id = 1;
 
   // When true, the reply also carries holdings that never resolved, so one
@@ -386,6 +539,9 @@ message ListCustodialPositionsRequest {
   // Unresolved holdings come with the first page only, so a read across
   // pages sees each once.
   string cursor = 4;
+
+  // Only the positions whose last change is above it, tombstones included.
+  Watermark since = 5;
 }
 
 message ListCustodialPositionsReply {
@@ -395,6 +551,9 @@ message ListCustodialPositionsReply {
   repeated UnresolvedHolding unresolved = 2;
 
   string next_cursor = 3;
+
+  // The point in the store's record the page was read at.
+  Watermark as_of = 4;
 }
 
 // A holding the deployment received but could not name.
@@ -420,6 +579,41 @@ message UnresolvedHolding {
   // inside it (decisions/023).
   reserved 4, 5, 6;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.9 — reading completed statements
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Read completed statements and their figures (W2.9).
+//
+// How a reconciliation, or a plugin seeding after a restart, reads the
+// figures without having heard W2.5: they are on the statement and on no
+// position. An open statement is not listed.
+message ListStatementsRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+
+  // ISO 8601; empty for any date.
+  string as_of_date = 2;
+
+  // Only statements completed after it.
+  Watermark since = 3;
+
+  int32 page_size = 4;
+
+  // Opaque: the previous reply's `next_cursor`, or empty for the first page.
+  string cursor = 5;
+}
+
+message ListStatementsReply {
+  // Completed statements only, each as it was announced (W2.5).
+  repeated StatementRecordedEvent statements = 1;
+
+  string next_cursor = 2;
+
+  // The point in the store's record the page was read at.
+  Watermark as_of = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

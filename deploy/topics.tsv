@@ -44,6 +44,7 @@ platform.reference.query.resolve-identifier	query	custody	instrument
 platform.reference.query.resolve-instrument	query	street	instrument
 platform.street.command.record-holding	command	custody	street
 platform.street.command.record-statement	command	custody	street
-platform.street.event.custodial-position-updated	event	street	dashboard
-platform.street.event.statement-recorded	event	street	dashboard
-platform.street.query.list-custodial-positions	query	dashboard	street
+platform.street.event.custodial-position-updated	event	street	dashboard,operations
+platform.street.event.statement-recorded	event	street	dashboard,operations
+platform.street.query.list-custodial-positions	query	dashboard,operations	street
+platform.street.query.list-statements	query	operations	street
