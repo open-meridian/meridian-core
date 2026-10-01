@@ -44,6 +44,7 @@ const APPLY: &str = "platform.config.command.apply-first-run-configuration";
 const ANSWER_ON_THE_WIRE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn main() {
+    meridian_runtime::answer_version();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

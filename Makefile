@@ -8,7 +8,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page \
-        build test test-store chart-check check-crate-boundaries check-test-targets check-local-storage \
+        build test test-store check-image-version chart-check check-crate-boundaries check-test-targets check-local-storage \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
@@ -19,6 +19,7 @@ help:
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
+	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
@@ -30,7 +31,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -803,6 +804,29 @@ test-directory: network
 		|| { echo "test-directory FAILED. The last 40 lines, and the whole of it in .test-directory.log:" >&2; \
 		     tail -40 .test-directory.log >&2; exit 1; }
 	@echo "test-directory OK: people sign in against a real directory, and the ways that go wrong stay apart"
+
+# Every binary in an image built with a version says that version, as publish
+# builds it: the components said `0.1.0`, the crate's, whatever release they
+# ran (plans/a-plugin-moves-with-its-deployment). Asked of the finished image,
+# as `meridian-<binary> --version`, rather than trusting the build's own check.
+# After the e2e targets, whose compose builds leave the cargo cache this one
+# rebuilds only the runtime crate from.
+IMAGE_VERSION_CHECK := 0.0.0+image-version-check
+IMAGE_VERSION_TAG   := meridian-core-version-check:local
+check-image-version:
+	@$(DOCKER) build --target runtime --build-arg MERIDIAN_VERSION=$(IMAGE_VERSION_CHECK) \
+		-t $(IMAGE_VERSION_TAG) . >.check-image-version.log 2>&1 \
+		|| { echo "check-image-version FAILED: the image did not build. The last 20 lines, and the whole of it in .check-image-version.log:" >&2; \
+		     tail -20 .check-image-version.log >&2; exit 1; }
+	@bins="$$(docker run --rm --entrypoint sh $(IMAGE_VERSION_TAG) -c 'ls /usr/local/bin/meridian-*')"; \
+	[ -n "$$bins" ] || { echo "check-image-version FAILED: the image holds no binaries, so the check would prove nothing" >&2; docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; exit 1; }; \
+	for bin in $$bins; do \
+		said="$$(docker run --rm $(IMAGE_VERSION_TAG) $$bin --version)"; \
+		[ "$$said" = "$(IMAGE_VERSION_CHECK)" ] \
+			|| { echo "check-image-version FAILED: $$bin says '$$said', built as $(IMAGE_VERSION_CHECK)" >&2; docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; exit 1; }; \
+	done; \
+	docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; \
+	echo "check-image-version OK: every binary in an image built as $(IMAGE_VERSION_CHECK) says so"
 
 chart-check:
 	# A key written twice is not an error to YAML or to Helm: the second wins

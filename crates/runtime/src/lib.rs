@@ -22,6 +22,35 @@ use meridian_bus::{Backend, Bus, MemoryBackend, NatsBackend};
 use meridian_conductor::platform::ComponentReport;
 use meridian_conductor::{DeploymentKey, Platform};
 
+/// The release this binary is, as every component reports it (W5.19, W5.20).
+///
+/// Built in, never read at run time. The publish workflow passes the version
+/// as the image's `MERIDIAN_VERSION` build argument -- the chart version it
+/// publishes beside the image, and the commit, `0.1.57+1a2b3c4` -- and the
+/// compiler keeps it. It was an environment variable, which the chart never
+/// set, so every component said its crate version, `0.1.0`, whatever release
+/// it ran; and a value a chart or a pod spec can set is one that can disagree
+/// with the binary it describes (plans/a-plugin-moves-with-its-deployment).
+///
+/// A build nobody gave a version -- `cargo build`, `docker compose build` --
+/// says so: its crate version, marked `-dev`.
+pub const VERSION: &str = match option_env!("MERIDIAN_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
+/// Answer `--version` with [`VERSION`] and exit, before anything starts.
+///
+/// First in every binary's `main`, so what an image runs can be asked of the
+/// image itself: the image build asks each binary, and refuses one that says
+/// anything other than the version it was built as.
+pub fn answer_version() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("{VERSION}");
+        std::process::exit(0);
+    }
+}
+
 /// How long a component waits on the platform before giving up on one attempt.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -403,12 +432,11 @@ pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schem
     use prost::Message as _;
 
     let started_at_ns = now_ns();
-    let version = var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
 
     loop {
         let report = meridian_domain::v1::ComponentReport {
             component: component.to_string(),
-            version: version.clone(),
+            version: VERSION.to_string(),
             schema_version: schema,
             health: meridian_domain::v1::ComponentHealth::Serving as i32,
             detail: String::new(),
@@ -486,7 +514,6 @@ pub async fn report_forever(
     schema: i64,
 ) {
     let started_at_ns = now_ns();
-    let version = var("MERIDIAN_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
 
     let heard = collect_inward(bus);
 
@@ -501,7 +528,7 @@ pub async fn report_forever(
         // key, so it has no reason to tell itself over a broker.
         let mut reports = vec![ComponentReport::serving(
             component,
-            &version,
+            VERSION,
             schema,
             started_at_ns,
         )];
@@ -758,6 +785,13 @@ mod tests {
 
     const EVERY: Duration = Duration::from_millis(1);
     const AT_MOST: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_build_never_reports_the_bare_crate_version() {
+        // `0.1.0` was what every component said, whatever release it ran. A
+        // published build says what publish gave it; any other says `-dev`.
+        assert_ne!(super::VERSION, env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn a_database_that_does_not_answer_yet_is_waited_for_and_then_migrated() {

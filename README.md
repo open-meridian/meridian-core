@@ -81,6 +81,9 @@ naming that image. The image carries every binary -- street, instrument,
 sidecar, conductor, dashboard, broker-config, first-run and launcher -- and the
 plugin UI kit, built from meridian-ui at the commit the `Dockerfile` pins; the
 dashboard answers a page asking for any kit `0.x` with the newest it carries.
+Each binary reports the release it was built as, `0.1.<n>+<commit>`, compiled
+in rather than configured, in its component report and as
+`meridian-<binary> --version`; a build publish did not make says `-dev`.
 A running deployment moves to a newer chart with `meridian upgrade-deployment`,
 or from a firm's own pipeline.
 

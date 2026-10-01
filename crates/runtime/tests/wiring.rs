@@ -536,10 +536,9 @@ async fn a_components_report_reaches_the_one_holding_the_key() {
         if let Some(report) = heard.lock().unwrap().get("street") {
             assert_eq!(report.schema_version, 2);
             assert_eq!(report.health, "COMPONENT_HEALTH_SERVING");
-            assert!(
-                !report.version.is_empty(),
-                "a report with no version says nothing"
-            );
+            // The build's own, never a variable's: unset here, as the chart
+            // leaves it, a component said `0.1.0` whatever it ran.
+            assert_eq!(report.version, meridian_runtime::VERSION);
             break;
         }
         assert!(

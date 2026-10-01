@@ -26,6 +26,7 @@ use meridian_street::store::StoreError;
 use meridian_street::PostgresStore;
 
 fn main() {
+    meridian_runtime::answer_version();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

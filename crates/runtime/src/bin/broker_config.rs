@@ -32,6 +32,7 @@ const HEADER: &str = "\
 ";
 
 fn main() {
+    meridian_runtime::answer_version();
     let failed = if std::env::args().nth(1).as_deref() == Some("serve") {
         tracing_subscriber::fmt()
             .with_env_filter(
