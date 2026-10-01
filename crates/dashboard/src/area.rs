@@ -22,7 +22,22 @@
 //! them for its pages before they moved here (meridian-core 1b2a9ad), and its
 //! status dot (`meridian:status`, kit 0.7.0) right after the plugin's name
 //! title, centred on it (the product owner, 2026-09-30: "green check circle
-//! should be next to plugin name title of the form"). The frame stays, so the plugin's script is kept
+//! should be next to plugin name title of the form").
+//!
+//! The head is the same on every tab and at every level (the product owner,
+//! 2026-10-01): the house, the plugin's name and its status dot on the left;
+//! on the right the page's actions -- Refresh as kit 0.8.0's circular-arrow
+//! icon, any other as its words -- immediately left of the Manage, Open and
+//! View switch, which is always the rightmost ("maybe the circular arrow to
+//! the left of the toggle"), so actions grow leftward and never move it. On
+//! a phone the head stays one row ("the phone width looks weird"; "maybe the
+//! toggle becomes a dropdown so they can be shown in the same row?"): the
+//! switch is a menu naming the level, and a long name is cut with an
+//! ellipsis, whole in its title. The plugin's instance is the line under the
+//! name at every width. Under Manage every tab has the dot ("yes,
+//! dot on every tab"): on the dashboard's own tabs, and on a page that tells
+//! none, the plugin's health as the dashboard knows it ([`crate::health`]);
+//! on a page that tells its own, the page's. The frame stays, so the plugin's script is kept
 //! from the person's dashboard session (decisions/021). No way to the
 //! plugin's tabs in the admin portal is drawn here (the product owner,
 //! 2026-09-30: "Remove 'its settings and access' link"); a deployment admin
@@ -38,6 +53,7 @@
 use meridian_access::{button, level_name, AccessLevel, Held};
 use meridian_domain::v1::PluginReport;
 
+use crate::health::State;
 use crate::html::{escape, HOUSE};
 
 /// One of the plugin's pages, as a tab of its area: what the query names it
@@ -184,12 +200,14 @@ pub fn href(instance: &str, level: AccessLevel, tab: Option<&str>) -> String {
 
 /// The header's area for a framed page's own actions (meridian-ui's
 /// `meridian:actions`), which the chrome's script draws; its frame names it.
+/// It sits immediately left of the level switch, in one right-hand group.
 pub const PAGE_ACTIONS: &str = "page-actions";
 
-/// Where a framed page's own status dot goes (meridian-ui's
-/// `meridian:status`, kit 0.7.0): right after the plugin's name title, in a
-/// place empty, and taking no room, until the page tells it a status, which
-/// the chrome's script draws it in; its frame names it.
+/// Where the status dot goes: right after the plugin's name title. A framed
+/// page's own (meridian-ui's `meridian:status`, kit 0.7.0) is drawn there by
+/// the chrome's script, whose frame names it; until it tells one, or where it
+/// tells none, the place holds what the dashboard drew: under Manage the
+/// plugin's health ([`Area::health`]), and otherwise nothing, taking no room.
 pub const PAGE_STATUS: &str = "page-status";
 
 /// The page as this dashboard can show it.
@@ -212,11 +230,45 @@ pub struct Area<'a> {
     pub tabs: &'a [Tab],
     pub current: Option<&'a Tab>,
     pub shown: Shown,
+    /// The plugin's health as the dashboard knows it, drawn as the status dot
+    /// where no page tells its own: given under Manage, so every tab there
+    /// has a dot; `None` at Open and View, where the dot is the page's alone.
+    pub health: Option<&'a State>,
+}
+
+/// The plugin's health as a status dot, drawn as the chrome's script draws a
+/// page's (the same button, its mark the state, its word its name and its
+/// note's first line, its why what describes it), so the two look and read
+/// alike. Every word is escaped.
+fn health_dot(state: &State) -> String {
+    let word = escape(state.word);
+    let detail = state.detail.trim();
+    let (described, about) = if detail.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(" aria-describedby=\"{PAGE_STATUS}-about-0\""),
+            format!(
+                "<span id=\"{PAGE_STATUS}-about-0\" hidden>{}</span>",
+                escape(detail)
+            ),
+        )
+    };
+    format!(
+        "<button type=\"button\" class=\"status-dot\" data-state=\"{state}\" aria-label=\"{word}\" \
+         data-note=\"{word}\"{described}></button>{about}",
+        state = state.dot,
+    )
 }
 
 /// The buttons for the levels held, the session's pressed: a person holding
 /// `admin` and `write` moves between Manage, Open and View here as on the
-/// home.
+/// home. Drawn twice, the stylesheet showing one: side by side, and on a
+/// phone a menu naming the session's level, so the head stays one row (the
+/// product owner, 2026-10-01: "maybe the toggle becomes a dropdown so they
+/// can be shown in the same row?"). The menu is a disclosure, needing no
+/// script: its summary a button a key opens, its levels the same links,
+/// which close it by going there.
 fn levels(area: &Area) -> String {
     let held = area.held.levels();
     if held.len() < 2 {
@@ -242,7 +294,12 @@ fn levels(area: &Area) -> String {
             )
         })
         .collect();
-    format!("<nav class=\"level-switch\" aria-label=\"Open it as\">{links}</nav>")
+    let said = button(area.level);
+    format!(
+        "<nav class=\"level-switch\" aria-label=\"Open it as\">{links}</nav>\
+         <details class=\"menu level-menu\"><summary aria-label=\"Open it as: {said}\">{said}</summary>\
+         <nav class=\"menu-pop\" aria-label=\"Open it as\">{links}</nav></details>"
+    )
 }
 
 fn nav(area: &Area) -> String {
@@ -276,17 +333,19 @@ fn nav(area: &Area) -> String {
 
 pub fn render(area: &Area) -> String {
     let framed = matches!(area.shown, Shown::Framed { .. });
-    let (actions, status) = if framed {
-        (
-            format!(
-                "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"{} actions\"></div>",
-                escape(area.current.map(|tab| tab.title.as_str()).unwrap_or_default())
-            ),
-            format!("<span class=\"title-status\" id=\"{PAGE_STATUS}\"></span>"),
+    // The page's actions, left of the switch: a framed page's, which it tells.
+    let actions = if framed {
+        format!(
+            "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"{} actions\"></div>",
+            escape(area.current.map(|tab| tab.title.as_str()).unwrap_or_default())
         )
     } else {
-        (String::new(), String::new())
+        String::new()
     };
+    let status = format!(
+        "<span class=\"title-status\" id=\"{PAGE_STATUS}\">{}</span>",
+        area.health.map(health_dot).unwrap_or_default()
+    );
     let body = match &area.shown {
         Shown::Framed { src, origin } => {
             let tab = area.current.expect("a framed page is a tab's");
@@ -309,9 +368,10 @@ pub fn render(area: &Area) -> String {
         nav(area)
     };
     format!(
-        "<div class=\"plugin-area\" data-level=\"{level}\"><div class=\"page-head\"><div>\
+        "<div class=\"plugin-area\" data-level=\"{level}\"><div class=\"page-head\">\
          <div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\">{HOUSE}</a>\
-         <h1>{name}</h1>{status}</div><p><code>{instance}</code></p></div><div class=\"head-side\">{levels}{actions}</div></div>\
+         <h1 title=\"{name}\">{name}</h1>{status}</div><p class=\"area-id\"><code>{instance}</code></p>\
+         <div class=\"head-side\">{actions}{levels}</div></div>\
          {nav}<div class=\"tab-body\" data-current=\"{current}\">{body}</div></div>",
         level = level_name(area.level),
         name = escape(area.name),
@@ -488,6 +548,7 @@ mod tests {
                 src: "/plugins/snaptrade-1/enter?path=%2Fstatements&level=write".into(),
                 origin: "https://snaptrade-1.plugins.meridian.example".into(),
             },
+            health: None,
         });
         assert!(page.contains("data-seamless"));
         assert!(page.contains(&format!("data-actions=\"{PAGE_ACTIONS}\"")));
@@ -532,18 +593,19 @@ mod tests {
                 src: "/plugins/snaptrade/enter?path=%2Fadmin%2Fconnections&level=admin".into(),
                 origin: "https://snaptrade.plugins.meridian.example".into(),
             },
+            health: None,
         });
         let head = page.split("<nav class=\"tabs").next().expect("the heading");
         assert_eq!(
             head,
             format!(
-                "<div class=\"plugin-area\" data-level=\"admin\"><div class=\"page-head\"><div>\
+                "<div class=\"plugin-area\" data-level=\"admin\"><div class=\"page-head\">\
                  <div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\">\
-                 {HOUSE}</a><h1>Snap&lt;Trade&gt;</h1><span class=\"title-status\" id=\"{PAGE_STATUS}\"></span>\
-                 </div><p><code>snaptrade</code></p></div>\
-                 <div class=\"head-side\"><span class=\"badge accent\" data-level=\"admin\">Manage</span>\
+                 {HOUSE}</a><h1 title=\"Snap&lt;Trade&gt;\">Snap&lt;Trade&gt;</h1><span class=\"title-status\" id=\"{PAGE_STATUS}\"></span>\
+                 </div><p class=\"area-id\"><code>snaptrade</code></p>\
+                 <div class=\"head-side\">\
                  <div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"Connections actions\"></div>\
-                 </div></div>"
+                 <span class=\"badge accent\" data-level=\"admin\">Manage</span></div></div>"
             )
         );
         for portal in ["/admin/plugins/", "data-portal", "settings and access"] {
@@ -576,6 +638,7 @@ mod tests {
             tabs: &manage,
             current: Some(&manage[0]),
             shown: Shown::Drawn("<section id=\"status\">the status</section>".into()),
+            health: None,
         });
         let nav = page
             .split("<nav class=\"tabs view-tabs\"")
@@ -598,10 +661,135 @@ mod tests {
             "<div class=\"tab-body\" data-current=\"summary\"><div class=\"area-drawn\" id=\"plugin-page\">\
              <section id=\"status\">the status</section></div></div>"
         ));
-        for framed in ["<iframe", PAGE_STATUS, PAGE_ACTIONS] {
+        for framed in ["<iframe", PAGE_ACTIONS] {
             assert!(!page.contains(framed), "{framed} in {page}");
         }
-        assert!(page.contains("<h1>SnapTrade</h1></div>"), "{page}");
+        assert!(
+            page.contains(&format!(
+                "<h1 title=\"SnapTrade\">SnapTrade</h1><span class=\"title-status\" id=\"{PAGE_STATUS}\"></span></div>"
+            )),
+            "{page}"
+        );
+    }
+
+    /// The head as the product owner agreed it on 2026-10-01 ("yes, dot on
+    /// every tab"; "make the level toggle consistent across all level pages";
+    /// "maybe the circular arrow to the left of the toggle"): on every tab
+    /// under Manage -- the dashboard's Summary and Settings and the plugin's
+    /// Account links alike -- the house, the name and the dot right after it;
+    /// and in the head's right-hand group the page's actions, where it has
+    /// any, immediately left of the switch, which is always the group's last.
+    #[test]
+    fn every_tab_under_manage_has_the_dot_after_the_name_and_the_switch_last_on_the_right() {
+        let report = report(&[
+            ("/admin/connections", "Connections", ADMIN),
+            ("/admin/accounts", "Account links", ADMIN),
+            ("/statements", "Statements", DATA),
+        ]);
+        let manage = tabs(Some(&report), AccessLevel::Admin);
+        let held = Held {
+            admin: true,
+            data: Some(AccessLevel::Write),
+            ..Default::default()
+        };
+        let health = State {
+            word: "Not healthy",
+            good: false,
+            dot: "error",
+            detail: "The last read failed: <503>".into(),
+        };
+        let at = |tab: &Tab| {
+            render(&Area {
+                instance: "snaptrade",
+                name: "SnapTrade",
+                held: &held,
+                level: AccessLevel::Admin,
+                tabs: &manage,
+                current: Some(tab),
+                shown: if tab.drawn {
+                    Shown::Drawn("<section>drawn</section>".into())
+                } else {
+                    Shown::Framed {
+                        src: "/plugins/snaptrade/enter?path=%2Fadmin%2Faccounts&level=admin".into(),
+                        origin: "https://snaptrade.plugins.meridian.example".into(),
+                    }
+                },
+                health: Some(&health),
+            })
+        };
+        let dot = format!(
+            "<span class=\"title-status\" id=\"{PAGE_STATUS}\"><button type=\"button\" class=\"status-dot\" \
+             data-state=\"error\" aria-label=\"Not healthy\" data-note=\"Not healthy\" \
+             aria-describedby=\"{PAGE_STATUS}-about-0\"></button><span id=\"{PAGE_STATUS}-about-0\" hidden>\
+             The last read failed: &lt;503&gt;</span></span>"
+        );
+        let switch = "<nav class=\"level-switch\" aria-label=\"Open it as\">\
+             <a href=\"/plugins/snaptrade?level=admin\" data-level=\"admin\" class=\"here\" aria-current=\"page\">\
+             Manage</a><a href=\"/plugins/snaptrade?level=write\" data-level=\"write\">Open</a>\
+             <a href=\"/plugins/snaptrade?level=read\" data-level=\"read\">View</a></nav>";
+        // And the same links as a menu naming the level, for a phone's one row.
+        let menu = "<details class=\"menu level-menu\"><summary aria-label=\"Open it as: Manage\">Manage</summary>\
+             <nav class=\"menu-pop\" aria-label=\"Open it as\">\
+             <a href=\"/plugins/snaptrade?level=admin\" data-level=\"admin\" class=\"here\" aria-current=\"page\">\
+             Manage</a><a href=\"/plugins/snaptrade?level=write\" data-level=\"write\">Open</a>\
+             <a href=\"/plugins/snaptrade?level=read\" data-level=\"read\">View</a></nav></details>";
+        for key in ["summary", "settings", "account-links"] {
+            let tab = manage.iter().find(|tab| tab.key == key).expect("the tab");
+            let page = at(tab);
+            let head = page.split("<nav class=\"tabs").next().expect("the heading");
+            let title = head
+                .split("<div class=\"area-title\">")
+                .nth(1)
+                .and_then(|rest| rest.split("</div><p class=\"area-id\">").next())
+                .expect("the title row");
+            // The name and its dot, and nothing else, on the left.
+            assert_eq!(
+                title,
+                format!(
+                    "<a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\">{HOUSE}</a>\
+                     <h1 title=\"SnapTrade\">SnapTrade</h1>{dot}"
+                ),
+                "{key}"
+            );
+            // The right-hand group: a framed page's actions, then the switch,
+            // the head's last, in the same place on every tab; a drawn tab
+            // has no actions.
+            let side = head
+                .split("<div class=\"head-side\">")
+                .nth(1)
+                .expect("the right-hand group");
+            let actions = format!(
+                "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" \
+                 aria-label=\"Account links actions\"></div>"
+            );
+            let expected = if tab.drawn {
+                format!("{switch}{menu}</div></div>")
+            } else {
+                format!("{actions}{switch}{menu}</div></div>")
+            };
+            assert_eq!(side, expected, "{key}");
+        }
+        // A healthy plugin's dot says so, with no why to describe it.
+        let well = State {
+            word: "Healthy",
+            good: true,
+            dot: "ok",
+            detail: String::new(),
+        };
+        let page = render(&Area {
+            instance: "snaptrade",
+            name: "SnapTrade",
+            held: &held,
+            level: AccessLevel::Admin,
+            tabs: &manage,
+            current: Some(&manage[0]),
+            shown: Shown::Drawn(String::new()),
+            health: Some(&well),
+        });
+        assert!(page.contains(&format!(
+            "<h1 title=\"SnapTrade\">SnapTrade</h1><span class=\"title-status\" id=\"{PAGE_STATUS}\"><button type=\"button\" \
+             class=\"status-dot\" data-state=\"ok\" aria-label=\"Healthy\" data-note=\"Healthy\"></button></span>"
+        )));
     }
 
     #[test]

@@ -136,7 +136,21 @@ nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:60
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
 .plugin-view nav.tabs{margin-bottom:1rem}.plugin-view .stack>*+*{margin-top:1.25rem}\
-.plugin-area nav.tabs{margin-bottom:var(--space-5)}.plugin-area .head-side{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}\
+.plugin-area nav.tabs{margin-bottom:var(--space-5)}\
+.plugin-area .page-head{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:\"title side\" \"id .\";\
+column-gap:1rem;row-gap:.3rem;align-items:center}.plugin-area .page-head .area-id{grid-area:id;margin:0;min-width:0}\
+.plugin-area .head-side{grid-area:side;justify-self:end;display:flex;gap:.6rem;align-items:center;justify-content:flex-end;\
+flex-wrap:wrap}.plugin-area .head-side .actions{align-items:center}.plugin-area .head-side .actions:empty{display:none}\
+.level-menu{display:none}.level-menu>summary{display:inline-flex;align-items:center;gap:.35rem;padding:.3rem .65rem;\
+border:1px solid var(--line-strong);border-radius:var(--radius);background:var(--accent-wash);color:var(--accent);\
+font-size:.86rem;font-weight:600;line-height:1.4;white-space:nowrap}\
+.level-menu>summary::after{content:\"\\25BE\";content:\"\\25BE\" / \"\"}\
+.level-menu>summary:hover,.level-menu[open]>summary{background:var(--accent-wash);color:var(--accent);filter:brightness(.97)}\
+.level-menu>summary:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}\
+.level-menu .menu-pop{min-width:9rem}.level-menu .menu-pop a[aria-current=page]{color:var(--accent);font-weight:600}\
+.level-menu .menu-pop a[aria-current=page]::after{content:\"\\2713\";margin-left:auto}\
+@media (max-width:36rem){.plugin-area .level-switch{display:none}.plugin-area .level-menu{display:block}\
+.plugin-area .area-title h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
 .figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\
@@ -148,7 +162,10 @@ overflow-wrap:anywhere}.figure[data-kind=text] .figure-value,.figure[data-kind=t
 .figure-as-of{margin:.3rem 0 0;color:var(--ink-faint);font-size:.8rem}.figure .noted{display:block;margin:.35rem 0 0}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
 color:var(--ink-faint);font-size:.88rem}\
-.plugin-area .area-title{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-area .area-title h1{min-width:0}\
+.plugin-area .area-title{grid-area:title;display:flex;align-items:center;gap:.45rem;min-width:0;min-height:2.5rem}\
+.plugin-area .area-title h1{min-width:0;overflow-wrap:anywhere}\
+button.icon-button{justify-content:center;padding:.48rem;line-height:0}\
+button.icon-button svg{display:block;width:1.15rem;height:1.15rem;margin:.125rem}\
 a.home-link{display:inline-flex;flex-shrink:0;padding:.3rem;border-radius:var(--radius);color:var(--ink-soft)}\
 a.home-link:hover{background:var(--hover);color:var(--ink);text-decoration:none}\
 a.home-link:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}a.home-link svg{display:block;width:22px;height:22px}\
@@ -463,9 +480,13 @@ const CHROME_SCRIPT: &str = r#"(function () {
   }
   var frames = Array.prototype.slice.call(document.querySelectorAll("iframe[data-plugin-frame]"));
   // Each load is a new page: its header actions and its status go until it
-  // offers its own.
+  // offers its own. And a frame whose page loaded before this script ran (a
+  // fast page, a long document) is told now, or it never would be: before
+  // its page loads, the frame's window is not at the plugin's origin, and the
+  // browser drops the message.
   frames.forEach(function (frame) {
     frame.addEventListener("load", function () { draw(frame, []); status(frame, null); tell(frame); });
+    tell(frame);
   });
   // A seamless frame's height is its page's, by meridian:size (meridian-ui's
   // README, "The frame: seamless"): taken only from that frame's own window,
@@ -487,13 +508,37 @@ const CHROME_SCRIPT: &str = r#"(function () {
   });
   // A seamless frame's header actions, by meridian:actions (meridian-ui's
   // README, "The frame: seamless"): the page's own buttons, drawn in the
-  // header's area its frame names (data-actions), under the size's guards and
-  // only in the kit's shape, else not at all. A label is text, never markup;
-  // a click is told back to the page, at the plugin's origin alone, and the
-  // page presses its own button, so its form posts with its own token.
+  // header's area its frame names (data-actions), immediately left of the
+  // level switch, which stays the rightmost, so actions grow leftward and
+  // never move it (the product owner, 2026-10-01: "maybe the circular arrow
+  // to the left of the toggle"); under the size's guards and only in the kit's shape, else not
+  // at all. A label is text, never markup; an icon this dashboard draws (kit
+  // 0.8.0's icon, ICONS) is drawn as it, the label its name and tooltip, and
+  // any other is its label. A click is told back to the page, at the plugin's
+  // origin alone, and the page presses its own button, so its form posts with
+  // its own token.
   var MOST_ACTIONS = 4;
   var LONGEST_LABEL = 40;
   var ACTION_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
+  // Each icon's path, drawn as the house is: a 24-unit box, in the button's
+  // own colour. refresh: a circular arrow, clockwise.
+  var ICONS = { refresh: "M19.5 12.5a7.5 7.5 0 1 1-7.5-7.5M9.5 2.5 12 5l-2.5 2.5" };
+  var SVG = "http://www.w3.org/2000/svg";
+  function icon(name) {
+    var svg = document.createElementNS(SVG, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    var path = document.createElementNS(SVG, "path");
+    path.setAttribute("d", ICONS[name]);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "2");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(path);
+    return svg;
+  }
   function offered(list) {
     if (!Array.isArray(list) || list.length > MOST_ACTIONS) return null;
     var ids = [];
@@ -504,6 +549,7 @@ const CHROME_SCRIPT: &str = r#"(function () {
       if (typeof a.label !== "string" || !a.label.trim() || a.label.length > LONGEST_LABEL) return null;
       if (a.tone !== undefined && a.tone !== "primary" && a.tone !== "danger") return null;
       if (a.disabled !== undefined && typeof a.disabled !== "boolean") return null;
+      if (a.icon !== undefined && (typeof a.icon !== "string" || !ACTION_ID.test(a.icon))) return null;
       ids.push(a.id);
     }
     return list;
@@ -514,8 +560,16 @@ const CHROME_SCRIPT: &str = r#"(function () {
     area.replaceChildren.apply(area, list.map(function (a) {
       var button = document.createElement("button");
       button.type = "button";
-      button.textContent = a.label;
-      if (a.tone) button.className = a.tone;
+      if (typeof a.icon === "string" && Object.prototype.hasOwnProperty.call(ICONS, a.icon)) {
+        button.className = "icon-button";
+        button.setAttribute("data-icon", a.icon);
+        button.setAttribute("aria-label", a.label);
+        button.title = a.label;
+        button.appendChild(icon(a.icon));
+      } else {
+        button.textContent = a.label;
+      }
+      if (a.tone) button.classList.add(a.tone);
       button.disabled = a.disabled === true;
       button.addEventListener("click", function () {
         if (!frame.contentWindow) return;
@@ -539,9 +593,13 @@ const CHROME_SCRIPT: &str = r#"(function () {
   // drawn right after the plugin's name title in the area's heading, in the
   // place its frame names (data-status), so the page spends no line of its
   // own on it (the product owner, 2026-09-30). Taken under the size's guards and only in the
-  // kit's shape, else not at all; state null takes the dot away, as a new
-  // load of the frame does. Its label is its name and its note's first line,
-  // its detail and moment its description; every word is text, never markup.
+  // kit's shape, else not at all; state null takes the page's dot away, as a
+  // new load of the frame does, and puts back what the place held when the
+  // dashboard drew it: under Manage, the plugin's health as the dashboard
+  // knows it, so every tab has a dot (the product owner, 2026-10-01: "yes,
+  // dot on every tab"). Its label is its name and its note's first line, its
+  // detail and moment its description; every word is text, never markup.
+  var drawnDots = new Map();
   var STATES = ["ok", "busy", "warn", "error"];
   var MOMENT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
   function words(v, least, most) { return typeof v === "string" && v.trim().length >= least && v.length <= most; }
@@ -556,8 +614,9 @@ const CHROME_SCRIPT: &str = r#"(function () {
   function status(frame, said) {
     var place = frame.hasAttribute("data-status") && document.getElementById(frame.getAttribute("data-status"));
     if (!place) return;
+    if (!drawnDots.has(place)) drawnDots.set(place, Array.prototype.slice.call(place.childNodes));
     if (noted && place.contains(noted)) unnote();
-    if (!said) { place.replaceChildren(); return; }
+    if (!said) { place.replaceChildren.apply(place, drawnDots.get(place)); return; }
     var about = [];
     if (said.detail && said.detail.trim()) about.push(said.detail);
     if (said.at) {
@@ -1199,6 +1258,8 @@ mod tests {
             "if (typeof a.label !== \"string\" || !a.label.trim() || a.label.length > LONGEST_LABEL) return null;",
             "if (a.tone !== undefined && a.tone !== \"primary\" && a.tone !== \"danger\") return null;",
             "if (a.disabled !== undefined && typeof a.disabled !== \"boolean\") return null;",
+            // Kit 0.8.0's icon: a name in the id's shape, or not there.
+            "if (a.icon !== undefined && (typeof a.icon !== \"string\" || !ACTION_ID.test(a.icon))) return null;",
         ] {
             assert!(shape.contains(check), "{check}\nnot in:{shape}");
         }
@@ -1220,17 +1281,61 @@ mod tests {
             "never markup"
         );
         assert!(
-            draw.contains("if (a.tone) button.className = a.tone;"),
+            draw.contains("if (a.tone) button.classList.add(a.tone);"),
             "a tone already checked"
         );
+        // An icon this dashboard draws, by a name it knows (never a path the
+        // page sends): the label its name for a screen reader and its tooltip,
+        // a button a key reaches; any other, the label as text.
+        for line in [
+            "if (typeof a.icon === \"string\" && Object.prototype.hasOwnProperty.call(ICONS, a.icon)) {",
+            "button.setAttribute(\"aria-label\", a.label);",
+            "button.title = a.label;",
+            "button.appendChild(icon(a.icon));",
+            "button.type = \"button\";",
+        ] {
+            assert!(draw.contains(line), "{line}\nnot in:{draw}");
+        }
+        assert!(CHROME_SCRIPT.contains(
+            "var ICONS = { refresh: \"M19.5 12.5a7.5 7.5 0 1 1-7.5-7.5M9.5 2.5 12 5l-2.5 2.5\" };"
+        ));
+        assert!(CHROME_SCRIPT.contains("path.setAttribute(\"d\", ICONS[name]);"));
+        assert!(
+            CHROME_SCRIPT.contains("path.setAttribute(\"stroke\", \"currentColor\");"),
+            "the button's own colour"
+        );
+        assert!(STYLE
+            .contains("button.icon-button{justify-content:center;padding:.48rem;line-height:0}"));
+        // In the right-hand group, left of the switch, which is its last
+        // (the product owner, 2026-10-01: "maybe the circular arrow to the
+        // left of the toggle"): the group sits at the right, and the actions
+        // grow leftward.
+        for rule in [
+            ".plugin-area .page-head{display:grid;grid-template-columns:minmax(0,1fr) auto;\
+             grid-template-areas:\"title side\" \"id .\";",
+            ".plugin-area .head-side{grid-area:side;justify-self:end;display:flex;gap:.6rem;align-items:center;\
+             justify-content:flex-end;",
+            ".plugin-area .head-side .actions:empty{display:none}",
+            // On a phone, one row (the product owner, 2026-10-01: "maybe the
+            // toggle becomes a dropdown so they can be shown in the same
+            // row?"): the switch a menu naming the level, and a long name
+            // cut with an ellipsis, whole in its title, rather than pushing
+            // the menu to a row of its own.
+            "@media (max-width:36rem){.plugin-area .level-switch{display:none}.plugin-area .level-menu{display:block}\
+             .plugin-area .area-title h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}",
+            ".level-menu{display:none}",
+            ".plugin-area .area-title{grid-area:title;",
+        ] {
+            assert!(STYLE.contains(rule), "{rule}");
+        }
         assert!(draw.contains(
             "frame.contentWindow.postMessage({ type: \"meridian:action\", version: 1, id: a.id }, frame.dataset.origin);"
         ), "the click, to the plugin's origin alone");
         assert!(!CHROME_SCRIPT.contains("\"*\""), "never to any origin");
         // A new page in the frame is offered nothing until it says.
         assert!(CHROME_SCRIPT.contains(
-            "frame.addEventListener(\"load\", function () { draw(frame, []); status(frame, null); tell(frame); });"
-        ));
+            "frame.addEventListener(\"load\", function () { draw(frame, []); status(frame, null); tell(frame); });\n    tell(frame);"
+        ), "and a page loaded before the script ran is told at once");
         // The tones the header can draw.
         assert!(STYLE.contains("button.danger{background:var(--danger-wash);border-color:var(--danger);color:var(--danger)}"));
     }
@@ -1308,7 +1413,10 @@ mod tests {
             .expect("the drawing");
         for line in [
             "var place = frame.hasAttribute(\"data-status\") && document.getElementById(frame.getAttribute(\"data-status\"));",
-            "if (!said) { place.replaceChildren(); return; }",
+            // None: what the dashboard drew there, under Manage its word on
+            // the plugin's health, so every tab keeps a dot.
+            "if (!drawnDots.has(place)) drawnDots.set(place, Array.prototype.slice.call(place.childNodes));",
+            "if (!said) { place.replaceChildren.apply(place, drawnDots.get(place)); return; }",
             "dot.className = \"status-dot\";",
             "dot.setAttribute(\"data-state\", said.state);",
             "dot.setAttribute(\"aria-label\", said.label);",
@@ -1329,7 +1437,7 @@ mod tests {
             "@media (prefers-reduced-motion:reduce){.status-dot[data-state=busy]::before{animation:none}}",
             // Beside the name title, centred on it, and taking no room
             // until there is a status.
-            ".plugin-area .area-title{display:flex;align-items:center;",
+            ".plugin-area .area-title{grid-area:title;display:flex;align-items:center;",
             ".plugin-area .title-status{display:inline-flex;align-items:center;flex-shrink:0}",
             ".plugin-area .title-status:empty{display:none}",
             // A note on the header stays with it as the page scrolls.

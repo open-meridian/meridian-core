@@ -1477,7 +1477,7 @@ async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamles
         body.contains(
             "<div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\"><svg"
         ) && body.contains(
-            "</svg></a><h1>snaptrade</h1><span class=\"title-status\" id=\"page-status\"></span></div>"
+            "</svg></a><h1 title=\"snaptrade\">snaptrade</h1><span class=\"title-status\" id=\"page-status\"></span></div>"
         ),
         "{body}"
     );
@@ -1972,6 +1972,77 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
     assert_eq!(forged.status, StatusCode::BAD_REQUEST);
     assert!(!forged.body.contains(TYPED_SECRET));
     assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+/// The head under Manage, as the product owner agreed it on 2026-10-01 ("yes,
+/// dot on every tab"; the level switch "consistent across all level pages"):
+/// Summary and Settings, which the dashboard draws, and Account links, a
+/// framed page of the plugin's, each have the status dot right after the
+/// plugin's name -- the plugin's health as the dashboard knows it, until and
+/// unless the framed page tells its own -- and the same switch in the same
+/// place, the last of the head's right-hand group, with a framed page's
+/// actions immediately left of it ("maybe the circular arrow to the left of
+/// the toggle").
+#[tokio::test]
+async fn every_tab_under_manage_has_the_dot_after_the_name_and_the_switch_in_the_same_place() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    held.plugin_settings = vec![snaptrade_settings()];
+    h.app.records.store(held, h.app.clock.now_ns());
+    snaptrade_reporting(&h);
+    serving_launched(&h);
+
+    let dot = "<span class=\"title-status\" id=\"page-status\"><button type=\"button\" \
+               class=\"status-dot\" data-state=\"ok\" aria-label=\"Healthy\" data-note=\"Healthy\">\
+               </button></span>";
+    let mut sides = Vec::new();
+    for tab in ["summary", "settings", "account-links"] {
+        let page = get(
+            &h.app,
+            DASHBOARD,
+            &format!("/plugins/{INSTANCE}?level=admin&tab={tab}"),
+            &[dashboard_cookie(&h)],
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{tab}: {}", page.body);
+        let body = page.body.split("</header>").nth(1).unwrap();
+        assert_eq!(tab_row(body).1, tab);
+        let head = body
+            .split("<div class=\"page-head\">")
+            .nth(1)
+            .and_then(|rest| rest.split("<nav class=\"tabs view-tabs\"").next())
+            .expect("the area's head");
+        // The dot right after the name, on every tab.
+        assert!(
+            head.contains(&format!("<h1 title=\"snaptrade\">snaptrade</h1>{dot}")),
+            "{tab}: {head}"
+        );
+        // A framed page's actions left of the switch, the group's last;
+        // nothing of the page's beside the name.
+        let title = head.split("<div class=\"head-side\">").next().unwrap();
+        let side = head
+            .split("<div class=\"head-side\">")
+            .nth(1)
+            .expect("the right-hand group");
+        assert!(!title.contains("actions"), "{tab}: {title}");
+        assert_eq!(
+            side.starts_with("<div class=\"actions\" id=\"page-actions\""),
+            tab == "account-links",
+            "{tab}: {side}"
+        );
+        let switch = if tab == "account-links" {
+            side.split_once("</div>").expect("the actions' end").1
+        } else {
+            side
+        };
+        assert!(switch.contains("data-level=\"admin\""), "{tab}: {switch}");
+        sides.push(switch.to_string());
+    }
+    // The switch the same, in the same place, on all three.
+    assert!(sides.windows(2).all(|w| w[0] == w[1]), "{sides:?}");
+    assert!(sides[0].contains("data-level=\"admin\""), "{}", sides[0]);
 }
 
 /// The dashboard's Summary and Settings are the plugin's admins' alone, a

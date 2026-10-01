@@ -53,10 +53,13 @@ impl Health {
 }
 
 /// How a plugin is, in a word and a sentence, from its last report as of
-/// `now`: the word for a badge, and whether it asks anything of anybody.
+/// `now`: the word for a badge, whether it asks anything of anybody, and the
+/// state of the status dot the plugin's area draws for it where a page tells
+/// none of its own (meridian-ui's `om-status`: `ok`, `warn` or `error`).
 pub struct State {
     pub word: &'static str,
     pub good: bool,
+    pub dot: &'static str,
     pub detail: String,
 }
 
@@ -65,6 +68,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
         return State {
             word: "Not heard from",
             good: false,
+            dot: "warn",
             detail: "Its sidecar has not reported since this dashboard started.".into(),
         };
     };
@@ -72,6 +76,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
         return State {
             word: "Silent",
             good: false,
+            dot: "error",
             detail: "Its sidecar has stopped reporting.".into(),
         };
     }
@@ -79,6 +84,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
         return State {
             word: "Not registered",
             good: false,
+            dot: "warn",
             detail: "The plugin has not registered with its sidecar: it is starting, or it left."
                 .into(),
         };
@@ -87,6 +93,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
         return State {
             word: "Not healthy",
             good: false,
+            dot: "error",
             detail: if report.health_detail.is_empty() {
                 "The plugin says it is not healthy, and not why.".into()
             } else {
@@ -97,6 +104,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
     State {
         word: "Healthy",
         good: true,
+        dot: "ok",
         detail: report.health_detail.clone(),
     }
 }
@@ -159,18 +167,23 @@ mod tests {
         let said = state(Some(&unwell), T0);
         assert_eq!(said.word, "Not healthy");
         assert!(!said.good);
+        assert_eq!(said.dot, "error");
         assert_eq!(said.detail, "required setting api_key is not set");
 
         let well = report("snaptrade-1", true);
         assert!(state(Some(&well), T0 + SILENT_NS).good);
+        assert_eq!(state(Some(&well), T0 + SILENT_NS).dot, "ok");
         assert_eq!(state(Some(&well), T0 + SILENT_NS + 1).word, "Silent");
+        assert_eq!(state(Some(&well), T0 + SILENT_NS + 1).dot, "error");
 
         let left = PluginReport {
             registered: false,
             ..well
         };
         assert_eq!(state(Some(&left), T0).word, "Not registered");
+        assert_eq!(state(Some(&left), T0).dot, "warn");
         assert_eq!(state(None, T0).word, "Not heard from");
+        assert_eq!(state(None, T0).dot, "warn");
     }
 
     #[tokio::test]

@@ -763,6 +763,9 @@ pub(crate) async fn frame(
         }
     };
     let held = access.held(&instance);
+    // Under Manage, the plugin's health is the dot on every tab where no page
+    // tells its own (the product owner, 2026-10-01: "yes, dot on every tab").
+    let health = crate::health::state(reports.get(&instance), app.clock.now_ns());
     let body = crate::area::render(&crate::area::Area {
         instance: &instance,
         name,
@@ -771,6 +774,7 @@ pub(crate) async fn frame(
         tabs: &tabs,
         current,
         shown,
+        health: (level == AccessLevel::Admin).then_some(&health),
     });
     let crumbs = format!(
         "{}{}",
