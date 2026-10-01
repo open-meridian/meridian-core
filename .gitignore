@@ -21,6 +21,9 @@ target/
 .test-store.log
 .interop.log
 .interop.positions
+# Written by `make harness-check`: the harness copied out of the image, and
+# the street store it printed.
+.harness/
 deploy/nats/dev.conf
 
 # Written and removed by `make check-codegen`.

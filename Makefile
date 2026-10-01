@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -24,6 +24,7 @@ help:
 	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
+	@echo "  make harness-check  the plugin harness in the image runs a plugin, end to end"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -32,7 +33,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -781,6 +782,67 @@ e2e-plugin-page: network
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
 	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level"
 
+# The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
+# copied out of the image this tree builds, started with core's own stand-in
+# plugin as its plugin, and driven by its runner as a plugin's e2e drives it.
+# Its own compose project, its own network and no published port, so nothing
+# here collides with the targets above; and it names no plugin, so nothing
+# here waits on one. A harness that would break a plugin's e2e breaks this
+# first.
+#
+# The run: the plugin registers; a deployment admin sets its settings, a
+# secret among them, in the dashboard's form, and the plugin holds them;
+# defines an account; links one of the two accounts the plugin reports
+# through the plugin's own form under Manage, with the page's CSRF token; the
+# plugin, woken by the link, records a statement for it as itself; the street
+# store printed by street.sql is the expected file exactly, nothing for the
+# account left unlinked; and the dashboard counts that one not linked.
+HARNESS_SECRET := sk-test-harness-not-a-real-key
+HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
+	MERIDIAN_HARNESS_PLUGIN_IMAGE=meridian-python-interop \
+	MERIDIAN_HARNESS_PLUGIN_ROLES=custody \
+	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
+	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f e2e/harness/stand-in.yaml
+HARNESS_RUN := $(HARNESS) run --rm -T runner
+
+harness-check:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "harness-check FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(RUNTIME_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/usr/share/meridian/harness" .harness >/dev/null \
+		&& $(DOCKER) rm "$$id" >/dev/null \
+		|| { echo "harness-check FAILED: the image carries no harness at /usr/share/meridian/harness" >&2; exit 1; }
+	@: >.e2e-harness.log
+	@$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
+	@started=$$(date +%s); \
+	fail() { echo "harness-check FAILED: $$1; the components' logs are in .e2e-harness.log" >&2; \
+		$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
+		$(HARNESS) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
+	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
+	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
+	$(HARNESS_RUN) page --level admin /settings --until '"missing_required": []' >/dev/null \
+		|| fail "the plugin never held its settings"; \
+	account="$$($(HARNESS_RUN) account 'Harness Brokerage')" || fail "the account was not defined"; \
+	$(HARNESS_RUN) form --level admin --page /admin/accounts --post /admin/accounts/link \
+		external_account_id=ext-e2e account_id="$$account" --expect "Linked ext-e2e to $$account" >/dev/null \
+		|| fail "the plugin's form did not link the account"; \
+	for i in $$(seq 1 60); do \
+		$(HARNESS) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+			-f /harness/street.sql >.harness/street 2>>.e2e-harness.log || fail "street.sql did not run"; \
+		grep -q '^statement|Harness Brokerage|stand-in|[0-9]*|complete|' .harness/street && break; \
+		sleep 1; \
+	done; \
+	diff -u e2e/harness/expected.street .harness/street >&2 \
+		|| fail "the street store is not e2e/harness/expected.street"; \
+	unlinked="$$($(HARNESS_RUN) unlinked --expect 1)" || fail "the dashboard did not count the unlinked account"; \
+	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
+	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness, copied out of the image, runs a plugin beside its sidecar; its runner sets the plugin's settings, defines an account and links it through the plugin's own form; the street store prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked)"
+
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
 	@# an anonymous volume and treats what it finds there as set up: a
@@ -1303,7 +1365,14 @@ down:
 # the rows whose currency was the connector's assumption; the positions the
 # venue also counts in cash; and each venue shape's statement figures as sent
 # (spec/the-account-side-fits-every-venue).
-# Ordered bytewise, so the file does not depend on the database's collation.
+# Read by the plugin harness's street.sql, the one statement of the format a
+# plugin's e2e compares against, so this holds it too. Ordered bytewise, so
+# the file does not depend on the database's collation. Only the suite's
+# account: the database is the one `make test-store` and the others leave
+# their rows in. Each venue shape's statement is its source's latest; the
+# suite's own source, `interop`, opens many, every one read at the same fixed
+# time, so which is latest is nothing the suite states, and its line is left
+# out.
 SDK ?= ../meridian-python
 
 interop: network
@@ -1332,25 +1401,10 @@ interop: network
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
-		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At \
-			-c "SELECT instrument_id || '|' || side || '|' || quantity::text || '|' \
-			          || coalesce(settle_date_quantity::text, '') || '|' \
-			          || coalesce(market_value::text || ' ' || currency, '') \
-			      FROM custodial_position WHERE account_id = 'ACC-INTEROP' \
-			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
-			-c "SELECT 'assumed|' || instrument_id || '|' || side FROM holding \
-			     WHERE account_id = 'ACC-INTEROP' AND currency_assumed \
-			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
-			-c "SELECT 'in-cash|' || instrument_id || '|' || side FROM custodial_position \
-			     WHERE account_id = 'ACC-INTEROP' AND also_counted_in_cash \
-			     ORDER BY instrument_id COLLATE \"C\", side COLLATE \"C\"" \
-			-c "SELECT 'statement|' || source || '|' \
-			          || coalesce(buying_power::text || ' ' || buying_power_currency, '') || '|' \
-			          || coalesce(margin_requirement::text || ' ' || margin_requirement_currency, '') || '|' \
-			          || coalesce(maintenance_excess::text || ' ' || maintenance_excess_currency, '') || '|' \
-			          || currency_assumed::text \
-			      FROM statement WHERE source LIKE 'interop-%' ORDER BY source COLLATE \"C\"" \
-			>.interop.positions 2>&1; \
+		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+			<deploy/harness/street.sql 2>>.interop.log \
+			| awk -F'|' '$$2 == "Interop" && !($$1 == "statement" && $$3 == "interop")' \
+			>.interop.positions; \
 		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \
 			echo "interop FAILED. The last 40 lines, and the whole of it in .interop.log:" >&2; \

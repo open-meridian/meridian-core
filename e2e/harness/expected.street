@@ -1,0 +1,6 @@
+assumed|Harness Brokerage|placeholder(symbol:SHRT@stand-in)|short
+position|Harness Brokerage|placeholder(figi:BBG000HARNES, symbol:HRN@stand-in)|long|12.5|10|1250.00 USD|
+position|Harness Brokerage|placeholder(iso4217:USD)|long|1523.45|1020.35|1523.45 USD|
+position|Harness Brokerage|placeholder(symbol:MMF@stand-in)|long|500.00||500.00 USD|in-cash
+position|Harness Brokerage|placeholder(symbol:SHRT@stand-in)|short|-40||-800.00 USD|
+statement|Harness Brokerage|stand-in|4|complete|25000.00 USD|||false

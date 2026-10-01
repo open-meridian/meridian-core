@@ -46,16 +46,31 @@ refuses whole, naming the bound. Written on the wire by hand, like its
 registration, so it does not matter which bindings the SDK's image carries.
 The sidecar reads figures from any heartbeat it accepts.
 
+Its Account links page also carries a form, as a plugin built on the SDK
+serves one: posted urlencoded to /admin/accounts/link with the page's `csrf`
+field, it links for the person, and on a link records a statement for the
+account as the plugin itself -- a connector reading again because a link
+woke it. Its rows
+name what a connector holds rather than an instrument, so each is resolved
+first (W3.1), and with no platform each resolves to the deployment's
+placeholder. The plugin harness's own check (`make harness-check`) drives
+it so, with STAND_IN_REPORTS_AT_START set, which reports the accounts its
+connection reaches once it has registered, as a connector does after its
+first read.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
 import base64
 import hashlib
+import html
 import http.server
 import json
 import os
+import secrets
 import threading
 import time
+import urllib.parse
 import uuid
 
 import grpc
@@ -255,21 +270,7 @@ def report():
     how one gets linked, and a sync state describes the connection, not data
     recorded against the account (ruled 2026-09-28)."""
     ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
-    said = {}
-    try:
-        ops.ReportExternalAccounts(
-            operations_pb2.ReportExternalAccountsParams(accounts=[
-                operations_pb2.ExternalAccount(
-                    external_account_id=EXTERNAL_ACCOUNT, name="E2E Brokerage",
-                    venue_account_type="Individual"),
-                operations_pb2.ExternalAccount(
-                    external_account_id=OTHER_ACCOUNT, name="E2E Roth",
-                    venue_account_type="Roth IRA"),
-            ]),
-            timeout=10)
-        said["accounts"] = "published"
-    except grpc.RpcError as refused:
-        said["accounts"] = f"{refused.code().name}: {refused.details()}"
+    said = {"accounts": report_accounts()}
     try:
         ops.ReportSyncStatus(
             operations_pb2.ReportSyncStatusParams(
@@ -283,6 +284,122 @@ def report():
     except grpc.RpcError as refused:
         said["sync"] = f"{refused.code().name}: {refused.details()}"
     return said
+
+
+def report_accounts():
+    """The accounts the connection reaches (W2.8): "published", or why not."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        ops.ReportExternalAccounts(
+            operations_pb2.ReportExternalAccountsParams(accounts=[
+                operations_pb2.ExternalAccount(
+                    external_account_id=EXTERNAL_ACCOUNT, name="E2E Brokerage",
+                    venue_account_type="Individual"),
+                operations_pb2.ExternalAccount(
+                    external_account_id=OTHER_ACCOUNT, name="E2E Roth",
+                    venue_account_type="Roth IRA"),
+            ]),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return f"{refused.code().name}: {refused.details()}"
+    return "published"
+
+
+def report_at_start():
+    """As a connector does after its first read: the accounts it reaches,
+    said again until the sidecar takes them."""
+    for _ in range(60):
+        said = report_accounts()
+        print(f"reported the accounts it reaches: {said}", flush=True)
+        if said == "published":
+            return
+        time.sleep(1)
+
+
+def decimal(text):
+    """A Decimal, exactly as written: its digits and its scale (decisions/023)."""
+    whole, _, fraction = text.partition(".")
+    value = int(whole + fraction)
+    return operations_pb2.Decimal(high=value >> 64, low=value & (2**64 - 1), scale=len(fraction))
+
+
+def money(text, currency="USD"):
+    return operations_pb2.Money(amount=decimal(text), currency_code=currency)
+
+
+def figi(value):
+    return operations_pb2.Identifier(scheme="figi", value=value)
+
+
+def symbol(value):
+    return operations_pb2.Identifier(scheme="symbol", value=value, source=SOURCE)
+
+
+# What the connector's read finds in a linked account, chosen so the harness's
+# street.sql prints every column it has: a FIGI and a symbol with a
+# settle-date quantity and a value; a short whose currency the connector
+# assumed; a money-market fund the venue also counts in cash; and cash.
+SOURCE = "stand-in"
+STATEMENT_ROWS = [
+    {"identifiers": [figi("BBG000HARNES"), symbol("HRN")], "side": "long",
+     "quantity": "12.5", "settle": "10", "value": "1250.00"},
+    {"identifiers": [symbol("SHRT")], "side": "short", "quantity": "-40",
+     "value": "-800.00", "assumed": True},
+    {"identifiers": [symbol("MMF")], "side": "long", "quantity": "500.00",
+     "value": "500.00", "in_cash": True},
+    {"identifiers": [operations_pb2.Identifier(scheme="iso4217", value="USD")], "side": "long",
+     "quantity": "1523.45", "settle": "1020.35", "value": "1523.45"},
+]
+SIDES = {"long": operations_pb2.HOLDING_SIDE_LONG, "short": operations_pb2.HOLDING_SIDE_SHORT}
+
+
+def record_statement(external_account_id):
+    """One statement of the linked account's rows, as the plugin itself: each
+    identifier set resolved first (W3.1), then the statement and its rows
+    (W2.2). Raises the refusal of the first that is refused."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    resolved = []
+    for row in STATEMENT_ROWS:
+        found = ops.ResolveIdentifier(
+            operations_pb2.ResolveIdentifierParams(
+                identifiers=row["identifiers"], as_of_ns=time.time_ns()),
+            timeout=10)
+        resolved.append(found.instrument_id)
+    opened = ops.RecordHoldingsStatement(
+        operations_pb2.RecordHoldingsStatementParams(
+            source=SOURCE, external_statement_id=str(uuid.uuid4()), as_of_date="2026-09-26",
+            read_at_ns=time.time_ns(), expected_rows=len(STATEMENT_ROWS),
+            buying_power=money("25000.00")),
+        timeout=10)
+    for row, instrument_id in zip(STATEMENT_ROWS, resolved):
+        held = operations_pb2.RecordHoldingParams(
+            statement_id=opened.statement_id, instrument_id=instrument_id,
+            side=SIDES[row["side"]], quantity=decimal(row["quantity"]),
+            market_value=money(row["value"]), external_account_id=external_account_id,
+            currency_assumed=row.get("assumed", False),
+            also_counted_in_cash=row.get("in_cash", False))
+        if "settle" in row:
+            held.settle_date_quantity.CopyFrom(decimal(row["settle"]))
+        ops.RecordHolding(held, timeout=10)
+
+
+def read_after_link(external_account_id):
+    """A read woken by a link: the accounts the connection reaches said again,
+    as a connector says them on every read, and the linked one's statement
+    recorded once the sidecar admits its rows, which it does when it has
+    heard of the link."""
+    print(f"reported the accounts it reaches: {report_accounts()}", flush=True)
+    for _ in range(60):
+        try:
+            record_statement(external_account_id)
+        except grpc.RpcError as refused:
+            print(f"the statement for {external_account_id} waits: "
+                  f"{refused.code().name}: {refused.details()}", flush=True)
+            time.sleep(1)
+            continue
+        print(f"recorded a statement for {external_account_id}", flush=True)
+        return
+    print(f"no statement for {external_account_id} was admitted in a minute", flush=True)
 
 
 def refused_as(refused):
@@ -327,12 +444,16 @@ def link_for(header, asked):
 
 
 KIT = "/.meridian/ui/0.3.0/meridian.css"
+# The token its forms carry, as an SDK page's do: one per process, which is
+# enough to show the form was read before it was posted.
+CSRF = secrets.token_hex(16)
+# Where that form posts, apart from /link, which a runner posts JSON to.
+LINK_FORM = "/admin/accounts/link"
 
 
 def admin_page(path, header):
     """One of its admin pages, on the kit: which it is, for whom, and on the
     Accounts page what it reaches and the deployment's accounts it offers."""
-    import html
     title = next(title for page, title in ADMIN_PAGES if page == path)
     caller = decoded(header) if header else {}
     rows = ""
@@ -344,6 +465,13 @@ def admin_page(path, header):
             for external, name in ((EXTERNAL_ACCOUNT, "E2E Brokerage"), (OTHER_ACCOUNT, "E2E Roth")))
         rows = ("<table><thead><tr><th>External account</th><th>At the venue</th>"
                 f"<th>Could link to</th></tr></thead><tbody>{rows}</tbody></table>")
+        # The form an SDK page serves: posted urlencoded, with its token.
+        rows += (f"<form method=\"post\" action=\"{LINK_FORM}\">"
+                 f"<input type=\"hidden\" name=\"csrf\" value=\"{CSRF}\">"
+                 "<label>External account <input name=\"external_account_id\"></label>"
+                 "<label>Account <input name=\"account_id\"></label>"
+                 "<label>Or a new account <input name=\"new_account_name\"></label>"
+                 "<button type=\"submit\">Link</button></form>")
     return (f"<!doctype html><html><head><meta charset=\"utf-8\"><link rel=\"stylesheet\" href=\"{KIT}\">"
             f"<title>{html.escape(title)}</title></head><body><main class=\"page\">"
             f"<h1>{html.escape(title)}</h1><p>A stand-in plugin's admin page, <code>{html.escape(path)}</code>, "
@@ -453,6 +581,9 @@ class Page(http.server.BaseHTTPRequestHandler):
             done = report()
         elif self.path == "/figures":
             done = heartbeat(nine=json.loads(sent or b"{}").get("nine", False))
+        elif self.path == LINK_FORM:
+            self.link_from_form(callers, sent)
+            return
         elif self.path == "/link":
             done = link_for(callers[0], json.loads(sent or b"{}"))
         else:
@@ -464,6 +595,31 @@ class Page(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def link_from_form(self, callers, sent):
+        """The Account links page's form, as a person posts it: refused
+        without the page's token, else linked for her, and on a link the
+        account read again so its rows follow."""
+        form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
+        if not callers or not secrets.compare_digest(form.get("csrf", ""), CSRF):
+            status, said = 403, "This form is not from this page."
+        else:
+            done = link_for(callers[0], form)
+            external = form.get("external_account_id", "")
+            if not done.get("ok"):
+                status, said = 200, f"The sidecar refused this: {done.get('code')}: {done.get('detail')}"
+            elif not done.get("account_id"):
+                status, said = 200, f"Unlinked {external}."
+            else:
+                status, said = 200, f"Linked {external} to {done['account_id']}."
+                threading.Thread(target=read_after_link, args=(external,), daemon=True).start()
+        body = (f"<!doctype html><html><head><meta charset=\"utf-8\"><title>Account links</title></head>"
+                f"<body><main class=\"page\"><p class=\"notice\">{html.escape(said)}</p></main></body></html>").encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *_args):
         pass
 
@@ -471,4 +627,6 @@ class Page(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     register()
     threading.Thread(target=watch_settings, daemon=True).start()
+    if os.environ.get("STAND_IN_REPORTS_AT_START"):
+        threading.Thread(target=report_at_start, daemon=True).start()
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Page).serve_forever()

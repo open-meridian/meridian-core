@@ -85,6 +85,10 @@ COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-
 COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launcher
 # One directory per version, where the dashboard looks (MERIDIAN_UI_DIR).
 COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
+# The plugin harness (deploy/harness/README.md): the compose file, runner and
+# SQL a plugin's own end-to-end check copies out of this image and runs
+# against it, so the harness is always the one built with these binaries.
+COPY deploy/harness/ /usr/share/meridian/harness/
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.
