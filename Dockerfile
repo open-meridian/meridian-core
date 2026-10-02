@@ -60,6 +60,21 @@ RUN set -eu; for bin in /usr/local/bin/meridian-*; do \
       esac; \
     done
 
+# The plugin harness (deploy/harness/README.md), its own image and files only:
+# the compose file, runner and SQL a plugin's own end-to-end check copies out
+# and runs against the runtime image of the same commit, which publish tags
+# both with. Nothing here runs, so it holds no shell and no binary, and the
+# runtime image below carries none of it: a deployment's pods never hold a
+# test deployment (kernel/the-plugin-harness-is-its-own-image).
+#
+# Before `runtime`, which stays the last stage, so a build naming no target
+# still makes the runtime image.
+FROM scratch AS harness
+LABEL org.opencontainers.image.source=https://github.com/open-meridian/meridian-core \
+      org.opencontainers.image.description="The plugin harness: files to copy out, never to run"
+COPY deploy/harness/compose.yaml deploy/harness/harness.py deploy/harness/street.sql \
+     deploy/harness/book.sql deploy/harness/README.md /harness/
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
@@ -86,10 +101,6 @@ COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-
 COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launcher
 # One directory per version, where the dashboard looks (MERIDIAN_UI_DIR).
 COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
-# The plugin harness (deploy/harness/README.md): the compose file, runner and
-# SQL a plugin's own end-to-end check copies out of this image and runs
-# against it, so the harness is always the one built with these binaries.
-COPY deploy/harness/ /usr/share/meridian/harness/
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.

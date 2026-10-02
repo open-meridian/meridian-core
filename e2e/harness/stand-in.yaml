@@ -1,24 +1,32 @@
-# Core's own stand-in plugin as the plugin harness's plugin, for
-# `make harness-check`: an override of the `plugin` service, as a plugin's
-# own e2e adds environment, a command or a volume with one of its own.
+# Core's own stand-in plugin as each of the plugin harness's three plugins
+# (e2e/harness/plugins.json), for `make harness-check`: an override of each
+# plugin's service, as a plugin's own e2e adds environment, a command or a
+# volume with one of its own.
 #
 # The stand-in runs on the SDK's image with its script mounted; the path is
-# absolute (MERIDIAN_HARNESS_STAND_IN), since a second compose file's
+# absolute (MERIDIAN_HARNESS_STAND_IN), since a later compose file's
 # relative paths resolve against the first file's directory.
-services:
-  plugin:
-    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
-    environment:
-      # Report the accounts its connection reaches once registered, as a
-      # connector does after its first read.
-      STAND_IN_REPORTS_AT_START: "1"
-    volumes:
-      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+x-stand-in: &stand-in
+  entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+  volumes:
+    - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
 
-  # And as the second plugin, an operations plugin's place (contract v8):
-  # registered beside the first, opened at write once the admin is granted
-  # it, writing nothing.
-  plugin-2:
-    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
-    volumes:
-      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+services:
+  # A custody plugin: reports the accounts its connection reaches once
+  # registered, as a connector does after its first read.
+  custody:
+    <<: *stand-in
+    environment:
+      STAND_IN_REPORTS_AT_START: "1"
+
+  # An operations plugin's place (contract v8): registered beside it, opened
+  # at write once the admin is granted it, writing nothing.
+  operations:
+    <<: *stand-in
+
+  # A plugin holding no role, which exits failing on its first start, as one
+  # calling before the deployment serves does, and registers on its second.
+  restarted:
+    <<: *stand-in
+    environment:
+      STAND_IN_FAILS_FIRST: "1"

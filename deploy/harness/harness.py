@@ -7,8 +7,20 @@ Standard library only. Run as the compose file's `runner` service:
 
 Each command signs in afresh, does one thing, prints what it found, and exits
 0; or exits non-zero saying why. Every wait has a bound (`--seconds`). Each
-acts on the plugin `plugin-1`, or on the second plugin with `--instance
-plugin-2` (the compose file's `second` profile).
+acts on the first plugin plugins.yaml lists, or on another with `--instance
+NAME`. The admin signs in with the password the compose file's `keys` drew
+for this run, read from the `secrets` volume and never printed.
+
+And one command that is not the runner's, run before anything starts, in
+the same image with the list on stdin:
+
+  compose < plugins.json > plugins.yaml
+      Writes the compose file's plugins for a JSON list of any number,
+      `[{"instance": NAME, "image": IMAGE, "roles": [ROLE, ...]}, ...]`: for
+      each, its sidecar as instance NAME holding those roles, and the plugin
+      as the service NAME in its sidecar's network namespace, restarted when
+      it fails, as a pod's container is; the broker configured for them all,
+      and a password drawn for each. The first is the runner's plugin.
 
   ready [--seconds N]
       Until the plugin has registered with its sidecar and the dashboard lists
@@ -29,13 +41,18 @@ plugin-2` (the compose file's `second` profile).
       or View -- and GETs PATH there. Prints the status, then the body. With
       --until, again until the body says TEXT.
 
-  form --level L --page PATH --post PATH [--csrf-field NAME] [--expect TEXT] FIELD=VALUE ...
+  form --level L --page PATH --post PATH [--csrf-field NAME] [--from-page NAME ...]
+       [--expect TEXT] FIELD=VALUE ...
       The same session: reads PATH, takes its CSRF field (`csrf`, as the SDK
-      names it; a FIELD given by that name wins) when it has one, and posts
-      the fields urlencoded to --post, a field repeated as often as given.
-      Prints the status, then the body. With --expect, fails unless the body
-      says TEXT. This is how a plugin's own link page is driven: a link is
-      the plugin's to send, for an admin (W6.4), never the harness's.
+      names it; a FIELD given by that name wins) when it has one, and each
+      field --from-page names (repeated, or comma separated) with the value
+      the page gives it, as a person posting the page's own form sends what
+      it holds -- a proposal's digest, say; and posts the fields urlencoded
+      to --post, a field repeated as often as given. A FIELD given wins over
+      one taken from the page; a field the page does not have fails. Prints
+      the status, then the body. With --expect, fails unless the body says
+      TEXT. This is how a plugin's own link page is driven: a link is the
+      plugin's to send, for an admin (W6.4), never the harness's.
 
   unlinked [--expect N] [--seconds N]
       Prints how many external accounts the plugin reported that nothing
@@ -51,11 +68,12 @@ plugin-2` (the compose file's `second` profile).
       write by someone granted write; the admin is granted nothing on a
       plugin until this is run.
 
-Reading core's HTML is this runner's alone, and only because it ships in the
-same image as the dashboard it reads, and core's gate runs it against that
-dashboard at every commit. A plugin never parses core's pages itself.
+Reading core's HTML is this runner's alone, and only because it is published
+at the same commit as the dashboard it reads, and core's gate runs it against
+that dashboard at every commit. A plugin never parses core's pages itself.
 """
 import html
+import json
 import os
 import re
 import sys
@@ -67,7 +85,8 @@ import urllib.request
 DASHBOARD = os.environ.get("MERIDIAN_HARNESS_DASHBOARD", "http://dashboard:8080")
 INSTANCE = os.environ.get("MERIDIAN_HARNESS_INSTANCE", "plugin-1")
 ADMIN = os.environ.get("MERIDIAN_HARNESS_ADMIN", "harness")
-PASSWORD = os.environ.get("MERIDIAN_HARNESS_ADMIN_PASSWORD", "")
+# Where `keys` put the admin's password, drawn at random for this run.
+PASSWORD_FILE = os.environ.get("MERIDIAN_HARNESS_ADMIN_PASSWORD_FILE", "/secrets/admin/password")
 # The admin's login as the deployment names its people: the dashboard's own
 # account, as the conductor was told at its start (compose.yaml).
 LOGIN = os.environ.get("MERIDIAN_HARNESS_ADMIN_LOGIN", f"local|{ADMIN}")
@@ -167,6 +186,19 @@ def form_token(page):
     return found.group(1) if found else ""
 
 
+def drawn_password():
+    """The admin's password, as `keys` drew it when the run started. Read,
+    never printed: a failure names the file, not what is in it."""
+    try:
+        with open(PASSWORD_FILE, encoding="utf-8") as drawn:
+            password = drawn.read().strip()
+    except OSError as unread:
+        raise Failed(f"the admin's password was not drawn: {PASSWORD_FILE}: {unread.strerror}") from None
+    if not password:
+        raise Failed(f"the admin's password was not drawn: {PASSWORD_FILE} is empty")
+    return password
+
+
 def signed_in(seconds=120):
     """The admin, signed in to the dashboard, once the dashboard answers and
     her account is the deployment's admin: the conductor names her at its
@@ -176,7 +208,7 @@ def signed_in(seconds=120):
         if admin.get("/healthz").status != 200:
             raise Failed("the dashboard is not serving yet")
         admin.get("/sign-in")
-        signed = admin.post("/sign-in", {"name": ADMIN, "password": PASSWORD})
+        signed = admin.post("/sign-in", {"name": ADMIN, "password": drawn_password()})
         if signed.status != 303:
             raise Failed(f"signing in as {ADMIN}: {signed.status} {sentence(signed)}")
         settings = admin.get("/admin")
@@ -318,6 +350,7 @@ def form(args):
     target = option(args, "--post", None)
     csrf = option(args, "--csrf-field", "csrf")
     text = option(args, "--expect", None)
+    taken = [name for value in options(args, "--from-page") for name in value.split(",") if name]
     if not shown or not target:
         raise Failed("form takes --page PATH and --post PATH")
     fields = pairs(args)
@@ -328,8 +361,17 @@ def form(args):
     read = followed(host, host.get(shown))
     if read.status != 200:
         raise Failed(f"{shown}: {read.status} {sentence(read)}")
-    if not any(name == csrf for name, _ in fields):
-        token = csrf_of(read.body, csrf)
+    given = {name for name, _ in fields}
+    for name in taken:
+        if name in given:
+            continue
+        value = field_of(read.body, name)
+        if value is None:
+            raise Failed(f"{shown} has no field {name!r} to take")
+        fields.append((name, value))
+        given.add(name)
+    if csrf not in given:
+        token = field_of(read.body, csrf)
         if token is not None:
             fields.append((csrf, token))
     reply = followed(host, host.post(target, fields))
@@ -341,12 +383,29 @@ def form(args):
         raise Failed(f"{target} did not say {text!r}")
 
 
-def csrf_of(body, name):
-    """The value of the form field `name` on a page, or None."""
-    for field in re.findall(r"<input\b[^>]*>", body):
-        if re.search(r'\bname="' + re.escape(name) + '"', field):
-            found = re.search(r'\bvalue="([^"]*)"', field)
-            return found.group(1) if found else ""
+def field_of(body, name):
+    """The value the page's first form field named `name` holds, as a
+    browser would post it: an input's value, a textarea's text, or a
+    select's selected option (else its first); None when it has none."""
+    named = r'\bname="' + re.escape(html.escape(name)) + '"'
+    for field in re.finditer(r"<(input|textarea|select)\b([^>]*)>", body):
+        kind, attributes = field.group(1), field.group(2)
+        if not re.search(named, attributes):
+            continue
+        if kind == "input":
+            found = re.search(r'\bvalue="([^"]*)"', attributes)
+            return html.unescape(found.group(1)) if found else ""
+        if kind == "textarea":
+            text = body[field.end():].split("</textarea>", 1)[0]
+            return html.unescape(text)
+        listed = re.findall(r"<option\b([^>]*)>([^<]*)",
+                              body[field.end():].split("</select>", 1)[0])
+        chosen = next((o for o in listed if re.search(r"\bselected\b", o[0])),
+                      listed[0] if listed else None)
+        if chosen is None:
+            return ""
+        found = re.search(r'\bvalue="([^"]*)"', chosen[0])
+        return html.unescape(found.group(1) if found else chosen[1].strip())
     return None
 
 
@@ -424,6 +483,14 @@ def option(args, name, default):
     return value
 
 
+def options(args, name):
+    """Takes every `name VALUE` out of `args`, in order."""
+    found = []
+    while name in args:
+        found.append(option(args, name, None))
+    return found
+
+
 def number(args, name, default):
     value = option(args, name, None)
     if value is None:
@@ -441,8 +508,115 @@ def pairs(args):
     return [tuple(arg.split("=", 1)) for arg in taken]
 
 
+# What a plugin instance may be named: a broker user, a host name below the
+# dashboard's and a compose service, so lower case, digits and inner hyphens.
+INSTANCE_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")
+ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
+# Names the deployment already holds: compose.yaml's services, and the broker
+# users that are not plugins. A sidecar is the service `sidecar-<instance>`.
+TAKEN = {"keys", "postgres", "broker-config", "nats", "migrate", "street", "bor",
+         "instrument", "conductor", "dashboard", "runner", "store",
+         "runtime", "first-run", "dashboard-1"}
+RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image of the harness's commit}"
+
+
+def plugins_listed(text):
+    """The plugins a compose file is written for, checked: a non-empty JSON
+    list of {instance, image, roles}, each instance named once."""
+    try:
+        listed = json.loads(text)
+    except ValueError as unread:
+        raise Failed(f"the plugins are not JSON: {unread}") from None
+    if not isinstance(listed, list) or not listed:
+        raise Failed('the plugins are a JSON list, at least one: [{"instance": ..., "image": ..., "roles": [...]}]')
+    seen = set()
+    for at, plugin in enumerate(listed):
+        where = f"plugin {at + 1}"
+        if not isinstance(plugin, dict) or set(plugin) != {"instance", "image", "roles"}:
+            raise Failed(f"{where} is an object of instance, image and roles, and nothing else")
+        name, image, roles = plugin["instance"], plugin["image"], plugin["roles"]
+        if not isinstance(name, str) or not INSTANCE_NAME.fullmatch(name):
+            raise Failed(f"{where}'s instance {name!r} is not lower case letters, digits and inner hyphens, "
+                         "at most 32, starting with a letter")
+        if name in TAKEN or name.startswith("sidecar-"):
+            raise Failed(f"{where}'s instance {name!r} is a name the harness already holds")
+        if name in seen:
+            raise Failed(f"{where}'s instance {name!r} is named twice")
+        seen.add(name)
+        if not isinstance(image, str) or not image or re.search(r"[\s$]", image):
+            raise Failed(f"{where}'s image {image!r} is not an image reference")
+        if not isinstance(roles, list) or not all(isinstance(r, str) and ROLE_NAME.fullmatch(r) for r in roles):
+            raise Failed(f"{where}'s roles are a list of role names, empty for a plugin holding none")
+    return listed
+
+
+def compose(args):
+    """The plugins' half of the deployment, as a compose file (JSON, which
+    compose reads as YAML), on stdout."""
+    if args:
+        raise Failed(f"compose takes the plugins on stdin, not {args[0]!r}")
+    listed = plugins_listed(sys.stdin.read())
+    names = [plugin["instance"] for plugin in listed]
+    instances = [{"instance_id": plugin["instance"], "roles": plugin["roles"]} for plugin in listed]
+    instances.append({"instance_id": "dashboard-1", "component": "dashboard"})
+    services = {
+        "keys": {"environment": {"MERIDIAN_HARNESS_BROKER_USERS": " ".join(names)}},
+        "broker-config": {"environment": {
+            "MERIDIAN_HARNESS_INSTANCES": json.dumps({"instances": instances})}},
+        "runner": {"environment": {"MERIDIAN_HARNESS_INSTANCE": names[0]}},
+    }
+    for plugin in listed:
+        name = plugin["instance"]
+        # Its sidecar, as instance `name` holding the plugin's roles. No
+        # registration step: a sidecar with an instance and a broker
+        # credential is enough, and the conductor learns what the plugin
+        # declares from its report. The dashboard's front door address makes
+        # `sidecar-<instance>` of the instance, which is this service's name.
+        services[f"sidecar-{name}"] = {
+            "image": RUNTIME_IMAGE,
+            "entrypoint": ["sh", "-c"],
+            "command": [
+                "set -e\n"
+                f"broker=$$(cat /secrets/nats/{name})\n"
+                f"export MERIDIAN_BROKER_URL=nats://{name}:$$broker@nats:4222\n"
+                "exec meridian-sidecar\n"],
+            "depends_on": {"nats": {"condition": "service_started"},
+                           "keys": {"condition": "service_completed_successfully"}},
+            "environment": {
+                "MERIDIAN_DEPLOYMENT_ID": "DEP-harness",
+                "MERIDIAN_PLUGIN_INSTANCE_ID": name,
+                "MERIDIAN_PLUGIN_ROLES": ",".join(plugin["roles"]),
+                "MERIDIAN_INSTANCE_ID": f"sidecar-{name}",
+                "MERIDIAN_FRONT_DOOR_ADDRESS": "0.0.0.0:9292",
+                "MERIDIAN_DASHBOARD_KEYS_DIR": "/keys/public",
+            },
+            "volumes": ["keys:/keys:ro", "secrets:/secrets:ro"],
+            "networks": ["harness"],
+        }
+        # The plugin, in its sidecar's network namespace as a plugin is in
+        # its sidecar's pod, and started again when it exits failing, as a
+        # pod's container is: a plugin whose first call comes before the
+        # deployment serves is refused, exits, and on its next start finds it
+        # serving (kernel/the-harness-restarts-its-plugin). A plugin adds
+        # environment, a command or a volume with its own `-f` override of
+        # this service.
+        services[name] = {
+            "image": plugin["image"],
+            "depends_on": {f"sidecar-{name}": {"condition": "service_started"}},
+            "environment": {"MERIDIAN_SIDECAR_ADDRESS": "127.0.0.1:9191"},
+            "network_mode": f"service:sidecar-{name}",
+            "restart": "on-failure",
+        }
+    written = {
+        "x-harness": "written by harness.py compose for " + ", ".join(names)
+                     + "; written again, never edited, for another list",
+        "services": services,
+    }
+    print(json.dumps(written, indent=2))
+
+
 COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
-            "form": form, "unlinked": unlinked, "grant": grant}
+            "form": form, "unlinked": unlinked, "grant": grant, "compose": compose}
 
 
 def main(argv):

@@ -87,13 +87,16 @@ in rather than configured, in its component report and as
 A running deployment moves to a newer chart with `meridian upgrade-deployment`,
 or from a firm's own pipeline.
 
-The image also carries the **plugin harness**, at `/usr/share/meridian/harness/`:
-the smallest deployment a plugin's own end-to-end check runs against, its
-runner and the SQL that prints the street store. A plugin copies it out of the
-image it pins and proves itself against that release; see
-[deploy/harness/README.md](deploy/harness/README.md). It is a development
-deployment for a test, never a way to run one. `make harness-check` holds it
-at every commit with core's own stand-in plugin.
+The **plugin harness** is its own image, `ghcr.io/open-meridian/meridian-harness`,
+files only, published at each commit with the runtime image of the same commit
+and tag; the runtime image carries none of it. It is the smallest deployment a
+plugin's own end-to-end check runs against, for any number of plugins: its
+compose file, its runner, and the SQL its `store` service prints the stores
+with. A plugin copies it out of the harness image pinned beside the runtime it
+proves itself against; see [deploy/harness/README.md](deploy/harness/README.md).
+It is a development deployment for a test, never a way to run one, and holds
+no fixed password: each is drawn per run. `make harness-check` holds it at
+every commit with three of core's stand-in plugins.
 
 ## Working on it
 

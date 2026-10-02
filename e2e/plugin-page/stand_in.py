@@ -48,15 +48,18 @@ The sidecar reads figures from any heartbeat it accepts.
 
 Its Account links page also carries a form, as a plugin built on the SDK
 serves one: posted urlencoded to /admin/accounts/link with the page's `csrf`
-field, it links for the person, and on a link records a statement for the
-account as the plugin itself -- a connector reading again because a link
-woke it. Its rows
+field and its `offered` field, the digest of the accounts it offered (as an
+operations plugin's confirmation carries its proposal's digest, which the
+harness's `form --from-page` takes), it links for the person, and on a link
+records a statement for the account as the plugin itself -- a connector
+reading again because a link woke it. Its rows
 name what a connector holds rather than an instrument, so each is resolved
 first (W3.1), and with no platform each resolves to the deployment's
 placeholder. The plugin harness's own check (`make harness-check`) drives
 it so, with STAND_IN_REPORTS_AT_START set, which reports the accounts its
 connection reaches once it has registered, as a connector does after its
-first read.
+first read; and with STAND_IN_FAILS_FIRST, which exits failing on its first
+start, so the harness is seen to start a plugin again.
 
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
@@ -451,6 +454,17 @@ CSRF = secrets.token_hex(16)
 LINK_FORM = "/admin/accounts/link"
 
 
+def offered_to(header):
+    """The deployment's accounts its Account links page offers the person
+    the header names, as the page says them."""
+    read = accounts_for(header) if header else {"ok": False}
+    return ", ".join(a["name"] for a in read.get("accounts", [])) or "none"
+
+
+def digest_of(offered):
+    return hashlib.sha256(offered.encode()).hexdigest()[:16]
+
+
 def admin_page(path, header):
     """One of its admin pages, on the kit: which it is, for whom, and on the
     Accounts page what it reaches and the deployment's accounts it offers."""
@@ -458,16 +472,18 @@ def admin_page(path, header):
     caller = decoded(header) if header else {}
     rows = ""
     if path == "/admin/accounts":
-        read = accounts_for(header) if header else {"ok": False}
-        offered = ", ".join(html.escape(a["name"]) for a in read.get("accounts", [])) or "none"
+        offered = offered_to(header)
         rows = "".join(
-            f"<tr><td>{html.escape(external)}</td><td>{html.escape(name)}</td><td>{offered}</td></tr>"
+            f"<tr><td>{html.escape(external)}</td><td>{html.escape(name)}</td><td>{html.escape(offered)}</td></tr>"
             for external, name in ((EXTERNAL_ACCOUNT, "E2E Brokerage"), (OTHER_ACCOUNT, "E2E Roth")))
         rows = ("<table><thead><tr><th>External account</th><th>At the venue</th>"
                 f"<th>Could link to</th></tr></thead><tbody>{rows}</tbody></table>")
-        # The form an SDK page serves: posted urlencoded, with its token.
+        # The form an SDK page serves: posted urlencoded, with its token,
+        # and the digest of what it offered, which a link must send back, as
+        # an operations plugin's confirmation sends its proposal's digest.
         rows += (f"<form method=\"post\" action=\"{LINK_FORM}\">"
                  f"<input type=\"hidden\" name=\"csrf\" value=\"{CSRF}\">"
+                 f"<input type=\"hidden\" name=\"offered\" value=\"{digest_of(offered)}\">"
                  "<label>External account <input name=\"external_account_id\"></label>"
                  "<label>Account <input name=\"account_id\"></label>"
                  "<label>Or a new account <input name=\"new_account_name\"></label>"
@@ -602,6 +618,8 @@ class Page(http.server.BaseHTTPRequestHandler):
         form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
         if not callers or not secrets.compare_digest(form.get("csrf", ""), CSRF):
             status, said = 403, "This form is not from this page."
+        elif form.get("offered") != digest_of(offered_to(callers[0])):
+            status, said = 200, "What this page offered is not what it offers now: read it again."
         else:
             done = link_for(callers[0], form)
             external = form.get("external_account_id", "")
@@ -625,6 +643,14 @@ class Page(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # A plugin that exits failing on its first start, as one whose first call
+    # comes before the deployment serves is refused and exits: the harness
+    # starts it again, as a pod's restart policy would, and this second start
+    # finds the mark its first left in the container's own filesystem.
+    if os.environ.get("STAND_IN_FAILS_FIRST") and not os.path.exists("/tmp/stand-in-failed-once"):
+        open("/tmp/stand-in-failed-once", "w").close()
+        print("stand-in: failing on its first start, as told", flush=True)
+        raise SystemExit(1)
     register()
     threading.Thread(target=watch_settings, daemon=True).start()
     if os.environ.get("STAND_IN_REPORTS_AT_START"):

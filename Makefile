@@ -24,7 +24,7 @@ help:
 	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
-	@echo "  make harness-check  the plugin harness in the image runs a plugin, end to end"
+	@echo "  make harness-check  the plugin harness image runs three plugins, end to end"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
@@ -786,76 +786,102 @@ e2e-plugin-page: network
 	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
-# copied out of the image this tree builds, started with core's own stand-in
-# plugin as its plugin, and driven by its runner as a plugin's e2e drives it.
-# Its own compose project, its own network and no published port, so nothing
-# here collides with the targets above; and it names no plugin, so nothing
-# here waits on one. A harness that would break a plugin's e2e breaks this
-# first.
+# its own image, files only, built from this tree beside the runtime image,
+# copied out, its plugins written by its own `compose` for three of core's
+# stand-in plugins, and driven by its runner and its `store` as a plugin's
+# e2e drives them. Its own compose project, its own network and no published
+# port, so nothing here collides with the targets above; and it names no
+# plugin, so nothing here waits on one. A harness that would break a
+# plugin's e2e breaks this first.
 #
-# The run: the plugin registers; a deployment admin sets its settings, a
-# secret among them, in the dashboard's form, and the plugin holds them;
-# defines an account; links one of the two accounts the plugin reports
-# through the plugin's own form under Manage, with the page's CSRF token; the
-# plugin, woken by the link, records a statement for it as itself; the street
-# store printed by street.sql is the expected file exactly, nothing for the
-# account left unlinked; and the dashboard counts that one not linked.
+# First, the image: the runtime image holds no harness, the harness image
+# holds its five files and nothing else, and none of them -- nor the plugins
+# file written from them -- holds a fixed password or hash.
+#
+# The run: the plugins register, one of them only once the harness has
+# started it again after it failed; a deployment admin, signed in with the
+# password drawn for this run, sets one plugin's settings, a secret among
+# them, in the dashboard's form, and the plugin holds them; defines an
+# account; links one of the two accounts the plugin reports through the
+# plugin's own form under Manage, with the page's CSRF token and the digest
+# of what it offered taken from the page; the plugin, woken by the link,
+# records a statement for it as itself; the street store printed by `store
+# street` is the expected file exactly, nothing for the account left
+# unlinked; the dashboard counts that one not linked; a second plugin is
+# opened at write only once the admin is granted it; and `store book` prints
+# the book empty.
+HARNESS_IMAGE := meridian-harness:local
+HARNESS_FILES := README.md book.sql compose.yaml harness.py street.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
-	MERIDIAN_HARNESS_PLUGIN_IMAGE=meridian-python-interop \
-	MERIDIAN_HARNESS_PLUGIN_ROLES=custody \
-	MERIDIAN_HARNESS_PLUGIN_2_ROLES=operations \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
-	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f e2e/harness/stand-in.yaml
+	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml
 HARNESS_RUN := $(HARNESS) run --rm -T runner
+HARNESS_STORE := $(HARNESS) run --rm -T store
 
 harness-check:
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(PY) e2e/harness/known_passwords.py --self-test
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "harness-check FAILED: the harness image did not build" >&2; exit 1; }
 	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "harness-check FAILED: the SDK's image did not build" >&2; exit 1; }
-	@rm -rf .harness && id="$$($(DOCKER) create $(RUNTIME_IMAGE) none)" \
-		&& $(DOCKER) cp "$$id:/usr/share/meridian/harness" .harness >/dev/null \
+	@$(DOCKER) run --rm --entrypoint sh $(RUNTIME_IMAGE) -c 'test ! -e /usr/share/meridian/harness' \
+		|| { echo "harness-check FAILED: the runtime image still carries the harness at /usr/share/meridian/harness" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null \
 		&& $(DOCKER) rm "$$id" >/dev/null \
-		|| { echo "harness-check FAILED: the image carries no harness at /usr/share/meridian/harness" >&2; exit 1; }
+		|| { echo "harness-check FAILED: the harness image carries nothing at /harness" >&2; exit 1; }
+	@held="$$(ls -A .harness | LC_ALL=C sort | tr '\n' ' ')"; [ "$$held" = "$(HARNESS_FILES) " ] \
+		|| { echo "harness-check FAILED: the harness image holds $$held; it holds $(HARNESS_FILES) and nothing else" >&2; exit 1; }
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/harness/plugins.json >.harness/plugins.yaml \
+		|| { echo "harness-check FAILED: the harness's compose did not write the plugins from e2e/harness/plugins.json" >&2; exit 1; }
+	@! printf '[{"instance": "nats", "image": "x", "roles": []}]' \
+		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >/dev/null 2>&1 \
+		|| { echo "harness-check FAILED: the harness's compose wrote a plugin named as one of its own services" >&2; exit 1; }
+	@$(PY) e2e/harness/known_passwords.py .harness/* \
+		|| { echo "harness-check FAILED: a fixed password or hash is in the harness's files (above, by line)" >&2; exit 1; }
 	@: >.e2e-harness.log
-	@$(HARNESS) --profile second down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
+	@$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
 	@started=$$(date +%s); \
 	fail() { echo "harness-check FAILED: $$1; the components' logs are in .e2e-harness.log" >&2; \
-		$(HARNESS) --profile second logs --no-color >>.e2e-harness.log 2>&1; \
-		$(HARNESS) --profile second down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+		$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
+		$(HARNESS) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
 	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
 	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
 	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
 	$(HARNESS_RUN) page --level admin /settings --until '"missing_required": []' >/dev/null \
 		|| fail "the plugin never held its settings"; \
 	account="$$($(HARNESS_RUN) account 'Harness Brokerage')" || fail "the account was not defined"; \
-	$(HARNESS_RUN) form --level admin --page /admin/accounts --post /admin/accounts/link \
+	$(HARNESS_RUN) form --level admin --page /admin/accounts --post /admin/accounts/link --from-page offered \
 		external_account_id=ext-e2e account_id="$$account" --expect "Linked ext-e2e to $$account" >/dev/null \
-		|| fail "the plugin's form did not link the account"; \
+		|| fail "the plugin's form did not link the account, with what its page offered taken from the page"; \
 	for i in $$(seq 1 60); do \
-		$(HARNESS) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
-			-f /harness/street.sql >.harness/street 2>>.e2e-harness.log || fail "street.sql did not run"; \
+		$(HARNESS_STORE) street >.harness/street 2>>.e2e-harness.log || fail "store street did not print the street store"; \
 		grep -q '^statement|Harness Brokerage|stand-in|[0-9]*|complete|' .harness/street && break; \
 		sleep 1; \
 	done; \
 	diff -u e2e/harness/expected.street .harness/street >&2 \
 		|| fail "the street store is not e2e/harness/expected.street"; \
 	unlinked="$$($(HARNESS_RUN) unlinked --expect 1)" || fail "the dashboard did not count the unlinked account"; \
-	$(HARNESS) --profile second up -d sidecar-2 plugin-2 >>.e2e-harness.log 2>&1 || fail "the second plugin did not start"; \
-	$(HARNESS_RUN) ready --instance plugin-2 >/dev/null || fail "the second plugin never registered"; \
-	$(HARNESS_RUN) page --instance plugin-2 --level write / >/dev/null 2>&1 \
+	$(HARNESS_RUN) ready --instance operations >/dev/null || fail "the second plugin never registered"; \
+	$(HARNESS_RUN) page --instance operations --level write / >/dev/null 2>&1 \
 		&& fail "the admin opened the second plugin at write before being granted it"; \
-	$(HARNESS_RUN) grant --instance plugin-2 --level write >/dev/null || fail "the admin was not granted write on the second plugin"; \
-	$(HARNESS_RUN) page --instance plugin-2 --level write / --until '"level": 2' >/dev/null \
+	$(HARNESS_RUN) grant --instance operations --level write >/dev/null || fail "the admin was not granted write on the second plugin"; \
+	$(HARNESS_RUN) page --instance operations --level write / --until '"level": 2' >/dev/null \
 		|| fail "the second plugin was not opened at write once granted"; \
-	$(HARNESS) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
-		-f /harness/book.sql >.harness/book 2>>.e2e-harness.log || fail "book.sql did not run"; \
+	$(HARNESS_RUN) ready --instance restarted >/dev/null || fail "the plugin that failed first never registered: the harness did not start it again"; \
+	restarts="$$($(DOCKER) inspect -f '{{.RestartCount}}' "$$($(HARNESS) ps -q restarted)")"; \
+	[ "$${restarts:-0}" -ge 1 ] || fail "the plugin that failed first registered without being restarted ($$restarts), so the check proves nothing"; \
+	$(HARNESS_STORE) book >.harness/book 2>>.e2e-harness.log || fail "store book did not print the book"; \
 	[ ! -s .harness/book ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book)"; \
+	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-	$(HARNESS) --profile second down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness, copied out of the image, runs a plugin beside its sidecar; its runner sets the plugin's settings, defines an account and links it through the plugin's own form; the street store prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin runs beside it, opened at write once the admin is granted it, and the book prints empty"
+	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

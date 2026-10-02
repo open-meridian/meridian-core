@@ -1,74 +1,64 @@
 # The plugin harness: the smallest deployment a plugin is proven against.
 #
 # A development deployment, for a plugin's own end-to-end check, and never a
-# way to run one: no platform, every account and password a test value, a
-# development dashboard, and nothing kept (`down -v`). See README.md beside
-# this file for the variables, the runner's commands and the street store's
-# line format.
+# way to run one: no platform, a development dashboard, and nothing kept
+# (`down -v`). See README.md beside this file for the runner's commands and
+# the stores' line formats.
 #
-# It ships inside the runtime image, at /usr/share/meridian/harness/, so the
-# harness a plugin runs is always the one built with the binaries it starts.
-# A plugin copies it out of the image it pinned and passes that same image in
-# MERIDIAN_RUNTIME_IMAGE: this file never guesses its own tag.
+# It ships as its own image, ghcr.io/open-meridian/meridian-harness, files
+# only, published at each commit with the runtime image of the same commit
+# and tag; the runtime image carries none of it. A plugin copies it out of
+# the harness image pinned beside the runtime it runs, and passes that
+# runtime in MERIDIAN_RUNTIME_IMAGE: this file never guesses its own tag.
+#
+# This file is the deployment; the plugins are not in it. `harness.py
+# compose` writes a second file for any number of plugins -- a sidecar and
+# the plugin for each, the broker configured for all their roles -- and every
+# compose command names both:
+#
+#     docker compose -p <project> -f compose.yaml -f plugins.yaml ...
 #
 # Its own project and network, and no published port: it runs beside core's
 # gates and another plugin's harness without either noticing. Name the
 # project (`-p`) after the plugin, so two never share one.
 #
-# Every variable below is required by every compose command, `down` and `run`
-# included, because compose reads the whole file each time:
-#   MERIDIAN_RUNTIME_IMAGE         the runtime image, by tag and digest
-#   MERIDIAN_HARNESS_PLUGIN_IMAGE  the plugin's image
-#   MERIDIAN_HARNESS_PLUGIN_ROLES  its roles, comma separated, as it declares
-#                                  them (empty for a plugin holding none)
+# No password is written here or anywhere in the harness. `keys` draws every
+# one at random when the run starts -- the database's, each broker user's,
+# and the admin's, whose Argon2id hash the dashboard is given at its start --
+# into the `secrets` volume, which only core's own services and the runner
+# mount, and which `down -v` removes.
 #
-# And, for a second plugin beside it (the `second` profile; a plugin that
-# writes the book proves itself against a custody plugin recording
-# statements), optional:
-#   MERIDIAN_HARNESS_PLUGIN_2_IMAGE  the second plugin's image
-#   MERIDIAN_HARNESS_PLUGIN_2_ROLES  its roles, comma separated
+# The one variable every compose command needs, `down` and `run` included:
+#   MERIDIAN_RUNTIME_IMAGE   the runtime image, by tag and digest, of the
+#                            commit this harness was published at
 
 name: meridian-harness
 
 # The deployment's components, one image.
 x-runtime: &runtime
-  image: ${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image this harness was copied from}
+  image: ${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image of the harness's commit}
   networks: [harness]
-
-# One database for every store, as the harness's single Postgres.
-x-database: &database postgres://meridian:meridian@postgres:5432/meridian
+  entrypoint: ["sh", "-c"]
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: meridian
-      POSTGRES_PASSWORD: meridian
-      POSTGRES_DB: meridian
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    volumes:
-      # The street store as lines: `exec -T postgres psql -U meridian -d
-      # meridian -At -v ON_ERROR_STOP=1 -f /harness/street.sql`; the book
-      # of record likewise, `-f /harness/book.sql` (contract v8).
-      - ./street.sql:/harness/street.sql:ro
-      - ./book.sql:/harness/book.sql:ro
-    networks: [harness]
-
+  # Every key and password of the run, drawn once, before anything that reads
+  # one starts, and kept for as long as the volumes are: a password drawn
+  # again would no longer open the account or database made with the first.
+  #
   # The dashboard's signing key, as the chart's Job makes it (the private
   # half where the dashboard reads it, the public half under its key id where
-  # the sidecar does), and the key secret settings are sealed with. One
-  # volume for all three, which a deployment never does.
+  # the sidecar does), and the key secret settings are sealed with, in
+  # `keys`. The passwords in `secrets`: each a letter and then hex, because
+  # the broker reads a value beginning like a number as a number, and a
+  # database URL carries it as it is. The admin's hash is Argon2id at the
+  # dashboard's defaults, in the PHC form it reads.
   keys:
     image: alpine/openssl:3.3.2
     entrypoint: ["sh", "-c"]
     command:
       - |
-        set -e
-        mkdir -p /keys/signing /keys/public /keys/settings
+        set -eu
+        mkdir -p /keys/signing /keys/public /keys/settings /secrets/nats /secrets/admin
         if [ ! -f /keys/signing/key-id ]; then
           id=harness-$$(openssl rand -hex 4)
           openssl genpkey -algorithm ed25519 -out /keys/signing/private-key.pem
@@ -76,99 +66,150 @@ services:
           printf %s "$$id" > /keys/signing/key-id
         fi
         [ -s /keys/settings/key ] || openssl rand -out /keys/settings/key 32
-        chmod -R a+rX /keys
+        drawn() { printf 'h%s' "$$(openssl rand -hex 24)"; }
+        [ -s /secrets/postgres ] || drawn > /secrets/postgres
+        for user in runtime first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
+          [ -s "/secrets/nats/$$user" ] || drawn > "/secrets/nats/$$user"
+        done
+        if [ ! -s /secrets/admin/hash ]; then
+          drawn > /secrets/admin/password
+          salt=$$(openssl rand -hex 16)
+          key=$$(openssl kdf -keylen 32 -kdfopt pass:"$$(cat /secrets/admin/password)" -kdfopt hexsalt:$$salt \
+            -kdfopt iter:2 -kdfopt memcost:19456 -kdfopt lanes:1 ARGON2ID | tr -d :)
+          b64() { xxd -r -p | base64 | tr -d '=\n'; }
+          printf '$$argon2id$$v=19$$m=19456,t=2,p=1$$%s$$%s' \
+            "$$(printf %s "$$salt" | b64)" "$$(printf %s "$$key" | b64)" > /secrets/admin/hash
+        fi
+        chmod -R a+rX /keys /secrets
     volumes:
       - keys:/keys
+      - secrets:/secrets
+    networks: [harness]
+
+  postgres:
+    image: postgres:16-alpine
+    depends_on:
+      keys:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD_FILE: /secrets/postgres
+      POSTGRES_DB: meridian
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - secrets:/secrets:ro
     networks: [harness]
 
   # The broker's configuration, generated from the contract the image
-  # carries for the one plugin instance and its roles, as a bundled broker
-  # generates its own (decisions/020). A role the contract does not know
+  # carries for the plugin instances and their roles, as a bundled broker
+  # generates its own (decisions/020). The instances are plugins.yaml's,
+  # which `harness.py compose` writes. A role the contract does not know
   # stops the run here, naming it.
   broker-config:
     <<: *runtime
+    command:
+      - |
+        set -e
+        printf '%s\n' "$${MERIDIAN_HARNESS_INSTANCES:?generate plugins.yaml with harness.py compose}" > /nats/instances.json
+        meridian-broker-config --instances /nats/instances.json --out /nats/harness.conf
+    volumes:
+      - broker:/nats
+
+  # The configuration names a variable for each user's password, and holds
+  # none: MERIDIAN_NATS_<USER>, upper case, `-` as `_`.
+  nats:
+    image: nats:2.10-alpine
     entrypoint: ["sh", "-c"]
     command:
       - |
         set -e
-        roles=$$(printf %s "$$MERIDIAN_HARNESS_PLUGIN_ROLES" | tr -d ' ' | sed 's/[^,][^,]*/"&"/g')
-        second=$$(printf %s "$$MERIDIAN_HARNESS_PLUGIN_2_ROLES" | tr -d ' ' | sed 's/[^,][^,]*/"&"/g')
-        printf '{"instances": [{"instance_id": "plugin-1", "roles": [%s]}, {"instance_id": "plugin-2", "roles": [%s]}, {"instance_id": "dashboard-1", "component": "dashboard"}]}\n' \
-          "$$roles" "$$second" > /nats/instances.json
-        meridian-broker-config --instances /nats/instances.json --out /nats/harness.conf
-    environment:
-      MERIDIAN_HARNESS_PLUGIN_ROLES: ${MERIDIAN_HARNESS_PLUGIN_ROLES?set MERIDIAN_HARNESS_PLUGIN_ROLES to the plugin's roles, comma separated}
-      MERIDIAN_HARNESS_PLUGIN_2_ROLES: ${MERIDIAN_HARNESS_PLUGIN_2_ROLES:-}
-    volumes:
-      - broker:/nats
-
-  nats:
-    image: nats:2.10-alpine
-    command: ["-c", "/etc/nats/harness.conf"]
+        for drawn in /secrets/nats/*; do
+          user=$$(basename "$$drawn" | tr a-z A-Z | tr - _)
+          export "MERIDIAN_NATS_$$user=$$(cat "$$drawn")"
+        done
+        exec nats-server -c /etc/nats/harness.conf
     depends_on:
       broker-config:
         condition: service_completed_successfully
-    environment:
-      # Harness-only passwords, for a broker nothing outside this network
-      # reaches. The configuration names each variable; it holds none.
-      MERIDIAN_NATS_RUNTIME: runtime-harness-only
-      MERIDIAN_NATS_FIRST_RUN: first-run-harness-only
-      MERIDIAN_NATS_DASHBOARD_1: dashboard-1-harness-only
-      MERIDIAN_NATS_PLUGIN_1: plugin-1-harness-only
-      MERIDIAN_NATS_PLUGIN_2: plugin-2-harness-only
+      keys:
+        condition: service_completed_successfully
     volumes:
       - broker:/etc/nats:ro
+      - secrets:/secrets:ro
     networks: [harness]
 
   # Every store's schema, once, before anything serves: a component verifies
   # the schema at start and refuses one it does not recognise.
   migrate:
     <<: *runtime
-    entrypoint: ["sh", "-c"]
     command:
-      - meridian-instrument migrate && meridian-street migrate && meridian-bor migrate && meridian-conductor migrate && meridian-dashboard migrate
+      - |
+        set -e
+        db=postgres://meridian:$$(cat /secrets/postgres)@postgres:5432/meridian
+        export MERIDIAN_DATABASE_URL=$$db MERIDIAN_STREET_DATABASE_URL=$$db MERIDIAN_BOR_DATABASE_URL=$$db \
+          MERIDIAN_CONFIG_DATABASE_URL=$$db MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=$$db
+        meridian-instrument migrate && meridian-street migrate && meridian-bor migrate \
+          && meridian-conductor migrate && meridian-dashboard migrate
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      MERIDIAN_DATABASE_URL: *database
-      MERIDIAN_STREET_DATABASE_URL: *database
-      MERIDIAN_BOR_DATABASE_URL: *database
-      MERIDIAN_CONFIG_DATABASE_URL: *database
-      MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL: *database
+    volumes:
+      - secrets:/secrets:ro
 
   street:
     <<: *runtime
-    command: ["meridian-street"]
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        export MERIDIAN_STREET_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        exec meridian-street
     depends_on: &serving
       migrate:
         condition: service_completed_successfully
       nats:
         condition: service_started
     environment:
-      MERIDIAN_STREET_DATABASE_URL: *database
-      MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
       MERIDIAN_INSTANCE_ID: street-1
+    volumes:
+      - secrets:/secrets:ro
 
   # The book of record (W9, contract v8): what an operations plugin writes,
   # and five roles read and hear.
   bor:
     <<: *runtime
-    command: ["meridian-bor"]
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        export MERIDIAN_BOR_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        exec meridian-bor
     depends_on: *serving
     environment:
-      MERIDIAN_BOR_DATABASE_URL: *database
-      MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
       MERIDIAN_INSTANCE_ID: bor-1
+    volumes:
+      - secrets:/secrets:ro
 
   instrument:
     <<: *runtime
-    command: ["meridian-instrument"]
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        export MERIDIAN_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        exec meridian-instrument
     depends_on: *serving
     environment:
-      MERIDIAN_DATABASE_URL: *database
-      MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
       MERIDIAN_INSTANCE_ID: instrument-1
+    volumes:
+      - secrets:/secrets:ro
 
   # No platform: its address resolves nowhere, which a conductor tolerates,
   # so nothing resolves and every row a plugin records names a placeholder.
@@ -176,17 +217,15 @@ services:
   # dashboard's local account below, made at its start.
   conductor:
     <<: *runtime
-    command: ["meridian-conductor"]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      nats:
-        condition: service_started
-      keys:
-        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        export MERIDIAN_CONFIG_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        exec meridian-conductor
+    depends_on: *serving
     environment:
-      MERIDIAN_CONFIG_DATABASE_URL: *database
-      MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
       MERIDIAN_PLATFORM_ADDRESS: http://no-platform.invalid
       MERIDIAN_DEPLOYMENT_ID: DEP-harness
       MERIDIAN_INSTANCE_ID: conductor-1
@@ -194,134 +233,84 @@ services:
       MERIDIAN_SETTINGS_KEY_DIR: /keys/settings
     volumes:
       - keys:/keys:ro
+      - secrets:/secrets:ro
 
   # A development deployment's dashboard (MERIDIAN_DEVELOPMENT): every page
   # says so, and a plugin's developer settings are shown and accepted. It
-  # holds the harness's one account, whose password is a harness-only test
-  # value; the hash below is of it, Argon2id at the dashboard's defaults.
+  # holds the harness's one account, made at its start from the hash `keys`
+  # drew this run, as the chart's dashboard is given first run's.
   dashboard:
     <<: *runtime
-    command: ["meridian-dashboard"]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      nats:
-        condition: service_started
-      keys:
-        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/dashboard-1); db=$$(cat /secrets/postgres)
+        hash=$$(cat /secrets/admin/hash)
+        export MERIDIAN_BROKER_URL=nats://dashboard-1:$$broker@nats:4222
+        export MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        export MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH="$$hash"
+        exec meridian-dashboard
+    depends_on: *serving
     environment:
-      MERIDIAN_BROKER_URL: nats://dashboard-1:dashboard-1-harness-only@nats:4222
       MERIDIAN_INSTANCE_ID: dashboard-1
       MERIDIAN_DASHBOARD_LISTEN: 0.0.0.0:8080
       MERIDIAN_DASHBOARD_URL: http://dashboard:8080
       MERIDIAN_DEVELOPMENT: "true"
       MERIDIAN_LOCAL_ACCOUNTS: "on"
-      MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL: *database
       MERIDIAN_LOCAL_ACCOUNT_NAME: harness
       MERIDIAN_LOCAL_ACCOUNT_DISPLAY_NAME: Harness Admin
-      MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH: $$argon2id$$v=19$$m=19456,t=2,p=1$$bRwFidvdsjyWKVRlZIcW/g$$iHiNbcC7a78/4w3nTa0eDCBs/ZlaVzjoGBGb+bCQi30
       MERIDIAN_PLUGIN_FRONT_DOOR: http://sidecar-{instance}:9292
       MERIDIAN_DASHBOARD_SIGNING_KEY_DIR: /keys/signing
     volumes:
       - keys:/keys:ro
-
-  # The plugin's sidecar, as instance plugin-1 holding the plugin's roles.
-  # No registration step: a sidecar with an instance and a broker credential
-  # is enough, and the conductor learns what the plugin declares from its
-  # report.
-  sidecar:
-    <<: *runtime
-    command: ["meridian-sidecar"]
-    depends_on:
-      nats:
-        condition: service_started
-      keys:
-        condition: service_completed_successfully
-    environment:
-      MERIDIAN_DEPLOYMENT_ID: DEP-harness
-      MERIDIAN_BROKER_URL: nats://plugin-1:plugin-1-harness-only@nats:4222
-      MERIDIAN_PLUGIN_INSTANCE_ID: plugin-1
-      MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_HARNESS_PLUGIN_ROLES?set MERIDIAN_HARNESS_PLUGIN_ROLES to the plugin's roles, comma separated}
-      MERIDIAN_INSTANCE_ID: sidecar-plugin-1
-      MERIDIAN_FRONT_DOOR_ADDRESS: 0.0.0.0:9292
-      MERIDIAN_DASHBOARD_KEYS_DIR: /keys/public
-    volumes:
-      - keys:/keys:ro
-    networks:
-      harness:
-        # The name the dashboard's front door address makes of the instance.
-        aliases: [sidecar-plugin-1]
-
-  # The plugin under test, in its sidecar's network namespace as a plugin is
-  # in its sidecar's pod. A plugin adds environment, a command or a volume
-  # with its own `-f` override of this service.
-  plugin:
-    image: ${MERIDIAN_HARNESS_PLUGIN_IMAGE:?set MERIDIAN_HARNESS_PLUGIN_IMAGE to the plugin's image}
-    depends_on:
-      sidecar:
-        condition: service_started
-    environment:
-      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
-    network_mode: "service:sidecar"
-
-  # A second plugin, beside the first, with the `second` profile: instance
-  # plugin-2 and its sidecar, its roles MERIDIAN_HARNESS_PLUGIN_2_ROLES. A
-  # plugin whose work is another's records -- an operations plugin
-  # reconciling what a custody plugin recorded -- runs that one here. The
-  # runner names it with `--instance plugin-2`. A plugin adds environment, a
-  # command or a volume with its own `-f` override of this service, as of
-  # `plugin`.
-  sidecar-2:
-    <<: *runtime
-    profiles: [second]
-    command: ["meridian-sidecar"]
-    depends_on:
-      nats:
-        condition: service_started
-      keys:
-        condition: service_completed_successfully
-    environment:
-      MERIDIAN_DEPLOYMENT_ID: DEP-harness
-      MERIDIAN_BROKER_URL: nats://plugin-2:plugin-2-harness-only@nats:4222
-      MERIDIAN_PLUGIN_INSTANCE_ID: plugin-2
-      MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_HARNESS_PLUGIN_2_ROLES:-}
-      MERIDIAN_INSTANCE_ID: sidecar-plugin-2
-      MERIDIAN_FRONT_DOOR_ADDRESS: 0.0.0.0:9292
-      MERIDIAN_DASHBOARD_KEYS_DIR: /keys/public
-    volumes:
-      - keys:/keys:ro
-    networks:
-      harness:
-        aliases: [sidecar-plugin-2]
-
-  plugin-2:
-    profiles: [second]
-    image: ${MERIDIAN_HARNESS_PLUGIN_2_IMAGE:-${MERIDIAN_HARNESS_PLUGIN_IMAGE}}
-    depends_on:
-      sidecar-2:
-        condition: service_started
-    environment:
-      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
-    network_mode: "service:sidecar-2"
+      - secrets:/secrets:ro
 
   # The runner: what a person would do in the dashboard, as the harness's
-  # admin. `run --rm runner <command>`; harness.py says the commands.
+  # admin, signing in with the password `keys` drew. `run --rm -T runner
+  # <command>`; harness.py says the commands. It acts on the first plugin
+  # plugins.yaml lists unless told `--instance`.
   runner:
     profiles: [runner]
     image: python:3.12-alpine
     entrypoint: ["python", "-u", "/harness/harness.py"]
     environment:
       MERIDIAN_HARNESS_DASHBOARD: http://dashboard:8080
-      MERIDIAN_HARNESS_INSTANCE: plugin-1
       MERIDIAN_HARNESS_ADMIN: harness
-      MERIDIAN_HARNESS_ADMIN_PASSWORD: Password1!
+      MERIDIAN_HARNESS_ADMIN_PASSWORD_FILE: /secrets/admin/password
     volumes:
       - ./harness.py:/harness/harness.py:ro
+      - secrets:/secrets:ro
+    networks: [harness]
+
+  # A store, printed by name as stable, sorted lines: `run --rm -T store
+  # street` or `store book` (README.md has their formats). Whoever reads a
+  # store here needs no database user, file or query of their own.
+  store:
+    profiles: [runner]
+    image: postgres:16-alpine
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        case "$${1:-}" in
+          street|book) ;;
+          *) echo "store takes the name of a store: street or book" >&2; exit 2 ;;
+        esac
+        PGPASSWORD=$$(cat /secrets/postgres)
+        export PGPASSWORD
+        exec psql -h postgres -U meridian -d meridian -At -v ON_ERROR_STOP=1 -f "/harness/$$1.sql"
+      - store
+    volumes:
+      - ./street.sql:/harness/street.sql:ro
+      - ./book.sql:/harness/book.sql:ro
+      - secrets:/secrets:ro
     networks: [harness]
 
 volumes:
   keys:
   broker:
+  secrets:
 
 networks:
   harness:
