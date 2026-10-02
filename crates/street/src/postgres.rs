@@ -30,9 +30,9 @@ use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
     from_statement_cursor, statement_cursor, Cause, Chain, Change, Collateral, Completed,
-    Completion, Cost, Counts, CustodialPosition, Direction, Figures, Holding, Identifier, Key, Lot,
-    Opened, Page, Read, Result, Scope, Settled, Side, Statement, StatementPage, StatementsRead,
-    Store, StoreError, PARTITION,
+    Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures, Holding,
+    Identifier, Key, Lot, Opened, Page, Read, Result, Scope, Settled, Side, Statement,
+    StatementPage, StatementsRead, Store, StoreError, PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -103,7 +103,8 @@ impl PostgresStore {
 const STATEMENT_COLUMNS: &str = "statement_id, source, external_statement_id, as_of_date,
         read_at_ns, expected_rows, account_id, external_account_id, institution,
         currency_assumed, completed_at_ns, completion_sequence, completion_previous,
-        cause_instance_id, cause_acting_for_subject, cause_correlation_id, cause_causation_id";
+        cause_instance_id, cause_acting_for_subject, cause_correlation_id, cause_causation_id,
+        security_interest";
 
 /// A custodial position's columns, in the order [`position_of`] reads them.
 const POSITION_COLUMNS: &str = "account_id, instrument_id, side, quantity::text,
@@ -128,8 +129,8 @@ impl Store for PostgresStore {
                 "INSERT INTO statement
                         (statement_id, source, external_statement_id, as_of_date, read_at_ns,
                          expected_rows, account_id, external_account_id, institution,
-                         currency_assumed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         currency_assumed, security_interest)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (source, external_statement_id) DO NOTHING",
                 &[
                     &statement.statement_id,
@@ -142,6 +143,7 @@ impl Store for PostgresStore {
                     &statement.external_account_id,
                     &statement.institution,
                     &statement.currency_assumed,
+                    &statement.security_interest,
                 ],
             )
             .map_err(unavailable)?;
@@ -243,7 +245,9 @@ impl Store for PostgresStore {
         let (margin_requirement, margin_requirement_currency) =
             money_columns(&holding.cost.margin_requirement);
         let settle_date_quantity = holding.settle_date_quantity.map(|q| q.to_string());
-        let parameters: [&(dyn ToSql + Sync); 19] = [
+        let available = holding.cost.available_quantity.map(|q| q.to_string());
+        let not_available = holding.cost.not_available_quantity.map(|q| q.to_string());
+        let parameters: [&(dyn ToSql + Sync); 22] = [
             &holding.holding_id,
             &holding.statement_id,
             &holding.account_id,
@@ -263,6 +267,9 @@ impl Store for PostgresStore {
             &average_cost_currency,
             &margin_requirement,
             &margin_requirement_currency,
+            &available,
+            &not_available,
+            &holding.cost.available_basis,
         ];
         tx.execute(
             "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
@@ -270,10 +277,12 @@ impl Store for PostgresStore {
                                   currency_assumed, escalated, identifiers, also_counted_in_cash,
                                   cost_basis, cost_basis_currency, average_cost,
                                   average_cost_currency, margin_requirement,
-                                  margin_requirement_currency)
+                                  margin_requirement_currency, available_quantity,
+                                  not_available_quantity, available_basis)
              VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7::text::numeric,
                      $8::text::numeric, $9, $10, $11, $12::text::jsonb, $13,
-                     $14::text::numeric, $15, $16::text::numeric, $17, $18::text::numeric, $19)",
+                     $14::text::numeric, $15, $16::text::numeric, $17, $18::text::numeric, $19,
+                     $20::text::numeric, $21::text::numeric, $22)",
             &parameters,
         )
         .map_err(unavailable)?;
@@ -290,6 +299,26 @@ impl Store for PostgresStore {
                     &cost,
                     &cost_currency,
                     &lot.acquired_date,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        for (ordinal, held) in holding.cost.encumbrances.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO holding_encumbrance (holding_id, ordinal, kind, quantity, available,
+                                                  source_code, pledgee, held_at, segment, detail)
+                 VALUES ($1, $2, $3, $4::text::numeric, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &holding.holding_id,
+                    &(ordinal as i32),
+                    &held.kind,
+                    &held.quantity.to_string(),
+                    &held.available,
+                    &held.source_code,
+                    &held.pledgee,
+                    &held.held_at,
+                    &held.segment,
+                    &held.detail,
                 ],
             )
             .map_err(unavailable)?;
@@ -798,7 +827,7 @@ fn insert_figures(tx: &mut Transaction<'_>, statement: &Statement) -> Result<()>
             let (after, after_currency) = money_columns(&balance.value_after_haircut);
             let haircut = balance.haircut.map(|haircut| haircut.to_string());
             let identifiers = to_json(&balance.unresolved_identifiers);
-            let parameters: [&(dyn ToSql + Sync); 13] = [
+            let parameters: [&(dyn ToSql + Sync); 14] = [
                 &statement.statement_id,
                 &figures.segment,
                 &(ordinal as i32),
@@ -812,14 +841,16 @@ fn insert_figures(tx: &mut Transaction<'_>, statement: &Statement) -> Result<()>
                 &after,
                 &after_currency,
                 &balance.held_at,
+                &balance.reusable,
             ];
             tx.execute(
                 "INSERT INTO statement_collateral
                         (statement_id, segment, ordinal, direction, instrument_id, identifiers,
                          quantity, value, value_currency, haircut, value_after_haircut,
-                         value_after_haircut_currency, held_at)
+                         value_after_haircut_currency, held_at, reusable)
                  VALUES ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::numeric,
-                         $8::text::numeric, $9, $10::text::numeric, $11::text::numeric, $12, $13)",
+                         $8::text::numeric, $9, $10::text::numeric, $11::text::numeric, $12, $13,
+                         $14)",
                 &parameters,
             )
             .map_err(unavailable)?;
@@ -860,7 +891,7 @@ fn figures_of(client: &mut impl GenericClient, statement_id: &str) -> Result<Vec
         .query(
             "SELECT segment, direction, instrument_id, identifiers::text, quantity::text,
                     value::text, value_currency, haircut::text, value_after_haircut::text,
-                    value_after_haircut_currency, held_at
+                    value_after_haircut_currency, held_at, reusable
                FROM statement_collateral WHERE statement_id = $1 ORDER BY segment, ordinal",
             &[&statement_id],
         )
@@ -881,6 +912,7 @@ fn figures_of(client: &mut impl GenericClient, statement_id: &str) -> Result<Vec
             haircut: reported_quantity_of(&row, 7)?,
             value_after_haircut: money_of(&row, 8, 9)?,
             held_at: row.get(10),
+            reusable: row.get(11),
         };
         if let Some(figures) = figures.iter_mut().find(|f| f.segment == segment) {
             figures.collateral.push(balance);
@@ -920,11 +952,58 @@ fn within(scope: &Scope) -> Option<Vec<String>> {
     }
 }
 
-/// Positions with the lots of the rows that last stated them, read in one go.
+/// Positions with the lots, sub-balances and available split of the rows that
+/// last stated them, read in one go.
 fn with_lots(client: &mut impl GenericClient, held: Vec<Held>) -> Result<Vec<CustodialPosition>> {
     let holding_ids: Vec<String> = held.iter().filter_map(|(_, id)| id.clone()).collect();
     let mut lots: std::collections::HashMap<String, Vec<Lot>> = std::collections::HashMap::new();
+    let mut encumbrances: std::collections::HashMap<String, Vec<Encumbrance>> =
+        std::collections::HashMap::new();
+    type Split = (Option<Quantity>, Option<Quantity>, i32);
+    let mut splits: std::collections::HashMap<String, Split> = std::collections::HashMap::new();
     if !holding_ids.is_empty() {
+        for row in client
+            .query(
+                "SELECT holding_id, kind, quantity::text, available, source_code, pledgee,
+                        held_at, segment, detail
+                   FROM holding_encumbrance WHERE holding_id = ANY($1)
+                  ORDER BY holding_id, ordinal",
+                &[&holding_ids],
+            )
+            .map_err(unavailable)?
+        {
+            encumbrances
+                .entry(row.get(0))
+                .or_default()
+                .push(Encumbrance {
+                    kind: row.get(1),
+                    quantity: quantity_of(&row, 2)?,
+                    available: row.get(3),
+                    source_code: row.get(4),
+                    pledgee: row.get(5),
+                    held_at: row.get(6),
+                    segment: row.get(7),
+                    detail: row.get(8),
+                });
+        }
+        for row in client
+            .query(
+                "SELECT holding_id, available_quantity::text, not_available_quantity::text,
+                        available_basis
+                   FROM holding WHERE holding_id = ANY($1)",
+                &[&holding_ids],
+            )
+            .map_err(unavailable)?
+        {
+            splits.insert(
+                row.get(0),
+                (
+                    reported_quantity_of(&row, 1)?,
+                    reported_quantity_of(&row, 2)?,
+                    row.get(3),
+                ),
+            );
+        }
         for row in client
             .query(
                 "SELECT holding_id, quantity::text, cost::text, cost_currency, acquired_date
@@ -943,8 +1022,18 @@ fn with_lots(client: &mut impl GenericClient, held: Vec<Held>) -> Result<Vec<Cus
     Ok(held
         .into_iter()
         .map(|(mut position, holding_id)| {
-            if let Some(found) = holding_id.and_then(|id| lots.remove(&id)) {
-                position.cost.lots = found;
+            if let Some(id) = holding_id {
+                if let Some(found) = lots.remove(&id) {
+                    position.cost.lots = found;
+                }
+                if let Some(found) = encumbrances.remove(&id) {
+                    position.cost.encumbrances = found;
+                }
+                if let Some((available, not_available, basis)) = splits.remove(&id) {
+                    position.cost.available_quantity = available;
+                    position.cost.not_available_quantity = not_available;
+                    position.cost.available_basis = basis;
+                }
             }
             position
         })
@@ -1150,6 +1239,7 @@ fn statement_of(row: &Row) -> Result<Statement> {
         institution: row.get(8),
         figures: Vec::new(),
         currency_assumed: row.get(9),
+        security_interest: row.get(17),
         completed: completed_at.map(|committed_at_ns| Completed {
             change: Change {
                 sequence: row.get::<_, i64>(11).max(0) as u64,
@@ -1186,6 +1276,10 @@ fn position_of(row: &Row) -> Result<Held> {
                 average_cost: money_of(row, 13, 14)?,
                 lots: Vec::new(),
                 margin_requirement: money_of(row, 15, 16)?,
+                available_quantity: None,
+                not_available_quantity: None,
+                available_basis: 0,
+                encumbrances: Vec::new(),
             },
             last_change: Change {
                 sequence: row.get::<_, i64>(17).max(0) as u64,

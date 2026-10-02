@@ -25,6 +25,33 @@ pub enum BusError {
     ShuttingDown,
 }
 
+/// How a component's refusal carries its reason code across the bus.
+///
+/// A handler answers with words, and where a plugin must tell its refusal
+/// apart from every other, a code from the typed-operations refusal catalogue
+/// beside them (meridian.v1.RefusalReason; spec/typed-sidecar-operations,
+/// section 7). The code rides at the front of the handler's words, in both
+/// the in-process path and the broker's refusal header, so neither path needs
+/// a second channel; the sidecar takes it off and sends it beside the
+/// status, and the words alone to the plugin (contract v8, open point 13 of
+/// sdk-contract/the-book-holds-positions). A refusal with no code is words
+/// alone, as every refusal was before.
+const REFUSAL_REASON_PREFIX: &str = "[refusal-reason ";
+
+/// A handler's refusal, carrying `reason` -- a meridian.v1.RefusalReason's
+/// number, never 0 -- beside its words.
+pub fn refusal(reason: i32, words: impl std::fmt::Display) -> String {
+    format!("{REFUSAL_REASON_PREFIX}{reason}] {words}")
+}
+
+/// A refusal's reason code and its words, where it carries one.
+pub fn read_refusal(detail: &str) -> Option<(i32, &str)> {
+    let rest = detail.strip_prefix(REFUSAL_REASON_PREFIX)?;
+    let (number, words) = rest.split_once("] ")?;
+    let reason: i32 = number.parse().ok()?;
+    (reason > 0).then_some((reason, words))
+}
+
 /// One message delivered to a subscriber.
 #[derive(Debug, Clone)]
 pub struct Delivery {
@@ -189,4 +216,26 @@ pub trait Backend: Send + Sync {
     /// are observable. A silent drop is indistinguishable from a message that
     /// was never sent.
     fn dropped(&self) -> u64;
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_carries_its_code_beside_its_words() {
+        let said = refusal(4, "ACC-1 has an opening balance standing");
+        assert_eq!(
+            read_refusal(&said),
+            Some((4, "ACC-1 has an opening balance standing"))
+        );
+    }
+
+    #[test]
+    fn words_alone_carry_no_code() {
+        assert_eq!(read_refusal("no statement STMT-1"), None);
+        // Nor does a code of 0, the unspecified reason, or one not a number.
+        assert_eq!(read_refusal("[refusal-reason 0] nothing"), None);
+        assert_eq!(read_refusal("[refusal-reason four] nothing"), None);
+    }
 }

@@ -70,10 +70,10 @@ spec:
       {{- end }}
       {{/*
         Each component migrates its own schema, in its own container, at the
-        version being released. Init containers for the configuration store and
-        the street store, and the instrument store's in the main one, so all
-        three must succeed for the release to proceed and the order is stated
-        rather than raced. The conductor's migration needs a database and no key.
+        version being released. Init containers for the configuration store,
+        the street store and the book, and the instrument store's in the main
+        one, so all must succeed for the release to proceed and the order is
+        stated rather than raced. The conductor's migration needs a database and no key.
       */}}
       initContainers:
         - name: conductor
@@ -129,6 +129,31 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.street.database.key | default .Values.database.key }}
+                  optional: true
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        - name: bor
+          image: "{{ .Values.image.repository }}:{{ .Values.bor.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-bor", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_BOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.borSecret | default .Values.migrate.existingSecret | default .Values.bor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.migrate.borKey | default .Values.bor.database.key | default (include "meridian-runtime.migrateKey" $) }}
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.bor.database.key | default .Values.database.key }}
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

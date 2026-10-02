@@ -21,6 +21,8 @@ target/
 .test-store.log
 .interop.log
 .interop.positions
+.e2e-book.before
+.e2e-book.after
 # Written by `make harness-check`: the harness copied out of the image, and
 # the street store it printed.
 .harness/

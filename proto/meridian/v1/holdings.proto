@@ -193,6 +193,12 @@ message RecordHoldingsStatementRequest {
   // it: the brokerage behind an aggregator, or the venue itself for a
   // direct connector. Empty where it does not say.
   string institution = 13;
+
+  // The account servicer holds a lien or a right of set-off over the
+  // account, as the statement reports it; unset where it does not say
+  // (contract v8; reference/encumbrance-survey). Not an encumbrance: it
+  // reduces no holding's available quantity.
+  optional bool security_interest = 14;
 }
 
 // A statement's figures for one margin segment, each as the venue reported
@@ -247,6 +253,11 @@ message ReportedCollateral {
   // Where it is held, as the venue names it: the FCM, the dealer, a
   // third-party custodian. Empty where it does not say.
   string held_at = 8;
+
+  // Whether the receiver may reuse it, as the agreement states and the venue
+  // reports it; unset where it does not say (contract v8). Received
+  // collateral is never a position (Q13), reusable or not.
+  optional bool reusable = 9;
 }
 
 // Whether a collateral balance was posted by the account or received by it.
@@ -355,10 +366,91 @@ message RecordHoldingRequest {
   // quantity or a multiplier (Q-A, 2026-10-01).
   optional Money average_cost = 18;
 
+  // Available and not, each as the source reports it, never derived from
+  // the other or from the quantity, unset where the source gives none --
+  // never zero, never the holding's quantity (W2.3; contract v8;
+  // reference/encumbrance-survey): the statement's AVAI and NAVL, a venue's
+  // order-netted figure with its basis saying so.
+  optional Decimal available_quantity = 19;
+  optional Decimal not_available_quantity = 20;
+  AvailableBasis available_basis = 21;
+
+  // Each sub-balance the source reports as encumbered, one per kind,
+  // location and pledgee; empty means none reported, not none held.
+  repeated ReportedEncumbrance encumbrances = 22;
+
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
   reserved 5, 6, 7;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// What a source's available figure is net of.
+enum AvailableBasis {
+  // The source does not say.
+  AVAILABLE_BASIS_UNSPECIFIED = 0;
+  AVAILABLE_BASIS_SETTLED = 1;
+  AVAILABLE_BASIS_TRADED = 2;
+  AVAILABLE_BASIS_CONTRACTUAL = 3;
+  // A venue's figure net of its open orders (Alpaca's qty_available,
+  // Binance's free): the order reservation is the oms's, never an
+  // encumbrance.
+  AVAILABLE_BASIS_ORDER_NETTED = 4;
+}
+
+// Why some of a holding cannot move (reference/encumbrance-survey, 3.1).
+// Pending settlement stays in the settlement buckets: PENDING, like
+// REHYPOTHECATED and BORROWED, is the street's, for the statement's own
+// consistency, and the book holds none of the three.
+enum EncumbranceKind {
+  // Not said. Refused: a sub-balance says which it is.
+  ENCUMBRANCE_KIND_UNSPECIFIED = 0;
+  // Pledged in place to a pledgee (PLED).
+  ENCUMBRANCE_KIND_PLEDGED = 1;
+  // Delivered to a third party as collateral (COLO).
+  ENCUMBRANCE_KIND_POSTED = 2;
+  // Lent (LOAN).
+  ENCUMBRANCE_KIND_ON_LOAN = 3;
+  // Blocked for a stated purpose (BLOK, BLCA, BLOT, BLOV).
+  ENCUMBRANCE_KIND_BLOCKED = 4;
+  // Movable only under conditions or with documents (RSTR, WDOC).
+  ENCUMBRANCE_KIND_RESTRICTED = 5;
+  // Between depositories, agents or registers (TRAN, REGO, BTRA).
+  ENCUMBRANCE_KIND_IN_TRANSIT = 6;
+  // A sub-balance the plugin cannot map: its source_code required.
+  ENCUMBRANCE_KIND_OTHER = 7;
+  // The street's only: as reported, for the consistency check.
+  ENCUMBRANCE_KIND_PENDING = 8;
+  // The street's only: used by the broker under a right of use; it does not
+  // reduce the available quantity.
+  ENCUMBRANCE_KIND_REHYPOTHECATED = 9;
+  // The street's only: borrowed, title to us, with a return obligation.
+  ENCUMBRANCE_KIND_BORROWED = 10;
+}
+
+// One sub-balance of a holding, as the source reports it.
+message ReportedEncumbrance {
+  EncumbranceKind kind = 1;
+  // Signed as the holding's quantity. Larger than the holding is recorded
+  // as reported: the custodian's data, which the reconciliation flags.
+  Decimal quantity = 2;
+  // Whether the source reports it available; unset where it does not say,
+  // since the kind does not imply it.
+  optional bool available = 3;
+  // The source's own code or label, verbatim ("PLED"); required for OTHER.
+  string source_code = 4;
+  // To whom it is pledged, posted or lent, as reported (a name, a BIC or an
+  // LEI); empty where not stated.
+  string pledgee = 5;
+  // The safekeeping place or third party holding it, as reported; empty
+  // where not stated.
+  string held_at = 6;
+  // The margin segment it is under where the source names one, as the venue
+  // names it; with the holding's external account, a margin agreement's key.
+  // Empty otherwise: a custody statement never names one.
+  string segment = 7;
+  // The source's narrative; empty where none.
+  string detail = 8;
 }
 
 // One lot of a holding, as the custodian lists it.
@@ -432,6 +524,9 @@ message StatementRecordedEvent {
   // from a plugin before v7.
   string external_account_id = 13;
   string institution = 14;
+
+  // As the statement reported it (contract v8).
+  optional bool security_interest = 15;
 }
 
 // A custodial position that changed, and the statement that changed it.
@@ -511,6 +606,12 @@ message CustodialPosition {
 
   // As on RecordHoldingRequest (Q-A).
   Money average_cost = 19;
+
+  // As on RecordHoldingRequest, from the row that last stated this.
+  Decimal available_quantity = 20;
+  Decimal not_available_quantity = 21;
+  AvailableBasis available_basis = 22;
+  repeated ReportedEncumbrance encumbrances = 23;
 
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).

@@ -92,6 +92,10 @@ pub enum StoreError {
     #[error("{0}")]
     Figures(String),
 
+    /// A holding's sub-balance that cannot stand as sent (W2.3, v8).
+    #[error("{0}")]
+    Encumbrance(String),
+
     /// A quantity or an amount outside what the wire carries, named.
     #[error(transparent)]
     OutOfRange(#[from] Refused),
@@ -220,6 +224,10 @@ pub struct Statement {
     /// its own stated assumption.
     pub currency_assumed: bool,
 
+    /// The account servicer's lien or right of set-off over the account, as
+    /// reported; absent where the statement does not say (contract v8).
+    pub security_interest: Option<bool>,
+
     /// Set once, when the statement completed (W2.5): the change, who caused
     /// it and when.
     pub completed: Option<Completed>,
@@ -266,6 +274,8 @@ pub struct Collateral {
     pub haircut: Option<Quantity>,
     pub value_after_haircut: Option<Money>,
     pub held_at: String,
+    /// Whether the receiver may reuse it, as reported (contract v8).
+    pub reusable: Option<bool>,
 }
 
 /// Whether collateral was posted by the account or received by it.
@@ -302,6 +312,22 @@ pub struct Lot {
     pub acquired_date: String,
 }
 
+/// One encumbered sub-balance of a holding, as the source reports it (W2.3,
+/// contract v8; reference/encumbrance-survey): its kind as the wire numbers
+/// it, its quantity signed as the holding's, and the rest each empty or
+/// absent where the source does not say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Encumbrance {
+    pub kind: i32,
+    pub quantity: Quantity,
+    pub available: Option<bool>,
+    pub source_code: String,
+    pub pledgee: String,
+    pub held_at: String,
+    pub segment: String,
+    pub detail: String,
+}
+
 /// What the custodian reported of a holding's cost and margin, each absent
 /// where it reported none and never derived (W2.3; Q-A).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -312,6 +338,14 @@ pub struct Cost {
     pub average_cost: Option<Money>,
     pub lots: Vec<Lot>,
     pub margin_requirement: Option<Money>,
+    /// Available and not, with what the available figure is net of, and
+    /// each encumbered sub-balance, all as reported, none derived (the product
+    /// owner, 2026-10-01). Kept with the lots, on the row that last stated the
+    /// position.
+    pub available_quantity: Option<Quantity>,
+    pub not_available_quantity: Option<Quantity>,
+    pub available_basis: i32,
+    pub encumbrances: Vec<Encumbrance>,
 }
 
 /// Which side of an instrument a holding or a position is on.

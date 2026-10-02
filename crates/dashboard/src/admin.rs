@@ -51,6 +51,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin", get(admin_page))
         .route("/admin/accounts", post(define_account))
         .route("/admin/accounts/close", post(close_account))
+        .route("/admin/accounts/book", post(set_book))
         .route("/admin/user-groups", post(define_user_group))
         .route("/admin/account-groups", post(define_account_group))
         .route("/admin/access-groups", post(define_access_group))
@@ -371,6 +372,7 @@ fn token_input(session: &Session) -> String {
 
 // ── The overview ────────────────────────────────────────────────────────────
 
+mod books;
 mod overview;
 pub mod people;
 mod picker;
@@ -451,11 +453,13 @@ async fn admin_page(
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
     let people = people_known(&app, &records, &holders).await;
+    let books = books::read(&app.bus).await;
     let body = overview::render(
         &records,
         &holders,
         &lines,
         &people,
+        &books,
         &token_input(&session),
         &notice,
     );
@@ -770,6 +774,47 @@ async fn define_account(
         )
         .await
         .map(|_| ())
+    })
+}
+
+/// W9.13: an account's attributes in the book, for a deployment admin, each
+/// one that changed its own act with the reason given.
+async fn set_book(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    admin_form!(app, headers, fields, session, {
+        let account_id = field(&fields, "account_id");
+        match books::read(&app.bus).await {
+            books::Books::NotAnswering(why) => {
+                Err(format!("the book of record is not answering: {why}"))
+            }
+            books::Books::Read(held) => {
+                let held = held.iter().find(|a| a.account_id == account_id);
+                match books::requests(
+                    account_id,
+                    field(&fields, "base_currency_code"),
+                    field(&fields, "lot_relief_default"),
+                    field(&fields, "reason"),
+                    held,
+                ) {
+                    Err(sentence) => Err(sentence),
+                    Ok(asked) => {
+                        let mut outcome = Ok(());
+                        for request in asked {
+                            if let Err(refused) =
+                                books::set(&app.bus, &session.subject, request).await
+                            {
+                                outcome = Err(refused);
+                                break;
+                            }
+                        }
+                        outcome
+                    }
+                }
+            }
+        }
     })
 }
 

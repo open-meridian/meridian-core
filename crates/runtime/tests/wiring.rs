@@ -510,10 +510,34 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
     assert!(!dashboard.may_publish(meridian_street::service::RECORD_HOLDING));
 
+    // The book (W9, contract v8): operations writes it; portfolio, reporting,
+    // compliance and oms read and hear it and write nothing; oms hears no
+    // figures (open point 12); none but operations reads the street.
+    let operations = contract.grants_for(&roles(&["operations"])).unwrap();
+    assert!(operations.may_publish(meridian_bor::service::RECORD_OPENING_BALANCE));
+    assert!(operations.may_publish(meridian_bor::service::RESOLVE_BREAK));
+    assert!(operations.may_publish(meridian_bor::service::CLOSE_BREAKS_AS_CLEARED));
+    assert!(operations.may_publish(meridian_bor::service::RECORD_ENCUMBRANCES));
+    assert!(operations.may_subscribe(meridian_bor::service::BREAK_CHANGED));
+    let oms = contract.grants_for(&roles(&["oms"])).unwrap();
+    assert!(oms.may_publish(meridian_bor::service::LIST_POSITIONS));
+    assert!(oms.may_subscribe(meridian_bor::service::POSITION_CHANGED));
+    assert!(!oms.may_subscribe(meridian_bor::service::ACCOUNT_FIGURES_RECORDED));
+    assert!(!oms.may_publish(meridian_bor::service::RECORD_BREAK));
+    let portfolio = contract.grants_for(&roles(&["portfolio"])).unwrap();
+    assert!(!portfolio.may_publish(meridian_bor::service::RESOLVE_BREAK));
+    assert!(!portfolio.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
+    let book = contract.component("bor");
+    assert!(book.may_publish(meridian_bor::service::POSITION_CHANGED));
+    assert!(book.may_subscribe(meridian_bor::service::RECORD_OPENING_BALANCE));
+    // The attributes are set from the dashboard, for a deployment admin.
+    assert!(dashboard.may_publish(meridian_bor::service::SET_ACCOUNT_ATTRIBUTE));
+    assert!(!operations.may_publish(meridian_bor::service::SET_ACCOUNT_ATTRIBUTE));
+
     // Several roles hold the union; a role the contract gives nothing holds
     // nothing, and adds nothing to another.
-    let with_oms = contract.grants_for(&roles(&["custody", "oms"])).unwrap();
-    assert_eq!(with_oms, custody);
+    let with_ems = contract.grants_for(&roles(&["custody", "ems"])).unwrap();
+    assert_eq!(with_ems, custody);
 
     // Denial is by refusal for a name that is not a role, never by granting it
     // nothing and letting it register.

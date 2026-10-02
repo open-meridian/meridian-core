@@ -549,6 +549,7 @@ mod tests {
                     institution: String::new(),
                     figures: Vec::new(),
                     currency_assumed: false,
+                    security_interest: None,
                     completed: None,
                 },
                 &Cause::default(),

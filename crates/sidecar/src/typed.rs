@@ -530,7 +530,14 @@ pub(crate) fn refused(failed: BusError) -> Status {
     match failed {
         BusError::NoHandler(topic) => Status::unavailable(format!("nothing serves {topic}")),
         timeout @ BusError::Timeout { .. } => Status::deadline_exceeded(timeout.to_string()),
-        BusError::HandlerFailed { detail, .. } => Status::aborted(detail),
+        // A component's refusal of its own (W9's book, contract v8), its
+        // reason code carried beside the status and its words alone in it.
+        BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
+            .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
+        {
+            Some((reason, words)) => refused_for(Code::Aborted, words.to_string(), reason),
+            None => Status::aborted(detail),
+        },
         BusError::NotPublishable(topic) => {
             Status::invalid_argument(format!("`{topic}` is not a publishable topic"))
         }

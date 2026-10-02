@@ -1807,6 +1807,2241 @@ pub struct Money {
     #[prost(string, tag = "2")]
     pub currency_code: ::prost::alloc::string::String,
 }
+/// Where a change sits in its store's record (spec/plugins-hear-and-read, Q1
+/// as clarified 2026-10-01).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JournalRef {
+    /// The partition the change was made in: the street store's one, or a
+    /// book partition.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// Its number there: the partition's next, taken in the change's own
+    /// transaction, so the numbers have no holes.
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    /// The number of the previous change the same row made for the same
+    /// account, 0 for its first: what a plugin hearing only some accounts
+    /// checks for a gap in its own.
+    #[prost(uint64, tag = "3")]
+    pub previous_sequence: u64,
+}
+/// Who caused a change, as the store recorded it when it committed (Q3).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChangeCause {
+    /// The instance that sent the command, as its sidecar stamped it.
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// The person it was sent for (W4.9); empty when the plugin acted as itself.
+    #[prost(string, tag = "2")]
+    pub acting_for_subject: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub correlation_id: ::prost::alloc::string::String,
+    /// The command's message_id.
+    #[prost(string, tag = "4")]
+    pub causation_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub committed_at_ns: i64,
+}
+/// A point in a store's record: a sequence per partition. What a read
+/// answers it was read at, and what a read of changes since takes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Watermark {
+    #[prost(message, repeated, tag = "1")]
+    pub partitions: ::prost::alloc::vec::Vec<PartitionSequence>,
+}
+/// One partition's sequence within a watermark.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionSequence {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+}
+/// How fresh a connected account's data is, as reported by the rail.
+///
+/// And why, when it is not current. Published so an operator can tell stale
+/// data from absent data, which look identical on a holdings screen and mean
+/// completely different things. And "unhealthy" alone cannot say whose fix it
+/// is: a connection that needs a person to sign in again, one somebody
+/// disabled, and one that is a day late by design look the same as a flag and
+/// ask for three different things.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SyncStatusEvent {
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    /// The account the external account is linked to (W6.4), set by the sidecar.
+    /// Empty when it is not linked.
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    /// When the rail last successfully synced this account from the institution.
+    /// Not when the data is as of: a venue a day late by design syncs today what
+    /// was true yesterday, which the two fields below say.
+    #[prost(int64, tag = "3")]
+    pub last_synced_at_ns: i64,
+    /// Whether the rail currently considers the connection healthy. A false here
+    /// with a recent last_synced_at_ns means the data is good but the connection
+    /// has since broken. `state` says why.
+    #[prost(bool, tag = "4")]
+    pub connection_healthy: bool,
+    /// Rail-supplied text, for whatever `state` does not say. Diagnostic only;
+    /// nothing branches on it.
+    #[prost(string, tag = "5")]
+    pub status_detail: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub observed_at_ns: i64,
+    /// The account as the rail knows it, which the sidecar translates.
+    #[prost(string, tag = "7")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// Whether the data is current, and if not, why: which is also whose fix it
+    /// is and what the dashboard tells a deployment admin to do.
+    #[prost(enumeration = "SyncState", tag = "8")]
+    pub state: i32,
+    /// When the holdings the rail serves are as of, and when the history
+    /// (transactions) is. Separately, because venues keep them apart and a
+    /// connection can have one current and the other not: SnapTrade reports
+    /// holdings to the minute and transactions by the day. Zero where the rail
+    /// does not say.
+    #[prost(int64, tag = "9")]
+    pub holdings_as_of_ns: i64,
+    #[prost(int64, tag = "10")]
+    pub history_as_of_ns: i64,
+}
+/// Open one statement: the connector's snapshot of one account, at one moment.
+///
+/// A statement is the connector's, not the venue's: none of the eight venues
+/// surveyed has a statement of its own, and every one gives a live snapshot.
+/// So the connector reads an account, and what it read is a statement.
+///
+/// Two dates, and they are not the same thing. `as_of_date` is the date the
+/// positions reflect. `read_at_ns` is when the connector fetched them. A
+/// statement read this morning may be as of yesterday's close, and conflating
+/// the two is how stale data passes for current.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordHoldingsStatementRequest {
+    /// The rail namespace, e.g. "snaptrade".
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    /// The connector's identifier for this snapshot, made from the account it
+    /// read and the time it read it, so the same read sent twice has the same
+    /// one. Used to recognise a redelivery of the same statement.
+    #[prost(string, tag = "2")]
+    pub external_statement_id: ::prost::alloc::string::String,
+    /// ISO 8601 date the positions are as of.
+    #[prost(string, tag = "3")]
+    pub as_of_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub read_at_ns: i64,
+    /// How many holding rows will follow, per W2.2.
+    ///
+    /// The only thing that marks the end of a statement. Nothing else in the
+    /// sequence does: rows arrive as separate messages and none of them is
+    /// distinguishable as the last. The kernel closes the statement when this many
+    /// have landed, and a statement whose rows never all arrive stays open rather
+    /// than publishing counts that are wrong.
+    ///
+    /// The connector holds the whole list before it publishes any of it, so it
+    /// knows this without reading anything twice.
+    #[prost(int32, tag = "5")]
+    pub expected_rows: i32,
+    /// Superseded from contract v7 by `figures` (W2.2): read from a plugin
+    /// before v7 as the set with no segment, refused from one at v7 sent
+    /// beside `figures`. Kept, never reused.
+    #[prost(message, optional, tag = "6")]
+    pub buying_power: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "7")]
+    pub margin_requirement: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "8")]
+    pub maintenance_excess: ::core::option::Option<Money>,
+    /// True when the venue stated no currency for the figures and the
+    /// connector's is its own stated assumption (E*TRADE's balances carry none),
+    /// rather than something the venue said. Of every set in `figures`.
+    #[prost(bool, tag = "9")]
+    pub currency_assumed: bool,
+    /// The account as the rail knows it; the sidecar sets account_id from its
+    /// link and refuses the statement when there is none (stamped.tsv). A
+    /// statement is one account's, and a row naming another is refused.
+    #[prost(string, tag = "10")]
+    pub external_account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub account_id: ::prost::alloc::string::String,
+    /// One set per margin segment the venue reports (Q6, Q12); no two name
+    /// the same segment. Never derived: a figure computed here from the
+    /// holdings would be ours presented as the custodian's, and margin is
+    /// where that difference costs money.
+    #[prost(message, repeated, tag = "12")]
+    pub figures: ::prost::alloc::vec::Vec<StatementFigures>,
+    /// The institution holding the external account, as the connector names
+    /// it: the brokerage behind an aggregator, or the venue itself for a
+    /// direct connector. Empty where it does not say.
+    #[prost(string, tag = "13")]
+    pub institution: ::prost::alloc::string::String,
+    /// The account servicer holds a lien or a right of set-off over the
+    /// account, as the statement reports it; unset where it does not say
+    /// (contract v8; reference/encumbrance-survey). Not an encumbrance: it
+    /// reduces no holding's available quantity.
+    #[prost(bool, optional, tag = "14")]
+    pub security_interest: ::core::option::Option<bool>,
+}
+/// A statement's figures for one margin segment, each as the venue reported
+/// it and unset where it reported none; never derived.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StatementFigures {
+    /// The segment as the venue names it, verbatim ("securities",
+    /// "commodities", an FCM's class); empty for the account as a whole.
+    #[prost(string, tag = "1")]
+    pub segment: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub buying_power: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "3")]
+    pub margin_requirement: ::core::option::Option<Money>,
+    /// Negative is a deficit.
+    #[prost(message, optional, tag = "4")]
+    pub maintenance_excess: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "5")]
+    pub initial_margin: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "6")]
+    pub variation_margin: ::core::option::Option<Money>,
+    /// A brokerage's own total account value, as it reports it (Q-B); never a
+    /// sum of the holdings.
+    #[prost(message, optional, tag = "7")]
+    pub net_liquidation: ::core::option::Option<Money>,
+    /// The collateral held under this segment, as reported (W2.2; Q12, Q13).
+    /// A balance moves nothing: posted collateral the custodian also lists as a
+    /// holding is a holding row too, and collateral received under a security
+    /// interest is never one.
+    #[prost(message, repeated, tag = "8")]
+    pub collateral: ::prost::alloc::vec::Vec<ReportedCollateral>,
+}
+/// One collateral balance under a margin segment, each field as the venue
+/// reports it and unset where it does not; never derived.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportedCollateral {
+    /// Posted by the account, or received by it. Unspecified is refused.
+    #[prost(enumeration = "CollateralDirection", tag = "1")]
+    pub direction: i32,
+    /// Resolved as a holding's instrument is (W3.1): an instrument or the
+    /// deployment's placeholder, the currency's cash instrument for cash; or,
+    /// when the resolve was ambiguous, the identifiers the connector held.
+    /// Exactly one of the two, as on RecordHoldingRequest.
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(message, optional, tag = "4")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "5")]
+    pub value: ::core::option::Option<Money>,
+    /// A fraction of the value: 0.15 is 15%, a venue's percentage written as
+    /// its fraction.
+    #[prost(message, optional, tag = "6")]
+    pub haircut: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "7")]
+    pub value_after_haircut: ::core::option::Option<Money>,
+    /// Where it is held, as the venue names it: the FCM, the dealer, a
+    /// third-party custodian. Empty where it does not say.
+    #[prost(string, tag = "8")]
+    pub held_at: ::prost::alloc::string::String,
+    /// Whether the receiver may reuse it, as the agreement states and the venue
+    /// reports it; unset where it does not say (contract v8). Received
+    /// collateral is never a position (Q13), reusable or not.
+    #[prost(bool, optional, tag = "9")]
+    pub reusable: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordHoldingsStatementReply {
+    /// Kernel-assigned. Every row references it.
+    #[prost(string, tag = "1")]
+    pub statement_id: ::prost::alloc::string::String,
+    /// True when this statement had already been recorded and the existing one is
+    /// being returned. Makes redelivery a no-op rather than a duplicate.
+    #[prost(bool, tag = "2")]
+    pub already_recorded: bool,
+}
+/// One holding, for one account, at one instrument, on one side.
+///
+/// Either `instrument_id` is set, meaning the connector resolved it (to an
+/// instrument, or to the deployment's LCL- placeholder when nothing matched),
+/// or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
+/// both, and never neither. A row that could not be resolved is still recorded, because a
+/// dropped holding is invisible and an operator comparing against their
+/// brokerage would find a silent discrepancy with nothing to investigate.
+///
+/// Cash is a holding like any other: of the currency's cash instrument, which
+/// the identifier scheme `iso4217` names ({scheme: iso4217, value: USD}), its
+/// quantity the cash the venue reports in that currency. A crypto asset held as
+/// cash, such as USDC at Coinbase, is a holding of that asset's instrument.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordHoldingRequest {
+    #[prost(string, tag = "1")]
+    pub statement_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Set when resolution succeeded.
+    #[prost(string, tag = "3")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// Set when it did not: everything the connector held, so an operator can see
+    /// exactly what could not be accounted for.
+    #[prost(message, repeated, tag = "4")]
+    pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// The trade-date quantity: what is held counting every trade executed,
+    /// settled or not. Required. Signed to match `side`: negative is short.
+    #[prost(message, optional, tag = "9")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The rail's valuation of the holding, in its currency. Recorded as
+    /// reported, not recomputed: this is the custodian's belief, and rederiving it
+    /// would discard the thing that makes a later comparison meaningful. Unset
+    /// where the venue reported none (SnapTrade and Kalshi do not), which is not
+    /// a value of zero.
+    #[prost(message, optional, tag = "10")]
+    pub market_value: ::core::option::Option<Money>,
+    /// The account as the rail knows it. The connector sets this and leaves
+    /// `account_id` empty; the sidecar sets `account_id` from the link in the
+    /// connector's settings (W6.4), and refuses the row, with that reason, when
+    /// there is none. Refused is not dropped: the external account is reported
+    /// unlinked, and the next statement after it is linked records it (W2).
+    #[prost(string, tag = "8")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// Long or short, stated rather than read off the sign, and the quantity's
+    /// sign matches it. A venue that reports an account's long and short of one
+    /// instrument apart (Schwab) sends two rows, one on each side; one that
+    /// reports a signed number (E*TRADE, Kalshi) sends the side its sign means.
+    /// A Kalshi NO position is a short row of the market's one contract.
+    #[prost(enumeration = "HoldingSide", tag = "11")]
+    pub side: i32,
+    /// The settle-date quantity: what is held counting only settled trades,
+    /// where the venue reports it, and unset where it does not. For cash, the
+    /// settled cash.
+    #[prost(message, optional, tag = "12")]
+    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// True when the venue stated no currency and the one here is the
+    /// connector's stated assumption (E*TRADE, Schwab and Public state none),
+    /// rather than something the venue said: the market value's currency, and
+    /// for cash the currency whose cash instrument the row names. A
+    /// pseudo-currency such as Interactive Brokers' BASE is never one.
+    #[prost(bool, tag = "13")]
+    pub currency_assumed: bool,
+    /// This position's value is also included in the account's cash holding as
+    /// the venue reports it: SnapTrade counts a money-market fund in cash and
+    /// lists it as a position too. The street store keeps both as reported; a
+    /// reader counting the account once counts the fund as a position and
+    /// deducts it from cash.
+    #[prost(bool, tag = "14")]
+    pub also_counted_in_cash: bool,
+    /// As the venue reports them, unset or empty where it reports none, never
+    /// derived (W2.3; sdk-contract/a-holding-carries-its-cost). The holding's
+    /// total cost.
+    #[prost(message, optional, tag = "15")]
+    pub cost_basis: ::core::option::Option<Money>,
+    /// Its lots as the custodian lists them; none is not one lot, and lots
+    /// whose quantities do not sum to the holding's are recorded as reported.
+    #[prost(message, repeated, tag = "16")]
+    pub lots: ::prost::alloc::vec::Vec<ReportedLot>,
+    #[prost(message, optional, tag = "17")]
+    pub margin_requirement: ::core::option::Option<Money>,
+    /// The venue's average cost per unit, in the venue's unit (SnapTrade: per
+    /// share, for an option whose quantity counts contracts). Never computed
+    /// from cost_basis, nor cost_basis from it: nothing multiplies it by the
+    /// quantity or a multiplier (Q-A, 2026-10-01).
+    #[prost(message, optional, tag = "18")]
+    pub average_cost: ::core::option::Option<Money>,
+    /// Available and not, each as the source reports it, never derived from
+    /// the other or from the quantity, unset where the source gives none --
+    /// never zero, never the holding's quantity (W2.3; contract v8;
+    /// reference/encumbrance-survey): the statement's AVAI and NAVL, a venue's
+    /// order-netted figure with its basis saying so.
+    #[prost(message, optional, tag = "19")]
+    pub available_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "20")]
+    pub not_available_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(enumeration = "AvailableBasis", tag = "21")]
+    pub available_basis: i32,
+    /// Each sub-balance the source reports as encumbered, one per kind,
+    /// location and pledgee; empty means none reported, not none held.
+    #[prost(message, repeated, tag = "22")]
+    pub encumbrances: ::prost::alloc::vec::Vec<ReportedEncumbrance>,
+}
+/// One sub-balance of a holding, as the source reports it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportedEncumbrance {
+    #[prost(enumeration = "EncumbranceKind", tag = "1")]
+    pub kind: i32,
+    /// Signed as the holding's quantity. Larger than the holding is recorded
+    /// as reported: the custodian's data, which the reconciliation flags.
+    #[prost(message, optional, tag = "2")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Whether the source reports it available; unset where it does not say,
+    /// since the kind does not imply it.
+    #[prost(bool, optional, tag = "3")]
+    pub available: ::core::option::Option<bool>,
+    /// The source's own code or label, verbatim ("PLED"); required for OTHER.
+    #[prost(string, tag = "4")]
+    pub source_code: ::prost::alloc::string::String,
+    /// To whom it is pledged, posted or lent, as reported (a name, a BIC or an
+    /// LEI); empty where not stated.
+    #[prost(string, tag = "5")]
+    pub pledgee: ::prost::alloc::string::String,
+    /// The safekeeping place or third party holding it, as reported; empty
+    /// where not stated.
+    #[prost(string, tag = "6")]
+    pub held_at: ::prost::alloc::string::String,
+    /// The margin segment it is under where the source names one, as the venue
+    /// names it; with the holding's external account, a margin agreement's key.
+    /// Empty otherwise: a custody statement never names one.
+    #[prost(string, tag = "7")]
+    pub segment: ::prost::alloc::string::String,
+    /// The source's narrative; empty where none.
+    #[prost(string, tag = "8")]
+    pub detail: ::prost::alloc::string::String,
+}
+/// One lot of a holding, as the custodian lists it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportedLot {
+    /// Signed as the holding's quantity: negative is short.
+    #[prost(message, optional, tag = "1")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The lot's total cost, unset where not reported; its sign as reported,
+    /// never flipped (Q-D, 2026-10-01).
+    #[prost(message, optional, tag = "2")]
+    pub cost: ::core::option::Option<Money>,
+    /// ISO 8601; empty where not reported.
+    #[prost(string, tag = "3")]
+    pub acquired_date: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordHoldingReply {
+    #[prost(string, tag = "1")]
+    pub holding_id: ::prost::alloc::string::String,
+    /// True when the row carried an instrument and updated a position. False for
+    /// an unresolved row, which updates nothing, because there is no position to
+    /// update until the deployment knows what it holds.
+    #[prost(bool, tag = "2")]
+    pub resolved: bool,
+}
+/// A statement is complete.
+///
+/// The unresolved count is the number an operator actually watches; a statement
+/// that is complete and fully resolved is the only quiet outcome.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StatementRecordedEvent {
+    #[prost(string, tag = "1")]
+    pub statement_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub as_of_date: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub rows_received: i32,
+    #[prost(int32, tag = "5")]
+    pub rows_resolved: i32,
+    #[prost(int32, tag = "6")]
+    pub rows_unresolved: i32,
+    #[prost(int64, tag = "7")]
+    pub recorded_at_ns: i64,
+    /// The account the statement is of: its external account's, or, from a
+    /// plugin before v7, its rows' (W2.2).
+    #[prost(string, tag = "8")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The statement's figures as recorded, one set per segment (W2.2).
+    #[prost(message, repeated, tag = "9")]
+    pub figures: ::prost::alloc::vec::Vec<StatementFigures>,
+    #[prost(bool, tag = "10")]
+    pub currency_assumed: bool,
+    /// The completion's number in the street's partition, chained per account
+    /// with the statements before it, and who caused it: the row whose landing
+    /// completed it (W2.5, W4.3).
+    #[prost(message, optional, tag = "11")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "12")]
+    pub cause: ::core::option::Option<ChangeCause>,
+    /// The account as the rail knows it, and the institution holding it, as
+    /// the statement named them: with the source and a segment, what a margin
+    /// agreement is keyed by and an opening balance names as its source. Empty
+    /// from a plugin before v7.
+    #[prost(string, tag = "13")]
+    pub external_account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "14")]
+    pub institution: ::prost::alloc::string::String,
+    /// As the statement reported it (contract v8).
+    #[prost(bool, optional, tag = "15")]
+    pub security_interest: ::core::option::Option<bool>,
+}
+/// A custodial position that changed, and the statement that changed it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CustodialPositionUpdatedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub position: ::core::option::Option<CustodialPosition>,
+    /// The statement that caused this. Lets a reader explain any position by
+    /// pointing at what produced it.
+    #[prost(string, tag = "2")]
+    pub statement_id: ::prost::alloc::string::String,
+    /// The previous quantity, so a subscriber can render a delta without holding
+    /// its own history.
+    #[prost(message, optional, tag = "4")]
+    pub previous_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The change's number in the street's partition, chained per account with
+    /// the positions changed before it, and who caused it (W2.4, W4.3).
+    #[prost(message, optional, tag = "5")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "6")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+/// What the custodian says an account holds of an instrument, on one side,
+/// right now. Keyed by all three: an account may hold an instrument long and
+/// short at once, as a venue reporting them apart says.
+///
+/// Custodial, and named so deliberately. This is the custodian's belief, arrived
+/// at by reading their statements; it is not what the deployment calculates from
+/// its own activity. Those are different numbers whose disagreement is the
+/// entire subject of reconciliation, and a message called `Position` would make
+/// a consumer guess which one it had.
+///
+/// Our own book does not exist yet. When it does it gets its own message and its
+/// own name, and no reader of this one silently changes meaning.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CustodialPosition {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// An instrument, or the deployment's LCL- placeholder awaiting identity,
+    /// which the INS- ID replaces when it arrives (W3.9).
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The trade-date quantity, signed to match `side`.
+    #[prost(message, optional, tag = "9")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Unset where the custodian reported no value, which is not zero.
+    #[prost(message, optional, tag = "10")]
+    pub market_value: ::core::option::Option<Money>,
+    /// The statement this was last stated by, and when. One not restated recently
+    /// is not wrong, but it is worth showing differently.
+    #[prost(string, tag = "6")]
+    pub last_statement_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub as_of_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub updated_at_ns: i64,
+    #[prost(enumeration = "HoldingSide", tag = "11")]
+    pub side: i32,
+    /// The settle-date quantity, where the custodian reported one.
+    #[prost(message, optional, tag = "12")]
+    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// This position's value is also included in the account's cash holding as
+    /// the custodian reports it; both are kept as reported.
+    #[prost(bool, tag = "13")]
+    pub also_counted_in_cash: bool,
+    /// As the custodian reported them on the row that last stated this, unset
+    /// or empty where it reported none (W2.3).
+    #[prost(message, optional, tag = "14")]
+    pub cost_basis: ::core::option::Option<Money>,
+    #[prost(message, repeated, tag = "15")]
+    pub lots: ::prost::alloc::vec::Vec<ReportedLot>,
+    #[prost(message, optional, tag = "16")]
+    pub margin_requirement: ::core::option::Option<Money>,
+    /// Its last change: a delivery at or below it is already in it.
+    #[prost(message, optional, tag = "17")]
+    pub last_change: ::core::option::Option<JournalRef>,
+    /// A tombstone (W2.6, W3.9): returned only to a read since a watermark,
+    /// and delivered once.
+    #[prost(bool, tag = "18")]
+    pub removed: bool,
+    /// As on RecordHoldingRequest (Q-A).
+    #[prost(message, optional, tag = "19")]
+    pub average_cost: ::core::option::Option<Money>,
+    /// As on RecordHoldingRequest, from the row that last stated this.
+    #[prost(message, optional, tag = "20")]
+    pub available_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "21")]
+    pub not_available_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(enumeration = "AvailableBasis", tag = "22")]
+    pub available_basis: i32,
+    #[prost(message, repeated, tag = "23")]
+    pub encumbrances: ::prost::alloc::vec::Vec<ReportedEncumbrance>,
+}
+/// Read custodial positions, and the unresolved holdings beside them (W2.7).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCustodialPositionsRequest {
+    /// Empty means every account in the reader's scope for a plugin, every
+    /// account for a core component (W4.11).
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// When true, the reply also carries holdings that never resolved, so one
+    /// request answers both "what does the custodian say I hold" and "what could I
+    /// not account for".
+    #[prost(bool, tag = "2")]
+    pub include_unresolved: bool,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
+    /// Unresolved holdings come with the first page only, so a read across
+    /// pages sees each once.
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+    /// Only the positions whose last change is above it, tombstones included.
+    #[prost(message, optional, tag = "5")]
+    pub since: ::core::option::Option<Watermark>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCustodialPositionsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub positions: ::prost::alloc::vec::Vec<CustodialPosition>,
+    /// Populated only when include_unresolved was set.
+    #[prost(message, repeated, tag = "2")]
+    pub unresolved: ::prost::alloc::vec::Vec<UnresolvedHolding>,
+    #[prost(string, tag = "3")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// The point in the store's record the page was read at.
+    #[prost(message, optional, tag = "4")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+/// A holding the deployment received but could not name.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnresolvedHolding {
+    #[prost(string, tag = "1")]
+    pub holding_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// Signed, as the row stated it: negative is a short row.
+    #[prost(message, optional, tag = "10")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Unset where the custodian reported no value.
+    #[prost(message, optional, tag = "11")]
+    pub market_value: ::core::option::Option<Money>,
+    #[prost(string, tag = "7")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub as_of_date: ::prost::alloc::string::String,
+    /// Whether an escalation has already been raised for these identifiers, so the
+    /// view can separate "nobody has looked at this" from "this is with the
+    /// administrator".
+    #[prost(bool, tag = "9")]
+    pub escalated: bool,
+}
+/// Read completed statements and their figures (W2.9).
+///
+/// How a reconciliation, or a plugin seeding after a restart, reads the
+/// figures without having heard W2.5: they are on the statement and on no
+/// position. An open statement is not listed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListStatementsRequest {
+    /// Empty: every account in the reader's scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// ISO 8601; empty for any date.
+    #[prost(string, tag = "2")]
+    pub as_of_date: ::prost::alloc::string::String,
+    /// Only statements completed after it.
+    #[prost(message, optional, tag = "3")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "4")]
+    pub page_size: i32,
+    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
+    #[prost(string, tag = "5")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListStatementsReply {
+    /// Completed statements only, each as it was announced (W2.5).
+    #[prost(message, repeated, tag = "1")]
+    pub statements: ::prost::alloc::vec::Vec<StatementRecordedEvent>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// The point in the store's record the page was read at.
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+/// Every external account a connection reaches, as the connector sees it now.
+///
+/// Published before anything is recorded against any of them, so linking one
+/// (W6.4) is a choice among the accounts on offer rather than a guess made
+/// after a statement was refused for want of a link: one SnapTrade connection
+/// can reach several brokerage accounts, and an administrator links the ones
+/// they mean. The whole list each time, so an account missing from it is one
+/// the connection no longer reaches.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalAccountsEvent {
+    #[prost(message, repeated, tag = "1")]
+    pub accounts: ::prost::alloc::vec::Vec<ExternalAccount>,
+}
+/// One account a connection reaches, as the custodian presents it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExternalAccount {
+    /// Stable: the connector makes it so where the venue does not, and it is the
+    /// `external_account_id` the account's rows name. SnapTrade's changes on
+    /// reconnect unless its `institution_account_id` is used; Kalshi's is a
+    /// subaccount and a matching engine joined. A handle the venue wants on each
+    /// call (E*TRADE's accountIdKey, Schwab's hash) stays inside the plugin.
+    #[prost(string, tag = "1")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// The custodian's own name for it, as a person there would recognise it.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// The venue's own word for the kind of account, verbatim and for display
+    /// only. Nothing reads meaning into it: what an account may do is the
+    /// platform's restriction set, in the platform's words, which each plugin
+    /// maps its venue's types onto when that set is ruled.
+    #[prost(string, tag = "3")]
+    pub venue_account_type: ::prost::alloc::string::String,
+}
+/// Why a connection's data is, or is not, current.
+///
+/// The venues surveyed fail in exactly these ways (reference/broker-apis.md),
+/// and each asks something different of a person, which is the point of
+/// naming them rather than leaving them to a flag and free text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SyncState {
+    /// Not said: a connector written before this was. Shown as what
+    /// connection_healthy says.
+    Unspecified = 0,
+    /// Current. Nothing to do.
+    Current = 1,
+    /// Still serving, but older than it should be: holdings_as_of_ns says since
+    /// when. Usually the rail's to recover; nothing to do but wait.
+    Stale = 2,
+    /// A person must sign in again at the venue before it serves anything new:
+    /// E*TRADE and Interactive Brokers daily, Schwab weekly, Interactive Brokers
+    /// also when connected but signed out.
+    NeedsSignIn = 3,
+    /// The connection is disabled and serves only what it last read, as
+    /// SnapTrade does. Somebody re-enables it.
+    Disabled = 4,
+    /// Late on purpose, as Interactive Brokers through SnapTrade is by a business
+    /// day. Expected; nothing to do.
+    DelayedByDesign = 5,
+    /// The venue does not provide holdings through this connection, as some
+    /// brokerages hide them from SnapTrade (its `holdings_unavailable`). Waiting
+    /// changes nothing: holdings will not arrive this way, so the account is
+    /// connected another way or through another venue.
+    HoldingsUnavailable = 6,
+}
+impl SyncState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SYNC_STATE_UNSPECIFIED",
+            Self::Current => "SYNC_STATE_CURRENT",
+            Self::Stale => "SYNC_STATE_STALE",
+            Self::NeedsSignIn => "SYNC_STATE_NEEDS_SIGN_IN",
+            Self::Disabled => "SYNC_STATE_DISABLED",
+            Self::DelayedByDesign => "SYNC_STATE_DELAYED_BY_DESIGN",
+            Self::HoldingsUnavailable => "SYNC_STATE_HOLDINGS_UNAVAILABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SYNC_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SYNC_STATE_CURRENT" => Some(Self::Current),
+            "SYNC_STATE_STALE" => Some(Self::Stale),
+            "SYNC_STATE_NEEDS_SIGN_IN" => Some(Self::NeedsSignIn),
+            "SYNC_STATE_DISABLED" => Some(Self::Disabled),
+            "SYNC_STATE_DELAYED_BY_DESIGN" => Some(Self::DelayedByDesign),
+            "SYNC_STATE_HOLDINGS_UNAVAILABLE" => Some(Self::HoldingsUnavailable),
+            _ => None,
+        }
+    }
+}
+/// Whether a collateral balance was posted by the account or received by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CollateralDirection {
+    /// Not said. Refused: collateral is posted or received.
+    Unspecified = 0,
+    Posted = 1,
+    Received = 2,
+}
+impl CollateralDirection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COLLATERAL_DIRECTION_UNSPECIFIED",
+            Self::Posted => "COLLATERAL_DIRECTION_POSTED",
+            Self::Received => "COLLATERAL_DIRECTION_RECEIVED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COLLATERAL_DIRECTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "COLLATERAL_DIRECTION_POSTED" => Some(Self::Posted),
+            "COLLATERAL_DIRECTION_RECEIVED" => Some(Self::Received),
+            _ => None,
+        }
+    }
+}
+/// What a source's available figure is net of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AvailableBasis {
+    /// The source does not say.
+    Unspecified = 0,
+    Settled = 1,
+    Traded = 2,
+    Contractual = 3,
+    /// A venue's figure net of its open orders (Alpaca's qty_available,
+    /// Binance's free): the order reservation is the oms's, never an
+    /// encumbrance.
+    OrderNetted = 4,
+}
+impl AvailableBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AVAILABLE_BASIS_UNSPECIFIED",
+            Self::Settled => "AVAILABLE_BASIS_SETTLED",
+            Self::Traded => "AVAILABLE_BASIS_TRADED",
+            Self::Contractual => "AVAILABLE_BASIS_CONTRACTUAL",
+            Self::OrderNetted => "AVAILABLE_BASIS_ORDER_NETTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AVAILABLE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "AVAILABLE_BASIS_SETTLED" => Some(Self::Settled),
+            "AVAILABLE_BASIS_TRADED" => Some(Self::Traded),
+            "AVAILABLE_BASIS_CONTRACTUAL" => Some(Self::Contractual),
+            "AVAILABLE_BASIS_ORDER_NETTED" => Some(Self::OrderNetted),
+            _ => None,
+        }
+    }
+}
+/// Why some of a holding cannot move (reference/encumbrance-survey, 3.1).
+/// Pending settlement stays in the settlement buckets: PENDING, like
+/// REHYPOTHECATED and BORROWED, is the street's, for the statement's own
+/// consistency, and the book holds none of the three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EncumbranceKind {
+    /// Not said. Refused: a sub-balance says which it is.
+    Unspecified = 0,
+    /// Pledged in place to a pledgee (PLED).
+    Pledged = 1,
+    /// Delivered to a third party as collateral (COLO).
+    Posted = 2,
+    /// Lent (LOAN).
+    OnLoan = 3,
+    /// Blocked for a stated purpose (BLOK, BLCA, BLOT, BLOV).
+    Blocked = 4,
+    /// Movable only under conditions or with documents (RSTR, WDOC).
+    Restricted = 5,
+    /// Between depositories, agents or registers (TRAN, REGO, BTRA).
+    InTransit = 6,
+    /// A sub-balance the plugin cannot map: its source_code required.
+    Other = 7,
+    /// The street's only: as reported, for the consistency check.
+    Pending = 8,
+    /// The street's only: used by the broker under a right of use; it does not
+    /// reduce the available quantity.
+    Rehypothecated = 9,
+    /// The street's only: borrowed, title to us, with a return obligation.
+    Borrowed = 10,
+}
+impl EncumbranceKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ENCUMBRANCE_KIND_UNSPECIFIED",
+            Self::Pledged => "ENCUMBRANCE_KIND_PLEDGED",
+            Self::Posted => "ENCUMBRANCE_KIND_POSTED",
+            Self::OnLoan => "ENCUMBRANCE_KIND_ON_LOAN",
+            Self::Blocked => "ENCUMBRANCE_KIND_BLOCKED",
+            Self::Restricted => "ENCUMBRANCE_KIND_RESTRICTED",
+            Self::InTransit => "ENCUMBRANCE_KIND_IN_TRANSIT",
+            Self::Other => "ENCUMBRANCE_KIND_OTHER",
+            Self::Pending => "ENCUMBRANCE_KIND_PENDING",
+            Self::Rehypothecated => "ENCUMBRANCE_KIND_REHYPOTHECATED",
+            Self::Borrowed => "ENCUMBRANCE_KIND_BORROWED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ENCUMBRANCE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "ENCUMBRANCE_KIND_PLEDGED" => Some(Self::Pledged),
+            "ENCUMBRANCE_KIND_POSTED" => Some(Self::Posted),
+            "ENCUMBRANCE_KIND_ON_LOAN" => Some(Self::OnLoan),
+            "ENCUMBRANCE_KIND_BLOCKED" => Some(Self::Blocked),
+            "ENCUMBRANCE_KIND_RESTRICTED" => Some(Self::Restricted),
+            "ENCUMBRANCE_KIND_IN_TRANSIT" => Some(Self::InTransit),
+            "ENCUMBRANCE_KIND_OTHER" => Some(Self::Other),
+            "ENCUMBRANCE_KIND_PENDING" => Some(Self::Pending),
+            "ENCUMBRANCE_KIND_REHYPOTHECATED" => Some(Self::Rehypothecated),
+            "ENCUMBRANCE_KIND_BORROWED" => Some(Self::Borrowed),
+            _ => None,
+        }
+    }
+}
+/// Which side of an instrument a holding or a custodial position is on.
+///
+/// A side of its own rather than the sign alone, because a venue can report
+/// both sides of one instrument at once, and two rows keyed by account and
+/// instrument alone would overwrite each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HoldingSide {
+    /// Not said. Refused by the street store: a holding says which side it is on.
+    Unspecified = 0,
+    Long = 1,
+    Short = 2,
+}
+impl HoldingSide {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HOLDING_SIDE_UNSPECIFIED",
+            Self::Long => "HOLDING_SIDE_LONG",
+            Self::Short => "HOLDING_SIDE_SHORT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HOLDING_SIDE_UNSPECIFIED" => Some(Self::Unspecified),
+            "HOLDING_SIDE_LONG" => Some(Self::Long),
+            "HOLDING_SIDE_SHORT" => Some(Self::Short),
+            _ => None,
+        }
+    }
+}
+/// Who made a change (step 5's requirement 28, landed with v8). Set by the
+/// book from the envelope the sidecar stamped (W4.9), never by a plugin.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Actor {
+    #[prost(oneof = "actor::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<actor::Kind>,
+}
+/// Nested message and enum types in `Actor`.
+pub mod actor {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        /// A person the sidecar vouched for, by the deployment-local subject
+        /// W6.1 records.
+        #[prost(message, tag = "1")]
+        Person(super::PersonActor),
+        /// A finding reported with no user: the plugin instance that sent it;
+        /// the book's own act (a placeholder followed) leaves it empty.
+        #[prost(message, tag = "2")]
+        System(super::SystemActor),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PersonActor {
+    #[prost(string, tag = "1")]
+    pub subject: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SystemActor {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+/// What a journal entry records beside its JournalRef and ChangeCause.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EntryMeta {
+    /// Minted by the book.
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+    /// An open list a reader takes as data (Q19): in v8 opening-balance,
+    /// placeholder-moved, figures-recorded, break-recorded, break-handled,
+    /// break-resolved, break-closed, adjustment, reversal, attribute-set.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub actor: ::core::option::Option<Actor>,
+    /// The time on the message that caused it, and when the book received it;
+    /// when it committed is the cause's committed_at_ns.
+    #[prost(int64, tag = "4")]
+    pub event_time_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub received_at_ns: i64,
+    /// ISO 8601: the business date it stands for.
+    #[prost(string, tag = "6")]
+    pub effective_date: ::prost::alloc::string::String,
+    /// The control partition's sequence in force (decisions/024's note).
+    #[prost(uint64, tag = "7")]
+    pub control_sequence: u64,
+    /// Each instrument it names, with the reference record's version in force
+    /// when it was recorded; none where the store has no version (Q31).
+    #[prost(message, repeated, tag = "8")]
+    pub reference_versions: ::prost::alloc::vec::Vec<ReferenceVersion>,
+    /// Required on a justified act: an opening balance, an adjustment, a
+    /// reversal, a resolution, handling, an attribute.
+    #[prost(string, tag = "9")]
+    pub reason: ::prost::alloc::string::String,
+    /// The breaks it records, handles, resolves or closes.
+    #[prost(string, repeated, tag = "10")]
+    pub break_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The key the plugin sent the command with, where it sent one (Q12 of the
+    /// sample operations plugin, ruled 2026-10-01).
+    #[prost(string, tag = "11")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReferenceVersion {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The InstrumentRecord's version (W3.6).
+    #[prost(int64, tag = "2")]
+    pub version: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MovementLine {
+    /// An instrument, a placeholder, or a currency's cash instrument.
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+    #[prost(enumeration = "SettlementBucket", tag = "3")]
+    pub bucket: i32,
+    /// ISO 8601; required on a pending line but at an opening balance; may be
+    /// years out.
+    #[prost(string, tag = "4")]
+    pub value_date: ::prost::alloc::string::String,
+    /// Signed as the position's quantity is, and added to it.
+    #[prost(message, optional, tag = "5")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The lot it adds to or relieves. Empty on a line that opens a lot, whose
+    /// identifier the book mints, and on cash, which has no lots.
+    #[prost(string, tag = "6")]
+    pub lot_id: ::prost::alloc::string::String,
+    /// Set on the line that opens a lot, and only there.
+    #[prost(message, optional, tag = "7")]
+    pub opens_lot: ::core::option::Option<LotTerms>,
+    /// A pending line's fail, where its source reports one.
+    #[prost(message, optional, tag = "8")]
+    pub pending_state: ::core::option::Option<PendingState>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LotTerms {
+    /// Each unset where not known; never derived one from the other.
+    #[prost(message, optional, tag = "1")]
+    pub unit_cost: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "2")]
+    pub cost: ::core::option::Option<Money>,
+    #[prost(string, tag = "3")]
+    pub acquired_date: ::prost::alloc::string::String,
+    /// Apart from acquisition, for wash-sale tacking; empty is the acquired
+    /// date.
+    #[prost(string, tag = "4")]
+    pub holding_period_start: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub settlement_date: ::prost::alloc::string::String,
+    #[prost(enumeration = "LotSource", tag = "6")]
+    pub source: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingState {
+    #[prost(bool, tag = "1")]
+    pub failing: bool,
+    /// As reported.
+    #[prost(string, tag = "2")]
+    pub fail_reason: ::prost::alloc::string::String,
+    /// ISO 8601; the date it is now expected; the bucket keeps its intended
+    /// date ("Three more considerations", 2).
+    #[prost(string, tag = "3")]
+    pub expected_date: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BasisAdjustment {
+    #[prost(string, tag = "1")]
+    pub lot_id: ::prost::alloc::string::String,
+    /// Where it moves; empty is unchanged.
+    #[prost(string, tag = "3")]
+    pub holding_period_start: ::prost::alloc::string::String,
+    #[prost(oneof = "basis_adjustment::Cost", tags = "2, 4")]
+    pub cost: ::core::option::Option<basis_adjustment::Cost>,
+}
+/// Nested message and enum types in `BasisAdjustment`.
+pub mod basis_adjustment {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Cost {
+        /// Added to the lot's cost; signed. Only on a lot whose cost is known.
+        #[prost(message, tag = "2")]
+        CostChange(super::Money),
+        /// The lot's cost, stated where it was unknown: a lot opened with no
+        /// cost -- a remainder lot, one of unknown cost because the source listed
+        /// none, a future's -- given its cost once it is known. Only on a lot
+        /// whose cost is unknown.
+        #[prost(message, tag = "4")]
+        StatedCost(super::Money),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BookPosition {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "3")]
+    pub side: i32,
+    /// Settled, plus pending, plus not stated: by construction.
+    #[prost(message, optional, tag = "4")]
+    pub trade_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Unset while any of the quantity is not stated: unknown, never zero.
+    #[prost(message, optional, tag = "5")]
+    pub settled_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "6")]
+    pub not_stated_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, repeated, tag = "7")]
+    pub pending: ::prost::alloc::vec::Vec<PendingSettlement>,
+    /// Open lots; their open quantities sum to trade_date_quantity, cash
+    /// excepted.
+    #[prost(message, repeated, tag = "8")]
+    pub lots: ::prost::alloc::vec::Vec<Lot>,
+    /// The opening balance's sources, with their as-of and basis.
+    #[prost(message, repeated, tag = "9")]
+    pub opened_from: ::prost::alloc::vec::Vec<OpeningSource>,
+    /// The business date of its last change.
+    #[prost(string, tag = "10")]
+    pub effective_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "11")]
+    pub last_change: ::core::option::Option<JournalRef>,
+    /// A tombstone, after a placeholder's move (W9.9): returned only to a read
+    /// since a watermark, and delivered once.
+    #[prost(bool, tag = "12")]
+    pub removed: bool,
+    /// Held under a placeholder instrument (W3.7) while the street's holding is
+    /// unresolved: in the opening balance and in reconciliation as any position,
+    /// flagged, until the book follows its replacement (W9.9).
+    #[prost(bool, tag = "13")]
+    pub placeholder: bool,
+    /// What of it cannot move, as the operations plugin last recorded it from
+    /// a statement (W9.15): an attribute, never a movement.
+    #[prost(message, repeated, tag = "14")]
+    pub encumbrances: ::prost::alloc::vec::Vec<Encumbrance>,
+    /// Derived, never reported: the quantity on free_basis less its
+    /// encumbrances. Unset while that quantity is unknown (some not stated).
+    #[prost(message, optional, tag = "15")]
+    pub free_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(enumeration = "FreeBasis", tag = "16")]
+    pub free_basis: i32,
+}
+/// One encumbrance of a position, as the book holds it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Encumbrance {
+    /// PLEDGED to OTHER only; the street's PENDING, REHYPOTHECATED and
+    /// BORROWED are refused.
+    #[prost(enumeration = "EncumbranceKind", tag = "1")]
+    pub kind: i32,
+    /// Signed as the position's quantity.
+    #[prost(message, optional, tag = "2")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(string, tag = "3")]
+    pub pledgee: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub held_at: ::prost::alloc::string::String,
+    /// Unset where the source names none.
+    #[prost(message, optional, tag = "5")]
+    pub agreement: ::core::option::Option<MarginAgreementRef>,
+    /// The source's code, verbatim; required for OTHER.
+    #[prost(string, tag = "6")]
+    pub source_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub detail: ::prost::alloc::string::String,
+    /// The statement it was recorded from.
+    #[prost(message, optional, tag = "8")]
+    pub source: ::core::option::Option<StreetRecordRef>,
+    /// Set by the book: the business date it was first recorded under its
+    /// kind, pledgee, location and agreement, and the change that last set it.
+    #[prost(string, tag = "9")]
+    pub since_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "10")]
+    pub set_by: ::core::option::Option<JournalRef>,
+}
+/// One position's encumbrances, as a statement states them: the whole set,
+/// empty when the statement reports none.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PositionEncumbrances {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+    #[prost(message, repeated, tag = "3")]
+    pub encumbrances: ::prost::alloc::vec::Vec<Encumbrance>,
+}
+/// W9.15. A finding, so the plugin may send it as itself.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordEncumbrancesRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub business_date: ::prost::alloc::string::String,
+    /// The statement they were read from.
+    #[prost(message, optional, tag = "3")]
+    pub source: ::core::option::Option<StreetRecordRef>,
+    #[prost(message, repeated, tag = "4")]
+    pub positions: ::prost::alloc::vec::Vec<PositionEncumbrances>,
+    /// The plugin's key for this command, derived from its source (Q12).
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingSettlement {
+    /// ISO 8601; empty only for "date not stated" at an opening balance.
+    #[prost(string, tag = "1")]
+    pub value_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "3")]
+    pub state: ::core::option::Option<PendingState>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Lot {
+    /// Minted by the book.
+    #[prost(string, tag = "1")]
+    pub lot_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub open_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "3")]
+    pub original_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// As opened, with each basis adjustment applied.
+    #[prost(message, optional, tag = "4")]
+    pub terms: ::core::option::Option<LotTerms>,
+    #[prost(message, optional, tag = "5")]
+    pub opened_by: ::core::option::Option<JournalRef>,
+    #[prost(message, repeated, tag = "6")]
+    pub relieved_by: ::prost::alloc::vec::Vec<JournalRef>,
+    #[prost(message, repeated, tag = "7")]
+    pub adjusted_by: ::prost::alloc::vec::Vec<JournalRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpeningSource {
+    #[prost(enumeration = "OpeningSourceKind", tag = "1")]
+    pub kind: i32,
+    /// The custodian or system as it is known in the deployment (the external
+    /// account's institution, the prior system's name).
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// ISO 8601: the date the source's figures are as of.
+    #[prost(string, tag = "3")]
+    pub as_of_date: ::prost::alloc::string::String,
+    #[prost(enumeration = "PositionBasis", tag = "4")]
+    pub basis: i32,
+    /// The street records it was composed from, by value (decisions/012).
+    #[prost(message, repeated, tag = "5")]
+    pub street_records: ::prost::alloc::vec::Vec<StreetRecordRef>,
+}
+/// A street record named by value: never a key the book follows.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreetRecordRef {
+    #[prost(string, tag = "1")]
+    pub statement_id: ::prost::alloc::string::String,
+    /// The custodial position's change, where one was compared or used.
+    #[prost(message, optional, tag = "2")]
+    pub change: ::core::option::Option<JournalRef>,
+    /// ISO 8601: the custodian's as-of date.
+    #[prost(string, tag = "3")]
+    pub as_of_date: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpeningPosition {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+    #[prost(message, optional, tag = "3")]
+    pub trade_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Unset where the source states none.
+    #[prost(message, optional, tag = "4")]
+    pub settled_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, repeated, tag = "5")]
+    pub pending: ::prost::alloc::vec::Vec<PendingSettlement>,
+    /// As reported; a position whose source reports none sends one, its cost
+    /// unknown; cash sends none.
+    #[prost(message, repeated, tag = "6")]
+    pub lots: ::prost::alloc::vec::Vec<OpeningLot>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpeningLot {
+    #[prost(message, optional, tag = "1")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "2")]
+    pub terms: ::core::option::Option<LotTerms>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordOpeningBalanceRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// ISO 8601: the business date it stands for (D0).
+    #[prost(string, tag = "2")]
+    pub as_of_date: ::prost::alloc::string::String,
+    /// One per custodian or system it was composed from.
+    #[prost(message, repeated, tag = "3")]
+    pub sources: ::prost::alloc::vec::Vec<OpeningSource>,
+    /// Empty: the account enters holding nothing.
+    #[prost(message, repeated, tag = "4")]
+    pub positions: ::prost::alloc::vec::Vec<OpeningPosition>,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    /// The reversed opening balance this replaces (Q27); empty for the first.
+    #[prost(string, tag = "6")]
+    pub replaces_entry_id: ::prost::alloc::string::String,
+    /// The plugin's key for this command, derived from its source (Q12 of the
+    /// sample operations plugin, ruled 2026-10-01, as FIX's ClOrdID): unique per
+    /// account; the same command again with the same key is answered with the
+    /// first's reply and applies nothing, and a different command with it is
+    /// refused (REFUSAL_REASON_IDEMPOTENCY_CONFLICT). Empty: none.
+    #[prost(string, tag = "7")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// The account's standing opening balance, set by the book when it journals
+/// W9.1 and cleared when it is reversed (Q21 of the sample operations plugin,
+/// ruled 2026-10-01): its entry, D0 and sources, read on the account's
+/// attributes (W9.14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpeningBalance {
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+    /// ISO 8601: D0.
+    #[prost(string, tag = "2")]
+    pub as_of_date: ::prost::alloc::string::String,
+    /// As recorded, the street records it was composed from among them.
+    #[prost(message, repeated, tag = "3")]
+    pub sources: ::prost::alloc::vec::Vec<OpeningSource>,
+    #[prost(message, optional, tag = "4")]
+    pub recorded_by: ::core::option::Option<Actor>,
+    #[prost(message, optional, tag = "5")]
+    pub journal: ::core::option::Option<JournalRef>,
+    /// The reason the person gave.
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PositionKey {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FigureKey {
+    #[prost(message, optional, tag = "1")]
+    pub agreement: ::core::option::Option<MarginAgreementRef>,
+    /// The figure, by its field's name in the data dictionary.
+    #[prost(string, tag = "2")]
+    pub figure: ::prost::alloc::string::String,
+    /// For a collateral balance: its instrument.
+    #[prost(string, tag = "3")]
+    pub instrument_id: ::prost::alloc::string::String,
+}
+/// One side of a difference; unset: absent on that side.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakValue {
+    #[prost(oneof = "break_value::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<break_value::Value>,
+}
+/// Nested message and enum types in `BreakValue`.
+pub mod break_value {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Quantity(::meridian_pb::v1::Decimal),
+        #[prost(message, tag = "2")]
+        Amount(super::Money),
+        #[prost(string, tag = "3")]
+        Text(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakDifference {
+    /// The field, by its name in the data dictionary ("settled_quantity",
+    /// "lots\[2\].terms.cost").
+    #[prost(string, tag = "1")]
+    pub field: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub book: ::core::option::Option<BreakValue>,
+    #[prost(message, optional, tag = "3")]
+    pub street: ::core::option::Option<BreakValue>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingSettlementRef {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+    #[prost(string, tag = "3")]
+    pub value_date: ::prost::alloc::string::String,
+}
+/// The item found to cause a break, linked by value (Q23's target).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakCause {
+    #[prost(enumeration = "BreakCauseCategory", tag = "1")]
+    pub category: i32,
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+    #[prost(oneof = "break_cause::Item", tags = "2, 3, 4, 5, 6")]
+    pub item: ::core::option::Option<break_cause::Item>,
+}
+/// Nested message and enum types in `BreakCause`.
+pub mod break_cause {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Item {
+        #[prost(message, tag = "2")]
+        StreetRecord(super::StreetRecordRef),
+        #[prost(message, tag = "3")]
+        BookEntry(super::JournalRef),
+        #[prost(message, tag = "4")]
+        PendingSettlement(super::PendingSettlementRef),
+        /// A corporate action's reference, as reported.
+        #[prost(string, tag = "5")]
+        EventReference(::prost::alloc::string::String),
+        #[prost(bool, tag = "6")]
+        NoneFound(bool),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakHandling {
+    /// A user the deployment knows (W6.1): one granted write on the account
+    /// through the plugin, or the person taking it (Q11 of the sample
+    /// operations plugin, ruled 2026-10-01).
+    #[prost(string, tag = "1")]
+    pub owner_subject: ::prost::alloc::string::String,
+    /// The operations plugin's own levels; core gives them no meaning.
+    #[prost(uint32, tag = "2")]
+    pub escalation_level: u32,
+    /// ISO 8601.
+    #[prost(string, tag = "3")]
+    pub due_date: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakResolution {
+    /// Resolved: the entries that corrected the book.
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<JournalRef>,
+    /// Closed: the explanation, no entry.
+    #[prost(string, tag = "2")]
+    pub explanation: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub actor: ::core::option::Option<Actor>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// Closed as cleared: the street record where the difference was gone (Q2
+    /// of the sample operations plugin, ruled 2026-10-01).
+    #[prost(message, optional, tag = "5")]
+    pub cleared_at: ::core::option::Option<StreetRecordRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Break {
+    #[prost(string, tag = "1")]
+    pub break_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "BreakCategory", tag = "5")]
+    pub category: i32,
+    #[prost(message, repeated, tag = "6")]
+    pub differences: ::prost::alloc::vec::Vec<BreakDifference>,
+    #[prost(message, optional, tag = "7")]
+    pub book_watermark: ::core::option::Option<Watermark>,
+    #[prost(message, optional, tag = "8")]
+    pub street: ::core::option::Option<StreetRecordRef>,
+    /// ISO 8601 business dates; age is derived from them, never stored.
+    #[prost(string, tag = "9")]
+    pub first_seen_date: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub last_seen_date: ::prost::alloc::string::String,
+    #[prost(enumeration = "BreakState", tag = "11")]
+    pub state: i32,
+    #[prost(message, repeated, tag = "12")]
+    pub candidate_causes: ::prost::alloc::vec::Vec<BreakCause>,
+    #[prost(message, optional, tag = "13")]
+    pub confirmed_cause: ::core::option::Option<BreakCause>,
+    #[prost(message, optional, tag = "14")]
+    pub handling: ::core::option::Option<BreakHandling>,
+    #[prost(message, optional, tag = "15")]
+    pub resolution: ::core::option::Option<BreakResolution>,
+    #[prost(message, optional, tag = "16")]
+    pub recorded_by: ::core::option::Option<Actor>,
+    #[prost(message, optional, tag = "17")]
+    pub last_change: ::core::option::Option<JournalRef>,
+    #[prost(oneof = "r#break::Subject", tags = "3, 4")]
+    pub subject: ::core::option::Option<r#break::Subject>,
+}
+/// Nested message and enum types in `Break`.
+pub mod r#break {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Subject {
+        #[prost(message, tag = "3")]
+        Position(super::PositionKey),
+        #[prost(message, tag = "4")]
+        Figure(super::FigureKey),
+    }
+}
+/// W9.4. A new break, or an open one brought up to date.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordBreakRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Empty: a new break, whose identifier the book mints.
+    #[prost(string, tag = "2")]
+    pub break_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "BreakCategory", tag = "5")]
+    pub category: i32,
+    #[prost(message, repeated, tag = "6")]
+    pub differences: ::prost::alloc::vec::Vec<BreakDifference>,
+    #[prost(message, optional, tag = "7")]
+    pub book_watermark: ::core::option::Option<Watermark>,
+    #[prost(message, optional, tag = "8")]
+    pub street: ::core::option::Option<StreetRecordRef>,
+    /// The reconciliation's business date: first seen for a new break, last
+    /// seen for one brought up to date.
+    #[prost(string, tag = "9")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "10")]
+    pub candidate_causes: ::prost::alloc::vec::Vec<BreakCause>,
+    /// The plugin's key for this command, derived from its source (Q12):
+    /// answered with the first's reply when it is sent again.
+    #[prost(string, tag = "11")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(oneof = "record_break_request::Subject", tags = "3, 4")]
+    pub subject: ::core::option::Option<record_break_request::Subject>,
+}
+/// Nested message and enum types in `RecordBreakRequest`.
+pub mod record_break_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Subject {
+        #[prost(message, tag = "3")]
+        Position(super::PositionKey),
+        #[prost(message, tag = "4")]
+        Figure(super::FigureKey),
+    }
+}
+/// W9.6. For a person.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HandleBreakRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub break_id: ::prost::alloc::string::String,
+    /// Unset: unchanged.
+    #[prost(message, optional, tag = "3")]
+    pub confirmed_cause: ::core::option::Option<BreakCause>,
+    /// Unset: unchanged; set: replaces the handling whole.
+    #[prost(message, optional, tag = "4")]
+    pub handling: ::core::option::Option<BreakHandling>,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    /// The plugin's key for this command (Q12).
+    #[prost(string, tag = "6")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// W9.7. For a person.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveBreakRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub break_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    /// The plugin's key for this command (Q12).
+    #[prost(string, tag = "9")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(oneof = "resolve_break_request::Resolution", tags = "4, 5, 6, 7")]
+    pub resolution: ::core::option::Option<resolve_break_request::Resolution>,
+}
+/// Nested message and enum types in `ResolveBreakRequest`.
+pub mod resolve_break_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Resolution {
+        /// The correcting entry, journalled in the same act.
+        #[prost(message, tag = "4")]
+        Adjustment(super::Adjustment),
+        #[prost(message, tag = "5")]
+        Reversal(super::Reversal),
+        /// Entries already recorded.
+        #[prost(message, tag = "6")]
+        Entries(super::ResolvedByEntries),
+        /// Closes the breaks, with no entry.
+        #[prost(string, tag = "7")]
+        Explanation(::prost::alloc::string::String),
+    }
+}
+/// W9.7. Close breaks as cleared, with no entry.
+/// Citing the statement where the difference was gone (Q2 of the sample operations plugin, ruled
+/// 2026-10-01: one typed operation a person takes; an opt-in automation runs
+/// it as a service account once
+/// sdk-contract/a-service-account-runs-a-plugins-autonomous-work lands, its
+/// actor an arm of Actor of its own). For a person until then.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CloseBreaksAsClearedRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub break_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The street record of the statement where the difference was gone, by
+    /// value.
+    #[prost(message, optional, tag = "3")]
+    pub cleared_at: ::core::option::Option<StreetRecordRef>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// The plugin's key for this command (Q12).
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// Step 5's non-order transaction's first kind (Q28). Slice D adds the
+/// cash-flow class and the other kinds as fields of their own (Q20).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Adjustment {
+    /// After the opening balance's date.
+    #[prost(string, tag = "1")]
+    pub effective_date: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub lines: ::prost::alloc::vec::Vec<MovementLine>,
+    #[prost(message, repeated, tag = "3")]
+    pub basis_adjustments: ::prost::alloc::vec::Vec<BasisAdjustment>,
+    /// A corporate action's reference, as reported, where it records one.
+    #[prost(string, tag = "4")]
+    pub event_reference: ::prost::alloc::string::String,
+}
+/// Names the entry it reverses; the book negates its lines, at that entry's
+/// effective date.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Reversal {
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolvedByEntries {
+    #[prost(string, repeated, tag = "1")]
+    pub entry_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MarginAgreementRef {
+    #[prost(oneof = "margin_agreement_ref::Agreement", tags = "1")]
+    pub agreement: ::core::option::Option<margin_agreement_ref::Agreement>,
+}
+/// Nested message and enum types in `MarginAgreementRef`.
+pub mod margin_agreement_ref {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Agreement {
+        /// Step 4: the statement's external account and segment (Q12). An
+        /// agreement the book records under a template arrives as another arm.
+        #[prost(message, tag = "1")]
+        StatementSegment(super::StatementSegmentRef),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StatementSegmentRef {
+    #[prost(string, tag = "1")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// As the venue names it; empty for the account as a whole.
+    #[prost(string, tag = "2")]
+    pub segment: ::prost::alloc::string::String,
+    /// As reported: the external account's institution.
+    #[prost(string, tag = "3")]
+    pub counterparty: ::prost::alloc::string::String,
+}
+/// The custodian's, labelled as such (Q8, revised and ruled); never a
+/// position's own.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportedPositionValue {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "HoldingSide", tag = "2")]
+    pub side: i32,
+    #[prost(message, optional, tag = "3")]
+    pub market_value: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "4")]
+    pub margin_requirement: ::core::option::Option<Money>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgreementFigures {
+    #[prost(message, optional, tag = "1")]
+    pub agreement: ::core::option::Option<MarginAgreementRef>,
+    /// As the street recorded them (W2.2), its segment equal to the
+    /// agreement's.
+    #[prost(message, optional, tag = "2")]
+    pub figures: ::core::option::Option<StatementFigures>,
+    /// On the set with no segment only.
+    #[prost(message, repeated, tag = "3")]
+    pub position_values: ::prost::alloc::vec::Vec<ReportedPositionValue>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordAccountFiguresRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub source: ::core::option::Option<StreetRecordRef>,
+    #[prost(message, repeated, tag = "4")]
+    pub agreements: ::prost::alloc::vec::Vec<AgreementFigures>,
+    /// The plugin's key for this command, derived from its source (Q12).
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// The record: one per account, agreement and business date.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountFigures {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub agreement: ::core::option::Option<MarginAgreementRef>,
+    #[prost(message, optional, tag = "4")]
+    pub figures: ::core::option::Option<StatementFigures>,
+    #[prost(message, repeated, tag = "5")]
+    pub position_values: ::prost::alloc::vec::Vec<ReportedPositionValue>,
+    #[prost(message, optional, tag = "6")]
+    pub source: ::core::option::Option<StreetRecordRef>,
+    #[prost(message, optional, tag = "7")]
+    pub last_change: ::core::option::Option<JournalRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BookEntryReply {
+    /// A duplicate, by its message identifier or its idempotency key, is
+    /// answered with the first's.
+    #[prost(message, optional, tag = "1")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    /// The entry's place in its partition: the number of the first change it
+    /// made.
+    #[prost(message, optional, tag = "2")]
+    pub journal: ::core::option::Option<JournalRef>,
+    /// Each record the entry changed, as it stands after it.
+    #[prost(message, repeated, tag = "3")]
+    pub positions: ::prost::alloc::vec::Vec<BookPosition>,
+    #[prost(message, repeated, tag = "4")]
+    pub breaks: ::prost::alloc::vec::Vec<Break>,
+    #[prost(message, repeated, tag = "5")]
+    pub figures: ::prost::alloc::vec::Vec<AccountFigures>,
+    /// The account's attributes, where the entry changed them: an opening
+    /// balance and its reversal set and clear the standing one (Q21).
+    #[prost(message, optional, tag = "6")]
+    pub attributes: ::core::option::Option<AccountAttributes>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PositionChangedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub position: ::core::option::Option<BookPosition>,
+    #[prost(message, optional, tag = "2")]
+    pub previous_trade_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "3")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "4")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "5")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakChangedEvent {
+    /// Not `break`, a keyword in the SDKs' languages.
+    #[prost(message, optional, tag = "1")]
+    pub break_record: ::core::option::Option<Break>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "4")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountFiguresRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub figures: ::core::option::Option<AccountFigures>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "4")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPositionsRequest {
+    /// Empty: every account in the reader's scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Only positions whose last change is above it, tombstones included.
+    #[prost(message, optional, tag = "2")]
+    pub since: ::core::option::Option<Watermark>,
+    /// The positions at the end of this business date (Q22), as known at
+    /// `at`, or now; served by replay. Neither with `since`.
+    #[prost(string, tag = "3")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub at: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "5")]
+    pub page_size: i32,
+    #[prost(string, tag = "6")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPositionsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub positions: ::prost::alloc::vec::Vec<BookPosition>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBreaksRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Empty: every state.
+    #[prost(enumeration = "BreakState", repeated, tag = "2")]
+    pub states: ::prost::alloc::vec::Vec<i32>,
+    #[prost(message, optional, tag = "3")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "4")]
+    pub page_size: i32,
+    #[prost(string, tag = "5")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBreaksReply {
+    #[prost(message, repeated, tag = "1")]
+    pub breaks: ::prost::alloc::vec::Vec<Break>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAccountFiguresRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Unset: every agreement.
+    #[prost(message, optional, tag = "2")]
+    pub agreement: ::core::option::Option<MarginAgreementRef>,
+    /// ISO 8601 business dates, inclusive; empty for open-ended.
+    #[prost(string, tag = "3")]
+    pub from_date: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub to_date: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(message, optional, tag = "6")]
+    pub at: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "7")]
+    pub page_size: i32,
+    #[prost(string, tag = "8")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAccountFiguresReply {
+    #[prost(message, repeated, tag = "1")]
+    pub figures: ::prost::alloc::vec::Vec<AccountFigures>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountAttributes {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// ISO 4217 until the money revision names an asset
+    /// (sdk-contract/money-names-an-asset-not-only-an-iso-currency).
+    #[prost(string, tag = "2")]
+    pub base_currency_code: ::prost::alloc::string::String,
+    #[prost(enumeration = "LotReliefMethod", tag = "3")]
+    pub lot_relief_default: i32,
+    #[prost(message, optional, tag = "4")]
+    pub last_change: ::core::option::Option<JournalRef>,
+    /// The standing opening balance, set by the book when it journals W9.1;
+    /// unset while none stands (Q21 of the sample operations plugin, ruled
+    /// 2026-10-01).
+    #[prost(message, optional, tag = "5")]
+    pub opening_balance: ::core::option::Option<OpeningBalance>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetAccountAttributeRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(oneof = "set_account_attribute_request::Attribute", tags = "2, 3")]
+    pub attribute: ::core::option::Option<set_account_attribute_request::Attribute>,
+}
+/// Nested message and enum types in `SetAccountAttributeRequest`.
+pub mod set_account_attribute_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Attribute {
+        #[prost(string, tag = "2")]
+        BaseCurrencyCode(::prost::alloc::string::String),
+        #[prost(enumeration = "super::LotReliefMethod", tag = "3")]
+        LotReliefDefault(i32),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountAttributeReply {
+    #[prost(message, optional, tag = "1")]
+    pub attributes: ::core::option::Option<AccountAttributes>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountAttributeChangedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub attributes: ::core::option::Option<AccountAttributes>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "4")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAccountAttributesRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAccountAttributesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub attributes: ::prost::alloc::vec::Vec<AccountAttributes>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SettlementBucket {
+    /// Refused.
+    Unspecified = 0,
+    Settled = 1,
+    /// Pending settlement on the line's value date. With no value date only at
+    /// an opening balance: the source's difference between trade-date and
+    /// settled quantities, "date not stated".
+    Pending = 2,
+    /// The source did not say whether it is settled or pending: only at an
+    /// opening balance whose source gave no settled quantity.
+    NotStated = 3,
+}
+impl SettlementBucket {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SETTLEMENT_BUCKET_UNSPECIFIED",
+            Self::Settled => "SETTLEMENT_BUCKET_SETTLED",
+            Self::Pending => "SETTLEMENT_BUCKET_PENDING",
+            Self::NotStated => "SETTLEMENT_BUCKET_NOT_STATED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SETTLEMENT_BUCKET_UNSPECIFIED" => Some(Self::Unspecified),
+            "SETTLEMENT_BUCKET_SETTLED" => Some(Self::Settled),
+            "SETTLEMENT_BUCKET_PENDING" => Some(Self::Pending),
+            "SETTLEMENT_BUCKET_NOT_STATED" => Some(Self::NotStated),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LotSource {
+    Unspecified = 0,
+    /// As the opening balance's source reported it (Q2).
+    OpeningBalance = 1,
+    /// Opened by an adjustment resolving a break (Q28). Step 5 adds the
+    /// book's own trade, slice D a transfer in.
+    Adjustment = 2,
+}
+impl LotSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOT_SOURCE_UNSPECIFIED",
+            Self::OpeningBalance => "LOT_SOURCE_OPENING_BALANCE",
+            Self::Adjustment => "LOT_SOURCE_ADJUSTMENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOT_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOT_SOURCE_OPENING_BALANCE" => Some(Self::OpeningBalance),
+            "LOT_SOURCE_ADJUSTMENT" => Some(Self::Adjustment),
+            _ => None,
+        }
+    }
+}
+/// The basis a position's free quantity is computed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FreeBasis {
+    Unspecified = 0,
+    /// Settled: a pledged or lent security that has not settled cannot be
+    /// delivered either (the product owner, 2026-10-01, Q2). The book's
+    /// default, and in v8 its only basis.
+    Settled = 1,
+    TradeDate = 2,
+}
+impl FreeBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FREE_BASIS_UNSPECIFIED",
+            Self::Settled => "FREE_BASIS_SETTLED",
+            Self::TradeDate => "FREE_BASIS_TRADE_DATE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FREE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "FREE_BASIS_SETTLED" => Some(Self::Settled),
+            "FREE_BASIS_TRADE_DATE" => Some(Self::TradeDate),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum OpeningSourceKind {
+    Unspecified = 0,
+    Custodian = 1,
+    PriorSystem = 2,
+}
+impl OpeningSourceKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OPENING_SOURCE_KIND_UNSPECIFIED",
+            Self::Custodian => "OPENING_SOURCE_KIND_CUSTODIAN",
+            Self::PriorSystem => "OPENING_SOURCE_KIND_PRIOR_SYSTEM",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OPENING_SOURCE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "OPENING_SOURCE_KIND_CUSTODIAN" => Some(Self::Custodian),
+            "OPENING_SOURCE_KIND_PRIOR_SYSTEM" => Some(Self::PriorSystem),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PositionBasis {
+    Unspecified = 0,
+    TradeDate = 1,
+    SettleDate = 2,
+}
+impl PositionBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "POSITION_BASIS_UNSPECIFIED",
+            Self::TradeDate => "POSITION_BASIS_TRADE_DATE",
+            Self::SettleDate => "POSITION_BASIS_SETTLE_DATE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "POSITION_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "POSITION_BASIS_TRADE_DATE" => Some(Self::TradeDate),
+            "POSITION_BASIS_SETTLE_DATE" => Some(Self::SettleDate),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BreakState {
+    Unspecified = 0,
+    Open = 1,
+    Resolved = 2,
+    Closed = 3,
+}
+impl BreakState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BREAK_STATE_UNSPECIFIED",
+            Self::Open => "BREAK_STATE_OPEN",
+            Self::Resolved => "BREAK_STATE_RESOLVED",
+            Self::Closed => "BREAK_STATE_CLOSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BREAK_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "BREAK_STATE_OPEN" => Some(Self::Open),
+            "BREAK_STATE_RESOLVED" => Some(Self::Resolved),
+            "BREAK_STATE_CLOSED" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BreakCategory {
+    Unspecified = 0,
+    TradeDateQuantity = 1,
+    SettledQuantity = 2,
+    CostOrLots = 3,
+    SettledAgainstPending = 4,
+    BookOnly = 5,
+    StreetOnly = 6,
+    /// A figure the book holds a value of its own for, such as the street's
+    /// available and not available against the book's position, or an
+    /// encumbrance against the book's of that kind, location and pledgee.
+    Figure = 7,
+}
+impl BreakCategory {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BREAK_CATEGORY_UNSPECIFIED",
+            Self::TradeDateQuantity => "BREAK_CATEGORY_TRADE_DATE_QUANTITY",
+            Self::SettledQuantity => "BREAK_CATEGORY_SETTLED_QUANTITY",
+            Self::CostOrLots => "BREAK_CATEGORY_COST_OR_LOTS",
+            Self::SettledAgainstPending => "BREAK_CATEGORY_SETTLED_AGAINST_PENDING",
+            Self::BookOnly => "BREAK_CATEGORY_BOOK_ONLY",
+            Self::StreetOnly => "BREAK_CATEGORY_STREET_ONLY",
+            Self::Figure => "BREAK_CATEGORY_FIGURE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BREAK_CATEGORY_UNSPECIFIED" => Some(Self::Unspecified),
+            "BREAK_CATEGORY_TRADE_DATE_QUANTITY" => Some(Self::TradeDateQuantity),
+            "BREAK_CATEGORY_SETTLED_QUANTITY" => Some(Self::SettledQuantity),
+            "BREAK_CATEGORY_COST_OR_LOTS" => Some(Self::CostOrLots),
+            "BREAK_CATEGORY_SETTLED_AGAINST_PENDING" => Some(Self::SettledAgainstPending),
+            "BREAK_CATEGORY_BOOK_ONLY" => Some(Self::BookOnly),
+            "BREAK_CATEGORY_STREET_ONLY" => Some(Self::StreetOnly),
+            "BREAK_CATEGORY_FIGURE" => Some(Self::Figure),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BreakCauseCategory {
+    Unspecified = 0,
+    UnbookedTrade = 1,
+    SettlementTiming = 2,
+    CostOrPrice = 3,
+    CorporateAction = 4,
+    Fail = 5,
+    CustodianError = 6,
+    Unknown = 7,
+}
+impl BreakCauseCategory {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BREAK_CAUSE_CATEGORY_UNSPECIFIED",
+            Self::UnbookedTrade => "BREAK_CAUSE_CATEGORY_UNBOOKED_TRADE",
+            Self::SettlementTiming => "BREAK_CAUSE_CATEGORY_SETTLEMENT_TIMING",
+            Self::CostOrPrice => "BREAK_CAUSE_CATEGORY_COST_OR_PRICE",
+            Self::CorporateAction => "BREAK_CAUSE_CATEGORY_CORPORATE_ACTION",
+            Self::Fail => "BREAK_CAUSE_CATEGORY_FAIL",
+            Self::CustodianError => "BREAK_CAUSE_CATEGORY_CUSTODIAN_ERROR",
+            Self::Unknown => "BREAK_CAUSE_CATEGORY_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BREAK_CAUSE_CATEGORY_UNSPECIFIED" => Some(Self::Unspecified),
+            "BREAK_CAUSE_CATEGORY_UNBOOKED_TRADE" => Some(Self::UnbookedTrade),
+            "BREAK_CAUSE_CATEGORY_SETTLEMENT_TIMING" => Some(Self::SettlementTiming),
+            "BREAK_CAUSE_CATEGORY_COST_OR_PRICE" => Some(Self::CostOrPrice),
+            "BREAK_CAUSE_CATEGORY_CORPORATE_ACTION" => Some(Self::CorporateAction),
+            "BREAK_CAUSE_CATEGORY_FAIL" => Some(Self::Fail),
+            "BREAK_CAUSE_CATEGORY_CUSTODIAN_ERROR" => Some(Self::CustodianError),
+            "BREAK_CAUSE_CATEGORY_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LotReliefMethod {
+    Unspecified = 0,
+    FirstInFirstOut = 1,
+    LastInFirstOut = 2,
+    HighestCost = 3,
+    LowestCost = 4,
+    AverageCost = 5,
+}
+impl LotReliefMethod {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOT_RELIEF_METHOD_UNSPECIFIED",
+            Self::FirstInFirstOut => "LOT_RELIEF_METHOD_FIRST_IN_FIRST_OUT",
+            Self::LastInFirstOut => "LOT_RELIEF_METHOD_LAST_IN_FIRST_OUT",
+            Self::HighestCost => "LOT_RELIEF_METHOD_HIGHEST_COST",
+            Self::LowestCost => "LOT_RELIEF_METHOD_LOWEST_COST",
+            Self::AverageCost => "LOT_RELIEF_METHOD_AVERAGE_COST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOT_RELIEF_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOT_RELIEF_METHOD_FIRST_IN_FIRST_OUT" => Some(Self::FirstInFirstOut),
+            "LOT_RELIEF_METHOD_LAST_IN_FIRST_OUT" => Some(Self::LastInFirstOut),
+            "LOT_RELIEF_METHOD_HIGHEST_COST" => Some(Self::HighestCost),
+            "LOT_RELIEF_METHOD_LOWEST_COST" => Some(Self::LowestCost),
+            "LOT_RELIEF_METHOD_AVERAGE_COST" => Some(Self::AverageCost),
+            _ => None,
+        }
+    }
+}
 /// Envelope wraps one payload.
 ///
 /// The payload is opaque bytes rather than a oneof over every message type. A
@@ -2556,739 +4791,6 @@ pub struct FirstRunApplied {
     /// succeeded; until then the dashboard shows that the rights are still held.
     #[prost(bool, tag = "4")]
     pub rights_released: bool,
-}
-/// Where a change sits in its store's record (spec/plugins-hear-and-read, Q1
-/// as clarified 2026-10-01).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct JournalRef {
-    /// The partition the change was made in: the street store's one, or a
-    /// book partition.
-    #[prost(string, tag = "1")]
-    pub partition: ::prost::alloc::string::String,
-    /// Its number there: the partition's next, taken in the change's own
-    /// transaction, so the numbers have no holes.
-    #[prost(uint64, tag = "2")]
-    pub sequence: u64,
-    /// The number of the previous change the same row made for the same
-    /// account, 0 for its first: what a plugin hearing only some accounts
-    /// checks for a gap in its own.
-    #[prost(uint64, tag = "3")]
-    pub previous_sequence: u64,
-}
-/// Who caused a change, as the store recorded it when it committed (Q3).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ChangeCause {
-    /// The instance that sent the command, as its sidecar stamped it.
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// The person it was sent for (W4.9); empty when the plugin acted as itself.
-    #[prost(string, tag = "2")]
-    pub acting_for_subject: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub correlation_id: ::prost::alloc::string::String,
-    /// The command's message_id.
-    #[prost(string, tag = "4")]
-    pub causation_id: ::prost::alloc::string::String,
-    #[prost(int64, tag = "5")]
-    pub committed_at_ns: i64,
-}
-/// A point in a store's record: a sequence per partition. What a read
-/// answers it was read at, and what a read of changes since takes.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Watermark {
-    #[prost(message, repeated, tag = "1")]
-    pub partitions: ::prost::alloc::vec::Vec<PartitionSequence>,
-}
-/// One partition's sequence within a watermark.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PartitionSequence {
-    #[prost(string, tag = "1")]
-    pub partition: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub sequence: u64,
-}
-/// How fresh a connected account's data is, as reported by the rail.
-///
-/// And why, when it is not current. Published so an operator can tell stale
-/// data from absent data, which look identical on a holdings screen and mean
-/// completely different things. And "unhealthy" alone cannot say whose fix it
-/// is: a connection that needs a person to sign in again, one somebody
-/// disabled, and one that is a day late by design look the same as a flag and
-/// ask for three different things.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SyncStatusEvent {
-    #[prost(string, tag = "1")]
-    pub source: ::prost::alloc::string::String,
-    /// The account the external account is linked to (W6.4), set by the sidecar.
-    /// Empty when it is not linked.
-    #[prost(string, tag = "2")]
-    pub account_id: ::prost::alloc::string::String,
-    /// When the rail last successfully synced this account from the institution.
-    /// Not when the data is as of: a venue a day late by design syncs today what
-    /// was true yesterday, which the two fields below say.
-    #[prost(int64, tag = "3")]
-    pub last_synced_at_ns: i64,
-    /// Whether the rail currently considers the connection healthy. A false here
-    /// with a recent last_synced_at_ns means the data is good but the connection
-    /// has since broken. `state` says why.
-    #[prost(bool, tag = "4")]
-    pub connection_healthy: bool,
-    /// Rail-supplied text, for whatever `state` does not say. Diagnostic only;
-    /// nothing branches on it.
-    #[prost(string, tag = "5")]
-    pub status_detail: ::prost::alloc::string::String,
-    #[prost(int64, tag = "6")]
-    pub observed_at_ns: i64,
-    /// The account as the rail knows it, which the sidecar translates.
-    #[prost(string, tag = "7")]
-    pub external_account_id: ::prost::alloc::string::String,
-    /// Whether the data is current, and if not, why: which is also whose fix it
-    /// is and what the dashboard tells a deployment admin to do.
-    #[prost(enumeration = "SyncState", tag = "8")]
-    pub state: i32,
-    /// When the holdings the rail serves are as of, and when the history
-    /// (transactions) is. Separately, because venues keep them apart and a
-    /// connection can have one current and the other not: SnapTrade reports
-    /// holdings to the minute and transactions by the day. Zero where the rail
-    /// does not say.
-    #[prost(int64, tag = "9")]
-    pub holdings_as_of_ns: i64,
-    #[prost(int64, tag = "10")]
-    pub history_as_of_ns: i64,
-}
-/// Open one statement: the connector's snapshot of one account, at one moment.
-///
-/// A statement is the connector's, not the venue's: none of the eight venues
-/// surveyed has a statement of its own, and every one gives a live snapshot.
-/// So the connector reads an account, and what it read is a statement.
-///
-/// Two dates, and they are not the same thing. `as_of_date` is the date the
-/// positions reflect. `read_at_ns` is when the connector fetched them. A
-/// statement read this morning may be as of yesterday's close, and conflating
-/// the two is how stale data passes for current.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordHoldingsStatementRequest {
-    /// The rail namespace, e.g. "snaptrade".
-    #[prost(string, tag = "1")]
-    pub source: ::prost::alloc::string::String,
-    /// The connector's identifier for this snapshot, made from the account it
-    /// read and the time it read it, so the same read sent twice has the same
-    /// one. Used to recognise a redelivery of the same statement.
-    #[prost(string, tag = "2")]
-    pub external_statement_id: ::prost::alloc::string::String,
-    /// ISO 8601 date the positions are as of.
-    #[prost(string, tag = "3")]
-    pub as_of_date: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub read_at_ns: i64,
-    /// How many holding rows will follow, per W2.2.
-    ///
-    /// The only thing that marks the end of a statement. Nothing else in the
-    /// sequence does: rows arrive as separate messages and none of them is
-    /// distinguishable as the last. The kernel closes the statement when this many
-    /// have landed, and a statement whose rows never all arrive stays open rather
-    /// than publishing counts that are wrong.
-    ///
-    /// The connector holds the whole list before it publishes any of it, so it
-    /// knows this without reading anything twice.
-    #[prost(int32, tag = "5")]
-    pub expected_rows: i32,
-    /// Superseded from contract v7 by `figures` (W2.2): read from a plugin
-    /// before v7 as the set with no segment, refused from one at v7 sent
-    /// beside `figures`. Kept, never reused.
-    #[prost(message, optional, tag = "6")]
-    pub buying_power: ::core::option::Option<Money>,
-    #[prost(message, optional, tag = "7")]
-    pub margin_requirement: ::core::option::Option<Money>,
-    #[prost(message, optional, tag = "8")]
-    pub maintenance_excess: ::core::option::Option<Money>,
-    /// True when the venue stated no currency for the figures and the
-    /// connector's is its own stated assumption (E*TRADE's balances carry none),
-    /// rather than something the venue said. Of every set in `figures`.
-    #[prost(bool, tag = "9")]
-    pub currency_assumed: bool,
-    /// The account as the rail knows it; the sidecar sets account_id from its
-    /// link and refuses the statement when there is none (stamped.tsv). A
-    /// statement is one account's, and a row naming another is refused.
-    #[prost(string, tag = "10")]
-    pub external_account_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "11")]
-    pub account_id: ::prost::alloc::string::String,
-    /// One set per margin segment the venue reports (Q6, Q12); no two name
-    /// the same segment. Never derived: a figure computed here from the
-    /// holdings would be ours presented as the custodian's, and margin is
-    /// where that difference costs money.
-    #[prost(message, repeated, tag = "12")]
-    pub figures: ::prost::alloc::vec::Vec<StatementFigures>,
-    /// The institution holding the external account, as the connector names
-    /// it: the brokerage behind an aggregator, or the venue itself for a
-    /// direct connector. Empty where it does not say.
-    #[prost(string, tag = "13")]
-    pub institution: ::prost::alloc::string::String,
-}
-/// A statement's figures for one margin segment, each as the venue reported
-/// it and unset where it reported none; never derived.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StatementFigures {
-    /// The segment as the venue names it, verbatim ("securities",
-    /// "commodities", an FCM's class); empty for the account as a whole.
-    #[prost(string, tag = "1")]
-    pub segment: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub buying_power: ::core::option::Option<Money>,
-    #[prost(message, optional, tag = "3")]
-    pub margin_requirement: ::core::option::Option<Money>,
-    /// Negative is a deficit.
-    #[prost(message, optional, tag = "4")]
-    pub maintenance_excess: ::core::option::Option<Money>,
-    #[prost(message, optional, tag = "5")]
-    pub initial_margin: ::core::option::Option<Money>,
-    #[prost(message, optional, tag = "6")]
-    pub variation_margin: ::core::option::Option<Money>,
-    /// A brokerage's own total account value, as it reports it (Q-B); never a
-    /// sum of the holdings.
-    #[prost(message, optional, tag = "7")]
-    pub net_liquidation: ::core::option::Option<Money>,
-    /// The collateral held under this segment, as reported (W2.2; Q12, Q13).
-    /// A balance moves nothing: posted collateral the custodian also lists as a
-    /// holding is a holding row too, and collateral received under a security
-    /// interest is never one.
-    #[prost(message, repeated, tag = "8")]
-    pub collateral: ::prost::alloc::vec::Vec<ReportedCollateral>,
-}
-/// One collateral balance under a margin segment, each field as the venue
-/// reports it and unset where it does not; never derived.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReportedCollateral {
-    /// Posted by the account, or received by it. Unspecified is refused.
-    #[prost(enumeration = "CollateralDirection", tag = "1")]
-    pub direction: i32,
-    /// Resolved as a holding's instrument is (W3.1): an instrument or the
-    /// deployment's placeholder, the currency's cash instrument for cash; or,
-    /// when the resolve was ambiguous, the identifiers the connector held.
-    /// Exactly one of the two, as on RecordHoldingRequest.
-    #[prost(string, tag = "2")]
-    pub instrument_id: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "3")]
-    pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
-    #[prost(message, optional, tag = "4")]
-    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    #[prost(message, optional, tag = "5")]
-    pub value: ::core::option::Option<Money>,
-    /// A fraction of the value: 0.15 is 15%, a venue's percentage written as
-    /// its fraction.
-    #[prost(message, optional, tag = "6")]
-    pub haircut: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    #[prost(message, optional, tag = "7")]
-    pub value_after_haircut: ::core::option::Option<Money>,
-    /// Where it is held, as the venue names it: the FCM, the dealer, a
-    /// third-party custodian. Empty where it does not say.
-    #[prost(string, tag = "8")]
-    pub held_at: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordHoldingsStatementReply {
-    /// Kernel-assigned. Every row references it.
-    #[prost(string, tag = "1")]
-    pub statement_id: ::prost::alloc::string::String,
-    /// True when this statement had already been recorded and the existing one is
-    /// being returned. Makes redelivery a no-op rather than a duplicate.
-    #[prost(bool, tag = "2")]
-    pub already_recorded: bool,
-}
-/// One holding, for one account, at one instrument, on one side.
-///
-/// Either `instrument_id` is set, meaning the connector resolved it (to an
-/// instrument, or to the deployment's LCL- placeholder when nothing matched),
-/// or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
-/// both, and never neither. A row that could not be resolved is still recorded, because a
-/// dropped holding is invisible and an operator comparing against their
-/// brokerage would find a silent discrepancy with nothing to investigate.
-///
-/// Cash is a holding like any other: of the currency's cash instrument, which
-/// the identifier scheme `iso4217` names ({scheme: iso4217, value: USD}), its
-/// quantity the cash the venue reports in that currency. A crypto asset held as
-/// cash, such as USDC at Coinbase, is a holding of that asset's instrument.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordHoldingRequest {
-    #[prost(string, tag = "1")]
-    pub statement_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub account_id: ::prost::alloc::string::String,
-    /// Set when resolution succeeded.
-    #[prost(string, tag = "3")]
-    pub instrument_id: ::prost::alloc::string::String,
-    /// Set when it did not: everything the connector held, so an operator can see
-    /// exactly what could not be accounted for.
-    #[prost(message, repeated, tag = "4")]
-    pub unresolved_identifiers: ::prost::alloc::vec::Vec<Identifier>,
-    /// The trade-date quantity: what is held counting every trade executed,
-    /// settled or not. Required. Signed to match `side`: negative is short.
-    #[prost(message, optional, tag = "9")]
-    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// The rail's valuation of the holding, in its currency. Recorded as
-    /// reported, not recomputed: this is the custodian's belief, and rederiving it
-    /// would discard the thing that makes a later comparison meaningful. Unset
-    /// where the venue reported none (SnapTrade and Kalshi do not), which is not
-    /// a value of zero.
-    #[prost(message, optional, tag = "10")]
-    pub market_value: ::core::option::Option<Money>,
-    /// The account as the rail knows it. The connector sets this and leaves
-    /// `account_id` empty; the sidecar sets `account_id` from the link in the
-    /// connector's settings (W6.4), and refuses the row, with that reason, when
-    /// there is none. Refused is not dropped: the external account is reported
-    /// unlinked, and the next statement after it is linked records it (W2).
-    #[prost(string, tag = "8")]
-    pub external_account_id: ::prost::alloc::string::String,
-    /// Long or short, stated rather than read off the sign, and the quantity's
-    /// sign matches it. A venue that reports an account's long and short of one
-    /// instrument apart (Schwab) sends two rows, one on each side; one that
-    /// reports a signed number (E*TRADE, Kalshi) sends the side its sign means.
-    /// A Kalshi NO position is a short row of the market's one contract.
-    #[prost(enumeration = "HoldingSide", tag = "11")]
-    pub side: i32,
-    /// The settle-date quantity: what is held counting only settled trades,
-    /// where the venue reports it, and unset where it does not. For cash, the
-    /// settled cash.
-    #[prost(message, optional, tag = "12")]
-    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// True when the venue stated no currency and the one here is the
-    /// connector's stated assumption (E*TRADE, Schwab and Public state none),
-    /// rather than something the venue said: the market value's currency, and
-    /// for cash the currency whose cash instrument the row names. A
-    /// pseudo-currency such as Interactive Brokers' BASE is never one.
-    #[prost(bool, tag = "13")]
-    pub currency_assumed: bool,
-    /// This position's value is also included in the account's cash holding as
-    /// the venue reports it: SnapTrade counts a money-market fund in cash and
-    /// lists it as a position too. The street store keeps both as reported; a
-    /// reader counting the account once counts the fund as a position and
-    /// deducts it from cash.
-    #[prost(bool, tag = "14")]
-    pub also_counted_in_cash: bool,
-    /// As the venue reports them, unset or empty where it reports none, never
-    /// derived (W2.3; sdk-contract/a-holding-carries-its-cost). The holding's
-    /// total cost.
-    #[prost(message, optional, tag = "15")]
-    pub cost_basis: ::core::option::Option<Money>,
-    /// Its lots as the custodian lists them; none is not one lot, and lots
-    /// whose quantities do not sum to the holding's are recorded as reported.
-    #[prost(message, repeated, tag = "16")]
-    pub lots: ::prost::alloc::vec::Vec<ReportedLot>,
-    #[prost(message, optional, tag = "17")]
-    pub margin_requirement: ::core::option::Option<Money>,
-    /// The venue's average cost per unit, in the venue's unit (SnapTrade: per
-    /// share, for an option whose quantity counts contracts). Never computed
-    /// from cost_basis, nor cost_basis from it: nothing multiplies it by the
-    /// quantity or a multiplier (Q-A, 2026-10-01).
-    #[prost(message, optional, tag = "18")]
-    pub average_cost: ::core::option::Option<Money>,
-}
-/// One lot of a holding, as the custodian lists it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReportedLot {
-    /// Signed as the holding's quantity: negative is short.
-    #[prost(message, optional, tag = "1")]
-    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// The lot's total cost, unset where not reported; its sign as reported,
-    /// never flipped (Q-D, 2026-10-01).
-    #[prost(message, optional, tag = "2")]
-    pub cost: ::core::option::Option<Money>,
-    /// ISO 8601; empty where not reported.
-    #[prost(string, tag = "3")]
-    pub acquired_date: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordHoldingReply {
-    #[prost(string, tag = "1")]
-    pub holding_id: ::prost::alloc::string::String,
-    /// True when the row carried an instrument and updated a position. False for
-    /// an unresolved row, which updates nothing, because there is no position to
-    /// update until the deployment knows what it holds.
-    #[prost(bool, tag = "2")]
-    pub resolved: bool,
-}
-/// A statement is complete.
-///
-/// The unresolved count is the number an operator actually watches; a statement
-/// that is complete and fully resolved is the only quiet outcome.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StatementRecordedEvent {
-    #[prost(string, tag = "1")]
-    pub statement_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub source: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub as_of_date: ::prost::alloc::string::String,
-    #[prost(int32, tag = "4")]
-    pub rows_received: i32,
-    #[prost(int32, tag = "5")]
-    pub rows_resolved: i32,
-    #[prost(int32, tag = "6")]
-    pub rows_unresolved: i32,
-    #[prost(int64, tag = "7")]
-    pub recorded_at_ns: i64,
-    /// The account the statement is of: its external account's, or, from a
-    /// plugin before v7, its rows' (W2.2).
-    #[prost(string, tag = "8")]
-    pub account_id: ::prost::alloc::string::String,
-    /// The statement's figures as recorded, one set per segment (W2.2).
-    #[prost(message, repeated, tag = "9")]
-    pub figures: ::prost::alloc::vec::Vec<StatementFigures>,
-    #[prost(bool, tag = "10")]
-    pub currency_assumed: bool,
-    /// The completion's number in the street's partition, chained per account
-    /// with the statements before it, and who caused it: the row whose landing
-    /// completed it (W2.5, W4.3).
-    #[prost(message, optional, tag = "11")]
-    pub journal: ::core::option::Option<JournalRef>,
-    #[prost(message, optional, tag = "12")]
-    pub cause: ::core::option::Option<ChangeCause>,
-    /// The account as the rail knows it, and the institution holding it, as
-    /// the statement named them: with the source and a segment, what a margin
-    /// agreement is keyed by and an opening balance names as its source. Empty
-    /// from a plugin before v7.
-    #[prost(string, tag = "13")]
-    pub external_account_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "14")]
-    pub institution: ::prost::alloc::string::String,
-}
-/// A custodial position that changed, and the statement that changed it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CustodialPositionUpdatedEvent {
-    #[prost(message, optional, tag = "1")]
-    pub position: ::core::option::Option<CustodialPosition>,
-    /// The statement that caused this. Lets a reader explain any position by
-    /// pointing at what produced it.
-    #[prost(string, tag = "2")]
-    pub statement_id: ::prost::alloc::string::String,
-    /// The previous quantity, so a subscriber can render a delta without holding
-    /// its own history.
-    #[prost(message, optional, tag = "4")]
-    pub previous_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// The change's number in the street's partition, chained per account with
-    /// the positions changed before it, and who caused it (W2.4, W4.3).
-    #[prost(message, optional, tag = "5")]
-    pub journal: ::core::option::Option<JournalRef>,
-    #[prost(message, optional, tag = "6")]
-    pub cause: ::core::option::Option<ChangeCause>,
-}
-/// What the custodian says an account holds of an instrument, on one side,
-/// right now. Keyed by all three: an account may hold an instrument long and
-/// short at once, as a venue reporting them apart says.
-///
-/// Custodial, and named so deliberately. This is the custodian's belief, arrived
-/// at by reading their statements; it is not what the deployment calculates from
-/// its own activity. Those are different numbers whose disagreement is the
-/// entire subject of reconciliation, and a message called `Position` would make
-/// a consumer guess which one it had.
-///
-/// Our own book does not exist yet. When it does it gets its own message and its
-/// own name, and no reader of this one silently changes meaning.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CustodialPosition {
-    #[prost(string, tag = "1")]
-    pub account_id: ::prost::alloc::string::String,
-    /// An instrument, or the deployment's LCL- placeholder awaiting identity,
-    /// which the INS- ID replaces when it arrives (W3.9).
-    #[prost(string, tag = "2")]
-    pub instrument_id: ::prost::alloc::string::String,
-    /// The trade-date quantity, signed to match `side`.
-    #[prost(message, optional, tag = "9")]
-    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// Unset where the custodian reported no value, which is not zero.
-    #[prost(message, optional, tag = "10")]
-    pub market_value: ::core::option::Option<Money>,
-    /// The statement this was last stated by, and when. One not restated recently
-    /// is not wrong, but it is worth showing differently.
-    #[prost(string, tag = "6")]
-    pub last_statement_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub as_of_date: ::prost::alloc::string::String,
-    #[prost(int64, tag = "8")]
-    pub updated_at_ns: i64,
-    #[prost(enumeration = "HoldingSide", tag = "11")]
-    pub side: i32,
-    /// The settle-date quantity, where the custodian reported one.
-    #[prost(message, optional, tag = "12")]
-    pub settle_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// This position's value is also included in the account's cash holding as
-    /// the custodian reports it; both are kept as reported.
-    #[prost(bool, tag = "13")]
-    pub also_counted_in_cash: bool,
-    /// As the custodian reported them on the row that last stated this, unset
-    /// or empty where it reported none (W2.3).
-    #[prost(message, optional, tag = "14")]
-    pub cost_basis: ::core::option::Option<Money>,
-    #[prost(message, repeated, tag = "15")]
-    pub lots: ::prost::alloc::vec::Vec<ReportedLot>,
-    #[prost(message, optional, tag = "16")]
-    pub margin_requirement: ::core::option::Option<Money>,
-    /// Its last change: a delivery at or below it is already in it.
-    #[prost(message, optional, tag = "17")]
-    pub last_change: ::core::option::Option<JournalRef>,
-    /// A tombstone (W2.6, W3.9): returned only to a read since a watermark,
-    /// and delivered once.
-    #[prost(bool, tag = "18")]
-    pub removed: bool,
-    /// As on RecordHoldingRequest (Q-A).
-    #[prost(message, optional, tag = "19")]
-    pub average_cost: ::core::option::Option<Money>,
-}
-/// Read custodial positions, and the unresolved holdings beside them (W2.7).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListCustodialPositionsRequest {
-    /// Empty means every account in the reader's scope for a plugin, every
-    /// account for a core component (W4.11).
-    #[prost(string, tag = "1")]
-    pub account_id: ::prost::alloc::string::String,
-    /// When true, the reply also carries holdings that never resolved, so one
-    /// request answers both "what does the custodian say I hold" and "what could I
-    /// not account for".
-    #[prost(bool, tag = "2")]
-    pub include_unresolved: bool,
-    #[prost(int32, tag = "3")]
-    pub page_size: i32,
-    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
-    /// Unresolved holdings come with the first page only, so a read across
-    /// pages sees each once.
-    #[prost(string, tag = "4")]
-    pub cursor: ::prost::alloc::string::String,
-    /// Only the positions whose last change is above it, tombstones included.
-    #[prost(message, optional, tag = "5")]
-    pub since: ::core::option::Option<Watermark>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListCustodialPositionsReply {
-    #[prost(message, repeated, tag = "1")]
-    pub positions: ::prost::alloc::vec::Vec<CustodialPosition>,
-    /// Populated only when include_unresolved was set.
-    #[prost(message, repeated, tag = "2")]
-    pub unresolved: ::prost::alloc::vec::Vec<UnresolvedHolding>,
-    #[prost(string, tag = "3")]
-    pub next_cursor: ::prost::alloc::string::String,
-    /// The point in the store's record the page was read at.
-    #[prost(message, optional, tag = "4")]
-    pub as_of: ::core::option::Option<Watermark>,
-}
-/// A holding the deployment received but could not name.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UnresolvedHolding {
-    #[prost(string, tag = "1")]
-    pub holding_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub account_id: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "3")]
-    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
-    /// Signed, as the row stated it: negative is a short row.
-    #[prost(message, optional, tag = "10")]
-    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// Unset where the custodian reported no value.
-    #[prost(message, optional, tag = "11")]
-    pub market_value: ::core::option::Option<Money>,
-    #[prost(string, tag = "7")]
-    pub source: ::prost::alloc::string::String,
-    #[prost(string, tag = "8")]
-    pub as_of_date: ::prost::alloc::string::String,
-    /// Whether an escalation has already been raised for these identifiers, so the
-    /// view can separate "nobody has looked at this" from "this is with the
-    /// administrator".
-    #[prost(bool, tag = "9")]
-    pub escalated: bool,
-}
-/// Read completed statements and their figures (W2.9).
-///
-/// How a reconciliation, or a plugin seeding after a restart, reads the
-/// figures without having heard W2.5: they are on the statement and on no
-/// position. An open statement is not listed.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListStatementsRequest {
-    /// Empty: every account in the reader's scope.
-    #[prost(string, tag = "1")]
-    pub account_id: ::prost::alloc::string::String,
-    /// ISO 8601; empty for any date.
-    #[prost(string, tag = "2")]
-    pub as_of_date: ::prost::alloc::string::String,
-    /// Only statements completed after it.
-    #[prost(message, optional, tag = "3")]
-    pub since: ::core::option::Option<Watermark>,
-    #[prost(int32, tag = "4")]
-    pub page_size: i32,
-    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
-    #[prost(string, tag = "5")]
-    pub cursor: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListStatementsReply {
-    /// Completed statements only, each as it was announced (W2.5).
-    #[prost(message, repeated, tag = "1")]
-    pub statements: ::prost::alloc::vec::Vec<StatementRecordedEvent>,
-    #[prost(string, tag = "2")]
-    pub next_cursor: ::prost::alloc::string::String,
-    /// The point in the store's record the page was read at.
-    #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
-}
-/// Every external account a connection reaches, as the connector sees it now.
-///
-/// Published before anything is recorded against any of them, so linking one
-/// (W6.4) is a choice among the accounts on offer rather than a guess made
-/// after a statement was refused for want of a link: one SnapTrade connection
-/// can reach several brokerage accounts, and an administrator links the ones
-/// they mean. The whole list each time, so an account missing from it is one
-/// the connection no longer reaches.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExternalAccountsEvent {
-    #[prost(message, repeated, tag = "1")]
-    pub accounts: ::prost::alloc::vec::Vec<ExternalAccount>,
-}
-/// One account a connection reaches, as the custodian presents it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExternalAccount {
-    /// Stable: the connector makes it so where the venue does not, and it is the
-    /// `external_account_id` the account's rows name. SnapTrade's changes on
-    /// reconnect unless its `institution_account_id` is used; Kalshi's is a
-    /// subaccount and a matching engine joined. A handle the venue wants on each
-    /// call (E*TRADE's accountIdKey, Schwab's hash) stays inside the plugin.
-    #[prost(string, tag = "1")]
-    pub external_account_id: ::prost::alloc::string::String,
-    /// The custodian's own name for it, as a person there would recognise it.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// The venue's own word for the kind of account, verbatim and for display
-    /// only. Nothing reads meaning into it: what an account may do is the
-    /// platform's restriction set, in the platform's words, which each plugin
-    /// maps its venue's types onto when that set is ruled.
-    #[prost(string, tag = "3")]
-    pub venue_account_type: ::prost::alloc::string::String,
-}
-/// Why a connection's data is, or is not, current.
-///
-/// The venues surveyed fail in exactly these ways (reference/broker-apis.md),
-/// and each asks something different of a person, which is the point of
-/// naming them rather than leaving them to a flag and free text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum SyncState {
-    /// Not said: a connector written before this was. Shown as what
-    /// connection_healthy says.
-    Unspecified = 0,
-    /// Current. Nothing to do.
-    Current = 1,
-    /// Still serving, but older than it should be: holdings_as_of_ns says since
-    /// when. Usually the rail's to recover; nothing to do but wait.
-    Stale = 2,
-    /// A person must sign in again at the venue before it serves anything new:
-    /// E*TRADE and Interactive Brokers daily, Schwab weekly, Interactive Brokers
-    /// also when connected but signed out.
-    NeedsSignIn = 3,
-    /// The connection is disabled and serves only what it last read, as
-    /// SnapTrade does. Somebody re-enables it.
-    Disabled = 4,
-    /// Late on purpose, as Interactive Brokers through SnapTrade is by a business
-    /// day. Expected; nothing to do.
-    DelayedByDesign = 5,
-    /// The venue does not provide holdings through this connection, as some
-    /// brokerages hide them from SnapTrade (its `holdings_unavailable`). Waiting
-    /// changes nothing: holdings will not arrive this way, so the account is
-    /// connected another way or through another venue.
-    HoldingsUnavailable = 6,
-}
-impl SyncState {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "SYNC_STATE_UNSPECIFIED",
-            Self::Current => "SYNC_STATE_CURRENT",
-            Self::Stale => "SYNC_STATE_STALE",
-            Self::NeedsSignIn => "SYNC_STATE_NEEDS_SIGN_IN",
-            Self::Disabled => "SYNC_STATE_DISABLED",
-            Self::DelayedByDesign => "SYNC_STATE_DELAYED_BY_DESIGN",
-            Self::HoldingsUnavailable => "SYNC_STATE_HOLDINGS_UNAVAILABLE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "SYNC_STATE_UNSPECIFIED" => Some(Self::Unspecified),
-            "SYNC_STATE_CURRENT" => Some(Self::Current),
-            "SYNC_STATE_STALE" => Some(Self::Stale),
-            "SYNC_STATE_NEEDS_SIGN_IN" => Some(Self::NeedsSignIn),
-            "SYNC_STATE_DISABLED" => Some(Self::Disabled),
-            "SYNC_STATE_DELAYED_BY_DESIGN" => Some(Self::DelayedByDesign),
-            "SYNC_STATE_HOLDINGS_UNAVAILABLE" => Some(Self::HoldingsUnavailable),
-            _ => None,
-        }
-    }
-}
-/// Whether a collateral balance was posted by the account or received by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum CollateralDirection {
-    /// Not said. Refused: collateral is posted or received.
-    Unspecified = 0,
-    Posted = 1,
-    Received = 2,
-}
-impl CollateralDirection {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "COLLATERAL_DIRECTION_UNSPECIFIED",
-            Self::Posted => "COLLATERAL_DIRECTION_POSTED",
-            Self::Received => "COLLATERAL_DIRECTION_RECEIVED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "COLLATERAL_DIRECTION_UNSPECIFIED" => Some(Self::Unspecified),
-            "COLLATERAL_DIRECTION_POSTED" => Some(Self::Posted),
-            "COLLATERAL_DIRECTION_RECEIVED" => Some(Self::Received),
-            _ => None,
-        }
-    }
-}
-/// Which side of an instrument a holding or a custodial position is on.
-///
-/// A side of its own rather than the sign alone, because a venue can report
-/// both sides of one instrument at once, and two rows keyed by account and
-/// instrument alone would overwrite each other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum HoldingSide {
-    /// Not said. Refused by the street store: a holding says which side it is on.
-    Unspecified = 0,
-    Long = 1,
-    Short = 2,
-}
-impl HoldingSide {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "HOLDING_SIDE_UNSPECIFIED",
-            Self::Long => "HOLDING_SIDE_LONG",
-            Self::Short => "HOLDING_SIDE_SHORT",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "HOLDING_SIDE_UNSPECIFIED" => Some(Self::Unspecified),
-            "HOLDING_SIDE_LONG" => Some(Self::Long),
-            "HOLDING_SIDE_SHORT" => Some(Self::Short),
-            _ => None,
-        }
-    }
 }
 /// What a plugin says about itself, from `\[tool.meridian\]` in its
 /// pyproject.toml. Declarations for an administrator to approve, not grants.

@@ -79,6 +79,7 @@ fn statement(account_id: &str) -> Statement {
         institution: String::new(),
         figures: Vec::new(),
         currency_assumed: false,
+        security_interest: None,
         completed: None,
     }
 }
@@ -599,6 +600,7 @@ fn a_statements_figures_are_kept_as_reported_and_read_back() {
                     haircut: Some(units("0.02")),
                     value_after_haircut: None,
                     held_at: "the prime broker".into(),
+                    reusable: Some(false),
                 }],
                 ..Default::default()
             },
@@ -609,15 +611,17 @@ fn a_statements_figures_are_kept_as_reported_and_read_back() {
             },
         ],
         currency_assumed: true,
+        security_interest: Some(true),
         ..statement(&unique("ACC"))
     };
     let (opened, _, _) = store.open(statement.clone(), &at(NOW)).unwrap();
     let read = store.statement(&opened.statement_id).unwrap().unwrap();
     assert_eq!(
         read.figures, statement.figures,
-        "in the order given, collateral too"
+        "in the order given, collateral too, reusable as reported"
     );
     assert!(read.currency_assumed);
+    assert_eq!(read.security_interest, Some(true), "as reported (v8)");
     assert_eq!(
         read.figures[0].buying_power.as_ref().unwrap().to_string(),
         "41250.00 USD",
@@ -1538,6 +1542,34 @@ fn a_holdings_cost_and_lots_are_kept_on_the_row_and_the_position() {
             },
         ],
         margin_requirement: Some(usd("703.13")),
+        // Available and not, and the sub-balances, as reported, here not
+        // fitting the holding's quantity: kept as reported, for the
+        // reconciliation to flag.
+        available_quantity: Some(units("5")),
+        not_available_quantity: None,
+        available_basis: 1,
+        encumbrances: vec![
+            meridian_street::Encumbrance {
+                kind: 1,
+                quantity: units("4"),
+                available: Some(false),
+                source_code: "PLED".into(),
+                pledgee: "Interactive Brokers".into(),
+                held_at: "DTC".into(),
+                segment: String::new(),
+                detail: String::new(),
+            },
+            meridian_street::Encumbrance {
+                kind: 7,
+                quantity: units("1.5"),
+                available: None,
+                source_code: "Not Segregated".into(),
+                pledgee: String::new(),
+                held_at: String::new(),
+                segment: "securities".into(),
+                detail: "as the statement says".into(),
+            },
+        ],
     };
     let account = holding.account_id.clone();
     let instrument = holding.instrument_id.clone().unwrap();

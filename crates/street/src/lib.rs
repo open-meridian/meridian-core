@@ -99,6 +99,6 @@ pub use postgres::PostgresStore;
 pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
     Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts, CustodialPosition,
-    Direction, Figures, Holding, Key, Lot, Opened, Scope, Settled, Side, Statement, Store,
-    StoreError, PARTITION,
+    Direction, Encumbrance, Figures, Holding, Key, Lot, Opened, Scope, Settled, Side, Statement,
+    Store, StoreError, PARTITION,
 };

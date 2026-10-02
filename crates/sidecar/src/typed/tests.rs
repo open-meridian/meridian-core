@@ -1690,3 +1690,78 @@ async fn an_unscoped_read_is_stamped_too_and_answered_whatever_the_scope() {
         .expect("answered");
     assert_eq!(*marked.lock().unwrap(), Some(true));
 }
+
+// ── Contract v8: a component's refusal carries its code ─────────────────────
+
+/// An `operations` plugin's sidecar, its contract the book's command, and a
+/// book that refuses every break for want of an opening balance, with its
+/// code (W9.4).
+async fn before_the_book_holds_the_account() -> Sidecar {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.book.command.record-break\tcommand\toperations\tbor\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\noperations\trole\nbor\tcomponent\nsidecar\tcomponent\n\
+         conductor\tcomponent\n",
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve("platform.book.command.record-break", |_| {
+        Err(meridian_bus::refusal(
+            RefusalReason::NoOpeningBalance as i32,
+            "account ACC-1 has no opening balance; it enters the book once, with one (W9.1)",
+        ))
+    });
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration {
+                plugin_instance_id: "operations-sample-1".into(),
+                read_account_ids: vec!["ACC-1".into()],
+                write_account_ids: vec!["ACC-1".into()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let sidecar = Sidecar::under(
+        &contract,
+        bus,
+        "DEP-test",
+        Identity::new("operations-sample-1", vec!["operations".into()]),
+    );
+    let reply = sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v8".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    sidecar
+}
+
+#[tokio::test]
+async fn a_components_refusal_reaches_the_plugin_with_its_code_beside_aborted() {
+    let sidecar = before_the_book_holds_the_account().await;
+    let refused = sidecar
+        .record_break(Request::new(meridian_pb::plugin::v1::RecordBreakParams {
+            account_id: "ACC-1".into(),
+            business_date: "2026-09-09".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Aborted);
+    assert_eq!(reason(&refused), Some(RefusalReason::NoOpeningBalance));
+    // The words alone: the code rides beside them, not in them.
+    assert_eq!(
+        refused.message(),
+        "account ACC-1 has no opening balance; it enters the book once, with one (W9.1)"
+    );
+}

@@ -14,3 +14,11 @@ services:
       STAND_IN_REPORTS_AT_START: "1"
     volumes:
       - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+
+  # And as the second plugin, an operations plugin's place (contract v8):
+  # registered beside the first, opened at write once the admin is granted
+  # it, writing nothing.
+  plugin-2:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro

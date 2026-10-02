@@ -21,6 +21,12 @@
 #   MERIDIAN_HARNESS_PLUGIN_IMAGE  the plugin's image
 #   MERIDIAN_HARNESS_PLUGIN_ROLES  its roles, comma separated, as it declares
 #                                  them (empty for a plugin holding none)
+#
+# And, for a second plugin beside it (the `second` profile; a plugin that
+# writes the book proves itself against a custody plugin recording
+# statements), optional:
+#   MERIDIAN_HARNESS_PLUGIN_2_IMAGE  the second plugin's image
+#   MERIDIAN_HARNESS_PLUGIN_2_ROLES  its roles, comma separated
 
 name: meridian-harness
 
@@ -46,8 +52,10 @@ services:
       retries: 30
     volumes:
       # The street store as lines: `exec -T postgres psql -U meridian -d
-      # meridian -At -v ON_ERROR_STOP=1 -f /harness/street.sql`.
+      # meridian -At -v ON_ERROR_STOP=1 -f /harness/street.sql`; the book
+      # of record likewise, `-f /harness/book.sql` (contract v8).
       - ./street.sql:/harness/street.sql:ro
+      - ./book.sql:/harness/book.sql:ro
     networks: [harness]
 
   # The dashboard's signing key, as the chart's Job makes it (the private
@@ -84,11 +92,13 @@ services:
       - |
         set -e
         roles=$$(printf %s "$$MERIDIAN_HARNESS_PLUGIN_ROLES" | tr -d ' ' | sed 's/[^,][^,]*/"&"/g')
-        printf '{"instances": [{"instance_id": "plugin-1", "roles": [%s]}, {"instance_id": "dashboard-1", "component": "dashboard"}]}\n' \
-          "$$roles" > /nats/instances.json
+        second=$$(printf %s "$$MERIDIAN_HARNESS_PLUGIN_2_ROLES" | tr -d ' ' | sed 's/[^,][^,]*/"&"/g')
+        printf '{"instances": [{"instance_id": "plugin-1", "roles": [%s]}, {"instance_id": "plugin-2", "roles": [%s]}, {"instance_id": "dashboard-1", "component": "dashboard"}]}\n' \
+          "$$roles" "$$second" > /nats/instances.json
         meridian-broker-config --instances /nats/instances.json --out /nats/harness.conf
     environment:
       MERIDIAN_HARNESS_PLUGIN_ROLES: ${MERIDIAN_HARNESS_PLUGIN_ROLES?set MERIDIAN_HARNESS_PLUGIN_ROLES to the plugin's roles, comma separated}
+      MERIDIAN_HARNESS_PLUGIN_2_ROLES: ${MERIDIAN_HARNESS_PLUGIN_2_ROLES:-}
     volumes:
       - broker:/nats
 
@@ -105,6 +115,7 @@ services:
       MERIDIAN_NATS_FIRST_RUN: first-run-harness-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-harness-only
       MERIDIAN_NATS_PLUGIN_1: plugin-1-harness-only
+      MERIDIAN_NATS_PLUGIN_2: plugin-2-harness-only
     volumes:
       - broker:/etc/nats:ro
     networks: [harness]
@@ -115,13 +126,14 @@ services:
     <<: *runtime
     entrypoint: ["sh", "-c"]
     command:
-      - meridian-instrument migrate && meridian-street migrate && meridian-conductor migrate && meridian-dashboard migrate
+      - meridian-instrument migrate && meridian-street migrate && meridian-bor migrate && meridian-conductor migrate && meridian-dashboard migrate
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       MERIDIAN_DATABASE_URL: *database
       MERIDIAN_STREET_DATABASE_URL: *database
+      MERIDIAN_BOR_DATABASE_URL: *database
       MERIDIAN_CONFIG_DATABASE_URL: *database
       MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL: *database
 
@@ -137,6 +149,17 @@ services:
       MERIDIAN_STREET_DATABASE_URL: *database
       MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
       MERIDIAN_INSTANCE_ID: street-1
+
+  # The book of record (W9, contract v8): what an operations plugin writes,
+  # and five roles read and hear.
+  bor:
+    <<: *runtime
+    command: ["meridian-bor"]
+    depends_on: *serving
+    environment:
+      MERIDIAN_BOR_DATABASE_URL: *database
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-harness-only@nats:4222
+      MERIDIAN_INSTANCE_ID: bor-1
 
   instrument:
     <<: *runtime
@@ -240,6 +263,46 @@ services:
     environment:
       MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
     network_mode: "service:sidecar"
+
+  # A second plugin, beside the first, with the `second` profile: instance
+  # plugin-2 and its sidecar, its roles MERIDIAN_HARNESS_PLUGIN_2_ROLES. A
+  # plugin whose work is another's records -- an operations plugin
+  # reconciling what a custody plugin recorded -- runs that one here. The
+  # runner names it with `--instance plugin-2`. A plugin adds environment, a
+  # command or a volume with its own `-f` override of this service, as of
+  # `plugin`.
+  sidecar-2:
+    <<: *runtime
+    profiles: [second]
+    command: ["meridian-sidecar"]
+    depends_on:
+      nats:
+        condition: service_started
+      keys:
+        condition: service_completed_successfully
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: DEP-harness
+      MERIDIAN_BROKER_URL: nats://plugin-2:plugin-2-harness-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: plugin-2
+      MERIDIAN_PLUGIN_ROLES: ${MERIDIAN_HARNESS_PLUGIN_2_ROLES:-}
+      MERIDIAN_INSTANCE_ID: sidecar-plugin-2
+      MERIDIAN_FRONT_DOOR_ADDRESS: 0.0.0.0:9292
+      MERIDIAN_DASHBOARD_KEYS_DIR: /keys/public
+    volumes:
+      - keys:/keys:ro
+    networks:
+      harness:
+        aliases: [sidecar-plugin-2]
+
+  plugin-2:
+    profiles: [second]
+    image: ${MERIDIAN_HARNESS_PLUGIN_2_IMAGE:-${MERIDIAN_HARNESS_PLUGIN_IMAGE}}
+    depends_on:
+      sidecar-2:
+        condition: service_started
+    environment:
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
+    network_mode: "service:sidecar-2"
 
   # The runner: what a person would do in the dashboard, as the harness's
   # admin. `run --rm runner <command>`; harness.py says the commands.

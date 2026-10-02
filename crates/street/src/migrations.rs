@@ -73,6 +73,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "every_change_numbered",
         sql: include_str!("../migrations/0005_every_change_numbered.sql"),
     },
+    Migration {
+        version: 6,
+        name: "what_cannot_move",
+        sql: include_str!("../migrations/0006_what_cannot_move.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -29,13 +29,14 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 7] = [
+const TABS: [(&str, &str); 8] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
     ("account-groups", "Account groups"),
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
+    ("books", "Books"),
     ("terminal-sessions", "Terminal sessions"),
 ];
 
@@ -186,6 +187,7 @@ pub fn render(
     holders: &[(String, String, usize)],
     plugins: &[Line],
     people: &[Person],
+    books: &super::books::Books,
     token: &str,
     notice: &str,
 ) -> String {
@@ -888,6 +890,24 @@ pub fn render(
          what it is and who owns it. Closed, never deleted.",
         &add_button("account", "an account"),
         format!("{table}{dialogs}"),
+    ));
+
+    // ── Books ───────────────────────────────────────────────────────────────
+    // W9.13, W9.14: each open account's attributes in the book of record,
+    // set for a deployment admin with a reason; no account's data.
+    let open: Vec<AccountRecord> = records
+        .accounts
+        .iter()
+        .filter(|a| a.state != meridian_domain::v1::AccountState::Closed as i32)
+        .cloned()
+        .collect();
+    let (books_body, books_dialog) = super::books::section(&open, books, token);
+    sections.push(section(
+        "books",
+        "Books",
+        "Each account's base currency and the lots a sale relieves when it names none, in          the book of record, and the date its opening balance stands for. Each change is          journalled with its reason.",
+        "",
+        format!("{books_body}{books_dialog}"),
     ));
 
     // ── Terminal sessions ───────────────────────────────────────────────────

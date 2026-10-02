@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clock", "crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run"]
+members = ["crates/clock", "crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/bor", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run"]
 
 [workspace.package]
 edition = "2021"
@@ -14,7 +14,7 @@ license = "AGPL-3.0-or-later"
 # reviewable change rather than something that drifts in on a rebuild -- a
 # schema change lands in every consumer as one arc or it is not landed.
 [workspace.dependencies]
-meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "a10efca83d2e046487996cc7a75c93fae22fde9a" }
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "4cc581fa0f94715d88241fcae115828f68ca21e7" }
 # The domain messages, generated here from proto/ rather than taken from the
 # schema: they are the runtime's own traffic past the sidecar.
 meridian-domain = { path = "crates/domain" }

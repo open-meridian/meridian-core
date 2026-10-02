@@ -4,6 +4,7 @@
 # components (decisions/020). A role's grants are the rows in topics.tsv that
 # name it. Regenerate from meridian-design with `make component-topics`.
 name	kind
+bor	component
 ccm	role
 compliance	role
 conductor	component

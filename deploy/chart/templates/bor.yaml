@@ -1,0 +1,83 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The book of record (W9): the firm's own positions, breaks and figures, an
+  append-only journal per account partition and the projections rebuilt from
+  it. Its own Deployment and tag beside the street store's, sharing no key,
+  join or transaction with it (decisions/012).
+
+  One writer per partition. Every command takes its partition's lock in
+  Postgres, and the rollout never surges -- the old one stops before the new
+  one starts, as the conductor's does (not Recreate: Helm 4's server-side
+  apply cannot change an existing Deployment to it) -- so an upgrade never
+  runs an old writer beside a new one over the same journal (W9.8).
+
+  No key and no platform address: what it runs reaches the platform by way
+  of the instrument store, as the street store's does.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-bor
+  labels:
+    meridian.dev/component: bor
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.bor.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: bor
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: bor
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bor
+          image: "{{ .Values.image.repository }}:{{ .Values.bor.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-bor"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-bor
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: MERIDIAN_BOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.bor.database.key | default .Values.database.key }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
+                  key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.borKey) }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
+          volumeMounts:
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}

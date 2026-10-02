@@ -87,7 +87,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         self.exact_money("margin_requirement", message.margin_requirement.as_ref())?;
         self.exact_money("average_cost", message.average_cost.as_ref())?;
+        self.exact("available_quantity", message.available_quantity.as_ref())?;
+        self.exact("not_available_quantity", message.not_available_quantity.as_ref())?;
+        for (i0, held0) in message.encumbrances.iter().enumerate() {
+            self.known(&format!("encumbrances[{i0}].kind"), held0.kind, domain::EncumbranceKind::try_from(held0.kind).is_ok())?;
+            self.exact(&format!("encumbrances[{i0}].quantity"), held0.quantity.as_ref())?;
+        }
         self.known("side", message.side, domain::HoldingSide::try_from(message.side).is_ok())?;
+        self.known("available_basis", message.available_basis, domain::AvailableBasis::try_from(message.available_basis).is_ok())?;
         message.account_id = self.linked_account("meridian.v1.RecordHoldingRequest", &message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
@@ -136,6 +143,16 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
     }
 
+    /// W3.6: `platform.reference.query.resolve-instrument`.
+    async fn resolve_instrument(
+        &self,
+        request: Request<plugin::ResolveInstrumentParams>,
+    ) -> Result<Response<plugin::ResolveInstrumentResult>, Status> {
+        let message: domain::ResolveInstrumentRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.resolve-instrument", "meridian.v1.ResolveInstrumentRequest", message, account, None).await
+    }
+
     /// W6.4: `platform.config.command.link-external-account`.
     async fn link_external_account(
         &self,
@@ -159,6 +176,236 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let message: domain::AccountsRequest = self.as_domain(params)?;
         let account = None;
         self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, account, acting_for).await
+    }
+
+    /// W9.1: `platform.book.command.record-opening-balance`.
+    async fn record_opening_balance(
+        &self,
+        request: Request<plugin::RecordOpeningBalanceParams>,
+    ) -> Result<Response<plugin::RecordOpeningBalanceResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordOpeningBalanceRequest = self.as_domain(params)?;
+        for (i0, held0) in message.sources.iter().enumerate() {
+            self.known(&format!("sources[{i0}].kind"), held0.kind, domain::OpeningSourceKind::try_from(held0.kind).is_ok())?;
+            self.known(&format!("sources[{i0}].basis"), held0.basis, domain::PositionBasis::try_from(held0.basis).is_ok())?;
+        }
+        for (i0, held0) in message.positions.iter().enumerate() {
+            self.known(&format!("positions[{i0}].side"), held0.side, domain::HoldingSide::try_from(held0.side).is_ok())?;
+            self.exact(&format!("positions[{i0}].trade_date_quantity"), held0.trade_date_quantity.as_ref())?;
+            self.exact(&format!("positions[{i0}].settled_quantity"), held0.settled_quantity.as_ref())?;
+            for (i1, held1) in held0.pending.iter().enumerate() {
+                self.exact(&format!("positions[{i0}].pending[{i1}].quantity"), held1.quantity.as_ref())?;
+            }
+            for (i1, held1) in held0.lots.iter().enumerate() {
+                self.exact(&format!("positions[{i0}].lots[{i1}].quantity"), held1.quantity.as_ref())?;
+                if let Some(held2) = held1.terms.as_ref() {
+                    self.exact_money(&format!("positions[{i0}].lots[{i1}].terms.unit_cost"), held2.unit_cost.as_ref())?;
+                    self.exact_money(&format!("positions[{i0}].lots[{i1}].terms.cost"), held2.cost.as_ref())?;
+                    self.known(&format!("positions[{i0}].lots[{i1}].terms.source"), held2.source, domain::LotSource::try_from(held2.source).is_ok())?;
+                }
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-opening-balance", "meridian.v1.RecordOpeningBalanceRequest", message, account, acting_for).await
+    }
+
+    /// W9.4: `platform.book.command.record-break`.
+    async fn record_break(
+        &self,
+        request: Request<plugin::RecordBreakParams>,
+    ) -> Result<Response<plugin::RecordBreakResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordBreakRequest = self.as_domain(params)?;
+        if let Some(domain::record_break_request::Subject::Position(held0)) = message.subject.as_ref() {
+            self.known("position.side", held0.side, domain::HoldingSide::try_from(held0.side).is_ok())?;
+        }
+        for (i0, held0) in message.differences.iter().enumerate() {
+            if let Some(held1) = held0.book.as_ref() {
+                if let Some(domain::break_value::Value::Quantity(held2)) = held1.value.as_ref() {
+                    self.exact(&format!("differences[{i0}].book.quantity"), Some(held2))?;
+                }
+                if let Some(domain::break_value::Value::Amount(held2)) = held1.value.as_ref() {
+                    self.exact_money(&format!("differences[{i0}].book.amount"), Some(held2))?;
+                }
+            }
+            if let Some(held1) = held0.street.as_ref() {
+                if let Some(domain::break_value::Value::Quantity(held2)) = held1.value.as_ref() {
+                    self.exact(&format!("differences[{i0}].street.quantity"), Some(held2))?;
+                }
+                if let Some(domain::break_value::Value::Amount(held2)) = held1.value.as_ref() {
+                    self.exact_money(&format!("differences[{i0}].street.amount"), Some(held2))?;
+                }
+            }
+        }
+        for (i0, held0) in message.candidate_causes.iter().enumerate() {
+            self.known(&format!("candidate_causes[{i0}].category"), held0.category, domain::BreakCauseCategory::try_from(held0.category).is_ok())?;
+            if let Some(domain::break_cause::Item::PendingSettlement(held1)) = held0.item.as_ref() {
+                self.known(&format!("candidate_causes[{i0}].pending_settlement.side"), held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+            }
+        }
+        self.known("category", message.category, domain::BreakCategory::try_from(message.category).is_ok())?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-break", "meridian.v1.RecordBreakRequest", message, account, acting_for).await
+    }
+
+    /// W9.5: `platform.book.command.record-account-figures`.
+    async fn record_account_figures(
+        &self,
+        request: Request<plugin::RecordAccountFiguresParams>,
+    ) -> Result<Response<plugin::RecordAccountFiguresResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordAccountFiguresRequest = self.as_domain(params)?;
+        for (i0, held0) in message.agreements.iter().enumerate() {
+            if let Some(held1) = held0.figures.as_ref() {
+                self.exact_money(&format!("agreements[{i0}].figures.buying_power"), held1.buying_power.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].figures.margin_requirement"), held1.margin_requirement.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].figures.maintenance_excess"), held1.maintenance_excess.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].figures.initial_margin"), held1.initial_margin.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].figures.variation_margin"), held1.variation_margin.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].figures.net_liquidation"), held1.net_liquidation.as_ref())?;
+                for (i2, held2) in held1.collateral.iter().enumerate() {
+                    self.known(&format!("agreements[{i0}].figures.collateral[{i2}].direction"), held2.direction, domain::CollateralDirection::try_from(held2.direction).is_ok())?;
+                    self.exact(&format!("agreements[{i0}].figures.collateral[{i2}].quantity"), held2.quantity.as_ref())?;
+                    self.exact_money(&format!("agreements[{i0}].figures.collateral[{i2}].value"), held2.value.as_ref())?;
+                    self.exact(&format!("agreements[{i0}].figures.collateral[{i2}].haircut"), held2.haircut.as_ref())?;
+                    self.exact_money(&format!("agreements[{i0}].figures.collateral[{i2}].value_after_haircut"), held2.value_after_haircut.as_ref())?;
+                }
+            }
+            for (i1, held1) in held0.position_values.iter().enumerate() {
+                self.known(&format!("agreements[{i0}].position_values[{i1}].side"), held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+                self.exact_money(&format!("agreements[{i0}].position_values[{i1}].market_value"), held1.market_value.as_ref())?;
+                self.exact_money(&format!("agreements[{i0}].position_values[{i1}].margin_requirement"), held1.margin_requirement.as_ref())?;
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-account-figures", "meridian.v1.RecordAccountFiguresRequest", message, account, acting_for).await
+    }
+
+    /// W9.15: `platform.book.command.record-encumbrances`.
+    async fn record_encumbrances(
+        &self,
+        request: Request<plugin::RecordEncumbrancesParams>,
+    ) -> Result<Response<plugin::RecordEncumbrancesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordEncumbrancesRequest = self.as_domain(params)?;
+        for (i0, held0) in message.positions.iter().enumerate() {
+            self.known(&format!("positions[{i0}].side"), held0.side, domain::HoldingSide::try_from(held0.side).is_ok())?;
+            for (i1, held1) in held0.encumbrances.iter().enumerate() {
+                self.known(&format!("positions[{i0}].encumbrances[{i1}].kind"), held1.kind, domain::EncumbranceKind::try_from(held1.kind).is_ok())?;
+                self.exact(&format!("positions[{i0}].encumbrances[{i1}].quantity"), held1.quantity.as_ref())?;
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-encumbrances", "meridian.v1.RecordEncumbrancesRequest", message, account, acting_for).await
+    }
+
+    /// W9.6: `platform.book.command.handle-break`.
+    async fn handle_break(
+        &self,
+        request: Request<plugin::HandleBreakParams>,
+    ) -> Result<Response<plugin::HandleBreakResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::HandleBreakRequest = self.as_domain(params)?;
+        if let Some(held0) = message.confirmed_cause.as_ref() {
+            self.known("confirmed_cause.category", held0.category, domain::BreakCauseCategory::try_from(held0.category).is_ok())?;
+            if let Some(domain::break_cause::Item::PendingSettlement(held1)) = held0.item.as_ref() {
+                self.known("confirmed_cause.pending_settlement.side", held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.handle-break", "meridian.v1.HandleBreakRequest", message, account, acting_for).await
+    }
+
+    /// W9.7: `platform.book.command.resolve-break`.
+    async fn resolve_break(
+        &self,
+        request: Request<plugin::ResolveBreakParams>,
+    ) -> Result<Response<plugin::ResolveBreakResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ResolveBreakRequest = self.as_domain(params)?;
+        if let Some(domain::resolve_break_request::Resolution::Adjustment(held0)) = message.resolution.as_ref() {
+            for (i1, held1) in held0.lines.iter().enumerate() {
+                self.known(&format!("adjustment.lines[{i1}].side"), held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+                self.known(&format!("adjustment.lines[{i1}].bucket"), held1.bucket, domain::SettlementBucket::try_from(held1.bucket).is_ok())?;
+                self.exact(&format!("adjustment.lines[{i1}].quantity"), held1.quantity.as_ref())?;
+                if let Some(held2) = held1.opens_lot.as_ref() {
+                    self.exact_money(&format!("adjustment.lines[{i1}].opens_lot.unit_cost"), held2.unit_cost.as_ref())?;
+                    self.exact_money(&format!("adjustment.lines[{i1}].opens_lot.cost"), held2.cost.as_ref())?;
+                    self.known(&format!("adjustment.lines[{i1}].opens_lot.source"), held2.source, domain::LotSource::try_from(held2.source).is_ok())?;
+                }
+            }
+            for (i1, held1) in held0.basis_adjustments.iter().enumerate() {
+                if let Some(domain::basis_adjustment::Cost::CostChange(held2)) = held1.cost.as_ref() {
+                    self.exact_money(&format!("adjustment.basis_adjustments[{i1}].cost_change"), Some(held2))?;
+                }
+                if let Some(domain::basis_adjustment::Cost::StatedCost(held2)) = held1.cost.as_ref() {
+                    self.exact_money(&format!("adjustment.basis_adjustments[{i1}].stated_cost"), Some(held2))?;
+                }
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.resolve-break", "meridian.v1.ResolveBreakRequest", message, account, acting_for).await
+    }
+
+    /// W9.7: `platform.book.command.close-breaks-as-cleared`.
+    async fn close_breaks_as_cleared(
+        &self,
+        request: Request<plugin::CloseBreaksAsClearedParams>,
+    ) -> Result<Response<plugin::CloseBreaksAsClearedResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::CloseBreaksAsClearedRequest = self.as_domain(params)?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.close-breaks-as-cleared", "meridian.v1.CloseBreaksAsClearedRequest", message, account, acting_for).await
+    }
+
+    /// W9.10: `platform.book.query.list-positions`.
+    async fn list_positions(
+        &self,
+        request: Request<plugin::ListPositionsParams>,
+    ) -> Result<Response<plugin::ListPositionsResult>, Status> {
+        let message: domain::ListPositionsRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-positions", "meridian.v1.ListPositionsRequest", message, account, None).await
+    }
+
+    /// W9.11: `platform.book.query.list-breaks`.
+    async fn list_breaks(
+        &self,
+        request: Request<plugin::ListBreaksParams>,
+    ) -> Result<Response<plugin::ListBreaksResult>, Status> {
+        let message: domain::ListBreaksRequest = self.as_domain(request.into_inner())?;
+        for &value in &message.states {
+            self.known("states", value, domain::BreakState::try_from(value).is_ok())?;
+        }
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-breaks", "meridian.v1.ListBreaksRequest", message, account, None).await
+    }
+
+    /// W9.12: `platform.book.query.list-account-figures`.
+    async fn list_account_figures(
+        &self,
+        request: Request<plugin::ListAccountFiguresParams>,
+    ) -> Result<Response<plugin::ListAccountFiguresResult>, Status> {
+        let message: domain::ListAccountFiguresRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-account-figures", "meridian.v1.ListAccountFiguresRequest", message, account, None).await
+    }
+
+    /// W9.14: `platform.book.query.list-account-attributes`.
+    async fn list_account_attributes(
+        &self,
+        request: Request<plugin::ListAccountAttributesParams>,
+    ) -> Result<Response<plugin::ListAccountAttributesResult>, Status> {
+        let message: domain::ListAccountAttributesRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-account-attributes", "meridian.v1.ListAccountAttributesRequest", message, account, None).await
     }
 
     type ReceiveStream = crate::receive::Deliveries;
@@ -190,6 +437,34 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.CustodialPositionUpdatedEvent",
         read: custodial_position_updated,
     },
+    crate::receive::Row {
+        name: "PositionChanged",
+        step: "W9.8",
+        topic: "platform.book.event.position-changed",
+        payload_type: "meridian.v1.PositionChangedEvent",
+        read: position_changed,
+    },
+    crate::receive::Row {
+        name: "BreakChanged",
+        step: "W9.8",
+        topic: "platform.book.event.break-changed",
+        payload_type: "meridian.v1.BreakChangedEvent",
+        read: break_changed,
+    },
+    crate::receive::Row {
+        name: "AccountFiguresRecorded",
+        step: "W9.8",
+        topic: "platform.book.event.account-figures-recorded",
+        payload_type: "meridian.v1.AccountFiguresRecordedEvent",
+        read: account_figures_recorded,
+    },
+    crate::receive::Row {
+        name: "AccountAttributeChanged",
+        step: "W9.8",
+        topic: "platform.book.event.account-attribute-changed",
+        payload_type: "meridian.v1.AccountAttributeChangedEvent",
+        read: account_attribute_changed,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -211,5 +486,49 @@ fn custodial_position_updated(payload: &[u8]) -> Result<crate::receive::Read, pr
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::CustodialPositionUpdated(message),
+    })
+}
+
+/// W9.8: a PositionChangedEvent, its account at `position.account_id`.
+fn position_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::PositionChangedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.position.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::PositionChanged(message),
+    })
+}
+
+/// W9.8: a BreakChangedEvent, its account at `break_record.account_id`.
+fn break_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::BreakChangedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.break_record.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::BreakChanged(message),
+    })
+}
+
+/// W9.8: a AccountFiguresRecordedEvent, its account at `figures.account_id`.
+fn account_figures_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::AccountFiguresRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.figures.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::AccountFiguresRecorded(message),
+    })
+}
+
+/// W9.8: a AccountAttributeChangedEvent, its account at `attributes.account_id`.
+fn account_attribute_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::AccountAttributeChangedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.attributes.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::AccountAttributeChanged(message),
     })
 }

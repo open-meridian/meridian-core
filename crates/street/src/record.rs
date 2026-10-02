@@ -13,14 +13,14 @@ use meridian_domain::v1::{
     ChangeCause, CollateralDirection, CustodialPositionUpdatedEvent, HoldingSide,
     Identifier as PbIdentifier, InstrumentReplacedEvent, JournalRef, RecordHoldingReply,
     RecordHoldingRequest, RecordHoldingsStatementReply, RecordHoldingsStatementRequest,
-    ReportedCollateral, ReportedLot, StatementFigures, StatementRecordedEvent,
+    ReportedCollateral, ReportedEncumbrance, ReportedLot, StatementFigures, StatementRecordedEvent,
 };
 
 use crate::amounts::{Money, Quantity};
 use crate::ids;
 use crate::store::{
-    Cause, Change, Collateral, Completion, Cost, Counts, CustodialPosition, Direction, Figures,
-    Holding, Identifier, Lot, Opened, Result, Settled, Side, Statement, Store, StoreError,
+    Cause, Change, Collateral, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance,
+    Figures, Holding, Identifier, Lot, Opened, Result, Settled, Side, Statement, Store, StoreError,
     PARTITION,
 };
 
@@ -60,6 +60,7 @@ pub fn open_statement(
             // presented as the custodian's.
             figures: figures_from_wire(request)?,
             currency_assumed: request.currency_assumed,
+            security_interest: request.security_interest,
             completed: None,
         },
         cause,
@@ -201,6 +202,7 @@ fn collateral_from_wire(i: usize, j: usize, balance: &ReportedCollateral) -> Res
             balance.value_after_haircut.as_ref(),
         )?,
         held_at: balance.held_at.clone(),
+        reusable: balance.reusable,
     })
 }
 
@@ -279,6 +281,24 @@ pub fn record_holding(
                 "margin_requirement",
                 request.margin_requirement.as_ref(),
             )?,
+            // As reported, and available plus not available, or a sub-balance,
+            // not fitting the holding is kept as reported: the custodian's
+            // data, which the reconciliation flags (W9.3, Q5).
+            available_quantity: Quantity::reported(
+                "available_quantity",
+                request.available_quantity.as_ref(),
+            )?,
+            not_available_quantity: Quantity::reported(
+                "not_available_quantity",
+                request.not_available_quantity.as_ref(),
+            )?,
+            available_basis: request.available_basis,
+            encumbrances: request
+                .encumbrances
+                .iter()
+                .enumerate()
+                .map(|(at, held)| encumbrance_from_wire(at, held))
+                .collect::<Result<_>>()?,
         },
 
         // Nothing has asked the platform about these identifiers yet. W3.2 is
@@ -329,6 +349,48 @@ fn lot_from_wire(lot: &ReportedLot) -> Result<Lot> {
         cost: Money::reported("lots.cost", lot.cost.as_ref())?,
         acquired_date: lot.acquired_date.clone(),
     })
+}
+
+/// A sub-balance as reported; refused for no kind, or OTHER with no code.
+fn encumbrance_from_wire(at: usize, held: &ReportedEncumbrance) -> Result<Encumbrance> {
+    use meridian_domain::v1::EncumbranceKind;
+    match EncumbranceKind::try_from(held.kind) {
+        Ok(EncumbranceKind::Unspecified) | Err(_) => {
+            return Err(StoreError::Encumbrance(format!(
+                "encumbrances[{at}].kind is unspecified; a sub-balance says which it is"
+            )))
+        }
+        Ok(EncumbranceKind::Other) if held.source_code.is_empty() => {
+            return Err(StoreError::Encumbrance(format!(
+                "encumbrances[{at}].source_code is required for OTHER: the source's own code, \
+                 verbatim"
+            )))
+        }
+        Ok(_) => {}
+    }
+    Ok(Encumbrance {
+        kind: held.kind,
+        quantity: Quantity::from_wire("encumbrances.quantity", held.quantity.as_ref())?,
+        available: held.available,
+        source_code: held.source_code.clone(),
+        pledgee: held.pledgee.clone(),
+        held_at: held.held_at.clone(),
+        segment: held.segment.clone(),
+        detail: held.detail.clone(),
+    })
+}
+
+pub(crate) fn encumbrance_to_wire(held: &Encumbrance) -> ReportedEncumbrance {
+    ReportedEncumbrance {
+        kind: held.kind,
+        quantity: held.quantity.to_wire(),
+        available: held.available,
+        source_code: held.source_code.clone(),
+        pledgee: held.pledgee.clone(),
+        held_at: held.held_at.clone(),
+        segment: held.segment.clone(),
+        detail: held.detail.clone(),
+    }
 }
 
 /// W3.9. Move what a replaced placeholder held onto the instrument that
@@ -409,6 +471,7 @@ pub(crate) fn statement_recorded(statement: &Statement, counts: Counts) -> State
         cause: Some(to_wire_cause(&completed.cause)),
         external_account_id: statement.external_account_id.clone(),
         institution: statement.institution.clone(),
+        security_interest: statement.security_interest,
     }
 }
 
@@ -443,6 +506,7 @@ fn figures_to_wire(figures: &Figures) -> StatementFigures {
                     .as_ref()
                     .and_then(Money::to_wire),
                 held_at: balance.held_at.clone(),
+                reusable: balance.reusable,
             })
             .collect(),
     }
@@ -533,6 +597,21 @@ pub(crate) fn to_wire_position(
         last_change: Some(to_wire_journal(position.last_change)),
         removed: position.removed,
         average_cost: position.cost.average_cost.as_ref().and_then(Money::to_wire),
+        available_quantity: position
+            .cost
+            .available_quantity
+            .and_then(|quantity| quantity.to_wire()),
+        not_available_quantity: position
+            .cost
+            .not_available_quantity
+            .and_then(|quantity| quantity.to_wire()),
+        available_basis: position.cost.available_basis,
+        encumbrances: position
+            .cost
+            .encumbrances
+            .iter()
+            .map(encumbrance_to_wire)
+            .collect(),
     }
 }
 
@@ -1613,5 +1692,75 @@ mod tests {
                 .is_some(),
             "a lot gone is a change, though the quantity is not"
         );
+    }
+
+    // ── What cannot move (W2.3, contract v8) ──
+
+    #[test]
+    fn available_and_its_sub_balances_are_carried_as_reported_and_a_change_is_a_change() {
+        use meridian_domain::v1::{AvailableBasis, EncumbranceKind};
+        let store = MemoryStore::new();
+        let first = opened(&store);
+        let mut row = holding_request(&first);
+        row.available_quantity = quantity("8.5");
+        row.not_available_quantity = quantity("4");
+        row.available_basis = AvailableBasis::Settled as i32;
+        row.encumbrances = vec![ReportedEncumbrance {
+            kind: EncumbranceKind::Pledged as i32,
+            quantity: quantity("4"),
+            available: Some(false),
+            source_code: "PLED".into(),
+            pledgee: "Interactive Brokers".into(),
+            held_at: "DTC".into(),
+            ..Default::default()
+        }];
+        let event = record_holding(&store, &row, &at(NOW))
+            .unwrap()
+            .event
+            .unwrap();
+        let position = event.position.unwrap();
+        // Available plus not available need not make the holding: as reported.
+        assert_eq!(read(&position.available_quantity), "8.5");
+        assert_eq!(read(&position.not_available_quantity), "4");
+        assert_eq!(position.available_basis, AvailableBasis::Settled as i32);
+        assert_eq!(position.encumbrances.len(), 1);
+        assert_eq!(position.encumbrances[0].source_code, "PLED");
+        assert_eq!(position.encumbrances[0].available, Some(false));
+
+        let mut again = statement_request();
+        again.external_statement_id = "SNAP-ACC-1/released".into();
+        let second = open_statement(&store, &again, &at(NOW))
+            .unwrap()
+            .reply
+            .statement_id;
+        let mut released = row.clone();
+        released.statement_id = second;
+        released.encumbrances.clear();
+        released.available_quantity = None;
+        released.not_available_quantity = None;
+        let event = record_holding(&store, &released, &at(NOW))
+            .unwrap()
+            .event
+            .expect("a sub-balance released is a change, though the quantity is not");
+        let position = event.position.unwrap();
+        assert!(
+            position.available_quantity.is_none(),
+            "not stated: unset, never derived"
+        );
+        assert!(position.encumbrances.is_empty());
+
+        // No kind, or OTHER with no code, is refused naming the field.
+        let mut unnamed = row.clone();
+        unnamed.encumbrances[0].kind = EncumbranceKind::Unspecified as i32;
+        let refused = record_holding(&store, &unnamed, &at(NOW)).unwrap_err();
+        assert!(
+            refused.to_string().contains("encumbrances[0].kind"),
+            "{refused}"
+        );
+        let mut other = row.clone();
+        other.encumbrances[0].kind = EncumbranceKind::Other as i32;
+        other.encumbrances[0].source_code.clear();
+        let refused = record_holding(&store, &other, &at(NOW)).unwrap_err();
+        assert!(refused.to_string().contains("source_code"), "{refused}");
     }
 }

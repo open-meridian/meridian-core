@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
- && cp target/release/meridian-street target/release/meridian-instrument \
+ && cp target/release/meridian-street target/release/meridian-bor target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar \
        target/release/meridian-dashboard \
        target/release/meridian-first-run target/release/meridian-broker-config \
@@ -76,6 +76,7 @@ VOLUME /var/lib/meridian
 # schedules by moving one Deployment's tag, not by pulling three images that
 # were built from different commits.
 COPY --from=build /usr/local/bin/meridian-street /usr/local/bin/meridian-street
+COPY --from=build /usr/local/bin/meridian-bor /usr/local/bin/meridian-bor
 COPY --from=build /usr/local/bin/meridian-instrument /usr/local/bin/meridian-instrument
 COPY --from=build /usr/local/bin/meridian-conductor /usr/local/bin/meridian-conductor
 COPY --from=build /usr/local/bin/meridian-sidecar /usr/local/bin/meridian-sidecar

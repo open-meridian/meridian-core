@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A deployment's components: the street store, the instrument store, the conductor and a plugin's sidecar"
+description = "A deployment's components: the street store, the book of record, the instrument store, the conductor and a plugin's sidecar"
 
 [lib]
 name = "meridian_runtime"
@@ -13,6 +13,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "meridian-street"
 path = "src/bin/street.rs"
+
+[[bin]]
+name = "meridian-bor"
+path = "src/bin/bor.rs"
 
 [[bin]]
 name = "meridian-instrument"
@@ -48,6 +52,7 @@ meridian-clock.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-instrument = { path = "../instrument" }
 meridian-street = { path = "../street" }
+meridian-bor = { path = "../bor" }
 meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
 meridian-dashboard = { path = "../dashboard" }

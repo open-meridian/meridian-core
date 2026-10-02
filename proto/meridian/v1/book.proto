@@ -1,0 +1,796 @@
+// The book of record: the deployment's own positions, breaks and figures.
+//
+// Derived from workflow W9 (the book of record), revision B of
+// plans/the-book-holds-positions, contract v8
+// (sdk-contract/the-book-holds-positions). Every message here traces to a
+// matrix row; see matrix/matrix.tsv.
+//
+// W2's governing idea, carried through: there are two beliefs about what is
+// held, ours and the custodian's. holdings.proto carries the custodian's into
+// the street store; this is ours. An account enters the book once, with an
+// opening balance; after that the book changes only by its own entries, each
+// a set of movement lines; and an operations plugin compares it with the
+// street every day, recording each difference as a break, which a justified
+// entry resolves or an explanation closes. No statement is ever applied to
+// the book, and the book and the street share no key (decisions/012): a
+// street record is named here by value.
+//
+// The book records; it computes no margin, no projection and no return.
+// Every quantity is a Decimal and every amount a Money (decisions/023), and a
+// value a source did not state is unset, never zero.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+import "meridian/v1/amounts.proto";
+import "meridian/v1/holdings.proto";
+import "meridian/v1/journal.proto";
+import "meridian/v1/sidecar.proto";
+
+// ── Who, and what every entry records (W9.8) ──
+
+// Who made a change (step 5's requirement 28, landed with v8). Set by the
+// book from the envelope the sidecar stamped (W4.9), never by a plugin.
+message Actor {
+  oneof kind {
+    // A person the sidecar vouched for, by the deployment-local subject
+    // W6.1 records.
+    PersonActor person = 1;
+    // A finding reported with no user: the plugin instance that sent it;
+    // the book's own act (a placeholder followed) leaves it empty.
+    SystemActor system = 2;
+  }
+  // A service account (step 5's Q24) and the venue arrive as arms of their
+  // own with their slices.
+}
+
+message PersonActor {
+  string subject = 1;
+}
+
+message SystemActor {
+  string instance_id = 1;
+}
+
+// What a journal entry records beside its JournalRef and ChangeCause.
+message EntryMeta {
+  // Minted by the book.
+  string entry_id = 1;
+  // An open list a reader takes as data (Q19): in v8 opening-balance,
+  // placeholder-moved, figures-recorded, break-recorded, break-handled,
+  // break-resolved, break-closed, adjustment, reversal, attribute-set.
+  string kind = 2;
+  Actor actor = 3;
+  // The time on the message that caused it, and when the book received it;
+  // when it committed is the cause's committed_at_ns.
+  int64 event_time_ns = 4;
+  int64 received_at_ns = 5;
+  // ISO 8601: the business date it stands for.
+  string effective_date = 6;
+  // The control partition's sequence in force (decisions/024's note).
+  uint64 control_sequence = 7;
+  // Each instrument it names, with the reference record's version in force
+  // when it was recorded; none where the store has no version (Q31).
+  repeated ReferenceVersion reference_versions = 8;
+  // Required on a justified act: an opening balance, an adjustment, a
+  // reversal, a resolution, handling, an attribute.
+  string reason = 9;
+  // The breaks it records, handles, resolves or closes.
+  repeated string break_ids = 10;
+  // The key the plugin sent the command with, where it sent one (Q12 of the
+  // sample operations plugin, ruled 2026-10-01).
+  string idempotency_key = 11;
+}
+
+message ReferenceVersion {
+  string instrument_id = 1;
+  // The InstrumentRecord's version (W3.6).
+  int64 version = 2;
+}
+
+// ── Movement: every entry that moves a position is lines (Q19) ──
+
+enum SettlementBucket {
+  // Refused.
+  SETTLEMENT_BUCKET_UNSPECIFIED = 0;
+  SETTLEMENT_BUCKET_SETTLED = 1;
+  // Pending settlement on the line's value date. With no value date only at
+  // an opening balance: the source's difference between trade-date and
+  // settled quantities, "date not stated".
+  SETTLEMENT_BUCKET_PENDING = 2;
+  // The source did not say whether it is settled or pending: only at an
+  // opening balance whose source gave no settled quantity.
+  SETTLEMENT_BUCKET_NOT_STATED = 3;
+}
+
+message MovementLine {
+  // An instrument, a placeholder, or a currency's cash instrument.
+  string instrument_id = 1;
+  HoldingSide side = 2;
+  SettlementBucket bucket = 3;
+  // ISO 8601; required on a pending line but at an opening balance; may be
+  // years out.
+  string value_date = 4;
+  // Signed as the position's quantity is, and added to it.
+  Decimal quantity = 5;
+  // The lot it adds to or relieves. Empty on a line that opens a lot, whose
+  // identifier the book mints, and on cash, which has no lots.
+  string lot_id = 6;
+  // Set on the line that opens a lot, and only there.
+  LotTerms opens_lot = 7;
+  // A pending line's fail, where its source reports one.
+  PendingState pending_state = 8;
+}
+
+message LotTerms {
+  // Each unset where not known; never derived one from the other.
+  optional Money unit_cost = 1;
+  optional Money cost = 2;
+  string acquired_date = 3;
+  // Apart from acquisition, for wash-sale tacking; empty is the acquired
+  // date.
+  string holding_period_start = 4;
+  string settlement_date = 5;
+  LotSource source = 6;
+}
+
+enum LotSource {
+  LOT_SOURCE_UNSPECIFIED = 0;
+  // As the opening balance's source reported it (Q2).
+  LOT_SOURCE_OPENING_BALANCE = 1;
+  // Opened by an adjustment resolving a break (Q28). Step 5 adds the
+  // book's own trade, slice D a transfer in.
+  LOT_SOURCE_ADJUSTMENT = 2;
+}
+
+message PendingState {
+  bool failing = 1;
+  // As reported.
+  string fail_reason = 2;
+  // ISO 8601; the date it is now expected; the bucket keeps its intended
+  // date ("Three more considerations", 2).
+  string expected_date = 3;
+}
+
+message BasisAdjustment {
+  string lot_id = 1;
+  oneof cost {
+    // Added to the lot's cost; signed. Only on a lot whose cost is known.
+    Money cost_change = 2;
+    // The lot's cost, stated where it was unknown: a lot opened with no
+    // cost -- a remainder lot, one of unknown cost because the source listed
+    // none, a future's -- given its cost once it is known. Only on a lot
+    // whose cost is unknown.
+    Money stated_cost = 4;
+  }
+  // Where it moves; empty is unchanged.
+  string holding_period_start = 3;
+}
+
+// ── The records: the projection (W9.2, W9.8) ──
+
+message BookPosition {
+  string account_id = 1;
+  string instrument_id = 2;
+  HoldingSide side = 3;
+  // Settled, plus pending, plus not stated: by construction.
+  Decimal trade_date_quantity = 4;
+  // Unset while any of the quantity is not stated: unknown, never zero.
+  optional Decimal settled_quantity = 5;
+  Decimal not_stated_quantity = 6;
+  repeated PendingSettlement pending = 7;
+  // Open lots; their open quantities sum to trade_date_quantity, cash
+  // excepted.
+  repeated Lot lots = 8;
+  // The opening balance's sources, with their as-of and basis.
+  repeated OpeningSource opened_from = 9;
+  // The business date of its last change.
+  string effective_date = 10;
+  JournalRef last_change = 11;
+  // A tombstone, after a placeholder's move (W9.9): returned only to a read
+  // since a watermark, and delivered once.
+  bool removed = 12;
+  // Held under a placeholder instrument (W3.7) while the street's holding is
+  // unresolved: in the opening balance and in reconciliation as any position,
+  // flagged, until the book follows its replacement (W9.9).
+  bool placeholder = 13;
+  // What of it cannot move, as the operations plugin last recorded it from
+  // a statement (W9.15): an attribute, never a movement.
+  repeated Encumbrance encumbrances = 14;
+  // Derived, never reported: the quantity on free_basis less its
+  // encumbrances. Unset while that quantity is unknown (some not stated).
+  optional Decimal free_quantity = 15;
+  FreeBasis free_basis = 16;
+}
+
+// The basis a position's free quantity is computed on.
+enum FreeBasis {
+  FREE_BASIS_UNSPECIFIED = 0;
+  // Settled: a pledged or lent security that has not settled cannot be
+  // delivered either (the product owner, 2026-10-01, Q2). The book's
+  // default, and in v8 its only basis.
+  FREE_BASIS_SETTLED = 1;
+  FREE_BASIS_TRADE_DATE = 2;
+}
+
+// One encumbrance of a position, as the book holds it.
+message Encumbrance {
+  // PLEDGED to OTHER only; the street's PENDING, REHYPOTHECATED and
+  // BORROWED are refused.
+  EncumbranceKind kind = 1;
+  // Signed as the position's quantity.
+  Decimal quantity = 2;
+  string pledgee = 3;
+  string held_at = 4;
+  // Unset where the source names none.
+  MarginAgreementRef agreement = 5;
+  // The source's code, verbatim; required for OTHER.
+  string source_code = 6;
+  string detail = 7;
+  // The statement it was recorded from.
+  StreetRecordRef source = 8;
+  // Set by the book: the business date it was first recorded under its
+  // kind, pledgee, location and agreement, and the change that last set it.
+  string since_date = 9;
+  JournalRef set_by = 10;
+}
+
+// One position's encumbrances, as a statement states them: the whole set,
+// empty when the statement reports none.
+message PositionEncumbrances {
+  string instrument_id = 1;
+  HoldingSide side = 2;
+  repeated Encumbrance encumbrances = 3;
+}
+
+// W9.15. A finding, so the plugin may send it as itself.
+message RecordEncumbrancesRequest {
+  string account_id = 1;
+  string business_date = 2;
+  // The statement they were read from.
+  StreetRecordRef source = 3;
+  repeated PositionEncumbrances positions = 4;
+  // The plugin's key for this command, derived from its source (Q12).
+  string idempotency_key = 5;
+}
+
+message PendingSettlement {
+  // ISO 8601; empty only for "date not stated" at an opening balance.
+  string value_date = 1;
+  Decimal quantity = 2;
+  PendingState state = 3;
+}
+
+message Lot {
+  // Minted by the book.
+  string lot_id = 1;
+  Decimal open_quantity = 2;
+  Decimal original_quantity = 3;
+  // As opened, with each basis adjustment applied.
+  LotTerms terms = 4;
+  JournalRef opened_by = 5;
+  repeated JournalRef relieved_by = 6;
+  repeated JournalRef adjusted_by = 7;
+}
+
+// ── W9.1: the opening balance ──
+
+enum OpeningSourceKind {
+  OPENING_SOURCE_KIND_UNSPECIFIED = 0;
+  OPENING_SOURCE_KIND_CUSTODIAN = 1;
+  OPENING_SOURCE_KIND_PRIOR_SYSTEM = 2;
+}
+
+enum PositionBasis {
+  POSITION_BASIS_UNSPECIFIED = 0;
+  POSITION_BASIS_TRADE_DATE = 1;
+  POSITION_BASIS_SETTLE_DATE = 2;
+}
+
+message OpeningSource {
+  OpeningSourceKind kind = 1;
+  // The custodian or system as it is known in the deployment (the external
+  // account's institution, the prior system's name).
+  string name = 2;
+  // ISO 8601: the date the source's figures are as of.
+  string as_of_date = 3;
+  PositionBasis basis = 4;
+  // The street records it was composed from, by value (decisions/012).
+  repeated StreetRecordRef street_records = 5;
+}
+
+// A street record named by value: never a key the book follows.
+message StreetRecordRef {
+  string statement_id = 1;
+  // The custodial position's change, where one was compared or used.
+  JournalRef change = 2;
+  // ISO 8601: the custodian's as-of date.
+  string as_of_date = 3;
+}
+
+message OpeningPosition {
+  string instrument_id = 1;
+  HoldingSide side = 2;
+  Decimal trade_date_quantity = 3;
+  // Unset where the source states none.
+  optional Decimal settled_quantity = 4;
+  repeated PendingSettlement pending = 5;
+  // As reported; a position whose source reports none sends one, its cost
+  // unknown; cash sends none.
+  repeated OpeningLot lots = 6;
+}
+
+message OpeningLot {
+  Decimal quantity = 1;
+  LotTerms terms = 2;
+}
+
+message RecordOpeningBalanceRequest {
+  string account_id = 1;
+  // ISO 8601: the business date it stands for (D0).
+  string as_of_date = 2;
+  // One per custodian or system it was composed from.
+  repeated OpeningSource sources = 3;
+  // Empty: the account enters holding nothing.
+  repeated OpeningPosition positions = 4;
+  string reason = 5;
+  // The reversed opening balance this replaces (Q27); empty for the first.
+  string replaces_entry_id = 6;
+  // The plugin's key for this command, derived from its source (Q12 of the
+  // sample operations plugin, ruled 2026-10-01, as FIX's ClOrdID): unique per
+  // account; the same command again with the same key is answered with the
+  // first's reply and applies nothing, and a different command with it is
+  // refused (REFUSAL_REASON_IDEMPOTENCY_CONFLICT). Empty: none.
+  string idempotency_key = 7;
+}
+
+// The account's standing opening balance, set by the book when it journals
+// W9.1 and cleared when it is reversed (Q21 of the sample operations plugin,
+// ruled 2026-10-01): its entry, D0 and sources, read on the account's
+// attributes (W9.14).
+message OpeningBalance {
+  string entry_id = 1;
+  // ISO 8601: D0.
+  string as_of_date = 2;
+  // As recorded, the street records it was composed from among them.
+  repeated OpeningSource sources = 3;
+  Actor recorded_by = 4;
+  JournalRef journal = 5;
+  // The reason the person gave.
+  string reason = 6;
+}
+
+// ── W9.4 to W9.7: breaks ──
+
+enum BreakState {
+  BREAK_STATE_UNSPECIFIED = 0;
+  BREAK_STATE_OPEN = 1;
+  BREAK_STATE_RESOLVED = 2;
+  BREAK_STATE_CLOSED = 3;
+}
+
+enum BreakCategory {
+  BREAK_CATEGORY_UNSPECIFIED = 0;
+  BREAK_CATEGORY_TRADE_DATE_QUANTITY = 1;
+  BREAK_CATEGORY_SETTLED_QUANTITY = 2;
+  BREAK_CATEGORY_COST_OR_LOTS = 3;
+  BREAK_CATEGORY_SETTLED_AGAINST_PENDING = 4;
+  BREAK_CATEGORY_BOOK_ONLY = 5;
+  BREAK_CATEGORY_STREET_ONLY = 6;
+  // A figure the book holds a value of its own for, such as the street's
+  // available and not available against the book's position, or an
+  // encumbrance against the book's of that kind, location and pledgee.
+  BREAK_CATEGORY_FIGURE = 7;
+}
+
+enum BreakCauseCategory {
+  BREAK_CAUSE_CATEGORY_UNSPECIFIED = 0;
+  BREAK_CAUSE_CATEGORY_UNBOOKED_TRADE = 1;
+  BREAK_CAUSE_CATEGORY_SETTLEMENT_TIMING = 2;
+  BREAK_CAUSE_CATEGORY_COST_OR_PRICE = 3;
+  BREAK_CAUSE_CATEGORY_CORPORATE_ACTION = 4;
+  BREAK_CAUSE_CATEGORY_FAIL = 5;
+  BREAK_CAUSE_CATEGORY_CUSTODIAN_ERROR = 6;
+  BREAK_CAUSE_CATEGORY_UNKNOWN = 7;
+}
+
+message PositionKey {
+  string instrument_id = 1;
+  HoldingSide side = 2;
+}
+
+message FigureKey {
+  MarginAgreementRef agreement = 1;
+  // The figure, by its field's name in the data dictionary.
+  string figure = 2;
+  // For a collateral balance: its instrument.
+  string instrument_id = 3;
+}
+
+// One side of a difference; unset: absent on that side.
+message BreakValue {
+  oneof value {
+    Decimal quantity = 1;
+    Money amount = 2;
+    string text = 3;
+  }
+}
+
+message BreakDifference {
+  // The field, by its name in the data dictionary ("settled_quantity",
+  // "lots[2].terms.cost").
+  string field = 1;
+  BreakValue book = 2;
+  BreakValue street = 3;
+}
+
+message PendingSettlementRef {
+  string instrument_id = 1;
+  HoldingSide side = 2;
+  string value_date = 3;
+}
+
+// The item found to cause a break, linked by value (Q23's target).
+message BreakCause {
+  BreakCauseCategory category = 1;
+  oneof item {
+    StreetRecordRef street_record = 2;
+    JournalRef book_entry = 3;
+    PendingSettlementRef pending_settlement = 4;
+    // A corporate action's reference, as reported.
+    string event_reference = 5;
+    bool none_found = 6;
+  }
+  string note = 7;
+}
+
+message BreakHandling {
+  // A user the deployment knows (W6.1): one granted write on the account
+  // through the plugin, or the person taking it (Q11 of the sample
+  // operations plugin, ruled 2026-10-01).
+  string owner_subject = 1;
+  // The operations plugin's own levels; core gives them no meaning.
+  uint32 escalation_level = 2;
+  // ISO 8601.
+  string due_date = 3;
+}
+
+message BreakResolution {
+  // Resolved: the entries that corrected the book.
+  repeated JournalRef entries = 1;
+  // Closed: the explanation, no entry.
+  string explanation = 2;
+  Actor actor = 3;
+  string reason = 4;
+  // Closed as cleared: the street record where the difference was gone (Q2
+  // of the sample operations plugin, ruled 2026-10-01).
+  StreetRecordRef cleared_at = 5;
+}
+
+message Break {
+  string break_id = 1;
+  string account_id = 2;
+  oneof subject {
+    PositionKey position = 3;
+    FigureKey figure = 4;
+  }
+  BreakCategory category = 5;
+  repeated BreakDifference differences = 6;
+  Watermark book_watermark = 7;
+  StreetRecordRef street = 8;
+  // ISO 8601 business dates; age is derived from them, never stored.
+  string first_seen_date = 9;
+  string last_seen_date = 10;
+  BreakState state = 11;
+  repeated BreakCause candidate_causes = 12;
+  BreakCause confirmed_cause = 13;
+  BreakHandling handling = 14;
+  BreakResolution resolution = 15;
+  Actor recorded_by = 16;
+  JournalRef last_change = 17;
+}
+
+// W9.4. A new break, or an open one brought up to date.
+message RecordBreakRequest {
+  string account_id = 1;
+  // Empty: a new break, whose identifier the book mints.
+  string break_id = 2;
+  oneof subject {
+    PositionKey position = 3;
+    FigureKey figure = 4;
+  }
+  BreakCategory category = 5;
+  repeated BreakDifference differences = 6;
+  Watermark book_watermark = 7;
+  StreetRecordRef street = 8;
+  // The reconciliation's business date: first seen for a new break, last
+  // seen for one brought up to date.
+  string business_date = 9;
+  repeated BreakCause candidate_causes = 10;
+  // The plugin's key for this command, derived from its source (Q12):
+  // answered with the first's reply when it is sent again.
+  string idempotency_key = 11;
+}
+
+// W9.6. For a person.
+message HandleBreakRequest {
+  string account_id = 1;
+  string break_id = 2;
+  // Unset: unchanged.
+  BreakCause confirmed_cause = 3;
+  // Unset: unchanged; set: replaces the handling whole.
+  BreakHandling handling = 4;
+  string reason = 5;
+  // The plugin's key for this command (Q12).
+  string idempotency_key = 6;
+}
+
+// W9.7. For a person.
+message ResolveBreakRequest {
+  string account_id = 1;
+  repeated string break_ids = 2;
+  string reason = 3;
+  oneof resolution {
+    // The correcting entry, journalled in the same act.
+    Adjustment adjustment = 4;
+    Reversal reversal = 5;
+    // Entries already recorded.
+    ResolvedByEntries entries = 6;
+    // Closes the breaks, with no entry.
+    string explanation = 7;
+  }
+  // The plugin's key for this command (Q12).
+  string idempotency_key = 9;
+}
+
+// W9.7. Close breaks as cleared, with no entry.
+// Citing the statement where the difference was gone (Q2 of the sample operations plugin, ruled
+// 2026-10-01: one typed operation a person takes; an opt-in automation runs
+// it as a service account once
+// sdk-contract/a-service-account-runs-a-plugins-autonomous-work lands, its
+// actor an arm of Actor of its own). For a person until then.
+message CloseBreaksAsClearedRequest {
+  string account_id = 1;
+  repeated string break_ids = 2;
+  // The street record of the statement where the difference was gone, by
+  // value.
+  StreetRecordRef cleared_at = 3;
+  string reason = 4;
+  // The plugin's key for this command (Q12).
+  string idempotency_key = 5;
+}
+
+// Step 5's non-order transaction's first kind (Q28). Slice D adds the
+// cash-flow class and the other kinds as fields of their own (Q20).
+message Adjustment {
+  // After the opening balance's date.
+  string effective_date = 1;
+  repeated MovementLine lines = 2;
+  repeated BasisAdjustment basis_adjustments = 3;
+  // A corporate action's reference, as reported, where it records one.
+  string event_reference = 4;
+}
+
+// Names the entry it reverses; the book negates its lines, at that entry's
+// effective date.
+message Reversal {
+  string entry_id = 1;
+}
+
+message ResolvedByEntries {
+  repeated string entry_ids = 1;
+}
+
+// ── W9.5: figures per margin agreement, as reported ──
+
+message MarginAgreementRef {
+  oneof agreement {
+    // Step 4: the statement's external account and segment (Q12). An
+    // agreement the book records under a template arrives as another arm.
+    StatementSegmentRef statement_segment = 1;
+  }
+}
+
+message StatementSegmentRef {
+  string external_account_id = 1;
+  // As the venue names it; empty for the account as a whole.
+  string segment = 2;
+  // As reported: the external account's institution.
+  string counterparty = 3;
+}
+
+// The custodian's, labelled as such (Q8, revised and ruled); never a
+// position's own.
+message ReportedPositionValue {
+  string instrument_id = 1;
+  HoldingSide side = 2;
+  optional Money market_value = 3;
+  optional Money margin_requirement = 4;
+}
+
+message AgreementFigures {
+  MarginAgreementRef agreement = 1;
+  // As the street recorded them (W2.2), its segment equal to the
+  // agreement's.
+  StatementFigures figures = 2;
+  // On the set with no segment only.
+  repeated ReportedPositionValue position_values = 3;
+}
+
+message RecordAccountFiguresRequest {
+  string account_id = 1;
+  string business_date = 2;
+  StreetRecordRef source = 3;
+  repeated AgreementFigures agreements = 4;
+  // The plugin's key for this command, derived from its source (Q12).
+  string idempotency_key = 5;
+}
+
+// The record: one per account, agreement and business date.
+message AccountFigures {
+  string account_id = 1;
+  string business_date = 2;
+  MarginAgreementRef agreement = 3;
+  StatementFigures figures = 4;
+  repeated ReportedPositionValue position_values = 5;
+  StreetRecordRef source = 6;
+  JournalRef last_change = 7;
+}
+
+// ── Every command's answer, after commit ──
+
+message BookEntryReply {
+  // A duplicate, by its message identifier or its idempotency key, is
+  // answered with the first's.
+  EntryMeta entry = 1;
+  // The entry's place in its partition: the number of the first change it
+  // made.
+  JournalRef journal = 2;
+  // Each record the entry changed, as it stands after it.
+  repeated BookPosition positions = 3;
+  repeated Break breaks = 4;
+  repeated AccountFigures figures = 5;
+  // The account's attributes, where the entry changed them: an opening
+  // balance and its reversal set and clear the standing one (Q21).
+  AccountAttributes attributes = 6;
+}
+
+// ── W9.8: deliveries, records whole ──
+
+message PositionChangedEvent {
+  BookPosition position = 1;
+  Decimal previous_trade_date_quantity = 2;
+  EntryMeta entry = 3;
+  JournalRef journal = 4;
+  ChangeCause cause = 5;
+}
+
+message BreakChangedEvent {
+  // Not `break`, a keyword in the SDKs' languages.
+  Break break_record = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+message AccountFiguresRecordedEvent {
+  AccountFigures figures = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+// ── W9.10 to W9.12: reads ──
+
+message ListPositionsRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+  // Only positions whose last change is above it, tombstones included.
+  Watermark since = 2;
+  // The positions at the end of this business date (Q22), as known at
+  // `at`, or now; served by replay. Neither with `since`.
+  string business_date = 3;
+  Watermark at = 4;
+  int32 page_size = 5;
+  string cursor = 6;
+}
+
+message ListPositionsReply {
+  repeated BookPosition positions = 1;
+  string next_cursor = 2;
+  Watermark as_of = 3;
+}
+
+message ListBreaksRequest {
+  string account_id = 1;
+  // Empty: every state.
+  repeated BreakState states = 2;
+  Watermark since = 3;
+  int32 page_size = 4;
+  string cursor = 5;
+}
+
+message ListBreaksReply {
+  repeated Break breaks = 1;
+  string next_cursor = 2;
+  Watermark as_of = 3;
+}
+
+message ListAccountFiguresRequest {
+  string account_id = 1;
+  // Unset: every agreement.
+  MarginAgreementRef agreement = 2;
+  // ISO 8601 business dates, inclusive; empty for open-ended.
+  string from_date = 3;
+  string to_date = 4;
+  Watermark since = 5;
+  Watermark at = 6;
+  int32 page_size = 7;
+  string cursor = 8;
+}
+
+message ListAccountFiguresReply {
+  repeated AccountFigures figures = 1;
+  string next_cursor = 2;
+  Watermark as_of = 3;
+}
+
+// ── W9.13, W9.14: the account's attributes (Q21; step 5's names) ──
+
+enum LotReliefMethod {
+  LOT_RELIEF_METHOD_UNSPECIFIED = 0;
+  LOT_RELIEF_METHOD_FIRST_IN_FIRST_OUT = 1;
+  LOT_RELIEF_METHOD_LAST_IN_FIRST_OUT = 2;
+  LOT_RELIEF_METHOD_HIGHEST_COST = 3;
+  LOT_RELIEF_METHOD_LOWEST_COST = 4;
+  LOT_RELIEF_METHOD_AVERAGE_COST = 5;
+}
+
+message AccountAttributes {
+  string account_id = 1;
+  // ISO 4217 until the money revision names an asset
+  // (sdk-contract/money-names-an-asset-not-only-an-iso-currency).
+  string base_currency_code = 2;
+  LotReliefMethod lot_relief_default = 3;
+  JournalRef last_change = 4;
+  // The standing opening balance, set by the book when it journals W9.1;
+  // unset while none stands (Q21 of the sample operations plugin, ruled
+  // 2026-10-01).
+  OpeningBalance opening_balance = 5;
+}
+
+message SetAccountAttributeRequest {
+  string account_id = 1;
+  oneof attribute {
+    string base_currency_code = 2;
+    LotReliefMethod lot_relief_default = 3;
+  }
+  string reason = 4;
+}
+
+message AccountAttributeReply {
+  AccountAttributes attributes = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+}
+
+message AccountAttributeChangedEvent {
+  AccountAttributes attributes = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+message ListAccountAttributesRequest {
+  string account_id = 1;
+  Watermark since = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message ListAccountAttributesReply {
+  repeated AccountAttributes attributes = 1;
+  string next_cursor = 2;
+  Watermark as_of = 3;
+}

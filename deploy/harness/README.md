@@ -25,9 +25,10 @@ versioned with the binaries beside it:
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | The deployment: Postgres, NATS with a configuration generated for one plugin instance and its roles, the stores migrated, street, instrument, conductor, a development dashboard, the plugin's sidecar, the `plugin` service, and the `runner` |
-| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked` |
+| `compose.yaml` | The deployment: Postgres, NATS with a configuration generated for the plugin instances and their roles, the stores migrated, street, the book (`bor`), instrument, conductor, a development dashboard, the plugin's sidecar, the `plugin` service, an optional second plugin beside it (`--profile second`), and the `runner` |
+| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant` |
 | `street.sql` | The street store as stable, sorted lines |
+| `book.sql` | The book of record as stable, sorted lines (contract v8) |
 
 ## Taking it out of the image
 
@@ -49,6 +50,20 @@ reads the whole file each time:
 | `MERIDIAN_RUNTIME_IMAGE` | the image the harness was copied from, so the file never guesses its own tag |
 | `MERIDIAN_HARNESS_PLUGIN_IMAGE` | the plugin's image |
 | `MERIDIAN_HARNESS_PLUGIN_ROLES` | its roles, comma separated, as it declares them; empty for a plugin holding none. A name that is not a role stops the run at `broker-config`, naming it |
+
+A second plugin is optional. Under `--profile second` it runs as instance
+`plugin-2` beside its own sidecar, with these, which may be left unset
+otherwise:
+
+| Variable | Value |
+|---|---|
+| `MERIDIAN_HARNESS_PLUGIN_2_IMAGE` | the second plugin's image; the first's when unset |
+| `MERIDIAN_HARNESS_PLUGIN_2_ROLES` | its roles, comma separated |
+
+An operations plugin proves itself this way against a custody plugin that
+records the statements it reconciles: the custody plugin as `plugin-1`, the
+operations plugin as `plugin-2`, each with its own override file of
+`plugin` or `plugin-2`.
 
 Name the project after the plugin (`-p`), so two harnesses never share one.
 
@@ -78,6 +93,10 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `page --level admin\|write\|read PATH [--until TEXT] [--seconds N]` | Opens a session on the plugin's own host at that level (Manage, Open, View), GETs `PATH`, prints the status and then the body; with `--until`, again until the body says `TEXT`. |
 | `form --level L --page PATH --post PATH [--csrf-field NAME] [--expect TEXT] FIELD=VALUE ...` | In such a session, reads `--page`, takes its CSRF field (`csrf`, the SDK's name; a field you give by that name wins), posts the fields urlencoded to `--post`, prints the status and the body. With `--expect`, fails unless the body says `TEXT`. A 4xx or 5xx fails. |
 | `unlinked [--expect N] [--seconds N]` | Prints how many external accounts the plugin reported that nothing links, as the dashboard counts them; with `--expect`, waits for `N`. |
+| `grant --level read\|write\|admin` | Grants the harness's admin that level on the plugin, on All accounts, as a deployment admin does: a user group holding the admin, an access group, and the permission joining them. The admin holds nothing on a plugin until granted; a session at `write` (Open) needs write. |
+
+Every command acts on `plugin-1`, or on the second plugin with `--instance
+plugin-2`.
 
 A link is the plugin's to send, acting for an admin, so the harness never sends
 one: `form` drives the plugin's own link page under Manage, which is also the
@@ -109,6 +128,34 @@ prints every account's rows, ordered bytewise:
 An account nothing links has no rows, so a file listing every account proves
 both what a linked account holds and that an unlinked one holds nothing. Pair
 it with `unlinked`, which proves the plugin reported the unlinked ones.
+
+## The book of record
+
+    docker compose ... exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 -f /harness/book.sql
+
+prints every account's book, ordered bytewise within each kind of line:
+
+    attributes|<account>|<base currency>|<lot relief>|<opening balance as of>
+    position|<account>|<instrument>|<side>|<trade date>|<settled>|<not stated>|<effective date>
+    pending|<account>|<instrument>|<side>|<value date>|<quantity>|<failing>
+    lot|<account>|<instrument>|<side>|<order opened>|<open>|<original>|<cost> <currency>|<acquired>|<source>
+    break|<account>|<subject>|<category>|<state>|<first seen>|<last seen>|<recorded by>|<confirmed cause>|<resolved by>
+    figures|<account>|<external account>/<segment>|<business date>
+    entry|<account>|<kind>|<effective date>|<actor>
+
+- `<account>` and `<instrument>` as `street.sql` prints them. No identifier the
+  book mints -- an entry's, a lot's, a break's -- and no number in a partition
+  or time is printed, so a file from one run compares with the next.
+- `<settled>` is empty while any of the quantity is not stated: unknown, never
+  zero. A `pending` line with no value date is "date not stated", from an
+  opening balance whose source gave a settled quantity.
+- An enum is its number, 0 for none: `<lot relief>` (LotReliefMethod),
+  `<category>` (BreakCategory), `<state>` (BreakState: 1 open, 2 resolved, 3
+  closed), `<confirmed cause>` (BreakCauseCategory), `<source>` (LotSource).
+  `<resolved by>` is `entries`, `explanation` or `cleared`, empty while open.
+- `<recorded by>` and `<actor>` are a person's subject, `instance <id>` for a
+  finding a plugin sent as itself, or `book` for the book's own act.
+- Entries are listed in the order each account's were made.
 
 ## A plugin's e2e, in outline
 

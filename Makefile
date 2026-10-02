@@ -9,7 +9,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -25,6 +25,7 @@ help:
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make harness-check  the plugin harness in the image runs a plugin, end to end"
+	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -33,7 +34,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -147,12 +148,13 @@ test:
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
+			-p meridian-bor --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 			-p meridian-runtime --test grants --test waiting \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the three stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
+	@echo "test-store OK: the four stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -801,6 +803,7 @@ HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_PLUGIN_IMAGE=meridian-python-interop \
 	MERIDIAN_HARNESS_PLUGIN_ROLES=custody \
+	MERIDIAN_HARNESS_PLUGIN_2_ROLES=operations \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
 	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f e2e/harness/stand-in.yaml
 HARNESS_RUN := $(HARNESS) run --rm -T runner
@@ -816,11 +819,11 @@ harness-check:
 		&& $(DOCKER) rm "$$id" >/dev/null \
 		|| { echo "harness-check FAILED: the image carries no harness at /usr/share/meridian/harness" >&2; exit 1; }
 	@: >.e2e-harness.log
-	@$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
+	@$(HARNESS) --profile second down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
 	@started=$$(date +%s); \
 	fail() { echo "harness-check FAILED: $$1; the components' logs are in .e2e-harness.log" >&2; \
-		$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-		$(HARNESS) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+		$(HARNESS) --profile second logs --no-color >>.e2e-harness.log 2>&1; \
+		$(HARNESS) --profile second down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
 	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
 	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
 	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
@@ -839,9 +842,19 @@ harness-check:
 	diff -u e2e/harness/expected.street .harness/street >&2 \
 		|| fail "the street store is not e2e/harness/expected.street"; \
 	unlinked="$$($(HARNESS_RUN) unlinked --expect 1)" || fail "the dashboard did not count the unlinked account"; \
+	$(HARNESS) --profile second up -d sidecar-2 plugin-2 >>.e2e-harness.log 2>&1 || fail "the second plugin did not start"; \
+	$(HARNESS_RUN) ready --instance plugin-2 >/dev/null || fail "the second plugin never registered"; \
+	$(HARNESS_RUN) page --instance plugin-2 --level write / >/dev/null 2>&1 \
+		&& fail "the admin opened the second plugin at write before being granted it"; \
+	$(HARNESS_RUN) grant --instance plugin-2 --level write >/dev/null || fail "the admin was not granted write on the second plugin"; \
+	$(HARNESS_RUN) page --instance plugin-2 --level write / --until '"level": 2' >/dev/null \
+		|| fail "the second plugin was not opened at write once granted"; \
+	$(HARNESS) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+		-f /harness/book.sql >.harness/book 2>>.e2e-harness.log || fail "book.sql did not run"; \
+	[ ! -s .harness/book ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book)"; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness, copied out of the image, runs a plugin beside its sidecar; its runner sets the plugin's settings, defines an account and links it through the plugin's own form; the street store prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked)"
+	$(HARNESS) --profile second down -v --remove-orphans >>.e2e-harness.log 2>&1; \
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness, copied out of the image, runs a plugin beside its sidecar; its runner sets the plugin's settings, defines an account and links it through the plugin's own form; the street store prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin runs beside it, opened at write once the admin is granted it, and the book prints empty"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1000,7 +1013,7 @@ chart-check:
 	echo "$$unset" | awk '/name: check-meridian-runtime-database$$/{f=1} f&&/^data:/{print "has data"} /^---/{f=0}' | grep -q . \
 		&& { echo "chart-check FAILED: the database secret the chart makes is not empty" >&2; exit 1; }; true
 	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
-	for store in meridian-conductor meridian-street meridian-instrument meridian-dashboard; do \
+	for store in meridian-conductor meridian-street meridian-bor meridian-instrument meridian-dashboard; do \
 		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
 			|| { echo "chart-check FAILED: the chart renders no migration for $$store" >&2; \
 			     echo "  each store verifies its schema and refuses to serve without one" >&2; exit 1; }; \
@@ -1252,6 +1265,11 @@ chart-check:
 	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
 		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-conductor"{c=1} c&&/^      maxSurge: 0$$/{f=1} END{exit !f}' \
 		|| { echo "chart-check FAILED: the conductor's Deployment surges, so an old conductor answers beside the new one while it waits for its schema" >&2; exit 1; }
+	@# One writer per partition of the book (W9.8): its rollout does not surge
+	@# either, so an old book never journals beside the new one.
+	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-bor"{c=1} c&&/^      maxSurge: 0$$/{f=1} END{exit !f}' \
+		|| { echo "chart-check FAILED: the book's Deployment surges, so two of it would write one partition's journal" >&2; exit 1; }
 	@# The Ingress (spec/live-plugin-development, ruling 1): none unless asked
 	@# for; asked for, two names to the dashboard's one port, the plugins' a
 	@# wildcard below the host; TLS for both; the address offered to the
@@ -1332,6 +1350,7 @@ migrate: network
 	@$(COMPOSE) up -d postgres >/dev/null
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm --build -T street meridian-street migrate
+	@$(COMPOSE) run --rm --build -T bor meridian-bor migrate
 	@$(COMPOSE) run --rm --build -T conductor meridian-conductor migrate
 
 up: migrate
@@ -1427,6 +1446,72 @@ interop: network
 		diff -u e2e/interop/positions.expected .interop.positions >&2 \
 			|| { echo "interop FAILED: the street store did not keep what the SDK sent" >&2; exit 1; }
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface, and the street store keeps its numbers exactly"
+
+# The book of record (W9, contract v8), end to end through the Python SDK.
+#
+# Every component, across the broker: the street store a custody plugin's
+# sidecar records statements into, the book an operations plugin's sidecar
+# writes for a person, and a reporting plugin's sidecar reading and hearing it
+# within its scope, beside an operations plugin's whose scope is empty. The
+# SDK's book suite (meridian-python tests/test_book.py) drives them: day 1, an
+# opening balance composed from the street and confirmed for a person, read
+# back by reporting, a second refused by its code and a duplicate applied
+# once; day 2, the custodian's change a break heard with its cause and own,
+# the figures per agreement, an adjustment resolving it and moving the book
+# into agreement with the custodian, an injected difference closed with an
+# explanation and another as cleared; scope isolation; a stream killed and
+# caught up. e2e/book/accounts.sql makes the accounts and the grants a
+# deployment admin would. The person's assertion is signed with a key made
+# for the run, whose public half only the operations sidecar holds.
+#
+# Then `meridian-bor rebuild`, and the book as deploy/harness/book.sql prints it
+# before and after must be the same, character for character: positions,
+# lots, pending settlements, breaks, figures and entries.
+e2e-book: network
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-book FAILED: the SDK's image did not build" >&2; exit 1; }
+	@$(COMPOSE) --profile book down -v --remove-orphans >/dev/null 2>&1 || true
+	@$(COMPOSE) up -d postgres >/dev/null 2>&1
+	@{ $(COMPOSE) run --rm --build -T instrument meridian-instrument migrate \
+	   && $(COMPOSE) run --rm --build -T street meridian-street migrate \
+	   && $(COMPOSE) run --rm --build -T bor meridian-bor migrate \
+	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >.e2e-book.log 2>&1 \
+		|| { echo "e2e-book FAILED: the schema could not be applied; see .e2e-book.log" >&2; exit 1; }
+	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+		<e2e/book/accounts.sql >/dev/null \
+		|| { echo "e2e-book FAILED: the accounts and grants could not be written" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
+	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book up -d --build street instrument conductor bor \
+		sidecar-book sidecar-book-operations sidecar-book-reporting sidecar-book-unscoped >>.e2e-book.log 2>&1 \
+		|| { echo "e2e-book FAILED: the components did not start; see .e2e-book.log" >&2; exit 1; }
+	@# --no-deps, as interop: everything the suite reaches is up already, and a
+	@# run that converged its dependencies could recreate sidecar-book under
+	@# Compose 2.38.x and leave the suite in a namespace nothing answers in.
+	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book run --rm --no-deps -T book \
+		python -m pytest -q tests/test_book.py >>.e2e-book.log 2>&1; \
+		status=$$?; \
+		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+			<deploy/harness/book.sql >.e2e-book.before 2>>.e2e-book.log; \
+		$(COMPOSE) stop bor >>.e2e-book.log 2>&1; \
+		$(COMPOSE) run --rm --no-deps -T bor meridian-bor rebuild >>.e2e-book.log 2>&1 || status=$$?; \
+		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+			<deploy/harness/book.sql >.e2e-book.after 2>>.e2e-book.log; \
+		$(COMPOSE) --profile book logs --no-color >>.e2e-book.log 2>&1; \
+		MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book down -v >/dev/null 2>&1; \
+		if [ $$status -ne 0 ]; then \
+			echo "e2e-book FAILED. The suite's last 60 lines, and every component's in .e2e-book.log:" >&2; \
+			grep -v '^[a-z-]*-1  |' .e2e-book.log | tail -60 >&2; exit 1; \
+		fi; \
+		grep -q '^position|' .e2e-book.before \
+			|| { echo "e2e-book FAILED: the book printed no position, so the rebuild proves nothing" >&2; exit 1; }; \
+		diff -u .e2e-book.before .e2e-book.after >&2 \
+			|| { echo "e2e-book FAILED: meridian-bor rebuild did not reproduce the book" >&2; exit 1; }
+	@echo "e2e-book OK: through the SDK, an opening balance for a person, breaks heard with their cause, figures per agreement, an adjustment resolving a break and moving the book, closes by explanation and as cleared, refusals by their code, scope isolation and a stream caught up; meridian-bor rebuild reproduces the book"
 
 # The end-to-end check, run rather than described.
 #

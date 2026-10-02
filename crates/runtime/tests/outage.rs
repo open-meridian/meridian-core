@@ -156,6 +156,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
                 institution: String::new(),
                 figures: Vec::new(),
                 currency_assumed: false,
+                security_interest: None,
                 completed: None,
             },
             &Cause {

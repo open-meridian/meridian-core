@@ -6,7 +6,9 @@ Standard library only. Run as the compose file's `runner` service:
     docker compose ... run --rm runner <command> [arguments]
 
 Each command signs in afresh, does one thing, prints what it found, and exits
-0; or exits non-zero saying why. Every wait has a bound (`--seconds`).
+0; or exits non-zero saying why. Every wait has a bound (`--seconds`). Each
+acts on the plugin `plugin-1`, or on the second plugin with `--instance
+plugin-2` (the compose file's `second` profile).
 
   ready [--seconds N]
       Until the plugin has registered with its sidecar and the dashboard lists
@@ -40,6 +42,15 @@ Each command signs in afresh, does one thing, prints what it found, and exits
       links, as the dashboard counts them on its line (W6.4, W6.10). With
       --expect, waits until it is N.
 
+  grant --level read|write|admin
+      Grants the harness's admin that level on the plugin, on All accounts,
+      as a deployment admin does in the dashboard (W6.5 to W6.8): a user group
+      holding the admin, an access group giving the plugin the level, and the
+      permission joining them. A plugin that writes for a person -- an
+      operations plugin confirming an opening balance (W9.1) -- is opened at
+      write by someone granted write; the admin is granted nothing on a
+      plugin until this is run.
+
 Reading core's HTML is this runner's alone, and only because it ships in the
 same image as the dashboard it reads, and core's gate runs it against that
 dashboard at every commit. A plugin never parses core's pages itself.
@@ -57,12 +68,25 @@ DASHBOARD = os.environ.get("MERIDIAN_HARNESS_DASHBOARD", "http://dashboard:8080"
 INSTANCE = os.environ.get("MERIDIAN_HARNESS_INSTANCE", "plugin-1")
 ADMIN = os.environ.get("MERIDIAN_HARNESS_ADMIN", "harness")
 PASSWORD = os.environ.get("MERIDIAN_HARNESS_ADMIN_PASSWORD", "")
-# The plugin's own host, below the dashboard's (decisions/021). A browser
-# resolves it by name; this sends to the dashboard naming the host, which is
-# the same request.
-PLUGIN_HOST = f"{INSTANCE}.plugins.{urllib.parse.urlparse(DASHBOARD).netloc}"
-VIEW = f"/admin/plugins/{INSTANCE}"
+# The admin's login as the deployment names its people: the dashboard's own
+# account, as the conductor was told at its start (compose.yaml).
+LOGIN = os.environ.get("MERIDIAN_HARNESS_ADMIN_LOGIN", f"local|{ADMIN}")
 LEVELS = ("admin", "write", "read")
+# The built-in account group holding every account (W6.6).
+ALL_ACCOUNTS = "all-accounts"
+
+
+def acting_on(instance):
+    """The plugin a command acts on: its own host, below the dashboard's
+    (decisions/021) -- a browser resolves it by name, and this sends to the
+    dashboard naming the host, which is the same request -- and its view."""
+    global INSTANCE, PLUGIN_HOST, VIEW
+    INSTANCE = instance
+    PLUGIN_HOST = f"{INSTANCE}.plugins.{urllib.parse.urlparse(DASHBOARD).netloc}"
+    VIEW = f"/admin/plugins/{INSTANCE}"
+
+
+acting_on(INSTANCE)
 
 
 class Failed(Exception):
@@ -347,6 +371,47 @@ def unlinked(args):
                 f"the dashboard never counted {wanted} not linked"))
 
 
+def grant(args):
+    level = option(args, "--level", None)
+    if level not in LEVELS:
+        raise Failed(f"grant takes --level {'|'.join(LEVELS)}")
+    if args:
+        raise Failed(f"grant takes no {args[0]!r}")
+    admin = signed_in()
+
+    def post(path, fields):
+        token = form_token(admin.get("/admin"))
+        done = admin.send("POST", path, fields + [("form_token", token)])
+        if done.status != 303:
+            raise Failed(f"{path}: {done.status} {sentence(done)}")
+
+    def defined(path, field, name, fields):
+        """The group named `name`, defined if it is not: the conductor mints a
+        new group's identifier, and an identifier sent names one to edit."""
+        found = minted(name)
+        post(path, ([(field, found)] if found else []) + [("name", name)] + fields)
+        found = minted(name)
+        if not found:
+            raise Failed(f"{path}: {name!r} is not listed once defined")
+        return found
+
+    def minted(name):
+        page = admin.get("/admin").body
+        found = re.search(r'<tr data-id="([^"]+)" data-name="' + re.escape(html.escape(name)) + '"',
+                          page)
+        return found.group(1) if found else ""
+
+    user_group = defined("/admin/user-groups", "user_group_id", "Harness admin",
+                         [("login", LOGIN)])
+    access_group = defined("/admin/access-groups", "access_group_id",
+                           f"Harness {level} on {INSTANCE}",
+                           [("plugin", INSTANCE), (f"level.{INSTANCE}", level)])
+    post("/admin/permissions", [("user_group_id", user_group),
+                                ("account_group_id", ALL_ACCOUNTS),
+                                ("access_group_id", access_group)])
+    print(f"grant: {ADMIN} holds {level} on {INSTANCE}, on All accounts")
+
+
 def option(args, name, default):
     """Takes `name VALUE` out of `args`."""
     if name not in args:
@@ -377,7 +442,7 @@ def pairs(args):
 
 
 COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
-            "form": form, "unlinked": unlinked}
+            "form": form, "unlinked": unlinked, "grant": grant}
 
 
 def main(argv):
@@ -386,6 +451,7 @@ def main(argv):
         return 2
     command, args = argv[0], list(argv[1:])
     try:
+        acting_on(option(args, "--instance", INSTANCE))
         COMMANDS[command](args)
     except Failed as failed:
         print(f"harness {command} FAILED: {failed}", file=sys.stderr)

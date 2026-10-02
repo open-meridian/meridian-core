@@ -139,6 +139,10 @@ migrate:
   configSecret: ""
   configKey: ""
 
+  # The book of record's, likewise.
+  borSecret: ""
+  borKey: ""
+
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
 
@@ -179,6 +183,19 @@ street:
   # Its own database, or the same one. Two schemas on one server is supported
   # and two components sharing a table is not, which is a rule the credentials
   # should enforce rather than the code remember.
+  database:
+    existingSecret: ""
+    key: ""
+
+# The book of record (W9). One replica: every command takes its partition's
+# lock, so a second would wait rather than help, and the rollout never surges
+# so an upgrade never runs two writers. Its tables are prefixed book_, so it
+# may share a schema with the others; its own database is supported and
+# kept apart from the street's by the credential.
+bor:
+  replicaCount: 1
+  image:
+    tag: ""
   database:
     existingSecret: ""
     key: ""
@@ -265,6 +282,7 @@ broker:
   instrumentKey: instrument
   conductorKey: conductor
   streetKey: street
+  borKey: bor
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so

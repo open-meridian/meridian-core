@@ -7,10 +7,11 @@
 //!
 //! # What it is not
 //!
-//! Not arithmetic. It compares, formats and parses, which is all the kernel
-//! does with a quantity today; when the book needs sums it decides how, within
-//! the rule that nothing is a float. No constructor takes a float and no
-//! conversion makes one.
+//! Not arithmetic beyond sums. It compares, formats and parses; and since the
+//! book of record (W9) sums movement lines, it adds and negates, exactly, at
+//! the larger of the two scales, refusing a sum the wire could not carry
+//! rather than rounding it. Nothing multiplies or divides. No constructor
+//! takes a float and no conversion makes one.
 //!
 //! # Equal is numeric
 //!
@@ -114,6 +115,41 @@ impl Exact {
 
     pub fn is_zero(self) -> bool {
         self.integer == 0
+    }
+
+    /// The same number with its sign turned: a line reversed (W9.7).
+    pub fn negated(self) -> Self {
+        Self {
+            integer: -self.integer,
+            scale: self.scale,
+        }
+    }
+
+    /// The exact sum, at the larger of the two scales: 12.5 and 2.50 is
+    /// 15.00. Refused, never rounded, when it is outside what the wire
+    /// carries.
+    pub fn checked_add(self, other: Self) -> Result<Self, OutOfRange> {
+        let scale = self.scale.max(other.scale);
+        let widen = |value: Self| {
+            value
+                .integer
+                .checked_mul(ten_to(scale - value.scale) as i128)
+                .ok_or(OutOfRange::Digits)
+        };
+        let sum = widen(self)?
+            .checked_add(widen(other)?)
+            .ok_or(OutOfRange::Digits)?;
+        Self::new(sum, scale)
+    }
+
+    /// The exact difference, as [`Exact::checked_add`] of the negation.
+    pub fn checked_sub(self, other: Self) -> Result<Self, OutOfRange> {
+        self.checked_add(other.negated())
+    }
+
+    /// Below zero.
+    pub fn is_negative(self) -> bool {
+        self.integer < 0
     }
 
     /// Whole units and the fraction, each as an unsigned magnitude, the
@@ -356,5 +392,25 @@ mod tests {
             exact("000000000000000000000000000000000000000001"),
             exact("1")
         );
+    }
+
+    #[test]
+    fn a_sum_is_exact_at_the_larger_scale() {
+        let sum = exact("12.5").checked_add(exact("2.50")).unwrap();
+        assert_eq!(sum.to_string(), "15.00");
+        assert_eq!(
+            exact("1000.00").checked_sub(exact("1000")).unwrap(),
+            Exact::ZERO
+        );
+        assert_eq!(exact("-2.5").negated().to_string(), "2.5");
+        assert!(exact("-0.1").is_negative());
+    }
+
+    #[test]
+    fn a_sum_the_wire_cannot_carry_is_refused_not_rounded() {
+        let most = exact("99999999999999999999999999999999999999");
+        assert_eq!(most.checked_add(exact("1")), Err(OutOfRange::Digits));
+        // Widening to the larger scale can itself overflow the 38 digits.
+        assert!(most.checked_add(exact("0.000000000000000001")).is_err());
     }
 }

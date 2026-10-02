@@ -1718,6 +1718,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-bor"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "meridian-bus",
+ "meridian-clock",
+ "meridian-domain",
+ "meridian-pb",
+ "postgres",
+ "prost",
+ "r2d2",
+ "r2d2_postgres",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-bus"
 version = "0.1.0"
 dependencies = [
@@ -1867,7 +1888,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=a10efca83d2e046487996cc7a75c93fae22fde9a#a10efca83d2e046487996cc7a75c93fae22fde9a"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=4cc581fa0f94715d88241fcae115828f68ca21e7#4cc581fa0f94715d88241fcae115828f68ca21e7"
 dependencies = [
  "prost",
  "tonic",
@@ -1881,6 +1902,7 @@ dependencies = [
  "bcrypt",
  "ed25519-dalek",
  "libc",
+ "meridian-bor",
  "meridian-bus",
  "meridian-clock",
  "meridian-conductor",

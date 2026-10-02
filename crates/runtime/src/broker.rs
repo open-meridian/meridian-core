@@ -27,7 +27,7 @@ use meridian_sidecar::Contract;
 const INBOX: &str = "_INBOX.>";
 
 /// The components this deployment's runtime hosts, sharing one credential.
-const RUNTIME_COMPONENTS: [&str; 3] = ["instrument", "street", "conductor"];
+const RUNTIME_COMPONENTS: [&str; 4] = ["instrument", "street", "bor", "conductor"];
 
 /// Components holding a credential of their own rather than the runtime's.
 ///

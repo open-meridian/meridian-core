@@ -49,6 +49,7 @@ services:
       MERIDIAN_NATS_CUSTODY_TEST_2: custody-test-2-dev-only
       MERIDIAN_NATS_OPERATIONS_TEST_1: operations-test-1-dev-only
       MERIDIAN_NATS_OPERATIONS_TEST_2: operations-test-2-dev-only
+      MERIDIAN_NATS_REPORTING_TEST_1: reporting-test-1-dev-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-dev-only
       MERIDIAN_NATS_FIRST_RUN: first-run-dev-only
       MERIDIAN_NATS_TESTS: tests-dev-only
@@ -83,6 +84,26 @@ services:
       MERIDIAN_STREET_DATABASE_URL: ${MERIDIAN_STREET_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: street-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
+  # The book of record (W9). Its own process and store beside the street's,
+  # sharing no key, join or transaction with it (decisions/012); here in the
+  # same database, its tables prefixed book_.
+  bor:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-bor"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_BOR_DATABASE_URL: ${MERIDIAN_BOR_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: bor-1
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
@@ -266,6 +287,130 @@ services:
       MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9193
       RUST_LOG: ${RUST_LOG:-info}
     network_mode: "service:sidecar"
+
+  # ── The book, end to end (make e2e-book) ──────────────────────────────────
+  #
+  # A custody plugin's sidecar recording statements, an operations plugin's
+  # writing the book for a person, a reporting plugin's reading it within its
+  # scope, and an operations plugin's whose scope is empty; all in one network
+  # namespace on ports of their own, as the interop sidecars are, so the SDK's
+  # book suite reaches each on loopback. The operations sidecar holds the
+  # public half of a key made for the run, and the suite the private half, to
+  # sign the person's assertion as the dashboard would (W4.9).
+  book-keys:
+    profiles: [book]
+    image: alpine/openssl:3.3.2
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /keys/signing /keys/public
+        if [ ! -f /keys/signing/key-id ]; then
+          id=book-$$(openssl rand -hex 4)
+          openssl genpkey -algorithm ed25519 -out /keys/signing/private-key.pem
+          openssl pkey -in /keys/signing/private-key.pem -pubout -out /keys/public/$$id.pem
+          openssl pkey -in /keys/signing/private-key.pem -outform DER -out /keys/signing/private-key.der
+          printf %s "$$id" > /keys/signing/key-id
+        fi
+        chmod -R a+rX /keys
+    volumes:
+      - book-keys:/keys
+
+  sidecar-book:
+    profiles: [book]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://custody-test-1:custody-test-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: custody-test-1
+      MERIDIAN_PLUGIN_ROLES: custody
+      MERIDIAN_INSTANCE_ID: sidecar-custody-test-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
+  sidecar-book-operations:
+    profiles: [book]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      sidecar-book:
+        condition: service_started
+      book-keys:
+        condition: service_completed_successfully
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://operations-test-1:operations-test-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: operations-test-1
+      MERIDIAN_PLUGIN_ROLES: operations
+      MERIDIAN_INSTANCE_ID: sidecar-operations-test-1
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9192
+      MERIDIAN_DASHBOARD_KEYS_DIR: /keys/public
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - book-keys:/keys:ro
+    network_mode: "service:sidecar-book"
+
+  sidecar-book-reporting:
+    profiles: [book]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      sidecar-book:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://reporting-test-1:reporting-test-1-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: reporting-test-1
+      MERIDIAN_PLUGIN_ROLES: reporting
+      MERIDIAN_INSTANCE_ID: sidecar-reporting-test-1
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9193
+      RUST_LOG: ${RUST_LOG:-info}
+    network_mode: "service:sidecar-book"
+
+  sidecar-book-unscoped:
+    profiles: [book]
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-sidecar"]
+    depends_on:
+      sidecar-book:
+        condition: service_started
+    environment:
+      MERIDIAN_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-DEP-local}
+      MERIDIAN_BROKER_URL: nats://operations-test-2:operations-test-2-dev-only@nats:4222
+      MERIDIAN_PLUGIN_INSTANCE_ID: operations-test-2
+      MERIDIAN_PLUGIN_ROLES: operations
+      MERIDIAN_INSTANCE_ID: sidecar-operations-test-2
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9194
+      RUST_LOG: ${RUST_LOG:-info}
+    network_mode: "service:sidecar-book"
+
+  book:
+    profiles: [book]
+    image: meridian-python-interop
+    depends_on:
+      sidecar-book:
+        condition: service_started
+    environment:
+      MERIDIAN_SIDECAR_ADDRESS: 127.0.0.1:9191
+      MERIDIAN_OPERATIONS_SIDECAR_ADDRESS: 127.0.0.1:9192
+      MERIDIAN_REPORTING_SIDECAR_ADDRESS: 127.0.0.1:9193
+      MERIDIAN_UNSCOPED_SIDECAR_ADDRESS: 127.0.0.1:9194
+      MERIDIAN_BOOK_KEYS: /keys/signing
+    volumes:
+      - book-keys:/keys:ro
+    network_mode: "service:sidecar-book"
 
   # The Python SDK against a sidecar, which is the only check that the two
   # implementations of the sidecar surface agree.
@@ -720,6 +865,7 @@ volumes:
   dashboard-e2e-state:
   plugin-page-keys:
   settings-key:
+  book-keys:
 
 networks:
   meridian:
