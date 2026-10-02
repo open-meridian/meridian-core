@@ -68,6 +68,7 @@ fn claims() -> CallerClaims {
         assertion_id: "a-1".into(),
         deployment_admin: true,
         level: meridian_pb::v1::AccessLevel::Admin as i32,
+        ..CallerClaims::default()
     }
 }
 

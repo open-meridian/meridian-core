@@ -109,6 +109,7 @@ fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         received_at_ns: now,
         committed_at_ns: now,
         reference_versions: Default::default(),
+        cash: Default::default(),
         control_sequence: 0,
     }
 }
@@ -125,14 +126,38 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
     M::decode(&envelope.payload[..]).map_err(|failed| format!("undecodable {wanted}: {failed}"))
 }
 
-/// The reference version of each instrument, from the instrument store,
-/// where it answers in time; none where it does not (Q31).
-fn versions(
-    bus: &Bus,
-    instruments: &[String],
-    now_ns: i64,
-) -> std::collections::BTreeMap<String, i64> {
-    let mut found = std::collections::BTreeMap::new();
+/// What the instrument store says of each instrument, where it answers in
+/// time: its reference version (Q31), and whether it is cash.
+#[derive(Default)]
+struct References {
+    versions: std::collections::BTreeMap<String, i64>,
+    cash: std::collections::BTreeMap<String, bool>,
+}
+
+/// The scheme a currency's identifier is in ({scheme: iso4217, value: USD}).
+const CURRENCY_SCHEME: &str = "iso4217";
+
+/// Whether a record says its instrument is cash: asset class cash, or a
+/// currency identifier; `None` where it names no asset class and no currency
+/// identifier, and cannot say (W9.1, contract v9).
+fn cash_said(record: &meridian_domain::v1::InstrumentRecord) -> Option<bool> {
+    let currency = record
+        .identifiers
+        .iter()
+        .any(|identifier| identifier.scheme == CURRENCY_SCHEME && !identifier.value.is_empty());
+    match meridian_domain::v1::AssetClass::try_from(record.asset_class) {
+        Ok(meridian_domain::v1::AssetClass::Cash) => Some(true),
+        _ if currency => Some(true),
+        Ok(meridian_domain::v1::AssetClass::Unspecified) | Err(_) => None,
+        Ok(_) => Some(false),
+    }
+}
+
+/// The reference version of each instrument, and whether it is cash, from
+/// the instrument store, where it answers in time; none where it does not
+/// (Q31), which is a record that cannot say.
+fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
+    let mut found = References::default();
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return found;
     };
@@ -160,7 +185,10 @@ fn versions(
         if let Ok(reply) = ResolveInstrumentReply::decode(&payload[..]) {
             if let Some(record) = reply.instrument.filter(|_| reply.found) {
                 if record.version > 0 {
-                    found.insert(instrument.clone(), record.version);
+                    found.versions.insert(instrument.clone(), record.version);
+                }
+                if let Some(cash) = cash_said(&record) {
+                    found.cash.insert(instrument.clone(), cash);
                 }
             }
         }
@@ -317,7 +345,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 decode(&envelope, "meridian.v1.RecordOpeningBalanceRequest")?;
             let mut ctx = context_of(&envelope, clock.as_ref());
             let named = decide::instruments_named(&[], &request.positions);
-            ctx.reference_versions = versions(&bus2, &named, ctx.received_at_ns);
+            let found = references(&bus2, &named, ctx.received_at_ns);
+            ctx.reference_versions = found.versions;
+            ctx.cash = found.cash;
             command(
                 &bus2,
                 store.as_ref(),
@@ -431,7 +461,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             )) = &request.resolution
             {
                 let named = decide::instruments_named(&adjustment.lines, &[]);
-                ctx.reference_versions = versions(&bus2, &named, ctx.received_at_ns);
+                let found = references(&bus2, &named, ctx.received_at_ns);
+                ctx.reference_versions = found.versions;
+                ctx.cash = found.cash;
             }
             command(
                 &bus2,

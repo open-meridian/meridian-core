@@ -41,6 +41,9 @@ pub enum StoreError {
     Refused {
         reason: RefusalReason,
         words: String,
+        /// Each field the command left out, by its path, for
+        /// REFUSAL_REASON_INCOMPLETE (contract v9); empty for every other.
+        fields: Vec<String>,
     },
 
     /// A command or a read that cannot stand as sent, with no code: the words
@@ -76,6 +79,22 @@ impl StoreError {
         StoreError::Refused {
             reason,
             words: words.into(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// An entry missing what the book requires for tax tracking, valuation,
+    /// confirmation or settlement, naming each field by its path (W9.1,
+    /// W9.7, contract v9): nothing applied.
+    pub fn incomplete(what: &str, fields: Vec<String>) -> StoreError {
+        let words = format!(
+            "{what} is incomplete: the book requires {}; supply each before it is sent",
+            fields.join(", ")
+        );
+        StoreError::Refused {
+            reason: RefusalReason::Incomplete,
+            words,
+            fields,
         }
     }
 
@@ -83,7 +102,11 @@ impl StoreError {
     /// sidecar puts beside the status (open point 13).
     pub fn on_the_bus(&self) -> String {
         match self {
-            StoreError::Refused { reason, words } => meridian_bus::refusal(*reason as i32, words),
+            StoreError::Refused {
+                reason,
+                words,
+                fields,
+            } => meridian_bus::refusal_naming(*reason as i32, fields, words),
             other => other.to_string(),
         }
     }

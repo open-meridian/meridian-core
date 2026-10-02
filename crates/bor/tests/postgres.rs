@@ -92,6 +92,7 @@ async fn send<M: Message>(
     let stamp = Stamp {
         acting_for_subject: person.unwrap_or_default().to_string(),
         account_scope: None,
+        ..Default::default()
     };
     bus.call_stamped(
         topic,
@@ -130,6 +131,7 @@ fn opening(account: &str, instrument: &str) -> RecordOpeningBalanceRequest {
                         amount: d("2250.00"),
                         currency_code: "USD".into(),
                     }),
+                    acquired_date: "2025-03-14".into(),
                     ..Default::default()
                 }),
             }],
@@ -334,7 +336,14 @@ async fn a_rebuild_reproduces_every_projection() {
                     side: HoldingSide::Long as i32,
                     bucket: SettlementBucket::Settled as i32,
                     quantity: d("2.5"),
-                    opens_lot: Some(LotTerms::default()),
+                    opens_lot: Some(LotTerms {
+                        cost: Some(Money {
+                            amount: d("567.50"),
+                            currency_code: "USD".into(),
+                        }),
+                        acquired_date: "2026-09-09".into(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()

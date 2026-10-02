@@ -67,8 +67,15 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// the book of record (W9): its commands, reads and deliveries, a typed
 /// operation carrying a oneof, a plugin-supplied idempotency key on the
 /// book's commands, and the book's refusal codes carried beside `aborted`
-/// (sdk-contract/the-book-holds-positions).
-pub const CONTRACT_CURRENT: u32 = 8;
+/// (sdk-contract/the-book-holds-positions). v9 is the book's refusal of an
+/// entry missing what downstream needs, `REFUSAL_REASON_INCOMPLETE` with each
+/// missing field in the refusal's `fields`
+/// (sdk-contract/the-book-refuses-what-downstream-cannot-use), and the
+/// delegation and client a person acted through, named in the claims and
+/// stamped on the envelope beside the person
+/// (sdk-contract/delegations-at-the-deployment-contract); a plugin built
+/// before reads neither, and the book's refusal applies to it all the same.
+pub const CONTRACT_CURRENT: u32 = 9;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -142,7 +149,7 @@ mod tests {
 
     #[test]
     fn a_plugin_built_for_the_current_contract_is_admitted() {
-        assert_eq!(admit("v8"), Ok(8));
+        assert_eq!(admit("v9"), Ok(9));
     }
 
     #[test]
@@ -156,6 +163,7 @@ mod tests {
         assert_eq!(admit("v5"), Ok(5));
         assert_eq!(admit("v6"), Ok(6));
         assert_eq!(admit("v7"), Ok(7));
+        assert_eq!(admit("v8"), Ok(8));
         assert_eq!(admit_within(1, 2, "v1"), Ok(1));
     }
 
@@ -260,6 +268,23 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_reading_the_books_fields_and_its_delegation_is_refused_by_a_sidecar_at_v8() {
+        // A plugin built on an SDK declaring v9 reads the book's INCOMPLETE
+        // refusal with its fields and the delegation in its caller's claims;
+        // a sidecar at v8 carries no fields and stamps no delegation.
+        // Refused at the door, in the fixture's words.
+        assert_eq!(
+            admit_within(2, 8, "v9"),
+            Err(
+                "the plugin was built against contract v9, newer than this sidecar \
+                 (v2 through v8); upgrade the runtime, or rebuild the plugin against \
+                 v8 or earlier"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
     fn a_version_is_read_as_its_number() {
         assert_eq!(declared("v6"), 6);
         assert_eq!(declared("v7"), 7);
@@ -281,7 +306,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v8); rebuild it against v2 or later"
+                 (v2 through v9); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -290,11 +315,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v9"),
+            admit("v10"),
             Err(
-                "the plugin was built against contract v9, newer than this sidecar \
-                 (v2 through v8); upgrade the runtime, or rebuild the plugin against \
-                 v8 or earlier"
+                "the plugin was built against contract v10, newer than this sidecar \
+                 (v2 through v9); upgrade the runtime, or rebuild the plugin against \
+                 v9 or earlier"
                     .into()
             )
         );
@@ -305,7 +330,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v8"
+                "the plugin declared no contract version; this sidecar accepts v2 through v9"
                     .into()
             )
         );

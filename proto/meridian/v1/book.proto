@@ -2,8 +2,10 @@
 //
 // Derived from workflow W9 (the book of record), revision B of
 // plans/the-book-holds-positions, contract v8
-// (sdk-contract/the-book-holds-positions). Every message here traces to a
-// matrix row; see matrix/matrix.tsv.
+// (sdk-contract/the-book-holds-positions); from v9 the book refuses an entry
+// missing what downstream needs, naming each field
+// (sdk-contract/the-book-refuses-what-downstream-cannot-use). Every message
+// here traces to a matrix row; see matrix/matrix.tsv.
 //
 // W2's governing idea, carried through: there are two beliefs about what is
 // held, ours and the custodian's. holdings.proto carries the custodian's into
@@ -95,12 +97,12 @@ enum SettlementBucket {
   // Refused.
   SETTLEMENT_BUCKET_UNSPECIFIED = 0;
   SETTLEMENT_BUCKET_SETTLED = 1;
-  // Pending settlement on the line's value date. With no value date only at
-  // an opening balance: the source's difference between trade-date and
-  // settled quantities, "date not stated".
+  // Pending settlement on the line's value date. With no value date on an
+  // adjustment the street gave no date for, or on a line a v8 opening
+  // balance recorded ("date not stated").
   SETTLEMENT_BUCKET_PENDING = 2;
-  // The source did not say whether it is settled or pending: only at an
-  // opening balance whose source gave no settled quantity.
+  // The source did not say whether it is settled or pending: only on a line
+  // a v8 opening balance recorded. Refused from v9.
   SETTLEMENT_BUCKET_NOT_STATED = 3;
 }
 
@@ -109,8 +111,8 @@ message MovementLine {
   string instrument_id = 1;
   HoldingSide side = 2;
   SettlementBucket bucket = 3;
-  // ISO 8601; required on a pending line but at an opening balance; may be
-  // years out.
+  // ISO 8601; on a pending line, empty only on an adjustment the street gave
+  // no date for; may be years out.
   string value_date = 4;
   // Signed as the position's quantity is, and added to it.
   Decimal quantity = 5;
@@ -124,7 +126,10 @@ message MovementLine {
 }
 
 message LotTerms {
-  // Each unset where not known; never derived one from the other.
+  // Each unset where not known; never derived one from the other. A lot the
+  // book opens carries its cost and acquisition date (v9): an opening
+  // balance or an adjustment without either is refused
+  // (REFUSAL_REASON_INCOMPLETE); a lot a v8 book opened may lack them.
   optional Money unit_cost = 1;
   optional Money cost = 2;
   string acquired_date = 3;
@@ -158,10 +163,9 @@ message BasisAdjustment {
   oneof cost {
     // Added to the lot's cost; signed. Only on a lot whose cost is known.
     Money cost_change = 2;
-    // The lot's cost, stated where it was unknown: a lot opened with no
-    // cost -- a remainder lot, one of unknown cost because the source listed
-    // none, a future's -- given its cost once it is known. Only on a lot
-    // whose cost is unknown.
+    // The lot's cost, stated where it was unknown: a lot a v8 book opened
+    // with no cost, given its cost once it is known. Only on a lot whose cost
+    // is unknown; from v9 the book opens none.
     Money stated_cost = 4;
   }
   // Where it moves; empty is unchanged.
@@ -174,10 +178,13 @@ message BookPosition {
   string account_id = 1;
   string instrument_id = 2;
   HoldingSide side = 3;
-  // Settled, plus pending, plus not stated: by construction.
+  // Settled plus pending, by construction; plus not stated where a v8
+  // opening balance opened that bucket.
   Decimal trade_date_quantity = 4;
-  // Unset while any of the quantity is not stated: unknown, never zero.
+  // Unset only while some of the quantity is in the not-stated bucket a v8
+  // opening balance opened: unknown, never zero.
   optional Decimal settled_quantity = 5;
+  // Zero on every position v9 records.
   Decimal not_stated_quantity = 6;
   repeated PendingSettlement pending = 7;
   // Open lots; their open quantities sum to trade_date_quantity, cash
@@ -256,7 +263,9 @@ message RecordEncumbrancesRequest {
 }
 
 message PendingSettlement {
-  // ISO 8601; empty only for "date not stated" at an opening balance.
+  // ISO 8601. Required at an opening balance (v9); empty on a position only
+  // for "date not stated", from a v8 opening balance or an adjustment the
+  // street gave no date for.
   string value_date = 1;
   Decimal quantity = 2;
   PendingState state = 3;
@@ -313,11 +322,14 @@ message OpeningPosition {
   string instrument_id = 1;
   HoldingSide side = 2;
   Decimal trade_date_quantity = 3;
-  // Unset where the source states none.
+  // Required (v9): where the source states none, a person supplies it.
+  // Unset, the opening balance is refused (REFUSAL_REASON_INCOMPLETE).
   optional Decimal settled_quantity = 4;
+  // Each with its value date; with the settled quantity they account for
+  // the whole trade-date quantity, or the balance is refused.
   repeated PendingSettlement pending = 5;
-  // As reported; a position whose source reports none sends one, its cost
-  // unknown; cash sends none.
+  // As reported and completed by a person, each with its quantity, cost and
+  // acquisition date; required but on cash, which sends none (v9).
   repeated OpeningLot lots = 6;
 }
 

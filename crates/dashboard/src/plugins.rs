@@ -115,6 +115,17 @@ pub(crate) struct Who {
     pub display_name: String,
     pub directory_groups: Vec<String>,
     pub covers: Option<crate::delegation::Covers>,
+    /// The delegation and its client, when they came through one: named in
+    /// the assertion, so the sidecar stamps it beside the person (W4.9,
+    /// W6.18, contract v9).
+    pub delegation: Option<Delegated>,
+}
+
+/// The delegation a person acted through, as the assertion names it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Delegated {
+    pub id: String,
+    pub client_name: String,
 }
 
 impl Who {
@@ -140,6 +151,7 @@ impl Came {
                 display_name: s.display_name,
                 directory_groups: s.directory_groups,
                 covers: None,
+                delegation: None,
             }),
             Came::Terminal(hash) => app
                 .terminals
@@ -151,6 +163,7 @@ impl Came {
                     display_name: p.display_name,
                     directory_groups: p.directory_groups,
                     covers: None,
+                    delegation: None,
                 }),
             Came::Delegation(id) => app
                 .delegations
@@ -165,6 +178,10 @@ impl Came {
                     display_name: d.display_name,
                     directory_groups: d.directory_groups,
                     covers: Some(d.covers),
+                    delegation: Some(Delegated {
+                        id: d.id,
+                        client_name: d.client_name,
+                    }),
                 }),
         })
     }
@@ -384,6 +401,7 @@ impl Plugins {
             deployment_admin: true,
             // And no level: developing a plugin opens none of its pages.
             level: AccessLevel::Unspecified as i32,
+            ..CallerClaims::default()
         };
         let assertion = match self.signer.sign(&claims) {
             Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
@@ -951,6 +969,18 @@ impl Opening {
             assertion_id: token(),
             deployment_admin: self.deployment_admin,
             level: self.level as i32,
+            // Through a client, the delegation and its name; a browser's
+            // session names neither (W6.18, decisions/029).
+            delegation_id: who
+                .delegation
+                .as_ref()
+                .map(|d| d.id.clone())
+                .unwrap_or_default(),
+            client_name: who
+                .delegation
+                .as_ref()
+                .map(|d| d.client_name.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1022,15 +1052,24 @@ async fn from_terminal(
             format!("you hold no access on {instance}"),
         )));
     };
-    let (came, covers) = match caller.through {
-        crate::web::Through::Session(hash) => (Came::Terminal(hash), None),
-        crate::web::Through::Delegation { id, covers, .. } => (Came::Delegation(id), Some(covers)),
+    let (came, covers, delegation) = match caller.through {
+        crate::web::Through::Session(hash) => (Came::Terminal(hash), None, None),
+        crate::web::Through::Delegation {
+            id,
+            client_name,
+            covers,
+        } => (
+            Came::Delegation(id.clone()),
+            Some(covers),
+            Some(Delegated { id, client_name }),
+        ),
     };
     let who = Who {
         subject: caller.person.subject,
         display_name: caller.person.display_name,
         directory_groups: caller.person.directory_groups,
         covers,
+        delegation,
     };
     Ok((who, opened, came))
 }

@@ -52,6 +52,14 @@ pub struct Context {
     /// The instrument store's version of each instrument the command names,
     /// where it has one.
     pub reference_versions: BTreeMap<String, i64>,
+    /// Whether each instrument the command names is cash, as its record says
+    /// (W9.1, contract v9): `true` for asset class cash or a currency
+    /// identifier, `false` for any other asset class. Absent where the record
+    /// cannot say -- a placeholder, a record naming no asset class, the
+    /// instrument store not answering -- and then its lots are not required
+    /// (the completion form's question 2, ruled 2026-10-02: flagged, not
+    /// blocking).
+    pub cash: BTreeMap<String, bool>,
     /// The control partition's sequence in force (decisions/024's note).
     pub control_sequence: u64,
 }
@@ -275,12 +283,11 @@ pub fn opening_balance(
         }
         _ => {}
     }
-    date("as_of_date", &request.as_of_date)?;
-    if request.sources.is_empty() {
-        return Err(StoreError::Invalid(
-            "an opening balance names the custodian or system it was composed from".into(),
-        ));
+    let missing = opening_missing(ctx, request);
+    if !missing.is_empty() {
+        return Err(StoreError::incomplete("the opening balance", missing));
     }
+    date("as_of_date", &request.as_of_date)?;
 
     let mut lines = Vec::new();
     let mut seen: BTreeSet<Key> = BTreeSet::new();
@@ -336,10 +343,105 @@ pub fn opening_balance(
     made(book, head, ctx, draft)
 }
 
+/// Every field an opening balance leaves out that the book requires (W9.1,
+/// contract v9; the product owner's required list of 2026-10-02), by its
+/// path in the command: of the balance, its date and a named source; of each
+/// position, its instrument, side and quantity, its settled quantity, each
+/// pending quantity with its value date, the whole quantity settled or
+/// pending on a date, and its lots -- but on cash, or where the instrument's
+/// record cannot say whether it is cash -- each with its quantity, cost and
+/// acquisition date. A value present but malformed is not missing: it is
+/// refused with its words when the lines are made.
+fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<String> {
+    let mut missing = Vec::new();
+    if request.as_of_date.trim().is_empty() {
+        missing.push("as_of_date".to_string());
+    }
+    if request.sources.is_empty() {
+        missing.push("sources".to_string());
+    } else if !request.positions.is_empty() {
+        for (index, source) in request.sources.iter().enumerate() {
+            if source.name.trim().is_empty() {
+                missing.push(format!("sources[{index}].name"));
+            }
+        }
+    }
+    for (index, position) in request.positions.iter().enumerate() {
+        let field = format!("positions[{index}]");
+        if position.instrument_id.is_empty() {
+            missing.push(format!("{field}.instrument_id"));
+        }
+        if position.side == HoldingSide::Unspecified as i32 {
+            missing.push(format!("{field}.side"));
+        }
+        if position.trade_date_quantity.is_none() {
+            missing.push(format!("{field}.trade_date_quantity"));
+        }
+        if position.settled_quantity.is_none() {
+            missing.push(format!("{field}.settled_quantity"));
+        }
+        for (at, pending) in position.pending.iter().enumerate() {
+            if pending.quantity.is_none() {
+                missing.push(format!("{field}.pending[{at}].quantity"));
+            }
+            if pending.value_date.trim().is_empty() {
+                missing.push(format!("{field}.pending[{at}].value_date"));
+            }
+        }
+        // Settled and pending on a date account for the whole quantity; the
+        // rest, neither, is pending whose quantity and date nobody has given.
+        let rest = || -> Option<Exact> {
+            let trade = Exact::from_wire(position.trade_date_quantity.as_ref()?).ok()?;
+            let settled = Exact::from_wire(position.settled_quantity.as_ref()?).ok()?;
+            let mut rest = trade.checked_add(settled.negated()).ok()?;
+            for pending in &position.pending {
+                let quantity = Exact::from_wire(pending.quantity.as_ref()?).ok()?;
+                rest = rest.checked_add(quantity.negated()).ok()?;
+            }
+            Some(rest)
+        };
+        if rest().is_some_and(|rest| !rest.is_zero()) {
+            missing.push(format!("{field}.pending"));
+        }
+        let cash = ctx.cash.get(&position.instrument_id).copied();
+        if position.lots.is_empty() && cash == Some(false) {
+            missing.push(format!("{field}.lots"));
+        }
+        for (at, lot) in position.lots.iter().enumerate() {
+            let lot_field = format!("{field}.lots[{at}]");
+            if lot.quantity.is_none() {
+                missing.push(format!("{lot_field}.quantity"));
+            }
+            missing.extend(terms_missing(&lot_field, lot.terms.as_ref(), ".terms"));
+        }
+    }
+    missing
+}
+
+/// What a lot the book opens leaves out of its terms (contract v9): its cost
+/// and its acquisition date. A lot of unknown cost is no longer admitted.
+/// `within` is the path of the terms inside `field`: `.terms` for an opening
+/// lot, `.opens_lot` for an adjustment's line.
+fn terms_missing(
+    field: &str,
+    terms: Option<&meridian_domain::v1::LotTerms>,
+    within: &str,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if terms.and_then(|terms| terms.cost.as_ref()).is_none() {
+        missing.push(format!("{field}{within}.cost"));
+    }
+    if terms.is_none_or(|terms| terms.acquired_date.trim().is_empty()) {
+        missing.push(format!("{field}{within}.acquired_date"));
+    }
+    missing
+}
+
 /// An opening position as lines opening each bucket and lot from zero (W9.2):
 /// the settled quantity to settled; each pending settlement on its value
-/// date; the rest to "date not stated" where the source stated a settled
-/// quantity, or to not stated where it stated none.
+/// date. The two account for the whole quantity, which [`opening_missing`]
+/// has checked (contract v9): the not-stated bucket and pending with no date,
+/// which v8 opened for the rest, are no longer admitted.
 fn opening_lines(
     ctx: &Context,
     field: &str,
@@ -396,16 +498,10 @@ fn opening_lines(
         rest = numbers::add(&format!("{field}.pending"), rest, quantity.negated())?;
     }
     if !rest.is_zero() {
-        buckets.push(Bucket {
-            bucket: if settled.is_some() {
-                SettlementBucket::Pending
-            } else {
-                SettlementBucket::NotStated
-            },
-            value_date: String::new(),
-            state: None,
-            quantity: rest,
-        });
+        return Err(StoreError::incomplete(
+            "the opening balance",
+            vec![format!("{field}.pending")],
+        ));
     }
     buckets.retain(|bucket| !bucket.quantity.is_zero());
 
@@ -427,8 +523,9 @@ fn opening_lines(
         return Err(StoreError::refused(
             RefusalReason::LotsUnbalanced,
             format!(
-                "{field}'s lots sum to {total} and its trade-date quantity is {trade}; send the \
-                 remainder as a lot of unknown cost, and say so in the reason"
+                "{field}'s lots sum to {total} and its trade-date quantity is {trade}; the rest \
+                 of its lots, each with its cost and acquisition date, is supplied before it \
+                 is sent"
             ),
         ));
     }
@@ -1161,6 +1258,22 @@ fn adjustment_body(
             "an adjustment carries movement lines, basis adjustments or both".into(),
         ));
     }
+    let missing: Vec<String> = adjustment
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.opens_lot.is_some())
+        .flat_map(|(index, line)| {
+            terms_missing(
+                &format!("adjustment.lines[{index}]"),
+                line.opens_lot.as_ref(),
+                ".opens_lot",
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(StoreError::incomplete("the adjustment", missing));
+    }
     let mut lines = Vec::new();
     for (index, line) in adjustment.lines.iter().enumerate() {
         let field = format!("adjustment.lines[{index}]");
@@ -1171,15 +1284,15 @@ fn adjustment_body(
         numbers::required(&format!("{field}.quantity"), line.quantity.as_ref())?;
         match SettlementBucket::try_from(line.bucket) {
             Ok(SettlementBucket::Settled) => {}
-            // A pending line may name no value date, "date not stated", as at
-            // an opening balance: the street carries none at v7.
+            // A pending line may name no value date: the street carries none,
+            // and a proposal matching the custodian's split cannot invent one.
             Ok(SettlementBucket::Pending) if line.value_date.is_empty() => {}
             Ok(SettlementBucket::Pending) => {
                 date(&format!("{field}.value_date"), &line.value_date)?
             }
             Ok(SettlementBucket::NotStated) => {
                 return Err(StoreError::Invalid(format!(
-                    "{field} is not stated, which only an opening balance's source may say"
+                    "{field} is not stated, which the book no longer admits (contract v9)"
                 )))
             }
             _ => {

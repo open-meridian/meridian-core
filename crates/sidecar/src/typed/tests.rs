@@ -792,6 +792,7 @@ fn claimed(
         assertion_id: "a-1".into(),
         deployment_admin,
         level: level as i32,
+        ..CallerClaims::default()
     }
     .encode_to_vec();
     CallerAssertion {
@@ -866,6 +867,79 @@ async fn a_command_sent_for_a_person_who_may_write_the_account_is_stamped_with_t
     assert_eq!(
         *subjects.lock().unwrap(),
         vec!["local|ada".to_string(), String::new()]
+    );
+}
+
+/// W4.9 (contract v9): a person through a client -- the CLI, their agent --
+/// is stamped with the delegation the assertion names, beside them; a
+/// browser's assertion names none, and the plugin as itself is stamped with
+/// nobody.
+#[tokio::test]
+async fn a_person_through_a_client_is_stamped_with_their_delegation() {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier = Arc::new(Verifier::holding(
+        "snaptrade-1",
+        KEY_ID,
+        key.verifying_key(),
+    ));
+    let (sidecar, bus, _) = registered_with(&["custody"], Some(verifier)).await;
+    let stamped = Arc::new(Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&stamped);
+    bus.serve(RECORD_HOLDING, move |envelope| {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        keeping
+            .lock()
+            .unwrap()
+            .push((meta.acting_for_subject, meta.acting_through_delegation));
+        Ok((
+            "meridian.v1.RecordHoldingReply".into(),
+            RecordHoldingReply {
+                holding_id: "H-1".into(),
+                resolved: true,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let through = |delegation: &str, client: &str| {
+        let issued = now();
+        let claims = CallerClaims {
+            subject: "local|ada".into(),
+            display_name: "Ada".into(),
+            audience_instance_id: "snaptrade-1".into(),
+            read_account_ids: vec!["ACC-1".into()],
+            write_account_ids: vec!["ACC-1".into()],
+            issued_at_ns: issued,
+            expires_at_ns: issued + 60_000_000_000,
+            assertion_id: format!("a-{delegation}"),
+            level: AccessLevel::Write as i32,
+            delegation_id: delegation.into(),
+            client_name: client.into(),
+            ..CallerClaims::default()
+        }
+        .encode_to_vec();
+        CallerAssertion {
+            signature: key.sign(&claims).to_bytes().to_vec(),
+            claims,
+            key_id: KEY_ID.into(),
+        }
+    };
+    for assertion in [through("DLG-1", "meridian on ada-laptop"), through("", "")] {
+        sidecar
+            .record_holding(Request::new(for_person("ext-1", assertion)))
+            .await
+            .expect("admitted");
+    }
+    sidecar
+        .record_holding(Request::new(holding("ext-1")))
+        .await
+        .expect("and the plugin as itself");
+    assert_eq!(
+        *stamped.lock().unwrap(),
+        vec![
+            ("local|ada".to_string(), "DLG-1".to_string()),
+            ("local|ada".to_string(), String::new()),
+            (String::new(), String::new()),
+        ]
     );
 }
 
@@ -1736,7 +1810,7 @@ async fn before_the_book_holds_the_account() -> Sidecar {
     );
     let reply = sidecar
         .register(Request::new(RegisterRequest {
-            schema_version: "v8".into(),
+            schema_version: "v9".into(),
             ..Default::default()
         }))
         .await
@@ -1764,4 +1838,78 @@ async fn a_components_refusal_reaches_the_plugin_with_its_code_beside_aborted() 
         refused.message(),
         "account ACC-1 has no opening balance; it enters the book once, with one (W9.1)"
     );
+}
+
+/// Contract v9: a refusal naming what the command left out carries each
+/// field beside its code, so a plugin shows a person what to complete.
+#[tokio::test]
+async fn an_incomplete_command_reaches_the_plugin_with_each_missing_field() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.book.command.record-break\tcommand\toperations\tbor\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\noperations\trole\nbor\tcomponent\nsidecar\tcomponent\n\
+         conductor\tcomponent\n",
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve("platform.book.command.record-break", |_| {
+        Err(meridian_bus::refusal_naming(
+            RefusalReason::Incomplete as i32,
+            &[
+                "positions[0].settled_quantity".into(),
+                "positions[0].lots".into(),
+            ],
+            "the opening balance is incomplete",
+        ))
+    });
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration {
+                plugin_instance_id: "operations-sample-1".into(),
+                read_account_ids: vec!["ACC-1".into()],
+                write_account_ids: vec!["ACC-1".into()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let sidecar = Sidecar::under(
+        &contract,
+        bus,
+        "DEP-test",
+        Identity::new("operations-sample-1", vec!["operations".into()]),
+    );
+    sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v9".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let refused = sidecar
+        .record_break(Request::new(meridian_pb::plugin::v1::RecordBreakParams {
+            account_id: "ACC-1".into(),
+            business_date: "2026-09-09".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Aborted);
+    let carried = refused
+        .metadata()
+        .get_bin(crate::REFUSAL_METADATA)
+        .expect("a refusal");
+    let refusal = Refusal::decode(carried.to_bytes().unwrap().as_ref()).unwrap();
+    assert_eq!(refusal.reason, RefusalReason::Incomplete as i32);
+    assert_eq!(
+        refusal.fields,
+        vec!["positions[0].settled_quantity", "positions[0].lots"]
+    );
+    assert_eq!(refused.message(), "the opening balance is incomplete");
 }

@@ -32,6 +32,12 @@ pub struct Stamp {
     /// The person a command is sent for; empty when the plugin acts as itself.
     pub acting_for_subject: String,
 
+    /// The delegation that person acted through, when the dashboard's
+    /// assertion named one: the CLI, their agent, an MCP client (W4.9,
+    /// decisions/029, contract v9). Empty for a person at the dashboard in a
+    /// browser, and always beside a person, never alone.
+    pub acting_through_delegation: String,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -236,7 +242,7 @@ impl Bus {
     ) -> crate::Result<(String, Vec<u8>)> {
         let stamp = Stamp {
             acting_for_subject: acting_for_subject.to_string(),
-            account_scope: None,
+            ..Stamp::default()
         };
         self.call_stamped(
             topic,
@@ -346,6 +352,7 @@ impl Bus {
             schema_version: "v1".to_string(),
             published_at_ns: self.clock.now_ns(),
             acting_for_subject: stamp.acting_for_subject.clone(),
+            acting_through_delegation: stamp.acting_through_delegation.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),
@@ -670,8 +677,8 @@ mod acting_for {
         let (applies, scope) = match scope {
             Some(accounts) => {
                 let stamp = super::Stamp {
-                    acting_for_subject: String::new(),
                     account_scope: Some(accounts),
+                    ..super::Stamp::default()
                 };
                 bus.call_stamped(topic, "", Vec::new(), None, None, &stamp)
                     .await
@@ -695,6 +702,36 @@ mod acting_for {
             ("true".into(), String::new())
         );
         assert_eq!(scope_seen(None).await, ("false".into(), String::new()));
+    }
+
+    #[tokio::test]
+    async fn a_person_through_a_client_carries_the_delegation_beside_them() {
+        // W4.9 (contract v9): the sidecar stamps the delegation the
+        // assertion named beside the person, and a store reads both.
+        let bus = Bus::single(
+            "sidecar-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        );
+        let topic = "platform.book.command.record-opening-balance";
+        bus.serve(topic, |envelope| {
+            let meta = envelope.meta.unwrap_or_default();
+            Ok((
+                meta.acting_for_subject,
+                meta.acting_through_delegation.into_bytes(),
+            ))
+        });
+        let stamp = super::Stamp {
+            acting_for_subject: "https://directory.example.org|8812".into(),
+            acting_through_delegation: "DLG-1".into(),
+            ..super::Stamp::default()
+        };
+        let (person, delegation) = bus
+            .call_stamped(topic, "", Vec::new(), None, None, &stamp)
+            .await
+            .expect("answered");
+        assert_eq!(person, "https://directory.example.org|8812");
+        assert_eq!(String::from_utf8(delegation).expect("utf-8"), "DLG-1");
     }
 
     #[tokio::test]

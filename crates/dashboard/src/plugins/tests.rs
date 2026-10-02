@@ -2411,3 +2411,37 @@ fn where_no_frame_can_hold_a_session_the_page_opens_in_a_window_of_its_own() {
         assert_eq!(plugins.frames(), frames, "{address}");
     }
 }
+
+/// W6.18 and W4.9 (contract v9): a person through a client carries the
+/// delegation and its client in the assertion, which the sidecar stamps beside
+/// them; a browser's session names neither.
+#[test]
+fn the_assertion_names_the_delegation_a_person_came_through() {
+    let opening = || Opening {
+        access: meridian_access::Levels::default(),
+        deployment_admin: false,
+        level: AccessLevel::Write,
+    };
+    let who = |delegation: Option<Delegated>| Who {
+        subject: ADA.into(),
+        display_name: "Ada Park".into(),
+        directory_groups: Vec::new(),
+        covers: None,
+        delegation,
+    };
+    let through = opening().claims(
+        &who(Some(Delegated {
+            id: "DLG-1".into(),
+            client_name: "meridian on ada-laptop".into(),
+        })),
+        INSTANCE,
+        1,
+    );
+    assert_eq!(through.subject, ADA);
+    assert_eq!(through.delegation_id, "DLG-1");
+    assert_eq!(through.client_name, "meridian on ada-laptop");
+
+    let browser = opening().claims(&who(None), INSTANCE, 1);
+    assert_eq!(browser.delegation_id, "");
+    assert_eq!(browser.client_name, "");
+}

@@ -707,6 +707,7 @@ mod tests {
         let stamp = meridian_bus::Stamp {
             acting_for_subject: String::new(),
             account_scope: Some(scope.iter().map(|a| a.to_string()).collect()),
+            ..Default::default()
         };
         bus.call_stamped(topic, payload_type, payload, None, None, &stamp)
             .await

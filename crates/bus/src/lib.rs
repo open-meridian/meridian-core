@@ -29,8 +29,8 @@ mod nats;
 mod router;
 
 pub use backend::{
-    read_refusal, refusal, Answer, Backend, BusError, Delivery, DropCount, Handler, HandlerReply,
-    Subscription,
+    read_refusal, refusal, refusal_fields, refusal_naming, Answer, Backend, BusError, Delivery,
+    DropCount, Handler, HandlerReply, Subscription,
 };
 pub use memory::MemoryBackend;
 pub use nats::NatsBackend;

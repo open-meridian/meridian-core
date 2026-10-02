@@ -205,7 +205,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
-        let subject = if topic.starts_with(CONFIGURATION) {
+        let (subject, delegation) = if topic.starts_with(CONFIGURATION) {
             let claims = self.vouched_admin(&topic, acting_for.as_ref(), self.clock.now_ns())?;
             tracing::info!(
                 instance = self.instance_id(),
@@ -214,9 +214,9 @@ impl Sidecar {
                 at_level = "admin",
                 "read for a person"
             );
-            claims.subject
+            (claims.subject, claims.delegation_id)
         } else {
-            String::new()
+            (String::new(), String::new())
         };
         let scope = self
             .configuration(self.clock.now_ns())
@@ -231,6 +231,7 @@ impl Sidecar {
         }
         let stamp = Stamp {
             acting_for_subject: subject,
+            acting_through_delegation: delegation,
             account_scope: Some(scope),
         };
         let (_, payload) = self
@@ -289,9 +290,7 @@ impl Sidecar {
                 at_level = "admin",
                 "sent for a person"
             );
-            return self
-                .ask_for(&topic, payload_type, message, &claims.subject)
-                .await;
+            return self.ask_for(&topic, payload_type, message, &claims).await;
         }
         if let Some(account) = &account {
             let configuration = self.configuration(now).await?;
@@ -304,41 +303,52 @@ impl Sidecar {
                 return Err(Status::permission_denied(refusal));
             }
         }
-        let subject = match acting_for {
-            None => String::new(),
+        let claims = match acting_for {
+            None => CallerClaims::default(),
             Some(assertion) => {
-                let subject = self.vouched_writer(&assertion, account.as_deref(), now)?;
+                let claims = self.vouched_writer(&assertion, account.as_deref(), now)?;
                 tracing::info!(
                     instance = self.instance_id(),
                     topic,
-                    by = subject,
+                    by = claims.subject,
                     at_level = "write",
                     "sent for a person"
                 );
-                subject
+                claims
             }
         };
-        self.ask_for(&topic, payload_type, message, &subject).await
+        self.ask_for(&topic, payload_type, message, &claims).await
     }
 
-    /// Asked, with the person stamped on the envelope, and the reply read as
-    /// its plugin-facing mirror.
+    /// Asked, with the person stamped on the envelope -- and the delegation
+    /// they acted through, when the assertion named one (W4.9, contract v9)
+    /// -- and the reply read as its plugin-facing mirror. Default claims are
+    /// the plugin acting as itself: nobody stamped.
     async fn ask_for<D: Message, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
         message: D,
-        subject: &str,
+        claims: &CallerClaims,
     ) -> Result<Response<R>, Status> {
+        let stamp = Stamp {
+            acting_for_subject: claims.subject.clone(),
+            acting_through_delegation: if claims.subject.is_empty() {
+                String::new()
+            } else {
+                claims.delegation_id.clone()
+            },
+            account_scope: None,
+        };
         let (_, payload) = self
             .bus
-            .call_for(
+            .call_stamped(
                 topic,
                 payload_type,
                 message.encode_to_vec(),
                 None,
                 None,
-                subject,
+                &stamp,
             )
             .await
             .map_err(refused)?;
@@ -448,7 +458,7 @@ impl Sidecar {
         assertion: &CallerAssertion,
         account: Option<&str>,
         now_ns: i64,
-    ) -> Result<String, Status> {
+    ) -> Result<CallerClaims, Status> {
         let verifier = self.verifier.as_ref().ok_or_else(|| {
             Status::unauthenticated(
                 "this sidecar holds none of the dashboard's keys, so it can vouch for nobody",
@@ -483,7 +493,7 @@ impl Sidecar {
             None if may_write.is_empty() => Err(Status::permission_denied(
                 "the person may write nothing through this plugin",
             )),
-            _ => Ok(claims.subject),
+            _ => Ok(claims),
         }
     }
 }
@@ -513,12 +523,24 @@ pub const REFUSAL_METADATA: &str = "meridian-refusal-bin";
 
 /// A refusal with its reason code from the catalogue beside the status.
 pub(crate) fn refused_for(code: Code, words: String, reason: RefusalReason) -> Status {
+    refused_naming(code, words, reason, Vec::new())
+}
+
+/// A refusal with its reason code and, for one naming what the command left
+/// out, each field by its path (contract v9's REFUSAL_REASON_INCOMPLETE).
+pub(crate) fn refused_naming(
+    code: Code,
+    words: String,
+    reason: RefusalReason,
+    fields: Vec<String>,
+) -> Status {
     let mut metadata = MetadataMap::new();
     metadata.insert_bin(
         REFUSAL_METADATA,
         MetadataValue::from_bytes(
             &Refusal {
                 reason: reason as i32,
+                fields,
             }
             .encode_to_vec(),
         ),
@@ -532,10 +554,16 @@ pub(crate) fn refused(failed: BusError) -> Status {
         timeout @ BusError::Timeout { .. } => Status::deadline_exceeded(timeout.to_string()),
         // A component's refusal of its own (W9's book, contract v8), its
         // reason code carried beside the status and its words alone in it.
+        // The fields it names as left out, where it names any, ride with it.
         BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
             .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
         {
-            Some((reason, words)) => refused_for(Code::Aborted, words.to_string(), reason),
+            Some((reason, words)) => refused_naming(
+                Code::Aborted,
+                words.to_string(),
+                reason,
+                meridian_bus::refusal_fields(&detail),
+            ),
             None => Status::aborted(detail),
         },
         BusError::NotPublishable(topic) => {

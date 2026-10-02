@@ -36,7 +36,14 @@ pub enum BusError {
 /// status, and the words alone to the plugin (contract v8, open point 13 of
 /// sdk-contract/the-book-holds-positions). A refusal with no code is words
 /// alone, as every refusal was before.
+///
+/// Where the refusal names what the command left out (contract v9's
+/// REFUSAL_REASON_INCOMPLETE), the fields ride with the code, each by its
+/// path in the command, separated by `;`: `[refusal-reason 11
+/// fields=positions[0].lots;sources] words`. A path holds no space and no
+/// `;`, so neither the code's end nor a field's is ever mistaken.
 const REFUSAL_REASON_PREFIX: &str = "[refusal-reason ";
+const REFUSAL_FIELDS: &str = "fields=";
 
 /// A handler's refusal, carrying `reason` -- a meridian.v1.RefusalReason's
 /// number, never 0 -- beside its words.
@@ -44,12 +51,45 @@ pub fn refusal(reason: i32, words: impl std::fmt::Display) -> String {
     format!("{REFUSAL_REASON_PREFIX}{reason}] {words}")
 }
 
+/// A handler's refusal naming each field the command left out, beside its
+/// code and its words.
+pub fn refusal_naming(reason: i32, fields: &[String], words: impl std::fmt::Display) -> String {
+    if fields.is_empty() {
+        return refusal(reason, words);
+    }
+    let named = fields.join(";");
+    format!("{REFUSAL_REASON_PREFIX}{reason} {REFUSAL_FIELDS}{named}] {words}")
+}
+
+/// The code, the fields and the words, where the detail carries a code.
+fn refusal_parts(detail: &str) -> Option<(i32, Vec<&str>, &str)> {
+    let rest = detail.strip_prefix(REFUSAL_REASON_PREFIX)?;
+    let (head, words) = rest.split_once("] ")?;
+    let (number, fields) = match head.split_once(' ') {
+        Some((number, named)) => (
+            number,
+            named
+                .strip_prefix(REFUSAL_FIELDS)?
+                .split(';')
+                .filter(|field| !field.is_empty())
+                .collect(),
+        ),
+        None => (head, Vec::new()),
+    };
+    let reason: i32 = number.parse().ok()?;
+    (reason > 0).then_some((reason, fields, words))
+}
+
 /// A refusal's reason code and its words, where it carries one.
 pub fn read_refusal(detail: &str) -> Option<(i32, &str)> {
-    let rest = detail.strip_prefix(REFUSAL_REASON_PREFIX)?;
-    let (number, words) = rest.split_once("] ")?;
-    let reason: i32 = number.parse().ok()?;
-    (reason > 0).then_some((reason, words))
+    refusal_parts(detail).map(|(reason, _, words)| (reason, words))
+}
+
+/// The fields a refusal names as left out; none where it names none.
+pub fn refusal_fields(detail: &str) -> Vec<String> {
+    refusal_parts(detail)
+        .map(|(_, fields, _)| fields.into_iter().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// One message delivered to a subscriber.
@@ -229,6 +269,21 @@ mod refusal_tests {
             read_refusal(&said),
             Some((4, "ACC-1 has an opening balance standing"))
         );
+    }
+
+    #[test]
+    fn a_refusal_names_the_fields_it_left_out() {
+        let fields = vec!["positions[0].lots".to_string(), "sources".to_string()];
+        let said = refusal_naming(11, &fields, "the opening balance is incomplete");
+        assert_eq!(
+            read_refusal(&said),
+            Some((11, "the opening balance is incomplete"))
+        );
+        assert_eq!(refusal_fields(&said), fields);
+        // A refusal naming none reads as v8's did.
+        assert_eq!(refusal_naming(4, &[], "standing"), refusal(4, "standing"));
+        assert!(refusal_fields(&refusal(4, "standing")).is_empty());
+        assert!(refusal_fields("no statement STMT-1").is_empty());
     }
 
     #[test]

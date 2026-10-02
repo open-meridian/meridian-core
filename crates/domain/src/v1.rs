@@ -2809,8 +2809,8 @@ pub struct MovementLine {
     pub side: i32,
     #[prost(enumeration = "SettlementBucket", tag = "3")]
     pub bucket: i32,
-    /// ISO 8601; required on a pending line but at an opening balance; may be
-    /// years out.
+    /// ISO 8601; on a pending line, empty only on an adjustment the street gave
+    /// no date for; may be years out.
     #[prost(string, tag = "4")]
     pub value_date: ::prost::alloc::string::String,
     /// Signed as the position's quantity is, and added to it.
@@ -2829,7 +2829,10 @@ pub struct MovementLine {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LotTerms {
-    /// Each unset where not known; never derived one from the other.
+    /// Each unset where not known; never derived one from the other. A lot the
+    /// book opens carries its cost and acquisition date (v9): an opening
+    /// balance or an adjustment without either is refused
+    /// (REFUSAL_REASON_INCOMPLETE); a lot a v8 book opened may lack them.
     #[prost(message, optional, tag = "1")]
     pub unit_cost: ::core::option::Option<Money>,
     #[prost(message, optional, tag = "2")]
@@ -2874,10 +2877,9 @@ pub mod basis_adjustment {
         /// Added to the lot's cost; signed. Only on a lot whose cost is known.
         #[prost(message, tag = "2")]
         CostChange(super::Money),
-        /// The lot's cost, stated where it was unknown: a lot opened with no
-        /// cost -- a remainder lot, one of unknown cost because the source listed
-        /// none, a future's -- given its cost once it is known. Only on a lot
-        /// whose cost is unknown.
+        /// The lot's cost, stated where it was unknown: a lot a v8 book opened
+        /// with no cost, given its cost once it is known. Only on a lot whose cost
+        /// is unknown; from v9 the book opens none.
         #[prost(message, tag = "4")]
         StatedCost(super::Money),
     }
@@ -2890,12 +2892,15 @@ pub struct BookPosition {
     pub instrument_id: ::prost::alloc::string::String,
     #[prost(enumeration = "HoldingSide", tag = "3")]
     pub side: i32,
-    /// Settled, plus pending, plus not stated: by construction.
+    /// Settled plus pending, by construction; plus not stated where a v8
+    /// opening balance opened that bucket.
     #[prost(message, optional, tag = "4")]
     pub trade_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// Unset while any of the quantity is not stated: unknown, never zero.
+    /// Unset only while some of the quantity is in the not-stated bucket a v8
+    /// opening balance opened: unknown, never zero.
     #[prost(message, optional, tag = "5")]
     pub settled_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Zero on every position v9 records.
     #[prost(message, optional, tag = "6")]
     pub not_stated_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     #[prost(message, repeated, tag = "7")]
@@ -2993,7 +2998,9 @@ pub struct RecordEncumbrancesRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PendingSettlement {
-    /// ISO 8601; empty only for "date not stated" at an opening balance.
+    /// ISO 8601. Required at an opening balance (v9); empty on a position only
+    /// for "date not stated", from a v8 opening balance or an adjustment the
+    /// street gave no date for.
     #[prost(string, tag = "1")]
     pub value_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
@@ -3057,13 +3064,16 @@ pub struct OpeningPosition {
     pub side: i32,
     #[prost(message, optional, tag = "3")]
     pub trade_date_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// Unset where the source states none.
+    /// Required (v9): where the source states none, a person supplies it.
+    /// Unset, the opening balance is refused (REFUSAL_REASON_INCOMPLETE).
     #[prost(message, optional, tag = "4")]
     pub settled_quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Each with its value date; with the settled quantity they account for
+    /// the whole trade-date quantity, or the balance is refused.
     #[prost(message, repeated, tag = "5")]
     pub pending: ::prost::alloc::vec::Vec<PendingSettlement>,
-    /// As reported; a position whose source reports none sends one, its cost
-    /// unknown; cash sends none.
+    /// As reported and completed by a person, each with its quantity, cost and
+    /// acquisition date; required but on cash, which sends none (v9).
     #[prost(message, repeated, tag = "6")]
     pub lots: ::prost::alloc::vec::Vec<OpeningLot>,
 }
@@ -3726,12 +3736,12 @@ pub enum SettlementBucket {
     /// Refused.
     Unspecified = 0,
     Settled = 1,
-    /// Pending settlement on the line's value date. With no value date only at
-    /// an opening balance: the source's difference between trade-date and
-    /// settled quantities, "date not stated".
+    /// Pending settlement on the line's value date. With no value date on an
+    /// adjustment the street gave no date for, or on a line a v8 opening
+    /// balance recorded ("date not stated").
     Pending = 2,
-    /// The source did not say whether it is settled or pending: only at an
-    /// opening balance whose source gave no settled quantity.
+    /// The source did not say whether it is settled or pending: only on a line
+    /// a v8 opening balance recorded. Refused from v9.
     NotStated = 3,
 }
 impl SettlementBucket {

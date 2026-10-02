@@ -59,6 +59,7 @@ async fn send<M: Message>(
     let stamp = Stamp {
         acting_for_subject: person.unwrap_or_default().to_string(),
         account_scope: None,
+        ..Default::default()
     };
     bus.call_stamped(
         topic,
@@ -390,39 +391,163 @@ async fn lots_that_do_not_sum_are_refused() {
     );
 }
 
+/// The book as an operations plugin's sidecar reaches it, beside an
+/// instrument store whose records say AAPL is an equity and USD is cash, and
+/// which has no record of anything else.
+fn wired_with_records() -> (Arc<Bus>, Arc<MemoryStore>) {
+    let (bus, store) = wired();
+    bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+        let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+        let record = |asset_class: AssetClass, identifiers: Vec<Identifier>| InstrumentRecord {
+            instrument_id: asked.instrument_id.clone(),
+            asset_class: asset_class as i32,
+            identifiers,
+            version: 1,
+            ..Default::default()
+        };
+        let instrument = match asked.instrument_id.as_str() {
+            AAPL => Some(record(AssetClass::Equity, vec![])),
+            // A currency's record may name no asset class: its identifier
+            // says it is cash.
+            USD => Some(record(
+                AssetClass::Unspecified,
+                vec![Identifier {
+                    scheme: "iso4217".into(),
+                    value: "USD".into(),
+                    ..Default::default()
+                }],
+            )),
+            _ => None,
+        };
+        Ok((
+            "meridian.v1.ResolveInstrumentReply".into(),
+            ResolveInstrumentReply {
+                found: instrument.is_some(),
+                instrument,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    (bus, store)
+}
+
+/// The fields a refusal names as left out.
+fn fields(detail: &str) -> Vec<String> {
+    meridian_bus::refusal_fields(detail)
+}
+
+async fn opening_refused(bus: &Bus, request: &RecordOpeningBalanceRequest) -> String {
+    send(
+        bus,
+        RECORD_OPENING_BALANCE,
+        "meridian.v1.RecordOpeningBalanceRequest",
+        request,
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn what_the_source_did_not_state_stays_unstated() {
-    let (bus, _) = wired();
+async fn what_the_source_did_not_state_is_refused_naming_each_field() {
+    // Contract v9 (sdk-contract/the-book-refuses-what-downstream-cannot-use):
+    // the not-stated bucket, pending with no date and a lot of unknown cost
+    // are no longer admitted; every missing field is named at once.
+    let (bus, store) = wired_with_records();
     let mut request = opening();
-    // Trade date only: not stated, and settled unknown.
+    // Trade date only, and no lots: settled and lots missing.
     request.positions[0].settled_quantity = None;
-    // Settled 600 of 1000, nothing pending stated: 400 pending, date not stated.
+    request.positions[0].lots = vec![];
+    // Settled 600 of 1000, nothing pending stated: the rest is pending with
+    // no quantity or date given. Cash, so no lots asked.
     request.positions[1].settled_quantity = d("600");
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(
+        fields(&refused),
+        [
+            "positions[0].settled_quantity",
+            "positions[0].lots",
+            "positions[1].pending",
+        ]
+    );
+    assert!(refused.contains("positions[0].lots"), "{refused}");
+    // Nothing applied.
+    assert!(store.journal(ACC).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lot_without_its_cost_or_date_and_a_pending_without_its_date_are_refused() {
+    let (bus, _) = wired_with_records();
+    let mut request = opening();
+    request.positions[0].settled_quantity = d("10");
+    request.positions[0].pending = vec![PendingSettlement {
+        value_date: String::new(),
+        quantity: d("2.5"),
+        state: None,
+    }];
+    request.positions[0].lots[0].terms = Some(LotTerms {
+        source: LotSource::OpeningBalance as i32,
+        ..Default::default()
+    });
+    request.sources[0].name = String::new();
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(
+        fields(&refused),
+        [
+            "sources[0].name",
+            "positions[0].pending[0].value_date",
+            "positions[0].lots[0].terms.cost",
+            "positions[0].lots[0].terms.acquired_date",
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
+    let (bus, _) = wired_with_records();
     let reply = BookEntryReply::decode(
         &send(
             &bus,
             RECORD_OPENING_BALANCE,
             "meridian.v1.RecordOpeningBalanceRequest",
-            &request,
+            &opening(),
             Some(PERSON),
         )
         .await
         .unwrap()[..],
     )
     .unwrap();
-
-    let aapl = position(&reply, AAPL);
-    assert!(aapl.settled_quantity.is_none(), "unknown, never zero");
-    assert_eq!(read(&aapl.not_stated_quantity), "12.5");
-    assert_eq!(read(&aapl.trade_date_quantity), "12.5");
     let usd = position(&reply, USD);
-    assert_eq!(read(&usd.settled_quantity), "600");
-    let [pending] = usd.pending.as_slice() else {
-        panic!("one pending: {:?}", usd.pending)
-    };
-    assert_eq!(pending.value_date, "", "date not stated");
-    assert_eq!(read(&pending.quantity), "400.00");
-    assert_eq!(read(&usd.trade_date_quantity), "1000.00");
+    assert!(usd.lots.is_empty());
+    assert_eq!(read(&usd.settled_quantity), "1000.00");
+    assert_eq!(read(&usd.not_stated_quantity), "0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lots_are_not_required_where_the_record_cannot_say_it_is_not_cash() {
+    // A placeholder, or a record naming no asset class: flagged by
+    // operations, never blocking (ruled 2026-10-02), so the book does not
+    // ask for lots it cannot know apply.
+    let (bus, _) = wired_with_records();
+    let mut request = opening();
+    request.positions.push(OpeningPosition {
+        instrument_id: "LCL-1".into(),
+        side: HoldingSide::Long as i32,
+        trade_date_quantity: d("40"),
+        settled_quantity: d("40"),
+        ..Default::default()
+    });
+    send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        "meridian.v1.RecordOpeningBalanceRequest",
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -440,14 +565,22 @@ async fn lots_across_buckets_sum_to_both() {
             expected_date: "2026-09-11".into(),
         }),
     }];
+    let terms = || {
+        Some(LotTerms {
+            cost: usd("900.00"),
+            acquired_date: "2025-03-14".into(),
+            source: LotSource::OpeningBalance as i32,
+            ..Default::default()
+        })
+    };
     request.positions[0].lots = vec![
         OpeningLot {
             quantity: d("5"),
-            terms: None,
+            terms: terms(),
         },
         OpeningLot {
             quantity: d("7.5"),
-            terms: None,
+            terms: terms(),
         },
     ];
     let reply = BookEntryReply::decode(
@@ -997,6 +1130,7 @@ async fn read_as_a_plugin<M: Message>(
     let stamp = Stamp {
         acting_for_subject: String::new(),
         account_scope: Some(scope.iter().map(|account| account.to_string()).collect()),
+        ..Default::default()
     };
     bus.call_stamped(
         topic,
@@ -1319,25 +1453,12 @@ async fn a_key_names_one_command_and_another_under_it_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lot_of_unknown_cost_is_given_its_cost_and_a_known_one_is_not() {
+async fn a_known_cost_moves_by_an_amount_and_is_never_stated_again() {
+    // From v9 the book opens no lot of unknown cost (W9.1, W9.7), so every
+    // lot a v9 command opens has a cost to change: stated_cost remains for a
+    // lot a v8 book recorded without one.
     let (bus, _) = wired();
-    let mut request = opening();
-    request.positions[0].lots[0].terms = Some(LotTerms {
-        source: LotSource::OpeningBalance as i32,
-        ..Default::default()
-    });
-    let opened = BookEntryReply::decode(
-        &send(
-            &bus,
-            RECORD_OPENING_BALANCE,
-            "meridian.v1.RecordOpeningBalanceRequest",
-            &request,
-            Some(PERSON),
-        )
-        .await
-        .unwrap()[..],
-    )
-    .unwrap();
+    let opened = open(&bus).await;
     let lot_id = position(&opened, AAPL).lots[0].lot_id.clone();
     let mut costing = aapl_break();
     costing.category = BreakCategory::CostOrLots as i32;
@@ -1359,19 +1480,7 @@ async fn a_lot_of_unknown_cost_is_given_its_cost_and_a_known_one_is_not() {
         })),
         idempotency_key: String::new(),
     };
-    // Unknown: changed by an amount is refused, and stated is admitted.
     let refused = resolve(
-        &bus,
-        &state(
-            &lot_id,
-            basis_adjustment::Cost::CostChange(usd("1.00").unwrap()),
-        ),
-        Some(PERSON),
-    )
-    .await
-    .unwrap_err();
-    assert!(refused.contains("state it"), "{refused}");
-    let stated = resolve(
         &bus,
         &state(
             &lot_id,
@@ -1380,13 +1489,52 @@ async fn a_lot_of_unknown_cost_is_given_its_cost_and_a_known_one_is_not() {
         Some(PERSON),
     )
     .await
+    .unwrap_err();
+    assert!(refused.contains("is known"), "{refused}");
+    let changed = resolve(
+        &bus,
+        &state(
+            &lot_id,
+            basis_adjustment::Cost::CostChange(usd("-112.50").unwrap()),
+        ),
+        Some(PERSON),
+    )
+    .await
     .unwrap();
-    let lot = &position(&stated, AAPL).lots[0];
+    let lot = &position(&changed, AAPL).lots[0];
     assert_eq!(
         read(&lot.terms.as_ref().unwrap().cost.as_ref().unwrap().amount),
-        "2250.00"
+        "2137.50"
     );
     assert_eq!(lot.adjusted_by.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adjustment_opening_a_lot_without_its_cost_or_date_is_refused() {
+    let (bus, _) = wired();
+    open(&bus).await;
+    let break_id = record_break(&bus, &aapl_break()).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    let mut request = adjustment("2026-09-09", true);
+    request.break_ids = vec![break_id];
+    if let Some(resolve_break_request::Resolution::Adjustment(adjustment)) =
+        request.resolution.as_mut()
+    {
+        adjustment.lines[0].opens_lot = Some(LotTerms {
+            source: LotSource::Adjustment as i32,
+            ..Default::default()
+        });
+    }
+    let refused = resolve(&bus, &request, Some(PERSON)).await.unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(
+        fields(&refused),
+        [
+            "adjustment.lines[0].opens_lot.cost",
+            "adjustment.lines[0].opens_lot.acquired_date",
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
