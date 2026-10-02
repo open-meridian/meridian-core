@@ -26,6 +26,7 @@ use prost::Message;
 
 use crate::accounts::{self, Accounts};
 use crate::clock::Clock;
+use crate::delegation::Delegations;
 use crate::directory::Directory;
 use crate::html::{escape, page, page_with, Chrome, Viewer};
 use crate::oidc::Oidc;
@@ -33,10 +34,12 @@ use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
 use crate::terminal::Terminals;
 
+mod delegations;
+pub(crate) mod oauth;
 mod reset;
 mod terminal;
-pub(crate) use terminal::bearer;
-pub use terminal::terminal_session_of;
+pub(crate) use delegations::path_segment;
+pub use terminal::{caller_of, Caller, Through};
 
 pub const SESSION_COOKIE: &str = "meridian_session";
 pub const SIGN_IN_COOKIE: &str = "meridian_signin";
@@ -54,6 +57,13 @@ pub struct App {
     /// Terminals' requests, codes and sessions (W6.13, W6.14). Apart from
     /// `sessions` because a terminal's session is never a browser's.
     pub terminals: Arc<Terminals>,
+    /// Clients, the delegations people make to them, and the authorisations
+    /// in flight (W6.14, W6.17, W6.18; decisions/029).
+    pub delegations: Arc<Delegations>,
+    /// This dashboard's own address, `MERIDIAN_DASHBOARD_URL`: the issuer
+    /// its OAuth metadata names. Empty on a developer's machine, where the
+    /// address a request reached it at stands in.
+    pub public_url: String,
     pub clock: Arc<dyn Clock>,
     pub bus: Arc<Bus>,
     /// None when no directory is configured, which the sign-in page says.
@@ -101,6 +111,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/mode", get(mode))
         .route("/.meridian/ui/{*file}", get(kit))
         .merge(terminal::routes())
+        .merge(oauth::routes())
+        .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())
         .merge(crate::admin::routes())
@@ -329,6 +341,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
              <a href=\"/claim\">Claim it</a> with a code from open-meridian.com.</p>",
         );
     }
+    body.push_str(&delegations::notices(&app, &session.subject).await);
     if listed.is_empty() {
         body.push_str(
             "<div class=\"panel empty-state\"><strong>No plugins for you yet</strong>\
@@ -497,7 +510,7 @@ async fn sign_in(
         } else {
             ""
         };
-        return Html(password_page(&app, "", None, notice)).into_response();
+        return Html(password_page(&app, "", For::Browser, notice)).into_response();
     }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
@@ -520,12 +533,7 @@ async fn sign_in(
 /// The same form signs somebody in for a terminal (W6.13), carrying the
 /// terminal's request so the sign-in ends in a confirmation rather than a
 /// browser session.
-pub(crate) fn password_page(
-    app: &App,
-    refusal: &str,
-    terminal: Option<&str>,
-    notice: &str,
-) -> String {
+pub(crate) fn password_page(app: &App, refusal: &str, purpose: For<'_>, notice: &str) -> String {
     let told = if refusal.is_empty() {
         String::new()
     } else {
@@ -544,15 +552,22 @@ pub(crate) fn password_page(
     } else {
         ""
     };
-    let (heading, carried) = match terminal {
-        Some(id) => (
+    let (heading, carried) = match purpose {
+        For::Terminal(id) => (
             "Sign in to connect a terminal",
             format!(
                 "<input type=\"hidden\" name=\"terminal\" value=\"{}\">",
                 escape(id)
             ),
         ),
-        None => ("Sign in", String::new()),
+        For::Client(id) => (
+            "Sign in to allow a client",
+            format!(
+                "<input type=\"hidden\" name=\"authorize\" value=\"{}\">",
+                escape(id)
+            ),
+        ),
+        For::Browser => ("Sign in", String::new()),
     };
     page(
         "Sign in",
@@ -569,6 +584,15 @@ pub(crate) fn password_page(
     )
 }
 
+/// What a sign-in is for: a browser's session, a terminal's request (W6.13),
+/// or a client's authorisation (W6.17). Only the first makes a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum For<'a> {
+    Browser,
+    Terminal(&'a str),
+    Client(&'a str),
+}
+
 #[derive(serde::Deserialize)]
 pub struct Credentials {
     name: String,
@@ -576,6 +600,45 @@ pub struct Credentials {
     /// A terminal's request, when this sign-in is for one.
     #[serde(default)]
     terminal: String,
+    /// A client's authorisation, when this sign-in is for one.
+    #[serde(default)]
+    authorize: String,
+}
+
+impl Credentials {
+    fn purpose(&self) -> For<'_> {
+        match (self.terminal.as_str(), self.authorize.as_str()) {
+            ("", "") => For::Browser,
+            (id, "") => For::Terminal(id),
+            (_, id) => For::Client(id),
+        }
+    }
+}
+
+/// Where a sign-in goes once the directory has vouched for somebody.
+async fn signed_in_for(
+    app: &Arc<App>,
+    purpose: For<'_>,
+    subject: &str,
+    display_name: &str,
+    groups: Vec<String>,
+    now: i64,
+) -> Response {
+    match purpose {
+        For::Browser => began(app, subject, display_name, groups, now).await,
+        For::Terminal(id) => terminal::signed_in(app, id, subject, display_name, groups, now).await,
+        For::Client(id) => oauth::signed_in(app, id, subject, display_name, groups, now).await,
+    }
+}
+
+/// A fresh sign-in, of any kind: the person's directory groups now, on every
+/// delegation they hold (requirement 7 of
+/// spec/clients-act-on-a-persons-delegation). A store that cannot be written
+/// does not stop the sign-in; the delegation's groups age instead.
+pub(crate) async fn afresh(app: &App, subject: &str, groups: Vec<String>, now: i64) {
+    if let Err(failed) = app.delegations.signed_in_afresh(subject, groups, now).await {
+        tracing::warn!(%failed, subject, "a sign-in's groups did not reach its delegations");
+    }
 }
 
 /// W7.7 by the other route. The directory checks the password; we never do.
@@ -587,10 +650,10 @@ async fn sign_in_with_password(
     if let Err(stale) = app.records.current(now) {
         return refused(&stale.to_string());
     }
-    let terminal = Some(credentials.terminal.as_str()).filter(|id| !id.is_empty());
+    let purpose = credentials.purpose();
     // The same sentence for both halves, wherever the refusal came from.
     let no = |reason: &str, status: StatusCode| {
-        let mut response = Html(password_page(&app, reason, terminal, "")).into_response();
+        let mut response = Html(password_page(&app, reason, purpose, "")).into_response();
         *response.status_mut() = status;
         response
     };
@@ -608,12 +671,7 @@ async fn sign_in_with_password(
         {
             Ok(person) => {
                 let subject = format!("{}|{}", directory.issuer(), person.subject);
-                match terminal {
-                    Some(id) => {
-                        terminal::signed_in(&app, id, &subject, &person.name, person.groups, now)
-                    }
-                    None => began(&app, &subject, &person.name, person.groups, now).await,
-                }
+                signed_in_for(&app, purpose, &subject, &person.name, person.groups, now).await
             }
             Err(crate::directory::Failure::Refused) => refused_them(),
             Err(ours) => {
@@ -662,10 +720,7 @@ async fn sign_in_with_password(
             groups,
         } => {
             app.sign_in_failures.clear(&credentials.name);
-            match terminal {
-                Some(id) => terminal::signed_in(&app, id, &subject, &display_name, groups, now),
-                None => began(&app, &subject, &display_name, groups, now).await,
-            }
+            signed_in_for(&app, purpose, &subject, &display_name, groups, now).await
         }
         // With how many attempts are left once there have been three, by the
         // name typed, so the page reads the same whether or not it is one.
@@ -717,7 +772,8 @@ async fn began(
     let key = app
         .sessions
         .start(subject, display_name, groups.clone(), now);
-    record_sign_in(app, subject, display_name, groups, now);
+    record_sign_in(app, subject, display_name, groups.clone(), now);
+    afresh(app, subject, groups, now).await;
     tracing::info!(subject, "signed in");
 
     let mut response = redirect("/");
@@ -781,34 +837,29 @@ async fn callback(
         return bad_request("this sign-in was started in another browser; start again here");
     }
 
-    // Whether this sign-in was a terminal's, asked before it is finished so
-    // a state is matched to at most one request, whatever happens next.
+    // Whether this sign-in was a terminal's or a client's, asked before it
+    // is finished so a state is matched to at most one request, whatever
+    // happens next.
     let terminal = app.terminals.for_provider_state(state);
+    let client = app.delegations.for_provider_state(state);
     let identity = match oidc.finish(state, code, now).await {
         Ok(identity) => identity,
         Err(failed) => return bad_request(&failed),
     };
-
-    let mut response = match terminal {
-        Some(id) => terminal::signed_in(
-            &app,
-            &id,
-            &identity.subject,
-            &identity.display_name,
-            identity.groups,
-            now,
-        ),
-        None => {
-            began(
-                &app,
-                &identity.subject,
-                &identity.display_name,
-                identity.groups,
-                now,
-            )
-            .await
-        }
+    let purpose = match (&terminal, &client) {
+        (Some(id), _) => For::Terminal(id),
+        (None, Some(id)) => For::Client(id),
+        (None, None) => For::Browser,
     };
+    let mut response = signed_in_for(
+        &app,
+        purpose,
+        &identity.subject,
+        &identity.display_name,
+        identity.groups,
+        now,
+    )
+    .await;
     // And the one cookie only this route sets: the state it was matched
     // against has done its work and should not outlive it.
     response.headers_mut().append(

@@ -241,3 +241,23 @@ async fn an_encrypted_directory_is_verified_and_refused_on_its_certificate() {
         other => panic!("expected the certificate to be refused, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_persons_groups_are_read_again_by_our_own_bind_and_a_leaver_is_not_found() {
+    // What a delegation is evaluated with between sign-ins (decisions/029):
+    // no password of theirs, and the directory's word as it is now.
+    let groups = directory()
+        .groups_of(ALICE)
+        .await
+        .expect("the directory answers")
+        .expect("alice is there");
+    assert_eq!(groups, vec![GROUP_A.to_string()]);
+    assert_eq!(
+        directory()
+            .groups_of("uid=left-last-year,ou=people,dc=example,dc=org")
+            .await
+            .expect("the directory answers"),
+        None,
+        "somebody the directory no longer finds is nobody"
+    );
+}

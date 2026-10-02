@@ -10,6 +10,8 @@
 //! # Where the bounds live
 //!
 //! Sessions end after 30 minutes idle or 12 hours absolute ([`session`]).
+//! A delegation lasts at most 90 days, on ten-minute access tokens
+//! ([`delegation`], decisions/029).
 //! The records are read every 30 seconds and refused past 10 minutes
 //! ([`records`]). All four are decisions/015's, stated as constants rather
 //! than configuration, because a bound somebody can widen in a values file is
@@ -22,6 +24,7 @@ pub mod catalogue;
 pub mod clock;
 pub mod custody;
 pub mod database;
+pub mod delegation;
 pub mod directory;
 pub mod figures;
 pub mod first_run;

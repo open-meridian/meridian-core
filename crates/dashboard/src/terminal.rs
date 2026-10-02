@@ -158,16 +158,17 @@ fn loopback(uri: &str) -> bool {
     matches!(port.parse::<u16>(), Ok(port) if port > 0) && !port.starts_with('0')
 }
 
-fn url_safe(byte: u8) -> bool {
+pub(crate) fn url_safe(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
 }
 
-fn unreserved(byte: u8) -> bool {
+pub(crate) fn unreserved(byte: u8) -> bool {
     url_safe(byte) || byte == b'.' || byte == b'~'
 }
 
 /// RFC 7636's S256: the challenge is the verifier's SHA-256, base64url.
-fn verifies(verifier: &str, challenge: &str) -> bool {
+/// Shared with delegations' authorisation codes ([`crate::delegation`]).
+pub(crate) fn verifies(verifier: &str, challenge: &str) -> bool {
     if !(43..=128).contains(&verifier.len()) || !verifier.bytes().all(unreserved) {
         return false;
     }
@@ -176,7 +177,7 @@ fn verifies(verifier: &str, challenge: &str) -> bool {
 }
 
 /// Equal, in a time that does not depend on where they differ.
-fn same(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 

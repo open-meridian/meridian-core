@@ -260,11 +260,35 @@ async fn reset(
             0
         }
     };
+    // And every delegation the old password made (requirement 7 of
+    // spec/clients-act-on-a-persons-delegation): a reset is a way back in
+    // for somebody who lost their password, or for somebody who took it.
+    let delegations = match app
+        .delegations
+        .revoke_person(
+            &subject,
+            "dashboard",
+            "the account's password was reset",
+            app.clock.now_ns(),
+        )
+        .await
+    {
+        Ok(revoked) => revoked,
+        Err(unavailable) => {
+            tracing::error!(
+                login,
+                %unavailable,
+                "a password was reset and its delegations could not be revoked"
+            );
+            0
+        }
+    };
     app.sign_in_failures.clear(login);
     tracing::info!(
         login,
         browsers,
         terminals,
+        delegations,
         "a local administrator's password was reset with a code from the platform"
     );
     redirect("/sign-in?reset=done")

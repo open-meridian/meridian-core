@@ -229,6 +229,8 @@ async fn harness() -> Harness {
         records: cache,
         sessions,
         terminals,
+        delegations: Arc::new(crate::delegation::Delegations::default()),
+        public_url: String::new(),
         clock: Arc::new(At(T0)),
         bus,
         oidc: None,

@@ -75,6 +75,7 @@ use meridian_pb::v1::CallerClaims;
 use prost::Message;
 
 use crate::clock::SECOND_NS;
+use crate::delegation::Delegations;
 use crate::html::{escape, page};
 use crate::session::{token, Sessions, ABSOLUTE_NS};
 use crate::signing::Signer;
@@ -97,19 +98,35 @@ const CODE_NS: i64 = 60 * SECOND_NS;
 const ASSERTION_NS: i64 = 60 * SECOND_NS;
 
 /// The session a plugin host's session came from, which it ends with: a
-/// browser's on the dashboard, or a terminal's (W6.15), held by the hash its
-/// own store keys it by, so no terminal's token is kept anywhere.
+/// browser's on the dashboard, a terminal's (W6.15), held by the hash its
+/// own store keys it by, or a delegation's, by its id -- so no terminal's
+/// token and no client's is kept anywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Came {
     Browser(String),
     Terminal(String),
+    Delegation(String),
 }
 
-/// Who a session names, whichever kind it is.
+/// Who a session names, whichever kind it is, and what it covers when it
+/// came through a delegation.
 pub(crate) struct Who {
     pub subject: String,
     pub display_name: String,
     pub directory_groups: Vec<String>,
+    pub covers: Option<crate::delegation::Covers>,
+}
+
+impl Who {
+    /// What they may reach now, from the records as they are, cut to what
+    /// the delegation covers when there is one.
+    fn access(&self, records: &meridian_domain::v1::AccessRecords) -> meridian_access::Access {
+        let access = meridian_access::person_access(records, &self.subject, &self.directory_groups);
+        match &self.covers {
+            Some(covers) => crate::delegation::narrow(access, covers, records),
+            None => access,
+        }
+    }
 }
 
 impl Came {
@@ -122,6 +139,7 @@ impl Came {
                 subject: s.subject,
                 display_name: s.display_name,
                 directory_groups: s.directory_groups,
+                covers: None,
             }),
             Came::Terminal(hash) => app
                 .terminals
@@ -132,6 +150,21 @@ impl Came {
                     subject: p.subject,
                     display_name: p.display_name,
                     directory_groups: p.directory_groups,
+                    covers: None,
+                }),
+            Came::Delegation(id) => app
+                .delegations
+                .delegation(id)
+                .await?
+                .filter(|d| {
+                    d.refusal(now_ns, crate::web::oauth::groups_bound(app))
+                        .is_none()
+                })
+                .map(|d| Who {
+                    subject: d.subject,
+                    display_name: d.display_name,
+                    directory_groups: d.directory_groups,
+                    covers: Some(d.covers),
                 }),
         })
     }
@@ -140,11 +173,16 @@ impl Came {
         &self,
         sessions: &Sessions,
         terminals: &Terminals,
+        delegations: &Delegations,
         now_ns: i64,
     ) -> Result<bool, Unavailable> {
         match self {
             Came::Browser(key) => Ok(sessions.is_live(key, now_ns)),
             Came::Terminal(hash) => terminals.is_live_hashed(hash, now_ns).await,
+            Came::Delegation(id) => Ok(delegations
+                .delegation(id)
+                .await?
+                .is_some_and(|d| d.live(now_ns))),
         }
     }
 }
@@ -457,7 +495,13 @@ impl Plugins {
     /// terminal session has ended. One whose terminal session could not be
     /// asked about is kept for the next sweep: a database briefly away has
     /// ended nobody's session.
-    pub async fn sweep(&self, sessions: &Sessions, terminals: &Terminals, now_ns: i64) {
+    pub async fn sweep(
+        &self,
+        sessions: &Sessions,
+        terminals: &Terminals,
+        delegations: &Delegations,
+        now_ns: i64,
+    ) {
         self.codes
             .lock()
             .expect("code lock poisoned")
@@ -471,7 +515,7 @@ impl Plugins {
             .collect();
         let mut ended = Vec::new();
         for (key, came) in held {
-            match came.is_live(sessions, terminals, now_ns).await {
+            match came.is_live(sessions, terminals, delegations, now_ns).await {
                 Ok(true) => {}
                 Ok(false) => ended.push(key),
                 Err(unavailable) => {
@@ -940,11 +984,12 @@ fn declined(status: StatusCode, reason: impl Into<String>) -> Response {
     answered(status, serde_json::json!({ "error": reason.into() }))
 }
 
-/// The person on a terminal session, what they hold on the plugin at the
+/// The person acting from a terminal, what they hold on the plugin at the
 /// level the request names as opening it from the dashboard would find it
-/// (W6.9's checks; W6.15), and the session a plugin-host session opened for
-/// them would end with. A request naming no level opens at the first held,
-/// as the home's first button does.
+/// (W6.9's checks; W6.15) -- cut to what their delegation covers, when they
+/// act on one -- and the session a plugin-host session opened for them would
+/// end with. A request naming no level opens at the first held, as the
+/// home's first button does.
 async fn from_terminal(
     app: &App,
     headers: &HeaderMap,
@@ -952,12 +997,7 @@ async fn from_terminal(
     named: Option<&str>,
     now: i64,
 ) -> Result<(Who, Opening, Came), Box<Response>> {
-    let person = crate::web::terminal_session_of(app, headers).await?;
-    let came = Came::Terminal(
-        crate::web::bearer(headers)
-            .map(|token| crate::terminal::hashed(&token))
-            .unwrap_or_default(),
-    );
+    let caller = crate::web::caller_of(app, headers).await?;
     if !is_instance(instance) {
         return Err(Box::new(declined(
             StatusCode::NOT_FOUND,
@@ -968,20 +1008,29 @@ async fn from_terminal(
         .records
         .current(now)
         .map_err(|stale| Box::new(declined(StatusCode::SERVICE_UNAVAILABLE, stale.to_string())))?;
-    let access =
-        meridian_access::person_access(&records, &person.subject, &person.directory_groups);
-    let level = level_to_open(&access.held(instance), named, instance)
-        .map_err(|why| Box::new(declined(StatusCode::FORBIDDEN, why)))?;
+    let access = caller.access(&records);
+    let level = match level_to_open(&access.held(instance), named, instance) {
+        Ok(level) => level,
+        Err(why) => {
+            caller.refused(app, &why).await;
+            return Err(Box::new(declined(StatusCode::FORBIDDEN, why)));
+        }
+    };
     let Some(opened) = opening(&access, instance, level) else {
         return Err(Box::new(declined(
             StatusCode::FORBIDDEN,
             format!("you hold no access on {instance}"),
         )));
     };
+    let (came, covers) = match caller.through {
+        crate::web::Through::Session(hash) => (Came::Terminal(hash), None),
+        crate::web::Through::Delegation { id, covers, .. } => (Came::Delegation(id), Some(covers)),
+    };
     let who = Who {
-        subject: person.subject,
-        display_name: person.display_name,
-        directory_groups: person.directory_groups,
+        subject: caller.person.subject,
+        display_name: caller.person.display_name,
+        directory_groups: caller.person.directory_groups,
+        covers,
     };
     Ok((who, opened, came))
 }
@@ -1239,10 +1288,10 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
     };
 
     // Evaluated now, from the records as they are now, at the session's
-    // level: access withdrawn a moment ago is withdrawn here, and a level no
-    // longer held opens nothing.
-    let access =
-        meridian_access::person_access(&records, &session.subject, &session.directory_groups);
+    // level, cut to what a delegation covers when it came through one:
+    // access withdrawn a moment ago is withdrawn here, and a level no longer
+    // held opens nothing.
+    let access = session.access(&records);
     let Some(opened) = opening(&access, instance, level) else {
         return said(
             StatusCode::FORBIDDEN,
@@ -1327,7 +1376,10 @@ async fn enter(
         .unwrap_or_default();
     let code = asked.get("code").map(String::as_str).unwrap_or_default();
     let came = match plugins.redeem(code, instance, now) {
-        Some((came, level)) => match came.is_live(&app.sessions, &app.terminals, now).await {
+        Some((came, level)) => match came
+            .is_live(&app.sessions, &app.terminals, &app.delegations, now)
+            .await
+        {
             Ok(true) => Some((came, level)),
             Ok(false) => None,
             Err(unavailable) => return refused(&unavailable.to_string()),

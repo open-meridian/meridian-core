@@ -202,6 +202,8 @@ fn dashboard(
         records: cache,
         sessions,
         terminals: Arc::new(crate::terminal::Terminals::default()),
+        delegations: Arc::new(crate::delegation::Delegations::default()),
+        public_url: String::new(),
         clock: Arc::new(clock),
         bus: Arc::new(Bus::single(
             "dashboard-1",
@@ -709,7 +711,9 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
         now,
     );
 
-    plugins.sweep(&h.app.sessions, &h.app.terminals, now).await;
+    plugins
+        .sweep(&h.app.sessions, &h.app.terminals, &h.app.delegations, now)
+        .await;
     assert_eq!(
         plugins.entered.lock().unwrap().len(),
         1,
@@ -719,7 +723,12 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
 
     h.app.sessions.end(&h.session);
     plugins
-        .sweep(&h.app.sessions, &h.app.terminals, now + CODE_NS + 1)
+        .sweep(
+            &h.app.sessions,
+            &h.app.terminals,
+            &h.app.delegations,
+            now + CODE_NS + 1,
+        )
         .await;
     assert!(plugins.entered.lock().unwrap().is_empty());
     assert!(plugins.codes.lock().unwrap().is_empty());

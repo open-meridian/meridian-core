@@ -36,8 +36,8 @@ fn routes(app: Arc<App>) -> Router {
     router(app).route(
         "/terminal/probe",
         get(move |headers: HeaderMap| async move {
-            match terminal_session_of(&probed, &headers).await {
-                Ok(person) => person.subject.into_response(),
+            match caller_of(&probed, &headers).await {
+                Ok(caller) => caller.person.subject.into_response(),
                 Err(refusal) => *refusal,
             }
         }),
@@ -384,7 +384,7 @@ impl crate::terminal::TerminalSessions for Away {
     fn keep(&self, _: &str, _: &Person, _: i64) -> Result<(), String> {
         Err("away".into())
     }
-    fn find(&self, _: &str, _: i64) -> Result<Result<Person, Refusal>, String> {
+    fn find(&self, _: &str, _: i64) -> Result<Result<Person, crate::terminal::Refusal>, String> {
         Err("away".into())
     }
     fn is_live(&self, _: &str, _: i64) -> Result<bool, String> {

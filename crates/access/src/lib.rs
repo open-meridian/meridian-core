@@ -390,6 +390,34 @@ fn accounts_of_group<'a>(
         .collect()
 }
 
+/// Every account the named account groups hold, All accounts as every
+/// account the records hold: what a delegation narrowed to those groups may
+/// reach (decisions/029), by the rule a permission reaches its accounts by.
+pub fn accounts_in_groups<'a>(
+    records: &AccessRecords,
+    account_group_ids: impl IntoIterator<Item = &'a String>,
+) -> BTreeSet<String> {
+    account_group_ids
+        .into_iter()
+        .flat_map(|id| accounts_of_group(records, id))
+        .map(|account| account.account_id.clone())
+        .collect()
+}
+
+/// The account groups a person's permissions name: those a delegation of
+/// theirs may be narrowed to (spec/clients-act-on-a-persons-delegation,
+/// requirement 3). The built-in access groups name none.
+pub fn account_groups_named(records: &AccessRecords, access: &Access) -> BTreeSet<String> {
+    records
+        .permissions
+        .iter()
+        .filter(|p| access.user_group_ids.contains(&p.user_group_id))
+        .filter(|p| !is_built_in_access_group(&p.access_group_id))
+        .filter(|p| !p.account_group_id.is_empty())
+        .map(|p| p.account_group_id.clone())
+        .collect()
+}
+
 /// A plugin's account scope: every account anybody may read through it, and
 /// every account anybody may write through it; and every account one of its
 /// external accounts is linked to. `admin` adds none.

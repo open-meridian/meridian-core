@@ -204,6 +204,46 @@ impl Directory {
         })
     }
 
+    /// A person's groups now, read by this deployment's own bind and never
+    /// theirs: what a delegation is evaluated with between sign-ins
+    /// (decisions/029; spec/clients-act-on-a-persons-delegation,
+    /// requirement 7). None when the directory no longer finds them, which
+    /// ends their delegations.
+    pub async fn groups_of(&self, dn: &str) -> Result<Option<Vec<String>>, Failure> {
+        let (mut ldap, connection) = self.connect().await?;
+        ldap3::drive!(connection);
+
+        ldap.simple_bind(&self.bind_dn, &self.bind_password)
+            .await
+            .map_err(|failed| Failure::NotOurs(failed.to_string()))?
+            .success()
+            .map_err(|failed| Failure::NotOurs(failed.to_string()))?;
+
+        let searched = ldap
+            .search(
+                dn,
+                Scope::Base,
+                "(objectClass=*)",
+                [self.group_attribute.as_str()],
+            )
+            .await
+            .map_err(|failed| Failure::Confused(failed.to_string()))?;
+        let _ = ldap.unbind().await;
+        // 32 is noSuchObject: the person is not there any more.
+        if searched.1.rc == 32 {
+            return Ok(None);
+        }
+        let (entries, _) = searched
+            .success()
+            .map_err(|failed| Failure::Confused(failed.to_string()))?;
+        Ok(entries.into_iter().next().map(|entry| {
+            SearchEntry::construct(entry)
+                .attrs
+                .remove(&self.group_attribute)
+                .unwrap_or_default()
+        }))
+    }
+
     /// Whether this deployment can use this directory at all: a server
     /// answers, the service account binds, and the base is there to search.
     ///

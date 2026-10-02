@@ -1,8 +1,10 @@
 //! Plugins, from a terminal (W8): the registry pass-through a plugin's image
 //! is pushed through, and the catalogue, launching and stopping.
 //!
-//! Every route here admits a deployment admin's terminal session and nothing
-//! else -- not a browser's cookie, which is refused as if absent. The image
+//! Every route here admits a deployment admin acting from a terminal -- an
+//! access token on a delegation covering the deployment admin's
+//! capabilities (W6.18), or a terminal session from before delegations --
+//! and nothing else: not a browser's cookie, which is refused as if absent. The image
 //! goes layer by layer in the registry's own protocol, streamed and never
 //! held, under `plugins/{name}` alone: the registry is reachable from
 //! outside the cluster only this way, and only to write and to ask whether a
@@ -28,7 +30,7 @@ use meridian_domain::v1::{
 use prost::Message;
 
 use crate::terminal::{rfc3339, Person};
-use crate::web::{terminal_session_of, App};
+use crate::web::{caller_of, App};
 
 pub const RECORD_PLUGIN_UPLOAD: &str = "platform.config.command.record-plugin-upload";
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
@@ -89,22 +91,33 @@ fn refused(status: StatusCode, reason: impl Into<String>) -> Response {
     json(status, serde_json::json!({ "error": reason.into() }))
 }
 
-/// A deployment admin's terminal session, or the refusal.
+/// A deployment admin acting from a terminal -- on a delegation covering the
+/// deployment admin's capabilities, or a terminal session from before
+/// delegations -- or the refusal.
 async fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
-    let person = terminal_session_of(app, headers).await?;
+    let caller = caller_of(app, headers).await?;
     let records = app
         .records
         .current(app.clock.now_ns())
         .map_err(|stale| Box::new(refused(StatusCode::SERVICE_UNAVAILABLE, stale.to_string())))?;
-    if !meridian_access::person_access(&records, &person.subject, &person.directory_groups)
-        .deployment_admin
-    {
-        return Err(Box::new(refused(
-            StatusCode::FORBIDDEN,
-            "only a deployment admin brings plugins into this deployment",
-        )));
+    if !caller.access(&records).deployment_admin {
+        let why = if caller.delegation_id().is_some()
+            && meridian_access::person_access(
+                &records,
+                &caller.person.subject,
+                &caller.person.directory_groups,
+            )
+            .deployment_admin
+        {
+            "this delegation does not cover the deployment admin's capabilities; connect again \
+             to widen it"
+        } else {
+            "only a deployment admin brings plugins into this deployment"
+        };
+        caller.refused(app, why).await;
+        return Err(Box::new(refused(StatusCode::FORBIDDEN, why)));
     }
-    Ok(person)
+    Ok(caller.person)
 }
 
 /// The admin, then their JSON: who is asking is settled before what they

@@ -43,7 +43,7 @@ use crate::records;
 use crate::session::Session;
 use crate::web::{refused, session_of, App};
 
-type Fields = HashMap<String, String>;
+pub(crate) type Fields = HashMap<String, String>;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -100,7 +100,7 @@ fn has_admin(records: &AccessRecords) -> bool {
         .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
 }
 
-fn status_page(status: StatusCode, title: &str, sentence: &str) -> Response {
+pub(crate) fn status_page(status: StatusCode, title: &str, sentence: &str) -> Response {
     (
         status,
         Html(page(
@@ -117,7 +117,7 @@ fn status_page(status: StatusCode, title: &str, sentence: &str) -> Response {
 
 /// Who is asking, what the records say now, and whether they hold
 /// deployment admin; or the response that refuses them.
-fn gate(
+pub(crate) fn gate(
     app: &App,
     headers: &HeaderMap,
     need_admin: bool,
@@ -171,7 +171,7 @@ fn gate_plugin(
     Ok((session, records, access))
 }
 
-fn form_token_matches(session: &Session, fields: &Fields) -> Result<(), Box<Response>> {
+pub(crate) fn form_token_matches(session: &Session, fields: &Fields) -> Result<(), Box<Response>> {
     if field(fields, "form_token") != session.form_token {
         return Err(Box::new(status_page(
             StatusCode::BAD_REQUEST,
@@ -349,7 +349,7 @@ async fn claim(
 }
 
 /// The header of a page in the admin portal, for a deployment admin.
-fn admin_chrome(session: &Session) -> Chrome<'_> {
+pub(crate) fn admin_chrome(session: &Session) -> Chrome<'_> {
     Chrome {
         viewer: Some(Viewer {
             display_name: &session.display_name,
@@ -363,7 +363,7 @@ fn admin_chrome(session: &Session) -> Chrome<'_> {
     }
 }
 
-fn token_input(session: &Session) -> String {
+pub(crate) fn token_input(session: &Session) -> String {
     format!(
         "<input type=\"hidden\" name=\"form_token\" value=\"{}\">",
         escape(&session.form_token)
@@ -450,6 +450,13 @@ async fn admin_page(
             return crate::web::refused(&unavailable.to_string());
         }
     };
+    let delegating = match app.delegations.holders(app.clock.now_ns()).await {
+        Ok(delegating) => delegating,
+        Err(unavailable) => {
+            tracing::error!(%unavailable, "delegations could not be listed");
+            return crate::web::refused(&unavailable.to_string());
+        }
+    };
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
     let people = people_known(&app, &records, &holders).await;
@@ -457,6 +464,7 @@ async fn admin_page(
     let body = overview::render(
         &records,
         &holders,
+        &delegating,
         &lines,
         &people,
         &books,

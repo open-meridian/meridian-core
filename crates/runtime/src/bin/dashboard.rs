@@ -20,6 +20,7 @@ use std::time::Duration;
 use meridian_dashboard::accounts::{Accounts as _, InPostgres};
 use meridian_dashboard::custody::Custody;
 use meridian_dashboard::database::{Database, Unverified};
+use meridian_dashboard::delegation::{self, DelegationStore, Delegations};
 use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::plugins::Plugins;
@@ -330,6 +331,12 @@ fn run() -> Result<(), String> {
             Arc::new(terminal::InMemory::default())
         }
     };
+    // Delegations beside them, in the same tables' database, so a client's
+    // delegation outlives a restart (decisions/029); in memory without one.
+    let delegation_store: Arc<dyn DelegationStore> = match &database {
+        Some(database) => Arc::new(delegation::InPostgres::on(database.clone())),
+        None => Arc::new(delegation::InMemory::default()),
+    };
     let accounts = match (&accounts_url, &database) {
         (Some(_), Some(database)) => {
             let store = InPostgres::on(database.clone());
@@ -377,6 +384,7 @@ fn run() -> Result<(), String> {
         let records = Arc::new(RecordsCache::default());
         let sessions = Arc::new(Sessions::default());
         let terminals = Arc::new(Terminals::keeping(terminal_sessions.clone()));
+        let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
         let clock = clock();
 
         // Once before listening, so the first request finds records when
@@ -402,6 +410,7 @@ fn run() -> Result<(), String> {
 
         let sweeping = Arc::clone(&sessions);
         let sweeping_terminals = Arc::clone(&terminals);
+        let sweeping_delegations = Arc::clone(&delegations);
         let sweeping_plugins = plugins.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_secs(60));
@@ -411,9 +420,17 @@ fn run() -> Result<(), String> {
                 if let Err(unavailable) = sweeping_terminals.sweep(now_ns()).await {
                     tracing::warn!(%unavailable, "terminal sessions were not swept");
                 }
+                if let Err(unavailable) = sweeping_delegations.sweep(now_ns()).await {
+                    tracing::warn!(%unavailable, "delegations were not swept");
+                }
                 if let Some(plugins) = &sweeping_plugins {
                     plugins
-                        .sweep(&sweeping, &sweeping_terminals, now_ns())
+                        .sweep(
+                            &sweeping,
+                            &sweeping_terminals,
+                            &sweeping_delegations,
+                            now_ns(),
+                        )
                         .await;
                 }
             }
@@ -467,6 +484,8 @@ fn run() -> Result<(), String> {
             records,
             sessions,
             terminals,
+            delegations,
+            public_url: public_url.clone(),
             clock,
             bus,
             oidc,

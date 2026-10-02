@@ -706,11 +706,12 @@ e2e-dashboard-accounts: network
 	$(E2E_ACCOUNTS_REGISTRY) up -d conductor dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner main; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner connect; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner delegate; \
 	$(E2E_ACCOUNTS_REGISTRY) up -d --force-recreate --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner restarted; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
-	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, a terminal's session outlives a dashboard restart and uploads a plugin, and enough wrong passwords stop it"
+	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, a terminal's session outlives a dashboard restart and uploads a plugin, a CLI's delegation outlives one too and is revoked by a reused refresh token, the admin and its client, and enough wrong passwords stop it"
 
 # A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
 # of their own: the account branch's dashboard, holding a key made as the

@@ -12,9 +12,15 @@ caught because nothing signed anybody in on this route. This does.
 Phases:
   main      -- the account first run made exists, and somebody uses it
   connect   -- a terminal connects as them (W6.13), as a released CLI does
+  delegate  -- the CLI connects by delegation (W6.17), as `meridian connect`
+               now does: registered, consented to after a fresh sign-in, a
+               code traded for a pair, and a refresh nobody asked for
   restarted -- after the dashboard is recreated, that terminal's session still
                pushes and uploads a plugin, and signing out ends it
-               (kernel/terminal-sessions-survive-a-restart)
+               (kernel/terminal-sessions-survive-a-restart); the delegation
+               stands and refreshes, a refresh token presented twice revokes
+               it, the admin revokes one client's and the other's works on,
+               and the client revokes its own (W6.14, W6.18)
   locked    -- and enough wrong passwords stop it being usable at all
 """
 import base64
@@ -222,6 +228,134 @@ def restarted_phase():
           f"refused as ended, not as unknown: {status} {body[:200]}")
 
 
+def token_endpoint(fields):
+    answer = Browser().post(dash("/oauth/token"), fields)
+    try:
+        return answer.status, json.loads(answer.body)
+    except ValueError:
+        return answer.status, {"body": answer.body[:200]}
+
+
+def delegated(browser=None):
+    """`meridian connect`, by delegation: the token answer and the client."""
+    registered = urllib.request.Request(
+        dash("/oauth/register"), method="POST",
+        data=json.dumps({
+            "client_name": "meridian on e2e",
+            "redirect_uris": [BACK],
+            "software_id": "meridian-cli",
+            "token_endpoint_auth_method": "none",
+        }).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(registered) as answer:
+            status, said = answer.status, json.loads(answer.read())
+    except urllib.error.HTTPError as refused:
+        status, said = refused.code, {}
+    client_id = said.get("client_id", "")
+    check(status == 201 and client_id, f"the CLI registers this computer: {status}")
+
+    verifier = b64url(os.urandom(32))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    browser = browser or Browser()
+    asked = browser.get(dash("/oauth/authorize?" + urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": BACK,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "e2e-delegate",
+        "resource": dash("/terminal"),
+    })))
+    request = hidden(asked, "authorize")
+    check(asked.status == 200 and request, f"the authorisation is the sign-in form: {asked.status}")
+    consenting = browser.post(dash("/sign-in"),
+                              {"name": NAME, "password": PASSWORD, "authorize": request})
+    check(consenting.status == 200 and "Allow a client to act as you" in consenting.body
+          and "meridian on e2e" in consenting.body,
+          f"signed in afresh, and asked to consent, naming the client: {consenting.status}")
+    decided = browser.post(dash("/oauth/authorize"), {
+        "request": hidden(consenting, "request"),
+        "confirm": hidden(consenting, "confirm"),
+        "decision": "allow",
+        "covers": "everything",
+        "days": "90",
+    })
+    back = urllib.parse.urlparse(decided.location or "")
+    code = urllib.parse.parse_qs(back.query).get("code", [""])[0]
+    check(decided.status == 302 and code, f"the loopback address gets a code: {decided.status}")
+    status, pair = token_endpoint({
+        "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
+        "redirect_uri": BACK, "client_id": client_id, "resource": dash("/terminal"),
+    })
+    check(status == 200 and pair.get("access_token", "").startswith("mda_")
+          and pair.get("refresh_token", "").startswith("mdr_"),
+          f"and the CLI trades it for an access token and a refresh token: {status} {pair}")
+    return client_id, pair
+
+
+def refreshed(client_id, refresh_token):
+    return token_endpoint({"grant_type": "refresh_token", "refresh_token": refresh_token,
+                           "client_id": client_id})
+
+
+def delegate_phase():
+    say("H: the CLI connects by delegation, as `meridian connect` now does")
+    client_id, first = delegated()
+    status, body, _ = terminal("GET", "/terminal/plugins", first.get("access_token", ""))
+    check(status == 200, f"its access token lists the catalogue: {status} {body[:200]}")
+    status, second = refreshed(client_id, first.get("refresh_token", ""))
+    check(status == 200 and second.get("delegation_id") == first.get("delegation_id"),
+          f"and a refresh brings the next pair on the same delegation: {status} {second}")
+    remember("client_id", client_id)
+    remember("spent_refresh", first.get("refresh_token", ""))
+    remember("access", second.get("access_token", ""))
+    remember("refresh", second.get("refresh_token", ""))
+
+
+def delegation_restarted_phase():
+    say("I: the dashboard restarted, and the delegation stands")
+    client_id, access, refresh = recall("client_id"), recall("access"), recall("refresh")
+    status, body, _ = terminal("GET", "/terminal/plugins", access)
+    check(status == 200, f"the access token from before the restart acts after it: {status} {body[:200]}")
+    status, third = refreshed(client_id, refresh)
+    check(status == 200, f"and refreshes: {status} {third}")
+
+    say("J: a refresh token presented twice revokes the delegation")
+    status, said = refreshed(client_id, recall("spent_refresh"))
+    check(status == 400 and said.get("reason") == "reused",
+          f"the spent refresh token is refused as reused: {status} {said}")
+    status, body, _ = terminal("GET", "/terminal/plugins", third.get("access_token", ""))
+    check(status == 401 and '"reason":"revoked"' in body.replace(" ", ""),
+          f"and the owner's newest pair is refused as revoked: {status} {body[:200]}")
+
+    say("K: the admin revokes one client's delegation, and the other's works on")
+    admin = Browser()
+    sign_in(admin, NAME, PASSWORD)
+    _, one = delegated()
+    other_client, other = delegated()
+    page = admin.get(dash("/admin/people/local%7C" + NAME + "/delegations"))
+    check(page.status == 200 and one.get("delegation_id", "?") in page.body,
+          f"the admin sees the person's delegations: {page.status}")
+    revoked = admin.post(dash("/admin/people/local%7C" + NAME + "/delegations/revoke"), {
+        "form_token": form_token(page), "delegation_id": one.get("delegation_id", ""),
+    })
+    check(revoked.status == 303, f"and revokes one: {revoked.status}")
+    status, _, _ = terminal("GET", "/terminal/plugins", one.get("access_token", ""))
+    check(status == 401, f"that client is refused at its next request: {status}")
+    status, _, _ = terminal("GET", "/terminal/plugins", other.get("access_token", ""))
+    check(status == 200, f"the other works on: {status}")
+
+    say("L: `meridian sign-out` revokes the delegation it holds")
+    answer = Browser().post(dash("/oauth/revoke"), {
+        "token": other.get("refresh_token", ""), "token_type_hint": "refresh_token",
+        "client_id": other_client,
+    })
+    check(answer.status == 200, f"revoked by its client: {answer.status}")
+    status, body, _ = terminal("GET", "/terminal/plugins", other.get("access_token", ""))
+    check(status == 401 and "revoked" in body, f"and refused from then on: {status} {body[:200]}")
+
+
 def locked_phase():
     say("D: enough wrong passwords and the account stops being usable")
     guesser = Browser()
@@ -248,8 +382,11 @@ def main():
         main_phase()
     elif phase == "connect":
         connect_phase()
+    elif phase == "delegate":
+        delegate_phase()
     elif phase == "restarted":
         restarted_phase()
+        delegation_restarted_phase()
     elif phase == "locked":
         locked_phase()
     else:

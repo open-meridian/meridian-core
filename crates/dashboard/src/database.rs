@@ -9,7 +9,9 @@
 //!   only where the firm has no directory of its own;
 //! - terminal sessions ([`crate::terminal`]), by hash, in every deployment
 //!   that signs people in, so a restart or an upgrade leaves them standing
-//!   (W6.13, ruled 2026-09-30).
+//!   (W6.13, ruled 2026-09-30);
+//! - clients, the delegations people make to them, and their tokens by
+//!   fingerprint ([`crate::delegation`], decisions/029), for the same reason.
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -47,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "terminal_session",
         sql: include_str!("../migrations/0002_terminal_session.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "delegation",
+        sql: include_str!("../migrations/0003_delegation.sql"),
     },
 ];
 

@@ -895,6 +895,7 @@ fn header(chrome: &Chrome) -> String {
                  <span class=\"avatar\" aria-hidden=\"true\">{initial}</span>\
                  <span class=\"person-name\">{name}</span></summary>\
                  <div class=\"menu-pop\"><div class=\"menu-label\">Signed in as <strong>{name}</strong></div><hr>\
+                 <a href=\"/delegations\">Connected clients</a><hr>\
                  <div class=\"menu-label\">Appearance</div>\
                  <a href=\"/mode?set=system\" data-mode=\"system\">System</a>\
                  <a href=\"/mode?set=light\" data-mode=\"light\">Light</a>\

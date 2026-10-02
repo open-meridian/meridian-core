@@ -3,13 +3,17 @@
 //! What only the database can show: the schema applied over a database made
 //! before it had a history, terminal sessions standing across a restart --
 //! a second store over the same tables -- ended and lapsed as the memory
-//! store ends and lapses them, and no token anywhere in them. Run by
+//! store ends and lapses them, delegations made, renewed, spent and revoked
+//! as the memory store does it, and no token anywhere in them. Run by
 //! `make test-store`; fails loudly without a database.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use meridian_dashboard::accounts::{self, Accounts as _, LocalAccount};
 use meridian_dashboard::database::{Database, Unverified};
+use meridian_dashboard::delegation::{
+    self, Client, Covers, DelegationStore, Delegations, Grant, Kind, Token,
+};
 use meridian_dashboard::session::{ABSOLUTE_NS, IDLE_NS};
 use meridian_dashboard::terminal::{hashed, InPostgres, Person, Refusal, TerminalSessions};
 
@@ -317,5 +321,284 @@ fn no_token_is_kept_only_its_hash() {
     assert!(
         !reasons.contains("ada"),
         "a reason row holds nothing about whose it was: {reasons}"
+    );
+}
+
+// ── Delegations ─────────────────────────────────────────────────────────────
+
+const DAY_NS: i64 = 24 * 60 * MINUTE_NS;
+
+fn client(id: &str, at: i64) -> Client {
+    Client {
+        client_id: id.into(),
+        name: format!("meridian on {id}"),
+        redirect_uris: vec!["http://127.0.0.1:53682/callback".into()],
+        software_id: "meridian-cli".into(),
+        registered_at_ns: at,
+        consented: false,
+    }
+}
+
+fn granting(client_id: &str, covers: Covers, until: i64) -> Grant {
+    Grant {
+        subject: "local|ada".into(),
+        display_name: "Ada Park".into(),
+        client_id: client_id.into(),
+        covers,
+        directory_groups: vec!["desk".into()],
+        expires_at_ns: until,
+    }
+}
+
+fn token(fingerprint: &str, kind: Kind, delegation_id: &str, client_id: &str, until: i64) -> Token {
+    Token {
+        fingerprint: fingerprint.into(),
+        kind,
+        resource: "terminal".into(),
+        delegation_id: delegation_id.into(),
+        client_id: client_id.into(),
+        expires_at_ns: until,
+        spent: false,
+    }
+}
+
+#[test]
+fn a_delegation_is_made_renewed_in_place_and_narrowed_as_it_was_asked() {
+    let (database, url) = migrated("granted");
+    let store = delegation::InPostgres::on(database);
+    assert!(store.register(&client("mdc_a", T0), 10).unwrap());
+    let narrowed = Covers {
+        deployment_admin: true,
+        plugins: [("oms-1".to_string(), "read".to_string())].into(),
+        account_groups: ["AG-1".to_string()].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", narrowed.clone(), T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    assert_eq!(made.covers, narrowed);
+    assert_eq!(made.client_name, "meridian on mdc_a");
+    assert!(store.client("mdc_a").unwrap().unwrap().consented);
+    store
+        .issue(&token(
+            "fp-old",
+            Kind::Refresh,
+            &made.id,
+            "mdc_a",
+            T0 + 30 * DAY_NS,
+        ))
+        .unwrap();
+
+    let later = T0 + 20 * DAY_NS;
+    let renewed = store
+        .grant(
+            &granting("mdc_a", Covers::everything(), later + 90 * DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert_eq!(
+        renewed.id, made.id,
+        "renewed in place: one standing per client"
+    );
+    assert_eq!(renewed.made_at_ns, T0);
+    assert_eq!(renewed.renewed_at_ns, later);
+    assert!(renewed.covers.everything);
+    assert_eq!(
+        store.token("fp-old").unwrap(),
+        None,
+        "its old tokens are gone"
+    );
+    assert_eq!(count(&url, "dashboard_delegation"), 1);
+
+    // Revoked, a new consent makes a new one beside it.
+    assert!(store.revoke(&made.id, "local|ada", "done", later).unwrap());
+    assert!(!store.revoke(&made.id, "local|ada", "again", later).unwrap());
+    let again = store
+        .grant(
+            &granting("mdc_a", Covers::everything(), later + DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert_ne!(again.id, made.id);
+    let theirs = store.of_person("local|ada", later).unwrap();
+    assert_eq!(theirs.len(), 2);
+    assert_eq!(theirs[0].id, again.id, "live first");
+    assert_eq!(theirs[1].revoked.as_ref().unwrap().why, "done");
+}
+
+#[test]
+fn a_refresh_token_is_spent_once_whichever_replica_asks() {
+    let (database, _) = migrated("spent");
+    let one = delegation::InPostgres::on(database.clone());
+    let other = delegation::InPostgres::on(database);
+    one.register(&client("mdc_a", T0), 10).unwrap();
+    let made = one
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    one.issue(&token(
+        "fp-r",
+        Kind::Refresh,
+        &made.id,
+        "mdc_a",
+        T0 + DAY_NS,
+    ))
+    .unwrap();
+    one.issue(&token(
+        "fp-a",
+        Kind::Access,
+        &made.id,
+        "mdc_a",
+        T0 + 10 * MINUTE_NS,
+    ))
+    .unwrap();
+    assert!(
+        !other.spend("fp-a", T0).unwrap(),
+        "an access token is never spent"
+    );
+    assert!(other.spend("fp-r", T0).unwrap());
+    assert!(!one.spend("fp-r", T0).unwrap(), "spent by the first");
+    assert!(one.token("fp-r").unwrap().unwrap().spent);
+}
+
+#[test]
+fn holders_last_use_refusals_groups_and_the_sweep() {
+    let (database, url) = migrated("delegation_sweep");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    store.register(&client("mdc_unconsented", T0), 10).unwrap();
+    let a = store
+        .grant(
+            &granting("mdc_a", Covers::everything(), T0 + 7 * DAY_NS),
+            T0,
+        )
+        .unwrap();
+    store
+        .grant(
+            &granting("mdc_b", Covers::everything(), T0 + 30 * DAY_NS),
+            T0,
+        )
+        .unwrap();
+    assert_eq!(
+        store.holders(T0).unwrap(),
+        vec![("local|ada".to_string(), "Ada Park".to_string(), 2)]
+    );
+    assert_eq!(
+        store.holders(T0 + 8 * DAY_NS).unwrap(),
+        vec![("local|ada".to_string(), "Ada Park".to_string(), 1)],
+        "a lapsed one is not held"
+    );
+
+    store.used(&a.id, T0 + MINUTE_NS).unwrap();
+    store.used(&a.id, T0).unwrap();
+    store
+        .refused(&a.id, "groups too old", T0 + 2 * MINUTE_NS)
+        .unwrap();
+    store
+        .signed_in("local|ada", &["risk".to_string()], T0 + 3 * MINUTE_NS)
+        .unwrap();
+    let read = store.delegation(&a.id).unwrap().unwrap();
+    assert_eq!(
+        read.last_used_at_ns,
+        Some(T0 + MINUTE_NS),
+        "never moved backwards"
+    );
+    assert_eq!(
+        read.last_refusal,
+        Some((T0 + 2 * MINUTE_NS, "groups too old".to_string()))
+    );
+    assert_eq!(read.directory_groups, vec!["risk".to_string()]);
+    assert_eq!(read.groups_read_at_ns, T0 + 3 * MINUTE_NS);
+    assert_eq!(
+        store
+            .revoke_person("local|ada", "local|root", "left", T0)
+            .unwrap(),
+        2
+    );
+
+    store.sweep(T0 + DAY_NS + 1).unwrap();
+    assert!(store.client("mdc_unconsented").unwrap().is_none());
+    assert!(store.client("mdc_a").unwrap().is_some());
+    assert_eq!(
+        count(&url, "dashboard_delegation"),
+        2,
+        "revoked ones stay listed"
+    );
+    store.sweep(T0 + 31 * DAY_NS).unwrap();
+    assert_eq!(count(&url, "dashboard_delegation"), 0);
+}
+
+/// The blocking Postgres client may not be used on an async runtime's own
+/// threads, so these tests drive the facade from outside one, as the
+/// dashboard's handlers do through `spawn_blocking`.
+fn on_a_runtime<T>(work: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(work)
+}
+
+#[test]
+fn a_delegation_stands_across_a_restart_and_no_token_is_kept() {
+    let (database, url) = migrated("delegation_restart");
+    let delegations = Delegations::keeping(std::sync::Arc::new(delegation::InPostgres::on(
+        database.clone(),
+    )));
+    let client = on_a_runtime(delegations.register(
+        delegation::Registration {
+            name: "meridian on ada-laptop".into(),
+            redirect_uris: vec!["http://127.0.0.1:53682/callback".into()],
+            software_id: "meridian-cli".into(),
+        },
+        T0,
+    ))
+    .unwrap()
+    .unwrap();
+    let made = delegation::InPostgres::on(database)
+        .grant(
+            &granting(&client.client_id, Covers::everything(), T0 + DAY_NS),
+            T0,
+        )
+        .unwrap();
+    let pair = on_a_runtime(delegations.issue(made, delegation::Resource::Terminal, T0)).unwrap();
+    drop(delegations);
+
+    // A new dashboard: a new pool, over the same tables.
+    let after = Delegations::keeping(std::sync::Arc::new(delegation::InPostgres::on(
+        Database::connect(&url, 2).unwrap(),
+    )));
+    let acting = on_a_runtime(after.check(
+        &pair.access_token,
+        delegation::Resource::Terminal,
+        None,
+        T0 + MINUTE_NS,
+    ))
+    .unwrap()
+    .expect("still acting after a restart");
+    assert_eq!(acting.subject, "local|ada");
+
+    let mut client_db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut dumped = String::new();
+    for table in [
+        "dashboard_oauth_client",
+        "dashboard_delegation",
+        "dashboard_delegation_token",
+    ] {
+        for row in client_db
+            .query(&format!("SELECT row_to_json(t)::text FROM {table} t"), &[])
+            .unwrap()
+        {
+            dumped.push_str(row.get::<_, &str>(0));
+        }
+    }
+    assert!(dumped.contains(&delegation::fingerprint(&pair.access_token)));
+    assert!(
+        !dumped.contains(&pair.access_token),
+        "a token in a table: {dumped}"
+    );
+    assert!(
+        !dumped.contains(&pair.refresh_token),
+        "a token in a table: {dumped}"
     );
 }

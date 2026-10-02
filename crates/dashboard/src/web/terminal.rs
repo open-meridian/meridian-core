@@ -22,9 +22,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use super::{password_page, record_sign_in, redirect, refused, set_cookie, App, SIGN_IN_COOKIE};
+use crate::delegation::{narrow, Covers, Refusal, Resource, ACCESS_PREFIX};
 use crate::html::{escape, page};
 use crate::session::IDLE_NS;
-use crate::terminal::{check, rfc3339, Person, Refusal};
+use crate::terminal::{check, rfc3339, Person, Unavailable};
+use meridian_domain::v1::AccessRecords;
 
 /// The header the CLI names its version in (W6.13; spec/the-cli, ruling 8).
 pub const CLI_VERSION: &str = "meridian-cli-version";
@@ -125,7 +127,7 @@ async fn authorize(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> R
     let id = app.terminals.open(request, now);
 
     if app.directory.is_some() || app.accounts.is_some() {
-        return Html(password_page(&app, "", Some(&id), "")).into_response();
+        return Html(password_page(&app, "", super::For::Terminal(&id), "")).into_response();
     }
     let Some(oidc) = &app.oidc else {
         return refused("no directory is configured for this deployment's dashboard");
@@ -144,7 +146,7 @@ async fn authorize(State(app): State<Arc<App>>, Query(asked): Query<Asked>) -> R
 
 /// Somebody signed in to a terminal's request: record it, and ask them to
 /// confirm. No browser session is made, by this or by anything after it.
-pub(super) fn signed_in(
+pub(super) async fn signed_in(
     app: &Arc<App>,
     id: &str,
     subject: &str,
@@ -163,7 +165,8 @@ pub(super) fn signed_in(
             "this terminal sign-in has expired or was already used; run `meridian connect` again",
         );
     };
-    record_sign_in(app, subject, display_name, groups, now);
+    record_sign_in(app, subject, display_name, groups.clone(), now);
+    super::afresh(app, subject, groups, now).await;
     tracing::info!(subject, "signed in to connect a terminal");
     Html(page(
         "Connect a terminal",
@@ -293,33 +296,150 @@ async fn sign_out(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// The terminal session a request presents, or the refusal to send back.
-/// Only for `/terminal/` paths, and it reads no cookie.
-pub async fn terminal_session_of(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
-    let found = match bearer(headers) {
-        Some(session) => app.terminals.find(&session, app.clock.now_ns()).await,
-        None => Ok(Err(Refusal::Unknown)),
-    };
+/// Who a request on a terminal path acts for, and through what.
+pub struct Caller {
+    pub person: Person,
+    pub through: Through,
+}
+
+/// What a terminal path's bearer credential was.
+pub enum Through {
+    /// A terminal session from before delegations, by its hash: honoured
+    /// for one release, then retired by the CLI version floor
+    /// (spec/clients-act-on-a-persons-delegation, requirement 22).
+    Session(String),
+    /// An access token on a delegation (W6.18).
+    Delegation {
+        id: String,
+        client_name: String,
+        covers: Covers,
+    },
+}
+
+impl Caller {
+    /// What they may reach now: the person's access from the records as they
+    /// are, cut to what the delegation covers, if it came through one.
+    pub fn access(&self, records: &AccessRecords) -> meridian_access::Access {
+        let access = meridian_access::person_access(
+            records,
+            &self.person.subject,
+            &self.person.directory_groups,
+        );
+        match &self.through {
+            Through::Session(_) => access,
+            Through::Delegation { covers, .. } => narrow(access, covers, records),
+        }
+    }
+
+    pub fn delegation_id(&self) -> Option<&str> {
+        match &self.through {
+            Through::Delegation { id, .. } => Some(id),
+            Through::Session(_) => None,
+        }
+    }
+
+    /// Note why a request through a delegation was refused, for the person
+    /// and the admin to read beside it. Nothing for a terminal session.
+    pub async fn refused(&self, app: &App, why: &str) {
+        if let Some(id) = self.delegation_id() {
+            if let Err(failed) = app.delegations.refused(id, why, app.clock.now_ns()).await {
+                tracing::warn!(%failed, "a delegation's refusal was not recorded");
+            }
+        }
+    }
+}
+
+fn unavailable(unavailable: Unavailable) -> Box<Response> {
     // A store that cannot be asked is ours to fix, not the person's: a 503,
     // so the CLI does not tell them to sign in again.
-    let found = found.map_err(|unavailable| {
-        tracing::error!(%unavailable, "a terminal session could not be read");
-        Box::new(json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({"error": "temporarily_unavailable", "error_description": unavailable.to_string()}),
-        ))
-    })?;
-    found.map_err(|refusal| {
-        let mut response = json(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({"error": "invalid_token", "reason": refusal.reason()}),
-        );
-        response.headers_mut().insert(
-            WWW_AUTHENTICATE,
-            axum::http::HeaderValue::from_static("Bearer error=\"invalid_token\""),
-        );
-        Box::new(response)
-    })
+    tracing::error!(%unavailable, "a terminal credential could not be read");
+    Box::new(json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({"error": "temporarily_unavailable", "error_description": unavailable.to_string()}),
+    ))
+}
+
+/// 401, naming why, and a sentence for a delegation's refusals, which an
+/// unsupervised client reports as what stopped it. A terminal session's
+/// keeps the answer the CLIs that hold one already read.
+fn invalid_token(
+    app: &App,
+    headers: &HeaderMap,
+    reason: &str,
+    sentence: Option<&str>,
+) -> Box<Response> {
+    let mut body = serde_json::json!({"error": "invalid_token", "reason": reason});
+    if let Some(sentence) = sentence {
+        body["error_description"] = sentence.into();
+    }
+    let mut response = json(StatusCode::UNAUTHORIZED, body);
+    // Where a client finds who issues this surface's tokens (RFC 9728).
+    let metadata = format!(
+        "Bearer error=\"invalid_token\", resource_metadata=\"{}/.well-known/oauth-protected-resource/terminal\"",
+        super::oauth::issuer(app, headers)
+    );
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_str(&metadata).unwrap_or_else(|_| {
+            axum::http::HeaderValue::from_static("Bearer error=\"invalid_token\"")
+        }),
+    );
+    Box::new(response)
+}
+
+/// Who a request on a terminal path acts for -- an access token on a
+/// delegation, or a terminal session from before them -- or the refusal to
+/// send back. Only for `/terminal/` paths, and it reads no cookie.
+pub async fn caller_of(app: &App, headers: &HeaderMap) -> Result<Caller, Box<Response>> {
+    let now = app.clock.now_ns();
+    let Some(presented) = bearer(headers) else {
+        return Err(invalid_token(app, headers, Refusal::Unknown.reason(), None));
+    };
+    if presented.starts_with(ACCESS_PREFIX) {
+        let checked = app
+            .delegations
+            .check(
+                &presented,
+                Resource::Terminal,
+                super::oauth::groups_bound(app),
+                now,
+            )
+            .await
+            .map_err(unavailable)?;
+        return match checked {
+            Ok(delegation) => Ok(Caller {
+                person: Person {
+                    subject: delegation.subject,
+                    display_name: delegation.display_name,
+                    directory_groups: delegation.directory_groups,
+                    signed_in_at_ns: delegation.groups_read_at_ns,
+                },
+                through: Through::Delegation {
+                    id: delegation.id,
+                    client_name: delegation.client_name,
+                    covers: delegation.covers,
+                },
+            }),
+            Err(refusal) => Err(invalid_token(
+                app,
+                headers,
+                refusal.reason(),
+                Some(refusal.sentence()),
+            )),
+        };
+    }
+    let found = app
+        .terminals
+        .find(&presented, now)
+        .await
+        .map_err(unavailable)?;
+    match found {
+        Ok(person) => Ok(Caller {
+            person,
+            through: Through::Session(crate::terminal::hashed(&presented)),
+        }),
+        Err(refusal) => Err(invalid_token(app, headers, refusal.reason(), None)),
+    }
 }
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Option<String> {
