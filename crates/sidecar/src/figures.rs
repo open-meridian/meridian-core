@@ -9,29 +9,26 @@
 //! refused whole, INVALID_ARGUMENT, naming the figure, the field and the bound
 //! in the words meridian-design's fixtures/sidecar/heartbeat.yaml pins. The
 //! SDK refuses the same in the plugin's process; this is for a plugin that
-//! built its heartbeat by hand.
+//! built its heartbeat by hand. Each bound is the data dictionary's entry, as
+//! `meridian_pb::bounds` generates it, and none is written here.
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
+use meridian_pb::bounds::{
+    Length, HEARTBEAT_REQUEST_FIGURES_COUNT as FIGURES, PLUGIN_FIGURE_LABEL_LENGTH as LABEL,
+    PLUGIN_FIGURE_TEXT_LENGTH as TEXT, PLUGIN_FIGURE_WHY_LENGTH as WHY,
+};
 use meridian_pb::v1::plugin_figure::Value;
 use meridian_pb::v1::{FigureState, PluginFigure};
 
-/// The most figures a plugin reports.
-pub const MOST_FIGURES: usize = 8;
-/// The longest label, in characters.
-pub const LONGEST_LABEL: usize = 40;
-/// The longest text value, in characters.
-pub const LONGEST_TEXT: usize = 40;
-/// The longest why, in characters; W6.3's 200.
-pub const LONGEST_WHY: usize = 200;
-
 /// The figures as given, or the refusal naming what broke which bound.
 pub fn check(figures: &[PluginFigure]) -> Result<(), String> {
-    if figures.len() > MOST_FIGURES {
+    if !FIGURES.admits(figures.len()) {
         return Err(format!(
-            "{} figures; a plugin reports at most {MOST_FIGURES}",
-            figures.len()
+            "{} figures; a plugin reports at most {}",
+            figures.len(),
+            FIGURES.most
         ));
     }
     let mut labels = BTreeSet::new();
@@ -39,10 +36,11 @@ pub fn check(figures: &[PluginFigure]) -> Result<(), String> {
         let at = format!("figures[{i}]");
         if figure.label.is_empty() {
             return Err(format!(
-                "{at}.label is empty; a label is 1 to {LONGEST_LABEL} characters"
+                "{at}.label is empty; a label is {} to {} characters",
+                LABEL.least, LABEL.most
             ));
         }
-        within(&at, "label", "a label", &figure.label, LONGEST_LABEL)?;
+        within(&at, "label", "a label", &figure.label, LABEL)?;
         if !labels.insert(figure.label.as_str()) {
             return Err(format!(
                 "{at}.label {:?} is given twice; a label is given once",
@@ -55,7 +53,7 @@ pub fn check(figures: &[PluginFigure]) -> Result<(), String> {
                     "{at} has no value; a figure is a count, a decimal, a text or a time"
                 ))
             }
-            Some(Value::Text(text)) => within(&at, "text", "a text", text, LONGEST_TEXT)?,
+            Some(Value::Text(text)) => within(&at, "text", "a text", text, TEXT)?,
             Some(Value::Decimal(decimal)) => {
                 Exact::from_wire(decimal).map_err(|out_of_range| {
                     format!("{at}.decimal {out_of_range}; it is refused rather than rounded")
@@ -69,18 +67,19 @@ pub fn check(figures: &[PluginFigure]) -> Result<(), String> {
                 figure.state
             ));
         }
-        within(&at, "why", "a why", &figure.why, LONGEST_WHY)?;
+        within(&at, "why", "a why", &figure.why, WHY)?;
     }
     Ok(())
 }
 
 /// A text field no longer than its bound, counted in characters as a person
 /// reads them rather than in bytes.
-fn within(at: &str, field: &str, what: &str, text: &str, most: usize) -> Result<(), String> {
+fn within(at: &str, field: &str, what: &str, text: &str, bound: Length) -> Result<(), String> {
     let length = text.chars().count();
-    if length > most {
+    if length > bound.most {
         return Err(format!(
-            "{at}.{field} is {length} characters; {what} is at most {most}"
+            "{at}.{field} is {length} characters; {what} is at most {}",
+            bound.most
         ));
     }
     Ok(())

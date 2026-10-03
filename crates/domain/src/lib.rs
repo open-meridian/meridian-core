@@ -8,10 +8,10 @@
 //! And one type written by hand, [`exact::Exact`]: a `meridian.v1.Decimal` as
 //! the runtime holds it. Here because every component that reads a quantity
 //! has to read it the same way, and this is the crate they all share. For the
-//! same reason, [`account`]'s bounds on an account's free text, and
-//! [`asset_class`]'s reading of an asset class from text.
+//! same reason, [`asset_class`]'s reading of an asset class from text. The
+//! bounds on a value -- an account's free text, a Decimal's places and digits --
+//! are the data dictionary's, generated into `meridian_pb::bounds`.
 
-pub mod account;
 pub mod asset_class;
 pub mod exact;
 

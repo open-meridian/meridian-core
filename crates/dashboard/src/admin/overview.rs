@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use meridian_access::{AccessLevel, ALL_PLUGINS_ADMIN, DEPLOYMENT_ADMIN};
-use meridian_domain::account;
 use meridian_domain::v1::{AccessEntry, AccessRecords, AccountRecord, AccountState};
+use meridian_pb::bounds::{ACCOUNT_RECORD_CUSTODIAN_LENGTH, ACCOUNT_RECORD_NOTE_LENGTH};
 
 use std::collections::HashSet;
 
@@ -795,8 +795,8 @@ pub fn render(
          <label>Note<textarea name=\"note\" rows=\"3\" maxlength=\"{note_most}\"></textarea></label>\
          <p class=\"hint\">All but the name are optional and free text, and the search box \
          finds an account by any of them. Leaving one empty clears it.</p>",
-        label = account::LABEL_MOST,
-        note_most = account::NOTE_MOST,
+        label = ACCOUNT_RECORD_CUSTODIAN_LENGTH.most,
+        note_most = ACCOUNT_RECORD_NOTE_LENGTH.most,
     );
     let mut rows = String::new();
     for (row, a) in accounts_sorted.iter().enumerate() {

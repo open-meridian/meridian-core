@@ -40,8 +40,9 @@ use tonic::{Response, Status};
 use crate::configuration::Configuration;
 use crate::service::Sidecar;
 
-/// The most deliveries that wait for the plugin (W4.3).
-pub(crate) const QUEUE: usize = 1024;
+/// The most deliveries that wait for the plugin (W4.3): the data dictionary's
+/// SidecarReceive.limit.
+pub(crate) const QUEUE: usize = meridian_pb::bounds::SIDECAR_RECEIVE_LIMIT_RANGE.most as usize;
 
 /// How often a subscription's drop count is read when nothing arrives on it,
 /// so a loss at the end of a stream is told without a later delivery.

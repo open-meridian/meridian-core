@@ -179,12 +179,13 @@ pub fn watermark_of(mark: &Mark) -> Watermark {
     }
 }
 
-/// How a page is sized: 100 when none is asked, and at most 500, answered at
-/// the bound rather than refused (as the street's reads are).
-pub fn page_limit(page_size: i32) -> usize {
+/// How a page is sized: 100 when none is asked, and at most the read's
+/// page_size entry allows, answered at the bound rather than refused (as the
+/// street's reads are); `bound` is that entry's, from `meridian_pb::bounds`.
+pub fn page_limit(page_size: i32, bound: meridian_pb::bounds::Range) -> usize {
     match page_size {
         size if size <= 0 => 100,
-        size => (size as usize).min(500),
+        size => (size as i64).min(bound.most) as usize,
     }
 }
 

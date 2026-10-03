@@ -42,6 +42,7 @@ use meridian_domain::v1::{
     ResolveBreakRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
     SetAccountAttributeRequest,
 };
+use meridian_pb::bounds;
 use prost::Message;
 
 use crate::decide::{self, Context, Made, RecordSays};
@@ -568,7 +569,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 since: mark_of(request.since.as_ref()),
                 business_date: request.business_date.clone(),
                 at: mark_of(request.at.as_ref()),
-                limit: page_limit(request.page_size),
+                limit: page_limit(
+                    request.page_size,
+                    bounds::LIST_POSITIONS_REQUEST_PAGE_SIZE_RANGE,
+                ),
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
@@ -600,7 +604,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 account_id: request.account_id.clone(),
                 states,
                 since: mark_of(request.since.as_ref()),
-                limit: page_limit(request.page_size),
+                limit: page_limit(
+                    request.page_size,
+                    bounds::LIST_BREAKS_REQUEST_PAGE_SIZE_RANGE,
+                ),
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
@@ -631,7 +638,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 to_date: request.to_date.clone(),
                 since: mark_of(request.since.as_ref()),
                 at: mark_of(request.at.as_ref()),
-                limit: page_limit(request.page_size),
+                limit: page_limit(
+                    request.page_size,
+                    bounds::LIST_ACCOUNT_FIGURES_REQUEST_PAGE_SIZE_RANGE,
+                ),
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
@@ -655,7 +665,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 scope: scope_of(&envelope),
                 account_id: request.account_id.clone(),
                 since: mark_of(request.since.as_ref()),
-                limit: page_limit(request.page_size),
+                limit: page_limit(
+                    request.page_size,
+                    bounds::LIST_ACCOUNT_ATTRIBUTES_REQUEST_PAGE_SIZE_RANGE,
+                ),
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;

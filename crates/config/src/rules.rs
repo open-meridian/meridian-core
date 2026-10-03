@@ -13,10 +13,13 @@
 use std::collections::BTreeSet;
 
 use meridian_access::{is_built_in_access_group, AccessLevel, ALL_ACCOUNTS};
-use meridian_domain::account;
 use meridian_domain::v1::{
     AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
     LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
+};
+use meridian_pb::bounds::{
+    ACCOUNT_RECORD_ACCOUNT_TYPE_LENGTH, ACCOUNT_RECORD_CUSTODIAN_LENGTH,
+    ACCOUNT_RECORD_NOTE_LENGTH, ACCOUNT_RECORD_OWNER_LENGTH,
 };
 use meridian_pb::v1::{SettingDeclaration, SettingType};
 
@@ -52,8 +55,9 @@ fn at_most(value: &str, most: usize, what: &str) -> Verdict {
     Ok(())
 }
 
-/// W6.3's bounds on an account's custodian, type, owner and note, each
-/// named as `whose` field when refused.
+/// W6.3's bounds on an account's custodian, type, owner and note -- the data
+/// dictionary's entries for meridian.v1.AccountRecord's -- each named as
+/// `whose` field when refused.
 fn account_attributes(
     whose: &str,
     custodian: &str,
@@ -63,12 +67,24 @@ fn account_attributes(
 ) -> Verdict {
     at_most(
         custodian,
-        account::LABEL_MOST,
+        ACCOUNT_RECORD_CUSTODIAN_LENGTH.most,
         &format!("{whose} custodian"),
     )?;
-    at_most(account_type, account::LABEL_MOST, &format!("{whose} type"))?;
-    at_most(owner, account::LABEL_MOST, &format!("{whose} owner"))?;
-    at_most(note, account::NOTE_MOST, &format!("{whose} note"))
+    at_most(
+        account_type,
+        ACCOUNT_RECORD_ACCOUNT_TYPE_LENGTH.most,
+        &format!("{whose} type"),
+    )?;
+    at_most(
+        owner,
+        ACCOUNT_RECORD_OWNER_LENGTH.most,
+        &format!("{whose} owner"),
+    )?;
+    at_most(
+        note,
+        ACCOUNT_RECORD_NOTE_LENGTH.most,
+        &format!("{whose} note"),
+    )
 }
 
 pub fn define_account(snapshot: &Snapshot, request: &DefineAccountRequest) -> Verdict {

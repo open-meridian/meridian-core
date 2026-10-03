@@ -23,22 +23,26 @@ use meridian_domain::v1::{
     ListStatementsRequest, PartitionSequence, UnresolvedHolding, Watermark,
 };
 
+use meridian_pb::bounds::{
+    Range, LIST_CUSTODIAL_POSITIONS_REQUEST_PAGE_SIZE_RANGE,
+    LIST_STATEMENTS_REQUEST_PAGE_SIZE_RANGE,
+};
+
 use crate::amounts::Money;
 use crate::record::{statement_recorded, to_wire_identifier, to_wire_position};
 use crate::store::{Holding, Read, Result, Scope, StatementsRead, Store, PARTITION};
 
-/// The most rows one reply will carry, whatever was asked for.
-///
-/// A page size is a request from a caller, not an instruction. Without a
-/// ceiling, one caller asking for everything decides how much memory this
-/// process uses.
-const MAX_PAGE: usize = 500;
+/// The rows a reply carries when the caller asks for none.
 const DEFAULT_PAGE: usize = 100;
 
-fn limit(page_size: i32) -> usize {
+/// A page's size: the default when none is asked, and never past the most
+/// the read's page_size entry allows, whatever was asked for -- a page size
+/// is a request from a caller, not an instruction, and without a ceiling one
+/// caller asking for everything decides how much memory this process uses.
+fn limit(page_size: i32, bound: Range) -> usize {
     match page_size {
         size if size <= 0 => DEFAULT_PAGE,
-        size => (size as usize).min(MAX_PAGE),
+        size => (size as i64).min(bound.most) as usize,
     }
 }
 
@@ -73,7 +77,10 @@ pub fn list_positions(
         scope: scope.clone(),
         account_id: request.account_id.clone(),
         include_unresolved: request.include_unresolved,
-        limit: limit(request.page_size),
+        limit: limit(
+            request.page_size,
+            LIST_CUSTODIAL_POSITIONS_REQUEST_PAGE_SIZE_RANGE,
+        ),
         cursor: request.cursor.clone(),
         since: since(request.since.as_ref()),
     })?;
@@ -96,7 +103,7 @@ pub fn list_statements(
         scope: scope.clone(),
         account_id: request.account_id.clone(),
         as_of_date: request.as_of_date.clone(),
-        limit: limit(request.page_size),
+        limit: limit(request.page_size, LIST_STATEMENTS_REQUEST_PAGE_SIZE_RANGE),
         cursor: request.cursor.clone(),
         since: since(request.since.as_ref()),
     })?;
@@ -315,7 +322,9 @@ mod tests {
         let mut greedy = asking(false);
         greedy.page_size = 100_000;
         let reply = list_positions(&store, &greedy, &Scope::Everything).unwrap();
-        assert!(reply.positions.len() <= MAX_PAGE);
+        assert!(
+            reply.positions.len() <= LIST_CUSTODIAL_POSITIONS_REQUEST_PAGE_SIZE_RANGE.most as usize
+        );
 
         let mut absent = asking(false);
         absent.page_size = 0;

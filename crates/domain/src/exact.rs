@@ -24,15 +24,18 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
+use meridian_pb::bounds::{DECIMAL_DIGITS, DECIMAL_SCALE};
 use meridian_pb::v1::Decimal;
 
-/// The most decimal places a value carries.
-pub const MAX_SCALE: u32 = 18;
+/// The most decimal places a value carries: meridian.v1.Decimal.scale's
+/// entry in the data dictionary.
+const PLACES: u32 = DECIMAL_SCALE.most as u32;
 
-/// The integer's magnitude stays below this: at most 38 significant digits.
-const LIMIT: u128 = 100_000_000_000_000_000_000_000_000_000_000_000_000;
+/// The integer's magnitude stays below this: at most the significant digits
+/// every Decimal's entry states (decisions/023).
+const LIMIT: u128 = ten_to(DECIMAL_DIGITS);
 
-/// 10^n for n up to [`MAX_SCALE`], which is all a comparison needs.
+/// 10^n for n up to [`DECIMAL_DIGITS`], which is all a comparison needs.
 const fn ten_to(n: u32) -> u128 {
     10u128.pow(n)
 }
@@ -54,9 +57,9 @@ impl fmt::Display for OutOfRange {
         match self {
             OutOfRange::Scale(scale) => write!(
                 f,
-                "has {scale} decimal places, and at most {MAX_SCALE} cross the wire"
+                "has {scale} decimal places, and at most {PLACES} cross the wire"
             ),
-            OutOfRange::Digits => write!(f, "has more than 38 digits"),
+            OutOfRange::Digits => write!(f, "has more than {DECIMAL_DIGITS} digits"),
             OutOfRange::NotDecimal(text) => write!(f, "{text:?} is not a decimal"),
         }
     }
@@ -79,7 +82,7 @@ impl Exact {
 
     /// Refused outside the range rather than clamped or rounded.
     pub fn new(integer: i128, scale: u32) -> Result<Self, OutOfRange> {
-        if scale > MAX_SCALE {
+        if scale > PLACES {
             return Err(OutOfRange::Scale(scale));
         }
         if integer.unsigned_abs() >= LIMIT {
@@ -161,7 +164,7 @@ impl Exact {
         let unit = ten_to(self.scale);
         (
             magnitude / unit,
-            (magnitude % unit) * ten_to(MAX_SCALE - self.scale),
+            (magnitude % unit) * ten_to(PLACES - self.scale),
         )
     }
 
@@ -251,7 +254,7 @@ impl FromStr for Exact {
             return Err(not_decimal());
         }
         let scale = u32::try_from(fraction.len()).map_err(|_| not_decimal())?;
-        if scale > MAX_SCALE {
+        if scale > PLACES {
             return Err(OutOfRange::Scale(scale));
         }
         let digits = format!("{whole}{fraction}");
