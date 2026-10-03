@@ -1311,6 +1311,11 @@ async fn complete_instruments(
         identifier_namespace: field(&fields, "identifier_namespace").into(),
         identifier_source: field(&fields, "identifier_source").into(),
         note: field(&fields, "note").into(),
+        asset_class_held: field(&fields, "asset_class_held").into(),
+        currency_held: field(&fields, "currency_held").into(),
+        description_held: field(&fields, "description_held").into(),
+        instrument_type_held: field(&fields, "instrument_type_held").into(),
+        fund_held: field(&fields, "fund_held").into(),
     };
     let back = format!("/admin/instruments/{}", filled.instrument_id);
     let outcome = match instruments::completion(&filled) {

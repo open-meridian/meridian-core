@@ -247,6 +247,15 @@ pub struct Filled {
     pub identifier_namespace: String,
     pub identifier_source: String,
     pub note: String,
+    /// What the record held when the page was drawn, as the form carried it
+    /// back: a value posted as it was held is no change, and is not sent
+    /// again, so a held value whose source the page did not show is never
+    /// resubmitted without one (product owner testing, 2026-10-03).
+    pub asset_class_held: String,
+    pub currency_held: String,
+    pub description_held: String,
+    pub instrument_type_held: String,
+    pub fund_held: String,
 }
 
 /// One record's completion from its form, or why the form cannot be sent.
@@ -259,7 +268,7 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
         .parse()
         .map_err(|_| "the form names no version of the record".to_string())?;
     let mut values = Vec::new();
-    if !filled.asset_class.is_empty() {
+    if !filled.asset_class.is_empty() && filled.asset_class != filled.asset_class_held {
         let class: i32 = filled
             .asset_class
             .parse()
@@ -269,7 +278,12 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
             source: filled.asset_class_source.trim().to_string(),
         });
     }
-    if !filled.currency.trim().is_empty() {
+    if !filled.currency.trim().is_empty()
+        && !filled
+            .currency
+            .trim()
+            .eq_ignore_ascii_case(filled.currency_held.trim())
+    {
         values.push(InstrumentValue {
             value: Some(instrument_value::Value::Currency(
                 filled.currency.trim().to_ascii_uppercase(),
@@ -277,7 +291,9 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
             source: filled.currency_source.trim().to_string(),
         });
     }
-    if !filled.description.trim().is_empty() {
+    if !filled.description.trim().is_empty()
+        && filled.description.trim() != filled.description_held.trim()
+    {
         values.push(InstrumentValue {
             value: Some(instrument_value::Value::Description(
                 filled.description.trim().to_string(),
@@ -285,7 +301,7 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
             source: filled.description_source.trim().to_string(),
         });
     }
-    if !filled.instrument_type.is_empty() {
+    if !filled.instrument_type.is_empty() && filled.instrument_type != filled.instrument_type_held {
         let kind: i32 = filled
             .instrument_type
             .parse()
@@ -303,15 +319,28 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
     ];
     if attributes.iter().any(|attribute| !attribute.is_empty()) {
         let number = |text: &str| text.parse::<i32>().unwrap_or(0);
-        values.push(InstrumentValue {
-            value: Some(instrument_value::Value::MoneyMarketFund(MoneyMarketFund {
-                category: number(&filled.fund_category),
-                investors: number(&filled.fund_investors),
-                nav: number(&filled.fund_nav),
-                liquidity_fee: number(&filled.fund_liquidity_fee),
-            })),
-            source: filled.fund_source.trim().to_string(),
-        });
+        let fund = MoneyMarketFund {
+            category: number(&filled.fund_category),
+            investors: number(&filled.fund_investors),
+            nav: number(&filled.fund_nav),
+            liquidity_fee: number(&filled.fund_liquidity_fee),
+        };
+        if instrument_type::fund_to_text(&fund) != filled.fund_held {
+            if !instrument_type::unstated(&fund).is_empty() {
+                return Err(
+                    "a money market fund's four attributes are stated together: its category, \
+                     investors, net asset value and liquidity fee"
+                        .into(),
+                );
+            }
+            if filled.fund_source.trim().is_empty() {
+                return Err("say where the money market fund's attributes came from".into());
+            }
+            values.push(InstrumentValue {
+                value: Some(instrument_value::Value::MoneyMarketFund(fund)),
+                source: filled.fund_source.trim().to_string(),
+            });
+        }
     }
     if !filled.identifier_scheme.trim().is_empty() || !filled.identifier_value.trim().is_empty() {
         values.push(InstrumentValue {
@@ -852,6 +881,7 @@ pub fn record_page(
             &[
                 (LiquidityFeeRegime::Mandatory as i32, "mandatory"),
                 (LiquidityFeeRegime::Discretionary as i32, "discretionary"),
+                (LiquidityFeeRegime::None as i32, "none"),
             ]
         ),
         fund_source = escape(&fund_source),
@@ -876,6 +906,11 @@ pub fn record_page(
         "<form method=\"post\" action=\"/admin/instruments/complete\" class=\"panel\" id=\"complete\">{token}\
          <input type=\"hidden\" name=\"instrument_id\" value=\"{id}\">\
          <input type=\"hidden\" name=\"against_version\" value=\"{version}\">\
+         <input type=\"hidden\" name=\"asset_class_held\" value=\"{class_held}\">\
+         <input type=\"hidden\" name=\"currency_held\" value=\"{currency_held}\">\
+         <input type=\"hidden\" name=\"description_held\" value=\"{description_held}\">\
+         <input type=\"hidden\" name=\"instrument_type_held\" value=\"{type_held}\">\
+         <input type=\"hidden\" name=\"fund_held\" value=\"{fund_held}\">\
          <div class=\"fields\">\
          <label>Asset class <select name=\"asset_class\" data-initial=\"{class}\">{options}</select></label>\
          <label>Where it came from <input name=\"asset_class_source\" value=\"{class_source}\"{class_offer}></label>\
@@ -891,6 +926,21 @@ pub fn record_page(
          <label>Why, when you change a value already set <input name=\"note\"></label>\
          </div><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save</button></div></form>",
         version = record.version,
+        class_held = escape(&if record.asset_class == 0 {
+            String::new()
+        } else {
+            record.asset_class.to_string()
+        }),
+        currency_held = escape(&record.currency),
+        description_held = escape(&record.description),
+        type_held = escape(&held_type),
+        fund_held = escape(
+            &record
+                .money_market_fund
+                .as_ref()
+                .map(instrument_type::fund_to_text)
+                .unwrap_or_default()
+        ),
         class = escape(&class),
         class_source = escape(&class_source),
         class_offer = offered_attr(&class_offer),
@@ -1122,6 +1172,80 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn a_held_value_posted_back_as_it_was_is_not_sent_again_and_a_new_one_is() {
+        // Product owner testing, 2026-10-03: the page pre-fills a held asset
+        // class and description, whose sources it may not show; saving only
+        // a new currency sends the currency alone.
+        let request = completion(&Filled {
+            instrument_id: "LCL-1".into(),
+            against_version: "3".into(),
+            asset_class: (AssetClass::Equity as i32).to_string(),
+            asset_class_held: (AssetClass::Equity as i32).to_string(),
+            description: "Apple Inc.".into(),
+            description_held: "Apple Inc.".into(),
+            currency: "usd".into(),
+            currency_source: "Fidelity statement".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let values = &request.completions[0].values;
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].value,
+            Some(instrument_value::Value::Currency("USD".into()))
+        );
+        // Nothing new at all is nothing to send.
+        assert!(completion(&Filled {
+            instrument_id: "LCL-1".into(),
+            against_version: "3".into(),
+            asset_class: (AssetClass::Equity as i32).to_string(),
+            asset_class_held: (AssetClass::Equity as i32).to_string(),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn a_funds_attributes_go_with_their_source_none_fee_included_and_round_trip() {
+        let page = record_page(&waiting(), &[], None, "");
+        assert!(page.contains("name=\"fund_source\""), "{page}");
+        assert!(page.contains("name=\"fund_liquidity_fee\""), "{page}");
+        assert!(page.contains(&format!(
+            "<option value=\"{}\">none</option>",
+            LiquidityFeeRegime::None as i32
+        )));
+        let fund = |source: &str| Filled {
+            instrument_id: "LCL-1".into(),
+            against_version: "2".into(),
+            fund_category: (MoneyMarketFundCategory::Government as i32).to_string(),
+            fund_investors: (MoneyMarketFundInvestors::Retail as i32).to_string(),
+            fund_nav: (MoneyMarketFundNav::Stable as i32).to_string(),
+            fund_liquidity_fee: (LiquidityFeeRegime::None as i32).to_string(),
+            fund_source: source.into(),
+            ..Default::default()
+        };
+        assert!(completion(&fund(""))
+            .unwrap_err()
+            .contains("where the money market fund's attributes came from"));
+        let request = completion(&fund("the fund's prospectus")).unwrap();
+        let value = &request.completions[0].values[0];
+        assert_eq!(value.source, "the fund's prospectus");
+        let Some(instrument_value::Value::MoneyMarketFund(held)) = &value.value else {
+            panic!("a fund's attributes");
+        };
+        assert_eq!(held.liquidity_fee, LiquidityFeeRegime::None as i32);
+        // Drawn again holding them, posted back unchanged: nothing sent.
+        let mut again = fund("");
+        again.fund_held = instrument_type::fund_to_text(held);
+        assert!(completion(&again).is_err());
+        let mut partial = fund("the prospectus");
+        partial.fund_nav = String::new();
+        assert!(completion(&partial)
+            .unwrap_err()
+            .contains("stated together"));
     }
 
     #[test]

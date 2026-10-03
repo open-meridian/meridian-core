@@ -139,6 +139,9 @@ enum LiquidityFeeRegime {
   LIQUIDITY_FEE_REGIME_MANDATORY = 1;
   // At the board's discretion, where in the fund's interest.
   LIQUIDITY_FEE_REGIME_DISCRETIONARY = 2;
+  // No liquidity fee: a government fund that has not chosen one, which
+  // neither of the others describes (contract v12).
+  LIQUIDITY_FEE_REGIME_NONE = 3;
 }
 
 // One typed identifier for an instrument.

@@ -1198,6 +1198,9 @@ pub enum LiquidityFeeRegime {
     Mandatory = 1,
     /// At the board's discretion, where in the fund's interest.
     Discretionary = 2,
+    /// No liquidity fee: a government fund that has not chosen one, which
+    /// neither of the others describes (contract v12).
+    None = 3,
 }
 impl LiquidityFeeRegime {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1209,6 +1212,7 @@ impl LiquidityFeeRegime {
             Self::Unspecified => "LIQUIDITY_FEE_REGIME_UNSPECIFIED",
             Self::Mandatory => "LIQUIDITY_FEE_REGIME_MANDATORY",
             Self::Discretionary => "LIQUIDITY_FEE_REGIME_DISCRETIONARY",
+            Self::None => "LIQUIDITY_FEE_REGIME_NONE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1217,6 +1221,7 @@ impl LiquidityFeeRegime {
             "LIQUIDITY_FEE_REGIME_UNSPECIFIED" => Some(Self::Unspecified),
             "LIQUIDITY_FEE_REGIME_MANDATORY" => Some(Self::Mandatory),
             "LIQUIDITY_FEE_REGIME_DISCRETIONARY" => Some(Self::Discretionary),
+            "LIQUIDITY_FEE_REGIME_NONE" => Some(Self::None),
             _ => None,
         }
     }

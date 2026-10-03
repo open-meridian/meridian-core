@@ -166,7 +166,7 @@ fn value_schema() -> Value {
                     "category": enum_names(&["MONEY_MARKET_FUND_CATEGORY_GOVERNMENT", "MONEY_MARKET_FUND_CATEGORY_PRIME", "MONEY_MARKET_FUND_CATEGORY_TAX_EXEMPT"]),
                     "investors": enum_names(&["MONEY_MARKET_FUND_INVESTORS_RETAIL", "MONEY_MARKET_FUND_INVESTORS_INSTITUTIONAL"]),
                     "nav": enum_names(&["MONEY_MARKET_FUND_NAV_STABLE", "MONEY_MARKET_FUND_NAV_FLOATING"]),
-                    "liquidity_fee": enum_names(&["LIQUIDITY_FEE_REGIME_MANDATORY", "LIQUIDITY_FEE_REGIME_DISCRETIONARY"]),
+                    "liquidity_fee": enum_names(&["LIQUIDITY_FEE_REGIME_MANDATORY", "LIQUIDITY_FEE_REGIME_DISCRETIONARY", "LIQUIDITY_FEE_REGIME_NONE"]),
                 },
                 "required": ["category", "investors", "nav", "liquidity_fee"],
                 "additionalProperties": false,
