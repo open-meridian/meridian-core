@@ -212,7 +212,8 @@ services:
       - secrets:/secrets:ro
 
   # No platform: its address resolves nowhere, which a conductor tolerates,
-  # so nothing resolves and every row a plugin records names a placeholder.
+  # and a deployment's records are its own (contract v10), so every row a
+  # plugin records names a record the deployment minted.
   # The deployment's admin is named here, as first run names one (W7.6): the
   # dashboard's local account below, made at its start.
   conductor:

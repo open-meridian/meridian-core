@@ -1061,7 +1061,8 @@ pub fn render(
         format!("<p class=\"passed\">{}</p>", escape(notice))
     };
     format!(
-        "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1></div>\
+        "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1>\
+         <a class=\"button\" href=\"/admin/instruments\">Instruments</a></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
          <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}</script>",
         sections.concat(),

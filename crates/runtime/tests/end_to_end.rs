@@ -1,18 +1,20 @@
-//! The instrument store against a running platform and a real database.
+//! The instrument store and the conductor against a running platform and a
+//! real database.
 //!
-//! Everything the crate claims about pulling, minting and applying is a claim
-//! until it has been made against the platform rather than against a scripted
-//! transport. This is that run.
+//! Everything the crates claim about asking the platform and keeping its
+//! answer is a claim until it has been made against the platform rather than
+//! against a scripted transport. This is that run.
 //!
-//! It signs with the key the instrument store generated and an operator registered, so a
+//! It signs with the deployment's key, which an operator registered, so a
 //! failure to authenticate fails here rather than being mocked away. Run by
 //! `make demo`, which brings up the database, registers the deployment and sets
-//! the three variables below.
+//! the variables below.
 //!
-//! The placeholder's whole arc runs through the real pieces on one in-process
-//! bus: the instrument store's query and reactor over Postgres, and the
-//! conductor over the platform. Only the connector and the broker are absent,
-//! and a resolve over the bus is what the connector's sidecar makes.
+//! A record's whole arc under decisions/030 runs through the real pieces on one
+//! in-process bus: the instrument store's handlers and reactor over Postgres,
+//! and the conductor over the platform. Only the connector, the dashboard and
+//! the broker are absent: a resolve and an ask over the bus are what their
+//! sidecar and the dashboard make.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,19 +23,21 @@ use prost::Message;
 use tokio::runtime::Runtime;
 
 use meridian_bus::{Bus, MemoryBackend, Subscription};
-use meridian_conductor::{Conductor, Config, DeploymentKey, HttpTransport, Platform, Reaction};
-use meridian_domain::v1::{
-    Identifier as PbIdentifier, InstrumentLifecycleState, InstrumentReplacedEvent,
-    PullInstrumentReply, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
-    ResolveInstrumentRequest,
+use meridian_conductor::{
+    Conductor, Config, DeploymentKey, HttpTransport, Platform, ASK_PLATFORM_FOR_INSTRUMENT,
 };
-use meridian_instrument::placeholder::announcement;
+use meridian_domain::v1::{
+    AskPlatformForInstrumentReply, AskPlatformForInstrumentRequest, EscalateInstrumentRequest,
+    Identifier as PbIdentifier, InstrumentAppliedEvent, ResolveIdentifierReply,
+    ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+};
+use meridian_instrument::complete::keep_platform_answer;
 use meridian_instrument::service::{
-    serve_queries, INSTRUMENT_MISSING, INSTRUMENT_PULLED, INSTRUMENT_REPLACED, RESOLVE_IDENTIFIER,
+    serve_all, INSTRUMENT_APPLIED, INSTRUMENT_MISSING, INSTRUMENT_PULLED, RESOLVE_IDENTIFIER,
     RESOLVE_INSTRUMENT,
 };
 use meridian_instrument::store::Store;
-use meridian_instrument::{resolve_identifier, PostgresStore, Reactor};
+use meridian_instrument::{resolve_identifier, PostgresStore, Reactor, GLOBAL_ID};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -54,15 +58,13 @@ fn now_ns() -> i64 {
 /// The store is deliberately used outside it. `PostgresStore` is synchronous
 /// and drives its own runtime, and a runtime cannot be started from inside
 /// another one: doing it aborts the process rather than returning an error.
-/// Production has the same constraint and answers it the same way, by keeping
-/// store work off the async worker.
 fn runtime() -> Runtime {
     Runtime::new().expect("could not build a runtime")
 }
 
 fn platform() -> Platform {
     let pem = std::fs::read_to_string(required("MERIDIAN_TEST_KEY_PATH"))
-        .expect("could not read the deployment key the instrument store generated");
+        .expect("could not read the deployment key");
 
     Platform::new(
         Config::new(
@@ -135,179 +137,211 @@ async fn awaited<T: Message + Default>(
 }
 
 #[test]
-fn a_placeholder_is_paired_with_an_ins_id_that_replaces_it_everywhere() {
-    // W3.1, W3.7, W3.3, W3.4, W3.5 and W3.8, in one run. Nothing matched, so
-    // the store answers a placeholder and announces it; the conductor pulls,
-    // misses, escalates it; the platform mints an INS- ID paired with it; the
-    // store applies the record and replaces the placeholder.
+fn a_record_minted_here_is_backfilled_with_the_global_id_and_no_key_changes() {
+    // decisions/030 end to end (W3.1, W3.7, W3.3, W3.5): nothing matched, so
+    // the store mints the deployment's own record; the platform comes to hold
+    // the security (here by its own escalation route, the staff's side); a
+    // person asks; the conductor pulls by the FIGI alone; the store adds the
+    // INS- ID as an identifier, and every key stays the deployment's.
     let store = Arc::new(store());
     let platform = Arc::new(platform());
     let identifiers = unknown_identifiers();
     let asking = ResolveIdentifierRequest {
         identifiers: identifiers.clone(),
         as_of_ns: now_ns(),
-        exchange_mic: String::new(),
-        currency: String::new(),
+        ..Default::default()
     };
 
-    let (placeholder, record) = runtime().block_on(async {
+    let (local, global) = runtime().block_on(async {
         let bus = Arc::new(Bus::single(
             "instrument-1",
             Arc::new(MemoryBackend::new()),
             Arc::new(meridian_clock::SystemClock),
         ));
-        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
-        let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
+        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
 
-        // Wired as the two processes wire themselves, less the announcing
-        // loop, which would carry every placeholder earlier runs left in this
-        // database to the platform before this one.
-        serve_queries(&bus, store.clone(), bus.clock());
-        let applying = bus.subscribe(INSTRUMENT_PULLED);
-        tokio::spawn(Reactor::new(bus.clone(), store.clone(), bus.clock()).consume(applying));
-        let misses = bus.subscribe(INSTRUMENT_MISSING);
-        tokio::spawn(Conductor::new(bus.clone(), platform.clone(), bus.clock()).consume(misses));
-
-        let first: ResolveIdentifierReply = ask(&bus, RESOLVE_IDENTIFIER, &asking).await;
-        assert!(
-            first.found,
-            "nothing matched, and a placeholder answers that"
+        // Wired as the two processes wire themselves.
+        let writing = Arc::new(std::sync::Mutex::new(()));
+        serve_all(&bus, store.clone(), bus.clock(), writing.clone());
+        let pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let missing = bus.subscribe(INSTRUMENT_MISSING);
+        tokio::spawn(
+            Reactor::sharing(bus.clone(), store.clone(), bus.clock(), writing)
+                .consume(pulled, missing),
         );
-        assert!(first.placeholder);
+        Conductor::new(bus.clone(), platform.clone(), bus.clock()).serve();
+
+        let first: ResolveIdentifierReply = ask(
+            &bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            &asking,
+        )
+        .await;
+        assert!(
+            first.found && first.minted,
+            "nothing matched, and a record is minted"
+        );
         assert!(
             first.instrument_id.starts_with("LCL-"),
             "{}",
             first.instrument_id
         );
-        let placeholder = first.instrument_id;
+        let local = first.instrument_id;
 
-        // The escalation's answer, as the conductor published it: the
-        // platform's INS- ID, naming the placeholder it replaces.
-        let answered: PullInstrumentReply = awaited(&mut pulled, |reply: &PullInstrumentReply| {
-            reply.replaces_instrument_id == placeholder
-        })
-        .await;
-        let record = answered.instrument.expect("a pairing carries its record");
+        // The platform comes to hold it.
+        let held = platform
+            .escalate(
+                &EscalateInstrumentRequest {
+                    source: "snaptrade".into(),
+                    identifiers: identifiers.clone(),
+                    as_of_ns: now_ns(),
+                    placeholder_instrument_id: local.clone(),
+                    ..Default::default()
+                },
+                now_ns(),
+            )
+            .await
+            .expect("the platform did not answer")
+            .expect("the platform held nothing and minted nothing");
         assert!(
-            record.instrument_id.starts_with("INS-"),
-            "only the platform mints identity, and it mints INS-: {}",
-            record.instrument_id
-        );
-        assert_eq!(
-            record.lifecycle_state,
-            InstrumentLifecycleState::Define as i32,
-            "a stub arrives in DEFINE, awaiting an administrator"
+            held.instrument_id.starts_with("INS-"),
+            "{}",
+            held.instrument_id
         );
 
-        let event: InstrumentReplacedEvent =
-            awaited(&mut replaced, |event: &InstrumentReplacedEvent| {
-                event.replaced_instrument_id == placeholder
-            })
-            .await;
-        assert_eq!(
-            event.instrument.map(|record| record.instrument_id),
-            Some(record.instrument_id.clone())
-        );
-
-        // The set answers the INS- ID now, and says it is not a placeholder.
-        let again: ResolveIdentifierReply = ask(&bus, RESOLVE_IDENTIFIER, &asking).await;
-        assert!(again.found);
-        assert!(!again.placeholder);
-        assert_eq!(again.instrument_id, record.instrument_id);
-
-        // And the placeholder itself answers the INS- record, so nothing a
-        // reader can hold still resolves to an LCL- ID.
-        let by_placeholder: ResolveInstrumentReply = ask(
+        // A person asks.
+        let answer: AskPlatformForInstrumentReply = ask(
             &bus,
-            RESOLVE_INSTRUMENT,
-            &ResolveInstrumentRequest {
-                instrument_id: placeholder.clone(),
+            ASK_PLATFORM_FOR_INSTRUMENT,
+            "meridian.v1.AskPlatformForInstrumentRequest",
+            &AskPlatformForInstrumentRequest {
+                instrument_id: local.clone(),
+                identifiers: identifiers.clone(),
                 as_of_ns: now_ns(),
             },
         )
         .await;
-        assert!(by_placeholder.found);
+        assert!(answer.reachable && answer.found, "{}", answer.detail);
+        let global = answer
+            .instrument
+            .expect("an answer carries its record")
+            .instrument_id;
+        assert_eq!(global, held.instrument_id);
+
+        // Kept: the INS- ID joins the deployment's record as an identifier.
+        let event: InstrumentAppliedEvent =
+            awaited(&mut applied, |event: &InstrumentAppliedEvent| {
+                event.instrument.as_ref().is_some_and(|record| {
+                    record.instrument_id == local
+                        && record.identifiers.iter().any(|identifier| {
+                            identifier.scheme == GLOBAL_ID && identifier.value == global
+                        })
+                })
+            })
+            .await;
+        assert!(event.applied);
+
+        // Every key stays the deployment's: the set resolves to the same
+        // record, which answers itself.
+        let again: ResolveIdentifierReply = ask(
+            &bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            &asking,
+        )
+        .await;
+        assert_eq!(again.instrument_id, local);
+        assert!(!again.minted);
+        let read: ResolveInstrumentReply = ask(
+            &bus,
+            RESOLVE_INSTRUMENT,
+            "meridian.v1.ResolveInstrumentRequest",
+            &ResolveInstrumentRequest {
+                instrument_id: local.clone(),
+                as_of_ns: now_ns(),
+            },
+        )
+        .await;
         assert_eq!(
-            by_placeholder.instrument.map(|record| record.instrument_id),
-            Some(record.instrument_id.clone())
+            read.instrument.map(|record| record.instrument_id),
+            Some(local.clone())
         );
 
-        // The platform keeps the pairing for this deployment, and answers it
-        // when asked by the placeholder.
-        let paired = platform
-            .pull_instrument(&placeholder, now_ns(), now_ns())
-            .await
-            .expect("the platform did not answer")
-            .expect("the platform does not know the pairing it made");
-        assert_eq!(paired.instrument_id, record.instrument_id);
-
-        (placeholder, record)
+        (local, global)
     });
 
     // Outside the runtime: the store's driver starts one of its own.
     assert_eq!(
-        store.version_of(&record.instrument_id).unwrap(),
-        Some(record.version)
+        store.replacement_of(&local).unwrap(),
+        None,
+        "nothing was replaced"
     );
-    assert_eq!(
-        store.replacement_of(&placeholder).unwrap(),
-        Some(record.instrument_id)
+    assert!(
+        store.by_id(&global).unwrap().is_none(),
+        "no record of the platform's own"
     );
 }
 
 /// Ask on the bus and read the answer.
-async fn ask<Q: Message, R: Message + Default>(bus: &Bus, topic: &str, question: &Q) -> R {
-    let payload_type = match topic {
-        RESOLVE_IDENTIFIER => "meridian.v1.ResolveIdentifierRequest",
-        _ => "meridian.v1.ResolveInstrumentRequest",
-    };
+async fn ask<Q: Message, R: Message + Default>(
+    bus: &Bus,
+    topic: &str,
+    payload_type: &str,
+    question: &Q,
+) -> R {
     let (_, payload) = bus
-        .call(topic, payload_type, question.encode_to_vec(), None, None)
+        .call(
+            topic,
+            payload_type,
+            question.encode_to_vec(),
+            None,
+            Some(Duration::from_secs(30)),
+        )
         .await
-        .expect("the instrument store answers");
+        .expect("answered");
     R::decode(&payload[..]).expect("the answer decodes")
 }
 
 #[test]
-fn applying_the_same_record_twice_changes_nothing() {
-    // A retry after an ambiguous failure is the expected case, not the
-    // exceptional one, and it has to be harmless against a real database and
-    // not only against a HashMap.
+fn keeping_the_same_answer_twice_changes_nothing() {
+    // A redelivery is the expected case, not the exceptional one, and it has
+    // to be harmless against a real database and not only against a HashMap.
     let store = store();
     let platform = platform();
-
+    let identifiers = unknown_identifiers();
     let minted = resolve_identifier(
         &store,
         &ResolveIdentifierRequest {
-            identifiers: unknown_identifiers(),
+            identifiers: identifiers.clone(),
             as_of_ns: now_ns(),
-            exchange_mic: String::new(),
-            currency: String::new(),
+            ..Default::default()
         },
+        "end-to-end",
         now_ns(),
     )
     .unwrap()
-    .minted
-    .expect("a set nobody has seen mints a placeholder");
-    let event = announcement(&minted, "end-to-end", now_ns());
+    .reply
+    .instrument_id;
 
-    let record = match runtime()
-        .block_on(platform.react_to_miss(&event, now_ns()))
+    let record = runtime()
+        .block_on(platform.escalate(
+            &EscalateInstrumentRequest {
+                source: "snaptrade".into(),
+                identifiers,
+                as_of_ns: now_ns(),
+                placeholder_instrument_id: minted.clone(),
+                ..Default::default()
+            },
+            now_ns(),
+        ))
         .unwrap()
-    {
-        Reaction::Minted(record) => *record,
-        other => panic!("expected a mint, got {other:?}"),
-    };
-    assert!(
-        record.instrument_id.starts_with("INS-"),
-        "{}",
-        record.instrument_id
-    );
+        .expect("the platform held nothing and minted nothing");
 
-    assert!(meridian_instrument::apply(&store, record.clone(), now_ns())
+    assert!(keep_platform_answer(&store, &minted, &record, now_ns())
         .unwrap()
-        .changed());
-    assert!(!meridian_instrument::apply(&store, record, now_ns())
+        .is_some());
+    assert!(keep_platform_answer(&store, &minted, &record, now_ns())
         .unwrap()
-        .changed());
+        .is_none());
 }

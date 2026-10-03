@@ -2,8 +2,9 @@
 // resolution misses.
 //
 // Derived from workflows W1 (security master administration) and W3 (instrument
-// resolution and escalation). Every message here traces to a matrix row; see
-// matrix/matrix.tsv.
+// resolution and completion in a deployment; contract v10, decisions/030: a
+// deployment mints its own instrument IDs, and a person completes its records).
+// Every message here traces to a matrix row; see matrix/matrix.tsv.
 //
 // The scope boundary is load-bearing: this is identity, mapping and structure.
 // Prices, yields, ratings, volumes and sector data are client-licensed and live
@@ -13,6 +14,8 @@
 syntax = "proto3";
 
 package meridian.v1;
+
+import "meridian/v1/sidecar.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The record
@@ -101,13 +104,13 @@ message Identifier {
 // a different instrument. A consumer resolving a historical date must key on
 // effective time, not on when it happened to learn the mapping.
 message InstrumentRecord {
-  // Canonical identifier, "INS-..." and minted only by the central authority.
-  //
-  // A deployment's stores may also hold its own placeholder, "LCL-...", which
-  // its instrument store mints for an identifier set nothing matched (W3.7)
-  // and which the INS- ID replaces in everything live when it arrives (W3.8).
-  // A placeholder is never minted by the authority and never leaves the
-  // deployment except on its own escalation.
+  // The record's key for life. On the platform's master, "INS-...", minted
+  // by it (W1). In a deployment, the deployment's own (decisions/030): "LCL-"
+  // for a record its instrument store minted (W3.7), which says who minted it
+  // and nothing about whether it is resolved; or the "INS-" ID of a record
+  // applied from the platform before contract v10, which it keeps. A global
+  // ID the platform answers later joins `identifiers` (scheme
+  // `open_meridian`), never replacing this.
   string instrument_id = 1;
 
   // The full identifier set. An amend replaces this authoritatively.
@@ -137,9 +140,91 @@ message InstrumentRecord {
   // cannot be back-dated.
   int64 record_time_ns = 10;
 
+  // In a deployment (contract v10): where each value in force came from --
+  // the asset class, the currency, the description and each identifier --
+  // with the person who set or accepted it, or the plugin that reported it
+  // (W3, requirement 1). Empty on the platform's master, whose changelog
+  // says it (W1.7).
+  repeated InstrumentValueSource sources = 12;
+
+  // In a deployment (contract v10): values offered by a plugin's source
+  // (W3.1) or the platform (W3.3), in force only when a person accepts one
+  // (W3.10). A later offer never overwrites a value in force.
+  repeated OfferedValue offers = 13;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
+}
+
+// Which value of a deployment's instrument record (W3, contract v10).
+enum InstrumentField {
+  INSTRUMENT_FIELD_UNSPECIFIED = 0;
+  INSTRUMENT_FIELD_ASSET_CLASS = 1;
+  INSTRUMENT_FIELD_CURRENCY = 2;
+  INSTRUMENT_FIELD_DESCRIPTION = 3;
+  // One of its identifiers, named beside the field.
+  INSTRUMENT_FIELD_IDENTIFIER = 4;
+}
+
+// One value for a deployment's record, set or offered, with where it came
+// from (W3.10, W3.1, W3.3).
+message InstrumentValue {
+  oneof value {
+    // One of the closed list; never unspecified.
+    AssetClass asset_class = 1;
+    // An ISO 4217 code, three capital letters; never a pseudo-currency such
+    // as BASE.
+    string currency = 2;
+    string description = 3;
+    Identifier identifier = 4;
+  }
+
+  // Where the value came from, in words: a statement, a prospectus, "ISO
+  // 4217", "the platform, record INS-... version 3". Required on a value a
+  // person sets.
+  string source = 5;
+}
+
+// Where a value in force on a deployment's record came from (W3,
+// requirements 1 and 3).
+message InstrumentValueSource {
+  InstrumentField field = 1;
+
+  // For INSTRUMENT_FIELD_IDENTIFIER: which identifier.
+  Identifier identifier = 2;
+
+  // In words, as the value was set with.
+  string source = 3;
+
+  // The person who set or accepted it: the deployment-local subject core
+  // stamped from the command's envelope (W4.9), never typed. Empty for an
+  // identifier a plugin reported, the platform's global ID, and a value
+  // applied from the platform before contract v10.
+  string person = 4;
+
+  // The plugin instance whose resolve joined the identifier (W3.1). Empty
+  // otherwise.
+  string instance_id = 5;
+
+  // When the store recorded it.
+  int64 recorded_at_ns = 6;
+
+  // Why a value held was changed, where given.
+  string note = 7;
+}
+
+// A value offered for a deployment's record (W3.1, W3.3), shown beside its
+// field and in force only when a person accepts it (W3.10).
+message OfferedValue {
+  InstrumentValue value = 1;
+
+  // The plugin instance whose source stated it. Empty for the platform's
+  // answer and for an offer the store derives itself (ISO 4217 for an
+  // `iso4217` identifier).
+  string instance_id = 2;
+
+  int64 offered_at_ns = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,6 +509,15 @@ message ResolveIdentifierRequest {
   // Narrows a symbol match. Empty means unconstrained.
   string exchange_mic = 3;
   string currency = 4;
+
+  // What the plugin's source states of the security, where it states it,
+  // and nothing it would have to guess (principle 14). Kept on the record as
+  // offers with the instance as their source, in force only when a person
+  // accepts them (W3.1, contract v10). Unspecified, or empty, is not stated.
+  AssetClass stated_asset_class = 5;
+  // An ISO 4217 code.
+  string stated_currency = 6;
+  string stated_description = 7;
 }
 
 message ResolveIdentifierReply {
@@ -432,11 +526,11 @@ message ResolveIdentifierReply {
   // Set only when found is false.
   MissReason miss_reason = 3;
 
-  // True when nothing matched and instrument_id is the deployment's LCL-
-  // placeholder for the set (W3.7), which a holding may be recorded against
-  // until its INS- ID replaces it. found is true alongside it. An ambiguous
-  // resolve never answers a placeholder.
-  bool placeholder = 4;
+  // True when nothing matched and this resolve minted instrument_id, the
+  // deployment's record for the set (W3.7, contract v10); found is true
+  // alongside it. A later resolve of the same identifiers matches the
+  // record, and is not minted. Until v10, true meant a placeholder.
+  bool minted = 4;
 }
 
 // Forward resolution: an instrument identifier to its record.
@@ -475,14 +569,15 @@ message MissingInstrumentDetectedEvent {
   MissReason reason = 6;
   int64 observed_at_ns = 7;
 
-  // The deployment's LCL- placeholder for these identifiers, when its
-  // instrument store minted or re-announced one (W3.7). Empty for an
-  // ambiguous miss, which has no placeholder.
-  string placeholder_instrument_id = 8;
-
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 2;
+
+  // Once the deployment's placeholder its instrument store announced on this
+  // topic (W3.7 until contract v10); a deployment's records are its own and
+  // nothing is announced (decisions/030).
+  reserved 8;
+  reserved "placeholder_instrument_id";
 }
 
 // Reply to a pull of one instrument from the central authority.
@@ -490,10 +585,12 @@ message PullInstrumentReply {
   bool found = 1;
   InstrumentRecord instrument = 2;
 
-  // On the instrument-pulled event: the deployment's placeholder this record
-  // replaces (W3.3, W3.4), so the instrument store can replace it (W3.8).
-  // Empty when the record replaces nothing.
-  string replaces_instrument_id = 3;
+  // On the instrument-pulled event: the deployment's record a person asked
+  // about (W3.3), on which the instrument store keeps this record's values
+  // as offers and adds its ID as an identifier, never replacing the
+  // deployment's key (W3.5, contract v10). Until v10, the placeholder it
+  // replaced.
+  string for_instrument_id = 3;
 }
 
 // Reply to a pull resolving identifiers against the central authority.
@@ -503,10 +600,11 @@ message PullIdentifierReply {
   MissReason miss_reason = 3;
 }
 
-// Ask the central authority to pair a deployment's placeholder with an
-// instrument (W3.4): one sharing an identifier in force on the date, or a stub
-// minted from these identifiers for an administrator to complete. Idempotent
-// per placeholder: asking again answers the same pairing.
+// The platform's surface for pairing a deployment's ID with an instrument
+// (W3.4), which a deployment does not call from contract v10: one sharing an
+// identifier in force on the date, or a stub minted from these identifiers
+// for an administrator to complete. Idempotent per deployment ID: asking
+// again answers the same pairing.
 message EscalateInstrumentRequest {
   string source = 1;
   AssetClass asset_class = 7;
@@ -514,7 +612,7 @@ message EscalateInstrumentRequest {
   int64 as_of_ns = 4;
   string requesting_deployment_id = 5;
 
-  // The deployment's LCL- placeholder for these identifiers.
+  // The deployment's ID for these identifiers.
   string placeholder_instrument_id = 6;
 
   // Once a string, and free text; retired for the enum
@@ -525,41 +623,264 @@ message EscalateInstrumentRequest {
 message EscalateInstrumentReply {
   InstrumentRecord instrument = 1;
 
-  // False when the authority paired the placeholder with an instrument it
+  // False when the authority paired the deployment's ID with an instrument it
   // already held rather than minting one. The caller applies the record
   // either way; this is for the operator.
   bool minted = 2;
 
-  // The placeholder the instrument replaces, echoed from the request.
+  // The deployment's ID it pairs with, echoed from the request.
   string replaces_instrument_id = 3;
 
   // True when the identifiers point at more than one instrument, or agree on
   // one identifier and contradict another of the same scheme. Nothing is
-  // paired or minted, instrument is empty, and staff decide; the placeholder
-  // stays in use until they have.
+  // paired or minted, instrument is empty, and staff decide.
   bool conflict = 4;
 }
 
-// A record reached the local replica, by pull or by mint.
+// A record of the deployment's reached a new version (W3.5): minted, joined
+// by an identifier, completed, merged, or answered by the platform.
 message InstrumentAppliedEvent {
   InstrumentRecord instrument = 1;
 
-  // False when the apply was a no-op because the held version was already at or
-  // above this one.
+  // False when nothing changed: a redelivery, or a version already held.
   bool applied = 2;
 
   int64 applied_at_ns = 3;
 }
 
-// A deployment's placeholder was replaced by the instrument that it stood for
-// (W3.8). Stores keyed by instrument move what they hold under the placeholder
-// onto the instrument (W3.9); records of what was reported keep it.
+// A deployment's record was replaced by another (W3.8): from contract v10, a
+// record a person merged into the one that stays (W3.13); before it, a
+// placeholder by its INS- ID. Stores keyed by instrument move what they hold
+// under it onto the one that stays (W3.9, W9.9); records of what was
+// reported keep it.
 message InstrumentReplacedEvent {
-  // The LCL- placeholder.
+  // The record replaced.
   string replaced_instrument_id = 1;
 
   // What replaces it.
   InstrumentRecord instrument = 2;
 
   int64 replaced_at_ns = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3, contract v10 — a deployment completes its own records, at the dashboard
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One record's values, set against the version it was read at (W3.10).
+message InstrumentCompletion {
+  string instrument_id = 1;
+
+  // The record's version when it was read; a record changed since is refused
+  // alone (REFUSAL_REASON_RECORD_CHANGED).
+  int64 against_version = 2;
+
+  // Each value with its source. A value already in force, sent again, is no
+  // change.
+  repeated InstrumentValue values = 3;
+
+  // Why: required where a value changes one already held
+  // (REFUSAL_REASON_REASON_REQUIRED); optional for filling a blank.
+  string note = 4;
+}
+
+// W3.10. For a deployment admin, the person stamped on the envelope.
+message CompleteInstrumentsRequest {
+  // Up to 500, each its own result.
+  repeated InstrumentCompletion completions = 1;
+}
+
+message InstrumentCompletionResult {
+  string instrument_id = 1;
+
+  // The record at its new version, when completed.
+  InstrumentRecord instrument = 2;
+
+  // When refused: the reason and each field, by its path in the completion
+  // (`values[0].currency`, `values[1].source`, `note`, `against_version`).
+  Refusal refusal = 3;
+
+  // The refusal in words, for the person.
+  string detail = 4;
+}
+
+message CompleteInstrumentsReply {
+  // One per completion, in the request's order.
+  repeated InstrumentCompletionResult results = 1;
+}
+
+// W3.11. For a deployment admin.
+message ListInstrumentsToCompleteRequest {
+  // Records complete as well; otherwise only those lacking something.
+  bool include_complete = 1;
+
+  // One record by its ID, as the page opening it reads it; empty for the
+  // list.
+  string instrument_id = 4;
+
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+// A record and what it lacks (W3.11).
+message InstrumentToComplete {
+  InstrumentRecord instrument = 1;
+
+  // An asset class or a currency, which the book requires (W9.1); a
+  // description; a symbol, where the record has a source that names one.
+  repeated InstrumentField lacks = 2;
+
+  // An asset class and a currency in force.
+  bool complete_for_book = 3;
+
+  // Complete for the book, a description, and a symbol where one exists.
+  bool complete = 4;
+}
+
+// Identifiers that met more than one record, or an identifier another record
+// carries (W3.1, W3.2, W3.10): not a match, and listed until a merge
+// settles it (W3.13).
+message InstrumentConflict {
+  // The identifiers that disagree.
+  repeated Identifier identifiers = 1;
+
+  // The records they meet, each as it is now.
+  repeated string instrument_ids = 2;
+
+  // The plugin instance that reported it; empty where a person's completion
+  // met it.
+  string reported_by = 3;
+
+  int64 first_seen_ns = 4;
+  int64 last_seen_ns = 5;
+}
+
+// How many identifiers of a licensed scheme the deployment's records carry
+// (W3.11): CUSIP Global Services counts toward its 500-identifier threshold.
+message LicensedIdentifierCount {
+  // `cusip`, `isin` or `sedol`.
+  string scheme = 1;
+  int64 count = 2;
+}
+
+message ListInstrumentsToCompleteReply {
+  // Those the book cannot use first, then the rest lacking something.
+  repeated InstrumentToComplete instruments = 1;
+  string next_cursor = 2;
+
+  // Every conflict not yet settled.
+  repeated InstrumentConflict conflicts = 3;
+
+  // Across the deployment, whatever the page.
+  int64 incomplete_for_book = 4;
+  int64 incomplete = 5;
+  repeated LicensedIdentifierCount licensed_identifiers = 6;
+}
+
+// W3.12.
+message ReadInstrumentHistoryRequest {
+  string instrument_id = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+// One change a version made.
+message InstrumentChange {
+  InstrumentField field = 1;
+
+  // For INSTRUMENT_FIELD_IDENTIFIER: which identifier.
+  Identifier identifier = 2;
+
+  // As text: an asset class by its name (`cash`), a currency, a
+  // description, an identifier's value. Empty where there was none, or
+  // where an identifier joined.
+  string before = 3;
+  string after = 4;
+
+  string source = 5;
+}
+
+// One version of a deployment's record, append-only (W3.12).
+message InstrumentVersion {
+  string instrument_id = 1;
+  int64 version = 2;
+
+  // What made it: mint, join, complete, platform, merge, merged-into,
+  // migrate. An open list a reader takes as data.
+  string operation = 3;
+
+  repeated InstrumentChange changes = 4;
+
+  // The person, stamped by core; empty for a plugin's report or a
+  // migration.
+  string person = 5;
+
+  // The plugin instance whose resolve made it, where one did.
+  string instance_id = 6;
+
+  string note = 7;
+  int64 record_time_ns = 8;
+
+  // For a merge, the other record: the one merged in, or the one this was
+  // merged into.
+  string merged_instrument_id = 9;
+}
+
+message ReadInstrumentHistoryReply {
+  // Newest first.
+  repeated InstrumentVersion versions = 1;
+  string next_cursor = 2;
+}
+
+// W3.13. For a deployment admin, the person stamped on the envelope.
+message MergeInstrumentsRequest {
+  // The record that stays, and the version it was read at.
+  string kept_instrument_id = 1;
+  int64 kept_version = 2;
+
+  // The record merged into it, replaced by it (W3.8).
+  string merged_instrument_id = 3;
+  int64 merged_version = 4;
+
+  // Fields where both carry a value, they differ, and the merged record's
+  // stands; any other differing field keeps the kept record's.
+  repeated InstrumentField take_from_merged = 5;
+
+  // Required: why they are one security.
+  string note = 6;
+}
+
+message MergeInstrumentsReply {
+  // The record that stays, at its new version.
+  InstrumentRecord instrument = 1;
+}
+
+// W3.3. For a person at the dashboard; the conductor alone reaches the
+// platform (decisions/011).
+message AskPlatformForInstrumentRequest {
+  // The deployment's record asked about.
+  string instrument_id = 1;
+
+  // The record's identifiers. The conductor sends the platform only the
+  // open ones -- the global ID, a FIGI, an ISO 4217 code -- never a licensed
+  // scheme's value nor a source-scoped symbol.
+  repeated Identifier identifiers = 2;
+
+  // The date the record's identifiers are asked about. Zero means now.
+  int64 as_of_ns = 3;
+}
+
+message AskPlatformForInstrumentReply {
+  // False when the platform could not be reached; `detail` says why, and
+  // completing the record works without it.
+  bool reachable = 1;
+
+  // The platform holds a record by one of the identifiers asked with.
+  bool found = 2;
+
+  // Its record: its ID joins the deployment's record as an identifier, and
+  // the rest is offered (W3.5).
+  InstrumentRecord instrument = 3;
+
+  string detail = 4;
 }

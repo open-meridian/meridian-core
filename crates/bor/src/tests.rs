@@ -20,7 +20,9 @@ const ACC: &str = "ACC-1";
 const AAPL: &str = "INS-01J8XQ4M7K0000000000AAPL";
 const USD: &str = "INS-01J8XQ4M7K00000000CASHUSD";
 
-fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
+/// The book alone, with no instrument store beside it: every command naming
+/// an instrument is refused to be tried again (contract v10).
+fn wired_alone() -> (Arc<Bus>, Arc<MemoryStore>) {
     let bus = Arc::new(Bus::single(
         "operations-sample-1",
         Arc::new(MemoryBackend::new()),
@@ -391,32 +393,31 @@ async fn lots_that_do_not_sum_are_refused() {
     );
 }
 
+/// The record ID SnapTrade reported without an asset class: held, and
+/// lacking its class and currency until the deployment admin completes it.
+const SNAP: &str = "LCL-01J8XQ4M7K00000000000001";
+const ZZTP_LOCAL: &str = "LCL-01J8XQ4M7K0000000000ZZTP";
+const ZZTP_KEPT: &str = "LCL-01J8XQ4M7K0000000000ZZT2";
+
 /// The book as an operations plugin's sidecar reaches it, beside an
-/// instrument store whose records say AAPL is an equity and USD is cash, and
-/// which has no record of anything else.
-fn wired_with_records() -> (Arc<Bus>, Arc<MemoryStore>) {
-    let (bus, store) = wired();
+/// instrument store whose records say AAPL is an equity in USD, USD is cash
+/// in USD, the two ZZTOP records equities in USD, and SNAP1 nothing yet; and
+/// which holds no record of anything else.
+fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
+    let (bus, store) = wired_alone();
     bus.serve(RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
-        let record = |asset_class: AssetClass, identifiers: Vec<Identifier>| InstrumentRecord {
+        let record = |asset_class: AssetClass, currency: &str| InstrumentRecord {
             instrument_id: asked.instrument_id.clone(),
             asset_class: asset_class as i32,
-            identifiers,
+            currency: currency.into(),
             version: 1,
             ..Default::default()
         };
         let instrument = match asked.instrument_id.as_str() {
-            AAPL => Some(record(AssetClass::Equity, vec![])),
-            // A currency's record may name no asset class: its identifier
-            // says it is cash.
-            USD => Some(record(
-                AssetClass::Unspecified,
-                vec![Identifier {
-                    scheme: "iso4217".into(),
-                    value: "USD".into(),
-                    ..Default::default()
-                }],
-            )),
+            AAPL | ZZTP_LOCAL | ZZTP_KEPT => Some(record(AssetClass::Equity, "USD")),
+            USD => Some(record(AssetClass::Cash, "USD")),
+            SNAP => Some(record(AssetClass::Unspecified, "")),
             _ => None,
         };
         Ok((
@@ -429,6 +430,10 @@ fn wired_with_records() -> (Arc<Bus>, Arc<MemoryStore>) {
         ))
     });
     (bus, store)
+}
+
+fn wired_with_records() -> (Arc<Bus>, Arc<MemoryStore>) {
+    wired()
 }
 
 /// The fields a refusal names as left out.
@@ -526,28 +531,85 @@ async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lots_are_not_required_where_the_record_cannot_say_it_is_not_cash() {
-    // A placeholder, or a record naming no asset class: flagged by
-    // operations, never blocking (ruled 2026-10-02), so the book does not
-    // ask for lots it cannot know apply.
-    let (bus, _) = wired_with_records();
+async fn an_instrument_whose_record_lacks_its_class_or_currency_is_refused_naming_both() {
+    // Contract v10 (the completion spec's requirement 15 and Q7): "flagged,
+    // not blocking" ends. A record SnapTrade reported without an asset class,
+    // and one the store does not hold, each lack both.
+    let (bus, store) = wired();
     let mut request = opening();
     request.positions.push(OpeningPosition {
-        instrument_id: "LCL-1".into(),
+        instrument_id: SNAP.into(),
         side: HoldingSide::Long as i32,
         trade_date_quantity: d("40"),
         settled_quantity: d("40"),
         ..Default::default()
     });
-    send(
-        &bus,
-        RECORD_OPENING_BALANCE,
-        "meridian.v1.RecordOpeningBalanceRequest",
-        &request,
-        Some(PERSON),
-    )
-    .await
-    .unwrap();
+    request.positions.push(OpeningPosition {
+        instrument_id: "LCL-01J8XQ4M7K0000000000NONE".into(),
+        side: HoldingSide::Long as i32,
+        trade_date_quantity: d("1"),
+        settled_quantity: d("1"),
+        ..Default::default()
+    });
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(
+        fields(&refused),
+        [
+            "positions[2].instrument.asset_class",
+            "positions[2].instrument.currency",
+            "positions[3].instrument.asset_class",
+            "positions[3].instrument.currency",
+        ]
+    );
+    assert!(store.journal(ACC).unwrap().is_empty(), "nothing applied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_the_instrument_store_cannot_answer_for_is_refused_to_be_tried_again() {
+    // Never admitted unchecked, and nothing recorded (contract v10).
+    let (bus, store) = wired_alone();
+    let refused = opening_refused(&bus, &opening()).await;
+    assert_eq!(
+        code(&refused),
+        Some(RefusalReason::ReferenceUnavailable),
+        "{refused}"
+    );
+    assert!(store.journal(ACC).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_acting_through_a_client_is_recorded_with_the_delegation_and_the_client() {
+    // sdk-contract/the-book-records-the-delegation: the entry's actor names
+    // the person, the delegation and the client, from the envelope's stamp.
+    let (bus, _) = wired();
+    let stamp = Stamp {
+        acting_for_subject: PERSON.into(),
+        acting_through_delegation: "DLG-1".into(),
+        acting_through_client: "meridian on ada-laptop".into(),
+        account_scope: None,
+    };
+    let (_, payload) = bus
+        .call_stamped(
+            RECORD_OPENING_BALANCE,
+            "meridian.v1.RecordOpeningBalanceRequest",
+            opening().encode_to_vec(),
+            None,
+            None,
+            &stamp,
+        )
+        .await
+        .unwrap();
+    let reply = BookEntryReply::decode(&payload[..]).unwrap();
+    let actor = reply.entry.unwrap().actor.unwrap();
+    assert_eq!(
+        actor.kind,
+        Some(actor::Kind::Person(PersonActor {
+            subject: PERSON.into(),
+            delegation_id: "DLG-1".into(),
+            client_name: "meridian on ada-laptop".into(),
+        }))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1316,12 +1378,12 @@ async fn attributes_are_set_for_a_person_before_or_after_an_opening_balance() {
 // ── W9.9 ────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
+async fn a_merged_record_is_followed_its_lots_keeping_their_identifiers() {
     let (bus, store) = wired();
     let store: Arc<dyn Store> = store;
     tokio::spawn(follow_replacements(bus.clone(), store.clone()));
-    let placeholder = "LCL-01J8XQ4M7K0000000000ZZTP";
-    let instrument = "INS-01J8XQ4M7K0000000000ZZTP";
+    let placeholder = ZZTP_LOCAL;
+    let instrument = ZZTP_KEPT;
     let mut request = opening();
     request.positions[0].instrument_id = placeholder.into();
     let opened = BookEntryReply::decode(
@@ -1336,10 +1398,8 @@ async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
         .unwrap()[..],
     )
     .unwrap();
-    // An unresolved holding enters the opening balance under its placeholder,
-    // flagged, and is reconciled like any position (the ruling of 2026-10-01).
-    assert!(position(&opened, placeholder).placeholder);
-    assert!(!position(&opened, USD).placeholder);
+    // A record the deployment minted is a record like any other
+    // (decisions/030): it enters the opening balance once it is complete.
     let lot_id = position(&opened, placeholder).lots[0].lot_id.clone();
     let mut on_it = aapl_break();
     on_it.subject = Some(record_break_request::Subject::Position(PositionKey {
@@ -1347,7 +1407,10 @@ async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
         side: HoldingSide::Long as i32,
     }));
     record_break(&bus, &on_it).await.unwrap();
-    assert_eq!(store.placeholder_instruments().unwrap(), vec![placeholder]);
+    assert!(store
+        .instruments_held()
+        .unwrap()
+        .contains(&placeholder.to_string()));
     let mut positions = bus.subscribe(POSITION_CHANGED);
 
     bus.publish(
@@ -1375,7 +1438,7 @@ async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
             "CORR-REPLACED"
         );
         let event = PositionChangedEvent::decode(&delivered.envelope.payload[..]).unwrap();
-        assert_eq!(event.entry.as_ref().unwrap().kind, "placeholder-moved");
+        assert_eq!(event.entry.as_ref().unwrap().kind, "instrument-merged");
         seen.push(event.position.unwrap());
     }
     let moved = seen
@@ -1383,7 +1446,6 @@ async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
         .find(|held| held.instrument_id == instrument)
         .unwrap();
     assert_eq!(read(&moved.trade_date_quantity), "12.5");
-    assert!(!moved.placeholder, "followed, it is flagged no longer");
     assert_eq!(moved.lots[0].lot_id, lot_id, "the lot keeps its identifier");
     assert_eq!(read(&moved.lots[0].original_quantity), "12.5");
     let tombstone = seen
@@ -1392,7 +1454,10 @@ async fn a_placeholder_is_followed_its_lots_keeping_their_identifiers() {
         .unwrap();
     assert!(tombstone.removed);
 
-    assert!(store.placeholder_instruments().unwrap().is_empty());
+    assert!(!store
+        .instruments_held()
+        .unwrap()
+        .contains(&placeholder.to_string()));
     let read = store.positions(&everything()).unwrap();
     assert!(read
         .records

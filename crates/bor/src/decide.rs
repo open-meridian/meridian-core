@@ -45,6 +45,11 @@ pub struct Context {
     /// The person the sidecar vouched for and stamped (W4.9); empty when the
     /// plugin acted as itself.
     pub acting_for: String,
+    /// The delegation and the client that person acted through, as the
+    /// sidecar stamped them beside the person (W4.9, contract v10); empty for
+    /// a person at the dashboard and for a plugin acting as itself.
+    pub acting_through_delegation: String,
+    pub acting_through_client: String,
     pub correlation_id: String,
     pub event_time_ns: i64,
     pub received_at_ns: i64,
@@ -52,16 +57,25 @@ pub struct Context {
     /// The instrument store's version of each instrument the command names,
     /// where it has one.
     pub reference_versions: BTreeMap<String, i64>,
-    /// Whether each instrument the command names is cash, as its record says
-    /// (W9.1, contract v9): `true` for asset class cash or a currency
-    /// identifier, `false` for any other asset class. Absent where the record
-    /// cannot say -- a placeholder, a record naming no asset class, the
-    /// instrument store not answering -- and then its lots are not required
-    /// (the completion form's question 2, ruled 2026-10-02: flagged, not
-    /// blocking).
-    pub cash: BTreeMap<String, bool>,
+    /// What each instrument's record says, where the instrument store holds
+    /// one (W9.1, contract v10). Absent for a record the store does not hold,
+    /// which lacks everything.
+    pub records: BTreeMap<String, RecordSays>,
+    /// The instrument store did not answer in time: the command cannot be
+    /// checked, and is refused to be tried again (contract v10).
+    pub reference_unavailable: bool,
     /// The control partition's sequence in force (decisions/024's note).
     pub control_sequence: u64,
+}
+
+/// What an instrument's record says that the book requires (W9.1, contract
+/// v10): an asset class and a currency in force, and whether its class is
+/// cash, which takes away the lots requirement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordSays {
+    pub asset_class: bool,
+    pub currency: bool,
+    pub cash: bool,
 }
 
 impl Context {
@@ -74,9 +88,44 @@ impl Context {
             } else {
                 actor::Kind::Person(PersonActor {
                     subject: self.acting_for.clone(),
+                    delegation_id: self.acting_through_delegation.clone(),
+                    client_name: if self.acting_through_delegation.is_empty() {
+                        String::new()
+                    } else {
+                        self.acting_through_client.clone()
+                    },
                 })
             }),
         }
+    }
+
+    /// Refused to be tried again when the instrument store did not answer:
+    /// a command the book cannot check is never admitted unchecked (contract
+    /// v10; the completion spec's Q7).
+    fn references_answered(&self) -> Result<()> {
+        if self.reference_unavailable {
+            return Err(StoreError::refused(
+                RefusalReason::ReferenceUnavailable,
+                "the instrument store did not answer in time, so the instruments this names \
+                 could not be checked; nothing was recorded, and the same command may be sent \
+                 again",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Each instrument field the book requires that `instrument`'s record
+    /// lacks, by its path under `field` (W9.1, contract v10).
+    fn instrument_missing(&self, field: &str, instrument: &str) -> Vec<String> {
+        let says = self.records.get(instrument).copied().unwrap_or_default();
+        let mut missing = Vec::new();
+        if !says.asset_class {
+            missing.push(format!("{field}.instrument.asset_class"));
+        }
+        if !says.currency {
+            missing.push(format!("{field}.instrument.currency"));
+        }
+        missing
     }
 
     fn cause(&self) -> ChangeCause {
@@ -283,6 +332,7 @@ pub fn opening_balance(
         }
         _ => {}
     }
+    ctx.references_answered()?;
     let missing = opening_missing(ctx, request);
     if !missing.is_empty() {
         return Err(StoreError::incomplete("the opening balance", missing));
@@ -346,10 +396,10 @@ pub fn opening_balance(
 /// Every field an opening balance leaves out that the book requires (W9.1,
 /// contract v9; the product owner's required list of 2026-10-02), by its
 /// path in the command: of the balance, its date and a named source; of each
-/// position, its instrument, side and quantity, its settled quantity, each
-/// pending quantity with its value date, the whole quantity settled or
-/// pending on a date, and its lots -- but on cash, or where the instrument's
-/// record cannot say whether it is cash -- each with its quantity, cost and
+/// position, its instrument with its record's asset class and currency
+/// (contract v10), side and quantity, its settled quantity, each pending
+/// quantity with its value date, the whole quantity settled or pending on a
+/// date, and its lots -- but on cash -- each with its quantity, cost and
 /// acquisition date. A value present but malformed is not missing: it is
 /// refused with its words when the lines are made.
 fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<String> {
@@ -370,6 +420,8 @@ fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<
         let field = format!("positions[{index}]");
         if position.instrument_id.is_empty() {
             missing.push(format!("{field}.instrument_id"));
+        } else {
+            missing.extend(ctx.instrument_missing(&field, &position.instrument_id));
         }
         if position.side == HoldingSide::Unspecified as i32 {
             missing.push(format!("{field}.side"));
@@ -403,8 +455,11 @@ fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<
         if rest().is_some_and(|rest| !rest.is_zero()) {
             missing.push(format!("{field}.pending"));
         }
-        let cash = ctx.cash.get(&position.instrument_id).copied();
-        if position.lots.is_empty() && cash == Some(false) {
+        // Whether lots apply is the record's to say: cash has none. A record
+        // with no class is refused naming its class above, and asked for its
+        // lots once it says.
+        let says = ctx.records.get(&position.instrument_id).copied();
+        if position.lots.is_empty() && says.is_some_and(|says| says.asset_class && !says.cash) {
             missing.push(format!("{field}.lots"));
         }
         for (at, lot) in position.lots.iter().enumerate() {
@@ -1258,19 +1313,17 @@ fn adjustment_body(
             "an adjustment carries movement lines, basis adjustments or both".into(),
         ));
     }
-    let missing: Vec<String> = adjustment
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.opens_lot.is_some())
-        .flat_map(|(index, line)| {
-            terms_missing(
-                &format!("adjustment.lines[{index}]"),
-                line.opens_lot.as_ref(),
-                ".opens_lot",
-            )
-        })
-        .collect();
+    ctx.references_answered()?;
+    let mut missing: Vec<String> = Vec::new();
+    for (index, line) in adjustment.lines.iter().enumerate() {
+        let field = format!("adjustment.lines[{index}]");
+        if !line.instrument_id.is_empty() {
+            missing.extend(ctx.instrument_missing(&field, &line.instrument_id));
+        }
+        if line.opens_lot.is_some() {
+            missing.extend(terms_missing(&field, line.opens_lot.as_ref(), ".opens_lot"));
+        }
+    }
     if !missing.is_empty() {
         return Err(StoreError::incomplete("the adjustment", missing));
     }
@@ -1558,13 +1611,18 @@ pub fn set_attribute(
     )
 }
 
-// ── W9.9: a placeholder followed ────────────────────────────────────────────
+// ── W9.9: a merged record followed ──────────────────────────────────────────
 
-/// Move what the account holds under `placeholder` onto `instrument`: lines
-/// closing each bucket and lot under the placeholder and opening the same
-/// under the instrument, the lots keeping their identifiers, costs and
-/// dates; the placeholder's positions kept as tombstones; the open breaks
-/// naming it brought onto the instrument. The book's own act: no person, no
+/// The kind of entry that moves what a merged record held (W9.9, contract
+/// v10). v8 and v9 journalled `placeholder-moved`, which stands as recorded.
+pub const INSTRUMENT_MERGED: &str = "instrument-merged";
+
+/// Move what the account holds under `placeholder`, a record merged into
+/// another (or before v10 a placeholder replaced by its INS- ID), onto
+/// `instrument`: lines closing each bucket and lot under the one and opening
+/// the same under the other, the lots keeping their identifiers, costs and
+/// dates; the replaced record's positions kept as tombstones; the open breaks
+/// naming it brought onto the record that stays. The book's own act: no person, no
 /// instance, nothing to refuse. `None` when the account holds nothing under
 /// it.
 pub fn follow_replacement(
@@ -1694,7 +1752,7 @@ pub fn follow_replacement(
         ctx,
         Draft {
             entry_id: ctx.mint(ids::ENTRY),
-            kind: "placeholder-moved",
+            kind: INSTRUMENT_MERGED,
             effective_date: ctx.today(),
             reason: String::new(),
             break_ids,

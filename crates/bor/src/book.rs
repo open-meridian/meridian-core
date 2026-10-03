@@ -178,9 +178,6 @@ impl PositionState {
             effective_date: self.effective_date.clone(),
             last_change: self.last_change.clone(),
             removed: self.removed,
-            placeholder: self
-                .instrument_id
-                .starts_with(crate::ids::PLACEHOLDER_PREFIX),
             encumbrances: self.encumbrances.clone(),
             free_quantity: self.free()?.map(numbers::wire).unwrap_or_default(),
             free_basis: FreeBasis::Settled as i32,
@@ -647,7 +644,7 @@ impl Book {
     }
 
     /// A lot of this account held under another position, whose record a
-    /// line moving it carries over: a placeholder's lots keep their
+    /// line moving it carries over: a merged record's lots keep their
     /// identifiers, costs and dates (W9.9).
     fn carried_lot(&self, key: &Key, lot_id: &str) -> Option<LotState> {
         self.positions

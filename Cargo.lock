@@ -1872,6 +1872,7 @@ dependencies = [
  "meridian-bus",
  "meridian-clock",
  "meridian-domain",
+ "meridian-pb",
  "meridian-symbology",
  "postgres",
  "prost",
@@ -1888,7 +1889,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=39640537804049c4b1c474ec5740125ed861bc01#39640537804049c4b1c474ec5740125ed861bc01"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=4ce61511ed959c53daf6439b8a8b807fc12bf069#4ce61511ed959c53daf6439b8a8b807fc12bf069"
 dependencies = [
  "prost",
  "tonic",

@@ -38,10 +38,6 @@ pub const ENTRY: &str = "ENT";
 pub const LOT: &str = "LOT";
 pub const BREAK: &str = "BRK";
 
-/// What a placeholder's instrument ID begins with: the instrument store mints
-/// them (W3.7), and the book follows each one's replacement (W9.9).
-pub const PLACEHOLDER_PREFIX: &str = "LCL-";
-
 #[cfg(test)]
 mod tests {
     use super::*;

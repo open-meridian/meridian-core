@@ -58,6 +58,15 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
         .route("/admin/end-terminal-sessions", post(end_terminal_sessions))
+        .route("/admin/instruments", get(instruments_page))
+        .route("/admin/instruments/complete", post(complete_instruments))
+        .route("/admin/instruments/accept", post(accept_offers))
+        .route("/admin/instruments/merge", post(merge_instruments))
+        .route("/admin/instruments/{instrument}", get(instrument_page))
+        .route(
+            "/admin/instruments/{instrument}/ask",
+            post(ask_the_platform),
+        )
         .route("/admin/plugins/{instance}", get(plugin_view))
         .route(
             "/admin/plugins/{instance}/settings",
@@ -373,6 +382,7 @@ pub(crate) fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod books;
+pub mod instruments;
 mod overview;
 pub mod people;
 mod picker;
@@ -1122,6 +1132,291 @@ async fn withdraw(
             Err(sentence) => Err(sentence),
         }
     })
+}
+
+/// The chrome of the Instruments pages: Settings, then where in them.
+fn instruments_chrome<'a>(session: &'a Session, record: Option<&str>) -> Chrome<'a> {
+    let crumbs = match record {
+        None => format!(
+            "{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_here("Instruments", None)
+        ),
+        Some(id) => format!(
+            "{}{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_link("/admin/instruments", "Instruments"),
+            crate::html::crumb_here(id, None)
+        ),
+    };
+    Chrome {
+        crumbs,
+        ..admin_chrome(session)
+    }
+}
+
+/// W3.11: the Instruments page, for a deployment admin.
+async fn instruments_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let listed = instruments::list(&app.bus, "").await;
+    let body = instruments::list_page(&listed, &token_input(&session), field(&query, "done"));
+    Html(page_with(
+        "Instruments",
+        &body,
+        &instruments_chrome(&session, None),
+    ))
+    .into_response()
+}
+
+/// One record, as its page draws it: the record and what it lacks, and its
+/// history; or the sentence saying why not.
+async fn one_record(
+    app: &App,
+    instrument: &str,
+) -> Result<
+    (
+        meridian_domain::v1::InstrumentToComplete,
+        Vec<meridian_domain::v1::InstrumentVersion>,
+    ),
+    String,
+> {
+    let listed = instruments::list(&app.bus, instrument).await?;
+    let item = listed
+        .instruments
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("the deployment holds no record {instrument}"))?;
+    let versions = instruments::history(&app.bus, instrument)
+        .await
+        .map(|history| history.versions)
+        .unwrap_or_default();
+    Ok((item, versions))
+}
+
+/// W3.10, W3.12: one record's page.
+async fn instrument_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instrument): Path<String>,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let (item, versions) = match one_record(&app, &instrument).await {
+        Ok(found) => found,
+        Err(why) => return status_page(StatusCode::NOT_FOUND, "No such record", &why),
+    };
+    let done = field(&query, "done");
+    let mut body = instruments::record_page(&item, &versions, None, &token_input(&session));
+    if !done.is_empty() {
+        body = format!("<p class=\"passed\">{}</p>{body}", escape(done));
+    }
+    Html(page_with(
+        &instrument,
+        &body,
+        &instruments_chrome(&session, Some(&instrument)),
+    ))
+    .into_response()
+}
+
+/// W3.10: one record's form, sent for the person signed in.
+async fn complete_instruments(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let filled = instruments::Filled {
+        instrument_id: field(&fields, "instrument_id").into(),
+        against_version: field(&fields, "against_version").into(),
+        asset_class: field(&fields, "asset_class").into(),
+        asset_class_source: field(&fields, "asset_class_source").into(),
+        currency: field(&fields, "currency").into(),
+        currency_source: field(&fields, "currency_source").into(),
+        description: field(&fields, "description").into(),
+        description_source: field(&fields, "description_source").into(),
+        identifier_scheme: field(&fields, "identifier_scheme").into(),
+        identifier_value: field(&fields, "identifier_value").into(),
+        identifier_namespace: field(&fields, "identifier_namespace").into(),
+        identifier_source: field(&fields, "identifier_source").into(),
+        note: field(&fields, "note").into(),
+    };
+    let back = format!("/admin/instruments/{}", filled.instrument_id);
+    let outcome = match instruments::completion(&filled) {
+        Err(why) => Err(why),
+        Ok(request) => match instruments::complete(&app.bus, &session.subject, request).await {
+            Err(refused) => Err(refused),
+            Ok(reply) => instruments::outcome(&reply),
+        },
+    };
+    match outcome {
+        Ok(said) => after_to(Ok(()), &format!("{back}?done={}", query_text(&said)), &back),
+        Err(why) => after_to(Err(why), &back, &back),
+    }
+}
+
+/// W3.10: the values offered for the records ticked, accepted in one command.
+async fn accept_offers(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let fields: Fields = pairs.iter().cloned().collect();
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let chosen: Vec<String> = pairs
+        .iter()
+        .filter(|(name, _)| name == "instrument_id")
+        .map(|(_, value)| value.clone())
+        .collect();
+    let outcome = match instruments::list(&app.bus, "").await {
+        Err(why) => Err(format!("the instrument store is not answering: {why}")),
+        Ok(listed) => {
+            let request = instruments::accepting(&listed.instruments, &chosen);
+            if request.completions.is_empty() {
+                Err("nothing offered for the records ticked".to_string())
+            } else {
+                match instruments::complete(&app.bus, &session.subject, request).await {
+                    Err(refused) => Err(refused),
+                    Ok(reply) => instruments::outcome(&reply),
+                }
+            }
+        }
+    };
+    match outcome {
+        Ok(said) => after_to(
+            Ok(()),
+            &format!("/admin/instruments?done={}", query_text(&said)),
+            "/admin/instruments",
+        ),
+        Err(why) => after_to(Err(why), "/admin/instruments", "/admin/instruments"),
+    }
+}
+
+/// W3.13: a conflict's records merged, the one chosen staying.
+async fn merge_instruments(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let kept = field(&fields, "kept_instrument_id").to_string();
+    let merged = field(&fields, "instrument_ids")
+        .split(',')
+        .map(str::trim)
+        .find(|id| !id.is_empty() && *id != kept)
+        .unwrap_or_default()
+        .to_string();
+    let outcome = async {
+        if kept.is_empty() || merged.is_empty() {
+            return Err("the form names no two records".to_string());
+        }
+        let version = |id: String| {
+            let app = &app;
+            async move {
+                instruments::list(&app.bus, &id)
+                    .await?
+                    .instruments
+                    .first()
+                    .and_then(|item| item.instrument.as_ref())
+                    .map(|record| record.version)
+                    .ok_or_else(|| format!("the deployment holds no record {id}"))
+            }
+        };
+        let request = meridian_domain::v1::MergeInstrumentsRequest {
+            kept_version: version(kept.clone()).await?,
+            merged_version: version(merged.clone()).await?,
+            kept_instrument_id: kept.clone(),
+            merged_instrument_id: merged.clone(),
+            take_from_merged: Vec::new(),
+            note: field(&fields, "note").to_string(),
+        };
+        instruments::merge(&app.bus, &session.subject, request)
+            .await
+            .map(|_| format!("{merged} merged into {kept}"))
+    }
+    .await;
+    match outcome {
+        Ok(said) => after_to(
+            Ok(()),
+            &format!("/admin/instruments?done={}", query_text(&said)),
+            "/admin/instruments",
+        ),
+        Err(why) => after_to(Err(why), "/admin/instruments", "/admin/instruments"),
+    }
+}
+
+/// W3.3: ask the platform about a record, when the person chooses to; the
+/// answer is drawn on the record's page, and kept by the instrument store.
+async fn ask_the_platform(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instrument): Path<String>,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let (item, _) = match one_record(&app, &instrument).await {
+        Ok(found) => found,
+        Err(why) => return status_page(StatusCode::NOT_FOUND, "No such record", &why),
+    };
+    let asked =
+        instruments::ask_platform(&app.bus, &item.instrument.clone().unwrap_or_default()).await;
+    // Read again: what the platform answered is kept on the record as it
+    // arrives, and the page shows what is kept by then.
+    let (item, versions) = one_record(&app, &instrument)
+        .await
+        .unwrap_or((item, Vec::new()));
+    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session));
+    Html(page_with(
+        &instrument,
+        &body,
+        &instruments_chrome(&session, Some(&instrument)),
+    ))
+    .into_response()
+}
+
+/// Text for a query string: what is not a letter, a digit or a few marks,
+/// percent-encoded.
+fn query_text(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            b' ' => "+".to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]

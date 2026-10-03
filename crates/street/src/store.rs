@@ -820,7 +820,8 @@ pub trait Store: Send + Sync {
         cause: &Cause,
     ) -> Result<Vec<Settled>>;
 
-    /// Every instrument ID a custodial position is held under that is a
-    /// placeholder (`LCL-`), each once, in order. What the sweep asks about.
-    fn placeholder_instruments(&self) -> Result<Vec<String>>;
+    /// Every instrument ID a custodial position is held under, each once, in
+    /// order: what the sweep asks the instrument store about, for a record
+    /// merged into another while the street was not listening (W3.9).
+    fn instruments_held(&self) -> Result<Vec<String>>;
 }

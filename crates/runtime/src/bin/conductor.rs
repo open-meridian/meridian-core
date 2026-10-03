@@ -1,8 +1,8 @@
 //! The deployment's end of the link to the platform, as its own process.
 //!
-//! Holds the key, makes the outbound connection, carries a miss to the platform
-//! and the answer back onto the bus, and reports what the deployment is running.
-//! Decision 011.
+//! Holds the key, makes the outbound connection, carries a person's ask about
+//! one of the deployment's records to the platform and the answer back onto the
+//! bus (W3.3), and reports what the deployment is running. Decision 011.
 //!
 //! It holds the configuration store: what a deployment admin authors, which
 //! nothing else can rebuild. It held no database until 2026-09-21, on the
@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use meridian_conductor::{Conductor, INSTRUMENT_MISSING};
+use meridian_conductor::Conductor;
 use meridian_config::store::StoreError;
 use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
@@ -189,11 +189,6 @@ fn run() -> Result<(), String> {
             key_path.clone(),
         );
 
-        // Subscribed before the loop starts, for the reason at-most-once
-        // delivery makes unforgiving: what arrives before a subscriber
-        // exists is dropped, and dropped silently.
-        let misses = bus.subscribe(INSTRUMENT_MISSING);
-
         // The config domain: registered and subscribed before the loop
         // starts, so nothing the dashboard or a sidecar asks is missed.
         meridian_config::serve(
@@ -218,9 +213,9 @@ fn run() -> Result<(), String> {
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
         );
 
-        let carrying = Arc::clone(&bus);
-        let conductor = Conductor::new(carrying, Arc::clone(&platform), clock());
-        let running = tokio::spawn(conductor.consume(misses));
+        // W3.3: a person's ask about a record, from the dashboard. Nothing
+        // here reacts to a miss any more (contract v10, decisions/030).
+        Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock()).serve();
 
         // W5.19 outward, W5.20 inward: this component holds the key, so it
         // is the one that can tell the platform anything, and what it tells
@@ -240,16 +235,9 @@ fn run() -> Result<(), String> {
         );
         ready.serving();
 
-        tokio::select! {
-            _ = running => {
-                tracing::warn!("the bus shut down");
-                Ok(())
-            }
-            _ = shutdown() => {
-                tracing::info!("stopping");
-                Ok(())
-            }
-        }
+        shutdown().await;
+        tracing::info!("stopping");
+        Ok(())
     })
 }
 

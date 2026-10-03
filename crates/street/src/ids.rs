@@ -11,12 +11,6 @@
 
 use rand::RngCore;
 
-/// What a placeholder's instrument ID begins with. Not minted here: the
-/// instrument store mints them, and a row may carry one until the platform's
-/// `INS-` ID replaces it (W3.7 to W3.9). Known here so the sweep can find the
-/// positions still held under one.
-pub const PLACEHOLDER_PREFIX: &str = "LCL-";
-
 /// No I, L, O or U, so an identifier read aloud or copied off a screen cannot
 /// become a different valid one.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";

@@ -1,28 +1,29 @@
 //! What the instrument store holds, and what any store of it must provide.
 //!
 //! The same shape the bus uses: a trait with one in-process implementation, and
-//! Postgres behind it when compose arrives. Writing against the trait first is
-//! what keeps SQL out of the domain logic rather than discovering it there
-//! later.
+//! Postgres behind it. Writing against the trait first is what keeps SQL out of
+//! the domain logic rather than discovering it there later.
 //!
-//! # Why a version, and why it is the only bookmark
+//! # The deployment's records (contract v10, decisions/030)
 //!
-//! Every record carries a version the platform assigns, monotonic per
-//! instrument. Applying one at or below the version held is a no-op. That single
-//! rule does most of the work in this crate:
+//! Every record is the deployment's own, under its own ID for life: one this
+//! store minted (`LCL-`), or one applied from the platform before v10, which
+//! keeps its `INS-` ID. Each value in force says where it came from, and the
+//! person who set or accepted it; values a plugin or the platform states are
+//! offers beside them, in force only once a person accepts one.
 //!
-//! - a retry after an ambiguous failure is harmless, so the retry policy can be
-//!   simple rather than exactly-once,
-//! - two overlapping pulls of the same instrument cannot corrupt anything,
-//! - and the highest version held **is** the resume cursor, so nothing has to
-//!   maintain a separate marker that can go stale while the platform is away.
+//! # Why a version, and why it gates every write
 //!
-//! The last point is what makes recovery from an outage automatic. There is no
-//! bookmark to repair because there is no bookmark.
+//! Every change makes a new version, numbered here, monotonic per record, and
+//! kept: [`Store::write`] stores the next version only while the record is
+//! still at the one the change was made against. That single rule makes a page
+//! open while a plugin joined an identifier safe -- the completion made against
+//! the old version is refused rather than writing over the join -- and gives
+//! the book the version each entry carries (W9.8).
 
 use std::collections::HashMap;
 
-/// One identifier in an instrument's set, valid over a window.
+/// One identifier in a record's set, valid over a window.
 ///
 /// Dated because identifiers are reused: a delisted instrument frees a ticker
 /// and somebody else is given it. A lookup without an as-of is a bug waiting for
@@ -47,35 +48,184 @@ impl Identifier {
     pub fn covers(&self, as_of_ns: i64) -> bool {
         self.valid_from_ns <= as_of_ns && self.valid_to_ns.is_none_or(|end| end > as_of_ns)
     }
+
+    /// The identifier without its dates.
+    pub fn asked(&self) -> Asked {
+        Asked {
+            scheme: self.scheme.clone(),
+            value: self.value.clone(),
+            source: self.source.clone(),
+        }
+    }
 }
 
-/// The store's copy of an instrument.
+/// Which value of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Field {
+    AssetClass,
+    Currency,
+    Description,
+    Identifier,
+}
+
+impl Field {
+    /// As the store writes it, and as a refusal names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Field::AssetClass => "asset_class",
+            Field::Currency => "currency",
+            Field::Description => "description",
+            Field::Identifier => "identifier",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Field> {
+        match name {
+            "asset_class" => Some(Field::AssetClass),
+            "currency" => Some(Field::Currency),
+            "description" => Some(Field::Description),
+            "identifier" => Some(Field::Identifier),
+            _ => None,
+        }
+    }
+}
+
+/// Where a value in force on a record came from (W3, requirement 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub field: Field,
+
+    /// For [`Field::Identifier`]: which identifier.
+    pub identifier: Option<Asked>,
+
+    /// In words: a statement, "ISO 4217", "the platform, record version 3",
+    /// "reported by custody-snaptrade-1".
+    pub source: String,
+
+    /// The person who set or accepted it, stamped by core; empty for a
+    /// plugin's report, the platform's global ID and a value applied from the
+    /// platform before v10.
+    pub person: String,
+
+    /// The plugin instance whose resolve joined an identifier.
+    pub instance_id: String,
+
+    pub recorded_at_ns: i64,
+
+    /// Why a value held was changed, where given.
+    pub note: String,
+}
+
+/// A value offered for a record, in force only when a person accepts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub field: Field,
+
+    /// As text: an asset class by its enum name, a currency, a description,
+    /// an identifier's value.
+    pub value: String,
+
+    /// For [`Field::Identifier`]: the identifier offered.
+    pub identifier: Option<Asked>,
+
+    /// In words, as [`Source::source`].
+    pub source: String,
+
+    /// The plugin instance whose source stated it; empty for the platform.
+    pub instance_id: String,
+
+    pub offered_at_ns: i64,
+}
+
+impl Offer {
+    /// Two offers are one when they offer the same value from the same place.
+    pub fn same_as(&self, other: &Offer) -> bool {
+        self.field == other.field
+            && self.value == other.value
+            && self.identifier == other.identifier
+            && self.instance_id == other.instance_id
+    }
+}
+
+/// One of the deployment's records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instrument {
-    /// The canonical identity, and the only thing a position or an order ever
-    /// stores. Never reused: an identifier retired here is not later given to
-    /// something else, so this field answers "which instrument" for all time
-    /// and needs no as-of. Everything dated hangs off it as an attribute,
-    /// tickers included.
+    /// The record's key for life, and the only thing a position or an order
+    /// ever stores. Never reused: an identifier retired here is not later
+    /// given to something else, so this field answers "which instrument" for
+    /// all time and needs no as-of. Everything dated hangs off it as an
+    /// attribute, tickers included.
     pub instrument_id: String,
     pub identifiers: Vec<Identifier>,
+
+    /// The enum's name (`ASSET_CLASS_EQUITY`), or empty for none.
     pub asset_class: String,
     pub currency: String,
     pub exchange_mic: String,
     pub description: String,
     pub lifecycle_state: String,
 
-    /// Assigned by the platform, monotonic. The apply gate and the resume
-    /// cursor are both this number.
+    /// Numbered by this store, monotonic per record. A record applied from
+    /// the platform before v10 kept the platform's number, and counts on from
+    /// it.
     pub version: i64,
 
     pub valid_from_ns: i64,
     pub record_time_ns: i64,
+
+    /// Where each value in force came from.
+    pub sources: Vec<Source>,
+
+    /// What plugins and the platform offer beside them.
+    pub offers: Vec<Offer>,
+}
+
+impl Instrument {
+    /// Whether the record carries this identifier, whatever its dates.
+    pub fn carries(&self, asked: &Asked) -> bool {
+        self.identifiers.iter().any(|held| {
+            held.scheme == asked.scheme && held.value == asked.value && held.source == asked.source
+        })
+    }
+
+    /// The value in force for a field other than an identifier.
+    pub fn value(&self, field: Field) -> &str {
+        match field {
+            Field::AssetClass => &self.asset_class,
+            Field::Currency => &self.currency,
+            Field::Description => &self.description,
+            Field::Identifier => "",
+        }
+    }
+
+    pub fn set_value(&mut self, field: Field, value: String) {
+        match field {
+            Field::AssetClass => self.asset_class = value,
+            Field::Currency => self.currency = value,
+            Field::Description => self.description = value,
+            Field::Identifier => {}
+        }
+    }
+
+    /// The source entry for a field other than an identifier, or for one
+    /// identifier.
+    pub fn source_of(&self, field: Field, identifier: Option<&Asked>) -> Option<&Source> {
+        self.sources
+            .iter()
+            .find(|source| source.field == field && source.identifier.as_ref() == identifier)
+    }
+
+    /// Record where a value came from, in place of what was said before.
+    pub fn set_source(&mut self, source: Source) {
+        self.sources
+            .retain(|held| !(held.field == source.field && held.identifier == source.identifier));
+        self.sources.push(source);
+    }
 }
 
 /// An identifier as a resolve asked it: undated, because the set is what one
 /// holding was said to be on one date, and the date travels beside it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Asked {
     pub scheme: String,
     pub value: String,
@@ -87,11 +237,8 @@ pub struct Asked {
 /// The identifiers a resolve carried, in one order whatever order they came
 /// in, each once.
 ///
-/// A placeholder stands in for a set rather than for an identifier, and the
-/// same set asked twice must meet the same placeholder. A connector that lists
-/// a FIGI before a symbol on Monday and after it on Tuesday is describing one
-/// holding, and two placeholders for it would be two positions for one
-/// security.
+/// A record minted for a set is minted once: the same set asked twice, in any
+/// order and by two resolves racing, meets one record.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IdentifierSet {
     members: Vec<Asked>,
@@ -126,7 +273,7 @@ impl IdentifierSet {
     /// can be read as a separator: a symbol with a colon in it, or a source
     /// that happens to end the way a scheme begins, cannot make two sets
     /// collide. A store holds this under a unique index, which is what makes
-    /// minting one placeholder per set a property of the table rather than of
+    /// minting one record per set a property of the table rather than of
     /// whichever caller got there first.
     pub fn key(&self) -> String {
         let mut key = String::new();
@@ -141,35 +288,60 @@ impl IdentifierSet {
     }
 }
 
-/// The deployment's stand-in for an identifier set nothing matched. W3.7.
-///
-/// Not an instrument, and deliberately kept apart from them: it carries no
-/// version because no authority has said anything about it, and holding it in
-/// the instrument table would let it match a later resolve as though it were
-/// one. It is what a holding is recorded against until the platform's `INS-`
-/// ID replaces it, and it is never deleted, because records made with it keep
-/// it and a reader holding one must still learn what it became.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Placeholder {
-    /// `LCL-`, minted here.
-    pub placeholder_id: String,
-    pub identifiers: IdentifierSet,
-
-    /// The namespace the identifiers were asked in, for the platform's sake.
+/// One change a version made, for the history (W3.12).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Change {
+    /// [`Field::name`].
+    pub field: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scheme: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    #[serde(default)]
+    pub before: String,
+    #[serde(default)]
+    pub after: String,
+    #[serde(default)]
     pub source: String,
-
-    /// Empty today: a resolve carries no asset class. Kept so the store does
-    /// not have to change shape the day one does.
-    pub asset_class: String,
-
-    /// The date the resolve that minted it asked about. An escalation targets
-    /// the mapping effective then, not the one effective when it is sent.
-    pub as_of_ns: i64,
-
-    pub minted_at_ns: i64,
 }
 
-/// What asking for a set's placeholder did.
+/// One version of a record, append-only (W3.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub instrument_id: String,
+    pub version: i64,
+
+    /// mint, join, offer, complete, platform, merge, merged-into, migrate.
+    pub operation: String,
+    pub changes: Vec<Change>,
+    pub person: String,
+    pub instance_id: String,
+    pub note: String,
+
+    /// For a merge, the other record.
+    pub merged_instrument_id: String,
+    pub record_time_ns: i64,
+}
+
+/// Identifiers that met more than one record, listed until a merge settles
+/// them (W3.1, W3.2, W3.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub identifiers: Vec<Asked>,
+    pub instrument_ids: Vec<String>,
+    pub reported_by: String,
+    pub first_seen_ns: i64,
+    pub last_seen_ns: i64,
+}
+
+impl Conflict {
+    /// One per set of identifiers that disagree.
+    pub fn key(&self) -> String {
+        IdentifierSet::new(self.identifiers.clone()).key()
+    }
+}
+
+/// What asking for a set's record did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stood {
     /// None was held for the set, so this one was, and it wants announcing.
@@ -180,6 +352,21 @@ pub enum Stood {
     AlreadyHeld,
 }
 
+/// What writing a record's next version did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Stored,
+
+    /// The record moved past the version the change was made against: the
+    /// version it is at now. Nothing was written.
+    Stale {
+        held: i64,
+    },
+
+    /// No such record.
+    Missing,
+}
+
 /// What recording a replacement did. W3.8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Replaced {
@@ -187,8 +374,7 @@ pub enum Replaced {
     Recorded,
 
     /// Recorded before, by this ID or another. Nothing changes: the first
-    /// pairing the platform gave stands, and a re-announced placeholder's
-    /// second answer is the same pairing anyway.
+    /// pairing stands.
     AlreadyRecorded { replaced_by: String },
 }
 
@@ -200,37 +386,19 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// What an applied record did, so a caller knows whether to announce it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Applied {
-    /// Written. The instrument store now holds this version.
-    Stored,
-
-    /// Ignored: an equal or older version than the one held.
-    ///
-    /// Not an error and not a failure. It is the expected outcome of a retry
-    /// and of two pulls racing, and treating it as either would make callers
-    /// defensive about something harmless.
-    AlreadyCurrent,
-}
-
 /// Where the instrument store keeps what it has been told.
 pub trait Store: Send + Sync {
-    /// The instrument, if it is held.
+    /// The record, if it is held, with its sources and offers.
     fn by_id(&self, instrument_id: &str) -> Result<Option<Instrument>>;
 
-    /// Every instrument this identifier mapped to at `as_of_ns`.
+    /// Every record this identifier mapped to at `as_of_ns`.
     ///
     /// Dated, always. Resolving without a moment is how a reused ticker
     /// resolves to whoever holds it now rather than whoever held it then.
     ///
     /// All of them rather than one of them, because "more than one matched" is
-    /// an answer the caller has to act on. A store that returned the first
-    /// match would be picking, and a pick made here would be invisible to the
-    /// step that is supposed to refuse it.
-    ///
-    /// Ordered by instrument identifier so a repeated query is a repeated
-    /// answer.
+    /// an answer the caller has to act on. Ordered by ID so a repeated query
+    /// is a repeated answer.
     fn matching(
         &self,
         scheme: &str,
@@ -239,49 +407,42 @@ pub trait Store: Send + Sync {
         as_of_ns: i64,
     ) -> Result<Vec<Instrument>>;
 
-    /// Write, unless what is held is already at or beyond this version.
-    ///
-    /// The gate lives in the store rather than in the caller because every
-    /// inbound path lands here, and a check spread across callers is a check
-    /// enforced by whichever caller remembered.
-    fn apply(&self, instrument: Instrument) -> Result<Applied>;
+    /// Every record held, ordered by ID: what the Instruments page lists
+    /// (W3.11). A deployment holds what its accounts hold, so a read of all of
+    /// them is a page's worth.
+    fn all(&self) -> Result<Vec<Instrument>>;
 
-    /// The highest version held, per instrument.
-    ///
-    /// The resume cursor, and deliberately derived rather than recorded: a
-    /// separate marker is a thing that can disagree with the data it describes.
-    fn version_of(&self, instrument_id: &str) -> Result<Option<i64>>;
-
-    /// How many instruments are held. For a dashboard and for tests.
+    /// How many records are held. For a dashboard and for tests.
     fn count(&self) -> Result<usize>;
 
-    /// The placeholder for the candidate's identifier set, holding the
-    /// candidate if the set has none. W3.7.
+    /// The record minted for this identifier set, holding the candidate if
+    /// the set has none (W3.7), with its first version.
     ///
     /// The candidate arrives already minted, because an ID is the caller's to
     /// make and whether it is kept is the store's to decide. One decision, so
-    /// two resolves of one set racing each other meet one placeholder: the
-    /// in-memory store decides under its lock, and Postgres under the unique
-    /// index on the set's key.
-    fn stand_in(&self, candidate: Placeholder) -> Result<(Placeholder, Stood)>;
+    /// two resolves of one set racing each other meet one record.
+    fn mint(
+        &self,
+        candidate: Instrument,
+        set_key: &str,
+        first: Version,
+    ) -> Result<(Instrument, Stood)>;
 
-    /// The placeholder with this ID, if this store minted it.
-    fn placeholder(&self, placeholder_id: &str) -> Result<Option<Placeholder>>;
+    /// Write `record` as its next version -- its identifiers, sources and
+    /// offers whole -- and `entry` into its history, unless it has moved past
+    /// `expected`.
+    fn write(&self, record: Instrument, expected: i64, entry: Version) -> Result<Written>;
 
-    /// Every placeholder not yet replaced, ordered by ID. What W3.7 announces
-    /// again at start and on an interval.
-    fn outstanding(&self) -> Result<Vec<Placeholder>>;
+    /// A record's versions, newest first.
+    fn history(&self, instrument_id: &str) -> Result<Vec<Version>>;
 
-    /// Every held instrument whose ID is `LCL-` and has not been replaced,
-    /// ordered by ID. The legacy path: see [`crate::placeholder`].
-    fn legacy_outstanding(&self) -> Result<Vec<Instrument>>;
+    /// List a conflict, or bring one listed up to date.
+    fn note_conflict(&self, conflict: Conflict) -> Result<()>;
+
+    /// Every conflict listed, ordered by when it was first seen.
+    fn conflicts(&self) -> Result<Vec<Conflict>>;
 
     /// Record that `replaced_id` is now `replaced_by`. W3.8.
-    ///
-    /// For any ID, not only a placeholder this store minted: a legacy `LCL-`
-    /// instrument is replaced the same way, and so is a placeholder whose row
-    /// a restore from an older backup lost, because the street store may
-    /// still hold positions under it.
     fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced>;
 
     /// What `instrument_id` was replaced by, if it was.
@@ -293,27 +454,18 @@ pub trait Store: Send + Sync {
 pub(crate) struct Held {
     pub(crate) by_id: HashMap<String, Instrument>,
 
-    pub(crate) placeholders: HashMap<String, Placeholder>,
+    /// A set's key to the record minted for it. The in-memory unique index.
+    pub(crate) minted_for: HashMap<String, String>,
 
-    /// A set's key to its placeholder's ID. The in-memory unique index.
-    pub(crate) placeholder_by_set: HashMap<String, String>,
+    pub(crate) history: HashMap<String, Vec<Version>>,
+
+    pub(crate) conflicts: HashMap<String, Conflict>,
 
     /// Replaced ID to what replaced it, and when.
     pub(crate) replacements: HashMap<String, (String, i64)>,
 }
 
 impl Held {
-    pub(crate) fn apply(&mut self, instrument: Instrument) -> Applied {
-        if let Some(existing) = self.by_id.get(&instrument.instrument_id) {
-            if existing.version >= instrument.version {
-                return Applied::AlreadyCurrent;
-            }
-        }
-        self.by_id
-            .insert(instrument.instrument_id.clone(), instrument);
-        Applied::Stored
-    }
-
     pub(crate) fn matching(
         &self,
         scheme: &str,
@@ -342,48 +494,79 @@ impl Held {
         found
     }
 
-    pub(crate) fn stand_in(&mut self, candidate: Placeholder) -> (Placeholder, Stood) {
-        let key = candidate.identifiers.key();
+    pub(crate) fn all(&self) -> Vec<Instrument> {
+        let mut all: Vec<Instrument> = self.by_id.values().cloned().collect();
+        all.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+        all
+    }
+
+    pub(crate) fn mint(
+        &mut self,
+        candidate: Instrument,
+        set_key: &str,
+        first: Version,
+    ) -> (Instrument, Stood) {
         if let Some(held) = self
-            .placeholder_by_set
-            .get(&key)
-            .and_then(|placeholder_id| self.placeholders.get(placeholder_id))
+            .minted_for
+            .get(set_key)
+            .and_then(|instrument_id| self.by_id.get(instrument_id))
         {
             return (held.clone(), Stood::AlreadyHeld);
         }
-
-        self.placeholder_by_set
-            .insert(key, candidate.placeholder_id.clone());
-        self.placeholders
-            .insert(candidate.placeholder_id.clone(), candidate.clone());
+        self.minted_for
+            .insert(set_key.to_string(), candidate.instrument_id.clone());
+        self.history
+            .entry(candidate.instrument_id.clone())
+            .or_default()
+            .push(first);
+        self.by_id
+            .insert(candidate.instrument_id.clone(), candidate.clone());
         (candidate, Stood::Minted)
     }
 
-    pub(crate) fn outstanding(&self) -> Vec<Placeholder> {
-        let mut outstanding: Vec<Placeholder> = self
-            .placeholders
-            .values()
-            .filter(|placeholder| !self.replacements.contains_key(&placeholder.placeholder_id))
-            .cloned()
-            .collect();
-        outstanding.sort_by(|left, right| left.placeholder_id.cmp(&right.placeholder_id));
-        outstanding
+    pub(crate) fn write(&mut self, record: Instrument, expected: i64, entry: Version) -> Written {
+        let Some(held) = self.by_id.get(&record.instrument_id) else {
+            return Written::Missing;
+        };
+        if held.version != expected {
+            return Written::Stale { held: held.version };
+        }
+        self.history
+            .entry(record.instrument_id.clone())
+            .or_default()
+            .push(entry);
+        self.by_id.insert(record.instrument_id.clone(), record);
+        Written::Stored
     }
 
-    pub(crate) fn legacy_outstanding(&self) -> Vec<Instrument> {
-        let mut legacy: Vec<Instrument> = self
-            .by_id
-            .values()
-            .filter(|instrument| {
-                instrument
-                    .instrument_id
-                    .starts_with(crate::ids::PLACEHOLDER_PREFIX)
-                    && !self.replacements.contains_key(&instrument.instrument_id)
-            })
-            .cloned()
-            .collect();
-        legacy.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
-        legacy
+    pub(crate) fn history(&self, instrument_id: &str) -> Vec<Version> {
+        let mut versions = self.history.get(instrument_id).cloned().unwrap_or_default();
+        versions.sort_by(|left, right| right.version.cmp(&left.version));
+        versions
+    }
+
+    pub(crate) fn note_conflict(&mut self, conflict: Conflict) {
+        let key = conflict.key();
+        match self.conflicts.get_mut(&key) {
+            Some(held) => {
+                held.instrument_ids = conflict.instrument_ids;
+                held.last_seen_ns = conflict.last_seen_ns;
+                if held.reported_by.is_empty() {
+                    held.reported_by = conflict.reported_by;
+                }
+            }
+            None => {
+                self.conflicts.insert(key, conflict);
+            }
+        }
+    }
+
+    pub(crate) fn conflicts(&self) -> Vec<Conflict> {
+        let mut all: Vec<Conflict> = self.conflicts.values().cloned().collect();
+        all.sort_by(|left, right| {
+            (left.first_seen_ns, left.key()).cmp(&(right.first_seen_ns, right.key()))
+        });
+        all
     }
 
     pub(crate) fn replace(

@@ -2,9 +2,9 @@
 //!
 //! Not against a fake. A store implementation tested against a stand-in tests
 //! the stand-in, and every property worth having here -- the version gate under
-//! concurrency, an identifier set replaced rather than merged, a dated window
-//! evaluated in SQL -- is a property of the database rather than of the Rust
-//! around it.
+//! concurrency, one record per minted set, a dated window evaluated in SQL,
+//! what a release before contract v10 held sourced once -- is a property of
+//! the database rather than of the Rust around it.
 //!
 //! These do not run under `make test`, which has no database. `make test-store`
 //! runs them through compose. They fail loudly when the database is missing
@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use meridian_instrument::store::{
-    Applied, Asked, Identifier, IdentifierSet, Instrument, Placeholder, Replaced, Stood, Store,
+    Asked, Change, Conflict, Field, Identifier, IdentifierSet, Instrument, Offer, Replaced, Source,
+    Stood, Store, Version, Written,
 };
 use meridian_instrument::PostgresStore;
 
@@ -43,6 +44,14 @@ fn store() -> PostgresStore {
     store
 }
 
+fn asked(scheme: &str, value: &str, source: &str) -> Asked {
+    Asked {
+        scheme: scheme.into(),
+        value: value.into(),
+        source: source.into(),
+    }
+}
+
 fn identifier(scheme: &str, value: &str, source: &str, valid_from_ns: i64) -> Identifier {
     Identifier {
         scheme: scheme.into(),
@@ -53,366 +62,324 @@ fn identifier(scheme: &str, value: &str, source: &str, valid_from_ns: i64) -> Id
     }
 }
 
-fn instrument(instrument_id: &str, identifiers: Vec<Identifier>, version: i64) -> Instrument {
+fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
     Instrument {
         instrument_id: instrument_id.into(),
+        sources: identifiers
+            .iter()
+            .map(|held| Source {
+                field: Field::Identifier,
+                identifier: Some(held.asked()),
+                source: "reported by custody-1".into(),
+                person: String::new(),
+                instance_id: "custody-1".into(),
+                recorded_at_ns: 100,
+                note: String::new(),
+            })
+            .collect(),
         identifiers,
-        asset_class: "ASSET_CLASS_EQUITY".into(),
-        currency: "USD".into(),
-        exchange_mic: "XNAS".into(),
-        description: "Apple Inc. common stock".into(),
-        lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
-        version,
-        valid_from_ns: 100,
-        record_time_ns: 100,
-    }
-}
-
-#[test]
-fn an_applied_record_comes_back_whole() {
-    let store = store();
-    let id = unique("INS");
-    let figi = unique("BBG");
-
-    assert_eq!(
-        store
-            .apply(instrument(&id, vec![identifier("figi", &figi, "", 100)], 1))
-            .unwrap(),
-        Applied::Stored
-    );
-
-    let held = store.by_id(&id).unwrap().unwrap();
-    assert_eq!(held.version, 1);
-    assert_eq!(held.description, "Apple Inc. common stock");
-    assert_eq!(held.identifiers.len(), 1);
-    assert_eq!(held.identifiers[0].value, figi);
-    assert_eq!(held.identifiers[0].valid_to_ns, None);
-}
-
-#[test]
-fn the_version_gate_behaves_the_way_the_in_memory_store_does() {
-    let store = store();
-    let id = unique("INS");
-    let figi = unique("BBG");
-    let record = |version| instrument(&id, vec![identifier("figi", &figi, "", 100)], version);
-
-    assert_eq!(store.apply(record(4)).unwrap(), Applied::Stored);
-    assert_eq!(store.apply(record(4)).unwrap(), Applied::AlreadyCurrent);
-    assert_eq!(store.apply(record(2)).unwrap(), Applied::AlreadyCurrent);
-    assert_eq!(store.apply(record(9)).unwrap(), Applied::Stored);
-    assert_eq!(store.version_of(&id).unwrap(), Some(9));
-}
-
-#[test]
-fn concurrent_applies_leave_the_highest_version_and_one_row() {
-    // The reason the gate is one statement rather than a read and a write. A
-    // row that does not exist yet locks nothing, so `SELECT ... FOR UPDATE`
-    // would let two inserts of a new instrument both through.
-    let store = Arc::new(store());
-    let id = unique("INS");
-    let figi = unique("BBG");
-
-    let mut racing = Vec::new();
-    for version in 1..=16 {
-        let store = store.clone();
-        let id = id.clone();
-        let figi = figi.clone();
-        racing.push(std::thread::spawn(move || {
-            store
-                .apply(instrument(
-                    &id,
-                    vec![identifier("figi", &figi, "", 100)],
-                    version,
-                ))
-                .unwrap()
-        }));
-    }
-    for thread in racing {
-        thread.join().unwrap();
-    }
-
-    assert_eq!(store.version_of(&id).unwrap(), Some(16));
-    assert_eq!(store.matching("figi", &figi, "", 300).unwrap().len(), 1);
-}
-
-#[test]
-fn an_identifier_resolves_only_while_its_window_covers_the_moment() {
-    let store = store();
-    let id = unique("INS");
-    let figi = unique("BBG");
-
-    let mut retired = instrument(&id, vec![identifier("figi", &figi, "", 100)], 2);
-    retired.identifiers[0].valid_to_ns = Some(500);
-    store.apply(retired).unwrap();
-
-    assert_eq!(store.matching("figi", &figi, "", 300).unwrap().len(), 1);
-    assert!(store.matching("figi", &figi, "", 900).unwrap().is_empty());
-    assert!(store.matching("figi", &figi, "", 50).unwrap().is_empty());
-}
-
-#[test]
-fn a_scoped_identifier_does_not_answer_for_a_global_one() {
-    let store = store();
-    let id = unique("INS");
-    let symbol = unique("SYM");
-
-    store
-        .apply(instrument(
-            &id,
-            vec![identifier("symbol", &symbol, "snaptrade", 100)],
-            1,
-        ))
-        .unwrap();
-
-    assert!(store
-        .matching("symbol", &symbol, "", 300)
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        store
-            .matching("symbol", &symbol, "snaptrade", 300)
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn two_instruments_on_one_identifier_both_come_back_in_a_stable_order() {
-    // Ambiguity has to be visible to the step that refuses it, and it has to
-    // name the same pair twice or nobody can reproduce the incident.
-    let store = store();
-    let symbol = unique("SYM");
-    let first = format!("INS-A-{symbol}");
-    let second = format!("INS-B-{symbol}");
-
-    for id in [&second, &first] {
-        store
-            .apply(instrument(
-                id,
-                vec![identifier("symbol", &symbol, "snaptrade", 100)],
-                1,
-            ))
-            .unwrap();
-    }
-
-    let found = store.matching("symbol", &symbol, "snaptrade", 300).unwrap();
-    assert_eq!(found.len(), 2);
-    assert_eq!(found[0].instrument_id, first);
-    assert_eq!(found[1].instrument_id, second);
-}
-
-#[test]
-fn a_later_version_replaces_the_identifier_set_rather_than_adding_to_it() {
-    // An amend is authoritative. An identifier absent from the new version is
-    // absent, which is the whole reason a delta was not the verb.
-    let store = store();
-    let id = unique("INS");
-    let figi = unique("BBG");
-    let dropped = unique("SYM");
-
-    store
-        .apply(instrument(
-            &id,
-            vec![
-                identifier("figi", &figi, "", 100),
-                identifier("symbol", &dropped, "snaptrade", 100),
-            ],
-            1,
-        ))
-        .unwrap();
-
-    store
-        .apply(instrument(&id, vec![identifier("figi", &figi, "", 100)], 2))
-        .unwrap();
-
-    assert_eq!(store.by_id(&id).unwrap().unwrap().identifiers.len(), 1);
-    assert!(store
-        .matching("symbol", &dropped, "snaptrade", 300)
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn an_instrument_nobody_applied_is_absent_rather_than_an_error() {
-    let store = store();
-    assert!(store.by_id(&unique("INS")).unwrap().is_none());
-    assert_eq!(store.version_of(&unique("INS")).unwrap(), None);
-}
-
-#[test]
-fn the_store_can_say_how_much_it_holds() {
-    let store = store();
-    store
-        .apply(instrument(
-            &unique("INS"),
-            vec![identifier("figi", &unique("BBG"), "", 100)],
-            1,
-        ))
-        .unwrap();
-
-    assert!(store.count().unwrap() >= 1);
-}
-
-fn asked(scheme: &str, value: &str, source: &str) -> Asked {
-    Asked {
-        scheme: scheme.into(),
-        value: value.into(),
-        source: source.into(),
-    }
-}
-
-fn candidate(identifiers: Vec<Asked>) -> Placeholder {
-    Placeholder {
-        placeholder_id: meridian_instrument::ids::placeholder(100),
-        identifiers: IdentifierSet::new(identifiers),
-        source: "snaptrade".into(),
         asset_class: String::new(),
-        as_of_ns: 100,
-        minted_at_ns: 200,
+        currency: String::new(),
+        exchange_mic: String::new(),
+        description: String::new(),
+        lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
+        version: 1,
+        valid_from_ns: 0,
+        record_time_ns: 100,
+        offers: vec![Offer {
+            field: Field::AssetClass,
+            value: "ASSET_CLASS_EQUITY".into(),
+            identifier: None,
+            source: "stated by custody-1".into(),
+            instance_id: "custody-1".into(),
+            offered_at_ns: 100,
+        }],
     }
 }
 
-#[test]
-fn one_set_in_any_order_is_one_placeholder_and_comes_back_whole() {
-    let store = store();
-    let symbol = unique("SYM");
-    let figi = unique("BBG");
+fn entry(instrument_id: &str, version: i64, operation: &str) -> Version {
+    Version {
+        instrument_id: instrument_id.into(),
+        version,
+        operation: operation.into(),
+        changes: vec![Change {
+            field: "identifier".into(),
+            scheme: "symbol".into(),
+            namespace: "snaptrade".into(),
+            before: String::new(),
+            after: "SNAP1".into(),
+            source: "reported by custody-1".into(),
+        }],
+        person: String::new(),
+        instance_id: "custody-1".into(),
+        note: String::new(),
+        merged_instrument_id: String::new(),
+        record_time_ns: 100 + version,
+    }
+}
 
-    let (first, stood) = store
-        .stand_in(candidate(vec![
-            asked("symbol", &symbol, "snaptrade"),
-            asked("figi", &figi, ""),
-        ]))
+fn minted(store: &PostgresStore, tag: &str) -> Instrument {
+    let id = unique("LCL");
+    let symbol = unique(tag);
+    let key = IdentifierSet::new([asked("symbol", &symbol, "snaptrade")]).key();
+    let (held, stood) = store
+        .mint(
+            record(&id, vec![identifier("symbol", &symbol, "snaptrade", 0)]),
+            &key,
+            entry(&id, 1, "mint"),
+        )
         .unwrap();
     assert_eq!(stood, Stood::Minted);
-    assert!(first.placeholder_id.starts_with("LCL-"));
-
-    let (again, stood) = store
-        .stand_in(candidate(vec![
-            asked("figi", &figi, ""),
-            asked("symbol", &symbol, "snaptrade"),
-        ]))
-        .unwrap();
-    assert_eq!(stood, Stood::AlreadyHeld);
-    assert_eq!(
-        again, first,
-        "the set, its date and its source survive the round trip"
-    );
-
-    let held = store.placeholder(&first.placeholder_id).unwrap().unwrap();
-    assert_eq!(held.identifiers.members().len(), 2);
-    assert_eq!(held.as_of_ns, 100);
-    assert_eq!(held.minted_at_ns, 200);
+    held
 }
 
 #[test]
-fn concurrent_resolves_of_one_set_meet_one_placeholder() {
-    // The reason the decision is the unique index's. Two resolves of one set
-    // on two statements at once must not mint two placeholders, or one
-    // security becomes two positions.
-    let store = Arc::new(store());
-    let symbol = unique("SYM");
-
-    let mut racing = Vec::new();
-    for _ in 0..16 {
-        let store = store.clone();
-        let symbol = symbol.clone();
-        racing.push(std::thread::spawn(move || {
-            store
-                .stand_in(candidate(vec![asked("symbol", &symbol, "snaptrade")]))
-                .unwrap()
-        }));
-    }
-    let answers: Vec<(Placeholder, Stood)> = racing
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
-        .collect();
-
-    let minted = answers
-        .iter()
-        .filter(|(_, stood)| *stood == Stood::Minted)
-        .count();
-    assert_eq!(minted, 1);
-    assert!(answers
-        .iter()
-        .all(|(placeholder, _)| placeholder.placeholder_id == answers[0].0.placeholder_id));
-}
-
-#[test]
-fn a_replaced_placeholder_is_kept_and_no_longer_outstanding() {
+fn a_minted_record_comes_back_whole_with_its_sources_offers_and_history() {
     let store = store();
-    let (held, _) = store
-        .stand_in(candidate(vec![asked(
-            "symbol",
-            &unique("SYM"),
-            "snaptrade",
-        )]))
-        .unwrap();
-    let outstanding = |store: &PostgresStore| {
-        store
-            .outstanding()
-            .unwrap()
-            .into_iter()
-            .any(|placeholder| placeholder.placeholder_id == held.placeholder_id)
-    };
-    assert!(outstanding(&store));
+    let held = minted(&store, "SNAP");
+    let back = store.by_id(&held.instrument_id).unwrap().unwrap();
+    assert_eq!(back, held);
+    let history = store.history(&held.instrument_id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].operation, "mint");
+    assert_eq!(history[0].changes[0].after, "SNAP1");
+}
 
-    let replacement = unique("INS");
+#[test]
+fn concurrent_resolves_of_one_set_meet_one_record() {
+    let store = Arc::new(store());
+    let symbol = unique("RACE");
+    let key = IdentifierSet::new([asked("symbol", &symbol, "snaptrade")]).key();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let (store, symbol, key) = (store.clone(), symbol.clone(), key.clone());
+            std::thread::spawn(move || {
+                let id = unique("LCL");
+                store
+                    .mint(
+                        record(&id, vec![identifier("symbol", &symbol, "snaptrade", 0)]),
+                        &key,
+                        entry(&id, 1, "mint"),
+                    )
+                    .unwrap()
+                    .0
+                    .instrument_id
+            })
+        })
+        .collect();
+    let ids: std::collections::HashSet<String> =
+        threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(ids.len(), 1, "one set, one record");
+}
+
+#[test]
+fn a_write_against_a_version_since_moved_on_is_refused_and_writes_nothing() {
+    let store = store();
+    let held = minted(&store, "GATE");
+    let mut next = held.clone();
+    next.asset_class = "ASSET_CLASS_EQUITY".into();
+    next.currency = "USD".into();
+    next.version = 2;
+    next.offers.clear();
+    next.sources.push(Source {
+        field: Field::AssetClass,
+        identifier: None,
+        source: "a statement".into(),
+        person: "local|ada".into(),
+        instance_id: String::new(),
+        recorded_at_ns: 200,
+        note: String::new(),
+    });
     assert_eq!(
         store
-            .replace(&held.placeholder_id, &replacement, 300)
+            .write(next.clone(), 1, entry(&held.instrument_id, 2, "complete"))
             .unwrap(),
+        Written::Stored
+    );
+    // The store answers sources by field; what they say is what was written.
+    let mut back = store.by_id(&held.instrument_id).unwrap().unwrap();
+    let order = |source: &Source| (source.field.name(), source.identifier.clone());
+    back.sources.sort_by_key(order);
+    let mut written = next.clone();
+    written.sources.sort_by_key(order);
+    assert_eq!(back, written);
+    assert_eq!(
+        store
+            .write(next.clone(), 1, entry(&held.instrument_id, 2, "complete"))
+            .unwrap(),
+        Written::Stale { held: 2 }
+    );
+    let mut missing = next;
+    missing.instrument_id = unique("LCL-NONE");
+    assert_eq!(
+        store
+            .write(
+                missing.clone(),
+                1,
+                entry(&missing.instrument_id, 2, "complete")
+            )
+            .unwrap(),
+        Written::Missing
+    );
+    assert_eq!(
+        store
+            .history(&held.instrument_id)
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+}
+
+#[test]
+fn an_identifier_matches_only_while_its_window_covers_the_moment_and_in_its_namespace() {
+    let store = store();
+    let id = unique("INS");
+    let figi = unique("BBG");
+    let key = unique("held");
+    store
+        .mint(
+            record(&id, vec![identifier("figi", &figi, "", 1_000)]),
+            &key,
+            entry(&id, 1, "migrate"),
+        )
+        .unwrap();
+    assert!(store.matching("figi", &figi, "", 999).unwrap().is_empty());
+    assert_eq!(store.matching("figi", &figi, "", 1_000).unwrap().len(), 1);
+    assert!(
+        store
+            .matching("figi", &figi, "snaptrade", 1_000)
+            .unwrap()
+            .is_empty(),
+        "a scoped identifier does not answer for a global one"
+    );
+}
+
+#[test]
+fn a_conflict_is_listed_once_and_brought_up_to_date() {
+    let store = store();
+    let figi = unique("BBG");
+    let conflict = Conflict {
+        identifiers: vec![asked("figi", &figi, "")],
+        instrument_ids: vec!["LCL-A".into(), "LCL-B".into()],
+        reported_by: String::new(),
+        first_seen_ns: 10,
+        last_seen_ns: 10,
+    };
+    store.note_conflict(conflict.clone()).unwrap();
+    store
+        .note_conflict(Conflict {
+            reported_by: "custody-1".into(),
+            first_seen_ns: 20,
+            last_seen_ns: 20,
+            ..conflict
+        })
+        .unwrap();
+    let mine: Vec<Conflict> = store
+        .conflicts()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.identifiers[0].value == figi)
+        .collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].first_seen_ns, 10);
+    assert_eq!(mine[0].last_seen_ns, 20);
+    assert_eq!(mine[0].reported_by, "custody-1");
+}
+
+#[test]
+fn a_replacement_is_kept_and_the_first_pairing_stands() {
+    let store = store();
+    let merged = unique("LCL");
+    assert_eq!(
+        store.replace(&merged, "LCL-KEPT", 10).unwrap(),
         Replaced::Recorded
     );
-    assert!(!outstanding(&store));
-    assert!(store.placeholder(&held.placeholder_id).unwrap().is_some());
     assert_eq!(
-        store.replacement_of(&held.placeholder_id).unwrap(),
-        Some(replacement.clone())
-    );
-
-    // The first pairing stands.
-    assert_eq!(
-        store
-            .replace(&held.placeholder_id, &unique("INS"), 400)
-            .unwrap(),
+        store.replace(&merged, "LCL-OTHER", 20).unwrap(),
         Replaced::AlreadyRecorded {
-            replaced_by: replacement
+            replaced_by: "LCL-KEPT".into()
         }
+    );
+    assert_eq!(
+        store.replacement_of(&merged).unwrap(),
+        Some("LCL-KEPT".into())
     );
 }
 
 #[test]
-fn a_legacy_lcl_instrument_is_outstanding_until_replaced() {
-    let store = store();
-    let legacy = format!("LCL-{}", unique("legacy"));
-    let current = unique("INS");
-    for id in [&legacy, &current] {
-        store
-            .apply(instrument(
-                id,
-                vec![identifier("figi", &unique("BBG"), "", 100)],
-                1,
-            ))
-            .unwrap();
-    }
+fn what_a_release_before_v10_held_is_sourced_once() {
+    // Q8: a placeholder not replaced becomes a record under its own ID, with
+    // its identifiers and no values, the class it kept an offer; one replaced
+    // stays replaced; a record applied from the platform keeps its values,
+    // each sourced "the platform, record version N" with no person.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let scratch = format!("before_v10_{}", unique("t").replace('-', "_"));
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
+        .unwrap();
+    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    // What a release before v10 made, and held.
+    admin
+        .batch_execute(&format!(
+            "SET search_path TO {scratch};
+             {first}
+             {second}
+             INSERT INTO instrument (instrument_id, asset_class, currency, description, version,
+                                     valid_from_ns, record_time_ns)
+                  VALUES ('INS-USD', 'ASSET_CLASS_CASH', 'USD', 'US dollar', 3, 0, 50);
+             INSERT INTO instrument_identifier (instrument_id, scheme, value, source, valid_from_ns)
+                  VALUES ('INS-USD', 'iso4217', 'USD', '', 0);
+             INSERT INTO instrument_placeholder (placeholder_id, identifier_key, source, asset_class,
+                                                 as_of_ns, minted_at_ns)
+                  VALUES ('LCL-OPEN', 'k-open', 'snaptrade', 'ASSET_CLASS_FUND', 1, 60),
+                         ('LCL-GONE', 'k-gone', 'snaptrade', '', 1, 70);
+             INSERT INTO instrument_placeholder_identifier (placeholder_id, scheme, value, source)
+                  VALUES ('LCL-OPEN', 'symbol', 'SPAXX', 'snaptrade'),
+                         ('LCL-GONE', 'symbol', 'GONE', 'snaptrade');
+             INSERT INTO instrument_replacement (replaced_id, replaced_by, replaced_at_ns)
+                  VALUES ('LCL-GONE', 'INS-USD', 80);",
+            first = include_str!("../migrations/0001_instrument.sql"),
+            second = include_str!("../migrations/0002_placeholder.sql"),
+        ))
+        .unwrap();
 
-    let listed = |store: &PostgresStore, id: &str| {
-        store
-            .legacy_outstanding()
-            .unwrap()
-            .into_iter()
-            .any(|instrument| instrument.instrument_id == id)
-    };
-    assert!(listed(&store, &legacy));
+    let store = PostgresStore::connect(&scoped, 1).unwrap();
+    store.migrate().unwrap();
+    store.migrate().expect("a second run finds nothing to do");
+
+    let usd = store.by_id("INS-USD").unwrap().unwrap();
+    assert_eq!(usd.version, 3, "its key and version stay");
+    let class = usd.source_of(Field::AssetClass, None).unwrap();
+    assert_eq!(class.source, "the platform, record version 3");
+    assert!(class.person.is_empty());
+    assert_eq!(store.history("INS-USD").unwrap()[0].operation, "migrate");
+
+    let open = store
+        .by_id("LCL-OPEN")
+        .unwrap()
+        .expect("a placeholder became a record");
+    assert!(open.asset_class.is_empty(), "no value in force");
+    assert_eq!(open.identifiers[0].value, "SPAXX");
+    assert_eq!(open.offers.len(), 1, "the class it kept is offered");
+    assert_eq!(open.offers[0].value, "ASSET_CLASS_FUND");
+    assert_eq!(store.history("LCL-OPEN").unwrap().len(), 1);
+
     assert!(
-        !listed(&store, &current),
-        "an INS- instrument is not legacy"
+        store.by_id("LCL-GONE").unwrap().is_none(),
+        "a replaced one stays replaced"
     );
+    assert_eq!(
+        store.replacement_of("LCL-GONE").unwrap(),
+        Some("INS-USD".into())
+    );
+    store.verify().unwrap();
 
-    store.replace(&legacy, &current, 300).unwrap();
-    assert!(!listed(&store, &legacy));
+    admin
+        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
+        .unwrap();
 }
 
 #[test]

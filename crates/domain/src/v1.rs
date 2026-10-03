@@ -31,13 +31,13 @@ pub struct Identifier {
 /// effective time, not on when it happened to learn the mapping.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentRecord {
-    /// Canonical identifier, "INS-..." and minted only by the central authority.
-    ///
-    /// A deployment's stores may also hold its own placeholder, "LCL-...", which
-    /// its instrument store mints for an identifier set nothing matched (W3.7)
-    /// and which the INS- ID replaces in everything live when it arrives (W3.8).
-    /// A placeholder is never minted by the authority and never leaves the
-    /// deployment except on its own escalation.
+    /// The record's key for life. On the platform's master, "INS-...", minted
+    /// by it (W1). In a deployment, the deployment's own (decisions/030): "LCL-"
+    /// for a record its instrument store minted (W3.7), which says who minted it
+    /// and nothing about whether it is resolved; or the "INS-" ID of a record
+    /// applied from the platform before contract v10, which it keeps. A global
+    /// ID the platform answers later joins `identifiers` (scheme
+    /// `open_meridian`), never replacing this.
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
     /// The full identifier set. An amend replaces this authoritatively.
@@ -67,6 +67,90 @@ pub struct InstrumentRecord {
     /// cannot be back-dated.
     #[prost(int64, tag = "10")]
     pub record_time_ns: i64,
+    /// In a deployment (contract v10): where each value in force came from --
+    /// the asset class, the currency, the description and each identifier --
+    /// with the person who set or accepted it, or the plugin that reported it
+    /// (W3, requirement 1). Empty on the platform's master, whose changelog
+    /// says it (W1.7).
+    #[prost(message, repeated, tag = "12")]
+    pub sources: ::prost::alloc::vec::Vec<InstrumentValueSource>,
+    /// In a deployment (contract v10): values offered by a plugin's source
+    /// (W3.1) or the platform (W3.3), in force only when a person accepts one
+    /// (W3.10). A later offer never overwrites a value in force.
+    #[prost(message, repeated, tag = "13")]
+    pub offers: ::prost::alloc::vec::Vec<OfferedValue>,
+}
+/// One value for a deployment's record, set or offered, with where it came
+/// from (W3.10, W3.1, W3.3).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentValue {
+    /// Where the value came from, in words: a statement, a prospectus, "ISO
+    /// 4217", "the platform, record INS-... version 3". Required on a value a
+    /// person sets.
+    #[prost(string, tag = "5")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(oneof = "instrument_value::Value", tags = "1, 2, 3, 4")]
+    pub value: ::core::option::Option<instrument_value::Value>,
+}
+/// Nested message and enum types in `InstrumentValue`.
+pub mod instrument_value {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        /// One of the closed list; never unspecified.
+        #[prost(enumeration = "super::AssetClass", tag = "1")]
+        AssetClass(i32),
+        /// An ISO 4217 code, three capital letters; never a pseudo-currency such
+        /// as BASE.
+        #[prost(string, tag = "2")]
+        Currency(::prost::alloc::string::String),
+        #[prost(string, tag = "3")]
+        Description(::prost::alloc::string::String),
+        #[prost(message, tag = "4")]
+        Identifier(super::Identifier),
+    }
+}
+/// Where a value in force on a deployment's record came from (W3,
+/// requirements 1 and 3).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentValueSource {
+    #[prost(enumeration = "InstrumentField", tag = "1")]
+    pub field: i32,
+    /// For INSTRUMENT_FIELD_IDENTIFIER: which identifier.
+    #[prost(message, optional, tag = "2")]
+    pub identifier: ::core::option::Option<Identifier>,
+    /// In words, as the value was set with.
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    /// The person who set or accepted it: the deployment-local subject core
+    /// stamped from the command's envelope (W4.9), never typed. Empty for an
+    /// identifier a plugin reported, the platform's global ID, and a value
+    /// applied from the platform before contract v10.
+    #[prost(string, tag = "4")]
+    pub person: ::prost::alloc::string::String,
+    /// The plugin instance whose resolve joined the identifier (W3.1). Empty
+    /// otherwise.
+    #[prost(string, tag = "5")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// When the store recorded it.
+    #[prost(int64, tag = "6")]
+    pub recorded_at_ns: i64,
+    /// Why a value held was changed, where given.
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A value offered for a deployment's record (W3.1, W3.3), shown beside its
+/// field and in force only when a person accepts it (W3.10).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OfferedValue {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<InstrumentValue>,
+    /// The plugin instance whose source stated it. Empty for the platform's
+    /// answer and for an offer the store derives itself (ISO 4217 for an
+    /// `iso4217` identifier).
+    #[prost(string, tag = "2")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub offered_at_ns: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DefineInstrumentRequest {
@@ -394,6 +478,17 @@ pub struct ResolveIdentifierRequest {
     pub exchange_mic: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub currency: ::prost::alloc::string::String,
+    /// What the plugin's source states of the security, where it states it,
+    /// and nothing it would have to guess (principle 14). Kept on the record as
+    /// offers with the instance as their source, in force only when a person
+    /// accepts them (W3.1, contract v10). Unspecified, or empty, is not stated.
+    #[prost(enumeration = "AssetClass", tag = "5")]
+    pub stated_asset_class: i32,
+    /// An ISO 4217 code.
+    #[prost(string, tag = "6")]
+    pub stated_currency: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub stated_description: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveIdentifierReply {
@@ -404,12 +499,12 @@ pub struct ResolveIdentifierReply {
     /// Set only when found is false.
     #[prost(enumeration = "MissReason", tag = "3")]
     pub miss_reason: i32,
-    /// True when nothing matched and instrument_id is the deployment's LCL-
-    /// placeholder for the set (W3.7), which a holding may be recorded against
-    /// until its INS- ID replaces it. found is true alongside it. An ambiguous
-    /// resolve never answers a placeholder.
+    /// True when nothing matched and this resolve minted instrument_id, the
+    /// deployment's record for the set (W3.7, contract v10); found is true
+    /// alongside it. A later resolve of the same identifiers matches the
+    /// record, and is not minted. Until v10, true meant a placeholder.
     #[prost(bool, tag = "4")]
-    pub placeholder: bool,
+    pub minted: bool,
 }
 /// Forward resolution: an instrument identifier to its record.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -454,11 +549,6 @@ pub struct MissingInstrumentDetectedEvent {
     pub reason: i32,
     #[prost(int64, tag = "7")]
     pub observed_at_ns: i64,
-    /// The deployment's LCL- placeholder for these identifiers, when its
-    /// instrument store minted or re-announced one (W3.7). Empty for an
-    /// ambiguous miss, which has no placeholder.
-    #[prost(string, tag = "8")]
-    pub placeholder_instrument_id: ::prost::alloc::string::String,
 }
 /// Reply to a pull of one instrument from the central authority.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -467,11 +557,13 @@ pub struct PullInstrumentReply {
     pub found: bool,
     #[prost(message, optional, tag = "2")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
-    /// On the instrument-pulled event: the deployment's placeholder this record
-    /// replaces (W3.3, W3.4), so the instrument store can replace it (W3.8).
-    /// Empty when the record replaces nothing.
+    /// On the instrument-pulled event: the deployment's record a person asked
+    /// about (W3.3), on which the instrument store keeps this record's values
+    /// as offers and adds its ID as an identifier, never replacing the
+    /// deployment's key (W3.5, contract v10). Until v10, the placeholder it
+    /// replaced.
     #[prost(string, tag = "3")]
-    pub replaces_instrument_id: ::prost::alloc::string::String,
+    pub for_instrument_id: ::prost::alloc::string::String,
 }
 /// Reply to a pull resolving identifiers against the central authority.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -483,10 +575,11 @@ pub struct PullIdentifierReply {
     #[prost(enumeration = "MissReason", tag = "3")]
     pub miss_reason: i32,
 }
-/// Ask the central authority to pair a deployment's placeholder with an
-/// instrument (W3.4): one sharing an identifier in force on the date, or a stub
-/// minted from these identifiers for an administrator to complete. Idempotent
-/// per placeholder: asking again answers the same pairing.
+/// The platform's surface for pairing a deployment's ID with an instrument
+/// (W3.4), which a deployment does not call from contract v10: one sharing an
+/// identifier in force on the date, or a stub minted from these identifiers
+/// for an administrator to complete. Idempotent per deployment ID: asking
+/// again answers the same pairing.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EscalateInstrumentRequest {
     #[prost(string, tag = "1")]
@@ -499,7 +592,7 @@ pub struct EscalateInstrumentRequest {
     pub as_of_ns: i64,
     #[prost(string, tag = "5")]
     pub requesting_deployment_id: ::prost::alloc::string::String,
-    /// The deployment's LCL- placeholder for these identifiers.
+    /// The deployment's ID for these identifiers.
     #[prost(string, tag = "6")]
     pub placeholder_instrument_id: ::prost::alloc::string::String,
 }
@@ -507,39 +600,40 @@ pub struct EscalateInstrumentRequest {
 pub struct EscalateInstrumentReply {
     #[prost(message, optional, tag = "1")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
-    /// False when the authority paired the placeholder with an instrument it
+    /// False when the authority paired the deployment's ID with an instrument it
     /// already held rather than minting one. The caller applies the record
     /// either way; this is for the operator.
     #[prost(bool, tag = "2")]
     pub minted: bool,
-    /// The placeholder the instrument replaces, echoed from the request.
+    /// The deployment's ID it pairs with, echoed from the request.
     #[prost(string, tag = "3")]
     pub replaces_instrument_id: ::prost::alloc::string::String,
     /// True when the identifiers point at more than one instrument, or agree on
     /// one identifier and contradict another of the same scheme. Nothing is
-    /// paired or minted, instrument is empty, and staff decide; the placeholder
-    /// stays in use until they have.
+    /// paired or minted, instrument is empty, and staff decide.
     #[prost(bool, tag = "4")]
     pub conflict: bool,
 }
-/// A record reached the local replica, by pull or by mint.
+/// A record of the deployment's reached a new version (W3.5): minted, joined
+/// by an identifier, completed, merged, or answered by the platform.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentAppliedEvent {
     #[prost(message, optional, tag = "1")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
-    /// False when the apply was a no-op because the held version was already at or
-    /// above this one.
+    /// False when nothing changed: a redelivery, or a version already held.
     #[prost(bool, tag = "2")]
     pub applied: bool,
     #[prost(int64, tag = "3")]
     pub applied_at_ns: i64,
 }
-/// A deployment's placeholder was replaced by the instrument that it stood for
-/// (W3.8). Stores keyed by instrument move what they hold under the placeholder
-/// onto the instrument (W3.9); records of what was reported keep it.
+/// A deployment's record was replaced by another (W3.8): from contract v10, a
+/// record a person merged into the one that stays (W3.13); before it, a
+/// placeholder by its INS- ID. Stores keyed by instrument move what they hold
+/// under it onto the one that stays (W3.9, W9.9); records of what was
+/// reported keep it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentReplacedEvent {
-    /// The LCL- placeholder.
+    /// The record replaced.
     #[prost(string, tag = "1")]
     pub replaced_instrument_id: ::prost::alloc::string::String,
     /// What replaces it.
@@ -547,6 +641,255 @@ pub struct InstrumentReplacedEvent {
     pub instrument: ::core::option::Option<InstrumentRecord>,
     #[prost(int64, tag = "3")]
     pub replaced_at_ns: i64,
+}
+/// One record's values, set against the version it was read at (W3.10).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentCompletion {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The record's version when it was read; a record changed since is refused
+    /// alone (REFUSAL_REASON_RECORD_CHANGED).
+    #[prost(int64, tag = "2")]
+    pub against_version: i64,
+    /// Each value with its source. A value already in force, sent again, is no
+    /// change.
+    #[prost(message, repeated, tag = "3")]
+    pub values: ::prost::alloc::vec::Vec<InstrumentValue>,
+    /// Why: required where a value changes one already held
+    /// (REFUSAL_REASON_REASON_REQUIRED); optional for filling a blank.
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W3.10. For a deployment admin, the person stamped on the envelope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompleteInstrumentsRequest {
+    /// Up to 500, each its own result.
+    #[prost(message, repeated, tag = "1")]
+    pub completions: ::prost::alloc::vec::Vec<InstrumentCompletion>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentCompletionResult {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The record at its new version, when completed.
+    #[prost(message, optional, tag = "2")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+    /// When refused: the reason and each field, by its path in the completion
+    /// (`values\[0\].currency`, `values\[1\].source`, `note`, `against_version`).
+    #[prost(message, optional, tag = "3")]
+    pub refusal: ::core::option::Option<::meridian_pb::v1::Refusal>,
+    /// The refusal in words, for the person.
+    #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompleteInstrumentsReply {
+    /// One per completion, in the request's order.
+    #[prost(message, repeated, tag = "1")]
+    pub results: ::prost::alloc::vec::Vec<InstrumentCompletionResult>,
+}
+/// W3.11. For a deployment admin.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListInstrumentsToCompleteRequest {
+    /// Records complete as well; otherwise only those lacking something.
+    #[prost(bool, tag = "1")]
+    pub include_complete: bool,
+    /// One record by its ID, as the page opening it reads it; empty for the
+    /// list.
+    #[prost(string, tag = "4")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+/// A record and what it lacks (W3.11).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentToComplete {
+    #[prost(message, optional, tag = "1")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+    /// An asset class or a currency, which the book requires (W9.1); a
+    /// description; a symbol, where the record has a source that names one.
+    #[prost(enumeration = "InstrumentField", repeated, tag = "2")]
+    pub lacks: ::prost::alloc::vec::Vec<i32>,
+    /// An asset class and a currency in force.
+    #[prost(bool, tag = "3")]
+    pub complete_for_book: bool,
+    /// Complete for the book, a description, and a symbol where one exists.
+    #[prost(bool, tag = "4")]
+    pub complete: bool,
+}
+/// Identifiers that met more than one record, or an identifier another record
+/// carries (W3.1, W3.2, W3.10): not a match, and listed until a merge
+/// settles it (W3.13).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentConflict {
+    /// The identifiers that disagree.
+    #[prost(message, repeated, tag = "1")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// The records they meet, each as it is now.
+    #[prost(string, repeated, tag = "2")]
+    pub instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The plugin instance that reported it; empty where a person's completion
+    /// met it.
+    #[prost(string, tag = "3")]
+    pub reported_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub first_seen_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub last_seen_ns: i64,
+}
+/// How many identifiers of a licensed scheme the deployment's records carry
+/// (W3.11): CUSIP Global Services counts toward its 500-identifier threshold.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LicensedIdentifierCount {
+    /// `cusip`, `isin` or `sedol`.
+    #[prost(string, tag = "1")]
+    pub scheme: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub count: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListInstrumentsToCompleteReply {
+    /// Those the book cannot use first, then the rest lacking something.
+    #[prost(message, repeated, tag = "1")]
+    pub instruments: ::prost::alloc::vec::Vec<InstrumentToComplete>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// Every conflict not yet settled.
+    #[prost(message, repeated, tag = "3")]
+    pub conflicts: ::prost::alloc::vec::Vec<InstrumentConflict>,
+    /// Across the deployment, whatever the page.
+    #[prost(int64, tag = "4")]
+    pub incomplete_for_book: i64,
+    #[prost(int64, tag = "5")]
+    pub incomplete: i64,
+    #[prost(message, repeated, tag = "6")]
+    pub licensed_identifiers: ::prost::alloc::vec::Vec<LicensedIdentifierCount>,
+}
+/// W3.12.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadInstrumentHistoryRequest {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+/// One change a version made.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentChange {
+    #[prost(enumeration = "InstrumentField", tag = "1")]
+    pub field: i32,
+    /// For INSTRUMENT_FIELD_IDENTIFIER: which identifier.
+    #[prost(message, optional, tag = "2")]
+    pub identifier: ::core::option::Option<Identifier>,
+    /// As text: an asset class by its name (`cash`), a currency, a
+    /// description, an identifier's value. Empty where there was none, or
+    /// where an identifier joined.
+    #[prost(string, tag = "3")]
+    pub before: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub after: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub source: ::prost::alloc::string::String,
+}
+/// One version of a deployment's record, append-only (W3.12).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentVersion {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub version: i64,
+    /// What made it: mint, join, complete, platform, merge, merged-into,
+    /// migrate. An open list a reader takes as data.
+    #[prost(string, tag = "3")]
+    pub operation: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub changes: ::prost::alloc::vec::Vec<InstrumentChange>,
+    /// The person, stamped by core; empty for a plugin's report or a
+    /// migration.
+    #[prost(string, tag = "5")]
+    pub person: ::prost::alloc::string::String,
+    /// The plugin instance whose resolve made it, where one did.
+    #[prost(string, tag = "6")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub record_time_ns: i64,
+    /// For a merge, the other record: the one merged in, or the one this was
+    /// merged into.
+    #[prost(string, tag = "9")]
+    pub merged_instrument_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadInstrumentHistoryReply {
+    /// Newest first.
+    #[prost(message, repeated, tag = "1")]
+    pub versions: ::prost::alloc::vec::Vec<InstrumentVersion>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// W3.13. For a deployment admin, the person stamped on the envelope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeInstrumentsRequest {
+    /// The record that stays, and the version it was read at.
+    #[prost(string, tag = "1")]
+    pub kept_instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub kept_version: i64,
+    /// The record merged into it, replaced by it (W3.8).
+    #[prost(string, tag = "3")]
+    pub merged_instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub merged_version: i64,
+    /// Fields where both carry a value, they differ, and the merged record's
+    /// stands; any other differing field keeps the kept record's.
+    #[prost(enumeration = "InstrumentField", repeated, tag = "5")]
+    pub take_from_merged: ::prost::alloc::vec::Vec<i32>,
+    /// Required: why they are one security.
+    #[prost(string, tag = "6")]
+    pub note: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeInstrumentsReply {
+    /// The record that stays, at its new version.
+    #[prost(message, optional, tag = "1")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+}
+/// W3.3. For a person at the dashboard; the conductor alone reaches the
+/// platform (decisions/011).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AskPlatformForInstrumentRequest {
+    /// The deployment's record asked about.
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The record's identifiers. The conductor sends the platform only the
+    /// open ones -- the global ID, a FIGI, an ISO 4217 code -- never a licensed
+    /// scheme's value nor a source-scoped symbol.
+    #[prost(message, repeated, tag = "2")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// The date the record's identifiers are asked about. Zero means now.
+    #[prost(int64, tag = "3")]
+    pub as_of_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AskPlatformForInstrumentReply {
+    /// False when the platform could not be reached; `detail` says why, and
+    /// completing the record works without it.
+    #[prost(bool, tag = "1")]
+    pub reachable: bool,
+    /// The platform holds a record by one of the identifiers asked with.
+    #[prost(bool, tag = "2")]
+    pub found: bool,
+    /// Its record: its ID joins the deployment's record as an identifier, and
+    /// the rest is offered (W3.5).
+    #[prost(message, optional, tag = "3")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+    #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
 }
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -646,6 +989,43 @@ impl AssetClass {
             "ASSET_CLASS_CRYPTO_ASSET" => Some(Self::CryptoAsset),
             "ASSET_CLASS_EVENT_CONTRACT" => Some(Self::EventContract),
             "ASSET_CLASS_CASH" => Some(Self::Cash),
+            _ => None,
+        }
+    }
+}
+/// Which value of a deployment's instrument record (W3, contract v10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InstrumentField {
+    Unspecified = 0,
+    AssetClass = 1,
+    Currency = 2,
+    Description = 3,
+    /// One of its identifiers, named beside the field.
+    Identifier = 4,
+}
+impl InstrumentField {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INSTRUMENT_FIELD_UNSPECIFIED",
+            Self::AssetClass => "INSTRUMENT_FIELD_ASSET_CLASS",
+            Self::Currency => "INSTRUMENT_FIELD_CURRENCY",
+            Self::Description => "INSTRUMENT_FIELD_DESCRIPTION",
+            Self::Identifier => "INSTRUMENT_FIELD_IDENTIFIER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INSTRUMENT_FIELD_UNSPECIFIED" => Some(Self::Unspecified),
+            "INSTRUMENT_FIELD_ASSET_CLASS" => Some(Self::AssetClass),
+            "INSTRUMENT_FIELD_CURRENCY" => Some(Self::Currency),
+            "INSTRUMENT_FIELD_DESCRIPTION" => Some(Self::Description),
+            "INSTRUMENT_FIELD_IDENTIFIER" => Some(Self::Identifier),
             _ => None,
         }
     }
@@ -2019,8 +2399,8 @@ pub struct ReportedCollateral {
     /// Posted by the account, or received by it. Unspecified is refused.
     #[prost(enumeration = "CollateralDirection", tag = "1")]
     pub direction: i32,
-    /// Resolved as a holding's instrument is (W3.1): an instrument or the
-    /// deployment's placeholder, the currency's cash instrument for cash; or,
+    /// Resolved as a holding's instrument is (W3.1): the deployment's record,
+    /// minted for it or held, the currency's cash instrument for cash; or,
     /// when the resolve was ambiguous, the identifiers the connector held.
     /// Exactly one of the two, as on RecordHoldingRequest.
     #[prost(string, tag = "2")]
@@ -2059,8 +2439,8 @@ pub struct RecordHoldingsStatementReply {
 }
 /// One holding, for one account, at one instrument, on one side.
 ///
-/// Either `instrument_id` is set, meaning the connector resolved it (to an
-/// instrument, or to the deployment's LCL- placeholder when nothing matched),
+/// Either `instrument_id` is set, meaning the connector resolved it (to the
+/// deployment's record, held or minted when nothing matched, W3.7),
 /// or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
 /// both, and never neither. A row that could not be resolved is still recorded, because a
 /// dropped holding is invisible and an operator comparing against their
@@ -2301,8 +2681,8 @@ pub struct CustodialPositionUpdatedEvent {
 pub struct CustodialPosition {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
-    /// An instrument, or the deployment's LCL- placeholder awaiting identity,
-    /// which the INS- ID replaces when it arrives (W3.9).
+    /// The deployment's record for the instrument, whatever its ID; a record a
+    /// person merged into another moves onto the one that stays (W3.9).
     #[prost(string, tag = "2")]
     pub instrument_id: ::prost::alloc::string::String,
     /// The trade-date quantity, signed to match `side`.
@@ -2736,7 +3116,7 @@ pub mod actor {
         #[prost(message, tag = "1")]
         Person(super::PersonActor),
         /// A finding reported with no user: the plugin instance that sent it;
-        /// the book's own act (a placeholder followed) leaves it empty.
+        /// the book's own act (a merged record followed) leaves it empty.
         #[prost(message, tag = "2")]
         System(super::SystemActor),
     }
@@ -2745,6 +3125,14 @@ pub mod actor {
 pub struct PersonActor {
     #[prost(string, tag = "1")]
     pub subject: ::prost::alloc::string::String,
+    /// The delegation the person acted through, and the client's registered
+    /// name, as the sidecar stamped them beside the person (W4.9, decisions/029;
+    /// contract v10). Empty for a person at the dashboard in a browser, and on
+    /// every act recorded before v10. The person stays the actor.
+    #[prost(string, tag = "2")]
+    pub delegation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub client_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SystemActor {
@@ -2758,7 +3146,7 @@ pub struct EntryMeta {
     #[prost(string, tag = "1")]
     pub entry_id: ::prost::alloc::string::String,
     /// An open list a reader takes as data (Q19): in v8 opening-balance,
-    /// placeholder-moved, figures-recorded, break-recorded, break-handled,
+    /// placeholder-moved (instrument-merged from v10), figures-recorded, break-recorded, break-handled,
     /// break-resolved, break-closed, adjustment, reversal, attribute-set.
     #[prost(string, tag = "2")]
     pub kind: ::prost::alloc::string::String,
@@ -2802,7 +3190,8 @@ pub struct ReferenceVersion {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MovementLine {
-    /// An instrument, a placeholder, or a currency's cash instrument.
+    /// The deployment's instrument record, a currency's cash instrument
+    /// included.
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
     #[prost(enumeration = "HoldingSide", tag = "2")]
@@ -2917,15 +3306,10 @@ pub struct BookPosition {
     pub effective_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "11")]
     pub last_change: ::core::option::Option<JournalRef>,
-    /// A tombstone, after a placeholder's move (W9.9): returned only to a read
-    /// since a watermark, and delivered once.
+    /// A tombstone, after a merged record's move (W9.9): returned only to a
+    /// read since a watermark, and delivered once.
     #[prost(bool, tag = "12")]
     pub removed: bool,
-    /// Held under a placeholder instrument (W3.7) while the street's holding is
-    /// unresolved: in the opening balance and in reconciliation as any position,
-    /// flagged, until the book follows its replacement (W9.9).
-    #[prost(bool, tag = "13")]
-    pub placeholder: bool,
     /// What of it cannot move, as the operations plugin last recorded it from
     /// a statement (W9.15): an attribute, never a movement.
     #[prost(message, repeated, tag = "14")]

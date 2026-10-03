@@ -1,302 +1,518 @@
-//! Answering instrument questions from what the instrument store holds.
+//! Answering instrument questions from the deployment's own records.
 //!
-//! Three steps live here. W3.1 turns a set of identifiers into one instrument,
-//! into the deployment's placeholder for the set, or into a miss. W3.6 turns an
-//! instrument identifier into its record, so a holding can be shown with a
-//! name. W3.2 turns a miss into a fact published on the bus, which is where
-//! this crate's obligation ends.
+//! W3.1 turns a set of identifiers into one record, a record minted for the
+//! set, or a miss. W3.6 turns a record's ID into the record, so a holding can
+//! be shown with a name and the book can read its asset class and currency.
+//! W3.2 lists the conflict a connector reports.
 //!
-//! # Nothing matched is answered; more than one is not
+//! # One identifier in common is one security (contract v10)
 //!
-//! A set that matched nothing is answered with its placeholder (W3.7), minted
-//! the first time the set is asked about and the same one every time after, so
-//! the holding can be recorded and counted at once. An ambiguous set is not: a
-//! placeholder would have to stand for one of the matches, which is the pick
-//! ambiguity refuses. See [`crate::placeholder`].
+//! Every record the deployment holds is searched, the records it minted
+//! included: a custody plugin's symbol and a market-data plugin's FIGI meet
+//! one record once either record carries both. On a match, the set's other
+//! identifiers join the record, each with the reporting instance as its
+//! source, where no other record carries them. A contradiction -- the set's
+//! identifiers meeting two records, by one tier or across tiers -- is not a
+//! match: nothing joins, the resolve is a miss, and the conflict is listed for
+//! a person, who merges what they say is one security (W3.13). That is the
+//! platform's ruled rule brought inside the deployment (the spec's Q4).
 //!
-//! Every answer is what the ID has become. A placeholder since replaced
-//! answers its `INS-` ID, and so does a legacy `LCL-` instrument, which is
-//! also why a resolve that matches both a replaced ID and its replacement
-//! meets one instrument and not two.
-//!
-//! # Identity is the answer; a ticker is an attribute
-//!
-//! A position and an order carry the canonical instrument identifier and
-//! nothing else about identity. Tickers, symbols and venue codes are dated
-//! attributes hanging off that identifier, true over a window and reassigned to
-//! somebody else afterwards. So resolution runs once, at the boundary where
-//! external data arrives, and everything downstream of it holds a key that
-//! cannot go stale.
-//!
-//! The identifier is also never reused. A retired instrument does not free its
-//! identifier for the next one, which is why forward resolution needs no as-of
-//! to decide *which* instrument it is being asked about: there has only ever
-//! been one.
+//! A set nothing matched is answered with a record minted for it (W3.7), the
+//! same one for the same set however often and however concurrently it is
+//! asked, so the holding can be recorded and counted at once.
 //!
 //! # Strongest first, and ambiguity is not a tiebreak
 //!
 //! A global scheme is tried before a source-scoped symbol, because a brokerage
 //! symbol means nothing outside its own namespace. Within a tier, more than one
-//! candidate is a miss rather than a choice. Picking would be wrong about half
-//! the time, and it would be wrong silently, which is worse than being unable
-//! to answer.
+//! candidate is a miss rather than a choice; an ambiguous tier does not fall
+//! through to a weaker one either.
 //!
-//! An ambiguous tier does not fall through to a weaker one either. Resolving by
-//! symbol what the FIGIs said was ambiguous would answer a question nobody
-//! asked, using the evidence the caller trusted least.
+//! # What a source states is offered, never in force
 //!
-//! # What the instrument store cannot answer yet
-//!
-//! It holds one version per instrument, so an identifier dropped by a later
-//! version is simply gone from it, and resolving as of a date when that mapping
-//! was still true returns nothing. Nothing, not the wrong instrument: the
-//! identifier's window is what gates the match, so a ticker since reassigned
-//! cannot answer for its previous holder. A safe failure, and still a gap.
-//! `design/replica-holds-one-version` owns closing it.
+//! An asset class, a currency or a description a plugin sends with its resolve
+//! is kept on the record as an offer, with the instance as its source, in force
+//! only when a person accepts it (W3.10; the spec's Q6).
 
 use meridian_domain::v1::{
-    AssetClass, Identifier as PbIdentifier, MissReason, MissingInstrumentDetectedEvent,
-    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
-    ResolveInstrumentRequest,
+    AssetClass, MissReason, MissingInstrumentDetectedEvent, ResolveIdentifierReply,
+    ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
 };
 
 use meridian_symbology::rank;
 
-use crate::apply::to_wire;
 use crate::ids;
-use crate::placeholder::{current, record_of};
-use crate::store::{Asked, IdentifierSet, Instrument, Placeholder, Result, Stood, Store};
+use crate::record::{asked_from_wire, asset_class_name, dated, is_currency, to_wire};
+use crate::replace::current;
+use crate::store::{
+    Asked, Change, Conflict, Field, IdentifierSet, Instrument, Offer, Result, Source, Stood, Store,
+    Version, Written,
+};
 
-/// What a resolve answered, and what it minted to answer it.
+/// What a resolve answered, and the record it changed to answer it.
 #[derive(Debug, Clone)]
 pub struct Resolution {
     pub reply: ResolveIdentifierReply,
 
-    /// The placeholder this resolve minted, which the caller announces (W3.7).
-    /// `None` when it answered an instrument, a placeholder already held, or a
-    /// miss, so a placeholder is announced as minted once and only once.
-    pub minted: Option<Placeholder>,
+    /// The record at its new version, when this resolve minted it, joined an
+    /// identifier to it, or kept a new offer on it: the caller announces it
+    /// (W3.5). `None` when nothing changed.
+    pub changed: Option<Instrument>,
 }
 
-/// W3.1 — which instrument this identifier set meant, on that date; or, when
-/// nothing did, the deployment's placeholder for the set (W3.7).
+/// W3.1 — which record this identifier set meant, on that date; or, when
+/// nothing did, a record minted for it (W3.7).
 ///
-/// `now_ns` is when a placeholder minted here is minted, passed in so a test
-/// controls time.
+/// `instance_id` is the plugin instance asking, the source of every
+/// identifier it joins and every value it offers. `now_ns` is when, passed in
+/// so a test controls time.
 pub fn resolve_identifier(
     store: &dyn Store,
     request: &ResolveIdentifierRequest,
+    instance_id: &str,
     now_ns: i64,
 ) -> Result<Resolution> {
-    let answered = |reply| Resolution {
-        reply,
-        minted: None,
-    };
+    let asked: Vec<Asked> = IdentifierSet::new(
+        request
+            .identifiers
+            .iter()
+            .map(asked_from_wire)
+            .filter(|asked| !asked.scheme.is_empty() && !asked.value.is_empty()),
+    )
+    .members()
+    .to_vec();
+    if asked.is_empty() {
+        return Ok(unchanged(missed(MissReason::NotFound)));
+    }
 
-    let mut tiers: Vec<usize> = request.identifiers.iter().map(rank).collect();
+    let mut tiers: Vec<usize> = asked.iter().map(rank_of).collect();
     tiers.sort_unstable();
     tiers.dedup();
 
     for tier in tiers {
+        let in_tier: Vec<&Asked> = asked.iter().filter(|each| rank_of(each) == tier).collect();
         let mut candidates: Vec<String> = Vec::new();
+        let mut meeting: Vec<Asked> = Vec::new();
 
-        for identifier in request.identifiers.iter().filter(|held| rank(held) == tier) {
-            let matches = store.matching(
-                &identifier.scheme,
-                &identifier.value,
-                &identifier.source,
-                request.as_of_ns,
-            )?;
-
-            for instrument in matches {
-                if !qualifies(&instrument, identifier, request) {
-                    continue;
-                }
-                // What it has become, before counting. A legacy LCL- record and
-                // the INS- record that replaced it both carry the identifiers,
-                // and they are one instrument.
-                let instrument_id = current(store, &instrument.instrument_id)?;
-
-                // Two identifiers reaching the same instrument agree; they do
-                // not compete. That holds only because an instrument identifier
-                // is never reused, so equality of the key is equality of the
+        for identifier in &in_tier {
+            for record in matches(store, identifier, request)? {
+                // What it has become, before counting: a record merged into
+                // another and the one that stays both carry the identifiers,
+                // and they are one record. That holds only because an ID is
+                // never reused, so equality of the key is equality of the
                 // thing.
-                if !candidates.contains(&instrument_id) {
-                    candidates.push(instrument_id);
+                let became = current(store, &record.instrument_id)?;
+                if !candidates.contains(&became) {
+                    candidates.push(became);
+                }
+                if !meeting.contains(identifier) {
+                    meeting.push((*identifier).clone());
                 }
             }
         }
 
         match candidates.len() {
             0 => continue,
-            1 => return Ok(answered(resolved(candidates.remove(0)))),
-            _ => return Ok(answered(missed(MissReason::Ambiguous))),
+            1 => {
+                return joined(
+                    store,
+                    request,
+                    &asked,
+                    candidates.remove(0),
+                    meeting,
+                    instance_id,
+                    now_ns,
+                )
+            }
+            _ => {
+                note(store, meeting, candidates, instance_id, now_ns)?;
+                return Ok(unchanged(missed(MissReason::Ambiguous)));
+            }
         }
     }
 
-    stand_in(store, request, now_ns)
+    mint(store, request, asked, instance_id, now_ns)
 }
 
-/// W3.7 — nothing matched, so answer the set's placeholder, minting it if this
-/// is the first time the set has been asked about.
-///
-/// An empty request is still a miss. A placeholder for no identifiers would
-/// stand for nothing, and every empty request would meet it.
-fn stand_in(
+/// One record matched: join the set's other identifiers to it, unless one of
+/// them is another record's, which is a contradiction and a miss.
+fn joined(
     store: &dyn Store,
     request: &ResolveIdentifierRequest,
+    asked: &[Asked],
+    found: String,
+    meeting: Vec<Asked>,
+    instance_id: &str,
     now_ns: i64,
 ) -> Result<Resolution> {
-    let identifiers = IdentifierSet::new(request.identifiers.iter().map(|identifier| Asked {
-        scheme: identifier.scheme.clone(),
-        value: identifier.value.clone(),
-        source: identifier.source.clone(),
-    }));
-    if identifiers.is_empty() {
-        return Ok(Resolution {
-            reply: missed(MissReason::NotFound),
-            minted: None,
-        });
-    }
+    let Some(mut record) = store.by_id(&found)? else {
+        // Replaced into something this store does not hold: answer it as it
+        // was answered before v10, the ID alone.
+        return Ok(unchanged(resolved(found, false)));
+    };
 
-    let (placeholder, stood) = store.stand_in(Placeholder {
-        placeholder_id: ids::placeholder(now_ns),
-        identifiers,
-        source: source_of(request).to_string(),
-        asset_class: String::new(),
-        as_of_ns: request.as_of_ns,
-        minted_at_ns: now_ns,
-    })?;
-
-    // Replaced, so the set has an identity now even though nothing held
-    // carries these identifiers: the platform may have paired the placeholder
-    // with an instrument it knows by others.
-    if stood == Stood::AlreadyHeld {
-        let became = current(store, &placeholder.placeholder_id)?;
-        if became != placeholder.placeholder_id {
-            return Ok(Resolution {
-                reply: resolved(became),
-                minted: None,
-            });
+    let mut joining = Vec::new();
+    for identifier in asked.iter().filter(|each| !record.carries(each)) {
+        let others = holders(store, identifier, request.as_of_ns, &found)?;
+        if !others.is_empty() {
+            let mut ids = vec![found.clone()];
+            ids.extend(others);
+            let mut identifiers = meeting.clone();
+            identifiers.push(identifier.clone());
+            note(store, identifiers, ids, instance_id, now_ns)?;
+            return Ok(unchanged(missed(MissReason::Ambiguous)));
         }
+        joining.push(identifier.clone());
     }
 
-    Ok(Resolution {
-        reply: ResolveIdentifierReply {
-            found: true,
-            instrument_id: placeholder.placeholder_id.clone(),
-            miss_reason: MissReason::Unspecified as i32,
-            placeholder: true,
-        },
-        minted: match stood {
-            Stood::Minted => Some(placeholder),
-            Stood::AlreadyHeld => None,
-        },
-    })
+    let expected = record.version;
+    let mut changes = Vec::new();
+    for identifier in &joining {
+        record.identifiers.push(dated(identifier));
+        record.set_source(Source {
+            field: Field::Identifier,
+            identifier: Some(identifier.clone()),
+            source: reported_by(instance_id),
+            person: String::new(),
+            instance_id: instance_id.to_string(),
+            recorded_at_ns: now_ns,
+            note: String::new(),
+        });
+        changes.push(identifier_change(identifier, &reported_by(instance_id)));
+    }
+    let offered = keep_offers(&mut record, stated(request, instance_id, now_ns));
+    if joining.is_empty() && !offered {
+        return Ok(unchanged(resolved(found, false)));
+    }
+
+    record.version = expected + 1;
+    record.record_time_ns = now_ns;
+    let entry = Version {
+        instrument_id: record.instrument_id.clone(),
+        version: record.version,
+        operation: if joining.is_empty() { "offer" } else { "join" }.into(),
+        changes,
+        person: String::new(),
+        instance_id: instance_id.to_string(),
+        note: String::new(),
+        merged_instrument_id: String::new(),
+        record_time_ns: now_ns,
+    };
+    match store.write(record.clone(), expected, entry)? {
+        Written::Stored => Ok(Resolution {
+            reply: resolved(found, false),
+            changed: Some(record),
+        }),
+        // Somebody wrote it in between: the match stands, and the identifiers
+        // join on the next report rather than over a version not read.
+        Written::Stale { .. } | Written::Missing => Ok(unchanged(resolved(found, false))),
+    }
 }
 
-/// W3.6 — the record behind an instrument identifier.
+/// W3.7 — nothing matched: mint a record for the set, or answer the one
+/// minted for it already.
+fn mint(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    asked: Vec<Asked>,
+    instance_id: &str,
+    now_ns: i64,
+) -> Result<Resolution> {
+    let set = IdentifierSet::new(asked.clone());
+    let instrument_id = ids::local(now_ns);
+    let mut candidate = Instrument {
+        instrument_id: instrument_id.clone(),
+        identifiers: asked.iter().map(dated).collect(),
+        asset_class: String::new(),
+        currency: String::new(),
+        exchange_mic: String::new(),
+        description: String::new(),
+        lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
+        version: 1,
+        valid_from_ns: 0,
+        record_time_ns: now_ns,
+        sources: asked
+            .iter()
+            .map(|identifier| Source {
+                field: Field::Identifier,
+                identifier: Some(identifier.clone()),
+                source: reported_by(instance_id),
+                person: String::new(),
+                instance_id: instance_id.to_string(),
+                recorded_at_ns: now_ns,
+                note: String::new(),
+            })
+            .collect(),
+        offers: Vec::new(),
+    };
+    keep_offers(&mut candidate, stated(request, instance_id, now_ns));
+    let first = Version {
+        instrument_id: instrument_id.clone(),
+        version: 1,
+        operation: "mint".into(),
+        changes: asked
+            .iter()
+            .map(|identifier| identifier_change(identifier, &reported_by(instance_id)))
+            .collect(),
+        person: String::new(),
+        instance_id: instance_id.to_string(),
+        note: String::new(),
+        merged_instrument_id: String::new(),
+        record_time_ns: now_ns,
+    };
+
+    let (record, stood) = store.mint(candidate, &set.key(), first)?;
+    match stood {
+        Stood::Minted => Ok(Resolution {
+            reply: resolved(record.instrument_id.clone(), true),
+            changed: Some(record),
+        }),
+        Stood::AlreadyHeld => {
+            let became = current(store, &record.instrument_id)?;
+            Ok(unchanged(resolved(became, false)))
+        }
+    }
+}
+
+/// W3.2 — a connector reports an ambiguous resolve: list the conflict if its
+/// identifiers meet more than one record, and say whether they did.
+pub fn conflict_reported(
+    store: &dyn Store,
+    event: &MissingInstrumentDetectedEvent,
+    now_ns: i64,
+) -> Result<bool> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut meeting: Vec<Asked> = Vec::new();
+    for identifier in &event.identifiers {
+        let asked = asked_from_wire(identifier);
+        for record in store.matching(&asked.scheme, &asked.value, &asked.source, event.as_of_ns)? {
+            let became = current(store, &record.instrument_id)?;
+            if !ids.contains(&became) {
+                ids.push(became);
+            }
+            if !meeting.contains(&asked) {
+                meeting.push(asked.clone());
+            }
+        }
+    }
+    if ids.len() < 2 {
+        return Ok(false);
+    }
+    note(
+        store,
+        meeting,
+        ids,
+        &event.publisher_instance_id,
+        if event.observed_at_ns > 0 {
+            event.observed_at_ns
+        } else {
+            now_ns
+        },
+    )?;
+    Ok(true)
+}
+
+/// W3.6 — the record behind an ID: its values with their sources, and the
+/// offers beside them.
 ///
-/// `as_of_ns` does not select which instrument. Identity is never reused, so
-/// the key answers that on its own. It selects which version's attributes were
-/// true then, and the instrument store holds one version, so the answer here is the
-/// version held whatever the as-of. Stale attributes on a stable identity, and
-/// the same gap `design/replica-holds-one-version` covers.
-///
-/// A replaced ID answers its replacement's record, whose `instrument_id` is
-/// not the one asked about: that difference is how a reader holding a
-/// placeholder learns what it became. A placeholder not yet replaced answers a
-/// record for itself, in DEFINE at version 0 (see [`record_of`]).
+/// `as_of_ns` does not select which record: an ID is never reused. A record
+/// merged into another answers the one that stays, whose `instrument_id` is
+/// not the one asked about: that difference is how a reader holding the
+/// merged ID learns what it became.
 pub fn resolve_instrument(
     store: &dyn Store,
     request: &ResolveInstrumentRequest,
 ) -> Result<ResolveInstrumentReply> {
     let became = current(store, &request.instrument_id)?;
-
-    let record = match store.by_id(&became)? {
-        Some(held) => Some(to_wire(&held)),
-        None => store.placeholder(&became)?.as_ref().map(record_of),
-    };
-
+    let record = store.by_id(&became)?.as_ref().map(to_wire);
     Ok(ResolveInstrumentReply {
         found: record.is_some(),
         instrument: record,
     })
 }
 
-/// W3.2 — the miss, as a fact to publish.
-///
-/// `None` when the resolution found something, so a caller cannot announce a
-/// miss that did not happen.
-///
-/// A fact and not a request: it reports what was held and stops. This crate has
-/// no authority to mint an instrument, and keeping that authority on the far
-/// side of an event boundary is what stops a misbehaving feed from filling the
-/// master with junk.
-pub fn missing_instrument(
+/// The records this identifier meets on the date, the request's venue and
+/// currency admitting them.
+fn matches(
+    store: &dyn Store,
+    identifier: &Asked,
     request: &ResolveIdentifierRequest,
-    reply: &ResolveIdentifierReply,
-    asset_class: AssetClass,
-    publisher_instance_id: &str,
-    observed_at_ns: i64,
-) -> Option<MissingInstrumentDetectedEvent> {
-    if reply.found {
-        return None;
+) -> Result<Vec<Instrument>> {
+    Ok(store
+        .matching(
+            &identifier.scheme,
+            &identifier.value,
+            &identifier.source,
+            request.as_of_ns,
+        )?
+        .into_iter()
+        .filter(|record| qualifies(record, identifier, request))
+        .collect())
+}
+
+/// The records other than `found`, as they are now, carrying `identifier` on
+/// the date.
+fn holders(
+    store: &dyn Store,
+    identifier: &Asked,
+    as_of_ns: i64,
+    found: &str,
+) -> Result<Vec<String>> {
+    let mut others = Vec::new();
+    for record in store.matching(
+        &identifier.scheme,
+        &identifier.value,
+        &identifier.source,
+        as_of_ns,
+    )? {
+        let became = current(store, &record.instrument_id)?;
+        if became != found && !others.contains(&became) {
+            others.push(became);
+        }
     }
-
-    Some(MissingInstrumentDetectedEvent {
-        source: source_of(request).to_string(),
-        asset_class: asset_class as i32,
-
-        // Everything held, not just what was tried. A reader with access to the
-        // platform may be able to pull on a scheme this store could not.
-        identifiers: request.identifiers.clone(),
-        as_of_ns: request.as_of_ns,
-        publisher_instance_id: publisher_instance_id.to_string(),
-        reason: reply.miss_reason,
-        observed_at_ns,
-        placeholder_instrument_id: String::new(),
-    })
+    Ok(others)
 }
 
 /// Whether the request's venue and currency admit this match.
 ///
-/// They narrow a source-scoped symbol, which is the identifier that needs
-/// narrowing: the same ticker trades in several places. They do not narrow a
-/// global identifier, which is unique already, and where a stale venue on the
-/// request would only suppress a correct answer.
-fn qualifies(
-    instrument: &Instrument,
-    identifier: &PbIdentifier,
-    request: &ResolveIdentifierRequest,
-) -> bool {
+/// They narrow a source-scoped symbol, the identifier that needs narrowing: the
+/// same ticker trades in several places. They do not narrow a global
+/// identifier, which is unique already. A record that names no venue or no
+/// currency yet -- one this deployment minted, until a person completes it --
+/// is not narrowed by what it does not say.
+fn qualifies(record: &Instrument, identifier: &Asked, request: &ResolveIdentifierRequest) -> bool {
     if identifier.source.is_empty() {
         return true;
     }
-
-    let venue_ok =
-        request.exchange_mic.is_empty() || request.exchange_mic == instrument.exchange_mic;
-    let currency_ok = request.currency.is_empty() || request.currency == instrument.currency;
-
+    let venue_ok = request.exchange_mic.is_empty()
+        || record.exchange_mic.is_empty()
+        || request.exchange_mic == record.exchange_mic;
+    let currency_ok = request.currency.is_empty()
+        || record.currency.is_empty()
+        || request.currency == record.currency;
     venue_ok && currency_ok
 }
 
-/// The namespace the miss happened in, for a reader deciding who to ask.
-fn source_of(request: &ResolveIdentifierRequest) -> &str {
-    request
-        .identifiers
-        .iter()
-        .map(|identifier| identifier.source.as_str())
-        .find(|source| !source.is_empty())
-        .unwrap_or_default()
+/// What the plugin's source stated, as offers (the spec's Q6). Only what it
+/// can be: a class the enum defines, a currency that is a code.
+fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) -> Vec<Offer> {
+    let words = format!("stated by {instance_id}");
+    let offer = |field: Field, value: String| Offer {
+        field,
+        value,
+        identifier: None,
+        source: words.clone(),
+        instance_id: instance_id.to_string(),
+        offered_at_ns: now_ns,
+    };
+    let mut offers = Vec::new();
+    if let Ok(class) = AssetClass::try_from(request.stated_asset_class) {
+        if class != AssetClass::Unspecified {
+            offers.push(offer(Field::AssetClass, asset_class_name(class as i32)));
+        }
+    }
+    let currency = request.stated_currency.trim();
+    if is_currency(currency) {
+        offers.push(offer(Field::Currency, currency.to_string()));
+    }
+    let description = request.stated_description.trim();
+    if !description.is_empty() {
+        offers.push(offer(Field::Description, description.to_string()));
+    }
+    offers
 }
 
-fn resolved(instrument_id: String) -> ResolveIdentifierReply {
+/// Keep each offer that says something the record does not, in place of what
+/// the same source offered for the field before. `true` when any changed.
+///
+/// An offer of the value already in force is no offer, and a later offer
+/// never touches a value in force (the spec's requirement 11).
+pub(crate) fn keep_offers(record: &mut Instrument, offers: Vec<Offer>) -> bool {
+    let mut changed = false;
+    for offer in offers {
+        let in_force = match offer.field {
+            Field::Identifier => offer
+                .identifier
+                .as_ref()
+                .is_some_and(|identifier| record.carries(identifier)),
+            field => record.value(field) == offer.value,
+        };
+        if in_force || record.offers.iter().any(|held| held.same_as(&offer)) {
+            continue;
+        }
+        if offer.field != Field::Identifier {
+            record.offers.retain(|held| {
+                !(held.field == offer.field
+                    && held.instance_id == offer.instance_id
+                    && held.source == offer.source)
+            });
+        }
+        record.offers.push(offer);
+        changed = true;
+    }
+    changed
+}
+
+/// List a conflict for a person, or bring it up to date.
+fn note(
+    store: &dyn Store,
+    identifiers: Vec<Asked>,
+    mut instrument_ids: Vec<String>,
+    reported_by: &str,
+    now_ns: i64,
+) -> Result<()> {
+    instrument_ids.sort();
+    instrument_ids.dedup();
+    tracing::info!(
+        records = ?instrument_ids,
+        reported_by,
+        "identifiers meet more than one record: listed for a person to merge"
+    );
+    store.note_conflict(Conflict {
+        identifiers,
+        instrument_ids,
+        reported_by: reported_by.to_string(),
+        first_seen_ns: now_ns,
+        last_seen_ns: now_ns,
+    })
+}
+
+pub(crate) fn reported_by(instance_id: &str) -> String {
+    if instance_id.is_empty() {
+        "reported by a plugin".into()
+    } else {
+        format!("reported by {instance_id}")
+    }
+}
+
+pub(crate) fn identifier_change(identifier: &Asked, source: &str) -> Change {
+    Change {
+        field: Field::Identifier.name().into(),
+        scheme: identifier.scheme.clone(),
+        namespace: identifier.source.clone(),
+        before: String::new(),
+        after: identifier.value.clone(),
+        source: source.to_string(),
+    }
+}
+
+fn rank_of(asked: &Asked) -> usize {
+    rank(&crate::record::asked_to_wire(asked))
+}
+
+fn unchanged(reply: ResolveIdentifierReply) -> Resolution {
+    Resolution {
+        reply,
+        changed: None,
+    }
+}
+
+fn resolved(instrument_id: String, minted: bool) -> ResolveIdentifierReply {
     ResolveIdentifierReply {
         found: true,
         instrument_id,
         miss_reason: MissReason::Unspecified as i32,
-        placeholder: false,
+        minted,
     }
 }
 
@@ -305,7 +521,7 @@ fn missed(reason: MissReason) -> ResolveIdentifierReply {
         found: false,
         instrument_id: String::new(),
         miss_reason: reason as i32,
-        placeholder: false,
+        minted: false,
     }
 }
 
@@ -314,47 +530,18 @@ mod tests {
     use super::*;
     use crate::store::Identifier;
     use crate::MemoryStore;
+    use meridian_domain::v1::Identifier as PbIdentifier;
 
     /// The fixture's as-of.
     const AS_OF: i64 = 1_757_289_600_000_000_000;
 
-    /// Long before it, so a mapping is comfortably in force.
-    const EFFECTIVE: i64 = 1_700_000_000_000_000_000;
-
-    /// When a placeholder minted by these tests is minted.
+    /// When a record minted by these tests is minted.
     const NOW: i64 = 1_757_376_000_000_000_000;
 
-    /// W3.1's answer alone, for the tests that are about the answer.
-    fn resolve(
-        store: &dyn Store,
-        request: &ResolveIdentifierRequest,
-    ) -> Result<ResolveIdentifierReply> {
-        resolve_identifier(store, request, NOW).map(|resolution| resolution.reply)
-    }
-
-    fn held(scheme: &str, value: &str, source: &str, valid_from_ns: i64) -> Identifier {
-        Identifier {
-            scheme: scheme.into(),
-            value: value.into(),
-            source: source.into(),
-            valid_from_ns,
-            valid_to_ns: None,
-        }
-    }
-
-    fn instrument(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
-        Instrument {
-            instrument_id: instrument_id.into(),
-            identifiers,
-            asset_class: "ASSET_CLASS_EQUITY".into(),
-            currency: "USD".into(),
-            exchange_mic: "XNAS".into(),
-            description: "Apple Inc. common stock".into(),
-            lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
-            version: 1,
-            valid_from_ns: EFFECTIVE,
-            record_time_ns: EFFECTIVE,
-        }
+    fn resolve(store: &dyn Store, request: &ResolveIdentifierRequest) -> ResolveIdentifierReply {
+        resolve_identifier(store, request, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .reply
     }
 
     fn asked(scheme: &str, value: &str, source: &str) -> PbIdentifier {
@@ -365,614 +552,392 @@ mod tests {
         }
     }
 
-    /// The fixture's request: a FIGI and a brokerage symbol, narrowed by venue
-    /// and currency.
     fn request(identifiers: Vec<PbIdentifier>) -> ResolveIdentifierRequest {
         ResolveIdentifierRequest {
             identifiers,
             as_of_ns: AS_OF,
             exchange_mic: "XNAS".into(),
             currency: "USD".into(),
+            ..Default::default()
         }
     }
 
+    /// A record applied from the platform before v10, as the migration left
+    /// it.
+    fn platform_record(
+        instrument_id: &str,
+        identifiers: Vec<(&str, &str, &str, i64)>,
+    ) -> Instrument {
+        Instrument {
+            instrument_id: instrument_id.into(),
+            identifiers: identifiers
+                .into_iter()
+                .map(|(scheme, value, source, from)| Identifier {
+                    scheme: scheme.into(),
+                    value: value.into(),
+                    source: source.into(),
+                    valid_from_ns: from,
+                    valid_to_ns: None,
+                })
+                .collect(),
+            asset_class: "ASSET_CLASS_EQUITY".into(),
+            currency: "USD".into(),
+            exchange_mic: "XNAS".into(),
+            description: "Apple Inc. common stock".into(),
+            lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
+            version: 4,
+            valid_from_ns: 0,
+            record_time_ns: 0,
+            sources: Vec::new(),
+            offers: Vec::new(),
+        }
+    }
+
+    fn hold(store: &MemoryStore, record: Instrument) {
+        let key = format!("held:{}", record.instrument_id);
+        let first = Version {
+            instrument_id: record.instrument_id.clone(),
+            version: record.version,
+            operation: "migrate".into(),
+            changes: Vec::new(),
+            person: String::new(),
+            instance_id: String::new(),
+            note: String::new(),
+            merged_instrument_id: String::new(),
+            record_time_ns: 0,
+        };
+        store.mint(record, &key, first).unwrap();
+    }
+
     #[test]
-    fn the_fixture_request_resolves_to_the_fixture_instrument() {
+    fn the_fixture_request_resolves_to_the_fixture_record() {
         let store = MemoryStore::new();
-        store
-            .apply(instrument(
+        hold(
+            &store,
+            platform_record(
                 "INS-01J8XQ4M7K0000000000AAPL",
                 vec![
-                    held("figi", "BBG000B9XRY4", "", EFFECTIVE),
-                    held("symbol", "AAPL", "snaptrade", EFFECTIVE),
+                    ("figi", "BBG000B9XRY4", "", 0),
+                    ("symbol", "AAPL", "snaptrade", 0),
                 ],
-            ))
-            .unwrap();
-
+            ),
+        );
         let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
                 asked("symbol", "AAPL", "snaptrade"),
             ]),
-        )
-        .unwrap();
-
+        );
         assert!(reply.found);
+        assert!(!reply.minted);
         assert_eq!(reply.instrument_id, "INS-01J8XQ4M7K0000000000AAPL");
     }
 
     #[test]
-    fn a_global_scheme_answers_before_a_brokerage_symbol() {
-        // The two identifiers disagree, which is exactly when the order matters.
-        // A symbol is meaningful only inside its namespace, so it loses.
+    fn nothing_matched_mints_a_record_once_and_matches_it_after() {
         let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-GLOBAL",
-                vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-            ))
-            .unwrap();
-        store
-            .apply(instrument(
-                "INS-SCOPED",
-                vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
-            ))
-            .unwrap();
+        let set = request(vec![asked("symbol", "ZZTOP", "snaptrade")]);
+        let first = resolve_identifier(&store, &set, "custody-snaptrade-1", NOW).unwrap();
+        assert!(first.reply.found && first.reply.minted);
+        assert!(first.reply.instrument_id.starts_with(ids::LOCAL_PREFIX));
+        let minted = first.changed.expect("a minted record is announced");
+        assert_eq!(minted.version, 1);
+        assert_eq!(minted.sources[0].instance_id, "custody-snaptrade-1");
+        assert!(
+            minted.asset_class.is_empty(),
+            "nothing in force from a resolve"
+        );
 
-        let reply = resolve(
-            &store,
-            &request(vec![
-                asked("symbol", "AAPL", "snaptrade"),
-                asked("figi", "BBG000B9XRY4", ""),
-            ]),
-        )
-        .unwrap();
-
-        assert_eq!(reply.instrument_id, "INS-GLOBAL");
+        let again = resolve(&store, &set);
+        assert_eq!(again.instrument_id, first.reply.instrument_id);
+        assert!(!again.minted, "matched, not minted, the second time");
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
-    fn a_weaker_global_scheme_answers_when_the_stronger_one_is_not_held() {
+    fn a_second_identifier_joins_the_record_one_in_common_meets() {
+        // The spec's Q4: SnapTrade's symbol, then a report carrying the symbol
+        // and a FIGI: one record, and the FIGI joins it from the instance.
         let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-BY-ISIN",
-                vec![held("isin", "US0378331005", "", EFFECTIVE)],
-            ))
-            .unwrap();
-
-        let reply = resolve(
-            &store,
-            &request(vec![
-                asked("figi", "BBG000B9XRY4", ""),
-                asked("isin", "US0378331005", ""),
-            ]),
-        )
-        .unwrap();
-
-        assert_eq!(reply.instrument_id, "INS-BY-ISIN");
-    }
-
-    #[test]
-    fn nothing_matched_is_answered_with_a_placeholder_minted_once() {
-        // The fixture's first case. The holding has a name at once, and the
-        // same name every time the set is asked about.
-        let store = MemoryStore::new();
-        let asking = request(vec![asked("symbol", "ZZTOP", "snaptrade")]);
-
-        let first = resolve_identifier(&store, &asking, NOW).unwrap();
-        assert!(first.reply.found);
-        assert!(first.reply.placeholder);
-        assert!(first.reply.instrument_id.starts_with("LCL-"));
-        let minted = first.minted.expect("the first resolve mints");
-        assert_eq!(minted.placeholder_id, first.reply.instrument_id);
-        assert_eq!(minted.source, "snaptrade");
-        assert_eq!(minted.as_of_ns, AS_OF);
-
-        let again = resolve_identifier(&store, &asking, NOW + 1).unwrap();
-        assert_eq!(again.reply.instrument_id, first.reply.instrument_id);
-        assert!(again.reply.placeholder);
-        assert!(again.minted.is_none(), "announced as minted twice");
-    }
-
-    #[test]
-    fn the_same_set_in_another_order_meets_the_same_placeholder() {
-        let store = MemoryStore::new();
-
         let first = resolve(
             &store,
-            &request(vec![
-                asked("symbol", "ZZTOP", "snaptrade"),
-                asked("figi", "BBG000ZZTOP1", ""),
-            ]),
-        )
-        .unwrap();
-        let reordered = resolve(
+            &request(vec![asked("symbol", "SPAXX", "snaptrade")]),
+        );
+        let joined = resolve_identifier(
             &store,
             &request(vec![
-                asked("figi", "BBG000ZZTOP1", ""),
-                asked("symbol", "ZZTOP", "snaptrade"),
+                asked("symbol", "SPAXX", "snaptrade"),
+                asked("figi", "BBG000SPAXX1", ""),
             ]),
+            "market-data-1",
+            NOW + 1,
         )
         .unwrap();
+        assert_eq!(joined.reply.instrument_id, first.instrument_id);
+        let record = joined.changed.expect("a join is a new version");
+        assert_eq!(record.version, 2);
+        let figi = record
+            .source_of(
+                Field::Identifier,
+                Some(&Asked {
+                    scheme: "figi".into(),
+                    value: "BBG000SPAXX1".into(),
+                    source: String::new(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(figi.instance_id, "market-data-1");
+        assert!(figi.person.is_empty());
 
-        assert_eq!(reordered.instrument_id, first.instrument_id);
-        assert_eq!(store.outstanding().unwrap().len(), 1);
+        // And the FIGI alone now meets it.
+        let by_figi = resolve(&store, &request(vec![asked("figi", "BBG000SPAXX1", "")]));
+        assert_eq!(by_figi.instrument_id, first.instrument_id);
+        assert_eq!(
+            store.history(&first.instrument_id).unwrap()[0].operation,
+            "join"
+        );
     }
 
     #[test]
-    fn a_different_set_is_a_different_placeholder() {
+    fn identifiers_meeting_two_records_are_a_miss_and_a_conflict_and_join_nothing() {
         let store = MemoryStore::new();
-
-        let one = resolve(
+        let by_symbol = resolve(
             &store,
             &request(vec![asked("symbol", "ZZTOP", "snaptrade")]),
-        )
-        .unwrap();
-        let other = resolve(
+        );
+        let by_figi = resolve(&store, &request(vec![asked("figi", "BBG000ZZTOP1", "")]));
+        assert_ne!(by_symbol.instrument_id, by_figi.instrument_id);
+
+        let both = resolve(
             &store,
             &request(vec![
                 asked("symbol", "ZZTOP", "snaptrade"),
                 asked("figi", "BBG000ZZTOP1", ""),
             ]),
-        )
-        .unwrap();
-
-        assert_ne!(one.instrument_id, other.instrument_id);
+        );
+        assert!(!both.found);
+        assert_eq!(both.miss_reason, MissReason::Ambiguous as i32);
+        let conflicts = store.conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        let mut ids = vec![
+            by_symbol.instrument_id.clone(),
+            by_figi.instrument_id.clone(),
+        ];
+        ids.sort();
+        assert_eq!(conflicts[0].instrument_ids, ids);
+        assert_eq!(conflicts[0].reported_by, "custody-snaptrade-1");
+        assert_eq!(
+            store
+                .by_id(&by_figi.instrument_id)
+                .unwrap()
+                .unwrap()
+                .identifiers
+                .len(),
+            1,
+            "nothing joined either record"
+        );
     }
 
     #[test]
-    fn ambiguity_mints_no_placeholder() {
-        // A placeholder would have to stand for one of the matches, which is
-        // the pick ambiguity refuses.
+    fn more_than_one_match_in_a_tier_is_a_miss_rather_than_a_guess() {
         let store = MemoryStore::new();
-        for instrument_id in ["INS-ONE", "INS-TWO"] {
-            store
-                .apply(instrument(
-                    instrument_id,
-                    vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
-                ))
-                .unwrap();
-        }
-
-        let resolution = resolve_identifier(
+        hold(
             &store,
-            &request(vec![asked("symbol", "AAPL", "snaptrade")]),
-            NOW,
-        )
-        .unwrap();
-
-        assert!(!resolution.reply.found);
-        assert!(!resolution.reply.placeholder);
-        assert!(resolution.minted.is_none());
-        assert!(store.outstanding().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_replaced_placeholder_answers_its_instrument() {
-        // The platform paired it with an instrument it knows by other
-        // identifiers, so nothing held carries these. The set answers the INS-
-        // ID all the same, and says it is not a placeholder.
-        let store = MemoryStore::new();
-        let asking = request(vec![asked("symbol", "ZZTOP", "snaptrade")]);
-        let placeholder = resolve(&store, &asking).unwrap().instrument_id;
-
-        store
-            .apply(instrument(
-                "INS-ZZTOP",
-                vec![held("figi", "BBG000ZZTOP1", "", EFFECTIVE)],
-            ))
-            .unwrap();
-        store.replace(&placeholder, "INS-ZZTOP", NOW).unwrap();
-
-        let reply = resolve(&store, &asking).unwrap();
-        assert!(reply.found);
-        assert!(!reply.placeholder);
-        assert_eq!(reply.instrument_id, "INS-ZZTOP");
-    }
-
-    #[test]
-    fn a_legacy_record_and_its_replacement_are_one_match_and_not_two() {
-        // The legacy path. The platform minted LCL- before it minted only INS-,
-        // and moved it to INS- keeping the identifiers, so both rows carry
-        // them. Counted as two, the set would turn ambiguous the moment its
-        // identity arrived.
-        let store = MemoryStore::new();
-        for instrument_id in ["LCL-LEGACY", "INS-MOVED"] {
-            store
-                .apply(instrument(
-                    instrument_id,
-                    vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-                ))
-                .unwrap();
-        }
-        store.replace("LCL-LEGACY", "INS-MOVED", NOW).unwrap();
-
-        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
-        assert!(reply.found);
-        assert_eq!(reply.instrument_id, "INS-MOVED");
-    }
-
-    #[test]
-    fn more_than_one_match_is_a_miss_rather_than_a_guess() {
-        // The fixture's second case. A silent pick would be wrong half the time.
-        let store = MemoryStore::new();
-        for instrument_id in ["INS-ONE", "INS-TWO"] {
-            store
-                .apply(instrument(
-                    instrument_id,
-                    vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
-                ))
-                .unwrap();
-        }
-
-        let reply = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")])).unwrap();
-
+            platform_record("INS-A", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        hold(
+            &store,
+            platform_record("INS-B", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")]));
         assert!(!reply.found);
-        assert!(reply.instrument_id.is_empty());
         assert_eq!(reply.miss_reason, MissReason::Ambiguous as i32);
+        assert_eq!(store.count().unwrap(), 2, "ambiguity mints nothing");
     }
 
     #[test]
-    fn an_ambiguous_tier_does_not_fall_through_to_a_weaker_one() {
-        // Two instruments claim the FIGI, one claims the symbol. Answering from
-        // the symbol would resolve by the evidence the caller trusted least,
-        // and would hide a contradiction in the evidence it trusted most.
+    fn a_global_scheme_answers_before_a_brokerage_symbol() {
         let store = MemoryStore::new();
-        for instrument_id in ["INS-ONE", "INS-TWO"] {
-            store
-                .apply(instrument(
-                    instrument_id,
-                    vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-                ))
-                .unwrap();
-        }
-        store
-            .apply(instrument(
-                "INS-THREE",
-                vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
-            ))
-            .unwrap();
-
+        hold(
+            &store,
+            platform_record("INS-GLOBAL", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        hold(
+            &store,
+            platform_record("INS-SCOPED", vec![("symbol", "AAPL", "snaptrade", 0)]),
+        );
+        // The two disagree; the FIGI decides, and the symbol, carried by
+        // another record, is a contradiction rather than a join.
         let reply = resolve(
             &store,
             &request(vec![
                 asked("figi", "BBG000B9XRY4", ""),
                 asked("symbol", "AAPL", "snaptrade"),
             ]),
-        )
-        .unwrap();
-
-        assert_eq!(reply.miss_reason, MissReason::Ambiguous as i32);
-    }
-
-    #[test]
-    fn two_identifiers_reaching_one_instrument_are_not_ambiguous() {
-        // They agree. That reads as agreement only because an instrument
-        // identifier is never reused, so equality of the key is equality of the
-        // instrument.
-        let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-ONE",
-                vec![
-                    held("figi", "BBG000B9XRY4", "", EFFECTIVE),
-                    held("isin", "US0378331005", "", EFFECTIVE),
-                ],
-            ))
-            .unwrap();
-
-        let reply = resolve(
-            &store,
-            &request(vec![
-                asked("figi", "BBG000B9XRY4", ""),
-                asked("isin", "US0378331005", ""),
-            ]),
-        )
-        .unwrap();
-
-        assert!(reply.found);
-        assert_eq!(reply.instrument_id, "INS-ONE");
-    }
-
-    #[test]
-    fn venue_and_currency_narrow_a_symbol_match() {
-        let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-NASDAQ",
-                vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
-            ))
-            .unwrap();
-
-        let mut elsewhere = instrument(
-            "INS-XETRA",
-            vec![held("symbol", "AAPL", "snaptrade", EFFECTIVE)],
         );
-        elsewhere.exchange_mic = "XETR".into();
-        elsewhere.currency = "EUR".into();
-        store.apply(elsewhere).unwrap();
-
-        let reply = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")])).unwrap();
-
-        assert_eq!(reply.instrument_id, "INS-NASDAQ");
+        assert!(
+            !reply.found,
+            "a symbol on another record contradicts the FIGI's"
+        );
+        let by_figi_alone = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")]));
+        assert_eq!(by_figi_alone.instrument_id, "INS-GLOBAL");
     }
 
     #[test]
-    fn a_venue_qualifier_does_not_suppress_a_global_match() {
-        // A FIGI is unique on its own. Narrowing it by a venue the caller
-        // happened to send would turn a correct answer into a miss.
+    fn venue_and_currency_narrow_a_symbol_match_once_the_record_says_them() {
         let store = MemoryStore::new();
-        let mut listed_elsewhere = instrument(
-            "INS-XETRA",
-            vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
+        let mut cad = platform_record("INS-CAD", vec![("symbol", "AAPL", "snaptrade", 0)]);
+        cad.currency = "CAD".into();
+        cad.exchange_mic = "XTSE".into();
+        hold(&store, cad);
+        let reply = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")]));
+        assert!(
+            reply.minted,
+            "a USD listing in XNAS is not the CAD one in XTSE"
         );
-        listed_elsewhere.exchange_mic = "XETR".into();
-        store.apply(listed_elsewhere).unwrap();
+        assert_ne!(reply.instrument_id, "INS-CAD");
 
-        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
-
-        assert_eq!(reply.instrument_id, "INS-XETRA");
+        // A minted record says no venue or currency, and is not narrowed by
+        // what it does not say.
+        let again = resolve(&store, &request(vec![asked("symbol", "AAPL", "snaptrade")]));
+        assert_eq!(again.instrument_id, reply.instrument_id);
     }
 
     #[test]
     fn an_identifier_does_not_resolve_before_the_mapping_existed() {
         let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-ONE",
-                vec![held("figi", "BBG000B9XRY4", "", AS_OF + 1)],
-            ))
-            .unwrap();
-
-        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")])).unwrap();
-
-        // Nothing matched then, so the set's placeholder, and not INS-ONE.
-        assert!(reply.placeholder, "{reply:?}");
-        assert_ne!(reply.instrument_id, "INS-ONE");
+        hold(
+            &store,
+            platform_record("INS-LATE", vec![("figi", "BBG000LATE01", "", AS_OF + 1)]),
+        );
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000LATE01", "")]));
+        assert!(reply.minted, "not the record whose mapping began later");
+        assert_ne!(reply.instrument_id, "INS-LATE");
     }
 
     #[test]
-    fn a_reassigned_ticker_misses_rather_than_answering_for_its_previous_holder() {
-        // ZZTOP belonged to one instrument and was later given to another. A
-        // statement from before the reassignment must not resolve to whoever
-        // holds the ticker now.
-        //
-        // The instrument store keeps one version, so the earlier mapping is simply gone
-        // and the honest answer is that nothing matched: the set's placeholder,
-        // which the platform can pair with the right instrument. Recorded, with
-        // the alternatives, in design/replica-holds-one-version.
+    fn what_the_source_states_is_offered_and_never_in_force() {
         let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-NEW-HOLDER",
-                vec![held("symbol", "ZZTOP", "snaptrade", AS_OF + 1)],
-            ))
+        let mut stating = request(vec![asked("symbol", "SNAP1", "snaptrade")]);
+        stating.stated_asset_class = AssetClass::Equity as i32;
+        stating.stated_currency = "USD".into();
+        stating.stated_description = "Snap One Holdings".into();
+        let minted = resolve_identifier(&store, &stating, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .changed
             .unwrap();
+        assert!(minted.asset_class.is_empty() && minted.currency.is_empty());
+        assert_eq!(minted.offers.len(), 3);
+        assert!(minted
+            .offers
+            .iter()
+            .all(|offer| offer.instance_id == "custody-snaptrade-1"));
 
-        let reply = resolve(
+        // Stated again, the same: nothing changes.
+        let again = resolve_identifier(&store, &stating, "custody-snaptrade-1", NOW + 1).unwrap();
+        assert!(again.changed.is_none());
+
+        // A pseudo-currency is no offer.
+        let mut base = request(vec![asked("symbol", "SNAP2", "snaptrade")]);
+        base.stated_currency = "BASE".into();
+        let minted = resolve_identifier(&store, &base, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert!(minted.offers.is_empty());
+    }
+
+    #[test]
+    fn a_merged_record_and_the_one_that_stays_are_one_match_and_not_two() {
+        let store = MemoryStore::new();
+        hold(
             &store,
-            &request(vec![asked("symbol", "ZZTOP", "snaptrade")]),
-        )
-        .unwrap();
-
-        assert!(reply.placeholder, "{reply:?}");
-        assert_ne!(reply.instrument_id, "INS-NEW-HOLDER");
+            platform_record("LCL-MERGED", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        hold(
+            &store,
+            platform_record("LCL-KEPT", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        store.replace("LCL-MERGED", "LCL-KEPT", NOW).unwrap();
+        let reply = resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")]));
+        assert_eq!(reply.instrument_id, "LCL-KEPT");
     }
 
     #[test]
     fn a_request_carrying_no_identifiers_is_a_miss() {
         let store = MemoryStore::new();
-        let reply = resolve(&store, &request(vec![])).unwrap();
-
-        assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
-    }
-
-    #[test]
-    fn an_instrument_resolves_by_its_canonical_identifier() {
-        let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-01J8XQ4M7K0000000000AAPL",
-                vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-            ))
-            .unwrap();
-
-        let reply = resolve_instrument(
-            &store,
-            &ResolveInstrumentRequest {
-                instrument_id: "INS-01J8XQ4M7K0000000000AAPL".into(),
-                as_of_ns: AS_OF,
-            },
-        )
-        .unwrap();
-
-        assert!(reply.found);
-        let record = reply.instrument.unwrap();
-        assert_eq!(record.instrument_id, "INS-01J8XQ4M7K0000000000AAPL");
-        assert_eq!(record.description, "Apple Inc. common stock");
-        assert_eq!(
-            record.lifecycle_state,
-            meridian_domain::v1::InstrumentLifecycleState::Active as i32
-        );
-    }
-
-    #[test]
-    fn forward_resolution_needs_no_as_of_to_know_which_instrument() {
-        // Identity is never reused, so the key answers that by itself. The
-        // as-of selects which version's attributes were true, and the instrument store
-        // holds one.
-        let store = MemoryStore::new();
-        store
-            .apply(instrument(
-                "INS-ONE",
-                vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-            ))
-            .unwrap();
-
-        let reply = resolve_instrument(
-            &store,
-            &ResolveInstrumentRequest {
-                instrument_id: "INS-ONE".into(),
-                as_of_ns: EFFECTIVE - 1,
-            },
-        )
-        .unwrap();
-
-        assert!(reply.found);
-        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-ONE");
-    }
-
-    #[test]
-    fn a_placeholder_resolves_to_a_record_for_itself_until_it_is_replaced() {
-        let store = MemoryStore::new();
-        let placeholder = resolve(
-            &store,
-            &request(vec![
-                asked("symbol", "ZZTOP", "snaptrade"),
-                asked("figi", "BBG000ZZTOP1", ""),
-            ]),
-        )
-        .unwrap()
-        .instrument_id;
-
-        let asking = ResolveInstrumentRequest {
-            instrument_id: placeholder.clone(),
-            as_of_ns: AS_OF,
-        };
-
-        let before = resolve_instrument(&store, &asking).unwrap();
-        assert!(before.found);
-        let record = before.instrument.unwrap();
-        assert_eq!(record.instrument_id, placeholder);
-        assert_eq!(record.identifiers.len(), 2);
-        assert_eq!(
-            record.lifecycle_state,
-            meridian_domain::v1::InstrumentLifecycleState::Define as i32
-        );
-        assert_eq!(record.version, 0);
-
-        // Then its identity arrives. Resolving the placeholder answers the
-        // replacement's record, which is how a reader holding it learns what
-        // it became.
-        store
-            .apply(instrument(
-                "INS-ZZTOP",
-                vec![held("figi", "BBG000ZZTOP1", "", EFFECTIVE)],
-            ))
-            .unwrap();
-        store.replace(&placeholder, "INS-ZZTOP", NOW).unwrap();
-
-        let after = resolve_instrument(&store, &asking).unwrap();
-        assert!(after.found);
-        assert_eq!(after.instrument.unwrap().instrument_id, "INS-ZZTOP");
-    }
-
-    #[test]
-    fn a_replaced_legacy_record_resolves_to_its_replacement() {
-        let store = MemoryStore::new();
-        for instrument_id in ["LCL-LEGACY", "INS-MOVED"] {
-            store
-                .apply(instrument(
-                    instrument_id,
-                    vec![held("figi", "BBG000B9XRY4", "", EFFECTIVE)],
-                ))
-                .unwrap();
-        }
-        store.replace("LCL-LEGACY", "INS-MOVED", NOW).unwrap();
-
-        let reply = resolve_instrument(
-            &store,
-            &ResolveInstrumentRequest {
-                instrument_id: "LCL-LEGACY".into(),
-                as_of_ns: AS_OF,
-            },
-        )
-        .unwrap();
-        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-MOVED");
-    }
-
-    #[test]
-    fn an_unheld_instrument_is_reported_as_not_found() {
-        let store = MemoryStore::new();
-
-        let reply = resolve_instrument(
-            &store,
-            &ResolveInstrumentRequest {
-                instrument_id: "INS-NOBODY".into(),
-                as_of_ns: AS_OF,
-            },
-        )
-        .unwrap();
-
+        let reply = resolve(&store, &request(vec![]));
         assert!(!reply.found);
-        assert!(reply.instrument.is_none());
+        assert_eq!(reply.miss_reason, MissReason::NotFound as i32);
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[test]
-    fn a_resolution_that_found_something_produces_no_miss_event() {
-        let request = request(vec![asked("figi", "BBG000B9XRY4", "")]);
-        let reply = resolved("INS-ONE".into());
-
-        assert!(missing_instrument(
-            &request,
-            &reply,
-            AssetClass::Equity,
-            "custody-snaptrade-1",
-            1
+    fn a_record_resolves_with_its_sources_and_a_merged_one_answers_what_stays() {
+        let store = MemoryStore::new();
+        let minted = resolve(&store, &request(vec![asked("iso4217", "USD", "")]));
+        let reply = resolve_instrument(
+            &store,
+            &ResolveInstrumentRequest {
+                instrument_id: minted.instrument_id.clone(),
+                as_of_ns: AS_OF,
+            },
         )
-        .is_none());
+        .unwrap();
+        let record = reply.instrument.unwrap();
+        assert_eq!(record.version, 1);
+        assert_eq!(record.sources.len(), 1);
+        assert_eq!(record.offers.len(), 2, "ISO 4217 offers cash in USD");
+
+        hold(&store, platform_record("LCL-KEPT", vec![]));
+        store
+            .replace(&minted.instrument_id, "LCL-KEPT", NOW)
+            .unwrap();
+        let after = resolve_instrument(
+            &store,
+            &ResolveInstrumentRequest {
+                instrument_id: minted.instrument_id,
+                as_of_ns: AS_OF,
+            },
+        )
+        .unwrap();
+        assert_eq!(after.instrument.unwrap().instrument_id, "LCL-KEPT");
+
+        let unheld = resolve_instrument(
+            &store,
+            &ResolveInstrumentRequest {
+                instrument_id: "LCL-NONE".into(),
+                as_of_ns: AS_OF,
+            },
+        )
+        .unwrap();
+        assert!(!unheld.found);
     }
 
     #[test]
-    fn a_miss_carries_everything_the_publisher_held() {
-        // The fixture's event. Both identifiers travel, not just the one that
-        // was tried: a reader with platform access may be able to pull on a
-        // scheme this store could not.
-        let request = ResolveIdentifierRequest {
+    fn a_reported_conflict_is_listed_only_where_the_identifiers_meet_two_records() {
+        let store = MemoryStore::new();
+        let a = resolve(
+            &store,
+            &request(vec![asked("symbol", "ZZTOP", "snaptrade")]),
+        );
+        let event = MissingInstrumentDetectedEvent {
+            source: "snaptrade".into(),
             identifiers: vec![
                 asked("symbol", "ZZTOP", "snaptrade"),
                 asked("figi", "BBG000ZZTOP1", ""),
             ],
             as_of_ns: AS_OF,
-            exchange_mic: String::new(),
-            currency: String::new(),
+            publisher_instance_id: "custody-snaptrade-1".into(),
+            reason: MissReason::Ambiguous as i32,
+            observed_at_ns: NOW,
+            ..Default::default()
         };
-
-        let event = missing_instrument(
-            &request,
-            &missed(MissReason::NotFound),
-            AssetClass::Equity,
-            "custody-snaptrade-1",
-            1_757_376_000_000_000_000,
-        )
-        .unwrap();
-
-        assert_eq!(event.source, "snaptrade");
-        assert_eq!(event.asset_class, AssetClass::Equity as i32);
-        assert_eq!(event.identifiers.len(), 2);
-        assert_eq!(event.as_of_ns, AS_OF);
-        assert_eq!(event.publisher_instance_id, "custody-snaptrade-1");
-        assert_eq!(event.reason, MissReason::NotFound as i32);
-        assert_eq!(event.observed_at_ns, 1_757_376_000_000_000_000);
-    }
-
-    #[test]
-    fn an_ambiguous_miss_reports_ambiguity_and_not_absence() {
-        // The two are acted on differently downstream: absence may warrant a
-        // pull, ambiguity warrants a human.
-        let request = request(vec![asked("symbol", "AAPL", "snaptrade")]);
-
-        let event = missing_instrument(
-            &request,
-            &missed(MissReason::Ambiguous),
-            AssetClass::Equity,
-            "custody-snaptrade-1",
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(event.reason, MissReason::Ambiguous as i32);
+        assert!(!conflict_reported(&store, &event, NOW).unwrap());
+        let b = resolve(&store, &request(vec![asked("figi", "BBG000ZZTOP1", "")]));
+        assert_ne!(a.instrument_id, b.instrument_id);
+        assert!(conflict_reported(&store, &event, NOW).unwrap());
+        assert_eq!(store.conflicts().unwrap().len(), 1);
     }
 }

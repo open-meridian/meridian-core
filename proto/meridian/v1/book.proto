@@ -4,8 +4,10 @@
 // plans/the-book-holds-positions, contract v8
 // (sdk-contract/the-book-holds-positions); from v9 the book refuses an entry
 // missing what downstream needs, naming each field
-// (sdk-contract/the-book-refuses-what-downstream-cannot-use). Every message
-// here traces to a matrix row; see matrix/matrix.tsv.
+// (sdk-contract/the-book-refuses-what-downstream-cannot-use); from v10 it
+// requires each instrument's asset class and currency, and names the
+// delegation a person acted through. Every message here traces to a matrix
+// row; see matrix/matrix.tsv.
 //
 // W2's governing idea, carried through: there are two beliefs about what is
 // held, ours and the custodian's. holdings.proto carries the custodian's into
@@ -40,7 +42,7 @@ message Actor {
     // W6.1 records.
     PersonActor person = 1;
     // A finding reported with no user: the plugin instance that sent it;
-    // the book's own act (a placeholder followed) leaves it empty.
+    // the book's own act (a merged record followed) leaves it empty.
     SystemActor system = 2;
   }
   // A service account (step 5's Q24) and the venue arrive as arms of their
@@ -49,6 +51,13 @@ message Actor {
 
 message PersonActor {
   string subject = 1;
+
+  // The delegation the person acted through, and the client's registered
+  // name, as the sidecar stamped them beside the person (W4.9, decisions/029;
+  // contract v10). Empty for a person at the dashboard in a browser, and on
+  // every act recorded before v10. The person stays the actor.
+  string delegation_id = 2;
+  string client_name = 3;
 }
 
 message SystemActor {
@@ -60,7 +69,7 @@ message EntryMeta {
   // Minted by the book.
   string entry_id = 1;
   // An open list a reader takes as data (Q19): in v8 opening-balance,
-  // placeholder-moved, figures-recorded, break-recorded, break-handled,
+  // placeholder-moved (instrument-merged from v10), figures-recorded, break-recorded, break-handled,
   // break-resolved, break-closed, adjustment, reversal, attribute-set.
   string kind = 2;
   Actor actor = 3;
@@ -107,7 +116,8 @@ enum SettlementBucket {
 }
 
 message MovementLine {
-  // An instrument, a placeholder, or a currency's cash instrument.
+  // The deployment's instrument record, a currency's cash instrument
+  // included.
   string instrument_id = 1;
   HoldingSide side = 2;
   SettlementBucket bucket = 3;
@@ -195,13 +205,15 @@ message BookPosition {
   // The business date of its last change.
   string effective_date = 10;
   JournalRef last_change = 11;
-  // A tombstone, after a placeholder's move (W9.9): returned only to a read
-  // since a watermark, and delivered once.
+  // A tombstone, after a merged record's move (W9.9): returned only to a
+  // read since a watermark, and delivered once.
   bool removed = 12;
-  // Held under a placeholder instrument (W3.7) while the street's holding is
-  // unresolved: in the opening balance and in reconciliation as any position,
-  // flagged, until the book follows its replacement (W9.9).
-  bool placeholder = 13;
+  // Once a flag on a position held under a placeholder instrument; from
+  // contract v10 a deployment's record is its own whatever its ID
+  // (decisions/030), and what holds a position back is a record the book
+  // cannot use (W9.1).
+  reserved 13;
+  reserved "placeholder";
   // What of it cannot move, as the operations plugin last recorded it from
   // a statement (W9.15): an attribute, never a movement.
   repeated Encumbrance encumbrances = 14;

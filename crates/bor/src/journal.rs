@@ -68,7 +68,7 @@ pub struct Body {
     pub figures: Vec<AccountFigures>,
     /// The account's attributes as they stand after it, whole.
     pub attributes: Option<AccountAttributes>,
-    /// Positions removed, after a placeholder's move (W9.9): kept as
+    /// Positions removed, after a merged record's move (W9.9): kept as
     /// tombstones.
     pub tombstones: Vec<(String, i32)>,
     /// The entry this one reverses.

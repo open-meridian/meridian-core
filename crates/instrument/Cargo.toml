@@ -9,6 +9,7 @@ description = "The deployment's instrument store: resolve, apply, and answer wha
 [dependencies]
 meridian-clock.workspace = true
 meridian-domain.workspace = true
+meridian-pb.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-symbology = { path = "../symbology" }
 prost.workspace = true

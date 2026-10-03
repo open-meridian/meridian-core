@@ -4,22 +4,23 @@
 -- database, where every store shares one schema, so an account's name is
 -- read beside its rows. Every account, ordered bytewise (COLLATE "C"), so the
 -- output does not depend on the database's collation; and nothing that
--- changes from run to run -- an account's ID, a placeholder's ID, a read
+-- changes from run to run -- an account's ID, a minted record's ID, a read
 -- time, a statement's ID -- is printed.
 --
 --   position|<account>|<instrument>|<side>|<quantity>|<settle-date quantity>|<market value> <currency>|<in-cash>
 --   assumed|<account>|<instrument>|<side>
 --   statement|<account>|<source>|<expected rows>|<complete or open>|<buying power>|<margin requirement>|<maintenance excess>|<currency assumed>
 --
--- <account> is the account's name. <instrument> is its INS- ID, or for the
--- deployment's placeholder the identifiers it stands for, sorted:
--- `placeholder(<scheme>:<value>[@<source>], ...)`. With no platform, as in
--- the harness, every instrument is a placeholder. A number is printed at the
+-- <account> is the account's name. <instrument> is its INS- ID, or for a
+-- record the deployment minted (contract v10: its LCL- ID, drawn per run)
+-- its identifiers in force, sorted: `local(<scheme>:<value>[@<source>], ...)`.
+-- With no platform, as in the harness, every record is one the deployment
+-- minted. A number is printed at the
 -- scale it was stated with (decisions/023), and what was not reported is
 -- empty, never zero. <in-cash> is `in-cash` for a position the venue also
 -- counts in cash.
 --
--- A position is the account's custodial position; one a placeholder's
+-- A position is the account's custodial position; one a merged record's
 -- replacement removed is kept by the store as a tombstone, and not printed.
 -- A statement's figures are those of its set with no segment, the account's
 -- as a whole (contract v7 keeps them per margin segment). An `assumed` line is a row
@@ -33,13 +34,15 @@
 -- in meridian-core hold it.
 
 WITH shown AS (
-    -- Each placeholder as the identifiers it stands for.
-    SELECT placeholder_id AS instrument_id,
-           'placeholder(' || string_agg(said, ', ' ORDER BY said COLLATE "C") || ')' AS instrument
-      FROM (SELECT placeholder_id,
+    -- Each record the deployment minted (an LCL- ID, drawn per run) as its
+    -- identifiers in force.
+    SELECT instrument_id,
+           'local(' || string_agg(said, ', ' ORDER BY said COLLATE "C") || ')' AS instrument
+      FROM (SELECT instrument_id,
                    scheme || ':' || value || CASE WHEN source <> '' THEN '@' || source ELSE '' END AS said
-              FROM instrument_placeholder_identifier) identifiers
-     GROUP BY placeholder_id
+              FROM instrument_identifier
+             WHERE instrument_id LIKE 'LCL-%' AND valid_to_ns IS NULL) identifiers
+     GROUP BY instrument_id
 ),
 named AS (
     SELECT account_id, name FROM config_account

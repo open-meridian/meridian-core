@@ -306,24 +306,24 @@ pub async fn move_onto_replacement(
     .await
 }
 
-/// Ask the instrument store what every placeholder still held has become, and
-/// move the positions under each one that has been replaced. Says how many
-/// positions were announced.
+/// Ask the instrument store what every instrument held has become, and move
+/// the positions under each one replaced by a merge. Says how many positions
+/// were announced.
 ///
 /// Moves exactly as [`move_onto_replacement`] does, through the same path, so
 /// a sweep that finds what an event already moved finds nothing, and one that
-/// finds what an event missed does what the event would have. A placeholder
-/// not yet replaced answers a record for itself and is left alone.
+/// finds what an event missed does what the event would have. A record not
+/// replaced answers itself and is left alone.
 ///
 /// Stops at the first question that cannot be asked: an instrument store that
 /// is away is away for all of them, and the next sweep asks again.
-pub async fn sweep_placeholders(
+pub async fn sweep_replacements(
     bus: &Bus,
     store: &Arc<dyn Store>,
     clock: &dyn Clock,
 ) -> Result<usize, String> {
     let listing = Arc::clone(store);
-    let placeholders = tokio::task::spawn_blocking(move || listing.placeholder_instruments())
+    let placeholders = tokio::task::spawn_blocking(move || listing.instruments_held())
         .await
         .map_err(|failed| format!("the sweep task failed: {failed}"))?
         .map_err(|failed| failed.to_string())?;
@@ -391,9 +391,9 @@ pub async fn sweep_forever(
     every: Duration,
 ) {
     loop {
-        match sweep_placeholders(&bus, &store, clock.as_ref()).await {
-            Ok(announced) => tracing::debug!(announced, "swept the placeholders still held"),
-            Err(why) => tracing::warn!(why, "could not sweep the placeholders still held"),
+        match sweep_replacements(&bus, &store, clock.as_ref()).await {
+            Ok(announced) => tracing::debug!(announced, "swept the instruments held for merges"),
+            Err(why) => tracing::warn!(why, "could not sweep the instruments held for merges"),
         }
         tokio::time::sleep(every).await;
     }
@@ -915,7 +915,7 @@ mod tests {
         record(&bus, held).await;
         next(&mut announced).await;
 
-        let moved = sweep_placeholders(&bus, &store, &Stopped(AtomicI64::new(NOW)))
+        let moved = sweep_replacements(&bus, &store, &Stopped(AtomicI64::new(NOW)))
             .await
             .unwrap();
         assert_eq!(
@@ -940,7 +940,7 @@ mod tests {
 
         // Found once, moved once: the next sweep has nothing to ask about.
         assert_eq!(
-            sweep_placeholders(&bus, &store, &Stopped(AtomicI64::new(NOW)))
+            sweep_replacements(&bus, &store, &Stopped(AtomicI64::new(NOW)))
                 .await
                 .unwrap(),
             0
@@ -948,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sweep_of_placeholders_not_yet_replaced_moves_nothing() {
+    async fn a_sweep_of_records_not_replaced_moves_nothing() {
         let (bus, store) = wired();
         let store: Arc<dyn Store> = store;
         let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
@@ -962,15 +962,15 @@ mod tests {
         next(&mut announced).await;
         next(&mut announced).await;
 
-        let moved = sweep_placeholders(&bus, &store, &Stopped(AtomicI64::new(NOW)))
+        let moved = sweep_replacements(&bus, &store, &Stopped(AtomicI64::new(NOW)))
             .await
             .unwrap();
 
         assert_eq!(moved, 0);
         assert_eq!(
             asked.load(Ordering::SeqCst),
-            1,
-            "only the placeholder is asked about"
+            2,
+            "every instrument held is asked about"
         );
         assert!(store
             .custodial_position(

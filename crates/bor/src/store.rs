@@ -299,9 +299,10 @@ pub trait Store: Send + Sync {
     /// Accounts holding a position, tombstones aside, under an instrument.
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>>;
 
-    /// Every instrument ID a position or an open break is held under that is
-    /// a placeholder (`LCL-`), each once, in order. What the sweep asks about.
-    fn placeholder_instruments(&self) -> Result<Vec<String>>;
+    /// Every instrument ID a position or an open break is held under, each
+    /// once, in order: what the sweep asks the instrument store about, for a
+    /// record merged into another while the book was not listening (W9.9).
+    fn instruments_held(&self) -> Result<Vec<String>>;
 
     fn positions(&self, read: &PositionsRead) -> Result<Page<BookPosition>>;
     fn breaks(&self, read: &BreaksRead) -> Result<Page<Break>>;

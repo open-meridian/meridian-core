@@ -154,20 +154,18 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    fn placeholder_instruments(&self) -> Result<Vec<String>> {
+    fn instruments_held(&self) -> Result<Vec<String>> {
         let state = self.state();
         let mut found = std::collections::BTreeSet::new();
         for book in state.books.values() {
             for ((instrument, _), position) in &book.positions {
-                if !position.removed && instrument.starts_with(crate::ids::PLACEHOLDER_PREFIX) {
+                if !position.removed {
                     found.insert(instrument.clone());
                 }
             }
             for record in book.breaks.values() {
                 if let Some(instrument) = open_break_instrument(record) {
-                    if instrument.starts_with(crate::ids::PLACEHOLDER_PREFIX) {
-                        found.insert(instrument.to_string());
-                    }
+                    found.insert(instrument.to_string());
                 }
             }
         }

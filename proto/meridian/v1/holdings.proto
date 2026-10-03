@@ -234,8 +234,8 @@ message ReportedCollateral {
   // Posted by the account, or received by it. Unspecified is refused.
   CollateralDirection direction = 1;
 
-  // Resolved as a holding's instrument is (W3.1): an instrument or the
-  // deployment's placeholder, the currency's cash instrument for cash; or,
+  // Resolved as a holding's instrument is (W3.1): the deployment's record,
+  // minted for it or held, the currency's cash instrument for cash; or,
   // when the resolve was ambiguous, the identifiers the connector held.
   // Exactly one of the two, as on RecordHoldingRequest.
   string instrument_id = 2;
@@ -283,8 +283,8 @@ message RecordHoldingsStatementReply {
 
 // One holding, for one account, at one instrument, on one side.
 //
-// Either `instrument_id` is set, meaning the connector resolved it (to an
-// instrument, or to the deployment's LCL- placeholder when nothing matched),
+// Either `instrument_id` is set, meaning the connector resolved it (to the
+// deployment's record, held or minted when nothing matched, W3.7),
 // or `unresolved_identifiers` is set, meaning the resolve was ambiguous. Never
 // both, and never neither. A row that could not be resolved is still recorded, because a
 // dropped holding is invisible and an operator comparing against their
@@ -566,8 +566,8 @@ message CustodialPositionUpdatedEvent {
 message CustodialPosition {
   string account_id = 1;
 
-  // An instrument, or the deployment's LCL- placeholder awaiting identity,
-  // which the INS- ID replaces when it arrives (W3.9).
+  // The deployment's record for the instrument, whatever its ID; a record a
+  // person merged into another moves onto the one that stays (W3.9).
   string instrument_id = 2;
 
   // The trade-date quantity, signed to match `side`.

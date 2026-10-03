@@ -66,6 +66,26 @@ fn wired() -> (Arc<Bus>, Arc<PostgresStore>) {
     ));
     let store = blocking(store);
     serve(bus.clone(), store.clone(), bus.clock());
+    // An instrument store whose every record names an equity in US dollars:
+    // from contract v10 the book requires each instrument's asset class and
+    // currency, and refuses a command it cannot check.
+    bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+        let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.ResolveInstrumentReply".into(),
+            ResolveInstrumentReply {
+                found: true,
+                instrument: Some(InstrumentRecord {
+                    instrument_id: asked.instrument_id,
+                    asset_class: AssetClass::Equity as i32,
+                    currency: "USD".into(),
+                    version: 1,
+                    ..Default::default()
+                }),
+            }
+            .encode_to_vec(),
+        ))
+    });
     (bus, store)
 }
 

@@ -599,16 +599,15 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn placeholder_instruments(&self) -> Result<Vec<String>> {
-        let pattern = format!("{}%", crate::ids::PLACEHOLDER_PREFIX);
+    fn instruments_held(&self) -> Result<Vec<String>> {
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id FROM book_position WHERE instrument_id LIKE $1 AND NOT removed
+                "SELECT instrument_id FROM book_position WHERE NOT removed
                  UNION
-                 SELECT instrument_id FROM book_break WHERE instrument_id LIKE $1 AND state = $2
+                 SELECT instrument_id FROM book_break WHERE instrument_id <> '' AND state = $1
                  ORDER BY 1",
-                &[&pattern, &(BreakState::Open as i32)],
+                &[&(BreakState::Open as i32)],
             )
             .map_err(unavailable)?
             .into_iter()

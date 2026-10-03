@@ -1000,10 +1000,7 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
     let placeholder = format!("LCL-{}", unique("p"));
     let instrument = unique("INS");
     let holding = stated(&store, &account, "2026-09-08", &placeholder, "5");
-    assert!(store
-        .placeholder_instruments()
-        .unwrap()
-        .contains(&placeholder));
+    assert!(store.instruments_held().unwrap().contains(&placeholder));
 
     let settled = store
         .move_positions(&placeholder, &instrument, &at(NOW))
@@ -1054,10 +1051,7 @@ fn a_placeholders_position_moves_and_its_holding_row_keeps_the_placeholder() {
     assert_eq!(recorded.as_deref(), Some(placeholder.as_str()));
 
     // Nothing is left for the sweep to ask about.
-    assert!(!store
-        .placeholder_instruments()
-        .unwrap()
-        .contains(&placeholder));
+    assert!(!store.instruments_held().unwrap().contains(&placeholder));
 
     // And hearing it again moves nothing.
     assert!(store

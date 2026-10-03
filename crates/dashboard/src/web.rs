@@ -342,6 +342,13 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         );
     }
     body.push_str(&delegations::notices(&app, &session.subject).await);
+    // W3.11: the records the book cannot use, a first-class number for the
+    // deployment admin who completes them (ruled 2026-10-02).
+    if access.deployment_admin {
+        body.push_str(&crate::admin::instruments::home_notice(
+            crate::admin::instruments::incomplete_for_book(&app.bus).await,
+        ));
+    }
     if listed.is_empty() {
         body.push_str(
             "<div class=\"panel empty-state\"><strong>No plugins for you yet</strong>\

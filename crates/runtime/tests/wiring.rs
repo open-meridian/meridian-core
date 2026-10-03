@@ -204,11 +204,11 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
     assert_eq!(value.currency_code, "USD");
 }
 
-/// W3.7 as a plugin sees it. A set nothing matches is answered with the
-/// deployment's placeholder, said to be one, the same one each time; and a
-/// holding recorded against it is a resolved row.
+/// W3.7 as a plugin sees it (contract v10). A set nothing matches is answered
+/// with a record the deployment mints, said to be minted, and the same record
+/// every time after; and a holding recorded against it is a resolved row.
 #[tokio::test]
-async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder() {
+async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record() {
     let (bus, sidecar) = runtime();
     admitted(&sidecar, "custody").await;
 
@@ -219,6 +219,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
             source: "snaptrade".into(),
         }],
         as_of_ns: NOW,
+        stated_currency: "USD".into(),
         ..Default::default()
     };
     let resolved = sidecar
@@ -229,8 +230,8 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
 
     assert!(resolved.found);
     assert!(
-        resolved.placeholder,
-        "the plugin's mirror dropped the placeholder flag"
+        resolved.minted,
+        "the plugin's mirror dropped the minted flag"
     );
     assert!(resolved.instrument_id.starts_with("LCL-"));
 
@@ -240,6 +241,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
         .expect("resolve is served")
         .into_inner();
     assert_eq!(again.instrument_id, resolved.instrument_id);
+    assert!(!again.minted, "matched the second time, not minted");
 
     let opened = sidecar
         .record_holdings_statement(Request::new(RecordHoldingsStatementParams {
@@ -273,7 +275,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_placeholder()
         .await
         .expect("the row is recorded")
         .into_inner();
-    assert!(recorded.resolved, "a placeholder row is a resolved row");
+    assert!(recorded.resolved, "a minted record's row is a resolved row");
 
     let (_, reply) = bus
         .call(

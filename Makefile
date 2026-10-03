@@ -866,6 +866,10 @@ harness-check:
 	done; \
 	diff -u e2e/harness/expected.street .harness/street >&2 \
 		|| fail "the street store is not e2e/harness/expected.street"; \
+	waiting="$$($(HARNESS_RUN) instruments --expect 4)" || fail "the Instruments page did not list the four records the book cannot use"; \
+	$(HARNESS_RUN) instrument --identifier 'symbol (stand-in): HRN' asset_class=equity currency=USD \
+		source='the stand-in statement' >/dev/null || fail "the admin did not complete a record at the Instruments page"; \
+	$(HARNESS_RUN) instruments --expect 3 >/dev/null || fail "a completed record is still listed as one the book cannot use"; \
 	unlinked="$$($(HARNESS_RUN) unlinked --expect 1)" || fail "the dashboard did not count the unlinked account"; \
 	$(HARNESS_RUN) ready --instance operations >/dev/null || fail "the second plugin never registered"; \
 	$(HARNESS_RUN) page --instance operations --level write / >/dev/null 2>&1 \
@@ -881,7 +885,7 @@ harness-check:
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1509,6 +1513,9 @@ e2e-book: network
 	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/book/accounts.sql >/dev/null \
 		|| { echo "e2e-book FAILED: the accounts and grants could not be written" >&2; exit 1; }
+	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+		<e2e/book/instruments.sql >/dev/null \
+		|| { echo "e2e-book FAILED: the instrument records could not be written" >&2; exit 1; }
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf

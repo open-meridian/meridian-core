@@ -17,16 +17,33 @@
 
 use meridian_domain::v1::Identifier as PbIdentifier;
 
+/// The scheme a record carries the platform's global ID under, once the
+/// platform answered a person's ask with it (W3.5; decisions/030: added, never
+/// substituted for the record's own ID).
+pub const GLOBAL_ID: &str = "open_meridian";
+
 /// Global schemes, strongest first.
 ///
-/// Ordered by how hard the scheme is to confuse: a FIGI names a listing, an
-/// ISIN names an issue, and the national schemes below it are narrower still
-/// in coverage while being no more precise.
+/// Ordered by how hard the scheme is to confuse: the platform's global ID
+/// names one instrument for all time, a FIGI names a listing, an ISIN names an
+/// issue, and the national schemes below it are narrower still in coverage
+/// while being no more precise.
 ///
 /// Global meaning meaningful outside any one rail. A brokerage symbol is not
 /// here at any position: it is ranked below everything in this table, however
 /// it is spelled.
-pub const GLOBAL_PRIORITY: [&str; 4] = ["figi", "isin", "cusip", "sedol"];
+pub const GLOBAL_PRIORITY: [&str; 5] = [GLOBAL_ID, "figi", "isin", "cusip", "sedol"];
+
+/// Schemes whose values are licensed (intent/vendor-sourced-reference-data,
+/// ruled 2026-10-02: a licensed identifier is a key, never an answer). A
+/// deployment keeps what its plugins reported under its own licence and never
+/// sends one to the platform; it counts how many it holds, CUSIP Global
+/// Services counting toward its 500-identifier threshold (W3.11).
+pub const LICENSED: [&str; 3] = ["cusip", "isin", "sedol"];
+
+/// Schemes whose values are open, and so the only ones a deployment asks the
+/// platform by (W3.3): the global ID, a FIGI, an ISO 4217 code.
+pub const OPEN: [&str; 3] = [GLOBAL_ID, "figi", "iso4217"];
 
 /// Where in the fallback order this identifier sits. Lower is stronger.
 pub fn rank(identifier: &PbIdentifier) -> usize {
@@ -40,6 +57,16 @@ pub fn rank(identifier: &PbIdentifier) -> usize {
         .position(|scheme| *scheme == identifier.scheme)
         // A global scheme nobody ranked still outranks a brokerage symbol.
         .unwrap_or(GLOBAL_PRIORITY.len())
+}
+
+/// The open identifiers in a set, strongest first: what the platform is asked
+/// by (W3.3). A licensed scheme's value and a source-scoped symbol are dropped,
+/// never sent.
+pub fn open_identifiers_strongest_first(identifiers: &[PbIdentifier]) -> Vec<&PbIdentifier> {
+    global_identifiers_strongest_first(identifiers)
+        .into_iter()
+        .filter(|identifier| OPEN.contains(&identifier.scheme.as_str()))
+        .collect()
 }
 
 /// The global identifiers in a set, strongest first.
@@ -89,6 +116,24 @@ mod tests {
             assert!(here >= previous, "{scheme} is out of order");
             previous = here;
         }
+    }
+
+    #[test]
+    fn asking_the_platform_sends_open_identifiers_only() {
+        let held = vec![
+            identifier("cusip", ""),
+            identifier("symbol", "snaptrade"),
+            identifier("iso4217", ""),
+            identifier("figi", ""),
+            identifier(GLOBAL_ID, ""),
+        ];
+
+        let asked: Vec<&str> = open_identifiers_strongest_first(&held)
+            .into_iter()
+            .map(|identifier| identifier.scheme.as_str())
+            .collect();
+
+        assert_eq!(asked, vec![GLOBAL_ID, "figi", "iso4217"]);
     }
 
     #[test]

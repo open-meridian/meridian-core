@@ -68,6 +68,20 @@ the same image with the list on stdin:
       write by someone granted write; the admin is granted nothing on a
       plugin until this is run.
 
+  instruments [--expect N] [--seconds N]
+      Prints the instrument records the book cannot use yet -- no asset class
+      or no currency -- one per line, its ID, a tab, and its identifiers as the
+      dashboard's Instruments page lists them (W3.11, contract v10). With
+      --expect, waits until it lists N.
+
+  instrument (ID | --identifier TEXT) asset_class=CLASS currency=CODE
+             [description=TEXT] source=TEXT [note=TEXT] [--seconds N]
+      Completes one record on its page, as the deployment admin does (W3.10):
+      the record named by its ID, or the first listed whose identifiers say
+      TEXT (`symbol: AAPL`), waiting for it to be listed. CLASS is one of
+      equity, debt, fund, derivative, crypto_asset, event_contract, cash; each
+      value goes with the source given, and the dashboard stamps the admin.
+
 Reading core's HTML is this runner's alone, and only because it is published
 at the same commit as the dashboard it reads, and core's gate runs it against
 that dashboard at every commit. A plugin never parses core's pages itself.
@@ -93,6 +107,9 @@ LOGIN = os.environ.get("MERIDIAN_HARNESS_ADMIN_LOGIN", f"local|{ADMIN}")
 LEVELS = ("admin", "write", "read")
 # The built-in account group holding every account (W6.6).
 ALL_ACCOUNTS = "all-accounts"
+# The asset classes as the Instruments page's form numbers them (W1's list).
+CLASSES = {"equity": 1, "debt": 2, "fund": 3, "derivative": 4, "crypto_asset": 5,
+           "event_contract": 6, "cash": 7}
 
 
 def acting_on(instance):
@@ -471,6 +488,85 @@ def grant(args):
     print(f"grant: {ADMIN} holds {level} on {INSTANCE}, on All accounts")
 
 
+def instrument_rows(admin):
+    """The Instruments page's records: each ID, its identifiers as listed, and
+    whether the book can use it."""
+    page = admin.get("/admin/instruments")
+    if page.status != 200:
+        raise Failed(f"/admin/instruments: {page.status} {sentence(page)}")
+    table = re.search(r'<table class="list" id="instruments-table">(.*?)</table>', page.body, re.S)
+    rows = []
+    for row in re.findall(r"<tr>(.*?)</tr>", table.group(1) if table else "", re.S):
+        found = re.search(r'<a href="/admin/instruments/([^"]+)">', row)
+        if not found:
+            continue
+        listed = re.search(r'<span class="id">(.*?)</span>', row, re.S)
+        rows.append((html.unescape(found.group(1)),
+                     html.unescape(listed.group(1)) if listed else "",
+                     "the book cannot use it" not in row))
+    return rows
+
+
+def instruments(args):
+    wanted = option(args, "--expect", None)
+    seconds = number(args, "--seconds", 60)
+    if args:
+        raise Failed(f"instruments takes no {args[0]!r}")
+    admin = signed_in()
+
+    def listed():
+        waiting = [row for row in instrument_rows(admin) if not row[2]]
+        if wanted is not None and len(waiting) != int(wanted):
+            raise Failed(f"the page lists {len(waiting)} the book cannot use")
+        return waiting
+
+    for instrument_id, identifiers, _ in until(seconds if wanted is not None else 0, listed,
+                                               f"the page never listed {wanted}"):
+        print(f"{instrument_id}\t{identifiers}")
+
+
+def instrument(args):
+    by_identifier = option(args, "--identifier", None)
+    seconds = number(args, "--seconds", 60)
+    asked = dict(pairs(args))
+    named = args.pop(0) if args else None
+    if args or (named is None) == (by_identifier is None):
+        raise Failed("instrument takes an ID or --identifier TEXT, and NAME=VALUE")
+    source = asked.get("source", "")
+    if asked.get("asset_class") not in CLASSES or not asked.get("currency") or not source:
+        raise Failed(f"instrument takes asset_class={'|'.join(CLASSES)}, currency=CODE and source=TEXT")
+    admin = signed_in()
+
+    def found():
+        for instrument_id, identifiers, _ in instrument_rows(admin):
+            if instrument_id == named or (by_identifier and by_identifier in identifiers):
+                return instrument_id
+        raise Failed(f"no record listed is {named or by_identifier!r}")
+
+    instrument_id = until(seconds, found, "the record was never listed")
+    page = admin.get(f"/admin/instruments/{urllib.parse.quote(instrument_id)}")
+    version = re.search(r'name="against_version" value="(\d+)"', page.body)
+    if page.status != 200 or version is None:
+        raise Failed(f"{instrument_id}'s page: {page.status} {sentence(page)}")
+    fields = {
+        "form_token": form_token(page),
+        "instrument_id": instrument_id,
+        "against_version": version.group(1),
+        "asset_class": str(CLASSES[asked["asset_class"]]),
+        "asset_class_source": source,
+        "currency": asked["currency"],
+        "currency_source": source,
+        "note": asked.get("note", ""),
+    }
+    if asked.get("description"):
+        fields["description"] = asked["description"]
+        fields["description_source"] = source
+    done = admin.post("/admin/instruments/complete", fields)
+    if done.status != 303:
+        raise Failed(f"{instrument_id} was not completed: {done.status} {sentence(done)}")
+    print(f"instrument: {instrument_id} completed, {asked['asset_class']} in {asked['currency']}")
+
+
 def option(args, name, default):
     """Takes `name VALUE` out of `args`."""
     if name not in args:
@@ -616,7 +712,8 @@ def compose(args):
 
 
 COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
-            "form": form, "unlinked": unlinked, "grant": grant, "compose": compose}
+            "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
+            "instruments": instruments, "instrument": instrument}
 
 
 def main(argv):

@@ -38,6 +38,11 @@ pub struct Stamp {
     /// browser, and always beside a person, never alone.
     pub acting_through_delegation: String,
 
+    /// The client's registered name, beside the delegation (W4.9, contract
+    /// v10), so a store records "the person, through that client" without a
+    /// second read. Empty whenever the delegation is.
+    pub acting_through_client: String,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -353,6 +358,7 @@ impl Bus {
             published_at_ns: self.clock.now_ns(),
             acting_for_subject: stamp.acting_for_subject.clone(),
             acting_through_delegation: stamp.acting_through_delegation.clone(),
+            acting_through_client: stamp.acting_through_client.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

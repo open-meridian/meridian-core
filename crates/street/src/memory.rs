@@ -91,19 +91,17 @@ impl Store for MemoryStore {
             .move_positions(replaced_id, instrument_id, cause))
     }
 
-    fn placeholder_instruments(&self) -> Result<Vec<String>> {
+    fn instruments_held(&self) -> Result<Vec<String>> {
         let held = self.read()?;
-        let mut placeholders: Vec<String> = held
+        let mut instruments: Vec<String> = held
             .positions
             .iter()
             .filter(|(_, position)| !position.removed)
-            .map(|(key, _)| &key.instrument_id)
-            .filter(|instrument_id| instrument_id.starts_with(crate::ids::PLACEHOLDER_PREFIX))
-            .cloned()
+            .map(|(key, _)| key.instrument_id.clone())
             .collect();
-        placeholders.sort();
-        placeholders.dedup();
-        Ok(placeholders)
+        instruments.sort();
+        instruments.dedup();
+        Ok(instruments)
     }
 }
 

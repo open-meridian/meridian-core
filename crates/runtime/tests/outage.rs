@@ -8,10 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_conductor::{Config, DeploymentKey, HttpTransport, Platform};
-use meridian_domain::v1::{
-    Identifier as PbIdentifier, InstrumentRecord as PbInstrument, ResolveIdentifierRequest,
-};
-use meridian_instrument::{apply, resolve_identifier, PostgresStore};
+use meridian_domain::v1::{Identifier as PbIdentifier, ResolveIdentifierRequest};
+use meridian_instrument::{resolve_identifier, PostgresStore};
 use meridian_street::amounts::{Money, Quantity};
 use meridian_street::store::{Cause, Holding, Settled, Side, Statement, Store as _};
 use tokio::runtime::Runtime;
@@ -35,29 +33,23 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
     let store = PostgresStore::connect(&required("MERIDIAN_TEST_DATABASE_URL"), 4).unwrap();
     store.migrate().unwrap();
 
-    // Something it was told before the platform went away.
+    // A record the deployment holds: its own, minted for what a plugin
+    // reported (decisions/030), before anything is asked of the platform.
     let stamp = now_ns();
-    let instrument_id = format!("INS-outage-{stamp}");
     let figi = format!("BBG{stamp}");
-    apply(
-        &store,
-        PbInstrument {
-            instrument_id: instrument_id.clone(),
-            identifiers: vec![PbIdentifier {
-                scheme: "figi".into(),
-                value: figi.clone(),
-                source: String::new(),
-            }],
-            asset_class: meridian_domain::v1::AssetClass::Equity as i32,
-            lifecycle_state: meridian_domain::v1::InstrumentLifecycleState::Active as i32,
-            version: 1,
-            valid_from_ns: stamp,
-            record_time_ns: stamp,
-            ..Default::default()
-        },
-        now_ns(),
-    )
-    .unwrap();
+    let asking = ResolveIdentifierRequest {
+        identifiers: vec![PbIdentifier {
+            scheme: "figi".into(),
+            value: figi,
+            source: String::new(),
+        }],
+        as_of_ns: stamp,
+        ..Default::default()
+    };
+    let instrument_id = resolve_identifier(&store, &asking, "outage", now_ns())
+        .unwrap()
+        .reply
+        .instrument_id;
 
     // The platform is not there.
     let pem = std::fs::read_to_string(required("MERIDIAN_TEST_KEY_PATH")).unwrap();
@@ -81,22 +73,9 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
     );
 
     // And none of that reached the question a connector actually asks.
-    let reply = resolve_identifier(
-        &store,
-        &ResolveIdentifierRequest {
-            identifiers: vec![PbIdentifier {
-                scheme: "figi".into(),
-                value: figi,
-                source: String::new(),
-            }],
-            as_of_ns: now_ns(),
-            exchange_mic: String::new(),
-            currency: String::new(),
-        },
-        now_ns(),
-    )
-    .unwrap()
-    .reply;
+    let reply = resolve_identifier(&store, &asking, "outage", now_ns())
+        .unwrap()
+        .reply;
 
     assert!(
         reply.found,
@@ -106,10 +85,9 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
 }
 
 #[test]
-fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platform_is_away() {
+fn a_holding_nobody_has_seen_is_recorded_against_a_record_minted_while_the_platform_is_away() {
     // W3.7's reason for being: the holding has a name at once, platform or no
-    // platform, and a position under it that every book can use until the
-    // INS- ID arrives.
+    // platform -- the deployment's own, for life (decisions/030).
     let url = required("MERIDIAN_TEST_DATABASE_URL");
     let instruments = PostgresStore::connect(&url, 4).unwrap();
     instruments.migrate().unwrap();
@@ -124,18 +102,18 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_placeholder_while_the_platfor
                 source: "snaptrade".into(),
             }],
             as_of_ns: stamp,
-            exchange_mic: String::new(),
-            currency: String::new(),
+            ..Default::default()
         },
+        "outage",
         now_ns(),
     )
     .unwrap();
 
     assert!(resolution.reply.found);
-    assert!(resolution.reply.placeholder);
+    assert!(resolution.reply.minted);
     assert!(
-        resolution.minted.is_some(),
-        "the placeholder was not minted here"
+        resolution.changed.is_some(),
+        "the record was not minted here"
     );
     let placeholder = resolution.reply.instrument_id;
     assert!(placeholder.starts_with("LCL-"), "{placeholder}");

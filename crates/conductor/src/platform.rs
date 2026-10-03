@@ -1,8 +1,8 @@
 //! The client a deployment calls the platform with. W3.3 and W3.4.
 //!
-//! Pull an instrument the master already knows, escalate one neither side
-//! knows, and do both under a throttle so a burst of misses is not a burst of
-//! anything.
+//! Ask the platform about one of the deployment's records when a person asks,
+//! by its open identifiers (W3.3, contract v10); and the client of the
+//! platform's escalation route, which a deployment no longer calls (W3.4).
 //!
 //! # What this file is really enforcing
 //!
@@ -35,25 +35,23 @@
 //!
 //! # What it refuses to do
 //!
-//! It does not mint. Escalation asks the platform to, and the platform may
-//! decline. It also does not escalate an ambiguous miss: ambiguity means the
-//! instrument exists more than once, and answering that by creating a third is
-//! the one mistake here that cannot be undone.
+//! It does not mint, and it sends no licensed scheme's value: a deployment's
+//! records are its own (decisions/030), and asking is by open identifiers
+//! alone.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_domain::asset_class;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
     EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
-    MissReason, MissingInstrumentDetectedEvent, RedeemClaimCodeReply,
+    RedeemClaimCodeReply,
 };
 use serde::Deserialize;
 
 use crate::assertions::{DeploymentKey, SigningError, MAX_LIFETIME_SECONDS};
-use meridian_symbology::global_identifiers_strongest_first;
+use meridian_symbology::{open_identifiers_strongest_first, GLOBAL_ID};
 
 /// How a request is made. Two verbs is all the contract uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +149,6 @@ pub struct Config {
     /// The first delay after a failure. Each further wait doubles it.
     pub backoff: Duration,
 
-    /// How long the same identifier set is left alone after being reacted to.
-    pub throttle: Duration,
-
     /// How many redirects one request may follow.
     pub redirects: u8,
 
@@ -163,47 +158,17 @@ pub struct Config {
 
 impl Config {
     /// Defaults chosen so a platform that is genuinely down is not hammered:
-    /// three attempts a quarter-second apart and doubling, and a five-minute
-    /// throttle on reacting to the same identifiers twice.
+    /// three attempts a quarter-second apart and doubling.
     pub fn new(address: impl Into<String>, deployment_id: impl Into<String>) -> Self {
         Self {
             address: address.into(),
             deployment_id: deployment_id.into(),
             attempts: 3,
             backoff: Duration::from_millis(250),
-            throttle: Duration::from_secs(300),
             redirects: 3,
             assertion_lifetime_secs: MAX_LIFETIME_SECONDS,
         }
     }
-}
-
-/// What reacting to a miss did.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Reaction {
-    /// The same identifiers were reacted to recently. Nothing was sent.
-    Throttled,
-
-    /// The master already knew it. W3.3, and most misses are this.
-    Pulled(Box<PbInstrument>),
-
-    /// Nobody knew it by a global identifier, so it was escalated, and the
-    /// platform answered with an instrument: a stub it minted, or one it
-    /// already held and paired the placeholder with (`minted: false`). W3.4.
-    /// Applied alike, so one variant.
-    Minted(Box<PbInstrument>),
-
-    /// The miss was ambiguous, so nothing was minted.
-    ///
-    /// More than one instrument matched locally. Whatever that is, it is not an
-    /// instrument nobody has heard of, and minting one would answer a
-    /// duplication problem by adding a duplicate.
-    AmbiguityNotMinted,
-
-    /// The platform neither knew it nor minted one, or found the identifiers
-    /// pointing at more than one instrument and left the conflict for staff.
-    /// Its decision, not ours.
-    Declined,
 }
 
 /// The deployment's end of the connection to the platform.
@@ -211,12 +176,6 @@ pub struct Platform {
     config: Config,
     key: DeploymentKey,
     transport: Arc<dyn Transport>,
-
-    /// Identifier set to the moment it was last reacted to.
-    ///
-    /// Swept on every use, so it holds at most the sets seen inside one window
-    /// rather than every set ever missed.
-    reacted: Mutex<HashMap<String, i64>>,
 }
 
 /// One component of this deployment, as it describes itself. W5.19.
@@ -265,7 +224,6 @@ impl Platform {
             config,
             key,
             transport,
-            reacted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -274,64 +232,35 @@ impl Platform {
         &self.config.address
     }
 
-    /// W3.3 and W3.4 together: the whole reaction to a miss.
+    /// W3.3. Ask the platform about one of the deployment's records, when a
+    /// person asks: by its open identifiers, strongest first -- its global ID
+    /// by the master's own name for it, then a FIGI, an ISO 4217 code -- and
+    /// never a licensed scheme's value or a source-scoped symbol, which never
+    /// leave the deployment (W3; intent/vendor-sourced-reference-data). The
+    /// first record found, or `None` when the platform holds none by them.
     ///
-    /// The throttle is here rather than in either step because the workflow puts
-    /// it here: a repeated miss inside the window is skipped before anything is
-    /// sent. On failure the entry is cleared, so a transient outage delays an
-    /// escalation instead of suppressing it permanently.
-    pub async fn react_to_miss(
+    /// Nothing escalates and nothing is minted: from contract v10 a
+    /// deployment's records are its own (decisions/030), and the platform
+    /// records what it was asked and did not hold for its staff (W1.13).
+    pub async fn ask(
         &self,
-        event: &MissingInstrumentDetectedEvent,
+        identifiers: &[PbIdentifier],
+        as_of_ns: i64,
         now_ns: i64,
-    ) -> Result<Reaction, PlatformError> {
-        let key = throttle_key(&event.identifiers);
-        if !self.begin(&key, now_ns) {
-            return Ok(Reaction::Throttled);
-        }
-
-        match self.react(event, now_ns).await {
-            Ok(reaction) => Ok(reaction),
-            Err(failed) => {
-                // The fixture's postcondition. A platform that was away must not
-                // leave this identifier set unreportable for the rest of the
-                // window.
-                self.clear(&key);
-                Err(failed)
+    ) -> Result<Option<PbInstrument>, PlatformError> {
+        for identifier in open_identifiers_strongest_first(identifiers) {
+            let found = if identifier.scheme == GLOBAL_ID {
+                self.pull_instrument(&identifier.value, as_of_ns, now_ns)
+                    .await?
+            } else {
+                self.pull_identifier(&identifier.scheme, &identifier.value, as_of_ns, now_ns)
+                    .await?
+            };
+            if found.is_some() {
+                return Ok(found);
             }
         }
-    }
-
-    async fn react(
-        &self,
-        event: &MissingInstrumentDetectedEvent,
-        now_ns: i64,
-    ) -> Result<Reaction, PlatformError> {
-        // Global schemes only, strongest first. A brokerage symbol is
-        // meaningless outside its own namespace, so sending one centrally would
-        // make the master's answer depend on which rail happened to ask.
-        for identifier in global_identifiers_strongest_first(&event.identifiers) {
-            if let Some(record) = self
-                .pull_identifier(
-                    &identifier.scheme,
-                    &identifier.value,
-                    event.as_of_ns,
-                    now_ns,
-                )
-                .await?
-            {
-                return Ok(Reaction::Pulled(Box::new(record)));
-            }
-        }
-
-        if event.reason == MissReason::Ambiguous as i32 {
-            return Ok(Reaction::AmbiguityNotMinted);
-        }
-
-        match self.escalate(event, now_ns).await? {
-            Some(record) => Ok(Reaction::Minted(Box::new(record))),
-            None => Ok(Reaction::Declined),
-        }
+        Ok(None)
     }
 
     /// W3.3, by the master's own name for the instrument.
@@ -368,23 +297,22 @@ impl Platform {
         found_or_nothing(response)
     }
 
-    /// W3.4. Ask the platform to mint identity from what nobody could resolve.
+    /// W3.4. The platform's surface for pairing a deployment's ID with an
+    /// instrument, or minting a stub its staff complete. A deployment does not
+    /// call it from contract v10 (decisions/030: its records are its own); it
+    /// stays the client of a route the platform serves, for
+    /// design/reconciling-locally-minted-identity.
     ///
     /// `None` when the platform declined. Nothing here can mint, and nothing
-    /// here retries a decline: the authority to create identity sits on the far
-    /// side of this call by design.
+    /// here retries a decline.
     pub async fn escalate(
         &self,
-        event: &MissingInstrumentDetectedEvent,
+        request: &EscalateInstrumentRequest,
         now_ns: i64,
     ) -> Result<Option<PbInstrument>, PlatformError> {
         let request = EscalateInstrumentRequest {
-            source: event.source.clone(),
-            asset_class: event.asset_class,
-            identifiers: event.identifiers.clone(),
-            as_of_ns: event.as_of_ns,
             requesting_deployment_id: self.config.deployment_id.clone(),
-            placeholder_instrument_id: event.placeholder_instrument_id.clone(),
+            ..request.clone()
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
@@ -679,29 +607,6 @@ impl Platform {
             last,
         })
     }
-
-    /// Whether this identifier set may be reacted to now, recording it if so.
-    fn begin(&self, key: &str, now_ns: i64) -> bool {
-        let window = self.config.throttle.as_nanos() as i64;
-        let mut reacted = self.reacted.lock().expect("the throttle lock is poisoned");
-
-        // Swept here rather than on a timer, so the map holds one window's
-        // worth of keys and nothing has to remember to clean it up.
-        reacted.retain(|_, at| now_ns.saturating_sub(*at) < window);
-
-        if reacted.contains_key(key) {
-            return false;
-        }
-        reacted.insert(key.to_string(), now_ns);
-        true
-    }
-
-    fn clear(&self, key: &str) {
-        self.reacted
-            .lock()
-            .expect("the throttle lock is poisoned")
-            .remove(key);
-    }
 }
 
 /// A reply from the platform, in the shape of the contract's messages.
@@ -867,6 +772,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         version: record.version,
         valid_from_ns: record.valid_from_ns,
         record_time_ns: record.record_time_ns,
+        ..Default::default()
     })
 }
 
@@ -929,25 +835,6 @@ fn encode(value: &str) -> String {
         }
     }
     encoded
-}
-
-/// One key for one identifier set, order-independent.
-///
-/// Sorted, because two reports of the same miss listing the same identifiers in
-/// a different order are the same miss, and a throttle that disagreed would let
-/// the second through.
-fn throttle_key(identifiers: &[PbIdentifier]) -> String {
-    let mut parts: Vec<String> = identifiers
-        .iter()
-        .map(|identifier| {
-            format!(
-                "{}:{}:{}",
-                identifier.scheme, identifier.source, identifier.value
-            )
-        })
-        .collect();
-    parts.sort();
-    parts.join("|")
 }
 
 /// The real transport: HTTPS, with the pieces the constraint needs turned on.
@@ -1030,6 +917,7 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine as _;
@@ -1323,8 +1211,8 @@ pub(crate) mod tests {
         )
     }
 
-    fn miss(reason: MissReason) -> MissingInstrumentDetectedEvent {
-        MissingInstrumentDetectedEvent {
+    fn escalation() -> EscalateInstrumentRequest {
+        EscalateInstrumentRequest {
             source: "snaptrade".into(),
             asset_class: AssetClass::Equity as i32,
             identifiers: vec![
@@ -1340,10 +1228,16 @@ pub(crate) mod tests {
                 },
             ],
             as_of_ns: AS_OF,
-            publisher_instance_id: "custody-snaptrade-1".into(),
-            reason: reason as i32,
-            observed_at_ns: NOW,
-            placeholder_instrument_id: String::new(),
+            requesting_deployment_id: String::new(),
+            placeholder_instrument_id: "LCL-01J8XQ4M7K0000000000ZZTP".into(),
+        }
+    }
+
+    fn identifier(scheme: &str, value: &str, source: &str) -> PbIdentifier {
+        PbIdentifier {
+            scheme: scheme.into(),
+            value: value.into(),
+            source: source.into(),
         }
     }
 
@@ -1557,256 +1451,97 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_miss_is_pulled_on_global_schemes_and_never_on_a_symbol() {
-        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ONE")))]);
-
-        let reaction = platform(transport.clone())
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
-            .await
-            .unwrap();
-
-        assert!(matches!(reaction, Reaction::Pulled(_)));
-        let urls = transport.urls();
-        assert_eq!(urls.len(), 1);
-        assert!(urls[0].contains("scheme=figi"));
-        assert!(!urls.iter().any(|url| url.contains("symbol")));
-    }
-
-    #[tokio::test]
-    async fn a_miss_the_master_does_not_know_is_escalated() {
+    async fn an_ask_sends_open_identifiers_only_strongest_first() {
+        // W3.3: never a licensed scheme's value, never a source-scoped symbol.
         let transport = Fake::new(vec![
             Ok(reply(404, "{\"found\": false}")),
-            Ok(reply(
-                201,
-                &serde_json::json!({
-                    "minted": true,
-                    "instrument": {
-                        "instrument_id": "INS-01J8",
-                        "asset_class": "ASSET_CLASS_EQUITY",
-                        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
-                        "version": 1,
-                    }
-                })
-                .to_string(),
-            )),
+            Ok(reply(200, &record_json("INS-USD"))),
         ]);
-
-        let reaction = platform(transport.clone())
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
+        let found = platform(transport.clone())
+            .ask(
+                &[
+                    identifier("cusip", "037833100", ""),
+                    identifier("symbol", "USD", "snaptrade"),
+                    identifier("iso4217", "USD", ""),
+                    identifier("figi", "BBG000USD001", ""),
+                ],
+                AS_OF,
+                NOW,
+            )
             .await
             .unwrap();
-
-        match reaction {
-            Reaction::Minted(record) => {
-                assert_eq!(record.instrument_id, "INS-01J8");
-                assert_eq!(
-                    record.lifecycle_state,
-                    meridian_domain::v1::InstrumentLifecycleState::Define as i32
-                );
-            }
-            other => panic!("expected a mint, got {other:?}"),
-        }
-
-        // The escalation carries every identifier, the brokerage symbol
-        // included: they are the stub an administrator completes.
-        let body = transport.seen.lock().unwrap()[1].body.clone().unwrap();
-        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(sent["identifiers"].as_array().unwrap().len(), 2);
-        assert_eq!(sent["requesting_deployment_id"], DEPLOYMENT);
-        assert_eq!(sent["source"], "snaptrade");
+        assert_eq!(found.unwrap().instrument_id, "INS-USD");
+        let urls = transport.urls();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("scheme=figi"), "{}", urls[0]);
+        assert!(urls[1].contains("scheme=iso4217"), "{}", urls[1]);
+        assert!(!urls
+            .iter()
+            .any(|url| url.contains("cusip") || url.contains("symbol")));
     }
 
     #[tokio::test]
-    async fn an_ambiguous_miss_is_not_minted() {
-        // More than one instrument matched. Whatever that is, it is not an
-        // instrument nobody has heard of, and minting one would answer a
-        // duplication problem by adding a duplicate.
-        let transport = Fake::new(vec![Ok(reply(404, "{\"found\": false}"))]);
+    async fn an_ask_by_the_global_id_pulls_the_record_by_its_own_name() {
+        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ONE")))]);
+        platform(transport.clone())
+            .ask(&[identifier(GLOBAL_ID, "INS-ONE", "")], AS_OF, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(transport.urls()[0].contains("/api/v1/reference/instruments/INS-ONE"));
+    }
 
-        let reaction = platform(transport.clone())
-            .react_to_miss(&miss(MissReason::Ambiguous), NOW)
+    #[tokio::test]
+    async fn an_ask_the_platform_holds_nothing_for_is_nothing_and_mints_nothing() {
+        let transport = Fake::new(vec![Ok(reply(404, "{\"found\": false}"))]);
+        let found = platform(transport.clone())
+            .ask(&[identifier("figi", "BBG000NONE01", "")], AS_OF, NOW)
             .await
             .unwrap();
-
-        assert_eq!(reaction, Reaction::AmbiguityNotMinted);
+        assert!(found.is_none());
         assert!(!transport
             .urls()
             .iter()
             .any(|url| url.contains("escalate-instrument")));
-    }
-
-    #[tokio::test]
-    async fn a_declined_escalation_is_not_an_error() {
-        let transport = Fake::new(vec![
-            Ok(reply(404, "{\"found\": false}")),
-            Ok(reply(200, "{\"minted\": false}")),
-        ]);
-
-        let reaction = platform(transport)
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
+        let none = platform(Fake::new(vec![]))
+            .ask(&[identifier("cusip", "037833100", "")], AS_OF, NOW)
             .await
             .unwrap();
-
-        assert_eq!(reaction, Reaction::Declined);
-    }
-
-    /// A placeholder's miss, as the instrument store announces it (W3.7).
-    fn placeholder_miss() -> MissingInstrumentDetectedEvent {
-        let mut event = miss(MissReason::NotFound);
-        event.placeholder_instrument_id = "LCL-01J8XQ4M7K0000000000ZZTP".into();
-        event
+        assert!(none.is_none(), "nothing open to ask by, nothing asked");
     }
 
     #[tokio::test]
-    async fn an_escalation_carries_the_placeholder_it_asks_to_pair() {
-        let transport = Fake::new(vec![
-            Ok(reply(404, "{\"found\": false}")),
-            Ok(reply(201, &record_json("INS-01J8XQ4M7K0000000000ZZTP"))),
-        ]);
-
+    async fn an_escalation_names_this_deployment_and_its_id() {
+        let transport = Fake::new(vec![Ok(reply(
+            201,
+            &record_json("INS-01J8XQ4M7K0000000000ZZTP"),
+        ))]);
         platform(transport.clone())
-            .react_to_miss(&placeholder_miss(), NOW)
+            .escalate(&escalation(), NOW)
             .await
             .unwrap();
-
-        let body = transport.seen.lock().unwrap()[1].body.clone().unwrap();
+        let body = transport.seen.lock().unwrap()[0].body.clone().unwrap();
         let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             sent["placeholder_instrument_id"],
             "LCL-01J8XQ4M7K0000000000ZZTP"
         );
+        assert_eq!(sent["requesting_deployment_id"], DEPLOYMENT);
     }
 
     #[tokio::test]
-    async fn a_pairing_with_an_instrument_already_held_is_applied_like_a_mint() {
-        // The fixture's first case: another deployment escalated it first, so
-        // the platform pairs this placeholder with what it minted then.
-        let transport = Fake::new(vec![
-            Ok(reply(404, "{\"found\": false}")),
-            Ok(reply(
-                200,
-                &serde_json::json!({
-                    "minted": false,
-                    "instrument": {
-                        "instrument_id": "INS-01J8XQ4M7K0000000000ZZTP",
-                        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
-                        "version": 1,
-                    },
-                    "replaces_instrument_id": "LCL-01J8XQ4M7K0000000000ZZTP",
-                })
-                .to_string(),
-            )),
-        ]);
-
-        let reaction = platform(transport)
-            .react_to_miss(&placeholder_miss(), NOW)
-            .await
-            .unwrap();
-
-        match reaction {
-            Reaction::Minted(record) => {
-                assert_eq!(record.instrument_id, "INS-01J8XQ4M7K0000000000ZZTP")
-            }
-            other => panic!("expected the pairing to be applied, got {other:?}"),
+    async fn a_conflict_or_a_decline_pairs_nothing() {
+        for answer in [
+            "{\"minted\": false, \"conflict\": true, \"instrument\": null}",
+            "{\"minted\": false}",
+        ] {
+            let transport = Fake::new(vec![Ok(reply(200, answer))]);
+            assert!(platform(transport)
+                .escalate(&escalation(), NOW)
+                .await
+                .unwrap()
+                .is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn a_conflict_pairs_nothing_and_is_declined() {
-        // The identifiers point at two instruments. Staff decide, and the
-        // placeholder stays in use until they do.
-        let transport = Fake::new(vec![
-            Ok(reply(404, "{\"found\": false}")),
-            Ok(reply(
-                200,
-                "{\"minted\": false, \"conflict\": true, \"instrument\": null}",
-            )),
-        ]);
-
-        let reaction = platform(transport)
-            .react_to_miss(&placeholder_miss(), NOW)
-            .await
-            .unwrap();
-
-        assert_eq!(reaction, Reaction::Declined);
-    }
-
-    #[tokio::test]
-    async fn a_repeated_miss_inside_the_window_is_skipped() {
-        // A burst of misses is not a burst of mints.
-        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ONE")))]);
-        let platform = platform(transport.clone());
-
-        platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
-            .await
-            .unwrap();
-        let again = platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW + 1_000_000_000)
-            .await
-            .unwrap();
-
-        assert_eq!(again, Reaction::Throttled);
-        assert_eq!(transport.calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn the_throttle_lets_go_once_the_window_passes() {
-        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ONE")))]);
-        let platform = platform(transport.clone());
-
-        platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
-            .await
-            .unwrap();
-        let later = platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW + 301_000_000_000)
-            .await
-            .unwrap();
-
-        assert!(matches!(later, Reaction::Pulled(_)));
-        assert_eq!(transport.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn the_order_identifiers_are_listed_in_does_not_defeat_the_throttle() {
-        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-ONE")))]);
-        let platform = platform(transport.clone());
-
-        platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
-            .await
-            .unwrap();
-
-        let mut reordered = miss(MissReason::NotFound);
-        reordered.identifiers.reverse();
-        let again = platform.react_to_miss(&reordered, NOW).await.unwrap();
-
-        assert_eq!(again, Reaction::Throttled);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_reaction_clears_the_throttle_so_a_later_report_retries() {
-        // The fixture's postcondition. A transient outage must not permanently
-        // suppress an escalation.
-        let transport = Fake::new(vec![failure("connection reset")]);
-        let platform = platform(transport.clone());
-
-        assert!(platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW)
-            .await
-            .unwrap_err()
-            .is_outage());
-
-        let second = platform
-            .react_to_miss(&miss(MissReason::NotFound), NOW + 1_000_000_000)
-            .await;
-
-        assert!(
-            second.is_err(),
-            "the second report was throttled instead of retried"
-        );
-        assert_eq!(transport.calls(), 6);
     }
 
     #[tokio::test]

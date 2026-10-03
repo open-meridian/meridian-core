@@ -9,8 +9,9 @@ it at every commit with three of core's stand-in plugins, so a change here
 that would break a plugin's e2e breaks core's gate first.
 
 **It is a development deployment, for a test, and never a way to run one.** It
-has no platform, so no instrument resolves and every row a plugin records names
-the deployment's placeholder; its dashboard runs with `MERIDIAN_DEVELOPMENT`,
+has no platform, and a deployment's records are its own (contract v10), so every
+row a plugin records names a record the deployment minted, completed by the
+runner as a deployment admin does at the dashboard's Instruments page; its dashboard runs with `MERIDIAN_DEVELOPMENT`,
 so developer settings are shown and accepted; and nothing outlives `down -v`.
 It publishes no port. To run a deployment, install the chart.
 
@@ -143,10 +144,11 @@ query of their own.
     statement|<account>|<source>|<expected rows>|<complete or open>|<buying power>|<margin requirement>|<maintenance excess>|<currency assumed>
 
 - `<account>` is the account's name, since its ID is minted per run.
-- `<instrument>` is an `INS-` ID, or for a placeholder the identifiers it stands
-  for, sorted: `placeholder(figi:BBG000B9XRY4, symbol:AAPL@snaptrade)`. In the
-  harness every instrument is a placeholder, so an expected file names each row
-  by the identifiers the plugin sent.
+- `<instrument>` is an `INS-` ID, or for a record the deployment minted (its
+  `LCL-` ID is drawn per run) its identifiers in force, sorted:
+  `local(figi:BBG000B9XRY4, symbol:AAPL@snaptrade)`. In the harness every record
+  is one the deployment minted, so an expected file names each row by the
+  identifiers the plugin sent. (`placeholder(...)` until contract v10.)
 - A number is printed at the scale it was stated with; what was not reported is
   empty, never zero. `<in-cash>` is `in-cash` for a position the venue also
   counts in cash.

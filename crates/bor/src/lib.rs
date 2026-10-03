@@ -13,7 +13,7 @@
 //! (W9.1), journalled as movement lines opening every position, lot and
 //! pending settlement from zero (W9.2). After that the book changes only by
 //! its own entries -- an adjustment or a reversal resolving a break, a
-//! placeholder followed -- each a set of lines. Every difference an
+//! merged record followed -- each a set of lines. Every difference an
 //! `operations` plugin finds between the book and the street is a break,
 //! recorded with its cause and resolved by a justified entry naming it or
 //! closed with an explanation; never by an overwrite.

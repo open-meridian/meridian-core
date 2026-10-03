@@ -205,7 +205,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
-        let (subject, delegation) = if topic.starts_with(CONFIGURATION) {
+        let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
             let claims = self.vouched_admin(&topic, acting_for.as_ref(), self.clock.now_ns())?;
             tracing::info!(
                 instance = self.instance_id(),
@@ -214,9 +214,9 @@ impl Sidecar {
                 at_level = "admin",
                 "read for a person"
             );
-            (claims.subject, claims.delegation_id)
+            (claims.subject, claims.delegation_id, claims.client_name)
         } else {
-            (String::new(), String::new())
+            (String::new(), String::new(), String::new())
         };
         let scope = self
             .configuration(self.clock.now_ns())
@@ -232,6 +232,7 @@ impl Sidecar {
         let stamp = Stamp {
             acting_for_subject: subject,
             acting_through_delegation: delegation,
+            acting_through_client: client,
             account_scope: Some(scope),
         };
         let (_, payload) = self
@@ -321,8 +322,9 @@ impl Sidecar {
     }
 
     /// Asked, with the person stamped on the envelope -- and the delegation
-    /// they acted through, when the assertion named one (W4.9, contract v9)
-    /// -- and the reply read as its plugin-facing mirror. Default claims are
+    /// they acted through, when the assertion named one (W4.9, contract v9),
+    /// with its client's name beside it (contract v10) -- and the reply read
+    /// as its plugin-facing mirror. Default claims are
     /// the plugin acting as itself: nobody stamped.
     async fn ask_for<D: Message, R: Message + Default>(
         &self,
@@ -337,6 +339,11 @@ impl Sidecar {
                 String::new()
             } else {
                 claims.delegation_id.clone()
+            },
+            acting_through_client: if claims.subject.is_empty() || claims.delegation_id.is_empty() {
+                String::new()
+            } else {
+                claims.client_name.clone()
             },
             account_scope: None,
         };
@@ -558,8 +565,15 @@ pub(crate) fn refused(failed: BusError) -> Status {
         BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
             .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
         {
+            // A store that could not check the command, nothing recorded:
+            // to be tried again, so the status a caller retries (contract
+            // v10). Every other refusal of a component's is `aborted`.
             Some((reason, words)) => refused_naming(
-                Code::Aborted,
+                if reason == RefusalReason::ReferenceUnavailable {
+                    Code::Unavailable
+                } else {
+                    Code::Aborted
+                },
                 words.to_string(),
                 reason,
                 meridian_bus::refusal_fields(&detail),

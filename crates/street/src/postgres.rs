@@ -669,15 +669,14 @@ impl Store for PostgresStore {
         Ok(settled)
     }
 
-    fn placeholder_instruments(&self) -> Result<Vec<String>> {
-        let pattern = format!("{}%", crate::ids::PLACEHOLDER_PREFIX);
+    fn instruments_held(&self) -> Result<Vec<String>> {
         Ok(self
             .conn()?
             .query(
                 "SELECT DISTINCT instrument_id FROM custodial_position
-                  WHERE instrument_id LIKE $1 AND NOT removed
+                  WHERE NOT removed
                   ORDER BY instrument_id",
-                &[&pattern],
+                &[],
             )
             .map_err(unavailable)?
             .into_iter()

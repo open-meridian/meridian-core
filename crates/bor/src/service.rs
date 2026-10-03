@@ -6,10 +6,11 @@
 //! resolution and its close as cleared (W9.7) -- and the dashboard's
 //! attribute (W9.13) arrive as
 //! commands; five roles' reads (W9.10 to W9.12, W9.14) as queries; a
-//! placeholder's replacement (W3.8) as an event, which the book follows
-//! (W9.9), also asking the instrument store about what it still holds under
-//! one (W3.6), and asking it the reference version of each instrument a
-//! command names (Q31). Every record an entry changes leaves as an event,
+//! merged record's replacement (W3.8) as an event, which the book follows
+//! (W9.9), also asking the instrument store what each instrument it holds has
+//! become (W3.6), and asking it the record of each instrument a command names:
+//! its version (Q31), and its asset class and currency, which the book
+//! requires (W9.1, contract v10). Every record an entry changes leaves as an event,
 //! whole, after the entry commits (W9.8).
 //!
 //! # Who caused it, and whose read it is
@@ -43,7 +44,7 @@ use meridian_domain::v1::{
 };
 use prost::Message;
 
-use crate::decide::{self, Context, Made};
+use crate::decide::{self, Context, Made, RecordSays};
 use crate::store::{
     mark_of, page_limit, watermark_of, Acted, AttributesRead, BreaksRead, Decided, FiguresRead,
     PositionsRead, Scope, Store, StoreError,
@@ -73,17 +74,18 @@ pub const LIST_ACCOUNT_ATTRIBUTES: &str = "platform.book.query.list-account-attr
 /// W3.8, heard (W9.9).
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
 
-/// W3.6, asked: an instrument's record, for its version (Q31) and for what a
-/// placeholder has become.
+/// W3.6, asked: an instrument's record, for its version (Q31), its asset class
+/// and currency (W9.1), and what a merged record has become.
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 
-/// How long a command waits for the instrument store's versions. Short: a
-/// version not had is recorded as none, never waited for (Q31).
+/// How long a command waits for the instrument store's records. Short: a
+/// store that does not answer in it is a command refused to be tried again
+/// (contract v10), never one admitted unchecked.
 const VERSION_WAIT: Duration = Duration::from_secs(2);
 
-/// How often the placeholders still held are asked about again: the
-/// recovery path for a replacement this process did not hear, so slow and
-/// certain, as the street store's is.
+/// How often the instruments held are asked about again: the recovery path
+/// for a merge this process did not hear, so slow and certain, as the street
+/// store's is.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// Whose read a query is (W4.11).
@@ -104,12 +106,15 @@ fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         message_id: meta.message_id,
         instance_id: meta.publisher_instance_id,
         acting_for: meta.acting_for_subject,
+        acting_through_delegation: meta.acting_through_delegation,
+        acting_through_client: meta.acting_through_client,
         correlation_id: meta.correlation_id,
         event_time_ns: meta.published_at_ns,
         received_at_ns: now,
         committed_at_ns: now,
         reference_versions: Default::default(),
-        cash: Default::default(),
+        records: Default::default(),
+        reference_unavailable: false,
         control_sequence: 0,
     }
 }
@@ -126,39 +131,39 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
     M::decode(&envelope.payload[..]).map_err(|failed| format!("undecodable {wanted}: {failed}"))
 }
 
-/// What the instrument store says of each instrument, where it answers in
-/// time: its reference version (Q31), and whether it is cash.
+/// What the instrument store says of each instrument a command names: its
+/// reference version (Q31), and what its record says the book requires (W9.1,
+/// contract v10); or that it did not answer in time.
 #[derive(Default)]
 struct References {
     versions: std::collections::BTreeMap<String, i64>,
-    cash: std::collections::BTreeMap<String, bool>,
+    records: std::collections::BTreeMap<String, RecordSays>,
+    unavailable: bool,
 }
 
-/// The scheme a currency's identifier is in ({scheme: iso4217, value: USD}).
-const CURRENCY_SCHEME: &str = "iso4217";
-
-/// Whether a record says its instrument is cash: asset class cash, or a
-/// currency identifier; `None` where it names no asset class and no currency
-/// identifier, and cannot say (W9.1, contract v9).
-fn cash_said(record: &meridian_domain::v1::InstrumentRecord) -> Option<bool> {
-    let currency = record
-        .identifiers
-        .iter()
-        .any(|identifier| identifier.scheme == CURRENCY_SCHEME && !identifier.value.is_empty());
-    match meridian_domain::v1::AssetClass::try_from(record.asset_class) {
-        Ok(meridian_domain::v1::AssetClass::Cash) => Some(true),
-        _ if currency => Some(true),
-        Ok(meridian_domain::v1::AssetClass::Unspecified) | Err(_) => None,
-        Ok(_) => Some(false),
+/// What a record says that the book requires: an asset class and a currency
+/// in force, and whether the class is cash.
+fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
+    let class = meridian_domain::v1::AssetClass::try_from(record.asset_class)
+        .unwrap_or(meridian_domain::v1::AssetClass::Unspecified);
+    RecordSays {
+        asset_class: class != meridian_domain::v1::AssetClass::Unspecified,
+        currency: !record.currency.trim().is_empty(),
+        cash: class == meridian_domain::v1::AssetClass::Cash,
     }
 }
 
-/// The reference version of each instrument, and whether it is cash, from
-/// the instrument store, where it answers in time; none where it does not
-/// (Q31), which is a record that cannot say.
+/// Each instrument's record from the instrument store. A record the store
+/// does not hold is absent, and lacks everything; a store that does not
+/// answer in time is `unavailable`, and the command is refused to be tried
+/// again.
 fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
     let mut found = References::default();
+    if instruments.is_empty() {
+        return found;
+    }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        found.unavailable = true;
         return found;
     };
     for instrument in instruments {
@@ -177,19 +182,27 @@ fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
         );
         let Ok((payload_type, payload)) = asked else {
             // The instrument store away is away for all of them.
+            found.unavailable = true;
             break;
         };
         if payload_type != "meridian.v1.ResolveInstrumentReply" {
-            continue;
+            found.unavailable = true;
+            break;
         }
-        if let Ok(reply) = ResolveInstrumentReply::decode(&payload[..]) {
-            if let Some(record) = reply.instrument.filter(|_| reply.found) {
-                if record.version > 0 {
-                    found.versions.insert(instrument.clone(), record.version);
+        match ResolveInstrumentReply::decode(&payload[..]) {
+            Ok(reply) => {
+                if let Some(record) = reply.instrument.filter(|_| reply.found) {
+                    if record.version > 0 {
+                        found.versions.insert(instrument.clone(), record.version);
+                    }
+                    found
+                        .records
+                        .insert(instrument.clone(), record_says(&record));
                 }
-                if let Some(cash) = cash_said(&record) {
-                    found.cash.insert(instrument.clone(), cash);
-                }
+            }
+            Err(_) => {
+                found.unavailable = true;
+                break;
             }
         }
     }
@@ -347,7 +360,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let named = decide::instruments_named(&[], &request.positions);
             let found = references(&bus2, &named, ctx.received_at_ns);
             ctx.reference_versions = found.versions;
-            ctx.cash = found.cash;
+            ctx.records = found.records;
+            ctx.reference_unavailable = found.unavailable;
             command(
                 &bus2,
                 store.as_ref(),
@@ -463,7 +477,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 let named = decide::instruments_named(&adjustment.lines, &[]);
                 let found = references(&bus2, &named, ctx.received_at_ns);
                 ctx.reference_versions = found.versions;
-                ctx.cash = found.cash;
+                ctx.records = found.records;
+                ctx.reference_unavailable = found.unavailable;
             }
             command(
                 &bus2,
@@ -698,11 +713,11 @@ pub async fn follow_one(
     .await
 }
 
-/// Ask the instrument store what every placeholder the book still holds has
-/// become, and follow each one replaced, as the event would have.
-pub async fn sweep_placeholders(bus: &Arc<Bus>, store: &Arc<dyn Store>) -> Result<usize, String> {
+/// Ask the instrument store what every instrument the book holds has become,
+/// and follow each one replaced, as the event would have.
+pub async fn sweep_replacements(bus: &Arc<Bus>, store: &Arc<dyn Store>) -> Result<usize, String> {
     let listing = Arc::clone(store);
-    let placeholders = tokio::task::spawn_blocking(move || listing.placeholder_instruments())
+    let placeholders = tokio::task::spawn_blocking(move || listing.instruments_held())
         .await
         .map_err(|failed| format!("the sweep task failed: {failed}"))?
         .map_err(|failed| failed.to_string())?;
@@ -739,16 +754,16 @@ pub async fn sweep_placeholders(bus: &Arc<Bus>, store: &Arc<dyn Store>) -> Resul
 /// Sweep now, and then every `every`, for as long as the process runs.
 pub async fn sweep_forever(bus: Arc<Bus>, store: Arc<dyn Store>, every: Duration) {
     loop {
-        match sweep_placeholders(&bus, &store).await {
-            Ok(moved) => tracing::debug!(moved, "swept the placeholders still held"),
-            Err(why) => tracing::warn!(why, "could not sweep the placeholders still held"),
+        match sweep_replacements(&bus, &store).await {
+            Ok(moved) => tracing::debug!(moved, "swept the instruments held for merges"),
+            Err(why) => tracing::warn!(why, "could not sweep the instruments held for merges"),
         }
         tokio::time::sleep(every).await;
     }
 }
 
 /// W9.9's one path, for the event and the sweep: each account holding the
-/// placeholder moved in its own entry, in its own partition.
+/// replaced record moved in its own entry, in its own partition.
 async fn move_accounts(
     bus: &Arc<Bus>,
     store: &Arc<dyn Store>,
@@ -809,6 +824,6 @@ async fn move_accounts(
     .map_err(|failed| format!("the move task failed: {failed}"))?
 }
 
-/// An account found holding a placeholder that no longer does, by the time
+/// An account found holding a replaced record that no longer does, by the time
 /// its lock is held: nothing to move, and nothing wrong.
-const NOTHING_HELD: &str = "the account holds nothing under the placeholder";
+const NOTHING_HELD: &str = "the account holds nothing under the replaced record";

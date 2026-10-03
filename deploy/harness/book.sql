@@ -15,14 +15,14 @@
 --   figures|<account>|<external account>/<segment>|<business date>
 --   entry|<account>|<kind>|<effective date>|<actor>
 --
--- <account> is the account's name. <instrument> is its INS- ID, or for the
--- deployment's placeholder the identifiers it stands for, sorted, as
--- street.sql prints it. A number is printed at the scale it was stated with
+-- <account> is the account's name. <instrument> is its INS- ID, or for a
+-- record the deployment minted its identifiers in force, sorted, as
+-- street.sql prints it: `local(...)`. A number is printed at the scale it was stated with
 -- (decisions/023); what is unknown is empty, never zero. <lot relief>,
 -- <category>, <state>, <confirmed cause> and <source> are the enum's number
 -- (0 is none). <recorded by> and <actor> are a person's subject, `instance
 -- <id>` for a finding a plugin sent as itself, or `book` for the book's own
--- act. A position the book removed after a placeholder's move is kept as a
+-- act. A position the book removed after a merged record's move is kept as a
 -- tombstone and not printed. Entries are printed in the order they were
 -- made in each account.
 --
@@ -31,12 +31,15 @@
 -- it, comparing the book before and after `meridian-bor rebuild`.
 
 WITH shown AS (
-    SELECT placeholder_id AS instrument_id,
-           'placeholder(' || string_agg(said, ', ' ORDER BY said COLLATE "C") || ')' AS instrument
-      FROM (SELECT placeholder_id,
+    -- Each record the deployment minted (an LCL- ID, drawn per run) as its
+    -- identifiers in force.
+    SELECT instrument_id,
+           'local(' || string_agg(said, ', ' ORDER BY said COLLATE "C") || ')' AS instrument
+      FROM (SELECT instrument_id,
                    scheme || ':' || value || CASE WHEN source <> '' THEN '@' || source ELSE '' END AS said
-              FROM instrument_placeholder_identifier) identifiers
-     GROUP BY placeholder_id
+              FROM instrument_identifier
+             WHERE instrument_id LIKE 'LCL-%' AND valid_to_ns IS NULL) identifiers
+     GROUP BY instrument_id
 ),
 named AS (
     SELECT account_id, name FROM config_account

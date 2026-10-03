@@ -1,15 +1,14 @@
 //! The deployment's instrument store, as its own process.
 //!
-//! Answers instrument questions locally and applies what the conductor publishes
-//! after pulling or escalating. It holds no key and reaches no network: the
-//! platform connection and the deployment's identity are the conductor's, per
-//! decision 011.
+//! The deployment's own instrument records (decisions/030): mints and matches
+//! them, keeps each value with its source and every version, and answers what
+//! an instrument is; the dashboard completes and merges them for a deployment
+//! admin (W3.10 to W3.13). It holds no key and reaches no network: asking the
+//! platform about a record is the conductor's, when a person asks (decision
+//! 011, W3.3).
 //!
-//! For identity, a replica rather than a cache: it keeps answering from what it holds when
-//! the platform is unreachable, which is what lets a deployment stay useful
-//! through somebody else's outage.
-//!
-//! `meridian-instrument migrate` applies its schema. `public-key` moved to the conductor with
+//! `meridian-instrument migrate` applies its schema, and at contract v10
+//! sources what an older release held (the spec's Q8). `public-key` moved to the conductor with
 //! the key it prints the public half of.
 
 use std::sync::Arc;

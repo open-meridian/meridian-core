@@ -126,6 +126,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
         let message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
+        self.known("stated_asset_class", message.stated_asset_class, domain::AssetClass::try_from(message.stated_asset_class).is_ok())?;
         let account = None;
         self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, account, None).await
     }
@@ -138,7 +139,6 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut message: domain::MissingInstrumentDetectedEvent = self.as_domain(request.into_inner())?;
         self.known("asset_class", message.asset_class, domain::AssetClass::try_from(message.asset_class).is_ok())?;
         self.known("reason", message.reason, domain::MissReason::try_from(message.reason).is_ok())?;
-        message.placeholder_instrument_id = Default::default();
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
     }

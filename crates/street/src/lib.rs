@@ -38,11 +38,12 @@
 //! as of a date; it is not a change to one. Adding rows up would double
 //! anything that appeared in two statements, and the result looks plausible.
 //!
-//! **A placeholder's positions move; its rows do not.** A row may name the
-//! deployment's `LCL-` placeholder for identifiers nothing matched, and it is
-//! recorded resolved and moves a position like any other. When the platform's
-//! `INS-` ID replaces the placeholder, the positions move onto it (W3.9) and the
-//! rows keep the placeholder, because they record what was reported.
+//! **A merged record's positions move; its rows do not.** A row names the
+//! deployment's record for what was reported, one minted for identifiers
+//! nothing matched as any other. When a person merges that record into
+//! another, the positions move onto the one that stays (W3.9) and the rows
+//! keep the ID they were recorded with, because they record what was reported
+//! (a placeholder replaced by its `INS-` ID, before contract v10, the same).
 //!
 //! **An unresolved row is recorded and moves nothing.** Dropping it would lose
 //! the only evidence that something was held. Guessing at the instrument would
