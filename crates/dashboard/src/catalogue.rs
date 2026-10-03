@@ -444,6 +444,10 @@ struct Upload {
     interface: bool,
     sdk_version: String,
     image_digest: String,
+    /// The version's declaration, as the CLI read it from the built image
+    /// (W8.1, contract v11); none from a CLI or a plugin before v11.
+    #[serde(default)]
+    declaration: Option<crate::declaration::Declared>,
 }
 
 async fn upload(
@@ -495,6 +499,15 @@ async fn upload(
         }
         Err(failed) => return refused(StatusCode::BAD_GATEWAY, failed),
     }
+    let declaration = match upload
+        .declaration
+        .as_ref()
+        .map(crate::declaration::from_json)
+    {
+        None => None,
+        Some(Ok(declaration)) => Some(declaration),
+        Some(Err(why)) => return refused(StatusCode::UNPROCESSABLE_ENTITY, why),
+    };
     let request = RecordPluginUploadRequest {
         metadata: Some(PluginMetadata {
             name: upload.name,
@@ -502,6 +515,7 @@ async fn upload(
             roles: upload.roles,
             interface: upload.interface,
             sdk_version: upload.sdk_version,
+            declaration,
         }),
         image_digest: upload.image_digest,
     };
@@ -559,6 +573,7 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 "name": m.name, "version": m.version, "roles": m.roles,
                 "interface": m.interface, "sdk_version": m.sdk_version,
                 "image_digest": version.image_digest,
+                "declaration": m.declaration.as_ref().map(crate::declaration::to_json),
             })
         })
         .collect();

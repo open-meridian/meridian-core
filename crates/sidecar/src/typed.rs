@@ -156,7 +156,7 @@ impl Sidecar {
     }
 
     /// An event: checked, published, and its identifier handed back.
-    pub(crate) async fn publish_typed<D: Message>(
+    pub(crate) async fn publish_typed<D: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
@@ -164,6 +164,7 @@ impl Sidecar {
     ) -> Result<Response<plugin::Published>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        let message = self.kept_at_the_edge(payload_type, message)?;
         let payload = message.encode_to_vec();
         let message_id = self
             .bus
@@ -256,7 +257,7 @@ impl Sidecar {
     /// with the person stamped on the envelope. One to the deployment's
     /// configuration is checked instead against the person being a deployment
     /// admin, and a link against what the plugin reported (W6.4).
-    pub(crate) async fn command_typed<D: Message, R: Message + Default>(
+    pub(crate) async fn command_typed<D: Message + Default, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
@@ -266,6 +267,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
         // A command naming no account names none: a statement from a plugin
         // built before v7 is admitted with no account (crate::older).

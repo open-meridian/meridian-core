@@ -19,8 +19,8 @@ use meridian_domain::v1::{
     PluginLaunch, PluginMetadata, PluginVersion, SignInRecord, UserGroup,
 };
 
-use meridian_pb::v1::SettingDeclaration;
-use prost::Message as _;
+use meridian_pb::v1::{PluginDeclaration, SettingDeclaration};
+use prost::Message;
 
 use crate::migrations;
 use crate::store::{
@@ -305,7 +305,7 @@ impl Store for PostgresStore {
         for row in tx
             .query(
                 "SELECT name, version, roles, interface, sdk_version, image_digest,
-                        uploaded_by, uploaded_at_ns
+                        uploaded_by, uploaded_at_ns, declaration
                    FROM config_plugin_version ORDER BY name, version",
                 &[],
             )
@@ -318,6 +318,15 @@ impl Store for PostgresStore {
                     roles: row.get(2),
                     interface: row.get(3),
                     sdk_version: row.get(4),
+                    declaration: row
+                        .get::<_, Option<Vec<u8>>>(8)
+                        .map(|bytes| PluginDeclaration::decode(bytes.as_slice()))
+                        .transpose()
+                        .map_err(|failed| {
+                            StoreError::Unavailable(format!(
+                                "a version's declaration did not read: {failed}"
+                            ))
+                        })?,
                 }),
                 image_digest: row.get(5),
                 uploaded_by: row.get(6),
@@ -708,8 +717,8 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_plugin_version
                         (name, version, roles, interface, sdk_version, image_digest,
-                         uploaded_by, uploaded_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         uploaded_by, uploaded_at_ns, declaration)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT (name, version) DO NOTHING",
                 &[
                     &metadata.name,
@@ -720,6 +729,7 @@ impl Store for PostgresStore {
                     &version.image_digest,
                     &version.uploaded_by,
                     &version.uploaded_at_ns,
+                    &metadata.declaration.as_ref().map(Message::encode_to_vec),
                 ],
             )
             .map_err(unavailable)?;

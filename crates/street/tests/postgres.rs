@@ -80,6 +80,8 @@ fn statement(account_id: &str) -> Statement {
         figures: Vec::new(),
         currency_assumed: false,
         security_interest: None,
+        raw_record: None,
+        provenance: Vec::new(),
         completed: None,
     }
 }
@@ -612,6 +614,8 @@ fn a_statements_figures_are_kept_as_reported_and_read_back() {
         ],
         currency_assumed: true,
         security_interest: Some(true),
+        raw_record: None,
+        provenance: Vec::new(),
         ..statement(&unique("ACC"))
     };
     let (opened, _, _) = store.open(statement.clone(), &at(NOW)).unwrap();
@@ -1564,6 +1568,9 @@ fn a_holdings_cost_and_lots_are_kept_on_the_row_and_the_position() {
                 detail: "as the statement says".into(),
             },
         ],
+        raw_record: None,
+        provenance: Vec::new(),
+        pending: Vec::new(),
     };
     let account = holding.account_id.clone();
     let instrument = holding.instrument_id.clone().unwrap();
@@ -1577,6 +1584,109 @@ fn a_holdings_cost_and_lots_are_kept_on_the_row_and_the_position() {
         held.cost, holding.cost,
         "as reported, the sign and the order kept"
     );
+}
+
+fn raw(key: &str) -> Option<meridian_street::RawRecord> {
+    Some(meridian_street::RawRecord {
+        instance_id: "custody-snaptrade-1".into(),
+        key: key.into(),
+    })
+}
+
+#[test]
+fn what_the_edge_keeps_is_kept_on_the_row_the_position_and_the_statement() {
+    // Contract v11: a row's raw record, provenance and pending quantities;
+    // the position carries them from the row that last stated it.
+    let store = store();
+    let mut opening = statement(&unique("ACC"));
+    opening.raw_record = raw("balances/A/1");
+    opening.provenance = vec![meridian_street::Provenance {
+        field: "institution".into(),
+        kind: 4,
+        rule: "the connection's brokerage name".into(),
+        ..Default::default()
+    }];
+    let (opened, _, _) = store.open(opening.clone(), &at(NOW)).unwrap();
+    let read = store.statement(&opened.statement_id).unwrap().unwrap();
+    assert_eq!(read.raw_record, raw("balances/A/1"));
+    assert_eq!(read.provenance, opening.provenance);
+
+    let mut holding = resolved(&opened, &unique("INS"));
+    holding.cost.raw_record = raw("positions/A/1");
+    holding.cost.pending = vec![meridian_street::Pending {
+        value_date: "2026-09-09".into(),
+        quantity: units("2.5"),
+    }];
+    holding.cost.provenance = vec![meridian_street::Provenance {
+        field: "settle_date_quantity".into(),
+        kind: 4,
+        rule: "the quantity less the trades not settled".into(),
+        ..Default::default()
+    }];
+    let account = holding.account_id.clone();
+    let instrument = holding.instrument_id.clone().unwrap();
+    store.record(holding.clone(), &at(NOW + 1)).unwrap();
+    let held = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.cost.raw_record, raw("positions/A/1"));
+    assert_eq!(held.cost.pending, holding.cost.pending);
+    assert_eq!(held.cost.provenance, holding.cost.provenance);
+}
+
+#[test]
+fn a_backfill_is_journaled_beside_the_row_and_run_twice_adds_nothing() {
+    // W2.4, contract v11, in the database: an amendment row beside the row
+    // as first recorded, which keeps its columns; the position the row last
+    // stated takes the field as a change of its own; again, nothing.
+    use meridian_street::store::{Amended, Amendment};
+    let store = store();
+    let opened = store.open(statement(&unique("ACC")), &at(NOW)).unwrap().0;
+    let holding = resolved(&opened, &unique("INS"));
+    let account = holding.account_id.clone();
+    let instrument = holding.instrument_id.clone().unwrap();
+    store.record(holding.clone(), &at(NOW + 1)).unwrap();
+    let before = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+
+    let amendment = Amendment {
+        statement_id: opened.statement_id.clone(),
+        account_id: account.clone(),
+        instrument_id: Some(instrument.clone()),
+        unresolved_identifiers: vec![],
+        side: Side::Long,
+        contract_version: "v11".into(),
+        field: "raw_record".into(),
+        raw_record: raw("positions/A/1"),
+        pending: vec![],
+        provenance: vec![],
+    };
+    match store.amend(amendment.clone(), &at(NOW + 2)).unwrap() {
+        Amended::Amended(Settled::Changed { position, .. }) => {
+            assert_eq!(position.cost.raw_record, raw("positions/A/1"));
+            assert!(position.last_change.sequence > before.last_change.sequence);
+        }
+        other => panic!("the position should have changed: {other:?}"),
+    }
+    let after = store
+        .custodial_position(&account, &instrument, Side::Long)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.cost.raw_record, raw("positions/A/1"));
+    assert_eq!(
+        store.amend(amendment.clone(), &at(NOW + 3)).unwrap(),
+        Amended::Nothing
+    );
+
+    let mut missing = amendment;
+    missing.instrument_id = Some(unique("INS"));
+    assert!(matches!(
+        store.amend(missing, &at(NOW + 4)),
+        Err(meridian_street::store::StoreError::NoSuchRow(_))
+    ));
 }
 
 #[test]

@@ -492,11 +492,13 @@ async fn the_accounts_a_connection_reaches_are_published_as_this_instance_unlink
                     external_account_id: "ext-1".into(),
                     name: "Individual Brokerage 1234".into(),
                     venue_account_type: "Individual".into(),
+                    ..Default::default()
                 },
                 ExternalAccount {
                     external_account_id: "ext-nobody-linked".into(),
                     name: "Roth IRA 5678".into(),
                     venue_account_type: "Roth IRA".into(),
+                    ..Default::default()
                 },
             ],
         }))

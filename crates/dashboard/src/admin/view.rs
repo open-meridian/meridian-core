@@ -100,6 +100,10 @@ pub struct Line {
     pub missing: Vec<String>,
     /// External accounts it reported or was refused for that nothing links.
     pub unlinked: usize,
+    /// Values its source sent that it could not convert, by scheme and code,
+    /// with how many of its accounts carry each (contract v11): counted for a
+    /// person to map, and the evidence the contract may need to grow.
+    pub failed: Vec<(String, String, usize)>,
 }
 
 /// A line for every instance known anywhere, by instance.
@@ -140,6 +144,7 @@ pub fn lines(
                 .iter()
                 .filter(|u| u.plugin_instance_id == instance)
                 .count(),
+            failed: custody.failed_conversions(instance),
         })
         .collect()
 }
@@ -206,6 +211,22 @@ pub fn flags(line: &Line, admin_pages: Option<&str>) -> String {
         flags.push_str(&format!(
             "<p class=\"flag\" data-flag=\"unlinked\" data-count=\"{}\">{link}</p>",
             line.unlinked
+        ));
+    }
+    if !line.failed.is_empty() {
+        let total: usize = line.failed.iter().map(|(_, _, count)| count).sum();
+        let codes = line
+            .failed
+            .iter()
+            .map(|(scheme, code, count)| format!("{scheme} {code} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        flags.push_str(&format!(
+            "<p class=\"flag\" data-flag=\"as-reported\" data-count=\"{total}\">{} its \
+             source sent did not convert, and travel as reported: {}. A person maps them; each \
+             is evidence the contract may need to grow.</p>",
+            plural(total, "value", "values"),
+            escape(&codes)
         ));
     }
     flags

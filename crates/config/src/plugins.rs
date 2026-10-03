@@ -23,6 +23,7 @@ use meridian_domain::v1::{
     PluginCatalogueRequest, PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion,
     RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, StopPluginRequest,
 };
+use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
 use prost::Message;
 
@@ -119,6 +120,9 @@ pub fn upload(
     if metadata.sdk_version.is_empty() {
         return Err("an upload names no SDK version".into());
     }
+    if let Some(declaration) = &metadata.declaration {
+        declared(declaration, &metadata.roles)?;
+    }
     if !is_digest(&request.image_digest) {
         return Err(format!(
             "`{}` is not an image digest; a version is recorded by `sha256:<hex>`",
@@ -126,6 +130,85 @@ pub fn upload(
         ));
     }
     Ok(metadata)
+}
+
+/// A version's declaration (W8.1, contract v11): what it does not carry
+/// named in a role it holds, each with why; its secret settings' names and
+/// texts within the dictionary's bounds; and storage asked for only by a
+/// version holding an edge role (decisions/028). The rule, as `meridian
+/// plugin check` is the convenience.
+fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), String> {
+    use meridian_pb::bounds::{
+        NOT_CARRIED_NAME_LENGTH, NOT_CARRIED_SCHEME_LENGTH, PLUGIN_DECLARATION_NOT_CARRIED_COUNT,
+        PLUGIN_DECLARATION_SECRET_SETTINGS_COUNT, STORAGE_DECLARATION_RETENTION_DAYS_RANGE,
+    };
+    use meridian_pb::v1::NotCarriedReason;
+    if !PLUGIN_DECLARATION_SECRET_SETTINGS_COUNT.admits(declaration.secret_settings.len()) {
+        return Err(format!(
+            "the declaration names {} secret settings; at most {}",
+            declaration.secret_settings.len(),
+            PLUGIN_DECLARATION_SECRET_SETTINGS_COUNT.most
+        ));
+    }
+    if let Some(at) = declaration
+        .secret_settings
+        .iter()
+        .position(String::is_empty)
+    {
+        return Err(format!("declaration.secret_settings[{at}] is empty"));
+    }
+    if !PLUGIN_DECLARATION_NOT_CARRIED_COUNT.admits(declaration.not_carried.len()) {
+        return Err(format!(
+            "the declaration names {} it does not carry; at most {}",
+            declaration.not_carried.len(),
+            PLUGIN_DECLARATION_NOT_CARRIED_COUNT.most
+        ));
+    }
+    for (i, held) in declaration.not_carried.iter().enumerate() {
+        if !roles.contains(&held.role) {
+            return Err(format!(
+                "declaration.not_carried[{i}].role `{}` is not a role this version declares",
+                held.role
+            ));
+        }
+        if !NOT_CARRIED_SCHEME_LENGTH.admits(held.scheme.chars().count())
+            || !NOT_CARRIED_NAME_LENGTH.admits(held.name.chars().count())
+        {
+            return Err(format!(
+                "declaration.not_carried[{i}] names its scheme in 1 to {} characters and its                  name in 1 to {}",
+                NOT_CARRIED_SCHEME_LENGTH.most, NOT_CARRIED_NAME_LENGTH.most
+            ));
+        }
+        if !matches!(
+            NotCarriedReason::try_from(held.reason),
+            Ok(reason) if reason != NotCarriedReason::Unspecified
+        ) {
+            return Err(format!(
+                "declaration.not_carried[{i}].reason is unspecified; say why it is not carried"
+            ));
+        }
+    }
+    if let Some(storage) = &declaration.storage {
+        if !roles
+            .iter()
+            .any(|role| meridian_domain::EDGE_ROLES.contains(&role.as_str()))
+        {
+            return Err(format!(
+                "declaration.storage is asked for by a version declaring {}, no edge role; only                  the edge roles ({}) own storage (decisions/028)",
+                if roles.is_empty() { "no role".to_string() } else { roles.join(", ") },
+                meridian_domain::EDGE_ROLES.join(", ")
+            ));
+        }
+        if !STORAGE_DECLARATION_RETENTION_DAYS_RANGE.admits(i64::from(storage.retention_days)) {
+            return Err(format!(
+                "declaration.storage.retention_days is {}; {} to {}",
+                storage.retention_days,
+                STORAGE_DECLARATION_RETENTION_DAYS_RANGE.least,
+                STORAGE_DECLARATION_RETENTION_DAYS_RANGE.most
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn set(items: &[String]) -> BTreeSet<&str> {
@@ -286,6 +369,9 @@ impl Plugins {
             // Whether the deployment is for development is the launcher's to
             // know and to refuse on (spec/live-plugin-development, ruling 2).
             live: request.live,
+            // Approved with the roles: storage of its own where it asks for
+            // it, and none where it asks for none (W8.3, contract v11).
+            declaration: metadata.declaration.clone(),
         };
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,

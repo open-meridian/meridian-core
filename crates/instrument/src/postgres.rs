@@ -39,12 +39,17 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0001_instrument.sql"),
     include_str!("../migrations/0002_placeholder.sql"),
     include_str!("../migrations/0003_records.sql"),
+    include_str!("../migrations/0004_instrument_type.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
 const NEWEST_TABLE: &str = "instrument_conflict";
+
+/// And the column the newest file adds to the record (0004, contract v11),
+/// which a table check cannot see.
+const NEWEST_COLUMN: &str = "money_market_fund";
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -91,7 +96,16 @@ impl PostgresStore {
                 &[&NEWEST_TABLE],
             )
             .map_err(unavailable)?
-            .is_some();
+            .is_some()
+            && conn
+                .query_opt(
+                    "SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = current_schema() AND table_name = 'instrument'
+                        AND column_name = $1",
+                    &[&NEWEST_COLUMN],
+                )
+                .map_err(unavailable)?
+                .is_some();
 
         if present {
             return Ok(());
@@ -313,7 +327,8 @@ impl PostgresStore {
         let rows = conn
             .query(
                 "SELECT instrument_id, asset_class, currency, exchange_mic, description,
-                        lifecycle_state, version, valid_from_ns, record_time_ns
+                        lifecycle_state, version, valid_from_ns, record_time_ns,
+                        instrument_type, money_market_fund
                    FROM instrument
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id",
@@ -334,6 +349,8 @@ impl PostgresStore {
                 version: row.get(6),
                 valid_from_ns: row.get(7),
                 record_time_ns: row.get(8),
+                instrument_type: row.get(9),
+                money_market_fund: row.get(10),
                 sources: Vec::new(),
                 offers: Vec::new(),
             })
@@ -637,8 +654,9 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO instrument (instrument_id, asset_class, currency, exchange_mic,
                                          description, lifecycle_state, version, valid_from_ns,
-                                         record_time_ns, mint_key)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                         record_time_ns, mint_key, instrument_type,
+                                         money_market_fund)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT (mint_key) WHERE mint_key IS NOT NULL DO NOTHING",
                 &[
                     &candidate.instrument_id,
@@ -651,6 +669,8 @@ impl Store for PostgresStore {
                     &candidate.valid_from_ns,
                     &candidate.record_time_ns,
                     &set_key,
+                    &candidate.instrument_type,
+                    &candidate.money_market_fund,
                 ],
             )
             .map_err(unavailable)?
@@ -682,7 +702,7 @@ impl Store for PostgresStore {
                 "UPDATE instrument
                     SET asset_class = $2, currency = $3, exchange_mic = $4, description = $5,
                         lifecycle_state = $6, version = $7, valid_from_ns = $8,
-                        record_time_ns = $9
+                        record_time_ns = $9, instrument_type = $11, money_market_fund = $12
                   WHERE instrument_id = $1 AND version = $10",
                 &[
                     &record.instrument_id,
@@ -695,6 +715,8 @@ impl Store for PostgresStore {
                     &record.valid_from_ns,
                     &record.record_time_ns,
                     &expected,
+                    &record.instrument_type,
+                    &record.money_market_fund,
                 ],
             )
             .map_err(unavailable)?;

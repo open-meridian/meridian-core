@@ -29,10 +29,10 @@ use r2d2_postgres::PostgresConnectionManager;
 use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
-    from_statement_cursor, statement_cursor, Cause, Chain, Change, Collateral, Completed,
-    Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures, Holding,
-    Identifier, Key, Lot, Opened, Page, Read, Result, Scope, Settled, Side, Statement,
-    StatementPage, StatementsRead, Store, StoreError, PARTITION,
+    from_statement_cursor, statement_cursor, Amended, Amendment, Cause, Chain, Change, Collateral,
+    Completed, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures,
+    Holding, Identifier, Key, Lot, Opened, Page, Pending, Provenance, RawRecord, Read, Result,
+    Scope, Settled, Side, Statement, StatementPage, StatementsRead, Store, StoreError, PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -104,7 +104,7 @@ const STATEMENT_COLUMNS: &str = "statement_id, source, external_statement_id, as
         read_at_ns, expected_rows, account_id, external_account_id, institution,
         currency_assumed, completed_at_ns, completion_sequence, completion_previous,
         cause_instance_id, cause_acting_for_subject, cause_correlation_id, cause_causation_id,
-        security_interest";
+        security_interest, raw_instance, raw_key";
 
 /// A custodial position's columns, in the order [`position_of`] reads them.
 const POSITION_COLUMNS: &str = "account_id, instrument_id, side, quantity::text,
@@ -129,8 +129,8 @@ impl Store for PostgresStore {
                 "INSERT INTO statement
                         (statement_id, source, external_statement_id, as_of_date, read_at_ns,
                          expected_rows, account_id, external_account_id, institution,
-                         currency_assumed, security_interest)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         currency_assumed, security_interest, raw_instance, raw_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (source, external_statement_id) DO NOTHING",
                 &[
                     &statement.statement_id,
@@ -144,12 +144,33 @@ impl Store for PostgresStore {
                     &statement.institution,
                     &statement.currency_assumed,
                     &statement.security_interest,
+                    &raw_instance(&statement.raw_record),
+                    &raw_key(&statement.raw_record),
                 ],
             )
             .map_err(unavailable)?;
 
         if inserted == 1 {
             insert_figures(&mut tx, &statement)?;
+            for (ordinal, held) in statement.provenance.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO statement_provenance (statement_id, ordinal, field, kind,
+                                                       raw_instance, raw_key, source, person, rule)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &statement.statement_id,
+                        &(ordinal as i32),
+                        &held.field,
+                        &held.kind,
+                        &raw_instance(&held.raw_record),
+                        &raw_key(&held.raw_record),
+                        &held.source,
+                        &held.person,
+                        &held.rule,
+                    ],
+                )
+                .map_err(unavailable)?;
+            }
             let mut statement = statement;
             // Nothing is coming, so nothing is outstanding. Marked here, in the
             // same transaction that decides it, so a redelivery finds it done.
@@ -179,6 +200,7 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         let mut held = statement_of(&row)?;
         held.figures = figures_of(&mut tx, &held.statement_id)?;
+        held.provenance = statement_provenance_of(&mut tx, &held.statement_id)?;
         tx.commit().map_err(unavailable)?;
 
         Ok((held, Opened::AlreadyRecorded, Completion::Nothing))
@@ -197,6 +219,7 @@ impl Store for PostgresStore {
         };
         let mut statement = statement_of(&row)?;
         statement.figures = figures_of(&mut *conn, statement_id)?;
+        statement.provenance = statement_provenance_of(&mut *conn, statement_id)?;
         Ok(Some(statement))
     }
 
@@ -247,7 +270,9 @@ impl Store for PostgresStore {
         let settle_date_quantity = holding.settle_date_quantity.map(|q| q.to_string());
         let available = holding.cost.available_quantity.map(|q| q.to_string());
         let not_available = holding.cost.not_available_quantity.map(|q| q.to_string());
-        let parameters: [&(dyn ToSql + Sync); 22] = [
+        let raw_instance_column = raw_instance(&holding.cost.raw_record);
+        let raw_key_column = raw_key(&holding.cost.raw_record);
+        let parameters: [&(dyn ToSql + Sync); 24] = [
             &holding.holding_id,
             &holding.statement_id,
             &holding.account_id,
@@ -270,6 +295,8 @@ impl Store for PostgresStore {
             &available,
             &not_available,
             &holding.cost.available_basis,
+            &raw_instance_column,
+            &raw_key_column,
         ];
         tx.execute(
             "INSERT INTO holding (holding_id, statement_id, account_id, instrument_id, side,
@@ -278,14 +305,21 @@ impl Store for PostgresStore {
                                   cost_basis, cost_basis_currency, average_cost,
                                   average_cost_currency, margin_requirement,
                                   margin_requirement_currency, available_quantity,
-                                  not_available_quantity, available_basis)
+                                  not_available_quantity, available_basis, raw_instance, raw_key)
              VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7::text::numeric,
                      $8::text::numeric, $9, $10, $11, $12::text::jsonb, $13,
                      $14::text::numeric, $15, $16::text::numeric, $17, $18::text::numeric, $19,
-                     $20::text::numeric, $21::text::numeric, $22)",
+                     $20::text::numeric, $21::text::numeric, $22, $23, $24)",
             &parameters,
         )
         .map_err(unavailable)?;
+        insert_edge(
+            &mut tx,
+            &holding.holding_id,
+            "",
+            &holding.cost.provenance,
+            &holding.cost.pending,
+        )?;
         for (ordinal, lot) in holding.cost.lots.iter().enumerate() {
             let (cost, cost_currency) = money_columns(&lot.cost);
             tx.execute(
@@ -439,7 +473,8 @@ impl Store for PostgresStore {
             tx.query(
                 "SELECT holding_id, statement_id, account_id, side, quantity::text,
                         settle_date_quantity::text, market_value::text, currency,
-                        currency_assumed, escalated, identifiers::text, also_counted_in_cash
+                        currency_assumed, escalated, identifiers::text, also_counted_in_cash,
+                        raw_instance, raw_key
                    FROM holding
                   WHERE instrument_id IS NULL AND ($1 = '' OR account_id = $1)
                     AND ($2::text[] IS NULL OR account_id = ANY($2))
@@ -461,7 +496,10 @@ impl Store for PostgresStore {
                     market_value: money_of(row, 6, 7)?,
                     currency_assumed: row.get(8),
                     also_counted_in_cash: row.get(11),
-                    cost: Cost::default(),
+                    cost: Cost {
+                        raw_record: raw_of(row, 12, 13),
+                        ..Cost::default()
+                    },
                     escalated: row.get(9),
                 })
             })
@@ -533,6 +571,7 @@ impl Store for PostgresStore {
         let mut page = Vec::with_capacity(statements.len());
         for mut statement in statements {
             statement.figures = figures_of(&mut tx, &statement.statement_id)?;
+            statement.provenance = statement_provenance_of(&mut tx, &statement.statement_id)?;
             let counts = counts_of(&mut tx, &statement.statement_id)?;
             page.push((statement, counts));
         }
@@ -667,6 +706,189 @@ impl Store for PostgresStore {
 
         tx.commit().map_err(unavailable)?;
         Ok(settled)
+    }
+
+    fn amend(&self, amendment: Amendment, cause: &Cause) -> Result<Amended> {
+        amendment.validate()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        if tx
+            .query_opt(
+                "SELECT 1 FROM statement WHERE statement_id = $1 FOR UPDATE",
+                &[&amendment.statement_id],
+            )
+            .map_err(unavailable)?
+            .is_none()
+        {
+            return Err(StoreError::UnknownStatement(amendment.statement_id.clone()));
+        }
+        let identifiers = to_json(&amendment.unresolved_identifiers);
+        let row = tx
+            .query_opt(
+                "SELECT holding_id FROM holding
+                  WHERE statement_id = $1 AND account_id = $2 AND side = $3
+                    AND (($4::text IS NOT NULL AND instrument_id = $4)
+                         OR ($4::text IS NULL AND instrument_id IS NULL
+                             AND identifiers = $5::text::jsonb))
+                  ORDER BY holding_id DESC LIMIT 1",
+                &[
+                    &amendment.statement_id,
+                    &amendment.account_id,
+                    &amendment.side.as_str(),
+                    &amendment.instrument_id,
+                    &identifiers,
+                ],
+            )
+            .map_err(unavailable)?
+            .ok_or_else(|| StoreError::NoSuchRow(amendment.describes()))?;
+        let holding_id: String = row.get(0);
+
+        if tx
+            .query_opt(
+                "SELECT 1 FROM holding_amendment
+                  WHERE holding_id = $1 AND contract_version = $2 AND field = $3",
+                &[&holding_id, &amendment.contract_version, &amendment.field],
+            )
+            .map_err(unavailable)?
+            .is_some()
+        {
+            tx.commit().map_err(unavailable)?;
+            return Ok(Amended::Nothing);
+        }
+        let (raw_record, provenance, pending) =
+            edges_of(&mut tx, std::slice::from_ref(&holding_id))?
+                .remove(&holding_id)
+                .unwrap_or_default();
+        let carried = Cost {
+            raw_record,
+            provenance,
+            pending,
+            ..Cost::default()
+        };
+        if amendment.already_carried(&carried) {
+            tx.commit().map_err(unavailable)?;
+            return Ok(Amended::Nothing);
+        }
+
+        // The position the row last stated, read before the amendment joins
+        // it, so what it said before is what the change is measured against.
+        let before = match &amendment.instrument_id {
+            None => None,
+            Some(instrument_id) => {
+                let found = tx
+                    .query_opt(
+                        &format!(
+                            "SELECT {POSITION_COLUMNS}
+                               FROM custodial_position
+                              WHERE account_id = $1 AND instrument_id = $2 AND side = $3
+                                AND last_holding_id = $4 AND NOT removed
+                                FOR UPDATE"
+                        ),
+                        &[
+                            &amendment.account_id,
+                            instrument_id,
+                            &amendment.side.as_str(),
+                            &holding_id,
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                match found {
+                    None => None,
+                    Some(row) => with_lots(&mut tx, vec![position_of(&row)?])?.pop(),
+                }
+            }
+        };
+
+        // The record it was re-converted from, which for a raw record's
+        // backfill is the value itself.
+        let raw = amendment.raw_record.clone();
+        tx.execute(
+            "INSERT INTO holding_amendment (holding_id, contract_version, field, raw_instance,
+                                            raw_key, cause_instance_id, cause_acting_for_subject,
+                                            cause_correlation_id, cause_causation_id,
+                                            committed_at_ns)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &holding_id,
+                &amendment.contract_version,
+                &amendment.field,
+                &raw_instance(&raw),
+                &raw_key(&raw),
+                &cause.instance_id,
+                &cause.acting_for_subject,
+                &cause.correlation_id,
+                &cause.causation_id,
+                &cause.committed_at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        match amendment.field.as_str() {
+            "pending" => insert_edge(
+                &mut tx,
+                &holding_id,
+                &amendment.contract_version,
+                &[],
+                &amendment.pending,
+            )?,
+            "provenance" => insert_edge(
+                &mut tx,
+                &holding_id,
+                &amendment.contract_version,
+                &amendment.provenance,
+                &[],
+            )?,
+            _ => {}
+        }
+
+        let settled = match before {
+            None if amendment.instrument_id.is_none() => Settled::Unresolved,
+            None => {
+                // Not the row that last stated its position: what it says now
+                // stands beside it, and the position is unchanged.
+                let position = match &amendment.instrument_id {
+                    Some(instrument_id) => self_position(
+                        &mut tx,
+                        &amendment.account_id,
+                        instrument_id,
+                        amendment.side,
+                    )?,
+                    None => None,
+                };
+                match position {
+                    Some(position) => Settled::Unchanged { position },
+                    None => Settled::Unresolved,
+                }
+            }
+            Some(before) => {
+                let mut position = CustodialPosition {
+                    cost: amendment.applied_to(&before.cost),
+                    updated_at_ns: cause.committed_at_ns,
+                    ..before.clone()
+                };
+                if position.differs_from(&before) {
+                    tx.execute(
+                        "UPDATE custodial_position SET updated_at_ns = $1
+                          WHERE account_id = $2 AND instrument_id = $3 AND side = $4",
+                        &[
+                            &cause.committed_at_ns,
+                            &position.account_id,
+                            &position.instrument_id,
+                            &position.side.as_str(),
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                    position.last_change = number(&mut tx, &position, cause)?;
+                    Settled::Changed {
+                        previous_quantity: before.quantity,
+                        position,
+                    }
+                } else {
+                    Settled::Unchanged { position: before }
+                }
+            }
+        };
+        tx.commit().map_err(unavailable)?;
+        Ok(Amended::Amended(settled))
     }
 
     fn instruments_held(&self) -> Result<Vec<String>> {
@@ -960,6 +1182,7 @@ fn with_lots(client: &mut impl GenericClient, held: Vec<Held>) -> Result<Vec<Cus
         std::collections::HashMap::new();
     type Split = (Option<Quantity>, Option<Quantity>, i32);
     let mut splits: std::collections::HashMap<String, Split> = std::collections::HashMap::new();
+    let mut edges = edges_of(client, &holding_ids)?;
     if !holding_ids.is_empty() {
         for row in client
             .query(
@@ -1022,6 +1245,11 @@ fn with_lots(client: &mut impl GenericClient, held: Vec<Held>) -> Result<Vec<Cus
         .into_iter()
         .map(|(mut position, holding_id)| {
             if let Some(id) = holding_id {
+                if let Some((raw_record, provenance, pending)) = edges.remove(&id) {
+                    position.cost.raw_record = raw_record;
+                    position.cost.provenance = provenance;
+                    position.cost.pending = pending;
+                }
                 if let Some(found) = lots.remove(&id) {
                     position.cost.lots = found;
                 }
@@ -1239,6 +1467,8 @@ fn statement_of(row: &Row) -> Result<Statement> {
         figures: Vec::new(),
         currency_assumed: row.get(9),
         security_interest: row.get(17),
+        raw_record: raw_of(row, 18, 19),
+        provenance: Vec::new(),
         completed: completed_at.map(|committed_at_ns| Completed {
             change: Change {
                 sequence: row.get::<_, i64>(11).max(0) as u64,
@@ -1279,6 +1509,9 @@ fn position_of(row: &Row) -> Result<Held> {
                 not_available_quantity: None,
                 available_basis: 0,
                 encumbrances: Vec::new(),
+                raw_record: None,
+                provenance: Vec::new(),
+                pending: Vec::new(),
             },
             last_change: Change {
                 sequence: row.get::<_, i64>(17).max(0) as u64,
@@ -1288,6 +1521,212 @@ fn position_of(row: &Row) -> Result<Held> {
         },
         row.get(20),
     ))
+}
+
+/// A position under its key, if one stands, with what its row carried.
+fn self_position(
+    tx: &mut Transaction<'_>,
+    account_id: &str,
+    instrument_id: &str,
+    side: Side,
+) -> Result<Option<CustodialPosition>> {
+    let row = tx
+        .query_opt(
+            &format!(
+                "SELECT {POSITION_COLUMNS}
+                   FROM custodial_position
+                  WHERE account_id = $1 AND instrument_id = $2 AND side = $3 AND NOT removed"
+            ),
+            &[&account_id, &instrument_id, &side.as_str()],
+        )
+        .map_err(unavailable)?;
+    match row {
+        None => Ok(None),
+        Some(row) => Ok(with_lots(&mut *tx, vec![position_of(&row)?])?.pop()),
+    }
+}
+
+fn raw_instance(raw: &Option<RawRecord>) -> String {
+    raw.as_ref()
+        .map(|raw| raw.instance_id.clone())
+        .unwrap_or_default()
+}
+
+fn raw_key(raw: &Option<RawRecord>) -> String {
+    raw.as_ref().map(|raw| raw.key.clone()).unwrap_or_default()
+}
+
+/// A raw record's reference from its two columns, or none where both are empty.
+fn raw_of(row: &Row, instance: usize, key: usize) -> Option<RawRecord> {
+    let instance_id: String = row.get(instance);
+    let key: String = row.get(key);
+    (!instance_id.is_empty() || !key.is_empty()).then_some(RawRecord { instance_id, key })
+}
+
+/// A row's provenance and pending quantities, as first recorded (`amended_in`
+/// empty) or as a backfill added them (its contract version).
+fn insert_edge(
+    tx: &mut Transaction<'_>,
+    holding_id: &str,
+    amended_in: &str,
+    provenance: &[Provenance],
+    pending: &[Pending],
+) -> Result<()> {
+    for (ordinal, held) in provenance.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO holding_provenance (holding_id, ordinal, field, kind, raw_instance,
+                                             raw_key, source, person, rule, amended_in)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &holding_id,
+                &(ordinal as i32),
+                &held.field,
+                &held.kind,
+                &raw_instance(&held.raw_record),
+                &raw_key(&held.raw_record),
+                &held.source,
+                &held.person,
+                &held.rule,
+                &amended_in,
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for (ordinal, held) in pending.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO holding_pending (holding_id, ordinal, value_date, quantity, amended_in)
+             VALUES ($1, $2, $3, $4::text::numeric, $5)",
+            &[
+                &holding_id,
+                &(ordinal as i32),
+                &held.value_date,
+                &held.quantity.to_string(),
+                &amended_in,
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+/// What each row carries now of what the edge keeps (contract v11): its raw
+/// record, provenance and pending quantities as first recorded, each filled
+/// from a backfill's amendment where the row as first recorded carried none.
+type Edge = (Option<RawRecord>, Vec<Provenance>, Vec<Pending>);
+
+fn edges_of(
+    client: &mut impl GenericClient,
+    holding_ids: &[String],
+) -> Result<std::collections::HashMap<String, Edge>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<String, Edge> = HashMap::new();
+    if holding_ids.is_empty() {
+        return Ok(out);
+    }
+    for row in client
+        .query(
+            "SELECT holding_id, raw_instance, raw_key FROM holding WHERE holding_id = ANY($1)",
+            &[&holding_ids],
+        )
+        .map_err(unavailable)?
+    {
+        out.entry(row.get(0)).or_default().0 = raw_of(&row, 1, 2);
+    }
+    for row in client
+        .query(
+            "SELECT holding_id, raw_instance, raw_key FROM holding_amendment
+              WHERE holding_id = ANY($1) AND field = 'raw_record'
+              ORDER BY committed_at_ns",
+            &[&holding_ids],
+        )
+        .map_err(unavailable)?
+    {
+        let edge = out.entry(row.get(0)).or_default();
+        if edge.0.is_none() {
+            edge.0 = raw_of(&row, 1, 2);
+        }
+    }
+    let mut provenance: HashMap<(String, bool), Vec<Provenance>> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT holding_id, field, kind, raw_instance, raw_key, source, person, rule,
+                    amended_in
+               FROM holding_provenance WHERE holding_id = ANY($1)
+              ORDER BY holding_id, amended_in, ordinal",
+            &[&holding_ids],
+        )
+        .map_err(unavailable)?
+    {
+        let amended: String = row.get(8);
+        provenance
+            .entry((row.get(0), amended.is_empty()))
+            .or_default()
+            .push(Provenance {
+                field: row.get(1),
+                kind: row.get(2),
+                raw_record: raw_of(&row, 3, 4),
+                source: row.get(5),
+                person: row.get(6),
+                rule: row.get(7),
+            });
+    }
+    let mut pending: HashMap<(String, bool), Vec<Pending>> = HashMap::new();
+    for row in client
+        .query(
+            "SELECT holding_id, value_date, quantity::text, amended_in
+               FROM holding_pending WHERE holding_id = ANY($1)
+              ORDER BY holding_id, amended_in, ordinal",
+            &[&holding_ids],
+        )
+        .map_err(unavailable)?
+    {
+        let amended: String = row.get(3);
+        pending
+            .entry((row.get(0), amended.is_empty()))
+            .or_default()
+            .push(Pending {
+                value_date: row.get(1),
+                quantity: quantity_of(&row, 2)?,
+            });
+    }
+    for id in holding_ids {
+        let edge = out.entry(id.clone()).or_default();
+        edge.1 = provenance
+            .remove(&(id.clone(), true))
+            .or_else(|| provenance.remove(&(id.clone(), false)))
+            .unwrap_or_default();
+        edge.2 = pending
+            .remove(&(id.clone(), true))
+            .or_else(|| pending.remove(&(id.clone(), false)))
+            .unwrap_or_default();
+    }
+    Ok(out)
+}
+
+/// A statement's provenance, in its order.
+fn statement_provenance_of(
+    client: &mut impl GenericClient,
+    statement_id: &str,
+) -> Result<Vec<Provenance>> {
+    client
+        .query(
+            "SELECT field, kind, raw_instance, raw_key, source, person, rule
+               FROM statement_provenance WHERE statement_id = $1 ORDER BY ordinal",
+            &[&statement_id],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| {
+            Ok(Provenance {
+                field: row.get(0),
+                kind: row.get(1),
+                raw_record: raw_of(row, 2, 3),
+                source: row.get(4),
+                person: row.get(5),
+                rule: row.get(6),
+            })
+        })
+        .collect()
 }
 
 fn side_of(row: &Row, column: usize) -> Result<Side> {

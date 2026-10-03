@@ -24,6 +24,7 @@ pub mod catalogue;
 pub mod clock;
 pub mod custody;
 pub mod database;
+pub mod declaration;
 pub mod delegation;
 pub mod directory;
 pub mod figures;

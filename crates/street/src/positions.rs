@@ -133,6 +133,7 @@ fn to_wire_unresolved(holding: &Holding) -> UnresolvedHolding {
         source: String::new(),
         as_of_date: String::new(),
         escalated: holding.escalated,
+        raw_record: crate::record::raw_to_wire(&holding.cost.raw_record),
     }
 }
 

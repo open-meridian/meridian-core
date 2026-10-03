@@ -49,6 +49,12 @@ pub struct Registration {
     /// its report carries for the dashboard to draw (W4.8). None after a
     /// heartbeat that was refused.
     pub figures: Vec<meridian_pb::v1::PluginFigure>,
+    /// The version's declaration it registered with (W4.1, contract v11),
+    /// which its report carries (W4.8); none from a plugin before v11.
+    pub declaration: Option<meridian_pb::v1::PluginDeclaration>,
+    /// How often it saw each name it does not carry, as its last accepted
+    /// heartbeat gave them (W4.5).
+    pub not_carried_seen: Vec<meridian_pb::v1::NotCarriedSeen>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -307,6 +313,22 @@ impl SidecarService for Sidecar {
             }));
         }
 
+        // The version's declaration, where it gives one (contract v11): each
+        // bound the dictionary's, a secret setting's name one it declares
+        // secret, a reason for what it does not carry, and storage only at
+        // the edge (decisions/028). Refused at the door, naming the field.
+        if let Some(declaration) = &req.declaration {
+            if let Some(refusal_reason) =
+                crate::edge::declaration_refused(declaration, &req.settings, &self.identity.roles)
+            {
+                return Ok(Response::new(RegisterReply {
+                    admitted: false,
+                    refusal_reason,
+                    ..Default::default()
+                }));
+            }
+        }
+
         // Grants come from what this sidecar was launched as, never from the
         // request. The request has nothing in it that could decide them.
         //
@@ -332,6 +354,8 @@ impl SidecarService for Sidecar {
             settings: req.settings.clone(),
             interface: req.interface.clone(),
             figures: Vec::new(),
+            declaration: req.declaration.clone(),
+            not_carried_seen: Vec::new(),
         });
         self.changed.notify_one();
 
@@ -369,26 +393,31 @@ impl SidecarService for Sidecar {
         // the refusal as the reason, and no figures rather than stale ones,
         // so a malformed figure is seen on the Summary and never taken for
         // silence.
-        let refused = crate::figures::check(&req.figures).err();
-        let (healthy, detail, figures) = match &refused {
+        let refused = crate::figures::check(&req.figures)
+            .err()
+            .or_else(|| crate::edge::seen_refused(&req.not_carried_seen));
+        let (healthy, detail, figures, seen) = match &refused {
             Some(refusal) => (
                 false,
                 format!("the plugin's heartbeat was refused: {refusal}"),
                 Vec::new(),
+                Vec::new(),
             ),
-            None if req.healthy => (true, String::new(), req.figures),
-            None => (false, req.detail.clone(), req.figures),
+            None if req.healthy => (true, String::new(), req.figures, req.not_carried_seen),
+            None => (false, req.detail.clone(), req.figures, req.not_carried_seen),
         };
 
         let mut changed = false;
         if let Some(state) = self.state.write().expect("state lock poisoned").as_mut() {
             changed = state.healthy != healthy
                 || state.health_detail != detail
-                || state.figures != figures;
+                || state.figures != figures
+                || state.not_carried_seen != seen;
             state.healthy = healthy;
             state.last_heartbeat_ns = self.clock.now_ns();
             state.health_detail = detail;
             state.figures = figures;
+            state.not_carried_seen = seen;
         }
         // What the report says moved, so it goes out now rather than at the
         // next interval; a heartbeat repeating the last says nothing new.
@@ -600,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v11"] {
+        for declared in ["v1", "v12"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -609,7 +638,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v10"));
+            assert!(reply.refusal_reason.contains("v2 through v11"));
             assert!(sc.registration().is_none());
         }
     }

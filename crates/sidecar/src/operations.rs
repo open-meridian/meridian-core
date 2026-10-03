@@ -18,16 +18,19 @@ use crate::service::Sidecar;
 
 #[tonic::async_trait]
 impl plugin::plugin_operations_server::PluginOperations for Sidecar {
-    /// W2.8: `platform.custody.{instance}.event.external-accounts`.
+    /// W2.8: `platform.custody.{instance}.event.external-accounts` (stable).
     async fn report_external_accounts(
         &self,
         request: Request<plugin::ReportExternalAccountsParams>,
     ) -> Result<Response<plugin::Published>, Status> {
         let message: domain::ExternalAccountsEvent = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.accounts.iter().enumerate() {
+            self.known(&format!("accounts[{i0}].account_kind"), held0.account_kind, domain::AccountKind::try_from(held0.account_kind).is_ok())?;
+        }
         self.publish_typed("platform.custody.{instance}.event.external-accounts", "meridian.v1.ExternalAccountsEvent", message).await
     }
 
-    /// W2.1: `platform.custody.{instance}.event.sync-status`.
+    /// W2.1: `platform.custody.{instance}.event.sync-status` (stable).
     async fn report_sync_status(
         &self,
         request: Request<plugin::ReportSyncStatusParams>,
@@ -38,7 +41,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.publish_typed("platform.custody.{instance}.event.sync-status", "meridian.v1.SyncStatusEvent", message).await
     }
 
-    /// W2.2: `platform.street.command.record-statement`.
+    /// W2.2: `platform.street.command.record-statement` (stable).
     async fn record_holdings_statement(
         &self,
         request: Request<plugin::RecordHoldingsStatementParams>,
@@ -64,12 +67,15 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.exact_money(&format!("figures[{i0}].collateral[{i1}].value_after_haircut"), held1.value_after_haircut.as_ref())?;
             }
         }
+        for (i0, held0) in message.provenance.iter().enumerate() {
+            self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+        }
         message.account_id = self.linked_account("meridian.v1.RecordHoldingsStatementRequest", &message.external_account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message, account, acting_for).await
     }
 
-    /// W2.3: `platform.street.command.record-holding`.
+    /// W2.3: `platform.street.command.record-holding` (stable).
     async fn record_holding(
         &self,
         request: Request<plugin::RecordHoldingParams>,
@@ -93,6 +99,12 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known(&format!("encumbrances[{i0}].kind"), held0.kind, domain::EncumbranceKind::try_from(held0.kind).is_ok())?;
             self.exact(&format!("encumbrances[{i0}].quantity"), held0.quantity.as_ref())?;
         }
+        for (i0, held0) in message.provenance.iter().enumerate() {
+            self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+        }
+        for (i0, held0) in message.pending.iter().enumerate() {
+            self.exact(&format!("pending[{i0}].quantity"), held0.quantity.as_ref())?;
+        }
         self.known("side", message.side, domain::HoldingSide::try_from(message.side).is_ok())?;
         self.known("available_basis", message.available_basis, domain::AvailableBasis::try_from(message.available_basis).is_ok())?;
         message.account_id = self.linked_account("meridian.v1.RecordHoldingRequest", &message.external_account_id).await?;
@@ -100,7 +112,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
     }
 
-    /// W2.7: `platform.street.query.list-custodial-positions`.
+    /// W2.7: `platform.street.query.list-custodial-positions` (stable).
     async fn list_custodial_positions(
         &self,
         request: Request<plugin::ListCustodialPositionsParams>,
@@ -110,7 +122,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.street.query.list-custodial-positions", "meridian.v1.ListCustodialPositionsRequest", message, account, None).await
     }
 
-    /// W2.9: `platform.street.query.list-statements`.
+    /// W2.9: `platform.street.query.list-statements` (stable).
     async fn list_statements(
         &self,
         request: Request<plugin::ListStatementsParams>,
@@ -120,18 +132,19 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.street.query.list-statements", "meridian.v1.ListStatementsRequest", message, account, None).await
     }
 
-    /// W3.1: `platform.reference.query.resolve-identifier`.
+    /// W3.1: `platform.reference.query.resolve-identifier` (stable).
     async fn resolve_identifier(
         &self,
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
         let message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
         self.known("stated_asset_class", message.stated_asset_class, domain::AssetClass::try_from(message.stated_asset_class).is_ok())?;
+        self.known("stated_instrument_type", message.stated_instrument_type, domain::InstrumentType::try_from(message.stated_instrument_type).is_ok())?;
         let account = None;
         self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, account, None).await
     }
 
-    /// W3.2: `platform.reference.event.instrument-missing`.
+    /// W3.2: `platform.reference.event.instrument-missing` (stable).
     async fn report_missing_instrument(
         &self,
         request: Request<plugin::ReportMissingInstrumentParams>,
@@ -143,7 +156,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
     }
 
-    /// W3.6: `platform.reference.query.resolve-instrument`.
+    /// W3.6: `platform.reference.query.resolve-instrument` (stable).
     async fn resolve_instrument(
         &self,
         request: Request<plugin::ResolveInstrumentParams>,
@@ -153,7 +166,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.reference.query.resolve-instrument", "meridian.v1.ResolveInstrumentRequest", message, account, None).await
     }
 
-    /// W6.4: `platform.config.command.link-external-account`.
+    /// W6.4: `platform.config.command.link-external-account` (stable).
     async fn link_external_account(
         &self,
         request: Request<plugin::LinkExternalAccountParams>,
@@ -166,7 +179,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.config.command.link-external-account", "meridian.v1.LinkExternalAccountRequest", message, account, acting_for).await
     }
 
-    /// W6.4: `platform.config.query.accounts`.
+    /// W6.4: `platform.config.query.accounts` (stable).
     async fn read_accounts_for_linking(
         &self,
         request: Request<plugin::ReadAccountsForLinkingParams>,
@@ -178,7 +191,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, account, acting_for).await
     }
 
-    /// W9.1: `platform.book.command.record-opening-balance`.
+    /// W9.1: `platform.book.command.record-opening-balance` (stable).
     async fn record_opening_balance(
         &self,
         request: Request<plugin::RecordOpeningBalanceParams>,
@@ -210,7 +223,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-opening-balance", "meridian.v1.RecordOpeningBalanceRequest", message, account, acting_for).await
     }
 
-    /// W9.4: `platform.book.command.record-break`.
+    /// W9.4: `platform.book.command.record-break` (stable).
     async fn record_break(
         &self,
         request: Request<plugin::RecordBreakParams>,
@@ -250,7 +263,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-break", "meridian.v1.RecordBreakRequest", message, account, acting_for).await
     }
 
-    /// W9.5: `platform.book.command.record-account-figures`.
+    /// W9.5: `platform.book.command.record-account-figures` (stable).
     async fn record_account_figures(
         &self,
         request: Request<plugin::RecordAccountFiguresParams>,
@@ -284,7 +297,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-account-figures", "meridian.v1.RecordAccountFiguresRequest", message, account, acting_for).await
     }
 
-    /// W9.15: `platform.book.command.record-encumbrances`.
+    /// W9.15: `platform.book.command.record-encumbrances` (stable).
     async fn record_encumbrances(
         &self,
         request: Request<plugin::RecordEncumbrancesParams>,
@@ -303,7 +316,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-encumbrances", "meridian.v1.RecordEncumbrancesRequest", message, account, acting_for).await
     }
 
-    /// W9.6: `platform.book.command.handle-break`.
+    /// W9.6: `platform.book.command.handle-break` (stable).
     async fn handle_break(
         &self,
         request: Request<plugin::HandleBreakParams>,
@@ -321,7 +334,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.handle-break", "meridian.v1.HandleBreakRequest", message, account, acting_for).await
     }
 
-    /// W9.7: `platform.book.command.resolve-break`.
+    /// W9.7: `platform.book.command.resolve-break` (stable).
     async fn resolve_break(
         &self,
         request: Request<plugin::ResolveBreakParams>,
@@ -353,7 +366,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.resolve-break", "meridian.v1.ResolveBreakRequest", message, account, acting_for).await
     }
 
-    /// W9.7: `platform.book.command.close-breaks-as-cleared`.
+    /// W9.7: `platform.book.command.close-breaks-as-cleared` (stable).
     async fn close_breaks_as_cleared(
         &self,
         request: Request<plugin::CloseBreaksAsClearedParams>,
@@ -365,7 +378,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.close-breaks-as-cleared", "meridian.v1.CloseBreaksAsClearedRequest", message, account, acting_for).await
     }
 
-    /// W9.10: `platform.book.query.list-positions`.
+    /// W9.10: `platform.book.query.list-positions` (stable).
     async fn list_positions(
         &self,
         request: Request<plugin::ListPositionsParams>,
@@ -375,7 +388,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-positions", "meridian.v1.ListPositionsRequest", message, account, None).await
     }
 
-    /// W9.11: `platform.book.query.list-breaks`.
+    /// W9.11: `platform.book.query.list-breaks` (stable).
     async fn list_breaks(
         &self,
         request: Request<plugin::ListBreaksParams>,
@@ -388,7 +401,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-breaks", "meridian.v1.ListBreaksRequest", message, account, None).await
     }
 
-    /// W9.12: `platform.book.query.list-account-figures`.
+    /// W9.12: `platform.book.query.list-account-figures` (stable).
     async fn list_account_figures(
         &self,
         request: Request<plugin::ListAccountFiguresParams>,
@@ -398,7 +411,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-account-figures", "meridian.v1.ListAccountFiguresRequest", message, account, None).await
     }
 
-    /// W9.14: `platform.book.query.list-account-attributes`.
+    /// W9.14: `platform.book.query.list-account-attributes` (stable).
     async fn list_account_attributes(
         &self,
         request: Request<plugin::ListAccountAttributesParams>,

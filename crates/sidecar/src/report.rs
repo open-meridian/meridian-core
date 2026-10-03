@@ -123,6 +123,14 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.figures.clone())
                 .unwrap_or_default(),
+            // The declaration it registered with, and how often it saw each
+            // name it does not carry (W4.5, W4.8, contract v11): names and
+            // counts, never a value, and the conductor carries neither on.
+            declaration: registration.as_ref().and_then(|r| r.declaration.clone()),
+            not_carried_seen: registration
+                .as_ref()
+                .map(|r| r.not_carried_seen.clone())
+                .unwrap_or_default(),
         }
     }
 }

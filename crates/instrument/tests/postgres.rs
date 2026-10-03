@@ -82,6 +82,8 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
         currency: String::new(),
         exchange_mic: String::new(),
         description: String::new(),
+        instrument_type: String::new(),
+        money_market_fund: String::new(),
         lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
         version: 1,
         valid_from_ns: 0,

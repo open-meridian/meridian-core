@@ -16,6 +16,10 @@ syntax = "proto3";
 
 package meridian.v1;
 
+// PluginDeclaration, which a plugin's SDK builds and its registration carries
+// too, declared in meridian-schema's sidecar.proto (contract v11).
+import "meridian/v1/sidecar.proto";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // W8.1 — an uploaded version
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,6 +42,14 @@ message PluginMetadata {
   // The open-meridian version its base image carries, so an administrator
   // can see which plugins stand on a base that needs a fix.
   string sdk_version = 6;
+
+  // What the version declares beside its roles (W8.1, contract v11): its
+  // secret settings' names, what it does not carry, and the storage it asks
+  // for. Read by the CLI from the built image, as the SDK builds it from the
+  // plugin's code; shown in the catalogue and approved at launch. Unset for
+  // a version built before v11. A declaration asking for storage on a
+  // version holding no edge role is refused.
+  PluginDeclaration declaration = 7;
 
   // The plugin's own names for its parts, retired: a plugin declares no
   // tags, and a person's access to it is read or write (decisions/026).
@@ -142,6 +154,12 @@ message CreatePluginRequest {
   // The chart's live shape rather than its plugin shape; refused by a
   // launcher on a deployment not installed for development.
   bool live = 6;
+
+  // The version's declaration, as approved at launch (W8.3, contract v11):
+  // the launcher gives the instance storage of its own where it asks for
+  // it. Unset for a version uploaded with none, which gets storage by
+  // holding an edge role, as before v11.
+  PluginDeclaration declaration = 7;
 
   // Tags, retired with them (decisions/026).
   reserved 4;

@@ -45,9 +45,9 @@ enum InstrumentLifecycleState {
 // `equity`, `debt`, `fund`, `derivative`, `crypto_asset`, `event_contract`,
 // `cash`.
 //
-// What kind of instrument within a class (an ETF is a fund, an option a
-// derivative) is its instrument type, which this does not carry: the list of
-// types is still open.
+// What kind of instrument within a class is its instrument type
+// (InstrumentType, contract v11), which grows one type at a time as a
+// workflow needs it.
 enum AssetClass {
   // No class. Held only by a stub minted from a deployment's miss (W3.4),
   // which may not know one; activating an instrument requires a class (W1.8).
@@ -73,6 +73,72 @@ enum AssetClass {
 
   // A holding of a currency's cash instrument (spec/the-account-side-fits-every-venue).
   ASSET_CLASS_CASH = 7;
+}
+
+// What kind of instrument within its asset class (contract v11; the product
+// owner, 2026-10-02: "Yes to put instrument type into v11 scope"). In the
+// contract's own words, ISO 10962 (CFI) a reference and not the vocabulary;
+// a type joins when a workflow needs it, each with its dictionary entry, and
+// each is under one asset class. Spelled in text as the value's name without
+// its prefix, lower case: `money_market_fund`.
+enum InstrumentType {
+  // No type stated: the asset class says all the record says.
+  INSTRUMENT_TYPE_UNSPECIFIED = 0;
+
+  // Under fund: a fund that invests in short-term debt under SEC rule 2a-7
+  // and aims to keep its value, with the attributes of MoneyMarketFund.
+  // Held as a fund, never as cash, even where a custodian sweeps cash into it.
+  INSTRUMENT_TYPE_MONEY_MARKET_FUND = 1;
+}
+
+// A money market fund's attributes, from SEC rule 2a-7 as amended in 2023
+// (the product owner, 2026-10-02, the custody audit's Q4). Its observations
+// -- its NAV on a day, its seven-day yield, its liquid assets, a fee imposed
+// -- are the lake's, not the record's.
+message MoneyMarketFund {
+  MoneyMarketFundCategory category = 1;
+  MoneyMarketFundInvestors investors = 2;
+  MoneyMarketFundNav nav = 3;
+  LiquidityFeeRegime liquidity_fee = 4;
+}
+
+// What a money market fund invests in.
+enum MoneyMarketFundCategory {
+  MONEY_MARKET_FUND_CATEGORY_UNSPECIFIED = 0;
+  // Cash, government securities and repurchase agreements backed by them.
+  MONEY_MARKET_FUND_CATEGORY_GOVERNMENT = 1;
+  // Also corporate short-term debt.
+  MONEY_MARKET_FUND_CATEGORY_PRIME = 2;
+  // Short-term municipal debt.
+  MONEY_MARKET_FUND_CATEGORY_TAX_EXEMPT = 3;
+}
+
+// Whom a money market fund is offered to.
+enum MoneyMarketFundInvestors {
+  MONEY_MARKET_FUND_INVESTORS_UNSPECIFIED = 0;
+  // Natural persons only.
+  MONEY_MARKET_FUND_INVESTORS_RETAIL = 1;
+  MONEY_MARKET_FUND_INVESTORS_INSTITUTIONAL = 2;
+}
+
+// How a money market fund prices its shares.
+enum MoneyMarketFundNav {
+  MONEY_MARKET_FUND_NAV_UNSPECIFIED = 0;
+  // A stable share price of 1.00: the book takes its position as one lot at
+  // stable value (W9.1).
+  MONEY_MARKET_FUND_NAV_STABLE = 1;
+  // A share price that floats with its holdings: lots like any fund.
+  MONEY_MARKET_FUND_NAV_FLOATING = 2;
+}
+
+// When a money market fund charges a fee on redemptions.
+enum LiquidityFeeRegime {
+  LIQUIDITY_FEE_REGIME_UNSPECIFIED = 0;
+  // Charged when daily net redemptions pass 5% of net assets: an
+  // institutional prime or tax-exempt fund.
+  LIQUIDITY_FEE_REGIME_MANDATORY = 1;
+  // At the board's discretion, where in the fund's interest.
+  LIQUIDITY_FEE_REGIME_DISCRETIONARY = 2;
 }
 
 // One typed identifier for an instrument.
@@ -152,6 +218,14 @@ message InstrumentRecord {
   // (W3.10). A later offer never overwrites a value in force.
   repeated OfferedValue offers = 13;
 
+  // Its type within its asset class (contract v11), in force once a person
+  // set or accepted it, as the asset class is. Unspecified where none is.
+  InstrumentType instrument_type = 14;
+
+  // A money market fund's attributes (contract v11); set only on a record
+  // whose type is money market fund.
+  MoneyMarketFund money_market_fund = 15;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
@@ -165,6 +239,9 @@ enum InstrumentField {
   INSTRUMENT_FIELD_DESCRIPTION = 3;
   // One of its identifiers, named beside the field.
   INSTRUMENT_FIELD_IDENTIFIER = 4;
+  // Contract v11.
+  INSTRUMENT_FIELD_INSTRUMENT_TYPE = 5;
+  INSTRUMENT_FIELD_MONEY_MARKET_FUND = 6;
 }
 
 // One value for a deployment's record, set or offered, with where it came
@@ -178,6 +255,10 @@ message InstrumentValue {
     string currency = 2;
     string description = 3;
     Identifier identifier = 4;
+    // Contract v11: one under the record's asset class; never unspecified.
+    InstrumentType instrument_type = 6;
+    // Contract v11: on a money market fund only, each attribute stated.
+    MoneyMarketFund money_market_fund = 7;
   }
 
   // Where the value came from, in words: a statement, a prospectus, "ISO
@@ -518,6 +599,9 @@ message ResolveIdentifierRequest {
   // An ISO 4217 code.
   string stated_currency = 6;
   string stated_description = 7;
+  // Its type within the stated class, where the source says it (contract
+  // v11): a custodian's sweep fund is a money market fund.
+  InstrumentType stated_instrument_type = 8;
 }
 
 message ResolveIdentifierReply {
@@ -568,6 +652,12 @@ message MissingInstrumentDetectedEvent {
   string publisher_instance_id = 5;
   MissReason reason = 6;
   int64 observed_at_ns = 7;
+
+  // The source's kind as reported, set only when it did not convert to an
+  // asset class and `asset_class` is unspecified (contract v11;
+  // spec/vendor-differences-have-a-place-in-the-contract, requirement 4).
+  // For a person setting the class; never read.
+  AsReported asset_class_as_reported = 10;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.

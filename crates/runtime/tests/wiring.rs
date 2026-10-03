@@ -422,6 +422,7 @@ async fn a_link_made_through_the_operation_reaches_the_plugins_scope_stream() {
                 external_account_id: "ext-7".into(),
                 name: "Individual Brokerage 1234".into(),
                 venue_account_type: "Individual".into(),
+                ..Default::default()
             }],
         }))
         .await

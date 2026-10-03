@@ -91,6 +91,7 @@ fn snaptrade(version: &str) -> RecordPluginUploadRequest {
             roles: vec!["custody".into()],
             interface: true,
             sdk_version: "0.2.0".into(),
+            declaration: None,
         }),
         image_digest: DIGEST.into(),
     }

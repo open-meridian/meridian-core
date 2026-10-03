@@ -337,6 +337,14 @@ fn version(name: &str, version: &str) -> PluginVersion {
             roles: vec!["custody".into()],
             interface: true,
             sdk_version: "0.2.0".into(),
+            // Kept with the version and read back whole (contract v11).
+            declaration: Some(meridian_pb::v1::PluginDeclaration {
+                secret_settings: vec!["consumer_key".into()],
+                not_carried: vec![],
+                storage: Some(meridian_pb::v1::StorageDeclaration {
+                    retention_days: 2555,
+                }),
+            }),
         }),
         image_digest: format!("sha256:{}", "a".repeat(64)),
         uploaded_by: "local|ada".into(),

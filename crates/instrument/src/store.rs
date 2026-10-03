@@ -66,6 +66,10 @@ pub enum Field {
     Currency,
     Description,
     Identifier,
+    /// Contract v11: the type within the asset class, and a money market
+    /// fund's attributes.
+    InstrumentType,
+    MoneyMarketFund,
 }
 
 impl Field {
@@ -76,6 +80,8 @@ impl Field {
             Field::Currency => "currency",
             Field::Description => "description",
             Field::Identifier => "identifier",
+            Field::InstrumentType => "instrument_type",
+            Field::MoneyMarketFund => "money_market_fund",
         }
     }
 
@@ -85,6 +91,8 @@ impl Field {
             "currency" => Some(Field::Currency),
             "description" => Some(Field::Description),
             "identifier" => Some(Field::Identifier),
+            "instrument_type" => Some(Field::InstrumentType),
+            "money_market_fund" => Some(Field::MoneyMarketFund),
             _ => None,
         }
     }
@@ -173,6 +181,15 @@ pub struct Instrument {
     pub valid_from_ns: i64,
     pub record_time_ns: i64,
 
+    /// Its type within its asset class, the enum's name
+    /// (`INSTRUMENT_TYPE_MONEY_MARKET_FUND`), or empty for none (contract v11).
+    pub instrument_type: String,
+
+    /// A money market fund's attributes, their enum names separated by a
+    /// space -- category, investors, NAV, liquidity fee -- or empty until a
+    /// person states them (contract v11).
+    pub money_market_fund: String,
+
     /// Where each value in force came from.
     pub sources: Vec<Source>,
 
@@ -195,6 +212,8 @@ impl Instrument {
             Field::Currency => &self.currency,
             Field::Description => &self.description,
             Field::Identifier => "",
+            Field::InstrumentType => &self.instrument_type,
+            Field::MoneyMarketFund => &self.money_market_fund,
         }
     }
 
@@ -204,6 +223,8 @@ impl Instrument {
             Field::Currency => self.currency = value,
             Field::Description => self.description = value,
             Field::Identifier => {}
+            Field::InstrumentType => self.instrument_type = value,
+            Field::MoneyMarketFund => self.money_market_fund = value,
         }
     }
 

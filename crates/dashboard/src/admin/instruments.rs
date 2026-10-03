@@ -17,13 +17,15 @@
 
 use std::time::Duration;
 
+use meridian_domain::instrument_type;
 use meridian_domain::v1::{
     instrument_value, AskPlatformForInstrumentReply, AskPlatformForInstrumentRequest, AssetClass,
     CompleteInstrumentsReply, CompleteInstrumentsRequest, Identifier, InstrumentCompletion,
-    InstrumentField, InstrumentRecord, InstrumentToComplete, InstrumentValue, InstrumentVersion,
-    ListInstrumentsToCompleteReply, ListInstrumentsToCompleteRequest, MergeInstrumentsReply,
-    MergeInstrumentsRequest, OfferedValue, ReadInstrumentHistoryReply,
-    ReadInstrumentHistoryRequest,
+    InstrumentField, InstrumentRecord, InstrumentToComplete, InstrumentType, InstrumentValue,
+    InstrumentVersion, LiquidityFeeRegime, ListInstrumentsToCompleteReply,
+    ListInstrumentsToCompleteRequest, MergeInstrumentsReply, MergeInstrumentsRequest,
+    MoneyMarketFund, MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
+    OfferedValue, ReadInstrumentHistoryReply, ReadInstrumentHistoryRequest,
 };
 use prost::Message;
 
@@ -59,6 +61,17 @@ const CLASSES: [(AssetClass, &str); 7] = [
     (AssetClass::EventContract, "Event contract"),
     (AssetClass::Cash, "Cash"),
 ];
+
+/// The instrument types, as the form offers them (contract v11), each under
+/// its asset class.
+const TYPES: [(InstrumentType, &str); 1] = [(
+    InstrumentType::MoneyMarketFund,
+    "Money market fund (a fund)",
+)];
+
+fn type_words(value: i32) -> &'static str {
+    instrument_type::words(InstrumentType::try_from(value).unwrap_or(InstrumentType::Unspecified))
+}
 
 fn class_name(value: i32) -> &'static str {
     CLASSES
@@ -219,6 +232,16 @@ pub struct Filled {
     pub currency_source: String,
     pub description: String,
     pub description_source: String,
+    /// Contract v11: the type within the asset class, its number as the
+    /// wire's; and a money market fund's four attributes, each its number,
+    /// stated together, with their source.
+    pub instrument_type: String,
+    pub instrument_type_source: String,
+    pub fund_category: String,
+    pub fund_investors: String,
+    pub fund_nav: String,
+    pub fund_liquidity_fee: String,
+    pub fund_source: String,
     pub identifier_scheme: String,
     pub identifier_value: String,
     pub identifier_namespace: String,
@@ -260,6 +283,34 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 filled.description.trim().to_string(),
             )),
             source: filled.description_source.trim().to_string(),
+        });
+    }
+    if !filled.instrument_type.is_empty() {
+        let kind: i32 = filled
+            .instrument_type
+            .parse()
+            .map_err(|_| format!("{:?} is no instrument type", filled.instrument_type))?;
+        values.push(InstrumentValue {
+            value: Some(instrument_value::Value::InstrumentType(kind)),
+            source: filled.instrument_type_source.trim().to_string(),
+        });
+    }
+    let attributes = [
+        &filled.fund_category,
+        &filled.fund_investors,
+        &filled.fund_nav,
+        &filled.fund_liquidity_fee,
+    ];
+    if attributes.iter().any(|attribute| !attribute.is_empty()) {
+        let number = |text: &str| text.parse::<i32>().unwrap_or(0);
+        values.push(InstrumentValue {
+            value: Some(instrument_value::Value::MoneyMarketFund(MoneyMarketFund {
+                category: number(&filled.fund_category),
+                investors: number(&filled.fund_investors),
+                nav: number(&filled.fund_nav),
+                liquidity_fee: number(&filled.fund_liquidity_fee),
+            })),
+            source: filled.fund_source.trim().to_string(),
         });
     }
     if !filled.identifier_scheme.trim().is_empty() || !filled.identifier_value.trim().is_empty() {
@@ -326,6 +377,8 @@ fn field_of(value: &InstrumentValue) -> i32 {
         Some(instrument_value::Value::Currency(_)) => InstrumentField::Currency,
         Some(instrument_value::Value::Description(_)) => InstrumentField::Description,
         Some(instrument_value::Value::Identifier(_)) => InstrumentField::Identifier,
+        Some(instrument_value::Value::InstrumentType(_)) => InstrumentField::InstrumentType,
+        Some(instrument_value::Value::MoneyMarketFund(_)) => InstrumentField::MoneyMarketFund,
         None => InstrumentField::Unspecified,
     }) as i32
 }
@@ -336,6 +389,10 @@ fn value_words(value: &InstrumentValue) -> String {
         Some(instrument_value::Value::Currency(code)) => code.clone(),
         Some(instrument_value::Value::Description(text)) => text.clone(),
         Some(instrument_value::Value::Identifier(id)) => identifier_words(id),
+        Some(instrument_value::Value::InstrumentType(kind)) => type_words(*kind).to_string(),
+        Some(instrument_value::Value::MoneyMarketFund(fund)) => {
+            instrument_type::fund_words(&instrument_type::fund_to_text(fund))
+        }
         None => String::new(),
     }
 }
@@ -355,6 +412,7 @@ fn lacks_words(lacks: &[i32]) -> String {
             InstrumentField::AssetClass => Some("asset class"),
             InstrumentField::Currency => Some("currency"),
             InstrumentField::Description => Some("description"),
+            InstrumentField::MoneyMarketFund => Some("the money market fund's attributes"),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -654,6 +712,22 @@ pub fn record_page(
             InstrumentField::Description,
             record.description.clone()
         ),
+    ) + &format!(
+        "<table class=\"list\"><tbody>{}{}</tbody></table>",
+        field_row(
+            "Instrument type",
+            InstrumentField::InstrumentType,
+            type_words(record.instrument_type).to_string()
+        ),
+        field_row(
+            "Money market fund",
+            InstrumentField::MoneyMarketFund,
+            record
+                .money_market_fund
+                .as_ref()
+                .map(|fund| instrument_type::fund_words(&instrument_type::fund_to_text(fund)))
+                .unwrap_or_default()
+        ),
     );
 
     // Pre-filled: the value in force and its source; otherwise what is
@@ -684,6 +758,104 @@ pub fn record_page(
         prefill(InstrumentField::Currency, record.currency.clone());
     let (description, description_source, description_offer) =
         prefill(InstrumentField::Description, record.description.clone());
+    let held_type = if record.instrument_type == 0 {
+        String::new()
+    } else {
+        record.instrument_type.to_string()
+    };
+    let (kind, kind_source, kind_offer) = match offer_for(&record, InstrumentField::InstrumentType)
+        .and_then(|offer| offer.value.as_ref())
+    {
+        Some(InstrumentValue {
+            value: Some(instrument_value::Value::InstrumentType(offered)),
+            source,
+        }) if held_type.is_empty() => (offered.to_string(), source.clone(), source.clone()),
+        _ => (
+            held_type.clone(),
+            if held_type.is_empty() {
+                String::new()
+            } else {
+                source_words(&record, InstrumentField::InstrumentType)
+            },
+            String::new(),
+        ),
+    };
+    let type_options: String = std::iter::once("<option value=\"\">Not set</option>".to_string())
+        .chain(TYPES.iter().map(|(value, name)| {
+            let value = (*value as i32).to_string();
+            format!(
+                "<option value=\"{value}\"{}>{name}</option>",
+                if value == kind { " selected" } else { "" }
+            )
+        }))
+        .collect();
+    let fund = record.money_market_fund.unwrap_or_default();
+    let fund_source = if record.money_market_fund.is_some() {
+        source_words(&record, InstrumentField::MoneyMarketFund)
+    } else {
+        String::new()
+    };
+    let select = |name: &str, held: i32, choices: &[(i32, &str)]| {
+        let options: String = std::iter::once("<option value=\"\">Not set</option>".to_string())
+            .chain(choices.iter().map(|(value, words)| {
+                format!(
+                    "<option value=\"{value}\"{}>{words}</option>",
+                    if *value == held { " selected" } else { "" }
+                )
+            }))
+            .collect();
+        format!("<select name=\"{name}\">{options}</select>")
+    };
+    let fund_fields = format!(
+        "<label>Instrument type <select name=\"instrument_type\" data-initial=\"{kind}\">{type_options}</select></label>\
+         <label>Where it came from <input name=\"instrument_type_source\" value=\"{kind_source}\"{kind_offer}></label>\
+         <label>Money market fund: category {category}</label>\
+         <label>investors {investors}</label>\
+         <label>net asset value {nav}</label>\
+         <label>liquidity fee {fee}</label>\
+         <label>Where they came from <input name=\"fund_source\" value=\"{fund_source}\"></label>",
+        kind = escape(&kind),
+        kind_source = escape(&kind_source),
+        kind_offer = if kind_offer.is_empty() {
+            String::new()
+        } else {
+            format!(" data-offered-source=\"{}\"", escape(&kind_offer))
+        },
+        category = select(
+            "fund_category",
+            fund.category,
+            &[
+                (MoneyMarketFundCategory::Government as i32, "government"),
+                (MoneyMarketFundCategory::Prime as i32, "prime"),
+                (MoneyMarketFundCategory::TaxExempt as i32, "tax-exempt"),
+            ]
+        ),
+        investors = select(
+            "fund_investors",
+            fund.investors,
+            &[
+                (MoneyMarketFundInvestors::Retail as i32, "retail"),
+                (MoneyMarketFundInvestors::Institutional as i32, "institutional"),
+            ]
+        ),
+        nav = select(
+            "fund_nav",
+            fund.nav,
+            &[
+                (MoneyMarketFundNav::Stable as i32, "stable at 1.00"),
+                (MoneyMarketFundNav::Floating as i32, "floating"),
+            ]
+        ),
+        fee = select(
+            "fund_liquidity_fee",
+            fund.liquidity_fee,
+            &[
+                (LiquidityFeeRegime::Mandatory as i32, "mandatory"),
+                (LiquidityFeeRegime::Discretionary as i32, "discretionary"),
+            ]
+        ),
+        fund_source = escape(&fund_source),
+    );
     let options: String = std::iter::once("<option value=\"\">Not set</option>".to_string())
         .chain(CLASSES.iter().map(|(value, name)| {
             let value = (*value as i32).to_string();
@@ -711,6 +883,7 @@ pub fn record_page(
          <label>Where it came from <input name=\"currency_source\" value=\"{currency_source}\"{currency_offer}></label>\
          <label>Description <input name=\"description\" value=\"{description}\" data-initial=\"{description}\"></label>\
          <label>Where it came from <input name=\"description_source\" value=\"{description_source}\"{description_offer}></label>\
+         {fund_fields}\
          <label>Add an identifier: scheme <input name=\"identifier_scheme\" placeholder=\"figi\"></label>\
          <label>value <input name=\"identifier_value\"></label>\
          <label>namespace, for a source's own symbol <input name=\"identifier_namespace\" placeholder=\"empty for a global scheme\"></label>\
@@ -770,6 +943,8 @@ pub fn record_page(
                         Ok(InstrumentField::AssetClass) => "asset class".to_string(),
                         Ok(InstrumentField::Currency) => "currency".to_string(),
                         Ok(InstrumentField::Description) => "description".to_string(),
+                        Ok(InstrumentField::InstrumentType) => "instrument type".to_string(),
+                        Ok(InstrumentField::MoneyMarketFund) => "money market fund".to_string(),
                         _ => change
                             .identifier
                             .as_ref()
@@ -831,7 +1006,7 @@ const FORM_SCRIPT: &str = r##"(function () {
   var form = document.getElementById("complete");
   if (!form) return;
   form.addEventListener("submit", function (event) {
-    var pairs = [["asset_class", "asset_class_source"], ["currency", "currency_source"], ["description", "description_source"]];
+    var pairs = [["asset_class", "asset_class_source"], ["currency", "currency_source"], ["description", "description_source"], ["instrument_type", "instrument_type_source"]];
     for (var i = 0; i < pairs.length; i++) {
       var value = form.elements[pairs[i][0]];
       var source = form.elements[pairs[i][1]];

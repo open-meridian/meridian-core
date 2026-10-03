@@ -156,6 +156,9 @@ plugin's e2e reads its raw records through the plugin, on its own page.
     assumed|<account>|<instrument>|<side>
     position|<account>|<instrument>|<side>|<quantity>|<settle-date quantity>|<market value> <currency>|<in-cash>
     statement|<account>|<source>|<expected rows>|<complete or open>|<buying power>|<margin requirement>|<maintenance excess>|<currency assumed>
+    pending|<account>|<instrument>|<side>|<value date>|<quantity>
+    closed|<account>|<instrument>|<side>|<field>|<kind>
+    amended|<account>|<instrument>|<side>|<contract version>|<field>|<raw record's key>
 
 - `<account>` is the account's name, since its ID is minted per run.
 - `<instrument>` is an `INS-` ID, or for a record the deployment minted (its
@@ -166,7 +169,18 @@ plugin's e2e reads its raw records through the plugin, on its own page.
 - A number is printed at the scale it was stated with; what was not reported is
   empty, never zero. `<in-cash>` is `in-cash` for a position the venue also
   counts in cash.
-- `assumed` is a row of a latest statement whose currency the connector assumed.
+- `assumed` is a row of a latest statement whose currency the connector assumed
+  (a plugin before contract v11; from v11 the currency's provenance says it).
+- From contract v11: `pending` is a position's quantity not yet settled, by its
+  value date; `closed` a value of a position the custody plugin closed rather
+  than read, by its path in the row (`quantity`, `settle_date_quantity`,
+  `market_value.currency_code`), with its provenance's kind (`derived`,
+  `supplied`, `second-source`, `reported`); each from the row that last stated
+  the position, with what a backfill added to it. `amended` is a backfill
+  journaled beside a row of a latest statement: the version and field that are
+  its cause, and the key of the raw record it was re-converted from. A raw
+  record's key otherwise stays off these lines: a plugin's own keys name its
+  reads, which change from run to run.
 - `statement` is the latest statement of each source for each account, by its
   rows' account. A statement none of whose rows was recorded (its account
   unlinked) belongs to no account and is not printed.

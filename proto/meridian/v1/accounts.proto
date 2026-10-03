@@ -661,6 +661,13 @@ message PluginReport {
   // refusal as health_detail. The conductor carries none of them on.
   repeated PluginFigure figures = 15;
 
+  // The declaration the plugin registered with (W4.1, W4.8, contract v11),
+  // and how often it saw each name it does not carry, as its last accepted
+  // heartbeat gave them (W4.5). Unset and empty while it is not registered,
+  // and from a plugin before v11. The conductor carries neither on.
+  PluginDeclaration declaration = 16;
+  repeated NotCarriedSeen not_carried_seen = 17;
+
   // A single role, before a plugin could hold several.
   reserved 2;
   reserved "role";

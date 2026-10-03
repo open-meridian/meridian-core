@@ -277,11 +277,13 @@ async fn the_dashboard_lists_and_links_no_external_accounts_and_counts_them() {
                     external_account_id: "SNAP-1".into(),
                     name: "Individual Brokerage 1234".into(),
                     venue_account_type: "Individual".into(),
+                    ..Default::default()
                 },
                 ExternalAccount {
                     external_account_id: "SNAP-2".into(),
                     name: "Roth IRA 5678".into(),
                     venue_account_type: "Roth IRA".into(),
+                    ..Default::default()
                 },
             ],
         },
@@ -1523,6 +1525,7 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
                     external_account_id: format!("SNAP-{n}"),
                     name: format!("Brokerage {n}"),
                     venue_account_type: "Individual".into(),
+                    ..Default::default()
                 })
                 .collect(),
         },
@@ -1956,6 +1959,7 @@ async fn the_plugins_tab_names_the_instance_apart_and_offers_a_search() {
                 external_account_id: "SNAP-1".into(),
                 name: "Individual Brokerage 1234".into(),
                 venue_account_type: "Individual".into(),
+                ..Default::default()
             }],
         },
     );

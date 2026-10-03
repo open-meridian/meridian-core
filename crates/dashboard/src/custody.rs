@@ -57,10 +57,13 @@ pub struct Unlinked {
     pub plugin_instance_id: String,
     pub external_account_id: String,
 
-    /// The custodian's name for it and the venue's type, where the connector
-    /// reported the account; empty for one known only from a refusal.
+    /// The custodian's name for it and its kind, where the connector
+    /// reported the account; empty for one known only from a refusal. The
+    /// kind in the platform's words (contract v11); not known with the venue's
+    /// type as reported beside it; or, from a plugin before v11 that sends no
+    /// kind, the venue's own type, shown only then (W2.8).
     pub name: String,
-    pub venue_account_type: String,
+    pub kind: String,
 
     /// Rows the sidecar refused for it, where any were.
     pub refused_rows: i64,
@@ -110,6 +113,24 @@ impl Custody {
 }
 
 impl Heard {
+    /// The values an instance's source sent that it could not convert, by
+    /// scheme and code, each with how many of its accounts carry it (W2.8,
+    /// contract v11): an account kind not known, with the type as reported.
+    pub fn failed_conversions(&self, instance: &str) -> Vec<(String, String, usize)> {
+        let mut counted: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for account in self.reported.get(instance).into_iter().flatten() {
+            if let Some(reported) = &account.account_kind_as_reported {
+                *counted
+                    .entry((reported.scheme.clone(), reported.code.clone()))
+                    .or_default() += 1;
+            }
+        }
+        counted
+            .into_iter()
+            .map(|((scheme, code), count)| (scheme, code, count))
+            .collect()
+    }
+
     /// Every account reported or refused that no link names, reported ones
     /// first in the order their connector gave them. One reported and refused
     /// both is one account, carrying its name and its refusals.
@@ -137,7 +158,7 @@ impl Heard {
                         plugin_instance_id: instance.clone(),
                         external_account_id: account.external_account_id.clone(),
                         name: account.name.clone(),
-                        venue_account_type: account.venue_account_type.clone(),
+                        kind: kind_words(account),
                         refused_rows: refused_rows(instance, &account.external_account_id),
                     });
                 }
@@ -155,13 +176,29 @@ impl Heard {
                         plugin_instance_id: instance.clone(),
                         external_account_id: external.clone(),
                         name: String::new(),
-                        venue_account_type: String::new(),
+                        kind: String::new(),
                         refused_rows: *rows,
                     });
                 }
             }
         }
         found
+    }
+}
+
+/// An account's kind as a person reads it (W2.8, contract v11): the kind,
+/// or not known with the venue's type as reported, or the venue's own type
+/// from a plugin before v11 that sends no kind.
+pub fn kind_words(account: &ExternalAccount) -> String {
+    use meridian_domain::v1::AccountKind;
+    match AccountKind::try_from(account.account_kind) {
+        Ok(AccountKind::Cash) => "cash".into(),
+        Ok(AccountKind::Margin) => "margin".into(),
+        Ok(AccountKind::Retirement) => "retirement".into(),
+        _ => match &account.account_kind_as_reported {
+            Some(reported) => format!("not known ({})", reported.text),
+            None => account.venue_account_type.clone(),
+        },
     }
 }
 
@@ -318,7 +355,29 @@ mod tests {
             external_account_id: id.into(),
             name: name.into(),
             venue_account_type: kind.into(),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_kind_is_shown_and_the_venues_type_only_where_none_is_sent() {
+        use meridian_domain::v1::AccountKind;
+        let mut held = account("SNAP-1", "Brokerage", "Individual");
+        assert_eq!(
+            kind_words(&held),
+            "Individual",
+            "a v10 plugin's type, shown"
+        );
+        held.account_kind = AccountKind::Margin as i32;
+        assert_eq!(kind_words(&held), "margin");
+        held.account_kind = AccountKind::Unspecified as i32;
+        held.venue_account_type = String::new();
+        held.account_kind_as_reported = Some(meridian_pb::v1::AsReported {
+            scheme: "snaptrade:account-type".into(),
+            code: "INDIVIDUAL".into(),
+            text: "Individual".into(),
+        });
+        assert_eq!(kind_words(&held), "not known (Individual)");
     }
 
     fn link(instance: &str, external: &str, account: &str) -> ExternalAccountLink {
@@ -351,7 +410,7 @@ mod tests {
                 plugin_instance_id: "snaptrade-1".into(),
                 external_account_id: "SNAP-2".into(),
                 name: "Roth IRA 5678".into(),
-                venue_account_type: "Roth IRA".into(),
+                kind: "Roth IRA".into(),
                 refused_rows: 0,
             }]
         );

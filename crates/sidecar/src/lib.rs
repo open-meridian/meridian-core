@@ -22,6 +22,7 @@ pub mod live;
 #[rustfmt::skip]
 mod operations;
 mod configuration;
+pub mod edge;
 mod older;
 mod receive;
 pub mod report;

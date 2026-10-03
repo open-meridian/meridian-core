@@ -16,10 +16,14 @@
 // keep.
 //
 // What a venue says is carried as it said it, and nothing it did not say is
-// made up here (spec/the-account-side-fits-every-venue): a value it did not
-// report is unset rather than zero, a currency it did not state is marked as
-// the connector's assumption, and a short is a short row rather than a sign
-// somebody has to remember the meaning of.
+// presented as though it had (spec/the-account-side-fits-every-venue;
+// contract v11): a value it did not report is unset rather than zero, or
+// closed by the plugin with its provenance (meridian-schema's Provenance),
+// and a short is a short row rather than a sign somebody has to remember the
+// meaning of. Each asset is counted once: the cash of a currency is net of
+// any holding the custodian also counts as cash. Every row references the
+// raw record it was converted from, in the plugin's own storage
+// (RawRecordRef, decisions/028).
 //
 // Until 2026-09-28 they were int64s at a fixed scale of 1e8, named
 // `*_scaled_1e8`, with the currency beside the amount. Those fields are
@@ -172,9 +176,11 @@ message RecordHoldingsStatementRequest {
   optional Money margin_requirement = 7;
   optional Money maintenance_excess = 8;
 
-  // True when the venue stated no currency for the figures and the
-  // connector's is its own stated assumption (E*TRADE's balances carry none),
-  // rather than something the venue said. Of every set in `figures`.
+  // Deprecated from contract v11, for `provenance` (a currency the venue did
+  // not state is derived by the plugin's rule, and says so): read from a
+  // plugin before v11 for the notice the stability list gives, then
+  // reserved. True when the venue stated no currency for the figures and the
+  // connector's was its own assumption. Of every set in `figures`.
   bool currency_assumed = 9;
 
   // The account as the rail knows it; the sidecar sets account_id from its
@@ -199,6 +205,16 @@ message RecordHoldingsStatementRequest {
   // (contract v8; reference/encumbrance-survey). Not an encumbrance: it
   // reduces no holding's available quantity.
   optional bool security_interest = 14;
+
+  // The raw record the statement's figures were converted from (contract
+  // v11). Required of a custody plugin by its suite.
+  RawRecordRef raw_record = 15;
+
+  // Each value the plugin closed rather than read -- the institution taken
+  // from the connection, an as-of date it derived, a figures' currency the
+  // venue left out -- by its path here (contract v11). A value with none is
+  // the venue's.
+  repeated Provenance provenance = 16;
 }
 
 // A statement's figures for one margin segment, each as the venue reported
@@ -335,18 +351,18 @@ message RecordHoldingRequest {
   // settled cash.
   optional Decimal settle_date_quantity = 12;
 
-  // True when the venue stated no currency and the one here is the
-  // connector's stated assumption (E*TRADE, Schwab and Public state none),
-  // rather than something the venue said: the market value's currency, and
-  // for cash the currency whose cash instrument the row names. A
-  // pseudo-currency such as Interactive Brokers' BASE is never one.
+  // Deprecated from contract v11, for `provenance`: a currency the venue
+  // did not state is derived by the plugin's named rule, and says so. Read
+  // from a plugin before v11 for the notice the stability list gives, then
+  // reserved. True when the venue stated no currency and the row's was the
+  // connector's assumption.
   bool currency_assumed = 13;
 
-  // This position's value is also included in the account's cash holding as
-  // the venue reports it: SnapTrade counts a money-market fund in cash and
-  // lists it as a position too. The street store keeps both as reported; a
-  // reader counting the account once counts the fund as a position and
-  // deducts it from cash.
+  // Deprecated from contract v11: each asset is counted once, the cash of a
+  // currency net of any holding the custodian also counts as cash, netted
+  // by the plugin at the edge (sdk-contract/the-street-counts-each-asset-once).
+  // Accepted from a plugin before v11 for the notice the stability list
+  // gives, then reserved; no reader acts on it.
   bool also_counted_in_cash = 14;
 
   // As the venue reports them, unset or empty where it reports none, never
@@ -379,10 +395,40 @@ message RecordHoldingRequest {
   // location and pledgee; empty means none reported, not none held.
   repeated ReportedEncumbrance encumbrances = 22;
 
+  // The raw record the row was converted from, in the plugin's own storage
+  // (contract v11; decisions/028): carried, never followed, past the plugin.
+  // Required of a custody plugin by its suite; a row the plugin derived
+  // wholly, as cash net of a fund, names the record it derived it from.
+  RawRecordRef raw_record = 23;
+
+  // Each value the plugin closed rather than read, by its path in the row:
+  // `quantity` for cash net of a fund the custodian also counts as cash,
+  // `settle_date_quantity`, `pending`, `market_value.currency_code` (contract
+  // v11). A value with none is the venue's, from `raw_record`.
+  repeated Provenance provenance = 24;
+
+  // The quantities not yet settled, each with its value date (contract
+  // v11). With `settle_date_quantity` they account for `quantity`. As the
+  // source reports them, or closed by the plugin with their provenance.
+  repeated ReportedPending pending = 25;
+
+  // Set when the row is a backfill of a row already recorded (contract
+  // v11): the street journals the named field as an amendment beside the row
+  // as first recorded, never an overwrite (W2.4).
+  Backfill backfill = 26;
+
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
   reserved 5, 6, 7;
   reserved "quantity_scaled_1e8", "market_value_scaled_1e8", "currency";
+}
+
+// A quantity not yet settled, and the date it is due to (W2.3, contract
+// v11). Signed as its holding's quantity is: a short's pending is negative.
+message ReportedPending {
+  // ISO 8601.
+  string value_date = 1;
+  Decimal quantity = 2;
 }
 
 // What a source's available figure is net of.
@@ -510,6 +556,7 @@ message StatementRecordedEvent {
 
   // The statement's figures as recorded, one set per segment (W2.2).
   repeated StatementFigures figures = 9;
+  // Deprecated from contract v11, as on the statement: for `provenance`.
   bool currency_assumed = 10;
 
   // The completion's number in the street's partition, chained per account
@@ -527,6 +574,11 @@ message StatementRecordedEvent {
 
   // As the statement reported it (contract v8).
   optional bool security_interest = 15;
+
+  // As the statement carried them (contract v11): its raw record, and the
+  // provenance of each value its plugin closed.
+  RawRecordRef raw_record = 16;
+  repeated Provenance provenance = 17;
 }
 
 // A custodial position that changed, and the statement that changed it.
@@ -587,8 +639,8 @@ message CustodialPosition {
   // The settle-date quantity, where the custodian reported one.
   Decimal settle_date_quantity = 12;
 
-  // This position's value is also included in the account's cash holding as
-  // the custodian reports it; both are kept as reported.
+  // Deprecated from contract v11, as on RecordHoldingRequest: the street
+  // counts each asset once. Set only from a plugin before v11.
   bool also_counted_in_cash = 13;
 
   // As the custodian reported them on the row that last stated this, unset
@@ -612,6 +664,12 @@ message CustodialPosition {
   Decimal not_available_quantity = 21;
   AvailableBasis available_basis = 22;
   repeated ReportedEncumbrance encumbrances = 23;
+
+  // As on RecordHoldingRequest, from the row that last stated this, with
+  // what a backfill added to it (contract v11).
+  RawRecordRef raw_record = 24;
+  repeated Provenance provenance = 25;
+  repeated ReportedPending pending = 26;
 
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
@@ -675,6 +733,9 @@ message UnresolvedHolding {
   // view can separate "nobody has looked at this" from "this is with the
   // administrator".
   bool escalated = 9;
+
+  // The raw record the row was converted from (contract v11).
+  RawRecordRef raw_record = 12;
 
   // The int64s at 1e8 and the currency that qualified the value, which is now
   // inside it (decisions/023).
@@ -745,9 +806,36 @@ message ExternalAccount {
   // The custodian's own name for it, as a person there would recognise it.
   string name = 2;
 
-  // The venue's own word for the kind of account, verbatim and for display
-  // only. Nothing reads meaning into it: what an account may do is the
-  // platform's restriction set, in the platform's words, which each plugin
-  // maps its venue's types onto when that set is ruled.
+  // Deprecated from contract v11, for `account_kind` (Q13, reversed on the
+  // revision, 2026-10-01): the venue's own word, verbatim and for display
+  // only. A plugin built for v11 leaves it empty; the sidecar accepts it
+  // from an earlier one for the notice the stability list gives, and the
+  // dashboard shows it only where no kind is sent; then it is reserved.
   string venue_account_type = 3;
+
+  // The account's kind, converted by the plugin from the venue's own type
+  // (contract v11). For display and for grouping accounts across plugins;
+  // nothing gates on it, and what an account may do is the platform's
+  // restriction set when that is ruled.
+  AccountKind account_kind = 4;
+
+  // The venue's type as reported, set only when the kind is not known
+  // because the type did not convert (spec/vendor-differences-have-a-place-
+  // in-the-contract, requirement 4). For a person to map; never read.
+  AsReported account_kind_as_reported = 5;
+}
+
+// An account's kind (contract v11): one coarse kind, the platform's own
+// words, never a venue's.
+enum AccountKind {
+  // Not known: the venue's type says neither cash nor margin nor
+  // retirement, and travels beside it as reported.
+  ACCOUNT_KIND_UNSPECIFIED = 0;
+  // Trades settle in full from the account's own cash; no borrowing.
+  ACCOUNT_KIND_CASH = 1;
+  // The account may borrow against its holdings under a margin agreement.
+  ACCOUNT_KIND_MARGIN = 2;
+  // A tax-advantaged retirement account, whether or not it allows limited
+  // margin.
+  ACCOUNT_KIND_RETIREMENT = 3;
 }

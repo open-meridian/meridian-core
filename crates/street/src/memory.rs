@@ -9,9 +9,9 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    from_statement_cursor, statement_cursor, Cause, Chain, Change, Completed, Completion, Counts,
-    CustodialPosition, Holding, Key, Opened, Page, Read, Result, Settled, Side, Statement,
-    StatementPage, StatementsRead, Store, StoreError,
+    from_statement_cursor, statement_cursor, Amended, Amendment, Cause, Chain, Change, Completed,
+    Completion, Counts, CustodialPosition, Holding, Key, Opened, Page, Read, Result, Settled, Side,
+    Statement, StatementPage, StatementsRead, Store, StoreError,
 };
 
 #[derive(Debug, Default)]
@@ -24,7 +24,7 @@ impl MemoryStore {
         Self::default()
     }
 
-    fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Held>> {
+    pub(crate) fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Held>> {
         self.held
             .read()
             .map_err(|_| StoreError::Unavailable("the street store lock is poisoned".into()))
@@ -91,6 +91,10 @@ impl Store for MemoryStore {
             .move_positions(replaced_id, instrument_id, cause))
     }
 
+    fn amend(&self, amendment: Amendment, cause: &Cause) -> Result<Amended> {
+        self.write()?.amend(amendment, cause)
+    }
+
     fn instruments_held(&self) -> Result<Vec<String>> {
         let held = self.read()?;
         let mut instruments: Vec<String> = held
@@ -127,6 +131,11 @@ pub(crate) struct Held {
     /// account: what the next change takes and names as its previous.
     pub(crate) head: u64,
     pub(crate) chains: HashMap<(Chain, String), u64>,
+
+    /// Each backfill journaled beside the row it amends (W2.4, contract v11):
+    /// the row's identifier, the amendment and its cause, in the order they
+    /// were journaled. The row in `holdings` stays as first recorded.
+    pub(crate) amendments: Vec<(String, Amendment, Cause)>,
 }
 
 impl Held {
@@ -307,6 +316,81 @@ impl Held {
         })
     }
 
+    /// What a row carries now: as first recorded, with each backfill's field.
+    pub(crate) fn as_amended(&self, holding: &Holding) -> crate::store::Cost {
+        self.amendments
+            .iter()
+            .filter(|(holding_id, _, _)| *holding_id == holding.holding_id)
+            .fold(holding.cost.clone(), |cost, (_, amendment, _)| {
+                amendment.applied_to(&cost)
+            })
+    }
+
+    pub(crate) fn amend(&mut self, amendment: Amendment, cause: &Cause) -> Result<Amended> {
+        amendment.validate()?;
+        if !self.statements.contains_key(&amendment.statement_id) {
+            return Err(StoreError::UnknownStatement(amendment.statement_id.clone()));
+        }
+        let Some(row) = self
+            .holdings
+            .iter()
+            .rev()
+            .find(|held| {
+                held.statement_id == amendment.statement_id
+                    && held.account_id == amendment.account_id
+                    && held.side == amendment.side
+                    && held.instrument_id == amendment.instrument_id
+                    && (amendment.instrument_id.is_some()
+                        || held.unresolved_identifiers == amendment.unresolved_identifiers)
+            })
+            .cloned()
+        else {
+            return Err(StoreError::NoSuchRow(amendment.describes()));
+        };
+        let journaled = self.amendments.iter().any(|(holding_id, held, _)| {
+            *holding_id == row.holding_id
+                && held.contract_version == amendment.contract_version
+                && held.field == amendment.field
+        });
+        let carried = self.as_amended(&row);
+        if journaled || amendment.already_carried(&carried) {
+            return Ok(Amended::Nothing);
+        }
+        let now = amendment.applied_to(&carried);
+        self.amendments
+            .push((row.holding_id.clone(), amendment, cause.clone()));
+
+        let Some(instrument_id) = row.instrument_id.clone() else {
+            return Ok(Amended::Amended(Settled::Unresolved));
+        };
+        let key = Key {
+            account_id: row.account_id.clone(),
+            instrument_id,
+            side: row.side,
+        };
+        let Some(standing) = self.positions.get(&key).cloned() else {
+            return Ok(Amended::Amended(Settled::Unresolved));
+        };
+        // Only the row that last stated the position speaks for it.
+        if standing.removed || standing.last_statement_id != row.statement_id {
+            return Ok(Amended::Amended(Settled::Unchanged { position: standing }));
+        }
+        let mut position = CustodialPosition {
+            cost: now,
+            updated_at_ns: cause.committed_at_ns,
+            ..standing.clone()
+        };
+        if !position.differs_from(&standing) {
+            return Ok(Amended::Amended(Settled::Unchanged { position: standing }));
+        }
+        position.last_change = self.next(Chain::Position, &row.account_id);
+        self.positions.insert(key, position.clone());
+        Ok(Amended::Amended(Settled::Changed {
+            previous_quantity: standing.quantity,
+            position,
+        }))
+    }
+
     pub(crate) fn move_positions(
         &mut self,
         replaced_id: &str,
@@ -442,7 +526,10 @@ impl Held {
                 .iter()
                 .filter(|holding| !holding.resolved())
                 .filter(|holding| read.scope.answers(&read.account_id, &holding.account_id))
-                .cloned()
+                .map(|holding| Holding {
+                    cost: self.as_amended(holding),
+                    ..holding.clone()
+                })
                 .collect();
             rows.sort_by(|left, right| left.holding_id.cmp(&right.holding_id));
             rows
@@ -548,6 +635,8 @@ mod tests {
                     figures: Vec::new(),
                     currency_assumed: false,
                     security_interest: None,
+                    raw_record: None,
+                    provenance: Vec::new(),
                     completed: None,
                 },
                 &Cause::default(),

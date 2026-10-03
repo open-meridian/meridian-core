@@ -99,7 +99,7 @@ pub use positions::{list_positions, list_statements};
 pub use postgres::PostgresStore;
 pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
-    Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts, CustodialPosition,
-    Direction, Encumbrance, Figures, Holding, Key, Lot, Opened, Scope, Settled, Side, Statement,
-    Store, StoreError, PARTITION,
+    Amended, Amendment, Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts,
+    CustodialPosition, Direction, Encumbrance, Figures, Holding, Key, Lot, Opened, Pending,
+    Provenance, RawRecord, Scope, Settled, Side, Statement, Store, StoreError, PARTITION,
 };

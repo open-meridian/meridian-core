@@ -14,6 +14,22 @@
 
 pub mod asset_class;
 pub mod exact;
+pub mod instrument_type;
+
+/// The roles at the edge, which alone may own storage for their raw external
+/// records (decisions/028, ruled point 1 and its amendment for `reporting`;
+/// meridian-design's matrix/boundaries/roles.yaml marks the same seven, and
+/// the chart says them for the launcher). Read by the sidecar and the
+/// conductor, each refusing a declaration asking for storage without one.
+pub const EDGE_ROLES: [&str; 7] = [
+    "ccm",
+    "custody",
+    "dgm",
+    "match",
+    "reporting",
+    "servicing",
+    "settlement",
+];
 
 #[allow(clippy::all)]
 pub mod v1 {

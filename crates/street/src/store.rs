@@ -96,6 +96,16 @@ pub enum StoreError {
     #[error("{0}")]
     Encumbrance(String),
 
+    /// What a plugin closed, or a backfill, that cannot stand as sent (W2.3,
+    /// W2.4, contract v11), naming the field.
+    #[error("{0}")]
+    Edge(String),
+
+    /// A backfill naming a row its statement never had (W2.4, contract v11):
+    /// a backfill corrects no row into existence.
+    #[error("the statement has no row for {0}; a backfill amends a row already recorded")]
+    NoSuchRow(String),
+
     /// A quantity or an amount outside what the wire carries, named.
     #[error(transparent)]
     OutOfRange(#[from] Refused),
@@ -228,6 +238,12 @@ pub struct Statement {
     /// reported; absent where the statement does not say (contract v8).
     pub security_interest: Option<bool>,
 
+    /// The raw record the statement's figures were converted from, in the
+    /// plugin's own storage, and the provenance of each value the plugin
+    /// closed rather than read (contract v11).
+    pub raw_record: Option<RawRecord>,
+    pub provenance: Vec<Provenance>,
+
     /// Set once, when the statement completed (W2.5): the change, who caused
     /// it and when.
     pub completed: Option<Completed>,
@@ -328,6 +344,136 @@ pub struct Encumbrance {
     pub detail: String,
 }
 
+/// A reference to the raw record a row was converted from, in the writing
+/// plugin's own storage (contract v11; decisions/028): carried, never
+/// followed, here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawRecord {
+    pub instance_id: String,
+    pub key: String,
+}
+
+/// Where a value the plugin closed rather than read came from (contract
+/// v11): the value's path in its message, the kind as the wire numbers it,
+/// and its raw record, second source, person or rule.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Provenance {
+    pub field: String,
+    pub kind: i32,
+    pub raw_record: Option<RawRecord>,
+    pub source: String,
+    pub person: String,
+    pub rule: String,
+}
+
+/// A quantity not yet settled, and its value date (contract v11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub value_date: String,
+    pub quantity: Quantity,
+}
+
+/// The fields a backfill may fill: those contract v11 added to a holding
+/// row, each by its path and the version that added it (W2.4).
+pub const BACKFILLED: [(&str, &str); 3] = [
+    ("raw_record", "v11"),
+    ("pending", "v11"),
+    ("provenance", "v11"),
+];
+
+/// A backfill of a row already recorded (W2.4, contract v11): which row --
+/// its statement, account, instrument or identifiers, and side -- the field
+/// it fills with its value, and the raw record it was re-converted from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amendment {
+    pub statement_id: String,
+    pub account_id: String,
+    pub instrument_id: Option<String>,
+    pub unresolved_identifiers: Vec<Identifier>,
+    pub side: Side,
+    pub contract_version: String,
+    pub field: String,
+    pub raw_record: Option<RawRecord>,
+    pub pending: Vec<Pending>,
+    pub provenance: Vec<Provenance>,
+}
+
+impl Amendment {
+    /// Refuse a backfill naming a field no revision added to the row, or the
+    /// wrong version for it, naming the field.
+    pub fn validate(&self) -> Result<()> {
+        match BACKFILLED.iter().find(|(field, _)| *field == self.field) {
+            None => Err(StoreError::Edge(format!(
+                "backfill.field {:?} is not a field a contract revision added to the row: {}",
+                self.field,
+                BACKFILLED.map(|(field, _)| field).join(", ")
+            ))),
+            Some((_, version)) if *version != self.contract_version => {
+                Err(StoreError::Edge(format!(
+                    "backfill.contract_version is {:?}; {} was added by {version}",
+                    self.contract_version, self.field
+                )))
+            }
+            Some(_) if self.field == "raw_record" && self.raw_record.is_none() => Err(
+                StoreError::Edge("a backfill of raw_record carries the raw record".into()),
+            ),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Whether `cost` -- what the row carried, as first recorded and as
+    /// amended -- already carries the field: a backfill fills only what the
+    /// row did not carry.
+    pub fn already_carried(&self, cost: &Cost) -> bool {
+        match self.field.as_str() {
+            "raw_record" => cost.raw_record.is_some(),
+            "pending" => !cost.pending.is_empty(),
+            "provenance" => !cost.provenance.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// `cost` with the field filled from this backfill.
+    pub fn applied_to(&self, cost: &Cost) -> Cost {
+        let mut cost = cost.clone();
+        match self.field.as_str() {
+            "raw_record" => cost.raw_record = self.raw_record.clone(),
+            "pending" => cost.pending = self.pending.clone(),
+            "provenance" => cost.provenance = self.provenance.clone(),
+            _ => {}
+        }
+        cost
+    }
+
+    /// The row's description in a refusal: its instrument or identifiers, and
+    /// its side.
+    pub fn describes(&self) -> String {
+        let what = match &self.instrument_id {
+            Some(instrument_id) => instrument_id.clone(),
+            None => self
+                .unresolved_identifiers
+                .iter()
+                .map(|identifier| format!("{}:{}", identifier.scheme, identifier.value))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        format!("{what}, {}", self.side)
+    }
+}
+
+/// What a backfill did (W2.4).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum Amended {
+    /// Journaled beside the row as first recorded; the position behind it,
+    /// where the row is the one that last stated it and it now says more,
+    /// changed as `Settled` says.
+    Amended(Settled),
+    /// The row already carried the field, or this backfill was journaled
+    /// already: nothing changed and nothing was added.
+    Nothing,
+}
+
 /// What the custodian reported of a holding's cost and margin, each absent
 /// where it reported none and never derived (W2.3; Q-A).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -346,6 +492,13 @@ pub struct Cost {
     pub not_available_quantity: Option<Quantity>,
     pub available_basis: i32,
     pub encumbrances: Vec<Encumbrance>,
+    /// The raw record the row was converted from, the provenance of each
+    /// value the plugin closed, and the quantities pending by value date
+    /// (contract v11): carried by the position from the row that last stated
+    /// it, as the lots are, with what a backfill added to that row.
+    pub raw_record: Option<RawRecord>,
+    pub provenance: Vec<Provenance>,
+    pub pending: Vec<Pending>,
 }
 
 /// Which side of an instrument a holding or a position is on.
@@ -819,6 +972,16 @@ pub trait Store: Send + Sync {
         instrument_id: &str,
         cause: &Cause,
     ) -> Result<Vec<Settled>>;
+
+    /// A backfill of a row already recorded (W2.4, contract v11): journaled
+    /// as an amendment beside the row as first recorded, never an overwrite,
+    /// with its cause and the raw record it was re-converted from. A field
+    /// the row already carries, or a backfill journaled before for the same
+    /// row, version and field, changes nothing. A row the statement never had
+    /// is refused. Where the row is the one that last stated its position,
+    /// the position takes what it now says as a change of its own, numbered
+    /// and recorded with `cause`, in the same transaction.
+    fn amend(&self, amendment: Amendment, cause: &Cause) -> Result<Amended>;
 
     /// Every instrument ID a custodial position is held under, each once, in
     /// order: what the sweep asks the instrument store about, for a record

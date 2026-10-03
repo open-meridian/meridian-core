@@ -1,7 +1,12 @@
+amended|Interop|INS-interop-backfill|long|v11|raw_record|positions/interop/backfill
 assumed|Interop|INS-interop-etrade-tsla|short
+closed|Interop|INS-interop-edge-vti|long|settle_date_quantity|derived
+pending|Interop|INS-interop-edge-vti|long|2026-09-29|2.5
 position|Interop|INS-interop-away|long|2|||
+position|Interop|INS-interop-backfill|long|3|||
 position|Interop|INS-interop-cash-cad|long|250.00|||
 position|Interop|INS-interop-cash-usd|long|1520.35|1020.35||
+position|Interop|INS-interop-edge-vti|long|12.5|10||
 position|Interop|INS-interop-eighteen-decimals|long|100000000000.000000000000000001||41230.50 USD|
 position|Interop|INS-interop-etrade-tsla|short|-100||-18250.00 USD|
 position|Interop|INS-interop-heard|long|12.5|||
@@ -14,6 +19,8 @@ position|Interop|INS-interop-schwab-msft|short|-50|-50|-21000.00 USD|
 position|Interop|INS-interop-snaptrade-spaxx|long|500||500.00 USD|in-cash
 position|Interop|INS-interop-snaptrade-vti|long|12.5|10||
 position|Interop|INS-interop-unheard|long|1|||
+statement|Interop|interop-backfill|1|complete||||false
+statement|Interop|interop-edge|1|complete||||false
 statement|Interop|interop-etrade|1|complete|41250.00 USD|18250.00 USD|23000.00 USD|true
 statement|Interop|interop-kalshi|1|complete||||false
 statement|Interop|interop-operations|1|complete||||false

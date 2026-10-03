@@ -135,6 +135,8 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_record_minted_while_the_platf
                 figures: Vec::new(),
                 currency_assumed: false,
                 security_interest: None,
+                raw_record: None,
+                provenance: Vec::new(),
                 completed: None,
             },
             &Cause {

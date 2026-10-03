@@ -114,10 +114,34 @@ pub fn template_for<'a>(
     development: bool,
     shapes: &'a Shapes,
 ) -> Result<Chosen<'a>, String> {
+    // Storage where the version's declaration asks for it, at the edge
+    // alone; a version uploaded with no declaration, built before v11, by
+    // holding an edge role, as before (W8.3, contract v11; decisions/028).
+    let asks = match &request.declaration {
+        None => true,
+        Some(declaration) => declaration.storage.is_some(),
+    };
+    let at_edge = shapes
+        .storage
+        .as_ref()
+        .is_some_and(|storage| at_the_edge(&request.roles, &storage.edge_roles));
+    if request
+        .declaration
+        .as_ref()
+        .is_some_and(|declaration| declaration.storage.is_some())
+        && shapes.storage.is_some()
+        && !at_edge
+    {
+        return Err(format!(
+            "{} asks for storage and holds no edge role; only the edge roles own storage \
+             (decisions/028)",
+            request.instance_id
+        ));
+    }
     let storage = shapes
         .storage
         .as_ref()
-        .filter(|storage| at_the_edge(&request.roles, &storage.edge_roles));
+        .filter(|storage| asks && at_the_edge(&request.roles, &storage.edge_roles));
     let claim = storage.map(|storage| storage.claim.as_str());
     if !request.live {
         let workload = storage.map_or(shapes.plain.as_str(), |storage| storage.plain.as_str());

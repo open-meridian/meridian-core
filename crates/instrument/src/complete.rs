@@ -12,15 +12,17 @@
 //! of its own: its INS- ID joins the record as an identifier -- added, never
 //! substituted (decisions/030, choice 2) -- and its values are offers.
 
+use meridian_domain::instrument_type;
 use meridian_domain::v1::{
     instrument_value, AssetClass, CompleteInstrumentsRequest, InstrumentCompletion,
-    InstrumentCompletionResult, InstrumentRecord as PbInstrument, MergeInstrumentsRequest,
+    InstrumentCompletionResult, InstrumentRecord as PbInstrument, InstrumentType,
+    MergeInstrumentsRequest,
 };
 use meridian_pb::v1::{Refusal, RefusalReason};
 use meridian_symbology::{GLOBAL_ID, OPEN};
 
 use crate::record::{
-    asked_from_wire, asset_class_name, class_words, dated, field_from_wire, is_currency, to_wire,
+    asked_from_wire, asset_class_name, dated, field_from_wire, is_currency, to_wire, value_words,
     CURRENCY_SCHEME,
 };
 use crate::replace::current;
@@ -208,6 +210,44 @@ fn complete_one(
                 }
                 (Field::Description, text.to_string(), None)
             }
+            instrument_value::Value::InstrumentType(kind) => {
+                match InstrumentType::try_from(*kind) {
+                    Ok(kind) if kind != InstrumentType::Unspecified => (
+                        Field::InstrumentType,
+                        instrument_type::name(kind).to_string(),
+                        None,
+                    ),
+                    _ => {
+                        problems.push((
+                            RefusalReason::Incomplete,
+                            path("instrument_type"),
+                            "an instrument type is one of the list: money_market_fund".into(),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            instrument_value::Value::MoneyMarketFund(fund) => {
+                let missing = instrument_type::unstated(fund);
+                if !missing.is_empty() {
+                    for attribute in &missing {
+                        problems.push((
+                            RefusalReason::Incomplete,
+                            path(&format!("money_market_fund.{attribute}")),
+                            format!(
+                                "a money market fund's attributes are stated together: its {}",
+                                missing.join(", ")
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                (
+                    Field::MoneyMarketFund,
+                    instrument_type::fund_to_text(fund),
+                    None,
+                )
+            }
             instrument_value::Value::Identifier(identifier) => {
                 let asked = asked_from_wire(identifier);
                 if asked.scheme.is_empty() || asked.value.is_empty() {
@@ -274,21 +314,61 @@ fn complete_one(
             recorded_at_ns: now_ns,
             note: completion.note.trim().to_string(),
         });
-        let words = |value: &str| {
-            if field == Field::AssetClass {
-                class_words(value)
-            } else {
-                value.to_string()
-            }
-        };
         changes.push(Change {
             field: field.name().into(),
             scheme: String::new(),
             namespace: String::new(),
-            before: words(&before),
-            after: words(&text),
+            before: value_words(field, &before),
+            after: value_words(field, &text),
             source: source.to_string(),
         });
+    }
+
+    // A type is under one asset class, and a fund's attributes belong to a
+    // money market fund (contract v11): refused naming the value that set
+    // what does not fit, whatever order the values came in.
+    let kind =
+        instrument_type::read(&record.instrument_type).unwrap_or(InstrumentType::Unspecified);
+    let at_value = |wanted: fn(&instrument_value::Value) -> bool, name: &str| {
+        completion
+            .values
+            .iter()
+            .position(|value| value.value.as_ref().is_some_and(wanted))
+            .map(|at| format!("values[{at}].{name}"))
+            .unwrap_or_else(|| name.to_string())
+    };
+    if let Some(class) = instrument_type::class_of(kind) {
+        if record.asset_class != asset_class_name(class as i32) {
+            problems.push((
+                RefusalReason::Incomplete,
+                at_value(
+                    |value| matches!(value, instrument_value::Value::InstrumentType(_)),
+                    "instrument_type",
+                ),
+                format!(
+                    "a {} is under {}, and the record's asset class is {}",
+                    instrument_type::words(kind),
+                    value_words(Field::AssetClass, &asset_class_name(class as i32)),
+                    if record.asset_class.is_empty() {
+                        "not set".to_string()
+                    } else {
+                        value_words(Field::AssetClass, &record.asset_class)
+                    }
+                ),
+            ));
+        }
+    }
+    if !record.money_market_fund.is_empty() && kind != InstrumentType::MoneyMarketFund {
+        problems.push((
+            RefusalReason::Incomplete,
+            at_value(
+                |value| matches!(value, instrument_value::Value::MoneyMarketFund(_)),
+                "money_market_fund",
+            ),
+            "a money market fund's attributes are set only on a record whose type is money \
+             market fund"
+                .into(),
+        ));
     }
 
     if changes_held && completion.note.trim().is_empty() {
@@ -497,7 +577,13 @@ pub fn merge(
         changes.push(identifier_change(&asked, &carried.source));
         stays.set_source(carried);
     }
-    for field in [Field::AssetClass, Field::Currency, Field::Description] {
+    for field in [
+        Field::AssetClass,
+        Field::Currency,
+        Field::Description,
+        Field::InstrumentType,
+        Field::MoneyMarketFund,
+    ] {
         let (ours, theirs) = (kept.value(field), merged.value(field));
         if theirs.is_empty() || ours == theirs {
             continue;
@@ -515,19 +601,12 @@ pub fn merge(
             recorded_at_ns: now_ns,
             note: note.to_string(),
         });
-        let words = |value: &str| {
-            if field == Field::AssetClass {
-                class_words(value)
-            } else {
-                value.to_string()
-            }
-        };
         changes.push(Change {
             field: field.name().into(),
             scheme: String::new(),
             namespace: String::new(),
-            before: words(ours),
-            after: words(theirs),
+            before: value_words(field, ours),
+            after: value_words(field, theirs),
             source: carried.source.clone(),
         });
         stays.set_source(carried);
@@ -829,6 +908,129 @@ mod tests {
         assert_eq!(history[0].operation, "complete");
         assert_eq!(history[0].person, ADA);
         assert_eq!(history[0].changes[0].after, "equity");
+    }
+
+    fn stable_government_fund() -> meridian_domain::v1::MoneyMarketFund {
+        use meridian_domain::v1::{
+            LiquidityFeeRegime, MoneyMarketFundCategory, MoneyMarketFundInvestors,
+            MoneyMarketFundNav,
+        };
+        meridian_domain::v1::MoneyMarketFund {
+            category: MoneyMarketFundCategory::Government as i32,
+            investors: MoneyMarketFundInvestors::Retail as i32,
+            nav: MoneyMarketFundNav::Stable as i32,
+            liquidity_fee: LiquidityFeeRegime::Discretionary as i32,
+        }
+    }
+
+    #[test]
+    fn a_money_market_fund_is_completed_with_its_type_and_attributes() {
+        // Contract v11: a type under its class, and a fund's four attributes,
+        // each a value with its source and the person.
+        let store = MemoryStore::new();
+        let id = minted(&store, "symbol", "SPAXX", "snaptrade");
+        let result = one(
+            &store,
+            &completing(
+                &id,
+                1,
+                vec![
+                    value(
+                        instrument_value::Value::AssetClass(AssetClass::Fund as i32),
+                        "stated by custody-snaptrade-1",
+                    ),
+                    value(
+                        instrument_value::Value::InstrumentType(
+                            InstrumentType::MoneyMarketFund as i32,
+                        ),
+                        "stated by custody-snaptrade-1",
+                    ),
+                    value(
+                        instrument_value::Value::Currency("USD".into()),
+                        "the prospectus",
+                    ),
+                    value(
+                        instrument_value::Value::MoneyMarketFund(stable_government_fund()),
+                        "the prospectus",
+                    ),
+                ],
+                "",
+            ),
+        );
+        assert!(result.refusal.is_none(), "{}", result.detail);
+        let record = result.instrument.unwrap();
+        assert_eq!(
+            record.instrument_type,
+            InstrumentType::MoneyMarketFund as i32
+        );
+        assert_eq!(record.money_market_fund, Some(stable_government_fund()));
+        let held = store.by_id(&id).unwrap().unwrap();
+        assert_eq!(
+            held.source_of(Field::MoneyMarketFund, None).unwrap().person,
+            ADA
+        );
+        let history = store.history(&id).unwrap();
+        assert!(history[0]
+            .changes
+            .iter()
+            .any(|change| change.after == "government, retail, stable NAV, discretionary fee"));
+        assert!(history[0]
+            .changes
+            .iter()
+            .any(|change| change.after == "money market fund"));
+    }
+
+    #[test]
+    fn a_type_off_its_class_and_a_funds_attributes_off_a_fund_are_refused_naming_them() {
+        let store = MemoryStore::new();
+        let id = minted(&store, "symbol", "SNAP1", "snaptrade");
+        let mut values = equity_in_usd();
+        values.push(value(
+            instrument_value::Value::InstrumentType(InstrumentType::MoneyMarketFund as i32),
+            "a statement",
+        ));
+        let refusal = one(&store, &completing(&id, 1, values, ""))
+            .refusal
+            .unwrap();
+        assert_eq!(refusal.reason, RefusalReason::Incomplete as i32);
+        assert_eq!(refusal.fields, vec!["values[2].instrument_type"]);
+
+        let mut values = equity_in_usd();
+        values.push(value(
+            instrument_value::Value::MoneyMarketFund(stable_government_fund()),
+            "a statement",
+        ));
+        let refusal = one(&store, &completing(&id, 1, values, ""))
+            .refusal
+            .unwrap();
+        assert_eq!(refusal.fields, vec!["values[2].money_market_fund"]);
+
+        let partial = meridian_domain::v1::MoneyMarketFund {
+            category: stable_government_fund().category,
+            nav: stable_government_fund().nav,
+            ..Default::default()
+        };
+        let refusal = one(
+            &store,
+            &completing(
+                &id,
+                1,
+                vec![value(
+                    instrument_value::Value::MoneyMarketFund(partial),
+                    "a statement",
+                )],
+                "",
+            ),
+        )
+        .refusal
+        .unwrap();
+        assert_eq!(
+            refusal.fields,
+            vec![
+                "values[0].money_market_fund.investors",
+                "values[0].money_market_fund.liquidity_fee"
+            ]
+        );
     }
 
     #[test]

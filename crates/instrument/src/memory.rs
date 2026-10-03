@@ -119,6 +119,8 @@ mod tests {
             version,
             valid_from_ns: 0,
             record_time_ns: 0,
+            instrument_type: String::new(),
+            money_market_fund: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }

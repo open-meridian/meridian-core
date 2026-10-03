@@ -231,6 +231,8 @@ fn mint(
         version: 1,
         valid_from_ns: 0,
         record_time_ns: now_ns,
+        instrument_type: String::new(),
+        money_market_fund: String::new(),
         sources: asked
             .iter()
             .map(|identifier| Source {
@@ -419,6 +421,19 @@ fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) ->
     if !description.is_empty() {
         offers.push(offer(Field::Description, description.to_string()));
     }
+    // A type, only under the class the source stated beside it (contract
+    // v11): a statement that contradicts itself offers nothing a person could
+    // accept.
+    if let Ok(kind) = meridian_domain::v1::InstrumentType::try_from(request.stated_instrument_type)
+    {
+        let under = meridian_domain::instrument_type::class_of(kind);
+        if under.is_some_and(|class| class as i32 == request.stated_asset_class) {
+            offers.push(offer(
+                Field::InstrumentType,
+                meridian_domain::instrument_type::name(kind).to_string(),
+            ));
+        }
+    }
     offers
 }
 
@@ -588,6 +603,8 @@ mod tests {
             version: 4,
             valid_from_ns: 0,
             record_time_ns: 0,
+            instrument_type: String::new(),
+            money_market_fund: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }
@@ -939,5 +956,46 @@ mod tests {
         assert_ne!(a.instrument_id, b.instrument_id);
         assert!(conflict_reported(&store, &event, NOW).unwrap());
         assert_eq!(store.conflicts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stated_type_is_offered_only_under_its_stated_class() {
+        // Contract v11: a sweep fund stated as a money market fund under fund
+        // is offered; a type off the class stated beside it offers nothing.
+        let store = MemoryStore::new();
+        let mut stating = ResolveIdentifierRequest {
+            identifiers: vec![meridian_domain::v1::Identifier {
+                scheme: "symbol".into(),
+                value: "SPAXX".into(),
+                source: "snaptrade".into(),
+            }],
+            as_of_ns: 1,
+            stated_asset_class: AssetClass::Fund as i32,
+            stated_instrument_type: meridian_domain::v1::InstrumentType::MoneyMarketFund as i32,
+            ..Default::default()
+        };
+        let minted = resolve_identifier(&store, &stating, "custody-snaptrade-1", 1)
+            .unwrap()
+            .reply
+            .instrument_id;
+        let held = store.by_id(&minted).unwrap().unwrap();
+        assert!(held
+            .offers
+            .iter()
+            .any(|offer| offer.field == Field::InstrumentType
+                && offer.value == "INSTRUMENT_TYPE_MONEY_MARKET_FUND"));
+        assert!(held.instrument_type.is_empty(), "offered, not in force");
+
+        stating.identifiers[0].value = "OTHER".into();
+        stating.stated_asset_class = AssetClass::Equity as i32;
+        let minted = resolve_identifier(&store, &stating, "custody-snaptrade-1", 2)
+            .unwrap()
+            .reply
+            .instrument_id;
+        let held = store.by_id(&minted).unwrap().unwrap();
+        assert!(!held
+            .offers
+            .iter()
+            .any(|offer| offer.field == Field::InstrumentType));
     }
 }

@@ -16,12 +16,15 @@ use meridian_domain::v1::{
     ReportedCollateral, ReportedEncumbrance, ReportedLot, StatementFigures, StatementRecordedEvent,
 };
 
+use meridian_domain::v1::ReportedPending as PbPending;
+use meridian_pb::v1::{Provenance as PbProvenance, ProvenanceKind, RawRecordRef};
+
 use crate::amounts::{Money, Quantity};
 use crate::ids;
 use crate::store::{
-    Cause, Change, Collateral, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance,
-    Figures, Holding, Identifier, Lot, Opened, Result, Settled, Side, Statement, Store, StoreError,
-    PARTITION,
+    Amended, Amendment, Cause, Change, Collateral, Completion, Cost, Counts, CustodialPosition,
+    Direction, Encumbrance, Figures, Holding, Identifier, Lot, Opened, Pending, Provenance,
+    RawRecord, Result, Settled, Side, Statement, Store, StoreError, PARTITION,
 };
 
 /// What opening a statement produced.
@@ -61,6 +64,10 @@ pub fn open_statement(
             figures: figures_from_wire(request)?,
             currency_assumed: request.currency_assumed,
             security_interest: request.security_interest,
+            // The raw record the figures came from, and what the plugin
+            // closed, as it sent them (contract v11).
+            raw_record: raw_from_wire(request.raw_record.as_ref()),
+            provenance: provenance_from_wire(&request.provenance)?,
             completed: None,
         },
         cause,
@@ -230,6 +237,9 @@ pub fn record_holding(
     request: &RecordHoldingRequest,
     cause: &Cause,
 ) -> Result<Recorded> {
+    if let Some(backfill) = &request.backfill {
+        return amend_holding(store, request, backfill, cause);
+    }
     let holding_id = ids::holding(cause.committed_at_ns);
 
     let holding = Holding {
@@ -299,6 +309,11 @@ pub fn record_holding(
                 .enumerate()
                 .map(|(at, held)| encumbrance_from_wire(at, held))
                 .collect::<Result<_>>()?,
+            // The raw record the row came from, what the plugin closed, and
+            // what is pending by value date, as it sent them (contract v11).
+            raw_record: raw_from_wire(request.raw_record.as_ref()),
+            provenance: provenance_from_wire(&request.provenance)?,
+            pending: pending_from_wire(&request.pending)?,
         },
 
         // Nothing has asked the platform about these identifiers yet. W3.2 is
@@ -339,6 +354,148 @@ pub fn record_holding(
         },
         completed,
     })
+}
+
+/// W2.4, contract v11: a row marked as a backfill amends the row as first
+/// recorded, never records another. The reply names no new row; where the
+/// amended row last stated its position and the position now says more, the
+/// change is announced as any other (W2.6).
+fn amend_holding(
+    store: &dyn Store,
+    request: &RecordHoldingRequest,
+    backfill: &meridian_pb::v1::Backfill,
+    cause: &Cause,
+) -> Result<Recorded> {
+    let amendment = Amendment {
+        statement_id: request.statement_id.clone(),
+        account_id: request.account_id.clone(),
+        instrument_id: Some(request.instrument_id.clone()).filter(|id| !id.is_empty()),
+        unresolved_identifiers: request
+            .unresolved_identifiers
+            .iter()
+            .map(from_wire_identifier)
+            .collect(),
+        side: side_from_wire(request.side)?,
+        contract_version: backfill.contract_version.clone(),
+        field: backfill.field.clone(),
+        raw_record: raw_from_wire(request.raw_record.as_ref()),
+        pending: pending_from_wire(&request.pending)?,
+        provenance: provenance_from_wire(&request.provenance)?,
+    };
+    amendment.validate()?;
+    let resolved = amendment.instrument_id.is_some();
+    let event = match store.amend(amendment, cause)? {
+        Amended::Amended(Settled::Changed {
+            position,
+            previous_quantity,
+        }) => Some(position_updated(
+            &position,
+            request.statement_id.clone(),
+            previous_quantity,
+            cause,
+        )),
+        Amended::Amended(_) | Amended::Nothing => None,
+    };
+    Ok(Recorded {
+        reply: RecordHoldingReply {
+            holding_id: String::new(),
+            resolved,
+        },
+        event,
+        completed: None,
+    })
+}
+
+/// A raw record's reference, or none where the plugin sent none.
+pub(crate) fn raw_from_wire(raw: Option<&RawRecordRef>) -> Option<RawRecord> {
+    raw.filter(|raw| !raw.key.is_empty() || !raw.instance_id.is_empty())
+        .map(|raw| RawRecord {
+            instance_id: raw.instance_id.clone(),
+            key: raw.key.clone(),
+        })
+}
+
+pub(crate) fn raw_to_wire(raw: &Option<RawRecord>) -> Option<RawRecordRef> {
+    raw.as_ref().map(|raw| RawRecordRef {
+        instance_id: raw.instance_id.clone(),
+        key: raw.key.clone(),
+    })
+}
+
+/// Each value the plugin closed, refused naming the field where it names no
+/// value or no kind (contract v11). The sidecar refused a plugin's already.
+pub(crate) fn provenance_from_wire(provenance: &[PbProvenance]) -> Result<Vec<Provenance>> {
+    provenance
+        .iter()
+        .enumerate()
+        .map(|(at, held)| {
+            if held.field.is_empty() {
+                return Err(StoreError::Edge(format!(
+                    "provenance[{at}].field is empty; a provenance names the value it is for"
+                )));
+            }
+            match ProvenanceKind::try_from(held.kind) {
+                Ok(ProvenanceKind::Unspecified) | Err(_) => {
+                    return Err(StoreError::Edge(format!(
+                        "provenance[{at}].kind is unspecified"
+                    )))
+                }
+                Ok(_) => {}
+            }
+            Ok(Provenance {
+                field: held.field.clone(),
+                kind: held.kind,
+                raw_record: raw_from_wire(held.raw_record.as_ref()),
+                source: held.source.clone(),
+                person: held.person.clone(),
+                rule: held.rule.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn provenance_to_wire(provenance: &[Provenance]) -> Vec<PbProvenance> {
+    provenance
+        .iter()
+        .map(|held| PbProvenance {
+            field: held.field.clone(),
+            kind: held.kind,
+            raw_record: raw_to_wire(&held.raw_record),
+            source: held.source.clone(),
+            person: held.person.clone(),
+            rule: held.rule.clone(),
+        })
+        .collect()
+}
+
+/// Each quantity pending by its value date; refused naming the field where
+/// it names no date (contract v11).
+fn pending_from_wire(pending: &[PbPending]) -> Result<Vec<Pending>> {
+    pending
+        .iter()
+        .enumerate()
+        .map(|(at, held)| {
+            if held.value_date.is_empty() {
+                return Err(StoreError::Edge(format!(
+                    "pending[{at}].value_date is empty; a pending quantity names its date"
+                )));
+            }
+            Ok(Pending {
+                value_date: held.value_date.clone(),
+                quantity: Quantity::from_wire("pending.quantity", held.quantity.as_ref())?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn pending_to_wire(pending: &[Pending]) -> Vec<PbPending> {
+    pending
+        .iter()
+        .map(|held| PbPending {
+            value_date: held.value_date.clone(),
+            quantity: held.quantity.to_wire(),
+        })
+        .collect()
 }
 
 fn lot_from_wire(lot: &ReportedLot) -> Result<Lot> {
@@ -472,6 +629,8 @@ pub(crate) fn statement_recorded(statement: &Statement, counts: Counts) -> State
         external_account_id: statement.external_account_id.clone(),
         institution: statement.institution.clone(),
         security_interest: statement.security_interest,
+        raw_record: raw_to_wire(&statement.raw_record),
+        provenance: provenance_to_wire(&statement.provenance),
     }
 }
 
@@ -612,6 +771,9 @@ pub(crate) fn to_wire_position(
             .iter()
             .map(encumbrance_to_wire)
             .collect(),
+        raw_record: raw_to_wire(&position.cost.raw_record),
+        provenance: provenance_to_wire(&position.cost.provenance),
+        pending: pending_to_wire(&position.cost.pending),
     }
 }
 
@@ -684,6 +846,172 @@ mod tests {
             .unwrap()
             .reply
             .statement_id
+    }
+
+    fn raw(key: &str) -> Option<RawRecordRef> {
+        Some(RawRecordRef {
+            instance_id: "custody-snaptrade-1".into(),
+            key: key.into(),
+        })
+    }
+
+    #[test]
+    fn a_rows_raw_record_provenance_and_pending_reach_its_position() {
+        // Contract v11: what the edge keeps travels with the row, and the
+        // position carries it from the row that last stated it.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+        let mut request = holding_request(&statement_id);
+        request.settle_date_quantity = quantity("10");
+        request.raw_record = raw("positions/SNAP-ACC-1/1");
+        request.pending = vec![PbPending {
+            value_date: "2026-09-09".into(),
+            quantity: quantity("2.5"),
+        }];
+        request.provenance = vec![PbProvenance {
+            field: "settle_date_quantity".into(),
+            kind: ProvenanceKind::Derived as i32,
+            rule: "the quantity less the trades not settled".into(),
+            ..Default::default()
+        }];
+        let recorded = record_holding(&store, &request, &at(NOW + 1)).unwrap();
+        let position = recorded.event.unwrap().position.unwrap();
+        assert_eq!(position.raw_record, raw("positions/SNAP-ACC-1/1"));
+        assert_eq!(position.pending.len(), 1);
+        assert_eq!(position.pending[0].value_date, "2026-09-09");
+        assert_eq!(position.provenance[0].field, "settle_date_quantity");
+    }
+
+    #[test]
+    fn a_provenance_with_no_kind_or_a_pending_with_no_date_is_refused_naming_it() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+        let mut request = holding_request(&statement_id);
+        request.provenance = vec![PbProvenance {
+            field: "quantity".into(),
+            ..Default::default()
+        }];
+        let refused = record_holding(&store, &request, &at(NOW + 1)).unwrap_err();
+        assert_eq!(refused.to_string(), "provenance[0].kind is unspecified");
+        let mut request = holding_request(&statement_id);
+        request.pending = vec![PbPending {
+            value_date: String::new(),
+            quantity: quantity("1"),
+        }];
+        assert!(record_holding(&store, &request, &at(NOW + 2))
+            .unwrap_err()
+            .to_string()
+            .starts_with("pending[0].value_date is empty"));
+    }
+
+    fn backfill_of(statement_id: &str, field: &str) -> RecordHoldingRequest {
+        let mut request = holding_request(statement_id);
+        request.raw_record = raw("positions/SNAP-ACC-1/1");
+        request.backfill = Some(meridian_pb::v1::Backfill {
+            contract_version: "v11".into(),
+            field: field.into(),
+        });
+        request
+    }
+
+    #[test]
+    fn a_backfill_amends_the_row_as_first_recorded_and_run_twice_adds_nothing() {
+        // W2.4, contract v11: the row stays as first recorded; the amendment
+        // beside it fills the field it lacked, and the position the row last
+        // stated takes it as a change of its own, numbered and announced.
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+        let first = record_holding(&store, &holding_request(&statement_id), &at(NOW + 1)).unwrap();
+        let before = first.event.unwrap().position.unwrap();
+        assert_eq!(before.raw_record, None);
+
+        let amended = record_holding(
+            &store,
+            &backfill_of(&statement_id, "raw_record"),
+            &at(NOW + 2),
+        )
+        .unwrap();
+        assert!(
+            amended.reply.holding_id.is_empty(),
+            "no new row is recorded"
+        );
+        assert!(amended.completed.is_none());
+        let event = amended.event.expect("the position says more now");
+        let position = event.position.unwrap();
+        assert_eq!(position.raw_record, raw("positions/SNAP-ACC-1/1"));
+        assert!(
+            position.last_change.unwrap().sequence > before.last_change.unwrap().sequence,
+            "numbered as a change of its own"
+        );
+
+        // The row as first recorded is untouched, and readable.
+        let held = store.read().unwrap();
+        let row = held
+            .holdings
+            .iter()
+            .find(|row| row.statement_id == statement_id)
+            .unwrap();
+        assert_eq!(row.cost.raw_record, None);
+        assert_eq!(held.amendments.len(), 1);
+        assert_eq!(held.amendments[0].1.contract_version, "v11");
+        drop(held);
+
+        // Run twice, nothing.
+        let again = record_holding(
+            &store,
+            &backfill_of(&statement_id, "raw_record"),
+            &at(NOW + 3),
+        )
+        .unwrap();
+        assert!(again.event.is_none());
+        assert_eq!(store.read().unwrap().amendments.len(), 1);
+    }
+
+    #[test]
+    fn a_backfill_fills_only_what_the_row_did_not_carry() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+        let mut row = holding_request(&statement_id);
+        row.raw_record = raw("positions/SNAP-ACC-1/first");
+        record_holding(&store, &row, &at(NOW + 1)).unwrap();
+        let carried = record_holding(
+            &store,
+            &backfill_of(&statement_id, "raw_record"),
+            &at(NOW + 2),
+        )
+        .unwrap();
+        assert!(carried.event.is_none());
+        assert!(store.read().unwrap().amendments.is_empty());
+    }
+
+    #[test]
+    fn a_backfill_of_a_row_the_statement_never_had_or_a_field_no_revision_added_is_refused() {
+        let store = MemoryStore::new();
+        let statement_id = opened(&store);
+        record_holding(&store, &holding_request(&statement_id), &at(NOW + 1)).unwrap();
+        let mut missing = backfill_of(&statement_id, "raw_record");
+        missing.instrument_id = "INS-01J8XQ4M7K0000000000NVDA".into();
+        let refused = record_holding(&store, &missing, &at(NOW + 2)).unwrap_err();
+        assert!(matches!(refused, StoreError::NoSuchRow(_)), "{refused}");
+        assert!(refused
+            .to_string()
+            .contains("INS-01J8XQ4M7K0000000000NVDA, long"));
+
+        let refused = record_holding(
+            &store,
+            &backfill_of(&statement_id, "cost_basis"),
+            &at(NOW + 3),
+        )
+        .unwrap_err();
+        assert!(refused
+            .to_string()
+            .starts_with("backfill.field \"cost_basis\""));
+        let mut wrong = backfill_of(&statement_id, "pending");
+        wrong.backfill.as_mut().unwrap().contract_version = "v7".into();
+        assert!(record_holding(&store, &wrong, &at(NOW + 4))
+            .unwrap_err()
+            .to_string()
+            .contains("pending was added by v11"));
     }
 
     #[test]

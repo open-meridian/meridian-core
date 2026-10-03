@@ -714,12 +714,19 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         "not said",
     );
     let figures = crate::figures::section(manage.report, manage.now);
+    let declared = crate::declaration::summary(
+        manage.report.and_then(|report| report.declaration.as_ref()),
+        manage
+            .report
+            .map(|report| report.not_carried_seen.as_slice())
+            .unwrap_or_default(),
+    );
     format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
          <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
-         holding it at one will be here. They are not built yet.</p></section>{figures}"
+         holding it at one will be here. They are not built yet.</p></section>{figures}{declared}"
     )
 }
 
@@ -1250,6 +1257,13 @@ async fn complete_instruments(
         currency_source: field(&fields, "currency_source").into(),
         description: field(&fields, "description").into(),
         description_source: field(&fields, "description_source").into(),
+        instrument_type: field(&fields, "instrument_type").into(),
+        instrument_type_source: field(&fields, "instrument_type_source").into(),
+        fund_category: field(&fields, "fund_category").into(),
+        fund_investors: field(&fields, "fund_investors").into(),
+        fund_nav: field(&fields, "fund_nav").into(),
+        fund_liquidity_fee: field(&fields, "fund_liquidity_fee").into(),
+        fund_source: field(&fields, "fund_source").into(),
         identifier_scheme: field(&fields, "identifier_scheme").into(),
         identifier_value: field(&fields, "identifier_value").into(),
         identifier_namespace: field(&fields, "identifier_namespace").into(),

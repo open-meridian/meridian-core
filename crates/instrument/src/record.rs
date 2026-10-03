@@ -5,11 +5,12 @@
 //! contract's, and letting one be the other means a schema change reaches into
 //! the store without passing anything that could object.
 
-use meridian_domain::asset_class;
 use meridian_domain::v1::{
     instrument_value, AssetClass, Identifier as PbIdentifier, InstrumentField,
-    InstrumentRecord as PbInstrument, InstrumentValue, InstrumentValueSource, OfferedValue,
+    InstrumentRecord as PbInstrument, InstrumentType, InstrumentValue, InstrumentValueSource,
+    OfferedValue,
 };
+use meridian_domain::{asset_class, instrument_type};
 
 use crate::store::{Asked, Field, Identifier, Instrument, Offer, Source};
 
@@ -45,6 +46,27 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         record_time_ns: instrument.record_time_ns,
         sources: instrument.sources.iter().map(source_to_wire).collect(),
         offers,
+        instrument_type: type_value(&instrument.instrument_type),
+        money_market_fund: instrument_type::fund_from_text(&instrument.money_market_fund),
+    }
+}
+
+/// A type as the store holds it, as the wire numbers it.
+pub fn type_value(name: &str) -> i32 {
+    instrument_type::read(name).unwrap_or(InstrumentType::Unspecified) as i32
+}
+
+/// A stored value as a person reads it in the history: a class by its word,
+/// a type by its words, a fund's attributes in words.
+pub fn value_words(field: Field, value: &str) -> String {
+    match field {
+        Field::AssetClass => class_words(value),
+        Field::InstrumentType => instrument_type::read(value)
+            .map(instrument_type::words)
+            .unwrap_or(value)
+            .to_string(),
+        Field::MoneyMarketFund => instrument_type::fund_words(value),
+        _ => value.to_string(),
     }
 }
 
@@ -69,6 +91,12 @@ fn offer_to_wire(offer: &Offer) -> OfferedValue {
                 }
                 Field::Currency => instrument_value::Value::Currency(offer.value.clone()),
                 Field::Description => instrument_value::Value::Description(offer.value.clone()),
+                Field::InstrumentType => {
+                    instrument_value::Value::InstrumentType(type_value(&offer.value))
+                }
+                Field::MoneyMarketFund => instrument_value::Value::MoneyMarketFund(
+                    instrument_type::fund_from_text(&offer.value).unwrap_or_default(),
+                ),
                 Field::Identifier => instrument_value::Value::Identifier(
                     offer
                         .identifier
@@ -118,6 +146,8 @@ pub fn field_to_wire(field: Field) -> InstrumentField {
         Field::Currency => InstrumentField::Currency,
         Field::Description => InstrumentField::Description,
         Field::Identifier => InstrumentField::Identifier,
+        Field::InstrumentType => InstrumentField::InstrumentType,
+        Field::MoneyMarketFund => InstrumentField::MoneyMarketFund,
     }
 }
 
@@ -127,18 +157,27 @@ pub fn field_from_wire(value: i32) -> Option<Field> {
         InstrumentField::Currency => Some(Field::Currency),
         InstrumentField::Description => Some(Field::Description),
         InstrumentField::Identifier => Some(Field::Identifier),
+        InstrumentField::InstrumentType => Some(Field::InstrumentType),
+        InstrumentField::MoneyMarketFund => Some(Field::MoneyMarketFund),
         InstrumentField::Unspecified => None,
     }
 }
 
 /// What a record lacks: an asset class or a currency, which the book requires
-/// (W9.1), and a description (W3.11). Computed from the fields; nobody sets
-/// it.
+/// (W9.1), a description (W3.11), and for a money market fund its attributes
+/// (contract v11), which the book's one lot at stable value waits on.
+/// Computed from the fields; nobody sets it.
 pub fn lacks(instrument: &Instrument) -> Vec<Field> {
-    [Field::AssetClass, Field::Currency, Field::Description]
+    let mut lacking: Vec<Field> = [Field::AssetClass, Field::Currency, Field::Description]
         .into_iter()
         .filter(|field| instrument.value(*field).is_empty())
-        .collect()
+        .collect();
+    if instrument_type::read(&instrument.instrument_type) == Some(InstrumentType::MoneyMarketFund)
+        && instrument_type::fund_from_text(&instrument.money_market_fund).is_none()
+    {
+        lacking.push(Field::MoneyMarketFund);
+    }
+    lacking
 }
 
 /// An asset class and a currency in force: what the book needs.
@@ -238,6 +277,8 @@ mod tests {
             version: 1,
             valid_from_ns: 0,
             record_time_ns: 5,
+            instrument_type: String::new(),
+            money_market_fund: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }

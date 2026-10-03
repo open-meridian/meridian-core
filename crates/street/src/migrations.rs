@@ -78,6 +78,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "what_cannot_move",
         sql: include_str!("../migrations/0006_what_cannot_move.sql"),
     },
+    Migration {
+        version: 7,
+        name: "the_edge_keeps_its_own",
+        sql: include_str!("../migrations/0007_the_edge_keeps_its_own.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\
