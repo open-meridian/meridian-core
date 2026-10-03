@@ -113,6 +113,15 @@ ALL_ACCOUNTS = "all-accounts"
 # The asset classes as the Instruments page's form numbers them (W1's list).
 CLASSES = {"equity": 1, "debt": 2, "fund": 3, "derivative": 4, "crypto_asset": 5,
            "event_contract": 6, "cash": 7}
+# An instrument's type within its class, and a money market fund's SEC rule
+# 2a-7 attributes, by the dashboard's form's numbers (contract v11).
+TYPES = {"money_market_fund": 1}
+FUND = {
+    "fund_category": {"government": 1, "prime": 2, "tax_exempt": 3},
+    "fund_investors": {"retail": 1, "institutional": 2},
+    "fund_nav": {"stable": 1, "floating": 2},
+    "fund_liquidity_fee": {"mandatory": 1, "discretionary": 2},
+}
 
 
 def acting_on(instance):
@@ -564,6 +573,20 @@ def instrument(args):
     if asked.get("description"):
         fields["description"] = asked["description"]
         fields["description_source"] = source
+    if asked.get("instrument_type"):
+        if asked["instrument_type"] not in TYPES:
+            raise Failed(f"instrument_type is {'|'.join(TYPES)}")
+        fields["instrument_type"] = str(TYPES[asked["instrument_type"]])
+        fields["instrument_type_source"] = source
+    stated = [name for name in FUND if asked.get(name)]
+    if stated:
+        if len(stated) != len(FUND):
+            raise Failed(f"a money market fund's attributes are stated together: {', '.join(FUND)}")
+        for name, words in FUND.items():
+            if asked[name] not in words:
+                raise Failed(f"{name} is {'|'.join(words)}")
+            fields[name] = str(words[asked[name]])
+        fields["fund_source"] = source
     done = admin.post("/admin/instruments/complete", fields)
     if done.status != 303:
         raise Failed(f"{instrument_id} was not completed: {done.status} {sentence(done)}")
