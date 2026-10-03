@@ -954,6 +954,9 @@ def mcp_list(args):
 STEP = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[[^\]]*\])*)")
 
 
+SET = re.compile(r"((?:[^=\[]|\[[^\]]*\])+)=(.*)", re.S)
+
+
 def put(tree, path, value):
     """Sets `path` in `tree`, by the dictionary's grammar, `[key=value]`
     picking the row whose key is that value; a missing row is added."""
@@ -1020,8 +1023,12 @@ def mcp_call(args):
     if given:
         arguments.update(json.loads(given))
     for each in sets:
-        path, _, value = each.partition("=")
-        put(arguments, path, value)
+        # The path ends at the first = outside its brackets, so a row picked
+        # by `[key=value]` is one path: positions[label=BTC].lots[0].cost=1.
+        assigned = SET.fullmatch(each)
+        if not assigned:
+            raise Failed(f"--set takes PATH=VALUE, not {each!r}")
+        put(arguments, assigned.group(1), assigned.group(2))
     result = rpc("tools/call", {"name": name, "arguments": arguments})
     answer = result.get("structuredContent") or {}
     text = json.dumps(answer, indent=1, sort_keys=True)

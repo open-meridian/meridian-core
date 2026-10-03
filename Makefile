@@ -878,7 +878,7 @@ harness-check:
 		|| fail "the delegation does not reach dashboard__complete_instruments"; \
 	! grep -q '^custody__' .harness/tools || fail "a delegation covering the deployment admin alone lists a plugin's tools"; \
 	$(HARNESS_RUN) mcp call dashboard__complete_instruments '{"completions": [{"instrument_id": "LCL-none", "against_version": 1, "values": [{"currency": "USD"}], "source": "s"}]}' \
-		--expect-outcome refused --expect 'completions[0].note' >/dev/null || fail "a completion through /mcp without a note was not refused naming completions[0].note"; \
+		--set 'completions[instrument_id=LCL-none].source=a statement (a=b)' --expect-outcome refused --expect 'completions[0].note' >/dev/null || fail "a completion through /mcp without a note was not refused naming completions[0].note"; \
 	completed="$$($(HARNESS_RUN) mcp complete --identifier 'symbol (stand-in): SHRT' asset_class=equity currency=USD \
 		source='the stand-in statement' note='Completed by the harness agent from the statement.')" \
 		|| fail "the agent did not complete a record through /mcp"; \
