@@ -36,8 +36,12 @@ against plugins. Decision 012 freed the word by renaming the component that
 held it, because in the v1 vocabulary `meridian_kernel` is the book of record
 and this store holds the custodian's belief instead.
 
-**Plugins are ephemeral.** Anything a plugin holds can vanish at any moment. The
-kernel is the seed on restart.
+**Stateless compute, owned storage.** Anything a plugin's process holds can
+vanish at any moment; the kernel is the seed on restart. A plugin holding an
+edge role may also own the storage the deployment gives its instance, for its
+raw external records, and rebuild from it; the launcher and the chart mount it
+for that instance alone, never delete it, and no plugin's storage is a channel
+to another (decisions/028).
 
 ## Verification
 

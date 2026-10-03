@@ -12,7 +12,10 @@
   launched, which marks what the launcher made and alone may remove, and
   live: the live shape of a development deployment
   (spec/live-plugin-development), where the plugin runs the files sent to it
-  since its image, from a folder it shares with its sidecar.
+  since its image, from a folder it shares with its sidecar; and storage: an
+  edge plugin's shape (decisions/028), which mounts its instance's claim,
+  `<fullname>-storage-<instance>`, in the plugin's container alone, at the
+  path MERIDIAN_STORAGE_DIR names.
 
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -87,6 +90,14 @@ spec:
       {{- $podSecurity := $top.Values.podSecurityContext | default dict }}
       {{- if .live }}
       {{- $podSecurity = merge (dict "fsGroup" 65532) $podSecurity }}
+      {{- end }}
+      {{- /*
+        Storage: the plugin writes its claim as the group a fresh volume is
+        given, unless podSecurityContext says otherwise (a cluster that
+        assigns its own, as OpenShift does, sets pluginStorage.fsGroup empty).
+      */}}
+      {{- if and .storage $top.Values.pluginStorage.fsGroup }}
+      {{- $podSecurity = merge (deepCopy $podSecurity) (dict "fsGroup" $top.Values.pluginStorage.fsGroup "fsGroupChangePolicy" "OnRootMismatch") }}
       {{- end }}
       {{- with $podSecurity }}
       securityContext:
@@ -253,6 +264,16 @@ spec:
             - name: MERIDIAN_LIVE_DIR
               value: /plugin/live
             {{- end }}
+            {{- if $.storage }}
+            {{- /*
+              Its instance's storage (decisions/028): durable, its own, and
+              no other plugin's. What it keeps there is its raw external
+              records and its working state; a fact anyone else needs still
+              goes through the sidecar.
+            */}}
+            - name: MERIDIAN_STORAGE_DIR
+              value: /var/lib/meridian/storage
+            {{- end }}
             {{- range $name, $value := .env }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -279,6 +300,10 @@ spec:
             - name: live
               mountPath: /plugin/live
             {{- end }}
+            {{- if $.storage }}
+            - name: storage
+              mountPath: /var/lib/meridian/storage
+            {{- end }}
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
@@ -292,6 +317,11 @@ spec:
         - name: live
           emptyDir:
             sizeLimit: 256Mi
+        {{- end }}
+        {{- if and .storage .plugin }}
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ include "meridian-runtime.fullname" $top }}-storage-{{ .instance }}
         {{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- /*

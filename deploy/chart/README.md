@@ -100,3 +100,27 @@ of three ways, chosen in the wizard rather than here:
 Nothing is configured here for any of them. `dashboard.oidc` exists for an
 administrator who would rather set a provider in values than in the wizard;
 everything else the wizard writes into Secrets this chart names.
+
+## Storage for plugins at the edge
+
+A plugin holding an edge role -- `ccm`, `custody`, `dgm`, `match`,
+`reporting`, `servicing` or `settlement` -- keeps an outside party's raw
+records and its working state, and rebuilds from them after a restart
+(decisions/028). Each such instance is given a volume of its own, a
+PersistentVolumeClaim named `<release>-meridian-runtime-storage-<instance>`,
+`pluginStorage.size` each from the default storage class or
+`pluginStorage.storageClassName`, mounted in that plugin's container alone at
+the path `MERIDIAN_STORAGE_DIR` names. No other plugin can mount it; where the
+cluster has ValidatingAdmissionPolicy (Kubernetes 1.30 and later), a plugin's
+pod asking for any storage but its own instance's is refused.
+
+Stopping a plugin keeps its storage, and launching the same plugin as the same
+instance mounts it again; launching a different plugin as that instance is
+refused while it is kept. Nothing in the deployment deletes one -- not
+stopping, not removing the plugin from `sidecars`, not uninstalling -- since a
+firm may have to keep those records for years. Removing one is an
+administrator's act, with `kubectl delete pvc`, until the dashboard has a
+place for it. Encryption at rest, snapshots and backups are the storage
+class's and the cluster's, as they are for the database; the claims carry
+`meridian.dev/component: plugin-storage` for a backup policy to select.
+`pluginStorage.enabled: false` gives no plugin storage.

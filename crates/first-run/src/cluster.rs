@@ -201,6 +201,71 @@ impl ApiServer {
             .to_string())
     }
 
+    /// A PersistentVolumeClaim in this namespace, or None when there is none
+    /// by that name: an edge plugin's storage (decisions/028).
+    pub async fn persistent_volume_claim(
+        &self,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>, ClusterError> {
+        let path = format!(
+            "/api/v1/namespaces/{}/persistentvolumeclaims/{name}",
+            self.namespace
+        );
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        if !(200..300).contains(&status) {
+            return Err(ClusterError(format!("GET {path} -> {status}: {body}")));
+        }
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))
+    }
+
+    /// Create a PersistentVolumeClaim in this namespace; its name, as the
+    /// API has it.
+    pub async fn create_persistent_volume_claim(
+        &self,
+        manifest: &serde_json::Value,
+    ) -> Result<String, ClusterError> {
+        let path = format!(
+            "/api/v1/namespaces/{}/persistentvolumeclaims",
+            self.namespace
+        );
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .body(manifest.to_string())
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("POST {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(ClusterError(format!("POST {path} -> {status}: {body}")));
+        }
+        let made: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|failed| ClusterError(format!("POST {path}: {failed}")))?;
+        Ok(made["metadata"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
     /// Delete a Deployment in this namespace; false when it was not there.
     pub async fn delete_deployment(&self, name: &str) -> Result<bool, ClusterError> {
         let path = format!(

@@ -10,6 +10,13 @@
 //! registry by digest and nothing else, roles that are names. It
 //! removes only Deployments carrying its label, and makes none for an
 //! instance that already has one.
+//!
+//! A plugin holding an edge role is also given its instance's storage
+//! (decisions/028): a claim the chart's own template describes, made once and
+//! kept, which its Deployment mounts. Stopping removes the Deployment and
+//! never the claim, so launching the same plugin as the same instance again
+//! finds what it kept; the launcher has no right to delete a claim at all,
+//! and refuses to hand one plugin's storage to another.
 
 use meridian_domain::v1::CreatePluginRequest;
 
@@ -62,19 +69,59 @@ pub fn checked(request: &CreatePluginRequest, registry: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// The shapes the chart renders for a launched plugin: the plugin shape and,
+/// on a development deployment alone, the live shape; and, where the chart
+/// gives edge plugins storage, the same two with the instance's storage
+/// mounted and the claim it mounts.
+#[derive(Debug, Clone, Default)]
+pub struct Shapes {
+    pub plain: String,
+    pub live: Option<String>,
+    pub storage: Option<StorageShapes>,
+}
+
+/// An edge plugin's shapes (decisions/028), and which roles are the edge's.
+#[derive(Debug, Clone, Default)]
+pub struct StorageShapes {
+    pub plain: String,
+    pub live: Option<String>,
+    pub claim: String,
+    pub edge_roles: Vec<String>,
+}
+
+/// What a request is made from: the Deployment's template, and the claim's
+/// for a plugin given storage.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chosen<'a> {
+    pub workload: &'a str,
+    pub claim: Option<&'a str>,
+}
+
+/// Whether a plugin holding `roles` is an edge plugin, which alone may own
+/// storage (decisions/028, ruled point 1, and its amendment for `reporting`).
+pub fn at_the_edge(roles: &[String], edge_roles: &[String]) -> bool {
+    roles.iter().any(|role| edge_roles.contains(role))
+}
+
 /// Which of the chart's templates a request is made from: the plugin shape,
-/// or the live shape (spec/live-plugin-development, rulings 2 and 4). A live
-/// request is refused on a deployment not installed for development, and on
-/// one whose chart rendered no live shape; nothing else is ever made in its
-/// place.
+/// or the live shape (spec/live-plugin-development, rulings 2 and 4), each
+/// with its instance's storage when the plugin holds an edge role and the
+/// chart gives edge plugins storage (decisions/028). A live request is
+/// refused on a deployment not installed for development, and on one whose
+/// chart rendered no live shape; nothing else is ever made in its place.
 pub fn template_for<'a>(
     request: &CreatePluginRequest,
     development: bool,
-    plain: &'a str,
-    live: Option<&'a str>,
-) -> Result<&'a str, String> {
+    shapes: &'a Shapes,
+) -> Result<Chosen<'a>, String> {
+    let storage = shapes
+        .storage
+        .as_ref()
+        .filter(|storage| at_the_edge(&request.roles, &storage.edge_roles));
+    let claim = storage.map(|storage| storage.claim.as_str());
     if !request.live {
-        return Ok(plain);
+        let workload = storage.map_or(shapes.plain.as_str(), |storage| storage.plain.as_str());
+        return Ok(Chosen { workload, claim });
     }
     if !development {
         return Err(format!(
@@ -83,12 +130,81 @@ pub fn template_for<'a>(
             request.instance_id
         ));
     }
-    live.ok_or_else(|| {
+    let live = match storage {
+        Some(storage) => storage.live.as_deref(),
+        None => shapes.live.as_deref(),
+    };
+    let workload = live.ok_or_else(|| {
         format!(
             "{} was asked for live, and this deployment's chart renders no live shape",
             request.instance_id
         )
-    })
+    })?;
+    Ok(Chosen { workload, claim })
+}
+
+/// The plugin's name, from its image in the deployment's own registry.
+fn plugin_of(image: &str) -> Option<&str> {
+    let (_, after) = image.split_once("/plugins/")?;
+    let (name, _) = after.split_once("@sha256:")?;
+    Some(name)
+}
+
+/// The label a claim carries naming the plugin whose records it holds.
+pub const PLUGIN_LABEL: &str = "meridian.dev/plugin";
+
+/// The claim template, filled in for a checked request: the instance's
+/// storage, labelled with the plugin it belongs to.
+pub fn claim(template: &str, request: &CreatePluginRequest) -> Result<serde_json::Value, String> {
+    let plugin =
+        plugin_of(&request.image).ok_or_else(|| format!("{} names no plugin", request.image))?;
+    let filled = template
+        .replace("__INSTANCE__", &request.instance_id)
+        .replace("__PLUGIN__", plugin);
+    if let Some(left) = placeholder(&filled) {
+        return Err(format!(
+            "the claim template has a placeholder this does not fill: {left}"
+        ));
+    }
+    let claim: serde_json::Value = serde_json::from_str(&filled)
+        .map_err(|failed| format!("the claim template is not JSON: {failed}"))?;
+    let labels = &claim["metadata"]["labels"];
+    if labels["meridian.dev/launched"] != "true" || labels[PLUGIN_LABEL] != plugin {
+        return Err(
+            "the claim template does not mark what it makes as the launcher's, \
+                    for its plugin"
+                .into(),
+        );
+    }
+    Ok(claim)
+}
+
+/// Whether a claim already there for the instance may be mounted by this
+/// request: only one the launcher made, for the same plugin. Another
+/// plugin's records are never a channel to this one (decisions/028), so
+/// launching a different plugin as an instance whose storage is kept is
+/// refused until an administrator removes that storage.
+pub fn reusable(existing: &serde_json::Value, request: &CreatePluginRequest) -> Result<(), String> {
+    let plugin = plugin_of(&request.image).unwrap_or_default();
+    let name = existing["metadata"]["name"].as_str().unwrap_or_default();
+    let labels = &existing["metadata"]["labels"];
+    if labels["meridian.dev/launched"] != "true" {
+        return Err(format!(
+            "{name}, the storage {} would mount, was not made by the launcher; \
+             it is kept, and an administrator decides what becomes of it",
+            request.instance_id
+        ));
+    }
+    match labels[PLUGIN_LABEL].as_str() {
+        Some(held) if held == plugin => Ok(()),
+        held => Err(format!(
+            "{name}, {}'s storage, holds the records of {}, not {plugin}; it is kept, \
+             so launch {} as another instance, or have an administrator remove the storage",
+            request.instance_id,
+            held.unwrap_or("another plugin"),
+            plugin,
+        )),
+    }
 }
 
 /// The template, filled in for a checked request, as the Deployment to

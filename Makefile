@@ -823,6 +823,9 @@ harness-check:
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
 	@$(PY) e2e/harness/known_passwords.py --self-test
+	@# One list of edge roles (decisions/028): the harness gives storage to the
+	@# plugins the chart does.
+	@$(PY) -c 'import re, sys; chart = re.search(r"define \"meridian-runtime.edgeRoles\" -}}\n(.*)\n", open("deploy/chart/templates/_helpers.tpl").read()).group(1).split(","); harness = list(eval(re.search(r"^EDGE_ROLES = (\(.*\))$$", open("deploy/harness/harness.py").read(), re.M).group(1))); sys.exit(0 if chart == harness else f"harness-check FAILED: the harness gives storage to {harness}, the chart to {chart}")'
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
 		|| { echo "harness-check FAILED: the harness image did not build" >&2; exit 1; }
@@ -883,9 +886,21 @@ harness-check:
 	$(HARNESS_STORE) book >.harness/book 2>>.e2e-harness.log || fail "store book did not print the book"; \
 	[ ! -s .harness/book ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book)"; \
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
+	$(HARNESS) exec -T -u 65532 custody python -c 'import os, pathlib; pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").write_text("a raw record")' \
+		|| fail "the custody plugin could not write its storage as a user that is not root"; \
+	$(HARNESS) up -d --force-recreate --no-deps custody >>.e2e-harness.log 2>&1 || fail "the custody plugin's container was not made again"; \
+	kept=; for i in $$(seq 1 30); do \
+		kept="$$($(HARNESS) exec -T custody python -c 'import os, pathlib; print(pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").read_text())' 2>/dev/null)" && break; \
+		sleep 1; \
+	done; \
+	[ "$$kept" = "a raw record" ] || fail "the custody plugin's storage did not outlive its container: $$kept"; \
+	for inner in operations restarted; do \
+		$(HARNESS) exec -T $$inner python -c 'import os, sys; sys.exit("MERIDIAN_STORAGE_DIR" in os.environ or os.path.exists("/var/lib/meridian/storage"))' \
+			|| fail "$$inner, holding no edge role, was given storage"; \
+	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1025,6 +1040,37 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker makes no credential for a sidecar's instance" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '"instance_id":"check-1","roles":\["custody","reporting"\]' \
 		|| { echo "chart-check FAILED: the bundled broker does not know a sidecar's instance and roles" >&2; exit 1; }
+	@# decisions/028. A configured plugin holding an edge role gets a claim of
+	@# its own, kept when the plugin is removed, mounted in its plugin's
+	@# container alone and named in MERIDIAN_STORAGE_DIR; one holding none gets
+	@# nothing; the launcher holds the edge shape and the claim it makes; off,
+	@# nothing of it renders; and where the cluster has
+	@# ValidatingAdmissionPolicy, every plugin pod is held to it.
+	@edge="--set sidecars[0].instanceId=edge-1 --set sidecars[0].roles={custody} --set sidecars[0].plugin.image=x/edge:1 \
+		--set sidecars[1].instanceId=inner-1 --set sidecars[1].roles={operations} --set sidecars[1].plugin.image=x/inner:1"; \
+	rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge 2>/dev/null)"; \
+	echo "$$rendered" | awk '/^---/{c=0} /^kind: PersistentVolumeClaim$$/{c=1} c&&/^  name: check-meridian-runtime-storage-edge-1$$/{n=1} c&&/helm.sh\/resource-policy: keep/{k=1} END{exit !(n&&k)}' \
+		|| { echo "chart-check FAILED: a configured plugin holding an edge role has no claim of its own that the chart keeps" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q 'claimName: check-meridian-runtime-storage-edge-1$$' \
+		|| { echo "chart-check FAILED: the edge plugin's pod does not mount its own claim" >&2; exit 1; }; \
+	[ "$$(echo "$$rendered" | grep -c 'mountPath: /var/lib/meridian/storage$$')" = 1 ] \
+		&& echo "$$rendered" | grep -A1 'name: MERIDIAN_STORAGE_DIR$$' | grep -q 'value: /var/lib/meridian/storage$$' \
+		|| { echo "chart-check FAILED: the storage is not mounted in the plugin's container alone, at MERIDIAN_STORAGE_DIR" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q 'storage-inner-1' \
+		&& { echo "chart-check FAILED: a plugin holding no edge role was given storage" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '^  claim.json: ' && echo "$$rendered" | grep -q '^  plugin-storage.json: ' \
+		|| { echo "chart-check FAILED: the launcher holds no edge shape or no claim to make" >&2; exit 1; }; \
+	echo "$$rendered" | grep -A1 'name: MERIDIAN_LAUNCHER_EDGE_ROLES$$' | grep -q 'value: "ccm,custody,dgm,match,reporting,servicing,settlement"$$' \
+		|| { echo "chart-check FAILED: the launcher is not told decisions/028's seven edge roles" >&2; exit 1; }; \
+	off="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge --set pluginStorage.enabled=false 2>/dev/null)"; \
+	echo "$$off" | grep -q 'storage-edge-1\|claim.json\|MERIDIAN_STORAGE_DIR\|persistentvolumeclaims' \
+		&& { echo "chart-check FAILED: with pluginStorage off, storage still renders" >&2; exit 1; }; \
+	held="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy --show-only templates/plugin-storage.yaml 2>/dev/null)"; \
+	echo "$$held" | grep -q "'check-meridian-runtime-storage-' +" \
+		&& echo "$$held" | grep -q '(ccm|custody|dgm|match|reporting|servicing|settlement)' \
+		&& echo "$$held" | grep -q 'meridian.dev/component: sidecar' \
+		|| { echo "chart-check FAILED: the admission policy on plugin pods does not render with their claim, the edge roles and its selector" >&2; exit 1; }
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
@@ -1223,9 +1269,10 @@ chart-check:
 		&& [ "$$(echo "$$broker" | grep -A1 'resources: \["secrets"\]' | grep -c 'resourceNames: \["check-meridian-runtime-broker-launched"\]')" = 1 ] \
 		|| { echo "chart-check FAILED: the broker's process may do more than read Deployments and write its launched plugins' credentials:" >&2; echo "$$broker" >&2; exit 1; }; \
 	launcher="$$(doc Role check-meridian-runtime-launcher)"; \
-	[ -n "$$launcher" ] && [ "$$(echo "$$launcher" | grep -c 'resources:')" = 1 ] \
+	[ -n "$$launcher" ] && [ "$$(echo "$$launcher" | grep -c 'resources:')" = 2 ] \
 		&& echo "$$launcher" | grep -q 'resources: \["deployments"\]' \
-		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019):" >&2; echo "$$launcher" >&2; exit 1; }; \
+		&& echo "$$launcher" | grep -A1 'resources: \["persistentvolumeclaims"\]' | grep -q 'verbs: \["create", "get"\]$$' \
+		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019) and make and read edge plugins' storage, never delete it (decisions/028):" >&2; echo "$$launcher" >&2; exit 1; }; \
 	template="$$(doc ConfigMap check-meridian-runtime-launcher-template)"; \
 	echo "$$template" | grep -q 'meridian.dev/launched' && echo "$$template" | grep -q 'check-meridian-runtime-broker-launched' \
 		|| { echo "chart-check FAILED: the launcher's template does not mark its workloads, or takes their credential from anywhere but the launched plugins' Secret" >&2; exit 1; }; \

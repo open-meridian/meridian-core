@@ -159,3 +159,68 @@ readinessProbe:
     medium: Memory
     sizeLimit: 1Mi
 {{- end -}}
+
+{{/*
+  The edge roles, comma-joined: the roles whose plugins keep an external
+  party's raw records and alone may own storage for them (decisions/028,
+  ruled point 1 and its amendment for `reporting`; meridian-design's
+  matrix/boundaries/roles.yaml marks the same seven `edge: true`). The
+  launcher is given this list, and the admission policy on plugin pods reads
+  it, so the chart says it once.
+*/}}
+{{- define "meridian-runtime.edgeRoles" -}}
+ccm,custody,dgm,match,reporting,servicing,settlement
+{{- end -}}
+
+{{/*
+  "true" when a plugin holding `roles` (a list) is given its instance's
+  storage: the chart gives edge plugins storage, and it holds an edge role.
+  Takes a dict: top (the chart), roles.
+*/}}
+{{- define "meridian-runtime.storedAtTheEdge" -}}
+{{- $edge := splitList "," (include "meridian-runtime.edgeRoles" .top) -}}
+{{- $held := false -}}
+{{- range .roles -}}
+{{- if has . $edge -}}{{- $held = true -}}{{- end -}}
+{{- end -}}
+{{- if and .top.Values.pluginStorage.enabled $held -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+  An edge plugin instance's storage (decisions/028): one claim per instance,
+  `<fullname>-storage-<instance>`, made by the deployment and mounted by
+  that instance's pod alone. Never removed with the plugin: the chart keeps
+  what it rendered (`helm.sh/resource-policy: keep`), and the launcher has no
+  right to delete a claim. Removing it is an administrator's act.
+
+  Takes a dict: top (the chart), instance, and launched with plugin (the
+  plugin's name, a placeholder in the launcher's copy) for the claim the
+  launcher makes, which it alone may mount again, for the same plugin.
+*/}}
+{{- define "meridian-runtime.pluginStorage" -}}
+{{- $top := .top -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-storage-{{ .instance }}
+  labels:
+    meridian.dev/component: plugin-storage
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- if .launched }}
+    meridian.dev/launched: "true"
+    meridian.dev/plugin: {{ .plugin | quote }}
+    {{- end }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+  {{- if not .launched }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with $top.Values.pluginStorage.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $top.Values.pluginStorage.size | quote }}
+{{- end -}}

@@ -942,6 +942,8 @@ spec:
         "the broker runs as its own process's child, and reads the Deployments and its Secret",
     )
 
+    edge_storage(s)
+
     print("P: a person makes a plugin, launches it, and opens its page", flush=True)
     # Results 2 and 3 of plans/a-person-reaches-a-plugin, by the real CLI:
     # `meridian plugin new`, `connect`, `upload`, `launch` and `list`, then
@@ -1043,6 +1045,26 @@ spec:
             time.sleep(1)
         s.check(up, f"the launcher made {' and '.join(deployments)}, and they came up")
         if up:
+            # decisions/028: the custody copy holds an edge role, so the
+            # launcher made its instance's claim, labelled with its plugin,
+            # and its pod mounts it; the reference plugin holds none.
+            claim = f"{RELEASE}-meridian-runtime-storage-{CUSTODY_INSTANCE}"
+            held = json.loads(kubectl("get", "pvc", claim, "--ignore-not-found", "-o", "json") or "{}")
+            s.check(
+                held.get("status", {}).get("phase") == "Bound"
+                and held["metadata"]["labels"].get("meridian.dev/plugin") == "reference-custody",
+                f"the custody plugin's storage, {claim}, is made, bound and its plugin's: "
+                f"{held.get('status', {}).get('phase', 'absent')}",
+            )
+            volumes = kubectl("get", "deployment", deployments[1], "-o",
+                              "jsonpath={.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}")
+            s.check(volumes == claim, f"and its pod mounts that claim and no other: {volumes or 'none'}")
+            s.check(
+                kubectl("get", "pvc", f"{RELEASE}-meridian-runtime-storage-{instance}",
+                        "--ignore-not-found", "-o", "name") == "",
+                "the reference plugin, holding no edge role, has no storage",
+            )
+        if up:
             kubectl("exec", "e2e-plugin", "-c", "browser", "--", "touch", "/shared/open-now")
         phase = ""
         for _ in range(600):
@@ -1129,6 +1151,67 @@ spec:
         s.check(status != 303, f"and the code, once spent, is refused: {status}")
 
     return verdict(s)
+
+
+def edge_storage(s):
+    """decisions/028, as the chart installed it: the launcher holds an edge
+    plugin's shape and the claim it makes, and, where the cluster has
+    ValidatingAdmissionPolicy, a plugin's pod mounting any storage but its
+    own instance's claim, or that claim without an edge role, is refused.
+
+    Asked of the API server by server-side dry run, so nothing is made: a
+    pod carrying the plugin label, a sidecar holding the roles, and the
+    volume under test. Launching an edge plugin for real is section P's.
+    """
+    print("S: an edge plugin's storage, and the policy on plugin pods", flush=True)
+    template = json.loads(kubectl(
+        "get", "configmap", f"{RELEASE}-meridian-runtime-launcher-template", "-o", "json"))["data"]
+    s.check(
+        {"plugin-storage.json", "claim.json"} <= set(template),
+        f"the launcher holds an edge plugin's shape and its claim: {sorted(template)}",
+    )
+    policy = f"{RELEASE}-meridian-runtime-plugin-storage"
+    if not subprocess.run(["kubectl", "get", "validatingadmissionpolicy", policy],
+                          capture_output=True).returncode == 0:
+        s.note("skipped the policy: this cluster has no ValidatingAdmissionPolicy (before 1.30)")
+        return
+    own = f"{RELEASE}-meridian-runtime-storage-e2e-edge"
+
+    def admitted(roles, volume):
+        manifest = json.dumps({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "e2e-edge", "labels": {
+                "meridian.dev/component": "sidecar", "meridian.dev/instance": "e2e-edge"}},
+            "spec": {
+                "containers": [
+                    {"name": "sidecar", "image": "busybox:1",
+                     "env": [{"name": "MERIDIAN_PLUGIN_ROLES", "value": roles}]},
+                    {"name": "plugin", "image": "busybox:1",
+                     "volumeMounts": [{"name": "storage", "mountPath": "/var/lib/meridian/storage"}]},
+                ],
+                "volumes": [{"name": "storage", **volume}],
+            },
+        })
+        done = subprocess.run(
+            ["kubectl", "--namespace", NAMESPACE, "create", "--dry-run=server", "-f", "-"],
+            input=manifest, capture_output=True, text=True,
+        )
+        return done.returncode == 0, (done.stdout + done.stderr).strip()
+
+    claim = lambda name: {"persistentVolumeClaim": {"claimName": name}}
+    ok, said = admitted("custody", claim(own))
+    s.check(ok, f"a custody plugin's pod mounting its own instance's claim is admitted: {said}")
+    ok, said = admitted("operations,reporting", claim(own))
+    s.check(ok, f"so is one holding reporting, an outbound edge, beside operations: {said}")
+    for roles, volume, why, words in [
+        ("custody", claim(f"{RELEASE}-meridian-runtime-storage-another"),
+         "another instance's claim", "its own instance's claim"),
+        ("custody", {"hostPath": {"path": "/var/lib"}}, "a host path", "its own instance's claim"),
+        ("operations", claim(own), "its own claim, holding no edge role", "edge role"),
+        ("", claim(own), "its own claim, holding no role", "edge role"),
+    ]:
+        ok, said = admitted(roles, volume)
+        s.check(not ok and words in said, f"a plugin's pod mounting {why} is refused: {said}")
 
 
 def verdict(s):

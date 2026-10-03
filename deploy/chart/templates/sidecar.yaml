@@ -9,6 +9,11 @@
 {{- end }}
 {{- end }}
 {{- $full := include "meridian-runtime.fullname" $top }}
+{{- $storage := and .plugin (include "meridian-runtime.storedAtTheEdge" (dict "top" $top "roles" (.roles | default list))) }}
+{{- if $storage }}
+{{- include "meridian-runtime.pluginStorage" (dict "top" $top "instance" .instanceId) }}
+---
+{{- end }}
 {{- include "meridian-runtime.plugin" (dict
       "top" $top
       "name" (printf "%s-sidecar-%s" $full .instanceId)
@@ -18,6 +23,7 @@
       "brokerKey" .instanceId
       "plugin" .plugin
       "imageTag" .imageTag
-      "launched" false) }}
+      "launched" false
+      "storage" $storage) }}
 ---
 {{- end }}

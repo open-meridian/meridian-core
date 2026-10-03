@@ -1,0 +1,75 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-plugin-storage" $full }}
+{{/*
+  Defence in depth for decisions/028, where the cluster can say so itself
+  (Kubernetes 1.30 and later): a plugin's pod mounts no storage but its own
+  instance's claim, and only a plugin holding an edge role mounts that. The
+  launcher and the chart already make every plugin's pod from one shape that
+  mounts nothing else; this holds a pod made any other way to the same.
+
+  A plugin's pod is any carrying `meridian.dev/component: sidecar`, launched
+  or configured. Its volumes may be what holds nothing durable -- an
+  emptyDir, a ConfigMap, a Secret, a projected or downward-API volume, which
+  a cluster's own admission (a service account's token, a mesh's proxy) may
+  add -- or the claim `<fullname>-storage-<its instance>`. A claim of any
+  other name, a host path, an ephemeral claim or any other volume source is
+  refused, and so is its own claim on a pod whose sidecar holds no edge role.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: claim
+      expression: >-
+        '{{ $full }}-storage-' +
+        object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: edge
+      expression: >-
+        object.spec.containers.exists(c, c.name == "sidecar" && has(c.env) &&
+          c.env.exists(e, e.name == "MERIDIAN_PLUGIN_ROLES" && has(e.value) &&
+            e.value.matches("(^|,)({{ include "meridian-runtime.edgeRoles" . | replace "," "|" }})(,|$)")))
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+          has(v.emptyDir) || has(v.configMap) || has(v.secret) ||
+          has(v.projected) || has(v.downwardAPI) ||
+          (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == variables.claim))
+      message: >-
+        a plugin's pod mounts no storage but its own instance's claim
+        (decisions/028)
+    - expression: >-
+        variables.edge || !has(object.spec.volumes) ||
+        !object.spec.volumes.exists(v, has(v.persistentVolumeClaim))
+      message: >-
+        only a plugin holding an edge role has storage (decisions/028)
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+    objectSelector:
+      matchLabels:
+        meridian.dev/component: sidecar
+{{- end }}

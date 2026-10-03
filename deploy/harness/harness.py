@@ -20,7 +20,10 @@ the same image with the list on stdin:
       each, its sidecar as instance NAME holding those roles, and the plugin
       as the service NAME in its sidecar's network namespace, restarted when
       it fails, as a pod's container is; the broker configured for them all,
-      and a password drawn for each. The first is the runner's plugin.
+      and a password drawn for each. A plugin holding an edge role is also
+      given its storage (decisions/028): a volume of its own, kept while the
+      run's volumes are, at the path MERIDIAN_STORAGE_DIR names. The first is
+      the runner's plugin.
 
   ready [--seconds N]
       Until the plugin has registered with its sidecar and the dashboard lists
@@ -611,9 +614,15 @@ ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # Names the deployment already holds: compose.yaml's services, and the broker
 # users that are not plugins. A sidecar is the service `sidecar-<instance>`.
 TAKEN = {"keys", "postgres", "broker-config", "nats", "migrate", "street", "bor",
-         "instrument", "conductor", "dashboard", "runner", "store",
+         "instrument", "conductor", "dashboard", "runner", "store", "storage",
          "runtime", "first-run", "dashboard-1"}
 RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image of the harness's commit}"
+# The roles whose plugins own storage for their raw external records
+# (decisions/028), as the chart's `meridian-runtime.edgeRoles` says them; a
+# plugin holding any is given a volume of its own, where the chart gives it a
+# claim of its own, at the same path.
+EDGE_ROLES = ("ccm", "custody", "dgm", "match", "reporting", "servicing", "settlement")
+STORAGE_DIR = "/var/lib/meridian/storage"
 
 
 def plugins_listed(text):
@@ -655,12 +664,25 @@ def compose(args):
     names = [plugin["instance"] for plugin in listed]
     instances = [{"instance_id": plugin["instance"], "roles": plugin["roles"]} for plugin in listed]
     instances.append({"instance_id": "dashboard-1", "component": "dashboard"})
+    stored = [plugin["instance"] for plugin in listed
+              if any(role in EDGE_ROLES for role in plugin["roles"])]
     services = {
         "keys": {"environment": {"MERIDIAN_HARNESS_BROKER_USERS": " ".join(names)}},
         "broker-config": {"environment": {
             "MERIDIAN_HARNESS_INSTANCES": json.dumps({"instances": instances})}},
         "runner": {"environment": {"MERIDIAN_HARNESS_INSTANCE": names[0]}},
     }
+    if stored:
+        # Each edge plugin's volume made writable before its plugin starts,
+        # whichever user the plugin's image runs as: a fresh volume is
+        # root's, and only the plugin's own container mounts it after this.
+        services["storage"] = {
+            "image": "alpine/openssl:3.3.2",
+            "entrypoint": ["sh", "-c"],
+            "command": ["chmod 0777 /storage/*"],
+            "volumes": [f"storage-{name}:/storage/{name}" for name in stored],
+            "networks": ["harness"],
+        }
     for plugin in listed:
         name = plugin["instance"]
         # Its sidecar, as instance `name` holding the plugin's roles. No
@@ -703,11 +725,19 @@ def compose(args):
             "network_mode": f"service:sidecar-{name}",
             "restart": "on-failure",
         }
+        # An edge plugin's storage (decisions/028): its own volume, which a
+        # restart or a recreated container keeps and `down -v` removes.
+        if name in stored:
+            services[name]["depends_on"]["storage"] = {"condition": "service_completed_successfully"}
+            services[name]["environment"]["MERIDIAN_STORAGE_DIR"] = STORAGE_DIR
+            services[name]["volumes"] = [f"storage-{name}:{STORAGE_DIR}"]
     written = {
         "x-harness": "written by harness.py compose for " + ", ".join(names)
                      + "; written again, never edited, for another list",
         "services": services,
     }
+    if stored:
+        written["volumes"] = {f"storage-{name}": {} for name in stored}
     print(json.dumps(written, indent=2))
 
 

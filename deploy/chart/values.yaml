@@ -347,6 +347,34 @@ launcher:
   enabled: true
   instanceId: launcher-1
 
+# Storage for a plugin at the edge (decisions/028): a plugin holding an edge
+# role (ccm, custody, dgm, match, reporting, servicing, settlement) keeps an
+# external party's raw records -- a venue's messages, a custodian's
+# statements, what it sent a regulator -- and its working state, and rebuilds
+# from them after a restart. Each such instance gets a volume of its own, one
+# PersistentVolumeClaim, `<release>-meridian-runtime-storage-<instance>`,
+# mounted in its plugin's container alone at the path MERIDIAN_STORAGE_DIR
+# names. No other plugin's pod may mount it, which an admission policy holds
+# where the cluster has ValidatingAdmissionPolicy.
+#
+# Stopping a plugin keeps its storage, and launching the same plugin as the
+# same instance mounts it again; launching another plugin as that instance is
+# refused while it is kept. Nothing in the deployment deletes one, uninstalling
+# included: removing it is an administrator's act, against the records a firm
+# must keep. Encryption at rest and backups are the storage class's and the
+# cluster's, as for the database.
+pluginStorage:
+  enabled: true
+  # Each instance's, requested once when it is made; a larger value applies
+  # to instances made after it changes.
+  size: 5Gi
+  # Empty is the cluster's default storage class.
+  storageClassName: ""
+  # The group a fresh volume is made writable by, so a plugin running as a
+  # non-root user can write it. Empty where the cluster assigns its own, as
+  # OpenShift does; podSecurityContext.fsGroup, when set, wins.
+  fsGroup: 65532
+
 
 resources:
   requests:

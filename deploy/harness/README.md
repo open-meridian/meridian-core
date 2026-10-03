@@ -69,9 +69,19 @@ sidecar before the deployment serves is refused, exits, and finds it serving
 on its next start. It also configures the broker for every instance and its
 roles; a name that is not a role stops the run at `broker-config`, naming it.
 
+A plugin holding an edge role (`ccm`, `custody`, `dgm`, `match`, `reporting`,
+`servicing` or `settlement`) is also given its storage, as a deployment gives
+it (decisions/028): a volume of its own, `storage-<instance>`, at the path
+`MERIDIAN_STORAGE_DIR` names (`/var/lib/meridian/storage`), writable by
+whichever user its image runs as. It outlives the plugin's restarts and a
+container made again (`up -d --force-recreate <instance>`), which is how a
+plugin's e2e proves it rebuilds from what it kept, and goes with `down -v`.
+No other plugin mounts it, and a plugin holding no edge role has none.
+
 - `instance` is lower case letters, digits and inner hyphens, at most 32,
   starting with a letter, and none of the names the harness already holds
-  (its services, `runtime`, `first-run`, `dashboard-1`, or `sidecar-...`).
+  (its services, `storage` among them, `runtime`, `first-run`, `dashboard-1`,
+  or `sidecar-...`).
 - `roles` is a list, empty for a plugin holding none.
 - The first plugin listed is the runner's, when a command names no
   `--instance`.
@@ -134,6 +144,10 @@ proof that the page links.
 prints that store as stable, sorted lines, so a file from one run compares
 with the next. Whoever reads a store needs no database user, password, file or
 query of their own.
+
+`store` prints the kernel's stores and never a plugin's storage: what an edge
+plugin keeps there is its own, read by no one else (decisions/028), so a
+plugin's e2e reads its raw records through the plugin, on its own page.
 
 ### The street store
 
