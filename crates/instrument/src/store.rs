@@ -115,6 +115,12 @@ pub struct Source {
     /// platform before v10.
     pub person: String,
 
+    /// The delegation the person acted through, and its client's name, when
+    /// they set the value through a client on the deployment's MCP surface
+    /// (contract v12, Q9): stamped from the envelope; empty otherwise.
+    pub acting_through_delegation: String,
+    pub client_name: String,
+
     /// The plugin instance whose resolve joined an identifier.
     pub instance_id: String,
 
@@ -336,6 +342,10 @@ pub struct Version {
     pub operation: String,
     pub changes: Vec<Change>,
     pub person: String,
+    /// The delegation and client the person acted through (contract v12);
+    /// empty otherwise.
+    pub acting_through_delegation: String,
+    pub client_name: String,
     pub instance_id: String,
     pub note: String,
 

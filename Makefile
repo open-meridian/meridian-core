@@ -873,6 +873,21 @@ harness-check:
 	$(HARNESS_RUN) instrument --identifier 'symbol (stand-in): HRN' asset_class=equity currency=USD \
 		source='the stand-in statement' >/dev/null || fail "the admin did not complete a record at the Instruments page"; \
 	$(HARNESS_RUN) instruments --expect 3 >/dev/null || fail "a completed record is still listed as one the book cannot use"; \
+	$(HARNESS_RUN) mcp connect --covers deployment_admin >/dev/null || fail "an MCP client was not connected on a delegation for the /mcp resource"; \
+	$(HARNESS_RUN) mcp list --expect dashboard__complete_instruments >.harness/tools 2>>.e2e-harness.log \
+		|| fail "the delegation does not reach dashboard__complete_instruments"; \
+	! grep -q '^custody__' .harness/tools || fail "a delegation covering the deployment admin alone lists a plugin's tools"; \
+	$(HARNESS_RUN) mcp call dashboard__complete_instruments '{"completions": [{"instrument_id": "LCL-none", "against_version": 1, "values": [{"currency": "USD"}], "source": "s"}]}' \
+		--expect-outcome refused --expect 'completions[0].note' >/dev/null || fail "a completion through /mcp without a note was not refused naming completions[0].note"; \
+	completed="$$($(HARNESS_RUN) mcp complete --identifier 'symbol (stand-in): SHRT' asset_class=equity currency=USD \
+		source='the stand-in statement' note='Completed by the harness agent from the statement.')" \
+		|| fail "the agent did not complete a record through /mcp"; \
+	through="$$(printf '%s' "$$completed" | sed -n 's/^mcp complete: \([^ ]*\) completed.*/\1/p')"; \
+	$(HARNESS_RUN) instruments --expect 2 >/dev/null || fail "the record completed through /mcp is still listed as one the book cannot use"; \
+	$(HARNESS_RUN) mcp call dashboard__read_instrument_history "{\"instrument_id\": \"$$through\"}" \
+		--expect '"client_name": "harness agent"' --expect '"person": "local|harness"' >/dev/null \
+		|| fail "the record's history does not name the person and the client it was completed through"; \
+	$(HARNESS_RUN) mcp calls --expect 4 >/dev/null || fail "Connected clients does not list the agent's calls"; \
 	unlinked="$$($(HARNESS_RUN) unlinked --expect 1)" || fail "the dashboard did not count the unlinked account"; \
 	$(HARNESS_RUN) ready --instance operations >/dev/null || fail "the second plugin never registered"; \
 	$(HARNESS_RUN) page --instance operations --level write / >/dev/null 2>&1 \
@@ -900,7 +915,7 @@ harness-check:
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

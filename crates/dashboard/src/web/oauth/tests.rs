@@ -240,7 +240,16 @@ fn terminal_resource() -> String {
 
 /// Through the sign-in to the consent page: its request and confirm.
 async fn consenting(app: &Arc<App>, client_id: &str) -> (String, String, String) {
-    let asked = get_page(app, &authorising(client_id, &terminal_resource())).await;
+    consenting_for(app, client_id, &terminal_resource()).await
+}
+
+/// The same, for a resource named.
+async fn consenting_for(
+    app: &Arc<App>,
+    client_id: &str,
+    resource: &str,
+) -> (String, String, String) {
+    let asked = get_page(app, &authorising(client_id, resource)).await;
     assert_eq!(asked.status(), StatusCode::OK);
     let page = body_of(asked).await;
     assert!(page.contains("Sign in to allow a client"), "{page}");
@@ -444,7 +453,8 @@ async fn a_known_client_asking_wrongly_is_sent_back_with_why() {
     );
     for resource in [
         "https://elsewhere.example/terminal",
-        "https://dash.firm.example/mcp",
+        "https://elsewhere.example/mcp",
+        "https://dash.firm.example/other",
         "",
     ] {
         let wrong = get_page(&app, &authorising(&client_id, resource)).await;
@@ -474,6 +484,22 @@ async fn the_consent_page_names_the_client_where_its_codes_go_and_the_clis_defau
     assert!(!page.contains("value=\"oms-1:admin\""), "{page}");
     assert!(page.contains("name=\"deployment_admin\""), "{page}");
     assert!(page.contains("value=\"AG-1\""), "{page}");
+}
+
+#[tokio::test]
+async fn consent_for_the_mcp_surface_lists_the_tools_each_row_reaches() {
+    // Contract v12 (W6.17, W6.20, Q5): rows of access, each with its tools,
+    // never single tools; the CLI's own page lists none.
+    let (app, _) = app();
+    let client_id = register_cli(&app).await;
+    let (_, _, page) = consenting_for(&app, &client_id, &format!("https://{HOST_NAME}/mcp")).await;
+    assert!(page.contains("Complete instrument records"), "{page}");
+    assert!(page.contains("those added later included"), "{page}");
+    let (_, _, terminal) = consenting(&app, &register_cli(&app).await).await;
+    assert!(
+        !terminal.contains("Complete instrument records"),
+        "{terminal}"
+    );
 }
 
 #[tokio::test]

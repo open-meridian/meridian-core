@@ -172,10 +172,10 @@ pub fn history(
                 .collect(),
             person: version.person.clone(),
             instance_id: version.instance_id.clone(),
-            // Contract v12: the delegation and client, once the store keeps
-            // them.
-            acting_through_delegation: String::new(),
-            client_name: String::new(),
+            // Contract v12: the delegation and client the person acted
+            // through.
+            acting_through_delegation: version.acting_through_delegation.clone(),
+            client_name: version.client_name.clone(),
             note: version.note.clone(),
             record_time_ns: version.record_time_ns,
             merged_instrument_id: version.merged_instrument_id.clone(),
@@ -237,6 +237,8 @@ mod tests {
                 complete_one,
                 1,
                 crate::store::Version {
+                    acting_through_delegation: String::new(),
+                    client_name: String::new(),
                     instrument_id: cusip.clone(),
                     version: 2,
                     operation: "complete".into(),

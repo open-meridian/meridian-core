@@ -68,6 +68,8 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
         sources: identifiers
             .iter()
             .map(|held| Source {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
                 field: Field::Identifier,
                 identifier: Some(held.asked()),
                 source: "reported by custody-1".into(),
@@ -101,6 +103,8 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
 
 fn entry(instrument_id: &str, version: i64, operation: &str) -> Version {
     Version {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         instrument_id: instrument_id.into(),
         version,
         operation: operation.into(),
@@ -184,6 +188,8 @@ fn a_write_against_a_version_since_moved_on_is_refused_and_writes_nothing() {
     next.version = 2;
     next.offers.clear();
     next.sources.push(Source {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         field: Field::AssetClass,
         identifier: None,
         source: "a statement".into(),

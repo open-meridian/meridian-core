@@ -220,6 +220,7 @@ fn dashboard(
         custody: Arc::default(),
         health: Arc::default(),
         kit: Some(Arc::new(kit())),
+        bounds: Arc::default(),
     });
     (app, session)
 }

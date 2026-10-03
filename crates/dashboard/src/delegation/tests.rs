@@ -195,7 +195,7 @@ fn a_request_holds_to_the_code_flow_and_s256() {
 }
 
 #[test]
-fn a_resource_is_named_by_an_absolute_address_whose_path_is_the_terminals() {
+fn a_resource_is_named_by_an_absolute_address_whose_path_is_the_terminals_or_the_mcp_surfaces() {
     assert_eq!(
         Resource::indicated("https://dash.firm.example/terminal"),
         Some((Resource::Terminal, "https://dash.firm.example".into()))
@@ -204,9 +204,14 @@ fn a_resource_is_named_by_an_absolute_address_whose_path_is_the_terminals() {
         Resource::indicated("http://127.0.0.1:8443/terminal/"),
         Some((Resource::Terminal, "http://127.0.0.1:8443".into()))
     );
+    // Contract v12: the deployment's MCP surface is a resource too.
+    assert_eq!(
+        Resource::indicated("https://dash.firm.example/mcp"),
+        Some((Resource::Mcp, "https://dash.firm.example".into()))
+    );
     for not in [
         "/terminal",
-        "https://dash.firm.example/mcp",
+        "https://dash.firm.example/mcpx",
         "https://d/terminal?x=1",
         "",
     ] {

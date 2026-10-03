@@ -60,6 +60,9 @@ pub enum Refusal {
     Replayed,
     NoInterface,
     PluginUnreachable(String),
+    /// The claims name a tool, and the request is not at its route (W4.9,
+    /// contract v12).
+    NotThisTool(String),
     /// A development path on an instance that is not live, or a deployment
     /// not installed for development: there is no such endpoint.
     NotLive,
@@ -75,7 +78,8 @@ impl Refusal {
             Refusal::ForAnotherInstance(_)
             | Refusal::OutOfDate
             | Refusal::LivesTooLong
-            | Refusal::Replayed => StatusCode::FORBIDDEN,
+            | Refusal::Replayed
+            | Refusal::NotThisTool(_) => StatusCode::FORBIDDEN,
             Refusal::NoInterface | Refusal::NotLive => StatusCode::NOT_FOUND,
             Refusal::PluginUnreachable(_) => StatusCode::BAD_GATEWAY,
         }
@@ -98,6 +102,7 @@ impl Refusal {
             Refusal::NoInterface => "this plugin serves no page".into(),
             Refusal::PluginUnreachable(why) => format!("the plugin did not answer: {why}"),
             Refusal::NotLive => "this plugin is not live on a development deployment".into(),
+            Refusal::NotThisTool(why) => why.clone(),
         }
     }
 }
@@ -313,8 +318,22 @@ async fn through(
                 .map_err(|_| Refusal::Malformed("not text".into()))
         })
         .transpose()?;
-    front_door.verifier.verify(text, now_ns)?;
+    let claims = front_door.verifier.verify(text, now_ns)?;
     let verified = header.expect("verified above");
+
+    // A call through the deployment's MCP surface names its tool, and is
+    // admitted only at that tool's route (W4.9, contract v12): the SDK serves
+    // it without a browser's form token, so it must reach nothing else.
+    if !claims.tool_name.is_empty() {
+        let tools = front_door
+            .sidecar
+            .registration()
+            .map(|registration| registration.tools)
+            .unwrap_or_default();
+        let path = request.uri().path().to_string();
+        crate::tools::admits(&tools, &claims.tool_name, request.method().as_str(), &path)
+            .map_err(Refusal::NotThisTool)?;
+    }
 
     // A development path is answered here and never reaches the plugin; and
     // before the page's port is asked for, since a plugin that crashed has

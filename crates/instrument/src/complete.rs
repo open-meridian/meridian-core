@@ -58,15 +58,46 @@ pub struct Completed {
     pub changed: Vec<Instrument>,
 }
 
+/// Who made a change: the person core stamped, and the delegation and its
+/// client's name when they acted through a client on the deployment's MCP
+/// surface (contract v12, Q9), each from the command's envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Actor {
+    pub person: String,
+    pub delegation: String,
+    pub client: String,
+}
+
+impl Actor {
+    /// A person at the dashboard in a browser: no delegation.
+    pub fn person(person: &str) -> Actor {
+        Actor {
+            person: person.to_string(),
+            ..Actor::default()
+        }
+    }
+}
+
 /// W3.10. Set the values of up to 500 records, each against its version,
-/// each refused alone.
+/// each refused alone, for a person at the dashboard.
 pub fn complete(
     store: &dyn Store,
     request: &CompleteInstrumentsRequest,
     person: &str,
     now_ns: i64,
 ) -> Result<std::result::Result<Completed, Refused>> {
-    if person.is_empty() {
+    complete_as(store, request, &Actor::person(person), now_ns)
+}
+
+/// W3.10, for whoever the envelope names: the person, and the delegation
+/// and client they acted through, recorded on each version and value.
+pub fn complete_as(
+    store: &dyn Store,
+    request: &CompleteInstrumentsRequest,
+    actor: &Actor,
+    now_ns: i64,
+) -> Result<std::result::Result<Completed, Refused>> {
+    if actor.person.is_empty() {
         return Ok(Err(Refused::new(
             RefusalReason::ActorRequired,
             "a person completes an instrument record, and none was named",
@@ -80,7 +111,7 @@ pub fn complete(
     }
     let mut completed = Completed::default();
     for completion in &request.completions {
-        let (result, changed) = complete_one(store, completion, person, now_ns)?;
+        let (result, changed) = complete_one(store, completion, actor, now_ns)?;
         completed.results.push(result);
         completed.changed.extend(changed);
     }
@@ -91,9 +122,14 @@ pub fn complete(
 fn complete_one(
     store: &dyn Store,
     completion: &InstrumentCompletion,
-    person: &str,
+    actor: &Actor,
     now_ns: i64,
 ) -> Result<(InstrumentCompletionResult, Option<Instrument>)> {
+    let (person, delegation, client) = (
+        actor.person.as_str(),
+        actor.delegation.as_str(),
+        actor.client.as_str(),
+    );
     let refuse =
         |reason: RefusalReason, fields: Vec<String>, detail: String| InstrumentCompletionResult {
             instrument_id: completion.instrument_id.clone(),
@@ -285,6 +321,8 @@ fn complete_one(
             }
             record.identifiers.push(dated(&asked));
             record.set_source(Source {
+                acting_through_delegation: delegation.to_string(),
+                client_name: client.to_string(),
                 field: Field::Identifier,
                 identifier: Some(asked.clone()),
                 source: source.to_string(),
@@ -306,6 +344,8 @@ fn complete_one(
         }
         record.set_value(field, text.clone());
         record.set_source(Source {
+            acting_through_delegation: delegation.to_string(),
+            client_name: client.to_string(),
             field,
             identifier: None,
             source: source.to_string(),
@@ -444,6 +484,8 @@ fn complete_one(
     record.version = held.version + 1;
     record.record_time_ns = now_ns;
     let entry = Version {
+        acting_through_delegation: delegation.to_string(),
+        client_name: client.to_string(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: "complete".into(),
@@ -506,6 +548,22 @@ pub fn merge(
     person: &str,
     now_ns: i64,
 ) -> Result<std::result::Result<Merged, Refused>> {
+    merge_as(store, request, &Actor::person(person), now_ns)
+}
+
+/// W3.13, for whoever the envelope names, the delegation and client beside
+/// the person on both records' versions.
+pub fn merge_as(
+    store: &dyn Store,
+    request: &MergeInstrumentsRequest,
+    actor: &Actor,
+    now_ns: i64,
+) -> Result<std::result::Result<Merged, Refused>> {
+    let (person, delegation, client) = (
+        actor.person.as_str(),
+        actor.delegation.as_str(),
+        actor.client.as_str(),
+    );
     if person.is_empty() {
         return Ok(Err(Refused::new(
             RefusalReason::ActorRequired,
@@ -566,6 +624,8 @@ pub fn merge(
             .source_of(Field::Identifier, Some(&asked))
             .cloned()
             .unwrap_or(Source {
+                acting_through_delegation: delegation.to_string(),
+                client_name: client.to_string(),
                 field: Field::Identifier,
                 identifier: Some(asked.clone()),
                 source: format!("merged from {merged_id}"),
@@ -593,6 +653,8 @@ pub fn merge(
         }
         stays.set_value(field, theirs.to_string());
         let carried = merged.source_of(field, None).cloned().unwrap_or(Source {
+            acting_through_delegation: delegation.to_string(),
+            client_name: client.to_string(),
             field,
             identifier: None,
             source: format!("merged from {merged_id}"),
@@ -616,6 +678,8 @@ pub fn merge(
     stays.version = kept.version + 1;
     stays.record_time_ns = now_ns;
     let stays_entry = Version {
+        acting_through_delegation: delegation.to_string(),
+        client_name: client.to_string(),
         instrument_id: stays.instrument_id.clone(),
         version: stays.version,
         operation: "merge".into(),
@@ -640,6 +704,8 @@ pub fn merge(
     gone.version = merged.version + 1;
     gone.record_time_ns = now_ns;
     let gone_entry = Version {
+        acting_through_delegation: delegation.to_string(),
+        client_name: client.to_string(),
         instrument_id: gone.instrument_id.clone(),
         version: gone.version,
         operation: "merged-into".into(),
@@ -703,6 +769,8 @@ pub fn keep_platform_answer(
         } else if !record.carries(&global) {
             record.identifiers.push(dated(&global));
             record.set_source(Source {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
                 field: Field::Identifier,
                 identifier: Some(global.clone()),
                 source: words.clone(),
@@ -755,6 +823,8 @@ pub fn keep_platform_answer(
     record.version = held.version + 1;
     record.record_time_ns = now_ns;
     let entry = Version {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: "platform".into(),
@@ -908,6 +978,50 @@ mod tests {
         assert_eq!(history[0].operation, "complete");
         assert_eq!(history[0].person, ADA);
         assert_eq!(history[0].changes[0].after, "equity");
+    }
+
+    #[test]
+    fn a_completion_through_a_client_records_the_delegation_and_client_beside_the_person() {
+        // Contract v12, Q9: "set by the person, through that client".
+        let store = MemoryStore::new();
+        let id = minted(&store, "symbol", "SNAP1", "snaptrade");
+        let actor = Actor {
+            person: ADA.into(),
+            delegation: "del-01J9AAAA".into(),
+            client: "Claude".into(),
+        };
+        let done = complete_as(
+            &store,
+            &completing(&id, 1, equity_in_usd(), ""),
+            &actor,
+            NOW + 1,
+        )
+        .unwrap()
+        .unwrap();
+        let source = done.changed[0].source_of(Field::AssetClass, None).unwrap();
+        assert_eq!(
+            (
+                source.person.as_str(),
+                source.acting_through_delegation.as_str(),
+                source.client_name.as_str()
+            ),
+            (ADA, "del-01J9AAAA", "Claude")
+        );
+        let history = store.history(&id).unwrap();
+        assert_eq!(history[0].acting_through_delegation, "del-01J9AAAA");
+        assert_eq!(history[0].client_name, "Claude");
+        // A person at the dashboard names none.
+        let other = minted(&store, "symbol", "SNAP2", "snaptrade");
+        let done = complete(
+            &store,
+            &completing(&other, 1, equity_in_usd(), ""),
+            ADA,
+            NOW + 2,
+        )
+        .unwrap()
+        .unwrap();
+        let source = done.changed[0].source_of(Field::AssetClass, None).unwrap();
+        assert!(source.acting_through_delegation.is_empty() && source.client_name.is_empty());
     }
 
     fn stable_government_fund() -> meridian_domain::v1::MoneyMarketFund {

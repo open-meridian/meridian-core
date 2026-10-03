@@ -726,7 +726,49 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
          <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
-         holding it at one will be here. They are not built yet.</p></section>{figures}{declared}"
+         holding it at one will be here. They are not built yet.</p></section>{figures}{declared}{tools}",
+        tools = tools_section(manage.report),
+    )
+}
+
+/// The plugin's tools on the deployment's MCP surface (W4.8, W6.20, contract
+/// v12): those its sidecar admitted, reads and acts apart, and each refused
+/// with why (requirement 10). Nothing for a plugin declaring none.
+fn tools_section(report: Option<&meridian_domain::v1::PluginReport>) -> String {
+    let Some(report) = report else {
+        return String::new();
+    };
+    if report.declared_tools.is_empty() && report.tool_refusals.is_empty() {
+        return String::new();
+    }
+    let rows: String = report
+        .declared_tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "<li data-tool=\"{name}\"><code>{name}</code> {title} ({kind}, {method} {path})</li>",
+                name = escape(&tool.name),
+                title = escape(&tool.title),
+                kind = if tool.reads { "reads" } else { "acts" },
+                method = escape(&tool.method),
+                path = escape(&tool.path),
+            )
+        })
+        .collect();
+    let refused: String = report
+        .tool_refusals
+        .iter()
+        .map(|why| {
+            format!(
+                "<li class=\"refused\" data-tool-refused>{}</li>",
+                escape(why)
+            )
+        })
+        .collect();
+    format!(
+        "<section class=\"panel padded\" id=\"tools\"><h2>Tools for agents</h2>\
+         <p class=\"hint\">What an agent a person delegated to may call on this deployment's \
+         MCP surface, each at its route's levels.</p><ul>{rows}{refused}</ul></section>"
     )
 }
 

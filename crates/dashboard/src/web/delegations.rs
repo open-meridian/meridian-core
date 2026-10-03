@@ -132,6 +132,64 @@ fn table(
     )
 }
 
+/// How many of a person's latest calls through the deployment's MCP surface
+/// Connected clients shows.
+const CALLS_SHOWN: usize = 50;
+
+/// The person's latest calls through `/mcp` (W6.20, requirement 21): when,
+/// which client, which tool and whose, at which level, how it came out and
+/// how long it took. Never an argument or an answer, which were not kept.
+async fn calls(app: &App, subject: &str) -> String {
+    let calls = match app
+        .delegations
+        .calls(
+            crate::delegation::CallsOf::Person(subject.to_string()),
+            CALLS_SHOWN,
+        )
+        .await
+    {
+        Ok(calls) => calls,
+        Err(failed) => {
+            return format!(
+                "<p class=\"refused\">The calls could not be read: {}</p>",
+                escape(&failed.to_string())
+            )
+        }
+    };
+    if calls.is_empty() {
+        return "<h2>Calls through the MCP surface</h2>\
+                <p class=\"empty\">No client has called a tool here.</p>"
+            .into();
+    }
+    let rows: String = calls
+        .iter()
+        .map(|call| {
+            format!(
+                "<tr data-outcome=\"{outcome}\"><td>{at}</td><td>{client}</td><td><code>{tool}</code></td>\
+                 <td>{level}</td><td>{outcome}{reason}</td><td>{ms} ms</td></tr>",
+                at = minute(call.called_at_ns),
+                client = escape(&call.client_name),
+                tool = escape(&call.tool),
+                level = escape(&call.level),
+                outcome = escape(&call.outcome),
+                reason = if call.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", escape(&call.reason))
+                },
+                ms = call.duration_ms,
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Calls through the MCP surface</h2>\
+         <p class=\"hint\">The latest {CALLS_SHOWN}, kept 90 days; never what was asked or \
+         answered.</p>\
+         <table class=\"calls\"><thead><tr><th>When</th><th>Client</th><th>Tool</th><th>Level</th>\
+         <th>Outcome</th><th>Took</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+}
+
 /// GET /delegations: ListOwnDelegations, the person's Connected clients.
 async fn own(
     State(app): State<Arc<App>>,
@@ -162,11 +220,12 @@ async fn own(
         "<div class=\"page-head\"><div><h1>Connected clients</h1>\
          <p>Clients acting as you on this deployment: the <code>meridian</code> command on each \
          computer you connected, and anything else you allowed. What each does is recorded as \
-         yours, through it.</p></div></div>{notice}{table}",
+         yours, through it.</p></div></div>{notice}{table}{calls}",
         table = table(&theirs, &group_names(&records), now, &token, &|d| Some((
             format!("/delegations/{}/revoke", d.id),
             String::new()
         ))),
+        calls = calls(&app, &session.subject).await,
     );
     Html(page_with(
         "Connected clients",
@@ -279,9 +338,10 @@ async fn persons(
     });
     let body = format!(
         "<div class=\"page-head\"><div><h1>{name}'s connected clients</h1>\
-         <p class=\"hint\">{login}</p></div>{all}</div>{notice}{rows}",
+         <p class=\"hint\">{login}</p></div>{all}</div>{notice}{rows}{calls}",
         name = escape(&called),
         login = escape(&subject),
+        calls = calls(&app, &subject).await,
     );
     let mut chrome = admin_chrome(&session);
     chrome.crumbs = format!(

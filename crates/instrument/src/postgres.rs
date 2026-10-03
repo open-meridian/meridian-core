@@ -40,6 +40,7 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0002_placeholder.sql"),
     include_str!("../migrations/0003_records.sql"),
     include_str!("../migrations/0004_instrument_type.sql"),
+    include_str!("../migrations/0005_delegation.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
@@ -47,9 +48,9 @@ const SCHEMA: &[&str] = &[
 /// migrated, rather than failing later on the first record.
 const NEWEST_TABLE: &str = "instrument_conflict";
 
-/// And the column the newest file adds to the record (0004, contract v11),
-/// which a table check cannot see.
-const NEWEST_COLUMN: &str = "money_market_fund";
+/// And the column the newest file adds (0005, contract v12: the delegation
+/// on a version), with its table, which a table check cannot see.
+const NEWEST_COLUMN: (&str, &str) = ("instrument_version", "client_name");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -100,9 +101,9 @@ impl PostgresStore {
             && conn
                 .query_opt(
                     "SELECT 1 FROM information_schema.columns
-                      WHERE table_schema = current_schema() AND table_name = 'instrument'
-                        AND column_name = $1",
-                    &[&NEWEST_COLUMN],
+                      WHERE table_schema = current_schema() AND table_name = $1
+                        AND column_name = $2",
+                    &[&NEWEST_COLUMN.0, &NEWEST_COLUMN.1],
                 )
                 .map_err(unavailable)?
                 .is_some();
@@ -245,6 +246,8 @@ impl PostgresStore {
                     continue;
                 }
                 record.set_source(Source {
+                    acting_through_delegation: String::new(),
+                    client_name: String::new(),
                     field,
                     identifier: None,
                     source: words.clone(),
@@ -269,6 +272,8 @@ impl PostgresStore {
             for identifier in record.identifiers.clone() {
                 let asked = identifier.asked();
                 record.set_source(Source {
+                    acting_through_delegation: String::new(),
+                    client_name: String::new(),
                     field: Field::Identifier,
                     identifier: Some(asked.clone()),
                     source: words.clone(),
@@ -290,6 +295,8 @@ impl PostgresStore {
                 });
             }
             let entry = Version {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
                 instrument_id: record.instrument_id.clone(),
                 version: record.version,
                 operation: "migrate".into(),
@@ -386,7 +393,7 @@ impl PostgresStore {
         for row in conn
             .query(
                 "SELECT instrument_id, field, scheme, namespace, value, source, person,
-                        instance_id, recorded_at_ns, note
+                        instance_id, recorded_at_ns, note, acting_through_delegation, client_name
                    FROM instrument_value_source
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id, field, scheme, namespace, value",
@@ -400,6 +407,8 @@ impl PostgresStore {
             };
             if let Some(&at) = index.get(&owner) {
                 instruments[at].sources.push(Source {
+                    acting_through_delegation: row.get(10),
+                    client_name: row.get(11),
                     field,
                     identifier: identifier_of(field, row.get(2), row.get(3), row.get(4)),
                     source: row.get(5),
@@ -479,8 +488,9 @@ impl PostgresStore {
             tx.execute(
                 "INSERT INTO instrument_value_source
                         (instrument_id, field, scheme, namespace, value, source, person,
-                         instance_id, recorded_at_ns, note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         instance_id, recorded_at_ns, note, acting_through_delegation,
+                         client_name)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT DO NOTHING",
                 &[
                     id,
@@ -493,6 +503,8 @@ impl PostgresStore {
                     &source.instance_id,
                     &source.recorded_at_ns,
                     &source.note,
+                    &source.acting_through_delegation,
+                    &source.client_name,
                 ],
             )
             .map_err(unavailable)?;
@@ -527,8 +539,9 @@ impl PostgresStore {
         tx.execute(
             "INSERT INTO instrument_version
                     (instrument_id, version, operation, changes, person, instance_id, note,
-                     merged_instrument_id, record_time_ns)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     merged_instrument_id, record_time_ns, acting_through_delegation,
+                     client_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT DO NOTHING",
             &[
                 &entry.instrument_id,
@@ -540,6 +553,8 @@ impl PostgresStore {
                 &entry.note,
                 &entry.merged_instrument_id,
                 &entry.record_time_ns,
+                &entry.acting_through_delegation,
+                &entry.client_name,
             ],
         )
         .map_err(unavailable)?;
@@ -745,7 +760,8 @@ impl Store for PostgresStore {
             .conn()?
             .query(
                 "SELECT version, operation, changes, person, instance_id, note,
-                        merged_instrument_id, record_time_ns
+                        merged_instrument_id, record_time_ns, acting_through_delegation,
+                        client_name
                    FROM instrument_version
                   WHERE instrument_id = $1
                   ORDER BY version DESC",
@@ -755,6 +771,8 @@ impl Store for PostgresStore {
         Ok(rows
             .into_iter()
             .map(|row| Version {
+                acting_through_delegation: row.get(8),
+                client_name: row.get(9),
                 instrument_id: instrument_id.to_string(),
                 version: row.get(0),
                 operation: row.get(1),

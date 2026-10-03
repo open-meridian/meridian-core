@@ -170,6 +170,8 @@ fn joined(
     for identifier in &joining {
         record.identifiers.push(dated(identifier));
         record.set_source(Source {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
             field: Field::Identifier,
             identifier: Some(identifier.clone()),
             source: reported_by(instance_id),
@@ -188,6 +190,8 @@ fn joined(
     record.version = expected + 1;
     record.record_time_ns = now_ns;
     let entry = Version {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: if joining.is_empty() { "offer" } else { "join" }.into(),
@@ -236,6 +240,8 @@ fn mint(
         sources: asked
             .iter()
             .map(|identifier| Source {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
                 field: Field::Identifier,
                 identifier: Some(identifier.clone()),
                 source: reported_by(instance_id),
@@ -249,6 +255,8 @@ fn mint(
     };
     keep_offers(&mut candidate, stated(request, instance_id, now_ns));
     let first = Version {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         instrument_id: instrument_id.clone(),
         version: 1,
         operation: "mint".into(),
@@ -613,6 +621,8 @@ mod tests {
     fn hold(store: &MemoryStore, record: Instrument) {
         let key = format!("held:{}", record.instrument_id);
         let first = Version {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
             instrument_id: record.instrument_id.clone(),
             version: record.version,
             operation: "migrate".into(),

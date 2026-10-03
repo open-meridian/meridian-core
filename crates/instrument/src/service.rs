@@ -32,7 +32,7 @@ use meridian_domain::v1::{
 };
 use prost::Message;
 
-use crate::complete::{complete, keep_platform_answer, merge};
+use crate::complete::{complete_as, keep_platform_answer, merge_as};
 use crate::list::{history, list_to_complete};
 use crate::record::to_wire;
 use crate::replace::replaced;
@@ -139,11 +139,12 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
         bus.serve(COMPLETE_INSTRUMENTS, move |envelope| {
             let request: CompleteInstrumentsRequest =
                 decode(&envelope, "meridian.v1.CompleteInstrumentsRequest")?;
-            let person = person_of(&envelope);
+            let actor = actor_of(&envelope);
+            let person = actor.person.clone();
             let now_ns = clock.now_ns();
             let done = {
                 let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
-                complete(store.as_ref(), &request, &person, now_ns)
+                complete_as(store.as_ref(), &request, &actor, now_ns)
                     .map_err(|failed| failed.to_string())?
             }
             .map_err(|refused| meridian_bus::refusal(refused.reason as i32, refused.words))?;
@@ -171,11 +172,12 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
         bus.serve(MERGE_INSTRUMENTS, move |envelope| {
             let request: MergeInstrumentsRequest =
                 decode(&envelope, "meridian.v1.MergeInstrumentsRequest")?;
-            let person = person_of(&envelope);
+            let actor = actor_of(&envelope);
+            let person = actor.person.clone();
             let now_ns = clock.now_ns();
             let merged = {
                 let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
-                let merged = merge(store.as_ref(), &request, &person, now_ns)
+                let merged = merge_as(store.as_ref(), &request, &actor, now_ns)
                     .map_err(|failed| failed.to_string())?
                     .map_err(|refused| {
                         meridian_bus::refusal(refused.reason as i32, refused.words)
@@ -264,12 +266,28 @@ fn announce(bus: &Bus, record: &Instrument, caused_by: &Envelope, now_ns: i64) {
     }
 }
 
-/// The person a command was sent for, as the dashboard stamped them.
-fn person_of(envelope: &Envelope) -> String {
+/// Who a command was sent for, as the dashboard stamped them: the person,
+/// and the delegation and client they acted through, if any (W4.9).
+fn actor_of(envelope: &Envelope) -> crate::complete::Actor {
     envelope
         .meta
         .as_ref()
-        .map(|meta| meta.acting_for_subject.clone())
+        .map(|meta| crate::complete::Actor {
+            person: meta.acting_for_subject.clone(),
+            // A delegation stands only beside a person, never alone.
+            delegation: if meta.acting_for_subject.is_empty() {
+                String::new()
+            } else {
+                meta.acting_through_delegation.clone()
+            },
+            client: if meta.acting_for_subject.is_empty()
+                || meta.acting_through_delegation.is_empty()
+            {
+                String::new()
+            } else {
+                meta.acting_through_client.clone()
+            },
+        })
         .unwrap_or_default()
 }
 

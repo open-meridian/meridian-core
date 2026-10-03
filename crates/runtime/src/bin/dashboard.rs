@@ -498,6 +498,7 @@ fn run() -> Result<(), String> {
             custody,
             health,
             kit,
+            bounds: Arc::default(),
         }));
         let listener = tokio::net::TcpListener::bind(listen)
             .await

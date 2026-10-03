@@ -243,6 +243,7 @@ async fn harness() -> Harness {
         custody: Arc::default(),
         health: Arc::default(),
         kit: None,
+        bounds: Arc::default(),
     });
     Harness {
         app,

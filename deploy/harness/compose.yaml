@@ -281,6 +281,9 @@ services:
     volumes:
       - ./harness.py:/harness/harness.py:ro
       - secrets:/secrets:ro
+      # What an MCP client keeps between commands (`mcp connect`): its token
+      # pair and what a call saved, for the run alone.
+      - runner-state:/state
     networks: [harness]
 
   # A store, printed by name as stable, sorted lines: `run --rm -T store
@@ -312,6 +315,7 @@ volumes:
   keys:
   broker:
   secrets:
+  runner-state:
 
 networks:
   harness:

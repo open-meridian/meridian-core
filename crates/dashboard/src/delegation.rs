@@ -44,7 +44,7 @@ use crate::session::token;
 use crate::terminal::{hashed, same, unreserved, url_safe, verifies, Person, Unavailable};
 
 mod store;
-pub use store::{DelegationStore, InMemory, InPostgres};
+pub use store::{CallsOf, DelegationStore, InMemory, InPostgres};
 
 pub const DAY_NS: i64 = 24 * HOUR_NS;
 /// An access token's life (requirement 8).
@@ -75,6 +75,31 @@ pub const MAX_CLIENTS: usize = 10_000;
 pub const UNCONSENTED_NS: i64 = DAY_NS;
 /// A revoked or lapsed delegation stays listed, with why, this long.
 pub const KEPT_NS: i64 = 30 * DAY_NS;
+/// How long a call through the deployment's MCP surface stays recorded: the
+/// longest a delegation lives (W6.20, Q8).
+pub const CALLS_KEPT_NS: i64 = 90 * DAY_NS;
+
+/// One call through the deployment's MCP surface, as recorded (W6.20,
+/// requirement 21): who, through which delegation and client, which tool
+/// and whose, at which level, how it came out and how long it took. Never
+/// an argument or an answer, which may carry account data a deployment
+/// admin, who reads this, reaches none of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    pub called_at_ns: i64,
+    pub subject: String,
+    pub delegation_id: String,
+    pub client_name: String,
+    /// `dashboard`, or a plugin's instance.
+    pub owner: String,
+    pub tool: String,
+    /// The level a plugin's tool opened at; empty for core's.
+    pub level: String,
+    /// made, unchanged or refused.
+    pub outcome: String,
+    pub reason: String,
+    pub duration_ms: i64,
+}
 /// What a person may choose a delegation to last, in days.
 pub const DAYS: [i64; 3] = [7, 30, 90];
 
@@ -86,12 +111,14 @@ pub const CLIENT_PREFIX: &str = "mdc_";
 /// consent page's defaults and nothing else, since anybody could say it.
 pub const CLI_SOFTWARE_ID: &str = "meridian-cli";
 
-/// A token's one resource (requirement 8; RFC 8707). The deployment MCP
-/// surface, `/mcp`, is slice 2's.
+/// A token's one resource (requirement 8; RFC 8707): the CLI's surface, or
+/// the deployment's MCP surface (W6.20, contract v12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resource {
     /// The CLI's surface, `/terminal/`.
     Terminal,
+    /// The deployment's MCP surface, `/mcp` ([`crate::mcp`]).
+    Mcp,
 }
 
 impl Resource {
@@ -99,6 +126,7 @@ impl Resource {
     pub fn path(self) -> &'static str {
         match self {
             Resource::Terminal => "/terminal",
+            Resource::Mcp => "/mcp",
         }
     }
 
@@ -106,12 +134,14 @@ impl Resource {
     pub fn name(self) -> &'static str {
         match self {
             Resource::Terminal => "terminal",
+            Resource::Mcp => "mcp",
         }
     }
 
     pub fn named(name: &str) -> Option<Resource> {
         match name {
             "terminal" => Some(Resource::Terminal),
+            "mcp" => Some(Resource::Mcp),
             _ => None,
         }
     }
@@ -129,6 +159,7 @@ impl Resource {
         }
         let resource = match url.path().trim_end_matches('/') {
             "/terminal" => Resource::Terminal,
+            "/mcp" => Resource::Mcp,
             _ => return None,
         };
         Some((resource, url.origin().ascii_serialization()))
@@ -1166,6 +1197,16 @@ impl Delegations {
     }
 
     /// Forget everything past its bound.
+    /// Record a call through the deployment's MCP surface.
+    pub async fn record_call(&self, call: ToolCall) -> Result<(), Unavailable> {
+        self.stored(move |store| store.record_call(&call)).await
+    }
+
+    /// The latest calls on a delegation, or of a person, newest first.
+    pub async fn calls(&self, of: CallsOf, limit: usize) -> Result<Vec<ToolCall>, Unavailable> {
+        self.stored(move |store| store.calls(&of, limit)).await
+    }
+
     pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
         {
             let mut pending = self.lock();

@@ -85,13 +85,50 @@ the same image with the list on stdin:
       equity, debt, fund, derivative, crypto_asset, event_contract, cash; each
       value goes with the source given, and the dashboard stamps the admin.
 
+  mcp connect [--covers deployment_admin] [--covers INSTANCE:LEVEL ...] [--client NAME]
+      Connects an MCP client as the admin, as an agent's client does (W6.17,
+      W6.20): registers it (named "harness agent" unless --client says), sends
+      her through the dashboard's authorisation for the `/mcp` resource with
+      a PKCE challenge, signs her in afresh, consents to only what --covers
+      names -- the deployment admin's capabilities, and each plugin and level
+      -- on All accounts, for 30 days, and exchanges the code for a token
+      pair, kept for the run in the runner's state. Prints the delegation and
+      how many tools it reaches.
+
+  mcp list [--expect NAME ...]
+      Prints the tools the connected delegation reaches, one name per line,
+      and fails unless each NAME --expect gives is among them.
+
+  mcp call NAME [JSON] [--from SAVED[.PATH]] [--set PATH=VALUE ...] [--save SAVED]
+           [--expect-outcome made|unchanged|refused] [--expect TEXT]
+      Calls a tool, the arguments a JSON object, or what an earlier call
+      saved (--from, at PATH in its answer), each --set changing one field by
+      the data dictionary's path grammar (`positions[label=BTC].lots[0].cost`
+      picks the position whose label is BTC; a missing row is added). Prints
+      the tool's typed answer as JSON; --save keeps it for a later --from.
+      Refreshes the token pair when the access token has lapsed.
+
+  mcp complete --identifier TEXT asset_class=CLASS currency=CODE source=TEXT note=TEXT
+               [instrument_type=... fund_category=... fund_investors=... fund_nav=...
+                fund_liquidity_fee=...]
+      Completes the record listed with that identifier through core's tools,
+      dashboard__list_instruments_to_complete then
+      dashboard__complete_instruments, against the version listed.
+
+  mcp calls [--expect N]
+      Prints how many calls Connected clients lists for the admin, as she
+      reads it in a browser; with --expect, fails unless it is N or more.
+
 Reading core's HTML is this runner's alone, and only because it is published
 at the same commit as the dashboard it reads, and core's gate runs it against
 that dashboard at every commit. A plugin never parses core's pages itself.
 """
+import base64
+import hashlib
 import html
 import json
 import os
+import secrets
 import re
 import sys
 import time
@@ -764,9 +801,309 @@ def compose(args):
     print(json.dumps(written, indent=2))
 
 
+# ── An MCP client, as an agent's (W6.17, W6.20, contract v12) ───────────────
+
+STATE = os.environ.get("MERIDIAN_HARNESS_STATE", "/state")
+MCP_STATE = os.path.join(STATE, "mcp.json")
+CALLBACK = "http://127.0.0.1:53682/callback"
+ENUM_CLASSES = {name: "ASSET_CLASS_" + name.upper() for name in CLASSES}
+ENUM_FUND = {
+    "fund_category": ("category", "MONEY_MARKET_FUND_CATEGORY_"),
+    "fund_investors": ("investors", "MONEY_MARKET_FUND_INVESTORS_"),
+    "fund_nav": ("nav", "MONEY_MARKET_FUND_NAV_"),
+    "fund_liquidity_fee": ("liquidity_fee", "LIQUIDITY_FEE_REGIME_"),
+}
+
+
+def send_json(method, path, body=None, form=None, bearer=None):
+    """A JSON (or form) request to the dashboard: its status, its JSON or
+    None, and where it redirects."""
+    data, kind = None, None
+    if body is not None:
+        data, kind = json.dumps(body).encode(), "application/json"
+    elif form is not None:
+        data, kind = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+    request = urllib.request.Request(DASHBOARD + path, data=data, method=method)
+    if kind:
+        request.add_header("Content-Type", kind)
+    if bearer:
+        request.add_header("Authorization", f"Bearer {bearer}")
+    try:
+        response = urllib.request.build_opener(NoRedirect).open(request, timeout=60)
+        status, raw, headers = response.status, response.read(), response.headers
+    except urllib.error.HTTPError as refused:
+        status, raw, headers = refused.code, refused.read(), refused.headers
+    try:
+        said = json.loads(raw) if raw else None
+    except ValueError:
+        said = None
+    return status, said, headers.get("Location")
+
+
+def mcp_state():
+    try:
+        with open(MCP_STATE, encoding="utf-8") as kept:
+            return json.load(kept)
+    except OSError:
+        raise Failed("no MCP client is connected: run `mcp connect` first") from None
+
+
+def keep_state(state):
+    os.makedirs(STATE, exist_ok=True)
+    with open(MCP_STATE + ".new", "w", encoding="utf-8") as kept:
+        json.dump(state, kept)
+    os.replace(MCP_STATE + ".new", MCP_STATE)
+
+
+def mcp_connect(args):
+    covers = options(args, "--covers")
+    client_name = option(args, "--client", "harness agent")
+    if args:
+        raise Failed(f"mcp connect takes no {args[0]!r}")
+    status, said, _ = send_json("POST", "/oauth/register",
+                                {"client_name": client_name, "redirect_uris": [CALLBACK]})
+    if status != 201 or not said:
+        raise Failed(f"the client was not registered: {status} {said}")
+    client_id = said["client_id"]
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    query = urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id, "redirect_uri": CALLBACK,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": "harness",
+        "resource": DASHBOARD + "/mcp",
+    })
+    person = Browser()
+    asked = person.get(f"/oauth/authorize?{query}")
+    found = re.search(r'name="authorize" value="([^"]+)"', asked.body)
+    if asked.status != 200 or not found:
+        raise Failed(f"the authorisation did not ask her to sign in: {asked.status} {sentence(asked)}")
+    consent = person.post("/sign-in", {"name": ADMIN, "password": drawn_password(),
+                                       "authorize": found.group(1)})
+    request = re.search(r'name="request" value="([^"]+)"', consent.body)
+    confirm = re.search(r'name="confirm" value="([^"]+)"', consent.body)
+    if consent.status != 200 or not request or not confirm:
+        raise Failed(f"she was not shown the consent page: {consent.status} {sentence(consent)}")
+    fields = [("request", request.group(1)), ("confirm", confirm.group(1)), ("decision", "allow"),
+              ("covers", "some"), ("days", "30"), ("account_group", ALL_ACCOUNTS)]
+    for covered in covers:
+        if covered == "deployment_admin":
+            fields.append(("deployment_admin", "1"))
+        elif re.fullmatch(r"[a-z0-9-]+:(admin|write|read)", covered):
+            fields.append(("level", covered))
+        else:
+            raise Failed(f"--covers is deployment_admin or INSTANCE:LEVEL, not {covered!r}")
+    data = urllib.parse.urlencode(fields).encode()
+    decided = urllib.request.Request(DASHBOARD + "/oauth/authorize", data=data, method="POST")
+    decided.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        response = urllib.request.build_opener(NoRedirect).open(decided, timeout=30)
+        status, location = response.status, response.headers.get("Location")
+    except urllib.error.HTTPError as refused:
+        status, location = refused.code, refused.headers.get("Location")
+    code = urllib.parse.parse_qs(urllib.parse.urlsplit(location or "").query).get("code", [""])[0]
+    if status != 302 or not code:
+        raise Failed(f"the consent did not send back a code: {status} {location}")
+    status, issued, _ = send_json("POST", "/oauth/token", form={
+        "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
+        "redirect_uri": CALLBACK, "client_id": client_id, "resource": DASHBOARD + "/mcp"})
+    if status != 200 or not issued:
+        raise Failed(f"the code was not exchanged: {status} {issued}")
+    keep_state({"client_id": client_id, "access": issued["access_token"],
+                "refresh": issued["refresh_token"], "delegation": issued["delegation_id"],
+                "saved": {}})
+    tools = rpc("tools/list")["tools"]
+    print(f"mcp: connected through delegation {issued['delegation_id']}, {len(tools)} tools")
+
+
+def rpc(method, params=None):
+    """One JSON-RPC message on the delegation, refreshing once on a 401."""
+    state = mcp_state()
+    message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    status, said, _ = send_json("POST", "/mcp", message, bearer=state["access"])
+    if status == 401:
+        refreshed, issued, _ = send_json("POST", "/oauth/token", form={
+            "grant_type": "refresh_token", "refresh_token": state["refresh"],
+            "client_id": state["client_id"]})
+        if refreshed != 200 or not issued:
+            raise Failed(f"the token pair was not refreshed: {refreshed} {issued}")
+        state["access"], state["refresh"] = issued["access_token"], issued["refresh_token"]
+        keep_state(state)
+        status, said, _ = send_json("POST", "/mcp", message, bearer=state["access"])
+    if status != 200 or not said or "result" not in said:
+        raise Failed(f"/mcp {method}: {status} {said}")
+    return said["result"]
+
+
+def mcp_list(args):
+    wanted = options(args, "--expect")
+    if args:
+        raise Failed(f"mcp list takes no {args[0]!r}")
+    names = [tool["name"] for tool in rpc("tools/list")["tools"]]
+    missing = [name for name in wanted if name not in names]
+    for name in names:
+        print(name)
+    if missing:
+        raise Failed(f"the delegation does not reach {', '.join(missing)}")
+
+
+STEP = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[[^\]]*\])*)")
+
+
+def put(tree, path, value):
+    """Sets `path` in `tree`, by the dictionary's grammar, `[key=value]`
+    picking the row whose key is that value; a missing row is added."""
+    node = tree
+    parts = path.split(".")
+    for depth, part in enumerate(parts):
+        matched = STEP.fullmatch(part)
+        if not matched:
+            raise Failed(f"{path!r} is not a path")
+        name, indices = matched.group(1), re.findall(r"\[([^\]]*)\]", matched.group(2))
+        last = depth == len(parts) - 1
+        if not indices:
+            if last:
+                node[name] = value
+                return
+            node = node.setdefault(name, {})
+            continue
+        rows = node.setdefault(name, [])
+        for at, index in enumerate(indices):
+            if "=" in index:
+                key, wanted = index.split("=", 1)
+                found = [row for row in rows if str(row.get(key)) == wanted]
+                if not found:
+                    raise Failed(f"no row of {name} has {key} {wanted!r}")
+                row = found[0]
+            else:
+                number = int(index)
+                while len(rows) <= number:
+                    rows.append({})
+                row = rows[number]
+            if last and at == len(indices) - 1:
+                raise Failed(f"{path!r} names a row, not a field")
+            node = row
+
+
+def pick(tree, path):
+    for part in [p for p in path.split(".") if p]:
+        matched = STEP.fullmatch(part)
+        if not matched:
+            raise Failed(f"{path!r} is not a path")
+        tree = tree[matched.group(1)]
+        for index in re.findall(r"\[([^\]]*)\]", matched.group(2)):
+            tree = tree[int(index)]
+    return tree
+
+
+def mcp_call(args):
+    taken = option(args, "--from", None)
+    sets = options(args, "--set")
+    save = option(args, "--save", None)
+    outcome = option(args, "--expect-outcome", None)
+    expected = options(args, "--expect")
+    name = args.pop(0) if args else None
+    given = args.pop(0) if args else None
+    if not name or args:
+        raise Failed("mcp call takes a tool's name, and its arguments as JSON")
+    state = mcp_state()
+    arguments = {}
+    if taken:
+        saved, _, at = taken.partition(".")
+        if saved not in state["saved"]:
+            raise Failed(f"nothing was saved as {saved!r}")
+        arguments = json.loads(json.dumps(pick(state["saved"][saved], at)))
+    if given:
+        arguments.update(json.loads(given))
+    for each in sets:
+        path, _, value = each.partition("=")
+        put(arguments, path, value)
+    result = rpc("tools/call", {"name": name, "arguments": arguments})
+    answer = result.get("structuredContent") or {}
+    text = json.dumps(answer, indent=1, sort_keys=True)
+    print(text)
+    if save:
+        state = mcp_state()
+        state["saved"][save] = answer
+        keep_state(state)
+    if outcome and answer.get("outcome") != outcome:
+        raise Failed(f"{name} answered {answer.get('outcome')}, not {outcome}: {answer.get('detail', '')}")
+    for words in expected:
+        if words not in text:
+            raise Failed(f"{name}'s answer does not say {words!r}")
+
+
+def identifiers_said(record):
+    said = []
+    for identifier in record.get("identifiers", []):
+        if identifier.get("source"):
+            said.append(f"{identifier['scheme']} ({identifier['source']}): {identifier['value']}")
+        else:
+            said.append(f"{identifier['scheme']}: {identifier['value']}")
+    return "; ".join(said)
+
+
+def mcp_complete(args):
+    by_identifier = option(args, "--identifier", None)
+    asked = dict(pairs(args))
+    if args or not by_identifier:
+        raise Failed("mcp complete takes --identifier TEXT and NAME=VALUE")
+    if asked.get("asset_class") not in CLASSES or not asked.get("currency") \
+            or not asked.get("source") or not asked.get("note"):
+        raise Failed("mcp complete takes asset_class=, currency=, source= and note=")
+    found, cursor = None, ""
+    while found is None:
+        page = rpc("tools/call", {"name": "dashboard__list_instruments_to_complete",
+                                  "arguments": {"cursor": cursor, "page_size": 500}})
+        data = (page.get("structuredContent") or {}).get("data") or {}
+        for record in data.get("records", []):
+            if by_identifier in identifiers_said(record):
+                found = record
+                break
+        cursor = data.get("next_cursor", "")
+        if found is None and not cursor:
+            raise Failed(f"no record listed is {by_identifier!r}")
+    values = [{"asset_class": ENUM_CLASSES[asked["asset_class"]]}, {"currency": asked["currency"]}]
+    if asked.get("instrument_type"):
+        values.append({"instrument_type": "INSTRUMENT_TYPE_" + asked["instrument_type"].upper()})
+    stated = {part: prefix + asked[name].upper() for name, (part, prefix) in ENUM_FUND.items()
+              if asked.get(name)}
+    if stated:
+        values.append({"money_market_fund": stated})
+    result = rpc("tools/call", {"name": "dashboard__complete_instruments", "arguments": {
+        "completions": [{"instrument_id": found["instrument_id"],
+                         "against_version": found["version"], "values": values,
+                         "source": asked["source"], "note": asked["note"]}]}})
+    answer = result.get("structuredContent") or {}
+    if answer.get("outcome") != "made":
+        raise Failed(f"{found['instrument_id']} was not completed: {json.dumps(answer)}")
+    print(f"mcp complete: {found['instrument_id']} completed, {asked['asset_class']} in "
+          f"{asked['currency']}, through the delegation")
+
+
+def mcp_calls(args):
+    wanted = option(args, "--expect", None)
+    if args:
+        raise Failed(f"mcp calls takes no {args[0]!r}")
+    admin = signed_in()
+    page = admin.get("/delegations")
+    table = re.search(r'<table class="calls">(.*?)</table>', page.body, re.S)
+    count = len(re.findall(r"<tr data-outcome=", table.group(1))) if table else 0
+    print(count)
+    if wanted is not None and count < int(wanted):
+        raise Failed(f"Connected clients lists {count} calls, fewer than {wanted}")
+
+
+def mcp(args):
+    verbs = {"connect": mcp_connect, "list": mcp_list, "call": mcp_call,
+             "complete": mcp_complete, "calls": mcp_calls}
+    if not args or args[0] not in verbs:
+        raise Failed(f"mcp takes {', '.join(verbs)}")
+    verbs[args.pop(0)](args)
+
+
 COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
-            "instruments": instruments, "instrument": instrument}
+            "instruments": instruments, "instrument": instrument, "mcp": mcp}
 
 
 def main(argv):

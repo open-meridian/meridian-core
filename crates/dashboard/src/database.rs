@@ -55,6 +55,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "delegation",
         sql: include_str!("../migrations/0003_delegation.sql"),
     },
+    Migration {
+        version: 4,
+        name: "tool_call",
+        sql: include_str!("../migrations/0004_tool_call.sql"),
+    },
 ];
 
 const HISTORY: &str = "\

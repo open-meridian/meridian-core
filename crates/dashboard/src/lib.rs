@@ -32,6 +32,7 @@ pub mod first_run;
 pub mod health;
 pub mod html;
 pub mod kit;
+pub mod mcp;
 pub mod oidc;
 pub mod plugins;
 pub mod records;

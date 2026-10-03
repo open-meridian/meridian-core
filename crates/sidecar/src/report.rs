@@ -131,10 +131,17 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.not_carried_seen.clone())
                 .unwrap_or_default(),
-            // The tools it declared (W4.1, W4.8, contract v12): none until a
-            // sidecar serving v12 checks them.
-            declared_tools: Vec::new(),
-            tool_refusals: Vec::new(),
+            // The tools it declared and this sidecar admitted, and a sentence
+            // for each refused (W4.1, W4.8, contract v12): the dashboard's
+            // catalogue for /mcp, and the Summary's.
+            declared_tools: registration
+                .as_ref()
+                .map(|r| r.tools.clone())
+                .unwrap_or_default(),
+            tool_refusals: registration
+                .as_ref()
+                .map(|r| r.tool_refusals.clone())
+                .unwrap_or_default(),
         }
     }
 }

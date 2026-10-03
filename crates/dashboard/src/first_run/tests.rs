@@ -173,6 +173,7 @@ fn app_with(
         custody: Arc::default(),
         health: Arc::default(),
         kit: None,
+        bounds: Arc::default(),
     })
 }
 

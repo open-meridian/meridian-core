@@ -9,7 +9,7 @@ ARG RUST_VERSION=1.90
 ARG NODE_VERSION=22.23.3
 # The plugin UI kit, meridian-ui, at a pinned commit of its public repository.
 # Moving the kit is moving this.
-ARG MERIDIAN_UI_REV=b2910abaed6198276b6b6ec74d9ccf975a50ec26
+ARG MERIDIAN_UI_REV=c51f6318ebb8a2ff2049a31a394930109046df9d
 
 # The kit the dashboard serves at /.meridian/ui/<version>/ on every plugin host
 # and its own (spec/plugin-pages-share-one-kit.md, Q2), built from its source

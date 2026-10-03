@@ -1006,6 +1006,143 @@ pub(crate) fn opening(
         })
 }
 
+// ── A tool's call through the deployment's MCP surface (W6.20) ─────────
+
+/// The most of a plugin's answer to a tool's call the dashboard reads: a
+/// larger read is paged (W6.20, Q7).
+pub const TOOL_ANSWER_MOST: usize = 1 << 20;
+
+/// How long a plugin has to answer a tool's call.
+pub const TOOL_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Who a tool's call acts for: the person, the delegation and its client.
+pub(crate) struct ToolCaller<'a> {
+    pub subject: &'a str,
+    pub display_name: &'a str,
+    pub delegation_id: &'a str,
+    pub client_name: &'a str,
+}
+
+impl Plugins {
+    /// CallPluginTool: the request the tool's route would receive from a
+    /// page, at the level opened, with the assertion naming the delegation,
+    /// its client and the tool, and the arguments as JSON; the plugin's typed
+    /// answer back, or a refusal saying why there is none. No bearer token
+    /// crosses: the sidecar sees the assertion alone.
+    pub(crate) async fn call_tool(
+        &self,
+        instance: &str,
+        caller: ToolCaller<'_>,
+        opened: Opening,
+        tool: &meridian_pb::v1::ToolDeclaration,
+        arguments: serde_json::Value,
+        now: i64,
+    ) -> serde_json::Value {
+        let refused = |reason: &str, detail: String| serde_json::json!({"outcome": "refused", "reason": reason, "fields": [], "detail": detail});
+        if !self.runs(instance).await {
+            return refused(
+                "not_running",
+                format!("no plugin {instance} runs in this deployment"),
+            );
+        }
+        let who = Who {
+            subject: caller.subject.to_string(),
+            display_name: caller.display_name.to_string(),
+            directory_groups: Vec::new(),
+            covers: None,
+            delegation: Some(Delegated {
+                id: caller.delegation_id.to_string(),
+                client_name: caller.client_name.to_string(),
+            }),
+        };
+        let mut claims = opened.claims(&who, instance, now);
+        claims.tool_name = tool.name.clone();
+        let assertion = match self.signer.sign(&claims) {
+            Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
+            Err(failed) => {
+                return refused(
+                    "unavailable",
+                    format!("the dashboard cannot vouch for anybody yet: {failed}"),
+                )
+            }
+        };
+        let Ok(method) = Method::from_bytes(tool.method.as_bytes()) else {
+            return refused("unavailable", format!("{} is not a method", tool.method));
+        };
+        let answer = self
+            .client
+            .request(
+                method,
+                format!("{}{}", self.front_door(instance), tool.path),
+            )
+            .header(CALLER, assertion)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json")
+            .timeout(TOOL_ANSWER_WITHIN)
+            .body(arguments.to_string())
+            .send()
+            .await;
+        let mut answer = match answer {
+            Ok(answer) => answer,
+            Err(failed) if failed.is_timeout() => {
+                return refused(
+                    "unanswered",
+                    format!(
+                        "{instance} did not answer within {} seconds",
+                        TOOL_ANSWER_WITHIN.as_secs()
+                    ),
+                )
+            }
+            Err(failed) => {
+                return refused("unanswered", format!("{instance} did not answer: {failed}"))
+            }
+        };
+        let status = answer.status();
+        let typed = answer
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|kind| kind.starts_with("application/json"));
+        let mut bytes = Vec::new();
+        loop {
+            match answer.chunk().await {
+                Ok(Some(chunk)) if bytes.len() + chunk.len() <= TOOL_ANSWER_MOST => {
+                    bytes.extend_from_slice(&chunk)
+                }
+                Ok(Some(_)) => {
+                    return refused(
+                        "too_large",
+                        format!("{instance} answered more than {TOOL_ANSWER_MOST} bytes: a larger read is paged"),
+                    )
+                }
+                Ok(None) => break,
+                Err(failed) => return refused("unanswered", format!("{instance} stopped answering: {failed}")),
+            }
+        }
+        if typed {
+            if let Ok(said) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if said.get("outcome").and_then(|o| o.as_str()).is_some() {
+                    return said;
+                }
+            }
+        }
+        // Not typed: the sidecar's own refusal, or a plugin answering a page.
+        let text = String::from_utf8_lossy(&bytes);
+        let said: String = text.chars().take(1000).collect();
+        if status.is_success() {
+            refused(
+                "untyped_answer",
+                format!("{instance} answered no typed data: {said}"),
+            )
+        } else {
+            refused(
+                "refused",
+                format!("{instance} answered {}: {said}", status.as_u16()),
+            )
+        }
+    }
+}
+
 // ── From a terminal (W6.15) ─────────────────────────────────────────────
 
 fn answered(status: StatusCode, body: serde_json::Value) -> Response {

@@ -28,6 +28,7 @@ mod receive;
 pub mod report;
 mod service;
 mod streams;
+pub mod tools;
 mod typed;
 
 pub use contract::{admit_within, CONTRACT_CURRENT, CONTRACT_FLOOR};

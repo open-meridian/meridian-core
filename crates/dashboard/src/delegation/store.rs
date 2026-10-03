@@ -11,7 +11,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
-use super::{Client, Covers, Delegation, Grant, Kind, Revoked, Token, KEPT_NS, UNCONSENTED_NS};
+use super::{
+    Client, Covers, Delegation, Grant, Kind, Revoked, Token, ToolCall, CALLS_KEPT_NS, KEPT_NS,
+    UNCONSENTED_NS,
+};
 use crate::database::{said, Database};
 use crate::session::token;
 
@@ -72,6 +75,21 @@ pub trait DelegationStore: Send + Sync {
     /// longer than they stay listed, and clients nobody consented to within
     /// a day.
     fn sweep(&self, now_ns: i64) -> Result<(), String>;
+
+    /// Record one call through the deployment's MCP surface (W6.20,
+    /// contract v12): never an argument or an answer.
+    fn record_call(&self, call: &ToolCall) -> Result<(), String>;
+
+    /// The latest calls, newest first, at most `limit`: on one delegation,
+    /// or every one of a person's.
+    fn calls(&self, of: &CallsOf, limit: usize) -> Result<Vec<ToolCall>, String>;
+}
+
+/// Whose calls to list.
+#[derive(Clone, Debug)]
+pub enum CallsOf {
+    Delegation(String),
+    Person(String),
 }
 
 /// How long a token is kept past its life, so a request on one just expired
@@ -94,6 +112,7 @@ struct Kept {
     clients: HashMap<String, Client>,
     delegations: HashMap<String, Delegation>,
     tokens: HashMap<String, Token>,
+    calls: Vec<ToolCall>,
 }
 
 impl Kept {
@@ -350,7 +369,29 @@ impl DelegationStore for InMemory {
             .retain(|_, t| delegations.contains(&t.delegation_id));
         kept.clients
             .retain(|_, c| c.consented || now_ns - c.registered_at_ns <= UNCONSENTED_NS);
+        kept.calls
+            .retain(|call| now_ns - call.called_at_ns <= CALLS_KEPT_NS);
         Ok(())
+    }
+
+    fn record_call(&self, call: &ToolCall) -> Result<(), String> {
+        self.lock().calls.push(call.clone());
+        Ok(())
+    }
+
+    fn calls(&self, of: &CallsOf, limit: usize) -> Result<Vec<ToolCall>, String> {
+        let kept = self.lock();
+        Ok(kept
+            .calls
+            .iter()
+            .rev()
+            .filter(|call| match of {
+                CallsOf::Delegation(id) => &call.delegation_id == id,
+                CallsOf::Person(subject) => &call.subject == subject,
+            })
+            .take(limit)
+            .cloned()
+            .collect())
     }
 }
 
@@ -787,6 +828,69 @@ impl DelegationStore for InPostgres {
             &[&now_ns, &UNCONSENTED_NS],
         )
         .map_err(said)?;
+        conn.execute(
+            "DELETE FROM dashboard_tool_call WHERE called_at_ns + $2::bigint < $1::bigint",
+            &[&now_ns, &CALLS_KEPT_NS],
+        )
+        .map_err(said)?;
         Ok(())
+    }
+
+    fn record_call(&self, call: &ToolCall) -> Result<(), String> {
+        let mut conn = self.database.conn()?;
+        conn.execute(
+            "INSERT INTO dashboard_tool_call (call_id, called_at_ns, subject, delegation_id,
+                 client_name, owner, tool, level, outcome, reason, duration_ms)
+             VALUES ($11, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &call.called_at_ns,
+                &call.subject,
+                &call.delegation_id,
+                &call.client_name,
+                &call.owner,
+                &call.tool,
+                &call.level,
+                &call.outcome,
+                &call.reason,
+                &call.duration_ms,
+                &token(),
+            ],
+        )
+        .map_err(said)?;
+        Ok(())
+    }
+
+    fn calls(&self, of: &CallsOf, limit: usize) -> Result<Vec<ToolCall>, String> {
+        let mut conn = self.database.conn()?;
+        let (column, value) = match of {
+            CallsOf::Delegation(id) => ("delegation_id", id),
+            CallsOf::Person(subject) => ("subject", subject),
+        };
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT called_at_ns, subject, delegation_id, client_name, owner, tool,
+                            level, outcome, reason, duration_ms
+                       FROM dashboard_tool_call WHERE {column} = $1
+                      ORDER BY called_at_ns DESC LIMIT $2"
+                ),
+                &[value, &(limit as i64)],
+            )
+            .map_err(said)?;
+        Ok(rows
+            .iter()
+            .map(|row| ToolCall {
+                called_at_ns: row.get(0),
+                subject: row.get(1),
+                delegation_id: row.get(2),
+                client_name: row.get(3),
+                owner: row.get(4),
+                tool: row.get(5),
+                level: row.get(6),
+                outcome: row.get(7),
+                reason: row.get(8),
+                duration_ms: row.get(9),
+            })
+            .collect())
     }
 }

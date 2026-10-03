@@ -128,6 +128,8 @@ mod tests {
 
     fn entry(instrument_id: &str, version: i64, operation: &str) -> Version {
         Version {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
             instrument_id: instrument_id.into(),
             version,
             operation: operation.into(),

@@ -44,6 +44,10 @@ pub fn routes() -> Router<Arc<App>> {
             "/.well-known/oauth-protected-resource/terminal",
             get(terminal_metadata),
         )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(mcp_metadata),
+        )
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize).post(decide))
         .route("/oauth/token", post(token))
@@ -141,13 +145,23 @@ async fn metadata(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 }
 
 /// RFC 9728, for the CLI's surface: which authorisation server issues its
-/// tokens. The MCP surface's is slice 2's.
+/// tokens.
 async fn terminal_metadata(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let issuer = issuer(&app, &headers);
+    resource_metadata(&app, &headers, Resource::Terminal)
+}
+
+/// RFC 9728, for the deployment's MCP surface (W6.20, contract v12): the
+/// dashboard issues its tokens, as it does the CLI's.
+async fn mcp_metadata(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    resource_metadata(&app, &headers, Resource::Mcp)
+}
+
+fn resource_metadata(app: &App, headers: &HeaderMap, resource: Resource) -> Response {
+    let issuer = issuer(app, headers);
     json(
         StatusCode::OK,
         serde_json::json!({
-            "resource": format!("{issuer}{}", Resource::Terminal.path()),
+            "resource": format!("{issuer}{}", resource.path()),
             "authorization_servers": [issuer],
             "bearer_methods_supported": ["header"],
         }),
@@ -333,7 +347,7 @@ async fn authorize(
                     ("error", "invalid_target"),
                     (
                         "error_description",
-                        &format!("resource must name {issuer}/terminal"),
+                        &format!("resource must name {issuer}/terminal or {issuer}/mcp"),
                     ),
                     ("state", state),
                 ],
@@ -477,6 +491,10 @@ pub(super) async fn signed_in(
         Ok(standing) => standing,
         Err(failed) => return refused(&failed.to_string()),
     };
+    let tools = match asked.resource {
+        Resource::Mcp => Some(tool_rows(app)),
+        Resource::Terminal => None,
+    };
     Html(consent_page(
         id,
         &confirm,
@@ -484,8 +502,65 @@ pub(super) async fn signed_in(
         &person,
         &holdable,
         standing.as_ref(),
+        tools.as_ref(),
     ))
     .into_response()
+}
+
+/// The tools each row of access reaches, for a client asking for `/mcp`
+/// (W6.17, W6.20, Q5): under each plugin and level, the plugin's tools that
+/// level serves, by title, reads and acts apart; under the deployment
+/// admin's capabilities, core's own.
+pub(crate) struct ToolRows {
+    pub plugins: BTreeMap<(String, String), Vec<(String, bool)>>,
+    pub deployment_admin: Vec<(String, bool)>,
+}
+
+pub(crate) fn tool_rows(app: &App) -> ToolRows {
+    let mut plugins: BTreeMap<(String, String), Vec<(String, bool)>> = BTreeMap::new();
+    for (instance, report) in app.health.view() {
+        for tool in &report.declared_tools {
+            for level in &tool.levels {
+                if let Ok(level) = AccessLevel::try_from(*level) {
+                    plugins
+                        .entry((instance.clone(), level_name(level).to_string()))
+                        .or_default()
+                        .push((tool.title.clone(), tool.reads));
+                }
+            }
+        }
+    }
+    ToolRows {
+        plugins,
+        deployment_admin: crate::mcp::instruments::SPECS
+            .iter()
+            .map(|spec| (spec.title.to_string(), spec.reads))
+            .collect(),
+    }
+}
+
+fn tools_said(tools: &[(String, bool)]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let said = |reads: bool| {
+        tools
+            .iter()
+            .filter(|(_, r)| *r == reads)
+            .map(|(title, _)| escape(title))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (reads, acts) = (said(true), said(false));
+    let mut out = String::from("<span class=\"hint tools\">");
+    if !reads.is_empty() {
+        out.push_str(&format!("Reads: {reads}. "));
+    }
+    if !acts.is_empty() {
+        out.push_str(&format!("Acts: {acts}."));
+    }
+    out.push_str("</span>");
+    out
 }
 
 fn consent_page(
@@ -495,6 +570,7 @@ fn consent_page(
     person: &Person,
     holdable: &Holdable,
     standing: Option<&Delegation>,
+    tools: Option<&ToolRows>,
 ) -> String {
     let client = &asked.client;
     let host = reqwest::Url::parse(&asked.redirect_uri)
@@ -542,8 +618,11 @@ fn consent_page(
         choices.push_str(&format!(
             "<label><input type=\"checkbox\" name=\"deployment_admin\" value=\"1\"{}> \
              Deployment admin: this deployment's own settings, accounts and plugins, but never \
-             who holds access</label>",
-            checked(covers.deployment_admin)
+             who holds access{}</label>",
+            checked(covers.deployment_admin),
+            tools
+                .map(|t| tools_said(&t.deployment_admin))
+                .unwrap_or_default(),
         ));
     }
     for (instance, levels) in &holdable.plugins {
@@ -551,7 +630,11 @@ fn consent_page(
             let name = level_name(*level);
             choices.push_str(&format!(
                 "<label><input type=\"checkbox\" name=\"level\" value=\"{instance}:{name}\"{on}> \
-                 {instance}: {said} ({name})</label>",
+                 {instance}: {said} ({name}){reach}</label>",
+                reach = tools
+                    .and_then(|t| t.plugins.get(&(instance.clone(), name.to_string())))
+                    .map(|reached| tools_said(reached))
+                    .unwrap_or_default(),
                 instance = escape(instance),
                 on = checked(
                     covers
@@ -594,7 +677,7 @@ fn consent_page(
              <input type=\"hidden\" name=\"confirm\" value=\"{confirm}\">\
              <fieldset><legend>What it may do</legend>\
              <label><input type=\"radio\" name=\"covers\" value=\"everything\"{all}> \
-             Everything you hold, as that changes</label>\
+             Everything you hold, as that changes{later}</label>\
              <label><input type=\"radio\" name=\"covers\" value=\"some\"{some}> \
              Only what is ticked below</label>\
              <div class=\"choices\">{choices}</div></fieldset>\
@@ -609,6 +692,12 @@ fn consent_page(
             confirm = escape(confirm),
             all = checked(covers.everything),
             some = checked(!covers.everything),
+            later = if tools.is_some() {
+                "<span class=\"hint tools\">Its tools on this deployment's MCP surface, \
+                 those added later included.</span>"
+            } else {
+                ""
+            },
         ),
     )
 }

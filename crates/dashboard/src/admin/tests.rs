@@ -173,6 +173,7 @@ fn harness_holding(
         custody: Arc::default(),
         health: Arc::default(),
         kit: None,
+        bounds: Arc::default(),
     });
     Harness {
         app,

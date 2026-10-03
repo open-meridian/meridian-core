@@ -79,9 +79,9 @@ fn source_to_wire(source: &Source) -> InstrumentValueSource {
         instance_id: source.instance_id.clone(),
         recorded_at_ns: source.recorded_at_ns,
         note: source.note.clone(),
-        // Contract v12: the delegation and client, once the store keeps them.
-        acting_through_delegation: String::new(),
-        client_name: String::new(),
+        // Contract v12: the delegation and client the person acted through.
+        acting_through_delegation: source.acting_through_delegation.clone(),
+        client_name: source.client_name.clone(),
     }
 }
 

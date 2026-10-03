@@ -303,6 +303,51 @@ async fn front_door(key: &SigningKey, port: Option<u32>) -> String {
     front_door_live(key, port, None).await
 }
 
+/// One whose plugin declared tools at registration (contract v12).
+async fn front_door_with_tools(
+    key: &SigningKey,
+    port: u32,
+    tools: Vec<meridian_pb::v1::ToolDeclaration>,
+) -> (String, Arc<Sidecar>) {
+    let bus = Arc::new(Bus::single(
+        INSTANCE,
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let sidecar = Arc::new(Sidecar::under(
+        &contract(),
+        bus,
+        "dep-local-1",
+        Identity::new(INSTANCE, vec!["custody".into()]),
+    ));
+    let reply = sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v12".into(),
+            interface: Some(InterfaceDeclaration {
+                loopback_port: port,
+                title: "Holdings".into(),
+                pages: vec![],
+            }),
+            tools,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    let door = router(
+        FrontDoor::new(
+            Arc::clone(&sidecar),
+            Verifier::holding(INSTANCE, KEY_ID, key.verifying_key()),
+        )
+        .unwrap(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, door).await.unwrap() });
+    (format!("http://{address}"), sidecar)
+}
+
 /// The same, live on a development deployment when given a folder.
 async fn front_door_live(
     key: &SigningKey,
@@ -574,5 +619,83 @@ async fn a_development_path_is_answered_here_and_never_reaches_the_plugin() {
     assert!(
         reached.lock().unwrap().is_empty(),
         "nothing reached the plugin"
+    );
+}
+
+fn a_tool(name: &str, method: &str, path: &str) -> meridian_pb::v1::ToolDeclaration {
+    meridian_pb::v1::ToolDeclaration {
+        name: name.into(),
+        title: "Confirm".into(),
+        description: "Records it.".into(),
+        method: method.into(),
+        path: path.into(),
+        levels: vec![meridian_pb::v1::AccessLevel::Write as i32],
+        reads: false,
+        input_schema: r#"{"type":"object"}"#.into(),
+        output_schema: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_tools_claim_reaches_the_plugin_at_its_route_and_nowhere_else() {
+    let key = key();
+    let (port, reached) = plugin().await;
+    let (door, sidecar) = front_door_with_tools(
+        &key,
+        port.into(),
+        vec![
+            a_tool("confirm", "POST", "/opening/confirm"),
+            a_tool("Bad-Name", "POST", "/bad"),
+        ],
+    )
+    .await;
+    // The refused tool names itself; the plugin is admitted all the same.
+    let report = sidecar.report(now_ns());
+    assert_eq!(report.declared_tools.len(), 1);
+    assert!(
+        report.tool_refusals[0].contains("Bad-Name"),
+        "{:?}",
+        report.tool_refusals
+    );
+
+    let calling = |id: &str| {
+        let mut c = claims(id);
+        c.issued_at_ns = now_ns();
+        c.expires_at_ns = c.issued_at_ns + 60 * SECOND;
+        c.tool_name = "confirm".into();
+        signed(&key, KEY_ID, &c)
+    };
+    let client = reqwest::Client::new();
+    let at_its_route = client
+        .post(format!("{door}/opening/confirm"))
+        .header(HEADER, calling("t-1"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(at_its_route.status(), 200);
+    let elsewhere = client
+        .post(format!("{door}/opening/other"))
+        .header(HEADER, calling("t-2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status(), 403);
+    assert!(elsewhere
+        .text()
+        .await
+        .unwrap()
+        .contains("served at POST /opening/confirm"));
+    let other_method = client
+        .get(format!("{door}/opening/confirm"))
+        .header(HEADER, calling("t-3"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_method.status(), 403);
+    assert_eq!(
+        reached.lock().unwrap().len(),
+        1,
+        "a tool's claim reached another route"
     );
 }

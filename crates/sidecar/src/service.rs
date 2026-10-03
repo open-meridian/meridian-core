@@ -55,6 +55,11 @@ pub struct Registration {
     /// How often it saw each name it does not carry, as its last accepted
     /// heartbeat gave them (W4.5).
     pub not_carried_seen: Vec<meridian_pb::v1::NotCarriedSeen>,
+    /// The tools it declared that this sidecar admitted (W4.1, contract
+    /// v12), which its report carries and its front door holds a tool's
+    /// claim to; and a sentence for each it refused ([`crate::tools`]).
+    pub tools: Vec<meridian_pb::v1::ToolDeclaration>,
+    pub tool_refusals: Vec<String>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -329,6 +334,14 @@ impl SidecarService for Sidecar {
             }
         }
 
+        // Its tools (contract v12), each checked and refused alone: a tool
+        // that fails names itself in the report and never stops the plugin
+        // registering (W4.1).
+        let (tools, tool_refusals) = crate::tools::checked(&req.tools, &self.identity.instance_id);
+        for refusal in &tool_refusals {
+            tracing::warn!(instance = self.identity.instance_id, "{refusal}");
+        }
+
         // Grants come from what this sidecar was launched as, never from the
         // request. The request has nothing in it that could decide them.
         //
@@ -356,6 +369,8 @@ impl SidecarService for Sidecar {
             figures: Vec::new(),
             declaration: req.declaration.clone(),
             not_carried_seen: Vec::new(),
+            tools,
+            tool_refusals,
         });
         self.changed.notify_one();
 
@@ -629,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v12"] {
+        for declared in ["v1", "v13"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -638,7 +653,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v11"));
+            assert!(reply.refusal_reason.contains("v2 through v12"));
             assert!(sc.registration().is_none());
         }
     }

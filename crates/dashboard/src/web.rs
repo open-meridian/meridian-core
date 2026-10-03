@@ -39,6 +39,7 @@ pub(crate) mod oauth;
 mod reset;
 mod terminal;
 pub(crate) use delegations::path_segment;
+pub(crate) use terminal::bearer as bearer_token;
 pub use terminal::{caller_of, Caller, Through};
 
 pub const SESSION_COOKIE: &str = "meridian_session";
@@ -99,6 +100,9 @@ pub struct App {
     /// (spec/plugin-pages-share-one-kit.md, Q2). None where this process
     /// carries none, which only a build outside the image does.
     pub kit: Option<Arc<crate::kit::Kit>>,
+    /// The deployment's MCP surface's bounds, per delegation and per plugin
+    /// instance (W6.20, Q7), held for every request this process serves.
+    pub bounds: Arc<crate::mcp::bounds::Bounds>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -112,6 +116,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/.meridian/ui/{*file}", get(kit))
         .merge(terminal::routes())
         .merge(oauth::routes())
+        .merge(crate::mcp::routes())
         .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())

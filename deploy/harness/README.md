@@ -27,7 +27,7 @@ same tag. The runtime image carries none of it.
 | File | What it is |
 |---|---|
 | `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles; the stores migrated; street, the book (`bor`), instrument, conductor and a development dashboard; the `runner`; and `store` |
-| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant`; and `compose`, which writes the plugins' half of the deployment |
+| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
 
@@ -129,6 +129,11 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `unlinked [--expect N] [--seconds N]` | Prints how many external accounts the plugin reported that nothing links, as the dashboard counts them; with `--expect`, waits for `N`. |
 | `instruments [--expect N] [--seconds N]` | Prints each record the dashboard's Instruments page lists as one the book cannot use, its ID and identifiers; with `--expect`, waits until it lists `N`. |
 | `instrument ID\|--identifier TEXT asset_class=CLASS currency=CODE source=TEXT [description=TEXT] [instrument_type=money_market_fund fund_category=government\|prime\|tax_exempt fund_investors=retail\|institutional fund_nav=stable\|floating fund_liquidity_fee=mandatory\|discretionary] [note=TEXT]` | Completes a record at the Instruments page as the deployment admin does, each value with its source: its asset class and currency, and its description; and from contract v11 its instrument type and, for a money market fund, its four attributes, stated together. |
+| `mcp connect [--covers deployment_admin] [--covers INSTANCE:LEVEL ...] [--client NAME]` | From contract v12: connects an MCP client as the admin, as an agent's client does: registers it, takes her through the authorisation for the `/mcp` resource with a PKCE challenge, signs her in afresh, consents to only what `--covers` names on All accounts, and keeps the token pair in the runner's state for the run. |
+| `mcp list [--expect NAME ...]` | Prints the tools the delegation reaches, one per line. |
+| `mcp call NAME [JSON] [--from SAVED[.PATH]] [--set PATH=VALUE ...] [--save SAVED] [--expect-outcome OUTCOME] [--expect TEXT]` | Calls a tool and prints its typed answer as JSON; `--from` starts from what an earlier call saved, and each `--set` changes one field by the dictionary's path grammar, `[key=value]` picking a row by a field of its own. Refreshes the pair when the access token has lapsed. |
+| `mcp complete --identifier TEXT asset_class=CLASS currency=CODE source=TEXT note=TEXT [instrument_type=... fund_...=...]` | Completes the record listed with that identifier through core's tools, against the version listed. |
+| `mcp calls [--expect N]` | Prints how many calls Connected clients lists for the admin; with `--expect`, fails below `N`. |
 | `grant --level read\|write\|admin` | Grants the harness's admin that level on the plugin, on All accounts, as a deployment admin does: a user group holding the admin, an access group, and the permission joining them. The admin holds nothing on a plugin until granted; a session at `write` (Open) needs write. |
 
 Every command acts on the first plugin listed, or on another with `--instance
