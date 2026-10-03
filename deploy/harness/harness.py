@@ -884,7 +884,10 @@ def mcp_connect(args):
     if consent.status != 200 or not request or not confirm:
         raise Failed(f"she was not shown the consent page: {consent.status} {sentence(consent)}")
     fields = [("request", request.group(1)), ("confirm", confirm.group(1)), ("decision", "allow"),
-              ("covers", "some"), ("days", "30"), ("account_group", ALL_ACCOUNTS)]
+              ("covers", "some"), ("days", "30")]
+    # Every account she may tick: All accounts once she holds a grant on it.
+    for offered in re.findall(r'name="account_group" value="([^"]+)"', consent.body):
+        fields.append(("account_group", html.unescape(offered)))
     for covered in covers:
         if covered == "deployment_admin":
             fields.append(("deployment_admin", "1"))
@@ -902,7 +905,9 @@ def mcp_connect(args):
         status, location = refused.code, refused.headers.get("Location")
     code = urllib.parse.parse_qs(urllib.parse.urlsplit(location or "").query).get("code", [""])[0]
     if status != 302 or not code:
-        raise Failed(f"the consent did not send back a code: {status} {location}")
+        offered = re.findall(r'name="(?:level|account_group|deployment_admin)" value="([^"]+)"',
+                             consent.body)
+        raise Failed(f"the consent did not send back a code: {status} {location}; it offered {offered}")
     status, issued, _ = send_json("POST", "/oauth/token", form={
         "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
         "redirect_uri": CALLBACK, "client_id": client_id, "resource": DASHBOARD + "/mcp"})
