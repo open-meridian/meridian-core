@@ -504,6 +504,40 @@ pub fn refused(reason: &str, detail: &str, fields: Vec<Value>) -> Value {
 async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> Value {
     let started = Instant::now();
     let called_at_ns = app.clock.now_ns();
+    // Bounded before anything is looked up, so a delegation asking for tools
+    // it does not reach is bounded as one calling those it does; the
+    // instance is the name's owner, which a plugin's tool always names.
+    let (owner, _) = name.split_once("__").unwrap_or((name, ""));
+    let instance = (owner != DASHBOARD && crate::plugins::is_instance(owner)).then_some(owner);
+    let admitted = match app
+        .bounds
+        .admit(called_at_ns, &caller.delegation_id, instance)
+    {
+        Ok(admitted) => admitted,
+        Err(wait) => {
+            let record = crate::delegation::ToolCall {
+                called_at_ns,
+                subject: caller.subject.clone(),
+                delegation_id: caller.delegation_id.clone(),
+                client_name: caller.client_name.clone(),
+                owner: owner.to_string(),
+                tool: name.to_string(),
+                level: String::new(),
+                outcome: "refused".into(),
+                reason: "rate_limited".into(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            };
+            if let Err(failed) = app.delegations.record_call(record).await {
+                tracing::warn!(%failed, tool = name, "a tool call was not recorded");
+            }
+            return tool_answer(json!({
+                "outcome": "refused",
+                "reason": "rate_limited",
+                "retry_after_seconds": wait,
+                "detail": format!("Too many calls on this delegation or to this plugin at once; try again in {wait} seconds."),
+            }));
+        }
+    };
     let tools = match catalogue(app, caller).await {
         Ok(tools) => tools,
         Err(why) => return tool_answer(refused("unavailable", &why, Vec::new())),
@@ -519,43 +553,22 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
         }
         return tool_answer(refused("not_listed", &said, Vec::new()));
     };
-    let instance = match &tool.owner {
-        Owner::Plugin { instance, .. } => Some(instance.as_str()),
-        Owner::Dashboard(_) => None,
-    };
-    let (structured, level) = match app
-        .bounds
-        .admit(called_at_ns, &caller.delegation_id, instance)
-    {
-        Err(wait) => (
-            json!({
-                "outcome": "refused",
-                "reason": "rate_limited",
-                "retry_after_seconds": wait,
-                "detail": format!("Too many calls on this delegation or to this plugin at once; try again in {wait} seconds."),
-            }),
-            None,
+    let (structured, level) = match &tool.owner {
+        Owner::Dashboard(spec) => (
+            instruments::call(app, caller, spec, arguments).await,
+            Some(AccessLevel::Unspecified),
         ),
-        Ok(admitted) => {
-            let answer = match &tool.owner {
-                Owner::Dashboard(spec) => (
-                    instruments::call(app, caller, spec, arguments).await,
-                    Some(AccessLevel::Unspecified),
-                ),
-                Owner::Plugin {
-                    instance,
-                    declared,
-                    level,
-                    ..
-                } => (
-                    plugin_call(app, caller, instance, declared, *level, arguments).await,
-                    Some(*level),
-                ),
-            };
-            drop(admitted);
-            answer
-        }
+        Owner::Plugin {
+            instance,
+            declared,
+            level,
+            ..
+        } => (
+            plugin_call(app, caller, instance, declared, *level, arguments).await,
+            Some(*level),
+        ),
     };
+    drop(admitted);
     let outcome = structured
         .get("outcome")
         .and_then(Value::as_str)

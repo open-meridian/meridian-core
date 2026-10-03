@@ -659,3 +659,26 @@ fn a_call_opens_at_write_before_read_before_admin() {
         None
     );
 }
+
+#[tokio::test]
+async fn a_delegation_past_its_burst_is_told_when_to_try_again_as_a_tool_error() {
+    let h = harness(false).await;
+    let token = token(&h.app, covering(&["write"], false), Resource::Mcp).await;
+    for _ in 0..crate::mcp::bounds::BURST as usize {
+        let (_, said, _) = rpc(&h.app, Some(&token), &[], call("nowhere__x", json!({}))).await;
+        assert_eq!(said["result"]["structuredContent"]["reason"], "not_listed");
+    }
+    let (status, said, _) = rpc(&h.app, Some(&token), &[], call("ops-1__confirm", json!({}))).await;
+    assert_eq!(status, 200, "a bound is a tool error, never an HTTP 429");
+    let refused = &said["result"]["structuredContent"];
+    assert_eq!(refused["reason"], "rate_limited");
+    assert!(refused["retry_after_seconds"].as_u64().unwrap() >= 1);
+    assert!(h.reached.lock().unwrap().is_empty());
+    let calls = h
+        .app
+        .delegations
+        .calls(crate::delegation::CallsOf::Person(ADA.into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(calls[0].reason, "rate_limited");
+}
