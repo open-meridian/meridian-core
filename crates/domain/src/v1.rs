@@ -166,6 +166,17 @@ pub struct InstrumentValueSource {
     /// Why a value held was changed, where given.
     #[prost(string, tag = "7")]
     pub note: ::prost::alloc::string::String,
+    /// The delegation the person acted through, when they set or accepted the
+    /// value through a client -- an agent on the deployment's MCP surface --
+    /// rather than at the dashboard in a browser (W3.10, W6.20, contract v12):
+    /// stamped from the command's envelope (W4.9), never typed. Empty beside a
+    /// person at the dashboard, and wherever person is.
+    #[prost(string, tag = "8")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    /// The client's registered name, beside acting_through_delegation, as the
+    /// envelope carried it; empty whenever it is.
+    #[prost(string, tag = "9")]
+    pub client_name: ::prost::alloc::string::String,
 }
 /// A value offered for a deployment's record (W3.1, W3.3), shown beside its
 /// field and in force only when a person accepts it (W3.10).
@@ -862,6 +873,15 @@ pub struct InstrumentVersion {
     /// merged into.
     #[prost(string, tag = "9")]
     pub merged_instrument_id: ::prost::alloc::string::String,
+    /// The delegation the person acted through, when they made the version
+    /// through a client rather than at the dashboard in a browser (W3.10,
+    /// W3.13, W6.20, contract v12), stamped from the command's envelope (W4.9);
+    /// and the client's registered name beside it. Both empty for a person at
+    /// the dashboard, a plugin's report and a migration.
+    #[prost(string, tag = "10")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub client_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadInstrumentHistoryReply {
@@ -1891,6 +1911,16 @@ pub struct PluginReport {
     pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
     #[prost(message, repeated, tag = "17")]
     pub not_carried_seen: ::prost::alloc::vec::Vec<::meridian_pb::v1::NotCarriedSeen>,
+    /// The tools the plugin declared when it registered that the sidecar
+    /// admitted (W4.1, W4.8, W6.20, contract v12), in its order, from which the
+    /// dashboard keeps its catalogue for the deployment's MCP surface; and each
+    /// it refused, as a sentence naming the tool and why, which the plugin's
+    /// Summary shows. Both empty while it is not registered, and from a plugin
+    /// before v12. The conductor carries neither on.
+    #[prost(message, repeated, tag = "18")]
+    pub declared_tools: ::prost::alloc::vec::Vec<::meridian_pb::v1::ToolDeclaration>,
+    #[prost(string, repeated, tag = "19")]
+    pub tool_refusals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {

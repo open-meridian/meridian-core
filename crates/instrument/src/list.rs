@@ -172,6 +172,10 @@ pub fn history(
                 .collect(),
             person: version.person.clone(),
             instance_id: version.instance_id.clone(),
+            // Contract v12: the delegation and client, once the store keeps
+            // them.
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
             note: version.note.clone(),
             record_time_ns: version.record_time_ns,
             merged_instrument_id: version.merged_instrument_id.clone(),

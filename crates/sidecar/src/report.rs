@@ -131,6 +131,10 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.not_carried_seen.clone())
                 .unwrap_or_default(),
+            // The tools it declared (W4.1, W4.8, contract v12): none until a
+            // sidecar serving v12 checks them.
+            declared_tools: Vec::new(),
+            tool_refusals: Vec::new(),
         }
     }
 }

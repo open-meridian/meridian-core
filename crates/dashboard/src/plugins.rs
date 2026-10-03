@@ -981,6 +981,8 @@ impl Opening {
                 .as_ref()
                 .map(|d| d.client_name.clone())
                 .unwrap_or_default(),
+            // A page's request names no tool: only `/mcp` sets one (W6.20).
+            tool_name: String::new(),
         }
     }
 }

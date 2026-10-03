@@ -668,6 +668,15 @@ message PluginReport {
   PluginDeclaration declaration = 16;
   repeated NotCarriedSeen not_carried_seen = 17;
 
+  // The tools the plugin declared when it registered that the sidecar
+  // admitted (W4.1, W4.8, W6.20, contract v12), in its order, from which the
+  // dashboard keeps its catalogue for the deployment's MCP surface; and each
+  // it refused, as a sentence naming the tool and why, which the plugin's
+  // Summary shows. Both empty while it is not registered, and from a plugin
+  // before v12. The conductor carries neither on.
+  repeated ToolDeclaration declared_tools = 18;
+  repeated string tool_refusals = 19;
+
   // A single role, before a plugin could hold several.
   reserved 2;
   reserved "role";
