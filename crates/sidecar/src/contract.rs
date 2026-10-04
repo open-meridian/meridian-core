@@ -103,8 +103,17 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// SDK derives from its typed routes, declared at registration, each checked
 /// and refused alone, carried in the report, and the tool a call names in
 /// the claims, admitted only at that tool's route ([`crate::tools`]). A
-/// plugin built before declares none, and is on no agent's list.
-pub const CONTRACT_CURRENT: u32 = 12;
+/// plugin built before declares none, and is on no agent's list. v13 is
+/// tickets inside a deployment (spec/a-problem-seen-in-a-deployment-reaches-
+/// someone-who-can-act, slice 1; sdk-contract/a-problem-reaches-someone-who-
+/// can-act-contract): `SidecarService.FileTicket` and `FiledTickets`, by
+/// which a plugin files a ticket for the person it is serving, never as
+/// itself, and reads back what became of what it filed ([`crate::tickets`]).
+/// A plugin built on them would meet `UNIMPLEMENTED` at its first filing on
+/// an older sidecar, rather than a refusal at registration naming both
+/// versions, which is why the version rose. A plugin built before files
+/// nothing.
+pub const CONTRACT_CURRENT: u32 = 13;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -352,7 +361,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v12); rebuild it against v2 or later"
+                 (v2 through v13); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -361,11 +370,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v13"),
+            admit("v14"),
             Err(
-                "the plugin was built against contract v13, newer than this sidecar \
-                 (v2 through v12); upgrade the runtime, or rebuild the plugin against \
-                 v12 or earlier"
+                "the plugin was built against contract v14, newer than this sidecar \
+                 (v2 through v13); upgrade the runtime, or rebuild the plugin against \
+                 v13 or earlier"
                     .into()
             )
         );
@@ -376,7 +385,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v12"
+                "the plugin declared no contract version; this sidecar accepts v2 through v13"
                     .into()
             )
         );

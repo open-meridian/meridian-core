@@ -12,7 +12,10 @@
 //! admitted only acting for an admin of the plugin, in a session opened by
 //! Manage (the claims' level `admin`), a link only for an external account the
 //! plugin itself reported (W2.8), and one naming a new account only for a
-//! deployment admin.
+//! deployment admin. **Two named exceptions** (contract v13; W4.9's notes,
+//! W4.12): filing a ticket and reading what the plugin filed are admitted
+//! acting for a person at any level, and never as the plugin itself
+//! ([`FOR_A_PERSON_AT_ANY_LEVEL`], the one place they are named).
 //!
 //! **A session's level decides what is sent for the person** (W4.9, W6.9).
 //! Under `write` (Open), a command on an account in the write set; under
@@ -58,6 +61,16 @@ use crate::service::Sidecar;
 /// an admin of the plugin (W6.4).
 const CONFIGURATION: &str = "platform.config.";
 const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
+/// A plugin's ticket, filed with the dashboard (PluginFilesTicket, W4.12).
+pub(crate) const FILE_TICKET: &str = "platform.config.command.file-ticket";
+/// What became of the tickets a plugin filed (ReadFiledTickets, W4.12).
+pub(crate) const FILED_TICKETS: &str = "platform.config.query.filed-tickets";
+/// The `config` topics sent for a person at any level -- `read`, `write` or
+/// `admin` -- rather than only for an admin of the plugin: the two named
+/// exceptions of W4.9's notes (contract v13, ruled 2026-10-03). Every other
+/// `config` command and query stays an admin's, and none is ever sent for
+/// the plugin as itself.
+pub(crate) const FOR_A_PERSON_AT_ANY_LEVEL: [&str; 2] = [FILE_TICKET, FILED_TICKETS];
 /// Where a plugin says which external accounts its connection reaches (W2.8).
 const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
 
@@ -207,12 +220,13 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
-            let claims = self.vouched_admin(&topic, acting_for.as_ref(), self.clock.now_ns())?;
+            let claims =
+                self.vouched_for_configuration(&topic, acting_for.as_ref(), self.clock.now_ns())?;
             tracing::info!(
                 instance = self.instance_id(),
                 topic,
                 by = claims.subject,
-                at_level = "admin",
+                at_level = level_named(claims.level),
                 "read for a person"
             );
             (claims.subject, claims.delegation_id, claims.client_name)
@@ -277,7 +291,7 @@ impl Sidecar {
             // An admin's act on the deployment's configuration, not a write
             // to an account: a link names an account nothing may write through
             // this plugin yet, since the link is what grants it (W4.11).
-            let claims = self.vouched_admin(&topic, acting_for.as_ref(), now)?;
+            let claims = self.vouched_for_configuration(&topic, acting_for.as_ref(), now)?;
             if topic == LINK_EXTERNAL_ACCOUNT {
                 self.reported_by_this_plugin(&message.encode_to_vec(), now)
                     .await?;
@@ -290,7 +304,7 @@ impl Sidecar {
                 instance = self.instance_id(),
                 topic,
                 by = claims.subject,
-                at_level = "admin",
+                at_level = level_named(claims.level),
                 "sent for a person"
             );
             return self.ask_for(&topic, payload_type, message, &claims).await;
@@ -362,6 +376,63 @@ impl Sidecar {
             .await
             .map_err(refused)?;
         mirrored(payload)
+    }
+
+    /// The claims a `config` topic is sent for, or the refusal: a person at
+    /// any level for the two named exceptions, an admin of this plugin in a
+    /// session opened by Manage for every other, and never the plugin as
+    /// itself (W4.9's notes, W4.12).
+    pub(crate) fn vouched_for_configuration(
+        &self,
+        topic: &str,
+        acting_for: Option<&CallerAssertion>,
+        now_ns: i64,
+    ) -> Result<CallerClaims, Status> {
+        if FOR_A_PERSON_AT_ANY_LEVEL.contains(&topic) {
+            self.vouched_person(topic, acting_for, now_ns)
+        } else {
+            self.vouched_admin(topic, acting_for, now_ns)
+        }
+    }
+
+    /// The claims of a person an assertion vouches for, at any level: what a
+    /// ticket is filed for, and read back for (W4.12). A filing with no
+    /// assertion is the plugin as itself, which never files.
+    fn vouched_person(
+        &self,
+        topic: &str,
+        acting_for: Option<&CallerAssertion>,
+        now_ns: i64,
+    ) -> Result<CallerClaims, Status> {
+        let refuse = |refusal: String| {
+            self.note_refusal(&refusal);
+            Err(Status::permission_denied(refusal))
+        };
+        let Some(assertion) = acting_for else {
+            return refuse(if topic == FILE_TICKET {
+                "a plugin files a ticket only for a person it acts for".to_string()
+            } else {
+                "a plugin reads what it filed only for a person it acts for".to_string()
+            });
+        };
+        let verifier = self.verifier.as_ref().ok_or_else(|| {
+            Status::unauthenticated(
+                "this sidecar holds none of the dashboard's keys, so it can vouch for nobody",
+            )
+        })?;
+        let claims = verifier
+            .vouched(assertion, now_ns)
+            .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        if !matches!(
+            AccessLevel::try_from(claims.level),
+            Ok(AccessLevel::Admin | AccessLevel::Write | AccessLevel::Read)
+        ) {
+            return refuse(format!(
+                "{} holds no level on this plugin in this session, so nothing is sent for them",
+                claims.subject
+            ));
+        }
+        Ok(claims)
     }
 
     /// The claims of an admin of this plugin an assertion vouches for, in a
@@ -504,6 +575,16 @@ impl Sidecar {
             )),
             _ => Ok(claims),
         }
+    }
+}
+
+/// A session's level as a log names it.
+pub(crate) fn level_named(level: i32) -> &'static str {
+    match AccessLevel::try_from(level) {
+        Ok(AccessLevel::Admin) => "admin",
+        Ok(AccessLevel::Write) => "write",
+        Ok(AccessLevel::Read) => "read",
+        _ => "none",
     }
 }
 

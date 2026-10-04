@@ -9,7 +9,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -1557,6 +1557,22 @@ interop: network
 		diff -u e2e/interop/positions.expected .interop.positions >&2 \
 			|| { echo "interop FAILED: the street store did not keep what the SDK sent" >&2; exit 1; }
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface, and the street store keeps its numbers exactly"
+
+# The red-team corpus, vendored from meridian-design's evals/prompt-attacks/
+# (plans/tickets-inside-a-deployment, Q6, ruled 2026-10-03): one corpus for
+# the deployment and the platform, canonical in design, each case unchanged.
+# Core's tests replay every case a deployment channel carries against the
+# sidecar's and the dashboard's rules, and `make e2e-tickets` files them on
+# the plugin harness. Regenerated here, never edited: run it again when
+# design's corpus changes, and commit the file it writes.
+DESIGN ?= ../meridian-design
+PROMPT_ATTACKS := deploy/prompt-attacks.json
+
+prompt-attacks:
+	@test -d "$(DESIGN)/evals/prompt-attacks" \
+		|| { echo "no corpus at $(DESIGN)/evals/prompt-attacks; set DESIGN=<path to meridian-design>" >&2; exit 1; }
+	@$(PY) -c 'import json, pathlib, subprocess, sys; root = pathlib.Path(sys.argv[1]); corpus = json.loads((root / "corpus.json").read_text()); cases = sorted((json.loads(p.read_text()) for p in root.glob("RT*/case.json")), key=lambda c: int(c["id"][2:])); rev = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%h", "--", "."], capture_output=True, text=True).stdout.strip(); out = {"about": "Vendored from meridian-design evals/prompt-attacks at " + rev + " by make prompt-attacks; never edited here.", "channels": corpus["channels"], "outcomes": corpus["outcomes"], "refusals": corpus["refusals"], "cases": cases}; pathlib.Path(sys.argv[2]).write_text(json.dumps(out, indent=1, ensure_ascii=True) + "\n")' "$(DESIGN)/evals/prompt-attacks" "$(PROMPT_ATTACKS)"
+	@echo "prompt-attacks: wrote $(PROMPT_ATTACKS) from $(DESIGN)/evals/prompt-attacks"
 
 # The book of record (W9, contract v8), end to end through the Python SDK.
 #

@@ -12,8 +12,9 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
-    AccountScopeDelivery, HeartbeatReply, HeartbeatRequest, LeaveReply, LeaveRequest,
-    PluginAccessReply, PluginAccessRequest, RegisterReply, RegisterRequest, SettingsDelivery,
+    AccountScopeDelivery, FileTicketReply, FileTicketRequest, HeartbeatReply, HeartbeatRequest,
+    LeaveReply, LeaveRequest, PluginAccessReply, PluginAccessRequest, ReadFiledTicketsReply,
+    ReadFiledTicketsRequest, RegisterReply, RegisterRequest, SettingsDelivery,
     WatchAccountScopeRequest, WatchSettingsRequest,
 };
 use tokio_stream::Stream;
@@ -141,6 +142,10 @@ pub struct Sidecar {
     /// The development endpoint, on a live instance of a development
     /// deployment alone (spec/live-plugin-development). Set once, at start.
     pub(crate) live: Arc<std::sync::OnceLock<Arc<crate::live::Live>>>,
+
+    /// The keys this instance filed a new ticket under within the hour, for
+    /// its rate (W4.12, [`crate::tickets`]).
+    pub(crate) filed: crate::tickets::Filed,
 }
 
 impl Sidecar {
@@ -196,6 +201,7 @@ impl Sidecar {
             live: Arc::default(),
             changed: Arc::default(),
             verifier: None,
+            filed: Arc::default(),
         }
     }
 
@@ -506,6 +512,23 @@ impl SidecarService for Sidecar {
             crate::streams::scope,
         )))
     }
+
+    /// W4.12: a ticket filed for the person the plugin is serving, never as
+    /// itself.
+    async fn file_ticket(
+        &self,
+        request: Request<FileTicketRequest>,
+    ) -> Result<Response<FileTicketReply>, Status> {
+        self.file_ticket_for_person(request).await
+    }
+
+    /// W4.12: what became of the tickets this plugin filed.
+    async fn filed_tickets(
+        &self,
+        request: Request<ReadFiledTicketsRequest>,
+    ) -> Result<Response<ReadFiledTicketsReply>, Status> {
+        self.filed_tickets_for_person(request).await
+    }
 }
 
 #[cfg(test)]
@@ -644,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v13"] {
+        for declared in ["v1", "v14"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -653,7 +676,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v12"));
+            assert!(reply.refusal_reason.contains("v2 through v13"));
             assert!(sc.registration().is_none());
         }
     }

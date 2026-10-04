@@ -10,11 +10,14 @@
 //! has to read it the same way, and this is the crate they all share. For the
 //! same reason, [`asset_class`]'s reading of an asset class from text. The
 //! bounds on a value -- an account's free text, a Decimal's places and digits --
-//! are the data dictionary's, generated into `meridian_pb::bounds`.
+//! are the data dictionary's, generated into `meridian_pb::bounds`. And
+//! [`text`], the characters a ticket's text may hold, which a plugin's
+//! sidecar and the dashboard both refuse alike (W4.12, W6.21).
 
 pub mod asset_class;
 pub mod exact;
 pub mod instrument_type;
+pub mod text;
 
 /// The roles at the edge, which alone may own storage for their raw external
 /// records (decisions/028, ruled point 1 and its amendment for `reporting`;

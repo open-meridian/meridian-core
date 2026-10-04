@@ -28,6 +28,7 @@ mod receive;
 pub mod report;
 mod service;
 mod streams;
+mod tickets;
 pub mod tools;
 mod typed;
 
