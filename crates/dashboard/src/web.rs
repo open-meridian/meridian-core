@@ -103,6 +103,9 @@ pub struct App {
     /// The deployment's MCP surface's bounds, per delegation and per plugin
     /// instance (W6.20, Q7), held for every request this process serves.
     pub bounds: Arc<crate::mcp::bounds::Bounds>,
+    /// Tickets, their notes, notices and each reader's place in an inbox
+    /// (W6.21 to W6.24, contract v13), kept in the dashboard's own tables.
+    pub tickets: Arc<crate::tickets::Tickets>,
 }
 
 pub fn router(app: Arc<App>) -> Router {

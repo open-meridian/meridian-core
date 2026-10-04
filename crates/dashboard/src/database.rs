@@ -11,7 +11,9 @@
 //!   that signs people in, so a restart or an upgrade leaves them standing
 //!   (W6.13, ruled 2026-09-30);
 //! - clients, the delegations people make to them, and their tokens by
-//!   fingerprint ([`crate::delegation`], decisions/029), for the same reason.
+//!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
+//! - tickets, their references and notes, notices and each reader's place
+//!   in a person's inbox ([`crate::tickets`], contract v13).
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -59,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "tool_call",
         sql: include_str!("../migrations/0004_tool_call.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "ticket",
+        sql: include_str!("../migrations/0005_ticket.sql"),
     },
 ];
 

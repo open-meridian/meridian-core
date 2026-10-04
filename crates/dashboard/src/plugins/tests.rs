@@ -221,6 +221,7 @@ fn dashboard(
         health: Arc::default(),
         kit: Some(Arc::new(kit())),
         bounds: Arc::default(),
+        tickets: Arc::default(),
     });
     (app, session)
 }

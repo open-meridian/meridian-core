@@ -25,6 +25,11 @@ meridian-access = { path = "crates/access" }
 meridian-config = { path = "crates/config" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1"
+# NFC and NFKC for a ticket's text (plans/tickets-inside-a-deployment, Q7,
+# ruled 2026-10-03): the one reviewed crate the injection rules and the
+# bounds need; the rules themselves are plain matchers, with no regular
+# expression crate. Already in the tree through the URL parser.
+unicode-normalization = "0.1"
 
 # The broker the bus runs on, per decision 010. Pinned to a minor version like
 # every other dependency a customer inherits.

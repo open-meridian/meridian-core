@@ -1836,6 +1836,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

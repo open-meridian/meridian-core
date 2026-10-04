@@ -244,6 +244,7 @@ async fn harness() -> Harness {
         health: Arc::default(),
         kit: None,
         bounds: Arc::default(),
+        tickets: Arc::default(),
     });
     Harness {
         app,

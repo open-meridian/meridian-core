@@ -4,6 +4,13 @@
 # a decision, so each one names the advisory, why it does not reach us, and
 # what would change that.
 
+# One crate entered for the kernel by a ruling rather than as a convenience
+# (plans/tickets-inside-a-deployment, Q7, ruled 2026-10-03):
+# `unicode-normalization`, for the NFC every ticket's text is kept as and the
+# NFKC its injection rules match on. Already in the tree through the URL
+# parser; the rules themselves are plain matchers, with no regular-expression
+# crate. Its advisories are checked here as every other crate's are.
+
 [advisories]
 # Unmaintained crates are reported by their direct dependents' advisories when
 # they matter; failing the build on every one would make the gate noise.

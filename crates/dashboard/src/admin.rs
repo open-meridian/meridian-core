@@ -577,7 +577,7 @@ async fn plugin_view(
 
 // ── A plugin instance's settings (W6.11) ────────────────────────────────────
 
-mod settings;
+pub(crate) mod settings;
 
 fn settings_of<'a>(records: &'a AccessRecords, instance: &str) -> Option<&'a PluginSettingsRecord> {
     records

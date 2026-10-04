@@ -268,6 +268,7 @@ async fn harness(deployment_admin: bool) -> Harness {
         health,
         kit: None,
         bounds: Arc::default(),
+        tickets: Arc::default(),
     });
     Harness {
         app,

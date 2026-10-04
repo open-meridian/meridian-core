@@ -337,6 +337,14 @@ fn run() -> Result<(), String> {
         Some(database) => Arc::new(delegation::InPostgres::on(database.clone())),
         None => Arc::new(delegation::InMemory::default()),
     };
+    // Tickets beside them (contract v13), so a ticket, its notes and a
+    // person's notices outlive a restart; in memory without one.
+    let ticket_store: Arc<dyn meridian_dashboard::tickets::TicketStore> = match &database {
+        Some(database) => Arc::new(meridian_dashboard::tickets::InPostgres::on(
+            database.clone(),
+        )),
+        None => Arc::new(meridian_dashboard::tickets::InMemory::default()),
+    };
     let accounts = match (&accounts_url, &database) {
         (Some(_), Some(database)) => {
             let store = InPostgres::on(database.clone());
@@ -385,6 +393,9 @@ fn run() -> Result<(), String> {
         let sessions = Arc::new(Sessions::default());
         let terminals = Arc::new(Terminals::keeping(terminal_sessions.clone()));
         let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
+        let tickets = Arc::new(meridian_dashboard::tickets::Tickets::keeping(
+            ticket_store.clone(),
+        ));
         let clock = clock();
 
         // Once before listening, so the first request finds records when
@@ -411,6 +422,7 @@ fn run() -> Result<(), String> {
         let sweeping = Arc::clone(&sessions);
         let sweeping_terminals = Arc::clone(&terminals);
         let sweeping_delegations = Arc::clone(&delegations);
+        let sweeping_tickets = Arc::clone(&tickets);
         let sweeping_plugins = plugins.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_secs(60));
@@ -422,6 +434,10 @@ fn run() -> Result<(), String> {
                 }
                 if let Err(unavailable) = sweeping_delegations.sweep(now_ns()).await {
                     tracing::warn!(%unavailable, "delegations were not swept");
+                }
+                // Notices past 90 days, with the call record (W6.24).
+                if let Err(unavailable) = sweeping_tickets.sweep(now_ns()).await {
+                    tracing::warn!(%unavailable, "notices were not swept");
                 }
                 if let Some(plugins) = &sweeping_plugins {
                     plugins
@@ -476,7 +492,7 @@ fn run() -> Result<(), String> {
             );
         }
 
-        let app = router(Arc::new(App {
+        let app = Arc::new(App {
             first_run,
             wizard: Arc::new(WizardSession::suggesting(
                 var("MERIDIAN_DASHBOARD_SUGGESTED_URL").unwrap_or_default(),
@@ -499,7 +515,13 @@ fn run() -> Result<(), String> {
             health,
             kit,
             bounds: Arc::default(),
-        }));
+            tickets,
+        });
+        // A plugin's filing and its read-back, answered on the bus for the
+        // instance its sidecar names (W4.12): the first topics the
+        // dashboard answers.
+        meridian_dashboard::tickets::plugin::serve(Arc::clone(&app));
+        let app = router(app);
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|failed| format!("could not listen on {listen}: {failed}"))?;
