@@ -1670,8 +1670,10 @@ pub async fn work(
     let refuse_not_worker = || {
         Refused::forbidden(
             "act",
-            "you may not work this ticket: it is worked by a person holding write on what it \
-             concerns and every account it names, or, naming none, by its admins",
+            format!(
+                "you may not work this ticket: it is worked by {}",
+                visibility::who_works(&ticket)
+            ),
         )
     };
     let (said, notice_kind) = match asked.act.as_str() {

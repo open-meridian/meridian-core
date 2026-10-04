@@ -707,6 +707,116 @@ async fn only_a_person_who_may_work_it_acts_and_each_act_is_a_change_note() {
     .unwrap();
 }
 
+/// A ticket about core or the platform naming accounts is worked by a
+/// deployment admin who also reads every one of them (ruled 2026-10-04):
+/// Dee, the deployment admin, as the records make her and with read added
+/// through `ops-1` on group A, then on both groups; nobody else gains.
+#[tokio::test]
+async fn a_ticket_about_core_naming_accounts_is_worked_by_a_deployment_admin_who_reads_every_one() {
+    let app = app();
+    let reading = |groups: &[&str]| {
+        let mut records = records();
+        for (n, group) in groups.iter().enumerate() {
+            records.permissions.push(permission(
+                &format!("P-dee-{n}"),
+                "UG-dee",
+                group,
+                "AG-ops-read",
+            ));
+        }
+        person_access(&records, DEE, &[])
+    };
+    let dee = reading(&[]);
+    let dee_growth = reading(&["AcG-A"]);
+    let dee_both = reading(&["AcG-A", "AcG-B"]);
+    let close = |id: &str| Act {
+        ticket_id: id.into(),
+        act: "close".into(),
+        resolution: "not_a_problem".into(),
+        ..Act::default()
+    };
+    let unnamed = filed(
+        &app,
+        &at_page(ADA),
+        filing("The dashboard is slow", "", "dashboard"),
+    )
+    .await;
+    let growth = filed(
+        &app,
+        &at_page(ADA),
+        filing("The book is off", "ACC-GROWTH differs.", "bor"),
+    )
+    .await;
+    let both = filed(
+        &app,
+        &at_page(DEE),
+        filing(
+            "Two accounts disagree",
+            "ACC-GROWTH and ACC-BETA differ.",
+            "bor",
+        ),
+    )
+    .await;
+
+    // Naming none: the deployment admin, as before.
+    work(&app, DEE, "Dee Admin", &dee, &close(&unnamed))
+        .await
+        .unwrap();
+    // Naming ACC-GROWTH: the admin who reads it works it; one who reads no
+    // account does not even see it.
+    let refused = work(&app, DEE, "Dee Admin", &dee, &close(&growth))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status, 404);
+    let closed = work(&app, DEE, "Dee Admin", &dee_growth, &close(&growth))
+        .await
+        .unwrap();
+    assert_eq!(closed.state, State::Closed);
+    // Naming two: an admin missing one may not, though she filed it and so
+    // sees it; reading both, she may.
+    let refused = work(&app, DEE, "Dee Admin", &dee_growth, &close(&both))
+        .await
+        .unwrap_err();
+    assert_eq!((refused.status, refused.fields[0].0.as_str()), (403, "act"));
+    assert!(refused.fields[0]
+        .1
+        .contains("a deployment admin who also reads every account"));
+    work(&app, DEE, "Dee Admin", &dee_both, &close(&both))
+        .await
+        .unwrap();
+
+    // Not a deployment admin: Ada reads ACC-GROWTH and writes it through
+    // ops-1, and may only withdraw what she filed; Ben may not see it.
+    let reopened = filed(
+        &app,
+        &at_page(ADA),
+        filing("The book is off again", "ACC-GROWTH differs again.", "bor"),
+    )
+    .await;
+    let ada = person_access(&records(), ADA, &[]);
+    let refused = work(&app, ADA, "Ada Park", &ada, &close(&reopened))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status, 403);
+    let ben = person_access(&records(), BEN, &[]);
+    let refused = work(&app, BEN, "Ben Ito", &ben, &close(&reopened))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status, 404);
+    work(
+        &app,
+        ADA,
+        "Ada Park",
+        &ada,
+        &Act {
+            resolution: "withdrawn".into(),
+            ..close(&reopened)
+        },
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn a_suspect_text_is_withheld_from_tools_and_released_only_by_someone_else_who_works_it() {
     let app = app();

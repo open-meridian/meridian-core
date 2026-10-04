@@ -958,11 +958,10 @@ fn ticket_body(
     if works || withdraws {
         body.push_str(&acts(session, records, access, ticket, works));
     } else {
-        body.push_str(
-            "<p class=\"hint\">You may read this ticket and add a note. It is worked by a person \
-             holding write on what it concerns and every account it names, or, naming none, by \
-             its admins.</p>",
-        );
+        body.push_str(&format!(
+            "<p class=\"hint\">You may read this ticket and add a note. It is worked by {}.</p>",
+            visibility::who_works(ticket)
+        ));
     }
     body.push_str("</div>");
     body

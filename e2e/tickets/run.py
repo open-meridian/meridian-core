@@ -18,7 +18,9 @@ reads `store tickets`:
    ticket's state, owner or due date.
 5. Only a person's acts work a ticket, each a change note with her name; no
    tool is listed for one; the admin works the unreferenced ticket and may
-   not see the referenced one.
+   not see the referenced one. A ticket about core naming Ada's account is
+   worked by no admin who cannot read it, and by the admin once granted
+   read on it (after step 7, so steps 6 and 7 read the admin as before).
 6. Visibility follows accounts, and a delegation narrowed to custody lists
    none of operations'.
 7. The inbox shows each change once per client, and nothing to Ben.
@@ -251,6 +253,20 @@ def run():
          "step 7: a second client did not read the same notices")
     runner("inbox", "--expect", "0", person="ben")
 
+    # 5, continued: core's ticket naming an account is worked by a deployment
+    # admin who also reads it (ruled 2026-10-04); not by the admin before she
+    # reads it, by Ben, who cannot see it, or by Ada, who filed it.
+    t5 = runner("ticket", "file", "--concerns", "dashboard", "title=The dashboard shows the wrong cash",
+                f"seen=The Summary for {account_a} shows yesterday's cash.", person="ada").strip()
+    runner("ticket", "work", t5, "act=assign", "owner=ada", "--expect-status", "404")
+    runner("ticket", "work", t5, "act=assign", "owner=ada", "--expect-status", "404", person="ben")
+    runner("ticket", "work", t5, "act=assign", "owner=ada", "--expect-status", "403", person="ada")
+    runner("grant", "--level", "read", "--accounts", account_a, instance="operations")
+    runner("ticket", "work", t5, "act=assign", "owner=ada")
+    row = ticket_row(store(), t5)
+    must(row[2] == "dashboard" and row[8] == "Ada Park",
+         f"step 5: core's ticket not assigned by the admin: {row}")
+
     # 8. Every red-team case leaves the records unchanged.
     corpus = json.load(open("deploy/prompt-attacks.json", encoding="utf-8"))
     before_tickets = store()
@@ -317,8 +333,9 @@ def run():
           "the rules' route and duplicate advice and an agent's advice change no ticket; only her "
           "acts on the page assign, resolve, reopen and close, each a change note in her name, "
           "and no tool is listed for one; the admin works the unreferenced ticket and cannot see "
-          "the referenced; Ben sees nothing naming her account, and a delegation narrowed to "
-          "custody lists none of operations'; each of her clients reads each change once and Ben "
+          "the referenced, and works core's ticket naming Ada's account only once she reads it; "
+          "Ben sees nothing naming her account, and a delegation narrowed to custody lists none "
+          "of operations'; each of her clients reads each change once and Ben "
           f"none; {replayed} red-team cases through the page, /mcp and the stand-in are refused "
           "by their bound or held and withheld from tools, every other record unchanged; and the "
           "conductor never heard of a ticket")

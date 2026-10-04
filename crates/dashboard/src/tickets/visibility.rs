@@ -16,8 +16,9 @@
 //! **Worked by** (at the page only, never through a delegation): a plugin's
 //! ticket by a person holding write on that plugin and on every account it
 //! names, one naming none also by its admins; core's and the platform's by
-//! the deployment admin; and the filer may close what they filed as
-//! withdrawn. A worker is always someone who may see it.
+//! the deployment admin, one naming accounts only by a deployment admin who
+//! also reads every one of them (ruled 2026-10-04); and the filer may close
+//! what they filed as withdrawn. A worker is always someone who may see it.
 
 use meridian_access::{Access, AccessLevel};
 
@@ -112,7 +113,18 @@ pub fn may_work(subject: &str, access: &Access, ticket: &Ticket) -> bool {
                 .all(|account| held.accounts.write.contains(*account));
         writes || (named.is_empty() && held.admin)
     } else {
-        named.is_empty() && access.deployment_admin
+        access.deployment_admin && (named.is_empty() || reads_every_account(access, ticket, &named))
+    }
+}
+
+/// Who works a ticket, as the page and a refusal say it to a person who
+/// may not.
+pub fn who_works(ticket: &Ticket) -> &'static str {
+    if ticket.concerns.kind == "plugin" {
+        "a person holding write on what it concerns and every account it names, or, naming \
+         none, by its admins"
+    } else {
+        "a deployment admin who also reads every account it names"
     }
 }
 
