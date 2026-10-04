@@ -203,7 +203,7 @@ jobs:
           push: true
 
       # Read back as a plugin reads it: the files copied out of the tag just
-      # pushed, all five and nothing else, rather than trusting a push that
+      # pushed, all six and nothing else, rather than trusting a push that
       # exited 0.
       - name: Check the harness can be copied out
         env:
@@ -215,7 +215,7 @@ jobs:
           docker rm "$id" >/dev/null
           held=$(find /tmp/harness -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')
           echo "held: $held"
-          [ "$held" = "README.md book.sql compose.yaml harness.py street.sql " ]
+          [ "$held" = "README.md book.sql compose.yaml harness.py street.sql tickets.sql " ]
 
   # The chart, pushed beside the image it names.
   #
