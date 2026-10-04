@@ -192,7 +192,35 @@ impl Covers {
             .contains(&(instance.to_string(), level.to_string()))
     }
 
-    /// For a person to read: what it covers, in a line.
+    /// The one level a person picks on a plugin instance (the product owner,
+    /// 2026-10-04, kernel/the-consent-page-at-scale ruling 1): the highest it
+    /// covers there. Manage includes Open and View, as holding it does.
+    pub fn level_on(&self, instance: &str) -> Option<AccessLevel> {
+        LEVELS_DOWN
+            .into_iter()
+            .find(|level| self.covers(instance, meridian_access::level_name(*level)))
+    }
+
+    /// Its plugin instances by the level picked on each, Manage first.
+    pub fn by_level(&self) -> Vec<(AccessLevel, Vec<&str>)> {
+        let instances: BTreeSet<&str> = self.plugins.iter().map(|(i, _)| i.as_str()).collect();
+        LEVELS_DOWN
+            .into_iter()
+            .map(|level| {
+                let at: Vec<&str> = instances
+                    .iter()
+                    .copied()
+                    .filter(|instance| self.level_on(instance) == Some(level))
+                    .collect();
+                (level, at)
+            })
+            .filter(|(_, at)| !at.is_empty())
+            .collect()
+    }
+
+    /// For a person to read, and a refusal to name: what it covers, in a
+    /// line, each plugin with the one level picked on it, as the consent page
+    /// picks one, however many it names.
     pub fn said(&self, names: &BTreeMap<String, String>) -> String {
         if self.everything {
             return "Everything you hold".into();
@@ -201,17 +229,22 @@ impl Covers {
         if self.deployment_admin {
             parts.push("deployment admin".to_string());
         }
-        let mut by_plugin: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (instance, level) in &self.plugins {
-            by_plugin.entry(instance).or_default().push(level);
-        }
-        for (instance, levels) in by_plugin {
-            let said: Vec<&str> = levels
-                .iter()
-                .filter_map(|level| meridian_access::parse_level(level))
-                .map(meridian_access::button)
-                .collect();
-            parts.push(format!("{instance} ({})", said.join(", ")));
+        let instances: BTreeSet<&str> = self.plugins.iter().map(|(i, _)| i.as_str()).collect();
+        let plugins: Vec<String> = instances
+            .into_iter()
+            .filter_map(|instance| {
+                let level = self.level_on(instance)?;
+                Some(format!("{instance} ({})", meridian_access::button(level)))
+            })
+            .collect();
+        if plugins.len() <= NAMES_SAID {
+            parts.extend(plugins);
+        } else {
+            parts.push(format!(
+                "{} and {} more plugins",
+                plugins[..NAMES_SAID].join(", "),
+                plugins.len() - NAMES_SAID
+            ));
         }
         if !self.account_groups.is_empty() {
             let groups: Vec<&str> = self
@@ -219,13 +252,39 @@ impl Covers {
                 .iter()
                 .map(|id| names.get(id).map(String::as_str).unwrap_or(id))
                 .collect();
-            parts.push(format!("accounts in {}", groups.join(", ")));
+            parts.push(format!("accounts in {}", listed(&groups)));
         }
         if parts.is_empty() {
             "Nothing".into()
         } else {
             parts.join("; ")
         }
+    }
+}
+
+/// The levels from the highest down: Manage, Open, View.
+pub const LEVELS_DOWN: [AccessLevel; 3] =
+    [AccessLevel::Admin, AccessLevel::Write, AccessLevel::Read];
+
+/// How many names a line says before "and N more".
+pub const NAMES_SAID: usize = 3;
+
+/// Names for a person to read, the first few and how many more: "a", "a and
+/// b", "a, b and c", "a, b, c and 297 more".
+pub fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        _ if names.len() <= NAMES_SAID => format!(
+            "{} and {}",
+            names[..names.len() - 1].join(", "),
+            names[names.len() - 1]
+        ),
+        _ => format!(
+            "{} and {} more",
+            names[..NAMES_SAID].join(", "),
+            names.len() - NAMES_SAID
+        ),
     }
 }
 

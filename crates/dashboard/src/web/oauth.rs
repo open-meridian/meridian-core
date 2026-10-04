@@ -15,7 +15,7 @@
 //! reads no bearer token. A token is accepted only on `/terminal/` paths
 //! ([`super::terminal::caller_of`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -30,9 +30,10 @@ use meridian_access::{button, level_name, person_access, AccessLevel};
 use super::{
     password_page, record_sign_in, redirect, refused, set_cookie, App, For, SIGN_IN_COOKIE,
 };
+use crate::admin::picker::{self, Choice};
 use crate::delegation::{
-    check_asked, Asked, Consent, Covers, Delegation, Refusal, Registration, Resource, DAYS, DAY_NS,
-    GROUPS_BOUND_NS, NOTICE_NS,
+    check_asked, listed, Asked, Consent, Covers, Delegation, Refusal, Registration, Resource, DAYS,
+    DAY_NS, GROUPS_BOUND_NS, LEVELS_DOWN, NOTICE_NS,
 };
 use crate::html::{escape, page};
 use crate::terminal::{rfc3339, Person};
@@ -399,9 +400,65 @@ async fn authorize(
 /// account groups their permissions name, and whether they hold the
 /// deployment admin's capabilities.
 struct Holdable {
+    /// Each plugin instance and the levels held on it, Manage first.
     plugins: BTreeMap<String, Vec<AccessLevel>>,
-    account_groups: BTreeMap<String, String>,
+    /// Each account group, its name and how many accounts it holds.
+    account_groups: BTreeMap<String, (String, usize)>,
     deployment_admin: bool,
+}
+
+impl Holdable {
+    fn group_names(&self) -> BTreeMap<String, String> {
+        self.account_groups
+            .iter()
+            .map(|(id, (name, _))| (id.clone(), name.clone()))
+            .collect()
+    }
+
+    /// What `covers` comes to on the page: on each plugin the one level
+    /// picked, the highest it covers that the person holds, with the levels
+    /// held below it; the account groups and the deployment admin's
+    /// capabilities only where held. A starting point, never a grant: what
+    /// is allowed is what the form sends, read by [`consent_of`].
+    fn picked(&self, covers: &Covers) -> Covers {
+        let mut picked = Covers {
+            everything: covers.everything,
+            deployment_admin: covers.deployment_admin && self.deployment_admin,
+            ..Covers::default()
+        };
+        for (instance, held) in &self.plugins {
+            let top = held.iter().copied().find(|level| {
+                covers
+                    .plugins
+                    .contains(&(instance.clone(), level_name(*level).into()))
+            });
+            if let Some(top) = top {
+                for level in with_below(held, top) {
+                    picked
+                        .plugins
+                        .insert((instance.clone(), level_name(level).to_string()));
+                }
+            }
+        }
+        picked.account_groups = covers
+            .account_groups
+            .iter()
+            .filter(|group| self.account_groups.contains_key(*group))
+            .cloned()
+            .collect();
+        picked
+    }
+}
+
+/// A level picked on a plugin, with every level held below it: Manage
+/// includes Open and View, and Open includes View, as holding them does
+/// (kernel/the-consent-page-at-scale, ruling 1).
+fn with_below(held: &[AccessLevel], picked: AccessLevel) -> Vec<AccessLevel> {
+    let rank = |level: AccessLevel| LEVELS_DOWN.iter().position(|l| *l == level);
+    held.iter()
+        .copied()
+        .filter(|level| rank(*level) >= rank(picked))
+        .collect()
 }
 
 async fn holdable(app: &App, person: &Person, now: i64) -> Result<Holdable, String> {
@@ -433,19 +490,24 @@ async fn holdable(app: &App, person: &Person, now: i64) -> Result<Holdable, Stri
         })
         .filter(|(_, levels)| !levels.is_empty())
         .collect();
-    let names: HashMap<&str, &str> = records
+    let named: HashMap<&str, (&str, usize)> = records
         .account_groups
         .iter()
-        .map(|g| (g.account_group_id.as_str(), g.name.as_str()))
+        .map(|g| {
+            (
+                g.account_group_id.as_str(),
+                (g.name.as_str(), g.account_ids.len()),
+            )
+        })
         .collect();
     let account_groups = meridian_access::account_groups_named(&records, &access)
         .into_iter()
         .map(|id| {
-            let name = names
+            let (name, accounts) = named
                 .get(id.as_str())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| id.clone());
-            (id, name)
+                .map(|(n, size)| (n.to_string(), *size))
+                .unwrap_or_else(|| (id.clone(), 0));
+            (id, (name, accounts))
         })
         .collect();
     Ok(Holdable {
@@ -479,31 +541,54 @@ pub(super) async fn signed_in(
     record_sign_in(app, subject, display_name, groups.clone(), now);
     super::afresh(app, subject, groups, now).await;
     tracing::info!(subject, client_id = %asked.client.client_id, "signed in to consent to a client");
-    let holdable = match holdable(app, &person, now).await {
+    consent_shown(app, id, &confirm, &asked, &person, false, now).await
+}
+
+/// The consent page for a signed-in authorisation: its choices starting from
+/// the standing delegation to this client when renewing one, from the
+/// person's last client's when they asked for that (ruling 3), else from the
+/// defaults (ruling 2).
+async fn consent_shown(
+    app: &App,
+    id: &str,
+    confirm: &str,
+    asked: &Asked,
+    person: &Person,
+    from_last: bool,
+    now: i64,
+) -> Response {
+    let holdable = match holdable(app, person, now).await {
         Ok(holdable) => holdable,
         Err(why) => return refused(&why),
     };
-    let standing = match app
-        .delegations
-        .standing(subject, &asked.client.client_id, now)
-        .await
-    {
-        Ok(standing) => standing,
+    let theirs = match app.delegations.of_person(&person.subject, now).await {
+        Ok(theirs) => theirs,
         Err(failed) => return refused(&failed.to_string()),
     };
+    let client_id = &asked.client.client_id;
+    let standing = theirs
+        .iter()
+        .find(|d| &d.client_id == client_id && d.live(now));
+    // The person's most recent consent to any other client, made or renewed.
+    let last = theirs
+        .iter()
+        .filter(|d| &d.client_id != client_id)
+        .max_by_key(|d| d.renewed_at_ns.max(d.made_at_ns));
     let tools = match asked.resource {
         Resource::Mcp => Some(tool_rows(app)),
         Resource::Terminal => None,
     };
-    Html(consent_page(
+    Html(consent_page(&Consenting {
         id,
-        &confirm,
-        &asked,
-        &person,
-        &holdable,
-        standing.as_ref(),
-        tools.as_ref(),
-    ))
+        confirm,
+        asked,
+        person,
+        holdable: &holdable,
+        standing,
+        last,
+        from_last: from_last && last.is_some(),
+        tools: tools.as_ref(),
+    }))
     .into_response()
 }
 
@@ -563,27 +648,157 @@ fn tools_said(tools: &[(String, bool)]) -> String {
     out
 }
 
-fn consent_page(
-    id: &str,
-    confirm: &str,
-    asked: &Asked,
-    person: &Person,
-    holdable: &Holdable,
-    standing: Option<&Delegation>,
-    tools: Option<&ToolRows>,
-) -> String {
+/// Everything the consent page is drawn from.
+struct Consenting<'a> {
+    id: &'a str,
+    confirm: &'a str,
+    asked: &'a Asked,
+    person: &'a Person,
+    holdable: &'a Holdable,
+    /// The person's live delegation to this client, which allowing renews.
+    standing: Option<&'a Delegation>,
+    /// Their most recent delegation to another client: "same as my last
+    /// client" (ruling 3).
+    last: Option<&'a Delegation>,
+    /// The choices start from `last`, as the person asked.
+    from_last: bool,
+    /// For a client asking for `/mcp`: what each row's tools are.
+    tools: Option<&'a ToolRows>,
+}
+
+/// One plugin instance's level, a select (ruling 1): Nothing, then each
+/// level held from View up, each naming the levels it includes. Its options'
+/// values are what [`consent_of`] reads as `level`.
+fn level_select(instance: &str, held: &[AccessLevel], picked: Option<AccessLevel>) -> String {
+    let selected = |on: bool| if on { " selected" } else { "" };
+    let mut options = format!(
+        "<option value=\"\"{}>Nothing</option>",
+        selected(picked.is_none())
+    );
+    for level in held.iter().rev().copied() {
+        let below: Vec<&str> = with_below(held, level)
+            .into_iter()
+            .filter(|l| *l != level)
+            .map(button)
+            .collect();
+        let words = if below.is_empty() {
+            button(level).to_string()
+        } else {
+            format!("{}, with {}", button(level), listed(&below))
+        };
+        // Whether the level reaches accounts, as Open and View do and
+        // Manage alone does not: the summary says when none is ticked.
+        let data = with_below(held, level)
+            .iter()
+            .any(|l| *l != AccessLevel::Admin);
+        options.push_str(&format!(
+            "<option value=\"{instance}:{name}\" data-short=\"{short}\"{data}{on}>{words}</option>",
+            instance = escape(instance),
+            name = level_name(level),
+            short = button(level),
+            data = if data { " data-accounts" } else { "" },
+            on = selected(picked == Some(level)),
+        ));
+    }
+    format!(
+        "<select name=\"level\" data-instance=\"{id}\" aria-label=\"Level on {id}\">{options}</select>",
+        id = escape(instance)
+    )
+}
+
+/// What a plugin's levels reach on the MCP surface, folded away under it:
+/// each level held and its tools, reads and acts apart. Empty when no level
+/// reaches a tool. With the titles, for the search to find the plugin by.
+fn reached(instance: &str, held: &[AccessLevel], tools: &ToolRows) -> (String, String) {
+    let mut lines = String::new();
+    let mut titles: BTreeSet<&str> = BTreeSet::new();
+    for level in held {
+        let Some(reached) = tools
+            .plugins
+            .get(&(instance.to_string(), level_name(*level).to_string()))
+        else {
+            continue;
+        };
+        titles.extend(reached.iter().map(|(title, _)| title.as_str()));
+        lines.push_str(&format!(
+            "<p><strong>{}</strong> {}</p>",
+            button(*level),
+            tools_said(reached)
+        ));
+    }
+    if titles.is_empty() {
+        return (String::new(), String::new());
+    }
+    (
+        format!(
+            "<details class=\"reach\"><summary>{n} tool{s}</summary>{lines}</details>",
+            n = titles.len(),
+            s = if titles.len() == 1 { "" } else { "s" },
+        ),
+        titles.into_iter().collect::<Vec<_>>().join(" "),
+    )
+}
+
+/// What a narrowed choice lets the client do, in a short paragraph, from
+/// what is picked. The page's script says the same from the form as it
+/// changes ([`CONSENT_SCRIPT`]); keep the two alike.
+fn may_do(picked: &Covers, names: &BTreeMap<String, String>) -> String {
+    let mut clauses: Vec<String> = picked
+        .by_level()
+        .into_iter()
+        .map(|(level, instances)| format!("use {} on {}", button(level), listed(&instances)))
+        .collect();
+    let mut groups: Vec<&str> = picked
+        .account_groups
+        .iter()
+        .map(|id| names.get(id).map(String::as_str).unwrap_or(id))
+        .collect();
+    groups.sort_by_key(|name| name.to_lowercase());
+    if !groups.is_empty() {
+        clauses.push(format!("reach the accounts in {}", listed(&groups)));
+    }
+    if picked.deployment_admin {
+        clauses.push("use the deployment admin's capabilities".into());
+    }
+    if clauses.is_empty() {
+        return "Nothing is ticked, so it could reach nothing. Tick what it needs.".into();
+    }
+    let mut said = format!("It may {}.", clauses.join("; "));
+    if groups.is_empty() && picked.plugins.iter().any(|(_, level)| level != "admin") {
+        said.push_str(" It reaches no account: tick an account group for that.");
+    }
+    said.push_str(" Nothing else, and never more than you hold.");
+    said
+}
+
+fn consent_page(consenting: &Consenting) -> String {
+    let Consenting {
+        id,
+        confirm,
+        asked,
+        person,
+        holdable,
+        standing,
+        last,
+        from_last,
+        tools,
+    } = consenting;
     let client = &asked.client;
     let host = reqwest::Url::parse(&asked.redirect_uri)
         .ok()
         .and_then(|url| url.host_str().map(String::from))
         .unwrap_or_default();
-    // What is ticked: the standing delegation's, when renewing one; else the
-    // CLI's default is everything, any other client's nothing.
-    let covers = match standing {
-        Some(standing) => standing.covers.clone(),
-        None if client.is_cli() => Covers::everything(),
-        None => Covers::default(),
+    // Where the choices start (ruling 2): the last client's, when asked
+    // for; the standing delegation's, when renewing one; else the CLI's
+    // default is everything, any other client's nothing ticked.
+    let start = match (from_last, last, standing) {
+        (true, Some(last), _) => last.covers.clone(),
+        (_, _, Some(standing)) => standing.covers.clone(),
+        _ if client.is_cli() => Covers::everything(),
+        _ => Covers::default(),
     };
+    let picked = holdable.picked(&start);
+    let names = holdable.group_names();
     let days = if client.is_cli() { 90 } else { 30 };
     let checked = |on: bool| if on { " checked" } else { "" };
     let who = if client.is_cli() {
@@ -613,45 +828,101 @@ fn consent_page(
         ),
         None => String::new(),
     };
+    let started = match (from_last, last) {
+        (true, Some(last)) => format!(
+            "<p class=\"warn\" data-started=\"last\">These choices start from what you allowed \
+             <strong>{}</strong>. Review them, then Allow.</p>",
+            escape(&last.client_name)
+        ),
+        _ => String::new(),
+    };
+    // Ruling 3: a starting point, never an answer; it fills the choices in
+    // again, for the person to read before Allow.
+    let from = match last {
+        Some(last) if !from_last => format!(
+            "<p class=\"hint from-last\">Or start from what you allowed \
+             <strong>{client}</strong> on {day}: {said}. \
+             <button type=\"submit\" name=\"decision\" value=\"last\" formnovalidate>\
+             Same as my last client</button></p>",
+            client = escape(&last.client_name),
+            day = escape(&rfc3339(last.renewed_at_ns.max(last.made_at_ns))[..10]),
+            said = escape(&last.covers.said(&names)),
+        ),
+        _ => String::new(),
+    };
+
     let mut choices = String::new();
     if holdable.deployment_admin {
+        let reach = tools
+            .filter(|t| !t.deployment_admin.is_empty())
+            .map(|t| {
+                format!(
+                    "<details class=\"reach\"><summary>{} tools</summary><p>{}</p></details>",
+                    t.deployment_admin.len(),
+                    tools_said(&t.deployment_admin)
+                )
+            })
+            .unwrap_or_default();
         choices.push_str(&format!(
-            "<label><input type=\"checkbox\" name=\"deployment_admin\" value=\"1\"{}> \
-             Deployment admin: this deployment's own settings, accounts and plugins, but never \
-             who holds access{}</label>",
-            checked(covers.deployment_admin),
-            tools
-                .map(|t| tools_said(&t.deployment_admin))
-                .unwrap_or_default(),
+            "<fieldset class=\"checks deployment\"><legend>This deployment</legend>\
+             <div class=\"picker-option\"><label class=\"check\"><input type=\"checkbox\" \
+             name=\"deployment_admin\" value=\"1\"{on}> <span class=\"option-label\">Deployment \
+             admin: its own settings, accounts and plugins, but never who holds access</span>\
+             </label>{reach}</div></fieldset>",
+            on = checked(picked.deployment_admin),
         ));
     }
-    for (instance, levels) in &holdable.plugins {
-        for level in levels {
-            let name = level_name(*level);
-            choices.push_str(&format!(
-                "<label><input type=\"checkbox\" name=\"level\" value=\"{instance}:{name}\"{on}> \
-                 {instance}: {said} ({name}){reach}</label>",
-                reach = tools
-                    .and_then(|t| t.plugins.get(&(instance.clone(), name.to_string())))
-                    .map(|reached| tools_said(reached))
-                    .unwrap_or_default(),
-                instance = escape(instance),
-                on = checked(
-                    covers
-                        .plugins
-                        .contains(&(instance.clone(), name.to_string()))
-                ),
-                said = button(*level),
-            ));
-        }
+    if !holdable.plugins.is_empty() {
+        let rows: Vec<Choice> = holdable
+            .plugins
+            .iter()
+            .map(|(instance, held)| {
+                let (after, also) = tools
+                    .map(|t| reached(instance, held, t))
+                    .unwrap_or_default();
+                Choice {
+                    value: instance.clone(),
+                    label: instance.clone(),
+                    also,
+                    after,
+                    control: level_select(instance, held, picked.level_on(instance)),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        choices.push_str(&picker::each(
+            "consent-plugins",
+            "Plugins: one level on each",
+            "plugins",
+            &rows,
+        ));
     }
-    for (group, name) in &holdable.account_groups {
-        choices.push_str(&format!(
-            "<label><input type=\"checkbox\" name=\"account_group\" value=\"{group}\"{on}> \
-             Accounts in {name}</label>",
-            group = escape(group),
-            name = escape(name),
-            on = checked(covers.account_groups.contains(group)),
+    if !holdable.account_groups.is_empty() {
+        let mut groups: Vec<(&String, &(String, usize))> = holdable.account_groups.iter().collect();
+        groups.sort_by(|(a, (an, _)), (b, (bn, _))| {
+            (an.to_lowercase(), *a).cmp(&(bn.to_lowercase(), *b))
+        });
+        let rows: Vec<Choice> = groups
+            .into_iter()
+            .map(|(group, (name, accounts))| Choice {
+                value: group.clone(),
+                label: name.clone(),
+                detail: format!(
+                    "{accounts} account{}",
+                    if *accounts == 1 { "" } else { "s" }
+                ),
+                also: group.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let chosen: HashSet<&str> = picked.account_groups.iter().map(String::as_str).collect();
+        choices.push_str(&picker::many(
+            "consent-groups",
+            "account_group",
+            "Account groups: the accounts it reaches",
+            "account groups",
+            &rows,
+            &chosen,
         ));
     }
     if choices.is_empty() {
@@ -666,41 +937,103 @@ fn consent_page(
             )
         })
         .collect();
+    let everything = format!(
+        "It may do anything you may do on this deployment, as that changes: every plugin at \
+         every level you hold{tools}, and every account you reach{admin}.",
+        tools = if tools.is_some() {
+            ", with its tools on this deployment's MCP surface, those added later included"
+        } else {
+            ""
+        },
+        admin = if holdable.deployment_admin {
+            ", and the deployment admin's capabilities"
+        } else {
+            ""
+        },
+    );
+    let for_days =
+        format!(" For <span data-days>{days}</span> days, recorded as yours, through it.");
     page(
         "Allow a client",
         &format!(
-            "<h1>Allow a client to act as you</h1>{who}{renewing}\
+            "<h1>Allow a client to act as you</h1>{who}{renewing}{started}\
              <p><strong>Only allow it if you started this yourself, just now.</strong> If you \
              did not, somebody is asking you to let them in.</p>\
              <form method=\"post\" action=\"/oauth/authorize\" class=\"consent\">\
              <input type=\"hidden\" name=\"request\" value=\"{id}\">\
              <input type=\"hidden\" name=\"confirm\" value=\"{confirm}\">\
-             <fieldset><legend>What it may do</legend>\
-             <label><input type=\"radio\" name=\"covers\" value=\"everything\"{all}> \
-             Everything you hold, as that changes{later}</label>\
-             <label><input type=\"radio\" name=\"covers\" value=\"some\"{some}> \
-             Only what is ticked below</label>\
+             <fieldset class=\"choice covers\"><legend>What it may do</legend>\
+             <div class=\"options\">\
+             <label class=\"option\"><input type=\"radio\" name=\"covers\" value=\"everything\"{all}> \
+             <span class=\"option-label\">Everything you hold, as that changes</span></label>\
+             <label class=\"option\"><input type=\"radio\" name=\"covers\" value=\"some\"{some}> \
+             <span class=\"option-label\">Only what is ticked</span></label></div>{from}\
              <div class=\"choices\">{choices}</div></fieldset>\
              <label>Until<select name=\"days\">{lasts}</select></label>\
-             <p class=\"hint\">You are told a week before it lapses. Everything it does is \
-             recorded as yours, through it. You can revoke it at any time from Connected \
-             clients.</p>\
+             <section class=\"summary\" aria-live=\"polite\"><h2>What it will be able to do</h2>\
+             <p class=\"summary-everything\">{everything}{for_days}</p>\
+             <p class=\"summary-some\"><span data-summary>{some_said}</span>{for_days}</p>\
+             <p class=\"hint\">You are told a week before it lapses. You can revoke it at any \
+             time from Connected clients.</p></section>\
+             <div class=\"consent-foot\">\
              <button name=\"decision\" value=\"allow\" class=\"primary\">Allow</button> \
-             <button name=\"decision\" value=\"deny\">Don't allow</button>\
-             </form>",
+             <button name=\"decision\" value=\"deny\">Don't allow</button></div>\
+             </form><script>(function () {{{picker_script}{consent_script}}})();</script>",
             id = escape(id),
             confirm = escape(confirm),
-            all = checked(covers.everything),
-            some = checked(!covers.everything),
-            later = if tools.is_some() {
-                "<span class=\"hint tools\">Its tools on this deployment's MCP surface, \
-                 those added later included.</span>"
-            } else {
-                ""
-            },
+            all = checked(start.everything),
+            some = checked(!start.everything),
+            everything = escape(&everything),
+            some_said = escape(&may_do(&picked, &names)),
+            picker_script = picker::SCRIPT,
+            consent_script = CONSENT_SCRIPT,
         ),
     )
 }
+
+/// The summary, said again from the form as it changes, as [`may_do`] says
+/// it; and the days chosen. Without it the summary is what the page opened
+/// with, and the form posts as it always did.
+const CONSENT_SCRIPT: &str = r#"
+  var form = document.querySelector("form.consent");
+  if (!form) return;
+  var summary = form.querySelector("[data-summary]");
+  var LEVELS = [["admin", "Manage"], ["write", "Open"], ["read", "View"]];
+  function listed(names) {
+    if (names.length < 2) return names.join("");
+    if (names.length <= 3) return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+    return names.slice(0, 3).join(", ") + " and " + (names.length - 3) + " more";
+  }
+  function label(input) { return input.closest(".picker-option").querySelector(".option-label").textContent; }
+  function update() {
+    var at = { admin: [], write: [], read: [] }, clauses = [], accounts = false;
+    Array.prototype.forEach.call(form.querySelectorAll("select[name=level]"), function (select) {
+      if (!select.value) return;
+      at[select.value.slice(select.value.lastIndexOf(":") + 1)].push(select.getAttribute("data-instance"));
+      if (select.options[select.selectedIndex].hasAttribute("data-accounts")) accounts = true;
+    });
+    LEVELS.forEach(function (level) {
+      if (at[level[0]].length) clauses.push("use " + level[1] + " on " + listed(at[level[0]]));
+    });
+    var groups = Array.prototype.map.call(form.querySelectorAll("input[name=account_group]:checked"), label);
+    if (groups.length) clauses.push("reach the accounts in " + listed(groups));
+    var admin = form.querySelector("input[name=deployment_admin]");
+    if (admin && admin.checked) clauses.push("use the deployment admin's capabilities");
+    var said;
+    if (!clauses.length) {
+      said = "Nothing is ticked, so it could reach nothing. Tick what it needs.";
+    } else {
+      said = "It may " + clauses.join("; ") + ".";
+      if (!groups.length && accounts) said += " It reaches no account: tick an account group for that.";
+      said += " Nothing else, and never more than you hold.";
+    }
+    summary.textContent = said;
+    var days = form.querySelector("select[name=days]").value;
+    Array.prototype.forEach.call(form.querySelectorAll("[data-days]"), function (span) { span.textContent = days; });
+  }
+  form.addEventListener("change", update);
+  update();
+"#;
 
 /// What the person ticked, held to what they hold now.
 fn consent_of(fields: &[(String, String)], holdable: &Holdable) -> Result<Consent, String> {
@@ -730,20 +1063,25 @@ fn consent_of(fields: &[(String, String)], holdable: &Holdable) -> Result<Consen
     }
     for (key, value) in fields {
         match key.as_str() {
+            // A plugin's select left at Nothing.
+            "level" if value.is_empty() => {}
             "level" => {
                 let Some((instance, level)) = value.rsplit_once(':') else {
                     return Err(format!("`{value}` is not a plugin and a level"));
                 };
-                let held = holdable
-                    .plugins
-                    .get(instance)
-                    .is_some_and(|levels| levels.iter().any(|l| level_name(*l) == level));
-                if !held {
+                let Some((held, picked)) = holdable.plugins.get(instance).and_then(|held| {
+                    let picked = held.iter().copied().find(|l| level_name(*l) == level)?;
+                    Some((held, picked))
+                }) else {
                     return Err(format!("you do not hold {level} on {instance}"));
+                };
+                // One level per plugin, including those held below it
+                // (ruling 1): what holding it gives.
+                for level in with_below(held, picked) {
+                    covers
+                        .plugins
+                        .insert((instance.to_string(), level_name(level).to_string()));
                 }
-                covers
-                    .plugins
-                    .insert((instance.to_string(), level.to_string()));
             }
             "account_group" => {
                 if !holdable.account_groups.contains_key(value) {
@@ -775,9 +1113,14 @@ async fn decide(
             .unwrap_or_default()
     };
     let (id, confirm) = (one("request"), one("confirm"));
-    let Some((_, person)) = app.delegations.consenting(&id, &confirm, now) else {
+    let Some((asked, person)) = app.delegations.consenting(&id, &confirm, now) else {
         return not_accepted("this authorisation has expired, was already used, or is not yours");
     };
+    // "Same as my last client" (ruling 3): the page again, its choices
+    // filled from that delegation, and nothing decided or spent.
+    if one("decision") == "last" {
+        return consent_shown(&app, &id, &confirm, &asked, &person, true, now).await;
+    }
     let consent = if one("decision") == "allow" {
         let holdable = match holdable(&app, &person, now).await {
             Ok(holdable) => holdable,

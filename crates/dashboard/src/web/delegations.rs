@@ -21,7 +21,7 @@ use meridian_domain::v1::AccessRecords;
 
 use super::{redirect, refused, session_of, App};
 use crate::admin::{admin_chrome, form_token_matches, gate, status_page, token_input, Fields};
-use crate::delegation::Delegation;
+use crate::delegation::{Covers, Delegation, NAMES_SAID};
 use crate::html::{crumb_here, crumb_link, escape, page_with, Chrome, Viewer};
 use crate::terminal::rfc3339;
 
@@ -78,6 +78,41 @@ fn standing(delegation: &Delegation, now: i64) -> (&'static str, String) {
     }
 }
 
+/// What a delegation covers, as the consent page chose it: a line, and when
+/// the line names only the first few, all of it folded beneath, each plugin
+/// under the one level picked on it and every account group
+/// (kernel/the-consent-page-at-scale).
+fn covers_cell(covers: &Covers, names: &BTreeMap<String, String>) -> String {
+    let line = escape(&covers.said(names));
+    let by_level = covers.by_level();
+    let long = covers.account_groups.len() > NAMES_SAID
+        || by_level.iter().any(|(_, at)| at.len() > NAMES_SAID);
+    if covers.everything || !long {
+        return line;
+    }
+    let mut all = String::new();
+    for (level, instances) in by_level {
+        all.push_str(&format!(
+            "<p><strong>{}</strong> {}</p>",
+            meridian_access::button(level),
+            escape(&instances.join(", "))
+        ));
+    }
+    if !covers.account_groups.is_empty() {
+        let mut groups: Vec<&str> = covers
+            .account_groups
+            .iter()
+            .map(|id| names.get(id).map(String::as_str).unwrap_or(id))
+            .collect();
+        groups.sort_by_key(|name| name.to_lowercase());
+        all.push_str(&format!(
+            "<p><strong>Accounts in</strong> {}</p>",
+            escape(&groups.join(", "))
+        ));
+    }
+    format!("<details class=\"covers\"><summary>{line}</summary>{all}</details>")
+}
+
 /// The table both pages draw. `revoke` is where a live one's form posts,
 /// given its id, or none for no form.
 fn table(
@@ -119,7 +154,7 @@ fn table(
                  <td class=\"actions\">{action}</td></tr>",
                 id = escape(&d.id),
                 client = escape(&d.client_name),
-                covers = escape(&d.covers.said(names)),
+                covers = covers_cell(&d.covers, names),
                 made = day(d.made_at_ns),
                 said = escape(&said),
             )
@@ -220,7 +255,9 @@ async fn own(
         "<div class=\"page-head\"><div><h1>Connected clients</h1>\
          <p>Clients acting as you on this deployment: the <code>meridian</code> command on each \
          computer you connected, and anything else you allowed. What each does is recorded as \
-         yours, through it.</p></div></div>{notice}{table}{calls}",
+         yours, through it.</p><p class=\"hint\">To change what one covers, or renew it, \
+         connect it again from that client: the page you allow it on offers the same choices, \
+         starting from what it covers now.</p></div></div>{notice}{table}{calls}",
         table = table(&theirs, &group_names(&records), now, &token, &|d| Some((
             format!("/delegations/{}/revoke", d.id),
             String::new()

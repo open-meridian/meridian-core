@@ -837,8 +837,36 @@ fn what_a_delegation_covers_is_said_in_a_line() {
         account_groups: BTreeSet::from(["AG-1".into()]),
         ..Covers::default()
     };
+    // One level per plugin, the highest covered (kernel/the-consent-page-at-scale).
     assert_eq!(
         some.said(&names),
-        "deployment admin; oms-1 (View, Open); accounts in Desk one"
+        "deployment admin; oms-1 (Open); accounts in Desk one"
     );
+}
+
+#[test]
+fn one_level_is_said_per_plugin_and_a_long_list_is_cut_short() {
+    let mut covers = Covers::default();
+    for i in 0..5 {
+        covers.plugins.insert((format!("p-{i}"), "admin".into()));
+        covers.plugins.insert((format!("p-{i}"), "read".into()));
+    }
+    covers.plugins.insert(("q-1".into(), "write".into()));
+    covers.plugins.insert(("q-1".into(), "read".into()));
+    covers.plugins.insert(("r-1".into(), "read".into()));
+    covers.account_groups = (0..300).map(|i| format!("AG-{i:03}")).collect();
+    assert_eq!(covers.level_on("p-0"), Some(AccessLevel::Admin));
+    assert_eq!(covers.level_on("q-1"), Some(AccessLevel::Write));
+    assert_eq!(covers.level_on("r-1"), Some(AccessLevel::Read));
+    assert_eq!(covers.level_on("s-1"), None);
+    assert_eq!(
+        covers.said(&BTreeMap::new()),
+        "p-0 (Manage), p-1 (Manage), p-2 (Manage) and 4 more plugins; \
+         accounts in AG-000, AG-001, AG-002 and 297 more"
+    );
+    assert_eq!(listed(&[]), "");
+    assert_eq!(listed(&["a"]), "a");
+    assert_eq!(listed(&["a", "b"]), "a and b");
+    assert_eq!(listed(&["a", "b", "c"]), "a, b and c");
+    assert_eq!(listed(&["a", "b", "c", "d"]), "a, b, c and 1 more");
 }

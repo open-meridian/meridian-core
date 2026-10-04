@@ -10,6 +10,10 @@
 //! many forms there are: the admin page has one dialog per kind of record,
 //! which an Edit fills, so the page grows with the options and not with the
 //! options times the records.
+//!
+//! [`each`] is the same list with one choice made per row by the control the
+//! row carries, a level select, in place of a checkbox: the consent page's
+//! plugins, one level per instance (kernel/the-consent-page-at-scale).
 
 use std::collections::HashSet;
 
@@ -29,6 +33,10 @@ pub struct Choice {
     pub only_when_chosen: bool,
     /// Markup after it, already HTML: an access entry's level.
     pub after: String,
+    /// For [`each`]: the row's control, already HTML, in place of a
+    /// checkbox and inside the row's label. It counts as chosen while its
+    /// value is not empty.
+    pub control: String,
 }
 
 /// A picker named `id`, posting each chosen value as `name`.
@@ -43,25 +51,8 @@ pub fn many(
     let options: String = choices
         .iter()
         .map(|choice| {
-            let detail = if choice.detail.is_empty() || choice.detail == choice.label {
-                String::new()
-            } else {
-                format!(" <span class=\"id\">{}</span>", escape(&choice.detail))
-            };
-            format!(
-                "<div class=\"picker-option\"{also}{only}><label class=\"check\"><input type=\"checkbox\" \
-                 name=\"{name}\" value=\"{value}\"{checked}> <span class=\"option-label\">{label}</span>{detail}\
-                 </label>{after}</div>",
-                also = if choice.also.is_empty() {
-                    String::new()
-                } else {
-                    format!(" data-also=\"{}\"", escape(&choice.also))
-                },
-                only = if choice.only_when_chosen {
-                    " data-only-when-chosen"
-                } else {
-                    ""
-                },
+            let checkbox = format!(
+                "<input type=\"checkbox\" name=\"{name}\" value=\"{value}\"{checked}> ",
                 name = escape(name),
                 value = escape(&choice.value),
                 checked = if chosen.contains(choice.value.as_str()) {
@@ -69,24 +60,68 @@ pub fn many(
                 } else {
                     ""
                 },
-                label = escape(&choice.label),
-                after = choice.after,
-            )
+            );
+            option(choice, &checkbox, "")
         })
         .collect();
+    fieldset(id, legend, noun, &options, true)
+}
+
+/// A picker named `id` whose every row makes its one choice by its own
+/// control ([`Choice::control`]): searched, counted and cleared as [`many`]
+/// is, without "Select all shown", which means nothing for a select.
+pub fn each(id: &str, legend: &str, noun: &str, choices: &[Choice]) -> String {
+    let options: String = choices
+        .iter()
+        .map(|choice| option(choice, "", &choice.control))
+        .collect();
+    fieldset(id, legend, noun, &options, false)
+}
+
+/// One row: `before` and `control` inside its label, either side of its
+/// words.
+fn option(choice: &Choice, before: &str, control: &str) -> String {
+    let detail = if choice.detail.is_empty() || choice.detail == choice.label {
+        String::new()
+    } else {
+        format!(" <span class=\"id\">{}</span>", escape(&choice.detail))
+    };
+    format!(
+        "<div class=\"picker-option\"{also}{only}><label class=\"check\">{before}<span \
+         class=\"option-label\">{label}</span>{detail}{control}</label>{after}</div>",
+        also = if choice.also.is_empty() {
+            String::new()
+        } else {
+            format!(" data-also=\"{}\"", escape(&choice.also))
+        },
+        only = if choice.only_when_chosen {
+            " data-only-when-chosen"
+        } else {
+            ""
+        },
+        label = escape(&choice.label),
+        after = choice.after,
+    )
+}
+
+fn fieldset(id: &str, legend: &str, noun: &str, options: &str, select_all: bool) -> String {
     let id = escape(id);
     let noun = escape(noun);
     format!(
         "<fieldset class=\"checks picker\" id=\"{id}\" data-picker><legend>{legend}</legend>\
          <div class=\"picker-tools\" hidden><input type=\"search\" placeholder=\"Search {noun}\" \
          aria-label=\"Search {noun}\" aria-controls=\"{id}-options\" data-picker-search>\
-         <button type=\"button\" data-picker-all>Select all shown</button>\
-         <button type=\"button\" data-picker-clear>Clear</button></div>\
+         {all}<button type=\"button\" data-picker-clear>Clear</button></div>\
          <p class=\"picker-status\" aria-live=\"polite\" hidden></p>\
          <ul class=\"picker-chosen\" aria-label=\"Chosen {noun}\" hidden></ul>\
          <div class=\"picker-options\" id=\"{id}-options\">{options}</div>\
          <p class=\"picker-none\" hidden>No {noun} match that search.</p></fieldset>",
         legend = escape(legend),
+        all = if select_all {
+            "<button type=\"button\" data-picker-all>Select all shown</button>"
+        } else {
+            ""
+        },
     )
 }
 
@@ -103,9 +138,25 @@ pub const SCRIPT: &str = r#"
     var chips = box.querySelector(".picker-chosen");
     var none = box.querySelector(".picker-none");
     var items = Array.prototype.slice.call(box.querySelectorAll(".picker-option"));
-    var boxes = items.map(function (item) { return item.querySelector("input[type=checkbox]"); });
+    var boxes = items.map(function (item) { return item.querySelector("input[type=checkbox], select"); });
     var names = items.map(function (item) { return item.querySelector(".option-label").textContent; });
-    var texts = items.map(function (item) { return (item.textContent + " " + (item.getAttribute("data-also") || "")).toLowerCase(); });
+    // Found by its words, its detail and its data-also, never by the options
+    // of a select it carries.
+    var texts = items.map(function (item, i) {
+      var detail = item.querySelector(".id");
+      return (names[i] + " " + (detail ? detail.textContent : "") + " " +
+        (item.getAttribute("data-also") || "")).toLowerCase();
+    });
+    // A checkbox is chosen while ticked, a select while its value is not empty.
+    function on(i) { return boxes[i].type === "checkbox" ? boxes[i].checked : boxes[i].value !== ""; }
+    function off(i) { if (boxes[i].type === "checkbox") boxes[i].checked = false; else boxes[i].value = ""; }
+    function said(i) {
+      if (boxes[i].type === "checkbox") return names[i];
+      var picked = boxes[i].options[boxes[i].selectedIndex];
+      return names[i] + ": " + (picked.getAttribute("data-short") || picked.text);
+    }
+    // Whoever reads the form's choices hears of a change made here too.
+    function changed() { box.dispatchEvent(new Event("change", { bubbles: true })); }
     var only = items.map(function (item) { return item.hasAttribute("data-only-when-chosen"); });
     var pending = false;
     tools.hidden = false;
@@ -116,26 +167,26 @@ pub const SCRIPT: &str = r#"
       var words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
       var shown = 0, chosen = 0, listed = 0;
       for (var i = 0; i < items.length; i++) {
-        var hide = only[i] && !boxes[i].checked;
+        var hide = only[i] && !on(i);
         if (!hide) listed++;
         if (!hide && words.length) hide = !words.every(function (w) { return texts[i].indexOf(w) !== -1; });
         if (items[i].hidden !== hide) items[i].hidden = hide;
         if (!hide) shown++;
-        if (boxes[i].checked) chosen++;
+        if (on(i)) chosen++;
       }
       none.hidden = shown !== 0 || !words.length;
       status.textContent = chosen + " chosen" + (words.length ? ", " + shown + " of " + listed + " shown" : ", " + listed + " in all");
     }
     function chosenChips() {
       var picked = [];
-      for (var i = 0; i < items.length; i++) if (boxes[i].checked) picked.push(i);
+      for (var i = 0; i < items.length; i++) if (on(i)) picked.push(i);
       var nodes = picked.slice(0, MOST_CHIPS).map(function (i) {
         var li = document.createElement("li");
         var button = document.createElement("button");
         button.type = "button";
-        button.textContent = names[i] + " \u00d7";
+        button.textContent = said(i) + " \u00d7";
         button.setAttribute("aria-label", "Remove " + names[i]);
-        button.addEventListener("click", function () { boxes[i].checked = false; refresh(); boxes[i].focus(); });
+        button.addEventListener("click", function () { off(i); refresh(); changed(); boxes[i].focus(); });
         li.appendChild(button);
         return li;
       });
@@ -155,14 +206,19 @@ pub const SCRIPT: &str = r#"
     });
     // Enter in the search box narrows; it never sends the form.
     search.addEventListener("keydown", function (event) { if (event.key === "Enter") event.preventDefault(); });
-    box.addEventListener("change", function (event) { if (event.target.type === "checkbox") refresh(); });
-    box.querySelector("[data-picker-all]").addEventListener("click", function () {
+    box.addEventListener("change", function (event) {
+      if (event.target.type === "checkbox" || event.target.tagName === "SELECT") refresh();
+    });
+    var all = box.querySelector("[data-picker-all]");
+    if (all) all.addEventListener("click", function () {
       for (var i = 0; i < items.length; i++) if (!items[i].hidden) boxes[i].checked = true;
       refresh();
+      changed();
     });
     box.querySelector("[data-picker-clear]").addEventListener("click", function () {
-      for (var i = 0; i < items.length; i++) boxes[i].checked = false;
+      for (var i = 0; i < items.length; i++) off(i);
       refresh();
+      changed();
     });
     box.refresh = function () { search.value = ""; refresh(); };
     refresh();
@@ -219,6 +275,32 @@ mod tests {
     }
 
     #[test]
+    fn a_picker_of_one_choice_each_carries_its_control_in_each_label() {
+        let html = each(
+            "consent-plugins",
+            "Plugins",
+            "plugins",
+            &[Choice {
+                value: "oms-1".into(),
+                label: "oms-1".into(),
+                control: "<select name=\"level\"><option value=\"\">Nothing</option></select>"
+                    .into(),
+                after: "<details class=\"reach\"></details>".into(),
+                ..Default::default()
+            }],
+        );
+        assert!(html.contains(
+            "<div class=\"picker-option\"><label class=\"check\"><span class=\"option-label\">oms-1\
+             </span><select name=\"level\"><option value=\"\">Nothing</option></select></label>\
+             <details class=\"reach\"></details></div>"
+        ), "{html}");
+        assert!(!html.contains("type=\"checkbox\""), "{html}");
+        // Clearing means something for a select; selecting all does not.
+        assert!(html.contains("data-picker-clear"));
+        assert!(!html.contains("data-picker-all"));
+    }
+
+    #[test]
     fn the_script_reads_each_option_once_and_flips_only_what_changes() {
         for held in [
             "var texts = items.map(",
@@ -227,7 +309,10 @@ mod tests {
             "if (event.key === \"Enter\") event.preventDefault();",
             "for (var i = 0; i < items.length; i++) if (!items[i].hidden) boxes[i].checked = true;",
             "button.setAttribute(\"aria-label\", \"Remove \" + names[i]);",
-            "button.textContent = names[i] + \" \\u00d7\";",
+            "button.textContent = said(i) + \" \\u00d7\";",
+            "if (boxes[i].type === \"checkbox\") return names[i];",
+            "return names[i] + \": \" + (picked.getAttribute(\"data-short\") || picked.text);",
+            "for (var i = 0; i < items.length; i++) off(i);",
             "var MOST_CHIPS = 12;",
         ] {
             assert!(SCRIPT.contains(held), "{held}");

@@ -331,7 +331,23 @@ details.developer .summary-note{margin-left:.35rem;font-weight:400;color:var(--i
 details.developer>.fields{margin-top:.6rem}\
 .form-foot{position:sticky;bottom:0;z-index:5;display:flex;justify-content:flex-end;margin-top:.7rem;padding:.5rem 0;\
 border-top:1px solid var(--line-soft);background:var(--card)}\
-.form-foot button{margin:0}";
+.form-foot button{margin:0}\
+form.consent fieldset.covers>legend{margin-bottom:.4rem;font-size:.84rem;font-weight:550}\
+form.consent .from-last button{margin:.35rem 0 0}\
+form.consent .choices{margin-top:.9rem}\
+form.consent:has(input[name=covers][value=everything]:checked) .choices,\
+form.consent:has(input[name=covers][value=everything]:checked) .summary-some,\
+form.consent:has(input[name=covers][value=some]:checked) .summary-everything{display:none}\
+form.consent .picker-option{flex-wrap:wrap}form.consent .picker-option label.check{flex:1 1 14rem}\
+form.consent .picker-option label.check select{margin-left:auto}\
+form.consent details.reach{flex:1 0 100%;margin:0 0 .35rem 1.5rem;font-size:.84rem;color:var(--ink-soft)}\
+form.consent details.reach>summary{cursor:pointer;color:var(--accent)}form.consent details.reach p{margin:.2rem 0}\
+form.consent details.reach .hint{display:inline;margin:0}\
+form.consent fieldset.deployment{max-height:none}\
+form.consent section.summary{margin:1rem 0 0;padding:.75rem 1rem;border:1px solid var(--line);border-radius:var(--radius);\
+background:var(--page)}form.consent section.summary h2{font-size:.95rem;margin:0 0 .35rem}\
+form.consent section.summary .hint{margin:.35rem 0 0}\
+form.consent .consent-foot{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}form.consent .consent-foot button{margin:0}";
 
 /// Whether this deployment was installed for development
 /// (spec/live-plugin-development, ruling 2). Process-wide, set once at start

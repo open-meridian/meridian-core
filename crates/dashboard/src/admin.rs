@@ -385,7 +385,7 @@ mod books;
 pub mod instruments;
 mod overview;
 pub mod people;
-mod picker;
+pub(crate) mod picker;
 
 /// Everybody this dashboard can name for a user group (people.rs): those the
 /// groups name, those holding a terminal session, and the accounts this

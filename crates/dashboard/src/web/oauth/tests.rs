@@ -799,3 +799,348 @@ async fn a_withdrawn_permission_reaches_a_delegation_at_its_next_request() {
     let listing = stopping(&app, access).await;
     assert_eq!(listing.status(), StatusCode::FORBIDDEN);
 }
+
+// ── The consent page at a firm's scale (kernel/the-consent-page-at-scale) ──
+
+/// A client that is not the CLI, sending its codes to the same address.
+async fn register_agent(app: &Arc<App>) -> String {
+    let response = post_json(
+        app,
+        "/oauth/register",
+        serde_json::json!({ "client_name": "Claude", "redirect_uris": [BACK] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    json_of(response).await["client_id"]
+        .as_str()
+        .expect("an id")
+        .to_string()
+}
+
+/// Between `<div class="choices">` and the end of its fieldset: the
+/// individual choices.
+fn choices_of(page: &str) -> &str {
+    let start = page.find("<div class=\"choices\">").expect("choices");
+    let end = start
+        + page[start..]
+            .find("</div></fieldset><label>Until")
+            .expect("their end");
+    &page[start..end]
+}
+
+#[tokio::test]
+async fn the_individual_choices_show_only_for_only_what_is_ticked_and_need_no_script() {
+    let (app, _) = app();
+    let (_, _, page) = consenting(&app, &register_cli(&app).await).await;
+    // One question at a time: while Everything is chosen the choices and
+    // their summary are hidden, by the stylesheet alone; Only what is ticked
+    // shows them. Nothing about it is the script's.
+    assert!(page.contains(
+        "form.consent:has(input[name=covers][value=everything]:checked) .choices,\
+         form.consent:has(input[name=covers][value=everything]:checked) .summary-some,\
+         form.consent:has(input[name=covers][value=some]:checked) .summary-everything{display:none}"
+    ));
+    // Never hidden by an attribute, which only a script could take away.
+    assert!(page.contains("<div class=\"choices\"><fieldset"), "{page}");
+    let choices = choices_of(&page);
+    for control in [
+        "name=\"deployment_admin\"",
+        "name=\"level\"",
+        "name=\"account_group\"",
+    ] {
+        assert!(choices.contains(control), "{control} among the choices");
+        assert!(
+            !page.replacen(choices, "", 1).contains(control),
+            "{control} only among the choices"
+        );
+    }
+    // The form's controls are plain ones: posted as they are without the
+    // script, which only searches and says the summary again.
+    assert!(page.contains("<form method=\"post\" action=\"/oauth/authorize\" class=\"consent\">"));
+}
+
+#[tokio::test]
+async fn a_new_client_starts_with_nothing_ticked_and_everything_offered_not_chosen() {
+    let (app, _) = app();
+    let (_, _, page) = consenting(&app, &register_agent(&app).await).await;
+    assert!(page.contains("value=\"everything\">"), "offered: {page}");
+    assert!(!page.contains("value=\"everything\" checked"), "{page}");
+    assert!(page.contains("value=\"some\" checked"), "{page}");
+    let choices = choices_of(&page);
+    assert!(!choices.contains(" checked"), "nothing ticked: {choices}");
+    assert!(
+        choices.contains("<option value=\"\" selected>Nothing</option>"),
+        "{choices}"
+    );
+    assert!(!choices.contains("\" selected>View"), "{choices}");
+    assert!(page.contains("value=\"30\" selected"), "{page}");
+    assert!(
+        page.contains("Nothing is ticked, so it could reach nothing."),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn one_level_is_picked_per_plugin_and_includes_those_held_below_it() {
+    let (app, _) = app();
+    let (_, _, page) = consenting(&app, &register_agent(&app).await).await;
+    // One select for oms-1, never a checkbox per level.
+    assert_eq!(page.matches("<select name=\"level\"").count(), 1, "{page}");
+    assert!(!page.contains("type=\"checkbox\" name=\"level\""), "{page}");
+    assert!(
+        page.contains(
+            "<option value=\"oms-1:write\" data-short=\"Open\" data-accounts>Open, with View</option>"
+        ),
+        "{page}"
+    );
+    // Open picked: the delegation covers Open and the View it includes.
+    let (_, said) = connected(
+        &app,
+        "covers=some&level=oms-1:write&account_group=AG-1&days=30",
+    )
+    .await;
+    let delegation = app
+        .delegations
+        .delegation(said["delegation_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        delegation.covers.plugins,
+        BTreeSet::from([
+            ("oms-1".to_string(), "write".to_string()),
+            ("oms-1".to_string(), "read".to_string())
+        ])
+    );
+    let access = said["access_token"].as_str().unwrap();
+    for level in ["write", "read"] {
+        let opened = send(
+            &app,
+            Request::post(format!("/terminal/plugins/oms-1/open?level={level}"))
+                .header(AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        // Admitted; refused only because this dashboard serves no plugin pages.
+        assert_eq!(opened.status(), StatusCode::SERVICE_UNAVAILABLE, "{level}");
+    }
+    // A plugin left at Nothing sends an empty level, which covers nothing.
+    let (_, nothing) = connected(&app, "covers=some&level=&days=30").await;
+    let delegation = app
+        .delegations
+        .delegation(nothing["delegation_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delegation.covers, Covers::default());
+}
+
+#[tokio::test]
+async fn same_as_my_last_client_fills_the_choices_for_the_person_to_review() {
+    let (app, _) = app();
+    // Before: the CLI, narrowed to View on oms-1 and the Desk's accounts.
+    connected(
+        &app,
+        "covers=some&level=oms-1:read&account_group=AG-1&days=30",
+    )
+    .await;
+    let agent = register_agent(&app).await;
+    let (request, confirm, page) = consenting(&app, &agent).await;
+    assert!(page.contains("value=\"last\""), "offered: {page}");
+    assert!(page.contains("meridian on ada-laptop"), "{page}");
+    assert!(page.contains("oms-1 (View); accounts in Desk"), "{page}");
+    // Asked for, the page again, filled in from it: nothing decided, and no
+    // code sent anywhere.
+    let filled = post_form(
+        &app,
+        "/oauth/authorize",
+        format!("request={request}&confirm={confirm}&decision=last"),
+    )
+    .await;
+    assert_eq!(filled.status(), StatusCode::OK);
+    assert!(filled.headers().get(LOCATION).is_none());
+    let page = body_of(filled).await;
+    assert!(page.contains("data-started=\"last\""), "{page}");
+    assert!(page.contains("value=\"some\" checked"), "{page}");
+    assert!(
+        page.contains("value=\"oms-1:read\" data-short=\"View\" data-accounts selected"),
+        "{page}"
+    );
+    assert!(page.contains("value=\"AG-1\" checked"), "{page}");
+    assert!(!page.contains("value=\"last\""), "offered once: {page}");
+    // The summary says what that comes to, before Allow.
+    assert!(
+        page.contains(
+            "<span data-summary>It may use View on oms-1; reach the accounts in Desk. Nothing \
+             else, and never more than you hold.</span>"
+        ),
+        "{page}"
+    );
+    // And the same authorisation is still the person's to answer.
+    assert_eq!(hidden(&page, "request"), request);
+    let decided = post_form(
+        &app,
+        "/oauth/authorize",
+        format!(
+            "request={request}&confirm={confirm}&decision=allow&covers=some\
+             &level=oms-1:read&account_group=AG-1&days=30"
+        ),
+    )
+    .await;
+    assert_eq!(decided.status(), StatusCode::FOUND);
+    assert!(query(&location(&decided), "code").is_some());
+}
+
+#[tokio::test]
+async fn the_summary_before_allow_states_what_the_client_may_do() {
+    let (app, _) = app();
+    let (_, _, cli) = consenting(&app, &register_cli(&app).await).await;
+    let summary = cli.find("What it will be able to do").expect("a summary");
+    let allow = cli.find("value=\"allow\"").expect("Allow");
+    assert!(summary < allow, "the summary comes before Allow");
+    assert!(cli.contains(
+        "It may do anything you may do on this deployment, as that changes: every plugin at every \
+         level you hold, and every account you reach, and the deployment admin&#39;s capabilities. \
+         For <span data-days>90</span> days"
+    ), "{cli}");
+    let (_, _, mcp) = consenting_for(
+        &app,
+        &register_cli(&app).await,
+        &format!("https://{HOST_NAME}/mcp"),
+    )
+    .await;
+    assert!(mcp.contains("those added later included"), "{mcp}");
+    // A choice with levels and no account group says it reaches none.
+    let holdable = Holdable {
+        plugins: BTreeMap::from([(
+            "oms-1".to_string(),
+            vec![AccessLevel::Write, AccessLevel::Read],
+        )]),
+        account_groups: BTreeMap::new(),
+        deployment_admin: true,
+    };
+    let picked = holdable.picked(&Covers {
+        plugins: BTreeSet::from([("oms-1".into(), "write".into())]),
+        deployment_admin: true,
+        ..Covers::default()
+    });
+    assert_eq!(
+        may_do(&picked, &BTreeMap::new()),
+        "It may use Open on oms-1; use the deployment admin's capabilities. It reaches no \
+         account: tick an account group for that. Nothing else, and never more than you hold."
+    );
+}
+
+/// A firm's records: Ada writing on 40 plugin instances, managing the first
+/// ten, and reaching 300 account groups of two accounts each.
+fn a_firm() -> AccessRecords {
+    let mut records = records();
+    records.accounts = (0..600)
+        .map(|i| AccountRecord {
+            account_id: format!("ACC-{i:03}"),
+            name: format!("Account {i}"),
+            state: AccountState::Open as i32,
+            ..Default::default()
+        })
+        .collect();
+    records.account_groups = (0..300)
+        .map(|i| AccountGroup {
+            account_group_id: format!("AG-{i:03}"),
+            name: format!("Fund {i:03}"),
+            account_ids: vec![format!("ACC-{:03}", 2 * i), format!("ACC-{:03}", 2 * i + 1)],
+            ..Default::default()
+        })
+        .collect();
+    let entries = |level: meridian_access::AccessLevel, n: usize| {
+        (0..n)
+            .map(|i| AccessEntry {
+                plugin_instance_id: format!("plugin-{i:02}"),
+                level: level as i32,
+            })
+            .collect()
+    };
+    records.access_groups = vec![
+        AccessGroup {
+            access_group_id: "AX-1".into(),
+            name: "Traders".into(),
+            entries: entries(meridian_access::AccessLevel::Write, 40),
+            ..Default::default()
+        },
+        AccessGroup {
+            access_group_id: "AX-2".into(),
+            name: "Operators".into(),
+            entries: entries(meridian_access::AccessLevel::Admin, 10),
+            ..Default::default()
+        },
+    ];
+    records.permissions.retain(|p| p.permission_id == "P-1");
+    records.permissions.extend((0..300).map(|i| Permission {
+        permission_id: format!("P-G{i:03}"),
+        user_group_id: "UG-1".into(),
+        account_group_id: format!("AG-{i:03}"),
+        access_group_id: "AX-1".into(),
+    }));
+    records.permissions.push(Permission {
+        permission_id: "P-ops".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: String::new(),
+        access_group_id: "AX-2".into(),
+    });
+    records
+}
+
+#[tokio::test]
+async fn forty_plugins_and_three_hundred_account_groups_make_one_short_page() {
+    let (app, _) = app();
+    app.records.store(a_firm(), T0);
+    let agent = register_agent(&app).await;
+    let (request, confirm, page) = consenting(&app, &agent).await;
+    // Plugins by instance, one level picked on each.
+    assert_eq!(page.matches("<select name=\"level\"").count(), 40);
+    assert!(!page.contains("type=\"checkbox\" name=\"level\""));
+    assert!(page.contains(
+        "<option value=\"plugin-00:admin\" data-short=\"Manage\" data-accounts>Manage, with Open and \
+         View</option>"
+    ), "manage includes open and view, as holding it does");
+    assert!(
+        !page.contains("value=\"plugin-10:admin\""),
+        "held on ten only"
+    );
+    // Account groups searched, with how many accounts each holds, and how
+    // many there are and are chosen (the picker's status, said by its
+    // script); every one a checkbox posting as it is.
+    assert_eq!(page.matches("name=\"account_group\"").count(), 300);
+    assert_eq!(
+        page.matches("data-picker-search>").count(),
+        2,
+        "both searched"
+    );
+    assert!(page.contains("aria-label=\"Search account groups\""));
+    assert!(page.contains("aria-label=\"Search plugins\""));
+    assert!(page.contains(
+        "<span class=\"option-label\">Fund 123</span> <span class=\"id\">2 accounts</span>"
+    ));
+    assert!(page.contains("data-also=\"AG-123\""), "found by its ID too");
+    // One question, one choice per row: a page a person reads.
+    let size = page.len();
+    println!("the consent page at 40 plugins and 300 account groups: {size} bytes");
+    assert!(size < 150_000, "{size} bytes");
+    // And finishing it is a handful of fields: one search, one level, one
+    // group.
+    let decided = post_form(
+        &app,
+        "/oauth/authorize",
+        format!(
+            "request={request}&confirm={confirm}&decision=allow&covers=some\
+             &level=plugin-07:admin&level=plugin-22:read&account_group=AG-123&days=7"
+        ),
+    )
+    .await;
+    assert_eq!(
+        decided.status(),
+        StatusCode::FOUND,
+        "{}",
+        body_of(decided).await
+    );
+}
