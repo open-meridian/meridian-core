@@ -117,7 +117,8 @@ pub fn unstated(fund: &MoneyMarketFund) -> Vec<&'static str> {
 }
 
 /// A fund's attributes as a person reads them: `government, retail, stable
-/// NAV, discretionary fee`.
+/// NAV, discretionary liquidity fee`, and `no liquidity fee` for a fund that
+/// charges none, which read as "none fee" until 2026-10-03.
 pub fn fund_words(text: &str) -> String {
     let Some(fund) = fund_from_text(text) else {
         return text.to_string();
@@ -128,8 +129,15 @@ pub fn fund_words(text: &str) -> String {
             .to_ascii_lowercase()
             .replace('_', "-")
     };
+    let fee = match LiquidityFeeRegime::try_from(fund.liquidity_fee).unwrap_or_default() {
+        LiquidityFeeRegime::None => "no liquidity fee".to_string(),
+        regime => format!(
+            "{} liquidity fee",
+            lower(regime.as_str_name(), "LIQUIDITY_FEE_REGIME_")
+        ),
+    };
     format!(
-        "{}, {}, {} NAV, {} fee",
+        "{}, {}, {} NAV, {fee}",
         lower(
             MoneyMarketFundCategory::try_from(fund.category)
                 .unwrap_or_default()
@@ -147,12 +155,6 @@ pub fn fund_words(text: &str) -> String {
                 .unwrap_or_default()
                 .as_str_name(),
             "MONEY_MARKET_FUND_NAV_"
-        ),
-        lower(
-            LiquidityFeeRegime::try_from(fund.liquidity_fee)
-                .unwrap_or_default()
-                .as_str_name(),
-            "LIQUIDITY_FEE_REGIME_"
         ),
     )
 }
@@ -193,8 +195,21 @@ mod tests {
         assert!(unstated(&fund).is_empty());
         assert_eq!(
             fund_words(&text),
-            "government, retail, stable NAV, discretionary fee"
+            "government, retail, stable NAV, discretionary liquidity fee"
         );
+        for (regime, said) in [
+            (LiquidityFeeRegime::None, "no liquidity fee"),
+            (LiquidityFeeRegime::Mandatory, "mandatory liquidity fee"),
+        ] {
+            let text = fund_to_text(&MoneyMarketFund {
+                liquidity_fee: regime as i32,
+                ..fund
+            });
+            assert_eq!(
+                fund_words(&text),
+                format!("government, retail, stable NAV, {said}")
+            );
+        }
         let partial = MoneyMarketFund {
             category: MoneyMarketFundCategory::Prime as i32,
             ..Default::default()

@@ -218,11 +218,24 @@ ingress:
   # The name people use, e.g. meridian.firm.example. Each plugin's page is on
   # a name below it, `<instance>.plugins.<host>`, so it cannot be an address.
   host: ""
-  # Passed through, and merged over the upload limits set for nginx-ingress.
+  # Passed through, and merged over the upload limits set for nginx-ingress
+  # and the HTTPS-only entrypoint set for Traefik.
   annotations: {}
+  # Plain HTTP, on the controller's port 80. Off: the Ingress serves HTTPS
+  # alone, and renders only with tls.secretName set, since an MCP client signs
+  # in over nothing else (task kernel/a-development-deployment-serves-https,
+  # ruling 3). On only for testing: the cluster tests reach Traefik on :80.
+  #
+  # Off, each controller is kept to HTTPS its own way. Traefik, Rancher
+  # Desktop's and k3s's, by the router.entrypoints annotation naming
+  # `websecure`, which the chart sets. nginx-ingress redirects plain HTTP to
+  # HTTPS of its own accord once an Ingress has TLS (its ssl-redirect, on by
+  # default). Any other controller: set what it reads in `annotations` above.
+  plainHttp: false
   tls:
-    # A Secret holding the certificate for `host`; empty serves plain HTTP,
-    # which only a local install should.
+    # A Secret holding the certificate for `host`. Required unless plainHttp
+    # is on. `meridian up` writes one for a name under `.localhost`, from the
+    # machine's own certificate authority; any other name's is the operator's.
     secretName: ""
     # One for `*.plugins.<host>`, a wildcard; empty uses secretName's, which
     # then has to cover both.

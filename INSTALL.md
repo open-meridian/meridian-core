@@ -82,7 +82,7 @@ outside the cluster at all until you arrange it.
 | | Use this when | What you pass to `meridian up` |
 |---|---|---|
 | **The chart's Ingress, by your name** | Your firm's cluster, with an ingress controller, which almost every one has | `--host meridian.firm.example`, and a values file naming the Secrets that hold its certificates: one for the name, one for `*.plugins.<the name>` |
-| **The chart's Ingress, on a laptop** | Trying it on Rancher Desktop, Docker Desktop or k3s | Nothing: it is `http://meridian.localhost` |
+| **The chart's Ingress, on a laptop** | Trying it on Rancher Desktop, Docker Desktop or k3s | Nothing: it is `https://meridian.localhost`, with a certificate from your machine's own certificate authority, which `meridian up` makes |
 | **A port-forward** | A cluster with no ingress controller | Nothing: `meridian up` forwards a port when it finds no controller, and holds it while you answer the wizard. `--no-ingress` asks for it anyway |
 
 **It must be a name, not an address.** Each plugin's page is served on its own
@@ -153,7 +153,17 @@ ingress:
 ```
 
 On a laptop, `meridian up --id DEP-01M3GZ8K4Q7T2V9W6X5Y3R1N0P` is the whole command: it is
-reached as `http://meridian.localhost`, which needs no certificate and no DNS.
+reached as `https://meridian.localhost`, which needs no DNS. The certificate is
+your machine's own: the first time, `meridian up` makes a certificate
+authority for Open Meridian and this machine, in its configuration directory,
+able to sign names under `.localhost` and nothing else. It says what that is
+for, then on macOS offers to add it to your login keychain (macOS asks for
+your password itself); elsewhere it prints the command that trusts it. It
+prints where the authority's certificate is, and the `NODE_EXTRA_CA_CERTS`
+line a Node-based client such as Claude Code may need. An agent signs in to a
+deployment's MCP over HTTPS alone, which is why a laptop's install is HTTPS
+too. The chart serves plain HTTP only when `ingress.plainHttp` turns it on,
+which is for the cluster tests and nothing else.
 Where the cluster has no ingress controller, it forwards a local port
 instead, and `--no-ingress` asks for that anyway.
 
@@ -216,7 +226,7 @@ person proving they are allowed to set it up.
 ## 6. Open the wizard
 
 Open the address `meridian up` printed: `https://<your name>/first-run`, or
-`http://meridian.localhost/first-run` on a laptop. Nothing about the wizard is
+`https://meridian.localhost/first-run` on a laptop. Nothing about the wizard is
 open to whoever finds it: it asks for the first-run code before anything else,
 and it is gone once applied.
 

@@ -1087,7 +1087,8 @@ mod tests {
         assert!(history[0]
             .changes
             .iter()
-            .any(|change| change.after == "government, retail, stable NAV, discretionary fee"));
+            .any(|change| change.after
+                == "government, retail, stable NAV, discretionary liquidity fee"));
         assert!(history[0]
             .changes
             .iter()

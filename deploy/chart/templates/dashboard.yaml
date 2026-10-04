@@ -81,6 +81,9 @@ spec:
             {{- if and .Values.ingress.enabled .Values.ingress.host }}
             # The address the Ingress serves, which the wizard offers rather
             # than asks for. What the wizard is told is still what is used.
+            # https wherever there is a certificate; http only when
+            # ingress.plainHttp is on, since without either the Ingress
+            # refuses to render.
             - name: MERIDIAN_DASHBOARD_SUGGESTED_URL
               value: {{ printf "%s://%s" (ternary "https" "http" (not (empty .Values.ingress.tls.secretName))) .Values.ingress.host | quote }}
             {{- end }}

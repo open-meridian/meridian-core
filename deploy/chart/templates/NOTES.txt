@@ -29,6 +29,21 @@ which a certificate authority issues only on proof of the DNS zone.
 An upload of a plugin is one large request: the Ingress lifts nginx-ingress's
 limit, and another controller needs its own body-size and timeout settings
 raised to match.
+{{- if .Values.ingress.plainHttp }}
+
+Plain HTTP is on (ingress.plainHttp), which is for testing alone: an MCP
+client will not sign in over it. Leave it off, and name a certificate's Secret
+in ingress.tls.secretName.
+{{- else }}
+
+It serves HTTPS alone: Traefik is kept to its websecure entrypoint, and
+nginx-ingress redirects plain HTTP itself. Another controller needs its own
+setting for that, in ingress.annotations.
+{{- if hasSuffix ".localhost" .Values.ingress.host }} The certificate is
+this machine's own, from the authority `meridian up` made; `meridian
+authority` says where it is and how a client trusts it.
+{{- end }}
+{{- end }}
 {{- else }}
 
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "meridian-runtime.fullname" . }}-dashboard 8443:80

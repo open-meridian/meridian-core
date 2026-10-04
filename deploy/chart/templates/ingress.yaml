@@ -11,12 +11,21 @@
   uploads -- is the dashboard's port too, told apart by path and credential.
   No certificate, DNS record or load balancer is made here: those are the
   cloud's or the operator's, and the plugins' name is a wildcard, which a
-  certificate authority issues only on proof of the DNS zone.
+  certificate authority issues only on proof of the DNS zone. On a laptop,
+  `meridian up` writes the Secret from the machine's own authority.
+
+  HTTPS only, unless ingress.plainHttp turns plain HTTP on, which the cluster
+  tests do and nothing else does (task kernel/a-development-deployment-serves-
+  https, ruling 3, amending spec/live-plugin-development requirement 2). So
+  an Ingress with no certificate renders only with it on.
 */}}
 {{- if .Values.ingress.enabled }}
 {{- $host := .Values.ingress.host | required "ingress.host is required: each plugin's page is served on a name below it" }}
 {{- if regexMatch "^[0-9.]+$|:" $host }}
 {{- fail (printf "ingress.host is %s, an IP address, and an address has no names below it for plugin pages: give it a name" $host) }}
+{{- end }}
+{{- if and (empty .Values.ingress.tls.secretName) (not .Values.ingress.plainHttp) }}
+{{- fail (printf "ingress.tls.secretName is empty, and the Ingress serves HTTPS alone: name the Secret holding the certificate for %s. `meridian up` writes one for a name under .localhost (a release older than its HTTPS does not: reach it with --no-ingress, or upgrade the CLI). ingress.plainHttp=true serves plain HTTP instead, for testing alone" $host) }}
 {{- end }}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $plugins := printf "*.plugins.%s" $host }}
@@ -35,6 +44,15 @@ metadata:
       their own settings in the chart's notes.
     */}}
     {{- $defaults := dict "nginx.ingress.kubernetes.io/proxy-body-size" "0" "nginx.ingress.kubernetes.io/proxy-read-timeout" "900" "nginx.ingress.kubernetes.io/proxy-send-timeout" "900" }}
+    {{- /*
+      HTTPS alone, unless plain HTTP was turned on: Traefik serves an Ingress
+      on every entrypoint it has, port 80's `web` among them, unless told.
+      nginx-ingress redirects to HTTPS by itself; another controller is told
+      through ingress.annotations (values.yaml).
+    */}}
+    {{- if not .Values.ingress.plainHttp }}
+    {{- $_ := set $defaults "traefik.ingress.kubernetes.io/router.entrypoints" "websecure" }}
+    {{- end }}
     {{- range $name, $value := merge (.Values.ingress.annotations | default dict) $defaults }}
     {{ $name }}: {{ $value | quote }}
     {{- end }}

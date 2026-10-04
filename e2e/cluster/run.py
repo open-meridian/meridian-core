@@ -473,6 +473,8 @@ def by_cli(s, deployment_id, enrolment_code):
         "--id", deployment_id, "--platform", PLATFORM_FROM_POD,
         *(["--image", IMAGE] if IMAGE else []),
         "--params", "/params.yaml", "--host", HOST, "--development", "--no-doctor",
+        # Plain HTTP and no certificate, as the runner's own install: for testing.
+        "--plain-http",
     ]
     done = subprocess.run(
         command, capture_output=True, text=True, env={**os.environ, **environment}
@@ -574,6 +576,10 @@ def main():
             "--set", "ingress.enabled=true",
             "--set", f"ingress.host={HOST}",
             "--set", f"ingress.className={INGRESS_CLASS}",
+            # Plain HTTP, which the chart serves only when told and only for
+            # testing: this run reaches Traefik on :80 (task kernel/a-
+            # development-deployment-serves-https, ruling 3).
+            "--set", "ingress.plainHttp=true",
         ]
         run(HELM, "upgrade", "--install", RELEASE, *chart, "--namespace", NAMESPACE, *values)
 

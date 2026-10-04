@@ -1217,6 +1217,23 @@ mod tests {
             "<option value=\"{}\">none</option>",
             LiquidityFeeRegime::None as i32
         )));
+        // Held, the record reads as a sentence: a fund charging no liquidity
+        // fee is "no liquidity fee", never "none fee".
+        let mut holding = waiting();
+        if let Some(record) = holding.instrument.as_mut() {
+            record.money_market_fund = Some(MoneyMarketFund {
+                category: MoneyMarketFundCategory::Government as i32,
+                investors: MoneyMarketFundInvestors::Retail as i32,
+                nav: MoneyMarketFundNav::Stable as i32,
+                liquidity_fee: LiquidityFeeRegime::None as i32,
+            });
+        }
+        let held_page = record_page(&holding, &[], None, "");
+        assert!(
+            held_page.contains("government, retail, stable NAV, no liquidity fee"),
+            "{held_page}"
+        );
+        assert!(!held_page.contains("none fee"), "{held_page}");
         let fund = |source: &str| Filled {
             instrument_id: "LCL-1".into(),
             against_version: "2".into(),

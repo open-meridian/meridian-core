@@ -387,6 +387,30 @@ async fn the_metadata_names_the_endpoints_and_no_identity_server() {
     );
 }
 
+/// A development deployment served over HTTPS at a `.localhost` name (task
+/// kernel/a-development-deployment-serves-https): everything an MCP client
+/// reads names that https origin, from MERIDIAN_DASHBOARD_URL alone, whatever
+/// Host a request arrived with.
+#[tokio::test]
+async fn a_local_https_address_is_the_issuer_and_the_mcp_resource() {
+    let (app, _) = app();
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.public_url = "https://meridian.localhost".into();
+    let app = Arc::new(built);
+    let resource = json_of(get_page(&app, "/.well-known/oauth-protected-resource/mcp").await).await;
+    assert_eq!(resource["resource"], "https://meridian.localhost/mcp");
+    assert_eq!(
+        resource["authorization_servers"],
+        serde_json::json!(["https://meridian.localhost"])
+    );
+    let said = json_of(get_page(&app, "/.well-known/oauth-authorization-server").await).await;
+    assert_eq!(said["issuer"], "https://meridian.localhost");
+    assert_eq!(
+        said["authorization_endpoint"],
+        "https://meridian.localhost/oauth/authorize"
+    );
+}
+
 #[tokio::test]
 async fn registration_grants_nothing_and_refuses_what_it_does_not_take() {
     let (app, _) = app();

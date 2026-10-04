@@ -1385,9 +1385,27 @@ chart-check:
 	echo "$$on" | grep -A1 'MERIDIAN_DASHBOARD_SUGGESTED_URL' | grep -q '"https://meridian.firm.example"' \
 		|| { echo "chart-check FAILED: the wizard is not offered the address the Ingress serves" >&2; exit 1; }; \
 	for bad in "--set ingress.host=10.0.0.7" "--set ingress.host="; do \
-		! $(HELM) template check deploy/chart $$base --set ingress.enabled=true $$bad >/dev/null 2>&1 \
+		! $(HELM) template check deploy/chart $$base --set ingress.enabled=true --set ingress.tls.secretName=dash-tls $$bad >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: an Ingress rendered with $$bad, where plugin pages cannot have names below it" >&2; exit 1; }; \
 	done
+	@# HTTPS alone unless plain HTTP is turned on, for testing (task kernel/a-
+	@# development-deployment-serves-https, ruling 3): no certificate and no
+	@# ingress.plainHttp is refused, saying both; with a certificate, Traefik is
+	@# kept to websecure; plain HTTP on is served on every entrypoint, and the
+	@# wizard is offered http.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set ingress.enabled=true --set ingress.host=meridian.localhost"; \
+	refused="$$($(HELM) template check deploy/chart $$base 2>&1)"; \
+	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'ingress.tls.secretName is empty' && echo "$$refused" | grep -q 'ingress.plainHttp=true' \
+		|| { echo "chart-check FAILED: an Ingress with no certificate rendered with plain HTTP off, or was refused without saying how to fix it:" >&2; echo "$$refused" | tail -3 >&2; exit 1; }; \
+	served="$$($(HELM) template check deploy/chart $$base --set ingress.tls.secretName=meridian-tls 2>/dev/null | awk '/^---/{p=0} /^kind: Ingress$$/{p=1} p')"; \
+	echo "$$served" | grep -q 'traefik.ingress.kubernetes.io/router.entrypoints: "websecure"' \
+		|| { echo "chart-check FAILED: with plain HTTP off, Traefik would serve the Ingress on port 80 too" >&2; exit 1; }; \
+	plain="$$($(HELM) template check deploy/chart $$base --set ingress.plainHttp=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: with ingress.plainHttp on, an Ingress with no certificate does not render" >&2; exit 1; }; \
+	! echo "$$plain" | grep -q 'router.entrypoints' \
+		|| { echo "chart-check FAILED: with ingress.plainHttp on, Traefik is still kept off port 80" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 'MERIDIAN_DASHBOARD_SUGGESTED_URL' | grep -q '"http://meridian.localhost"' \
+		|| { echo "chart-check FAILED: with plain HTTP on and no certificate, the wizard is not offered the http address the Ingress serves" >&2; exit 1; }
 	@# Development (spec/live-plugin-development, ruling 2): only when asked.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q MERIDIAN_DEVELOPMENT \
@@ -1409,7 +1427,7 @@ chart-check:
 	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
 	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup\|initContainers' \
 		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for, development only when asked for, the live shape there alone, and nothing an upgrade leaves behind"
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
