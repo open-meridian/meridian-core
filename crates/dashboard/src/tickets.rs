@@ -29,7 +29,9 @@
 //! AddTicketNote ([`add_note`]), CountTickets ([`count`]), WorkTicket
 //! ([`work`], a person's at the page alone), ReadInbox and MarkNoticesRead
 //! ([`read_inbox`], [`mark_read`]); and the plugin's two bus rows,
-//! PluginFilesTicket and ReadFiledTickets ([`plugin`]).
+//! PluginFilesTicket and ReadFiledTickets ([`plugin`]). Over HTTP, and as
+//! the pages a person works them on, [`pages`]; through `/mcp`,
+//! [`crate::mcp::tickets`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -50,6 +52,7 @@ use serde_json::{json, Value};
 
 use crate::web::App;
 
+pub mod pages;
 pub mod plugin;
 pub mod quarantine;
 pub mod rules;
@@ -887,6 +890,128 @@ pub fn accounts_in(records: &AccessRecords, said: &str) -> Vec<(String, String)>
     found.sort();
     found.dedup();
     found
+}
+
+// ── A filing from JSON ───────────────────────────────────────────────────────
+
+/// A filing as JSON carries it -- FileTicketRequest's fields by their names
+/// (Q8), a kind by its name or its proto name -- as the FileTicket row's
+/// body and `dashboard__file_ticket`'s arguments both take it. An input it
+/// does not take is refused by name, a value of the wrong shape by path;
+/// `also` names the inputs the caller reads itself (a page's form token).
+pub fn filing_from_json(said: &Value, also: &[&str]) -> Result<FileTicketRequest, Refused> {
+    let Some(top) = said.as_object() else {
+        return Err(Refused::invalid("", "a JSON object"));
+    };
+    const TAKES: [&str; 9] = [
+        "title",
+        "seen",
+        "kind",
+        "concerns",
+        "step",
+        "operation",
+        "reason",
+        "paths",
+        "references",
+    ];
+    for key in top.keys() {
+        if !TAKES.contains(&key.as_str()) && !also.contains(&key.as_str()) {
+            return Err(Refused::invalid(
+                key,
+                format!("{key:?} is not an input this takes"),
+            ));
+        }
+    }
+    let text =
+        |object: &serde_json::Map<String, Value>, name: &str, path: &str| match object.get(name) {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(said)) => Ok(said.clone()),
+            Some(_) => Err(Refused::invalid(path, "text")),
+        };
+    let kind = match top.get("kind") {
+        Some(Value::String(said)) => parse_kind(said)
+            .ok_or_else(|| Refused::invalid("kind", "defect, discrepancy, request or question"))?,
+        _ => {
+            return Err(Refused::invalid(
+                "kind",
+                "defect, discrepancy, request or question",
+            ))
+        }
+    };
+    let concerns = match top.get("concerns") {
+        Some(Value::Object(object)) => {
+            for key in object.keys() {
+                if !["kind", "instance", "version"].contains(&key.as_str()) {
+                    return Err(Refused::invalid(
+                        &format!("concerns.{key}"),
+                        format!("{key:?} is not an input this takes"),
+                    ));
+                }
+            }
+            Some(meridian_pb::v1::TicketSubject {
+                kind: text(object, "kind", "concerns.kind")?,
+                instance: text(object, "instance", "concerns.instance")?,
+                version: String::new(),
+            })
+        }
+        None | Some(Value::Null) => None,
+        Some(_) => return Err(Refused::invalid("concerns", "an object: kind and instance")),
+    };
+    let paths = match top.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(listed)) => listed
+            .iter()
+            .enumerate()
+            .map(|(n, path)| {
+                path.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| Refused::invalid(&format!("paths[{n}]"), "text"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(Refused::invalid("paths", "a list of field paths")),
+    };
+    let references = match top.get("references") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(listed)) => listed
+            .iter()
+            .enumerate()
+            .map(|(n, one)| {
+                let path = format!("references[{n}]");
+                let Some(object) = one.as_object() else {
+                    return Err(Refused::invalid(
+                        &path,
+                        "an object: kind, value, account_id",
+                    ));
+                };
+                for key in object.keys() {
+                    if !["kind", "value", "account_id"].contains(&key.as_str()) {
+                        return Err(Refused::invalid(
+                            &format!("{path}.{key}"),
+                            format!("{key:?} is not an input this takes"),
+                        ));
+                    }
+                }
+                Ok(TicketReference {
+                    kind: text(object, "kind", &format!("{path}.kind"))?,
+                    value: text(object, "value", &format!("{path}.value"))?,
+                    account_id: text(object, "account_id", &format!("{path}.account_id"))?,
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(Refused::invalid("references", "a list of records")),
+    };
+    Ok(FileTicketRequest {
+        title: text(top, "title", "title")?,
+        seen: text(top, "seen", "seen")?,
+        kind,
+        concerns,
+        step: text(top, "step", "step")?,
+        operation: text(top, "operation", "operation")?,
+        reason: text(top, "reason", "reason")?,
+        paths,
+        references,
+        idempotency_key: String::new(),
+    })
 }
 
 // ── FileTicket (W6.21) ───────────────────────────────────────────────────────
@@ -1954,4 +2079,4 @@ pub async fn filed(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

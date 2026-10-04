@@ -331,6 +331,19 @@ fn nav(area: &Area) -> String {
     format!("<nav class=\"tabs view-tabs\" aria-label=\"The plugin's pages\">{links}</nav>")
 }
 
+/// "Report a problem" in the area's head (W6.21), filling in this plugin:
+/// the instance, and the version the deployment knows it runs, set at
+/// filing. Leftmost of the right-hand group, so the switch stays last; on a
+/// phone its flag alone.
+pub fn report_problem(instance: &str) -> String {
+    format!(
+        "<a class=\"button report-problem\" href=\"/tickets/new?concerns=plugin&amp;instance={i}\" \
+         aria-label=\"Report a problem\" title=\"Report a problem\">{flag}<span class=\"bar-label\">Report a problem</span></a>",
+        i = escape(instance),
+        flag = crate::html::FLAG,
+    )
+}
+
 pub fn render(area: &Area) -> String {
     let framed = matches!(area.shown, Shown::Framed { .. });
     // The page's actions, left of the switch: a framed page's, which it tells.
@@ -371,12 +384,13 @@ pub fn render(area: &Area) -> String {
         "<div class=\"plugin-area\" data-level=\"{level}\"><div class=\"page-head\">\
          <div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\">{HOUSE}</a>\
          <h1 title=\"{name}\">{name}</h1>{status}</div><p class=\"area-id\"><code>{instance}</code></p>\
-         <div class=\"head-side\">{actions}{levels}</div></div>\
+         <div class=\"head-side\">{report}{actions}{levels}</div></div>\
          {nav}<div class=\"tab-body\" data-current=\"{current}\">{body}</div></div>",
         level = level_name(area.level),
         name = escape(area.name),
         instance = escape(area.instance),
         levels = levels(area),
+        report = report_problem(area.instance),
         current = escape(area.current.map(|tab| tab.key.as_str()).unwrap_or_default()),
     )
 }
@@ -603,16 +617,19 @@ mod tests {
                  <div class=\"area-title\"><a class=\"home-link\" href=\"/\" aria-label=\"Home\" title=\"Home\">\
                  {HOUSE}</a><h1 title=\"Snap&lt;Trade&gt;\">Snap&lt;Trade&gt;</h1><span class=\"title-status\" id=\"{PAGE_STATUS}\"></span>\
                  </div><p class=\"area-id\"><code>snaptrade</code></p>\
-                 <div class=\"head-side\">\
+                 <div class=\"head-side\">{report}\
                  <div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" aria-label=\"Connections actions\"></div>\
-                 <span class=\"badge accent\" data-level=\"admin\">Manage</span></div></div>"
+                 <span class=\"badge accent\" data-level=\"admin\">Manage</span></div></div>",
+                report = report_problem("snaptrade")
             )
         );
         for portal in ["/admin/plugins/", "data-portal", "settings and access"] {
             assert!(!page.contains(portal), "{portal} in {page}");
         }
-        // The house is the header's own, drawn once.
-        assert_eq!(page.matches("<svg").count(), 1);
+        // The house is the header's own, drawn once; the other icon is
+        // "Report a problem"'s flag.
+        assert_eq!(page.matches("<svg").count(), 2);
+        assert_eq!(page.matches(HOUSE).count(), 1);
     }
 
     /// The dashboard's own Summary and Settings tabs sit in the one tab row
@@ -762,10 +779,11 @@ mod tests {
                 "<div class=\"actions\" id=\"{PAGE_ACTIONS}\" role=\"group\" \
                  aria-label=\"Account links actions\"></div>"
             );
+            let report = report_problem("snaptrade");
             let expected = if tab.drawn {
-                format!("{switch}{menu}</div></div>")
+                format!("{report}{switch}{menu}</div></div>")
             } else {
-                format!("{actions}{switch}{menu}</div></div>")
+                format!("{report}{actions}{switch}{menu}</div></div>")
             };
             assert_eq!(side, expected, "{key}");
         }

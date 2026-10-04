@@ -855,6 +855,8 @@ pub(crate) async fn frame(
             crumbs,
             main: "page",
             in_admin: false,
+            // The area's head carries it, with the plugin filled in.
+            report: crate::html::Report::Omitted,
         },
     ))
     .into_response()

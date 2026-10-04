@@ -120,6 +120,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(terminal::routes())
         .merge(oauth::routes())
         .merge(crate::mcp::routes())
+        .merge(crate::tickets::pages::routes())
         .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())

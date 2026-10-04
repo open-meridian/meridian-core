@@ -2038,6 +2038,11 @@ async fn every_tab_under_manage_has_the_dot_after_the_name_and_the_switch_in_the
             .nth(1)
             .expect("the right-hand group");
         assert!(!title.contains("actions"), "{tab}: {title}");
+        // "Report a problem" first, the plugin filled in (W6.21).
+        let report = crate::area::report_problem("snaptrade-1");
+        let side = side
+            .strip_prefix(report.as_str())
+            .expect("Report a problem, first");
         assert_eq!(
             side.starts_with("<div class=\"actions\" id=\"page-actions\""),
             tab == "account-links",

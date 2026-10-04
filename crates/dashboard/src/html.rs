@@ -60,6 +60,33 @@ color:var(--ink-soft);font-weight:550;white-space:nowrap}\
 header.bar .bar-link:hover{background:var(--hover);color:var(--ink);text-decoration:none}\
 header.bar .bar-link.here{background:var(--accent-wash);color:var(--accent)}\
 header.bar .bar-link.side{padding:.4rem}header.bar .bar-link.side svg{display:block;width:20px;height:20px}\
+header.bar .bar-link.icon svg{display:block;width:18px;height:18px;flex-shrink:0}\
+header.bar .inbox-count{min-width:1.15rem;padding:0 .3rem;border-radius:999px;background:var(--accent);color:var(--card);\
+font-size:.72rem;font-weight:650;line-height:1.15rem;text-align:center}\
+@media (max-width:60rem){header.bar .bar-link .bar-label{display:none}header.bar .bar-link.icon{padding:.4rem}}\
+.plugin-area .report-problem{display:inline-flex;align-items:center;gap:.35rem;white-space:nowrap}\
+.plugin-area .report-problem svg{width:16px;height:16px;flex-shrink:0}\
+@media (max-width:36rem){.plugin-area .report-problem .bar-label{display:none}.plugin-area .report-problem{padding:.35rem .45rem}}\
+.ticket-text{white-space:pre-wrap;overflow-wrap:anywhere}\
+.ticket-text mark,.ticket-title mark{background:var(--warn-wash);color:var(--warn-ink);border-radius:3px;padding:0 .1em}\
+.url-host{color:var(--ink-faint);font-size:.9em}\
+.ticket section.panel,.inbox .panel,.tickets .panel{background:var(--card);border:1px solid var(--line);\
+border-radius:var(--radius-lg);padding:1rem 1.1rem;margin:1rem 0}\
+.ticket h1,.ticket-meta,.ticket .provenance{overflow-wrap:anywhere}\
+.ticket-meta,.provenance{color:var(--ink-soft)}.provenance{margin:0 0 .3rem;font-size:.92rem}\
+ol.notes,ol.notices{list-style:none;margin:0;padding:0}\
+ol.notes>li,ol.notices>li{padding:.7rem 0;border-top:1px solid var(--line-soft)}\
+ol.notes>li:first-child,ol.notices>li:first-child{border-top:0}\
+ol.notices>li[data-unread]>a{font-weight:650}\
+dl.ticket-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.3rem 1rem;margin:.8rem 0 0}\
+dl.ticket-facts dt{color:var(--ink-soft)}dl.ticket-facts dd{margin:0;overflow-wrap:anywhere}\
+ul.references{margin:0;padding-left:1.1rem}\
+.ticket-acts .acts{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:1rem}\
+form.act{display:flex;flex-direction:column;gap:.5rem;align-items:stretch;margin:0}\
+form.act button{align-self:flex-start}form.inline{display:inline}\
+.ticket-filter{display:flex;flex-wrap:wrap;gap:.75rem;align-items:flex-end;margin:.75rem 0}\
+.ticket-filter label{margin:0}\
+@media (max-width:36rem){dl.ticket-facts{grid-template-columns:minmax(0,1fr)}.ticket-filter>*{flex:1 1 100%}}\
 header.bar .person>summary{display:flex;align-items:center;gap:.5rem;padding:.3rem .5rem}\
 header.bar .person .avatar{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;\
 background:var(--accent-wash);color:var(--accent);font-weight:650;font-size:.8rem}\
@@ -391,6 +418,16 @@ const GEAR: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"
 /// The house: Home, from Settings and from a plugin's area, before its name.
 pub const HOUSE: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M3.5 11.2 \
      12 4l8.5 7.2M5.8 9.4V20h12.4V9.4M10 20v-5.5h4V20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" \
+     stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
+/// "Report a problem" in the header (W6.21): a flag, in the header's line.
+pub const FLAG: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M5.5 21V4.5\
+     M5.5 5h11l-2.2 4 2.2 4h-11\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" \
+     stroke-linejoin=\"round\"/></svg>";
+
+/// The Inbox (W6.24): a tray.
+pub const TRAY: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M3.5 13.5 6 5h12l2.5 \
+     8.5V19h-17v-5.5h5l1.5 2.5h5l1.5-2.5h4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" \
      stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
 /// A deployment admin's way between the two sides: a gear to Settings from
@@ -864,7 +901,42 @@ pub struct Chrome<'a> {
     pub main: &'a str,
     /// The admin portal is where the person is.
     pub in_admin: bool,
+    /// What "Report a problem" in the header says the person was on.
+    pub report: Report<'a>,
 }
+
+/// Where "Report a problem" in the header fills in what a ticket concerns
+/// from (W6.21): the dashboard by default; a part of core a page names (the
+/// Instruments page, the instrument store's records); or nowhere, on a
+/// plugin's area, whose own head carries it with the plugin filled in.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report<'a> {
+    #[default]
+    Dashboard,
+    Concerning(&'a str),
+    Omitted,
+}
+
+/// The Inbox's count in the header, read again every 30 seconds while the
+/// page is open (W6.24, requirement 36): a poll, never a stream.
+const INBOX_SCRIPT: &str = r#"(function () {
+  var count = document.querySelector("[data-inbox-count]");
+  if (!count || !window.fetch) return;
+  var link = count.closest("a");
+  function poll() {
+    fetch("/inbox/count", {credentials: "same-origin", headers: {Accept: "application/json"}})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (said) {
+        if (!said || typeof said.unread !== "number") return;
+        count.textContent = said.unread > 99 ? "99+" : String(said.unread);
+        count.hidden = said.unread === 0;
+        if (link) link.setAttribute("aria-label", said.unread ? "Inbox, " + said.unread + " unread" : "Inbox");
+      })
+      .catch(function () {});
+  }
+  poll();
+  setInterval(poll, 30000);
+})();"#;
 
 /// A whole page with no person in its header. `body` is already HTML;
 /// `title` is text.
@@ -900,6 +972,15 @@ fn header(chrome: &Chrome) -> String {
             } else {
                 String::new()
             };
+            let report = match chrome.report {
+                Report::Omitted => String::new(),
+                Report::Dashboard => report_link("dashboard"),
+                Report::Concerning(part) => report_link(part),
+            };
+            let inbox = format!(
+                "<a class=\"bar-link icon inbox\" href=\"/inbox\" aria-label=\"Inbox\" title=\"Inbox\">{TRAY}\
+                 <span class=\"bar-label\">Inbox</span><span class=\"inbox-count\" data-inbox-count hidden></span></a>"
+            );
             let initial: String = viewer
                 .display_name
                 .chars()
@@ -907,7 +988,7 @@ fn header(chrome: &Chrome) -> String {
                 .map(|c| c.to_uppercase().collect())
                 .unwrap_or_else(|| "?".into());
             format!(
-                "{admin}<details class=\"menu person\"><summary aria-label=\"{name}\">\
+                "{report}{inbox}{admin}<details class=\"menu person\"><summary aria-label=\"{name}\">\
                  <span class=\"avatar\" aria-hidden=\"true\">{initial}</span>\
                  <span class=\"person-name\">{name}</span></summary>\
                  <div class=\"menu-pop\"><div class=\"menu-label\">Signed in as <strong>{name}</strong></div><hr>\
@@ -930,6 +1011,15 @@ fn header(chrome: &Chrome) -> String {
     )
 }
 
+/// "Report a problem", filling in the part of core the page is.
+fn report_link(part: &str) -> String {
+    format!(
+        "<a class=\"bar-link icon report\" href=\"/tickets/new?concerns={}\" aria-label=\"Report a problem\" \
+         title=\"Report a problem\">{FLAG}<span class=\"bar-label\">Report a problem</span></a>",
+        escape(part)
+    )
+}
+
 fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> String {
     let banner = if development { DEVELOPMENT_BANNER } else { "" };
     let kit = KIT_STYLESHEET
@@ -946,10 +1036,15 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
          <title>{} · Open Meridian</title><script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}</style></head><body>\n\
-         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>\n</body></html>\n",
+         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
-        body
+        body,
+        inbox = if chrome.viewer.is_some() {
+            format!("<script>{INBOX_SCRIPT}</script>")
+        } else {
+            String::new()
+        },
     )
 }
 

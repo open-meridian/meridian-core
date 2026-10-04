@@ -27,11 +27,11 @@ use crate::records::RecordsCache;
 use crate::session::Sessions;
 use crate::web::App;
 
-const OPS: &str = "ops-1";
-const ADA: &str = "local|ada";
-const BEN: &str = "local|ben";
-const CY: &str = "local|cy";
-const DEE: &str = "local|dee";
+pub(crate) const OPS: &str = "ops-1";
+pub(crate) const ADA: &str = "local|ada";
+pub(crate) const BEN: &str = "local|ben";
+pub(crate) const CY: &str = "local|cy";
+pub(crate) const DEE: &str = "local|dee";
 
 fn group(id: &str, name: &str, logins: &[&str]) -> UserGroup {
     UserGroup {
@@ -129,7 +129,7 @@ fn records() -> AccessRecords {
     }
 }
 
-fn app() -> Arc<App> {
+pub(crate) fn app() -> Arc<App> {
     app_as("dashboard-1", Arc::default())
 }
 
@@ -173,7 +173,7 @@ fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
 use crate::Clock as _;
 
 /// A person at the dashboard's pages.
-fn at_page(subject: &str) -> Actor {
+pub(crate) fn at_page(subject: &str) -> Actor {
     let records = records();
     Actor {
         author: Author {

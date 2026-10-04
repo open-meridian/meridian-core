@@ -37,16 +37,7 @@ pub const MOST_COMPLETIONS: usize = 500;
 /// The longest a note or a source may be.
 const MOST_TEXT: usize = 2000;
 
-/// One of core's tools.
-#[derive(Debug)]
-pub struct Spec {
-    pub name: &'static str,
-    pub title: &'static str,
-    pub description: &'static str,
-    pub reads: bool,
-    pub open_world: bool,
-    pub input_schema: fn() -> Value,
-}
+pub use super::{Area, Spec};
 
 pub static SPECS: &[Spec] = &[
     Spec {
@@ -55,6 +46,7 @@ pub static SPECS: &[Spec] = &[
         description: "the deployment's instrument records the book cannot use first (no asset class or no currency), then those lacking a description, a symbol or a money market fund's attributes; each with what it lacks, its identifiers and who reported them, the values offered, and its version; the conflicts for a merge; the counts and the licensed identifiers per scheme. Paged by cursor.",
         reads: true,
         open_world: false,
+        area: Area::Instruments,
         input_schema: list_schema,
     },
     Spec {
@@ -63,6 +55,7 @@ pub static SPECS: &[Spec] = &[
         description: "one record by its ID: each value with its source, the person and the client it was set through, the values offered, what it lacks, and its version, which a completion names.",
         reads: true,
         open_world: false,
+        area: Area::Instruments,
         input_schema: one_schema,
     },
     Spec {
@@ -71,6 +64,7 @@ pub static SPECS: &[Spec] = &[
         description: "a record's versions, newest first: each change's field, before and after, its source, the person or reporting instance, the delegation and client, and the note.",
         reads: true,
         open_world: false,
+        area: Area::Instruments,
         input_schema: history_schema,
     },
     Spec {
@@ -79,6 +73,7 @@ pub static SPECS: &[Spec] = &[
         description: "set values on up to 500 records, each against the version read: an asset class, an instrument type within it, a money market fund's attributes, a currency, a description, or an identifier added; each value with its source in words (a value without one takes the completion's source), and a note on every completion saying why. Each record's own outcome, in order.",
         reads: false,
         open_world: false,
+        area: Area::Instruments,
         input_schema: complete_schema,
     },
     Spec {
@@ -87,6 +82,7 @@ pub static SPECS: &[Spec] = &[
         description: "accept, for each record named against the version read, every value offered for a field it lacks, each value carrying its offer's source, with a note saying why. Each record's own outcome, in order.",
         reads: false,
         open_world: false,
+        area: Area::Instruments,
         input_schema: accept_schema,
     },
     Spec {
@@ -95,6 +91,7 @@ pub static SPECS: &[Spec] = &[
         description: "merge a record into another that is the same security, each named at the version read, with a note; the merged record's identifiers join the one kept, and where both hold a value the kept one's stands unless take_from_merged names the field.",
         reads: false,
         open_world: false,
+        area: Area::Instruments,
         input_schema: merge_schema,
     },
     Spec {
@@ -103,6 +100,7 @@ pub static SPECS: &[Spec] = &[
         description: "ask the platform's open sources about one record by its open identifiers: its values come back as offers on the record, never in force until accepted; or the platform could not be reached.",
         reads: true,
         open_world: true,
+        area: Area::Instruments,
         input_schema: one_schema,
     },
 ];

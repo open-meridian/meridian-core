@@ -369,6 +369,7 @@ pub(crate) fn admin_chrome(session: &Session) -> Chrome<'_> {
         crumbs: crate::html::crumb_here("Settings", None),
         main: "page",
         in_admin: true,
+        report: crate::html::Report::Dashboard,
     }
 }
 
@@ -1200,8 +1201,52 @@ fn instruments_chrome<'a>(session: &'a Session, record: Option<&str>) -> Chrome<
     };
     Chrome {
         crumbs,
+        // The deployment's instrument records are the instrument store's.
+        report: crate::html::Report::Concerning("instrument"),
         ..admin_chrome(session)
     }
+}
+
+/// The Instruments page's refusal, said as every refusal here is, with
+/// "Report a problem" beside it filled with what the page knows: the
+/// instrument store, the row it sent, and the refusal in its words (W6.21,
+/// Q12: the page's last refusal, on the dashboard's own pages).
+fn instruments_refused(
+    app: &App,
+    session: &Session,
+    sentence: &str,
+    operation: &str,
+    back: &str,
+) -> Response {
+    let access = match app.records.current(app.clock.now_ns()) {
+        Ok(records) => person_access(&records, &session.subject, &session.directory_groups),
+        Err(_) => Access::default(),
+    };
+    let form = crate::tickets::pages::report_form(
+        session,
+        &access,
+        &crate::tickets::pages::Prefill {
+            concerns: "instrument".into(),
+            operation: operation.into(),
+            seen: format!("The Instruments page refused: {sentence}"),
+            ..Default::default()
+        },
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Html(page_with(
+            "Not done",
+            &format!(
+                "<h1>Not done</h1><p class=\"refused\">{}</p>\
+                 <p><a href=\"{}\" onclick=\"history.back();return false\">Back</a></p>\
+                 <details class=\"report-refusal\"><summary>Report a problem with this</summary>{form}</details>",
+                escape(sentence),
+                escape(back)
+            ),
+            &instruments_chrome(session, None),
+        )),
+    )
+        .into_response()
 }
 
 /// W3.11: the Instruments page, for a deployment admin.
@@ -1327,7 +1372,7 @@ async fn complete_instruments(
     };
     match outcome {
         Ok(said) => after_to(Ok(()), &format!("{back}?done={}", query_text(&said)), &back),
-        Err(why) => after_to(Err(why), &back, &back),
+        Err(why) => instruments_refused(&app, &session, &why, "CompleteInstruments", &back),
     }
 }
 
@@ -1370,7 +1415,13 @@ async fn accept_offers(
             &format!("/admin/instruments?done={}", query_text(&said)),
             "/admin/instruments",
         ),
-        Err(why) => after_to(Err(why), "/admin/instruments", "/admin/instruments"),
+        Err(why) => instruments_refused(
+            &app,
+            &session,
+            &why,
+            "CompleteInstruments",
+            "/admin/instruments",
+        ),
     }
 }
 
@@ -1429,7 +1480,13 @@ async fn merge_instruments(
             &format!("/admin/instruments?done={}", query_text(&said)),
             "/admin/instruments",
         ),
-        Err(why) => after_to(Err(why), "/admin/instruments", "/admin/instruments"),
+        Err(why) => instruments_refused(
+            &app,
+            &session,
+            &why,
+            "MergeInstruments",
+            "/admin/instruments",
+        ),
     }
 }
 
@@ -1470,7 +1527,7 @@ async fn ask_the_platform(
 
 /// Text for a query string: what is not a letter, a digit or a few marks,
 /// percent-encoded.
-fn query_text(text: &str) -> String {
+pub(crate) fn query_text(text: &str) -> String {
     text.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
