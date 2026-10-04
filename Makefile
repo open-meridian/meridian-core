@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -34,7 +34,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -707,11 +707,12 @@ e2e-dashboard-accounts: network
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner main; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner connect; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner delegate; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner tickets; \
 	$(E2E_ACCOUNTS_REGISTRY) up -d --force-recreate --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner restarted; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
-	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, a terminal's session outlives a dashboard restart and uploads a plugin, a CLI's delegation outlives one too and is revoked by a reused refresh token, the admin and its client, and enough wrong passwords stop it"
+	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, a terminal's session outlives a dashboard restart and uploads a plugin, a CLI's delegation outlives one too and is revoked by a reused refresh token, the admin and its client, a problem reported on a page and through /mcp is worked only at its page with nothing of it reaching the platform, and enough wrong passwords stop it"
 
 # A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
 # of their own: the account branch's dashboard, holding a key made as the
@@ -811,7 +812,7 @@ e2e-plugin-page: network
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty.
 HARNESS_IMAGE := meridian-harness:local
-HARNESS_FILES := README.md book.sql compose.yaml harness.py street.sql
+HARNESS_FILES := README.md book.sql compose.yaml harness.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
@@ -916,6 +917,25 @@ harness-check:
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
 	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+
+# Tickets inside a deployment (contract v13), end to end on the plugin
+# harness: core's stand-in as custody, operations and a plugin holding no
+# role, two people beside the admin, every step a person's page, an agent's
+# /mcp or the stand-in's page (e2e/tickets/run.py says each). Its own compose
+# project, so it never meets harness-check's.
+e2e-tickets:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "e2e-tickets FAILED: the harness image did not build" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-tickets FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/harness/plugins.json >.harness/plugins.yaml
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/tickets/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

@@ -27,9 +27,10 @@ same tag. The runtime image carries none of it.
 | File | What it is |
 |---|---|
 | `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles; the stores migrated; street, the book (`bor`), instrument, conductor and a development dashboard; the `runner`; and `store` |
-| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`; and `compose`, which writes the plugins' half of the deployment |
+| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
+| `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
 
 ## Taking it out of the image
 
@@ -112,6 +113,15 @@ start, and the conductor names that account the deployment's admin, as first
 run names one. The runner signs in with the password, read from the run's
 `secrets` volume; nothing else needs to, and it is never printed.
 
+A run that needs more than one person names them in `MERIDIAN_HARNESS_PEOPLE`
+-- `ada=Ada Park,ben=Ben Ito`, a name and how the deployment shows it, comma
+separated -- passed to every compose command, as `MERIDIAN_RUNTIME_IMAGE` is.
+`keys` draws a password and its hash for each, and the `people` service makes
+an account the dashboard holds for each from the hash, before the dashboard
+starts. Any runner command then acts as one of them with `--as NAME`; they
+hold nothing until `grant --to NAME` grants it. A run naming nobody has the
+admin alone, as before.
+
 ## The runner
 
     $H run --rm -T runner <command>
@@ -134,10 +144,16 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `mcp call NAME [JSON] [--from SAVED[.PATH]] [--set PATH=VALUE ...] [--save SAVED] [--expect-outcome OUTCOME] [--expect TEXT]` | Calls a tool and prints its typed answer as JSON; `--from` starts from what an earlier call saved, and each `--set` changes one field by the dictionary's path grammar, `[key=value]` picking a row by a field of its own. Refreshes the pair when the access token has lapsed. |
 | `mcp complete --identifier TEXT asset_class=CLASS currency=CODE source=TEXT note=TEXT [instrument_type=... fund_...=...]` | Completes the record listed with that identifier through core's tools, against the version listed. |
 | `mcp calls [--expect N]` | Prints how many calls Connected clients lists for the admin; with `--expect`, fails below `N`. |
-| `grant --level read\|write\|admin` | Grants the harness's admin that level on the plugin, on All accounts, as a deployment admin does: a user group holding the admin, an access group, and the permission joining them. The admin holds nothing on a plugin until granted; a session at `write` (Open) needs write. |
+| `grant --level read\|write\|admin [--to NAME] [--accounts ID,...]` | Grants the harness's admin that level on the plugin, on All accounts, as a deployment admin does: a user group holding the admin, an access group, and the permission joining them. The admin holds nothing on a plugin until granted; a session at `write` (Open) needs write. With `--to`, one of the run's people instead; with `--accounts`, on an account group of those accounts alone. |
+| `ticket file [--concerns PART] title=TEXT [seen=TEXT] [kind=KIND] [--expect-refused PATH]` | From contract v13: files a ticket as a person presses "Report a problem": about the plugin, or a part of core with `--concerns`. Prints its ID; with `--expect-refused`, fails unless refused naming `PATH`. |
+| `ticket list [--concerns X] [--state S] [--expect N] [--seconds N]` | Prints the tickets the person may see: ID, state and title, a held title withheld. |
+| `ticket read ID [--page] [--expect TEXT ...] [--expect-status N]` | Prints a ticket as its row answers it, a held text withheld; with `--page`, its page, where a person reads it. |
+| `ticket note ID TEXT` | Adds a note on the ticket's page. |
+| `ticket work ID act=ACT [owner=NAME] [due=DATE] [resolution=R] [cites=C] [release=ticket\|N] [--expect-status N]` | Takes one act on the ticket's page: assign, due, resolve, close, reopen or release. |
+| `inbox [--expect N] [--expect-kind KIND ...]` | Prints the person's notices new since their pages last read them: the ticket and the change's kind. |
 
 Every command acts on the first plugin listed, or on another with `--instance
-<instance>`.
+<instance>`; as the admin, or with `--as NAME` as one of the run's people.
 
 A link is the plugin's to send, acting for an admin, so the harness never sends
 one: `form` drives the plugin's own link page under Manage, which is also the
@@ -147,6 +163,15 @@ proof that the page links.
 
     $H run --rm -T store street
     $H run --rm -T store book
+    $H run --rm -T store tickets
+
+`store tickets` (contract v13) prints the dashboard's tickets, one line each,
+and the records each names and its notes, sorted, and never a text:
+
+    ticket|<ID>|<concerns kind>|<concerns instance>|<filed provenance>|<filed person>|<filed instance>|<state>|<owner>|<due>|<seen count>|<suspect>|<matched rules>
+    reference|<ID>|<position>|<kind>|<value>|<account>|<found in its text>
+    note|<ID>|<number>|<kind>|<author provenance>|<author person>|<author client>|<suspect>
+
 
 prints that store as stable, sorted lines, so a file from one run compares
 with the next. Whoever reads a store needs no database user, password, file or

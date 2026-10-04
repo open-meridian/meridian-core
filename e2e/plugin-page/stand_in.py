@@ -61,6 +61,16 @@ connection reaches once it has registered, as a connector does after its
 first read; and with STAND_IN_FAILS_FIRST, which exits failing on its first
 start, so the harness is seen to start a plugin again.
 
+A POST to /ticket files a ticket for the person the request came from
+(W4.12, contract v13), as a plugin's "Report a problem" does: the header it
+was handed, handed back as the call's `meridian-caller` metadata, at whatever
+level the page was opened. Its form names the title, what was seen, the kind
+and the plugin's own key; "about" names the instance it concerns, which the
+sidecar refuses when it is another plugin's; "as_itself" sends no header,
+which the sidecar refuses, since a plugin only files as a person. Written on
+the wire by hand, like its registration, so it does not matter which
+bindings the SDK's image carries. It answers what its sidecar said, as JSON.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -264,6 +274,59 @@ def write_for(header):
     except grpc.RpcError as refused:
         return {"ok": False, "code": refused.code().name, "detail": refused.details()}
     return {"ok": True, "holding_id": held.holding_id}
+
+
+def text_field(number, text):
+    data = text.encode()
+    return put_varint(number << 3 | 2) + put_varint(len(data)) + data
+
+
+def read_reply(data):
+    """FileTicketReply's ticket_id (1), outcome (2) and seen_count (3)."""
+    said, at = {}, 0
+    while at < len(data):
+        tag, at = read_varint(data, at)
+        number, kind = tag >> 3, tag & 7
+        if kind == 0:
+            value, at = read_varint(data, at)
+            said[number] = value
+        else:
+            length, at = read_varint(data, at)
+            said[number] = data[at:at + length].decode()
+            at += length
+    return {"ticket_id": said.get(1, ""), "outcome": said.get(2, ""), "seen_count": said.get(3, 0)}
+
+
+def read_varint(data, at):
+    value, shift = 0, 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, at
+
+
+KINDS = {"defect": 1, "discrepancy": 2, "request": 3, "question": 4}
+
+
+def file_ticket(callers, form):
+    """A ticket filed through the sidecar for the person the header names,
+    or as itself (refused), or about another plugin (refused)."""
+    concerns = text_field(1, "plugin") + (text_field(2, form["about"]) if form.get("about") else b"")
+    request = (text_field(1, form.get("title", "")) + text_field(2, form.get("seen", ""))
+               + put_varint(3 << 3) + put_varint(KINDS.get(form.get("kind", "defect"), 1))
+               + put_varint(4 << 3 | 2) + put_varint(len(concerns)) + concerns
+               + text_field(10, form.get("key", "")))
+    metadata = () if form.get("as_itself") or not callers else (("meridian-caller", callers[0]),)
+    call = grpc.insecure_channel(SIDECAR).unary_unary(
+        "/meridian.v1.SidecarService/FileTicket",
+        request_serializer=lambda sent: sent, response_deserializer=lambda got: got)
+    try:
+        return {"ok": True, **read_reply(call(request, metadata=metadata, timeout=10))}
+    except grpc.RpcError as refused:
+        return {"ok": False, "code": refused.code().name, "detail": refused.details()}
 
 
 def report():
@@ -602,6 +665,9 @@ class Page(http.server.BaseHTTPRequestHandler):
             return
         elif self.path == "/link":
             done = link_for(callers[0], json.loads(sent or b"{}"))
+        elif self.path == "/ticket":
+            form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
+            done = file_ticket(callers, form)
         else:
             done = write_for(callers[0]) if callers else {"ok": False, "detail": "nobody"}
         body = json.dumps(done).encode()

@@ -119,6 +119,43 @@ the same image with the list on stdin:
       Prints how many calls Connected clients lists for the admin, as she
       reads it in a browser; with --expect, fails unless it is N or more.
 
+  ticket file [--concerns PART] title=TEXT [seen=TEXT] [kind=KIND]
+              [operation=ROW] [reason=CODE] [--expect-refused PATH]
+      Files a ticket as a person does, pressing "Report a problem" (W6.21,
+      contract v13): about the runner's plugin, or a part of core with
+      --concerns (dashboard, bor, street, instrument, conductor, chart, cli,
+      sdk, platform). Prints the ticket's ID. With --expect-refused, fails
+      unless the dashboard refuses it naming PATH.
+
+  ticket list [--concerns X] [--state S] [--expect N] [--seconds N]
+      Prints the tickets the person may see, one per line: the ID, a tab, its
+      state, a tab, its title as the list answers it -- withheld while it is
+      held as suspect. With --expect, waits until it lists N.
+
+  ticket read ID [--page] [--expect TEXT ...] [--expect-status N]
+      Prints one ticket as its row answers it (JSON, a suspect text
+      withheld), or with --page the ticket's page, where a person reads it.
+
+  ticket note ID TEXT
+      Adds a note on the ticket's page.
+
+  ticket work ID act=ACT [owner=NAME] [due=DATE] [resolution=R] [cites=C]
+              [release=ticket|N] [--expect-status N]
+      Takes one act on the ticket's page (W6.23): assign (owner a person's
+      name, as --as takes it), due, resolve, close, reopen or release, against
+      the notes the page showed.
+
+  inbox [--expect N] [--expect-kind KIND ...]
+      Prints the person's notices new since their pages last read them, one
+      per line: the ticket's ID, a tab, the change's kind (W6.24). With
+      --expect, fails unless there are N.
+
+Every command acts as the harness's admin, or, given --as NAME, as one of
+the people `keys` drew a password for (MERIDIAN_HARNESS_PEOPLE, `name=Display
+Name` comma separated), whose account the `people` service made: a run that
+needs more than one person names them there. `grant --to NAME` grants such a
+person a level, and `--accounts ID,...` on only those accounts.
+
 Reading core's HTML is this runner's alone, and only because it is published
 at the same commit as the dashboard it reads, and core's gate runs it against
 that dashboard at every commit. A plugin never parses core's pages itself.
@@ -145,6 +182,8 @@ PASSWORD_FILE = os.environ.get("MERIDIAN_HARNESS_ADMIN_PASSWORD_FILE", "/secrets
 # account, as the conductor was told at its start (compose.yaml).
 LOGIN = os.environ.get("MERIDIAN_HARNESS_ADMIN_LOGIN", f"local|{ADMIN}")
 LEVELS = ("admin", "write", "read")
+# Who a command acts as: the admin, or with --as one of the run's people.
+AS = None
 # The built-in account group holding every account (W6.6).
 ALL_ACCOUNTS = "all-accounts"
 # The asset classes as the Instruments page's form numbers them (W1's list).
@@ -252,16 +291,25 @@ def form_token(page):
     return found.group(1) if found else ""
 
 
+def who():
+    """The name a command signs in with, and its login."""
+    if AS is None:
+        return ADMIN, LOGIN
+    return AS, f"local|{AS}"
+
+
 def drawn_password():
-    """The admin's password, as `keys` drew it when the run started. Read,
-    never printed: a failure names the file, not what is in it."""
+    """The password of whoever the command acts as, as `keys` drew it when
+    the run started. Read, never printed: a failure names the file, not what
+    is in it."""
+    password_file = PASSWORD_FILE if AS is None else f"/secrets/people/{AS}/password"
     try:
-        with open(PASSWORD_FILE, encoding="utf-8") as drawn:
+        with open(password_file, encoding="utf-8") as drawn:
             password = drawn.read().strip()
     except OSError as unread:
-        raise Failed(f"the admin's password was not drawn: {PASSWORD_FILE}: {unread.strerror}") from None
+        raise Failed(f"the password was not drawn: {password_file}: {unread.strerror}") from None
     if not password:
-        raise Failed(f"the admin's password was not drawn: {PASSWORD_FILE} is empty")
+        raise Failed(f"the password was not drawn: {password_file} is empty")
     return password
 
 
@@ -274,14 +322,17 @@ def signed_in(seconds=120):
         if admin.get("/healthz").status != 200:
             raise Failed("the dashboard is not serving yet")
         admin.get("/sign-in")
-        signed = admin.post("/sign-in", {"name": ADMIN, "password": drawn_password()})
+        name, _ = who()
+        signed = admin.post("/sign-in", {"name": name, "password": drawn_password()})
         if signed.status != 303:
-            raise Failed(f"signing in as {ADMIN}: {signed.status} {sentence(signed)}")
+            raise Failed(f"signing in as {name}: {signed.status} {sentence(signed)}")
+        if AS is not None:
+            return admin
         settings = admin.get("/admin")
         if settings.status != 200:
             raise Failed(f"{ADMIN} is not yet the deployment's admin: /admin {settings.status}")
         return admin
-    return until(seconds, attempt, f"{ADMIN} was not signed in as the deployment's admin")
+    return until(seconds, attempt, f"{who()[0]} was not signed in")
 
 
 def plugin_line(page):
@@ -498,11 +549,19 @@ def unlinked(args):
 
 def grant(args):
     level = option(args, "--level", None)
+    to = option(args, "--to", None)
+    accounts = [a for a in (option(args, "--accounts", "") or "").split(",") if a]
     if level not in LEVELS:
         raise Failed(f"grant takes --level {'|'.join(LEVELS)}")
     if args:
         raise Failed(f"grant takes no {args[0]!r}")
-    admin = signed_in()
+    global AS
+    acting, AS = AS, None
+    try:
+        admin = signed_in()
+    finally:
+        AS = acting
+    holder, login = (ADMIN, LOGIN) if to is None else (to, f"local|{to}")
 
     def post(path, fields):
         token = form_token(admin.get("/admin"))
@@ -526,15 +585,23 @@ def grant(args):
                           page)
         return found.group(1) if found else ""
 
-    user_group = defined("/admin/user-groups", "user_group_id", "Harness admin",
-                         [("login", LOGIN)])
+    user_group = defined("/admin/user-groups", "user_group_id",
+                         "Harness admin" if to is None else f"Harness {to}",
+                         [("login", login)])
     access_group = defined("/admin/access-groups", "access_group_id",
                            f"Harness {level} on {INSTANCE}",
                            [("plugin", INSTANCE), (f"level.{INSTANCE}", level)])
+    # An admin reaches no account's data, so its permission names none.
+    account_group = "" if level == "admin" else ALL_ACCOUNTS
+    if accounts and level != "admin":
+        account_group = defined("/admin/account-groups", "account_group_id",
+                                f"Harness accounts of {holder}",
+                                [("account_ids", account) for account in accounts])
     post("/admin/permissions", [("user_group_id", user_group),
-                                ("account_group_id", ALL_ACCOUNTS),
+                                ("account_group_id", account_group),
                                 ("access_group_id", access_group)])
-    print(f"grant: {ADMIN} holds {level} on {INSTANCE}, on All accounts")
+    print(f"grant: {holder} holds {level} on {INSTANCE}, on "
+          + ("no account" if level == "admin" else ", ".join(accounts) or "All accounts"))
 
 
 def instrument_rows(admin):
@@ -805,6 +872,15 @@ def compose(args):
 
 STATE = os.environ.get("MERIDIAN_HARNESS_STATE", "/state")
 MCP_STATE = os.path.join(STATE, "mcp.json")
+
+
+def mcp_state_for(client):
+    """Where a client keeps its token pair: the admin's harness agent where
+    it always has, any other person's or client's beside it."""
+    if AS is None and client == "harness agent":
+        return os.path.join(STATE, "mcp.json")
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{AS or 'admin'} {client}".lower()).strip("-")
+    return os.path.join(STATE, f"mcp-{slug}.json")
 CALLBACK = "http://127.0.0.1:53682/callback"
 ENUM_CLASSES = {name: "ASSET_CLASS_" + name.upper() for name in CLASSES}
 ENUM_FUND = {
@@ -877,7 +953,7 @@ def mcp_connect(args):
     found = re.search(r'name="authorize" value="([^"]+)"', asked.body)
     if asked.status != 200 or not found:
         raise Failed(f"the authorisation did not ask her to sign in: {asked.status} {sentence(asked)}")
-    consent = person.post("/sign-in", {"name": ADMIN, "password": drawn_password(),
+    consent = person.post("/sign-in", {"name": who()[0], "password": drawn_password(),
                                        "authorize": found.group(1)})
     request = re.search(r'name="request" value="([^"]+)"', consent.body)
     confirm = re.search(r'name="confirm" value="([^"]+)"', consent.body)
@@ -1105,6 +1181,175 @@ def mcp_calls(args):
         raise Failed(f"Connected clients lists {count} calls, fewer than {wanted}")
 
 
+# ── Tickets and the inbox, as a person on the page (W6.21 to W6.24) ────────
+
+def json_get(browser, path):
+    """A row's JSON, as the page's own session asks it."""
+    request = urllib.request.Request(DASHBOARD + path, method="GET")
+    request.add_header("Accept", "application/json")
+    request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in browser.cookies.items()))
+    try:
+        response = urllib.request.build_opener(NoRedirect).open(request, timeout=30)
+        status, raw = response.status, response.read()
+    except urllib.error.HTTPError as refused:
+        status, raw = refused.code, refused.read()
+    try:
+        return status, json.loads(raw) if raw else None
+    except ValueError:
+        return status, None
+
+
+def ticket_file(args):
+    concerns = option(args, "--concerns", None)
+    refused_at = option(args, "--expect-refused", None)
+    fields = dict(pairs(args))
+    if args:
+        raise Failed(f"ticket file takes NAME=VALUE, not {args[0]!r}")
+    person = signed_in()
+    asked = (f"/tickets/new?concerns={concerns}" if concerns
+             else f"/tickets/new?concerns=plugin&instance={INSTANCE}")
+    form_page = person.get(asked)
+    if form_page.status != 200:
+        raise Failed(f"Report a problem: {form_page.status} {sentence(form_page)}")
+    sent = {"form_token": form_token(form_page), "kind": fields.pop("kind", "defect"),
+            "title": fields.pop("title", ""), "seen": fields.pop("seen", "")}
+    if concerns:
+        sent["concerns"] = concerns
+    else:
+        sent["concerns"], sent["instance"] = "plugin", INSTANCE
+    sent.update(fields)
+    filed = person.post("/tickets", sent)
+    if refused_at is not None:
+        if filed.status < 400 or refused_at not in filed.body:
+            raise Failed(f"the filing was not refused naming {refused_at}: {filed.status} {sentence(filed)}")
+        print(f"ticket file: refused, {sentence(filed)}")
+        return
+    if filed.status != 303 or not (filed.location or "").startswith("/tickets/TKT-"):
+        raise Failed(f"the ticket was not filed: {filed.status} {sentence(filed)}")
+    print(filed.location.split("?", 1)[0].rsplit("/", 1)[1])
+
+
+def ticket_list(args):
+    concerns = option(args, "--concerns", "")
+    state = option(args, "--state", "")
+    wanted = option(args, "--expect", None)
+    seconds = number(args, "--seconds", 30)
+    if args:
+        raise Failed(f"ticket list takes no {args[0]!r}")
+    person = signed_in()
+    query = urllib.parse.urlencode({"concerns": concerns, "state": state})
+
+    def listed():
+        status, said = json_get(person, f"/tickets?{query}")
+        if status != 200 or said is None:
+            raise Failed(f"/tickets: {status}")
+        tickets = said["tickets"]
+        if wanted is not None and len(tickets) != int(wanted):
+            raise Failed(f"it lists {len(tickets)}")
+        return tickets
+
+    tickets = until(seconds if wanted is not None else 0, listed, f"the list never held {wanted}")
+    for ticket in tickets:
+        print(f"{ticket['ticket_id']}\t{ticket['state']}\t{json.dumps(ticket['title'])}")
+
+
+def ticket_read(args):
+    as_page = "--page" in args
+    if as_page:
+        args.remove("--page")
+    expected = options(args, "--expect")
+    status_wanted = option(args, "--expect-status", None)
+    if len(args) != 1:
+        raise Failed("ticket read takes one ticket ID")
+    person = signed_in()
+    if as_page:
+        reply = person.get(f"/tickets/{args[0]}")
+        status, printed = reply.status, reply.body
+    else:
+        status, said = json_get(person, f"/tickets/{args[0]}")
+        printed = json.dumps(said, indent=1, ensure_ascii=False) if said is not None else ""
+    if status_wanted is not None:
+        if status != int(status_wanted):
+            raise Failed(f"/tickets/{args[0]} answered {status}, not {status_wanted}")
+        print(status)
+        return
+    if status != 200:
+        raise Failed(f"/tickets/{args[0]}: {status}")
+    print(printed)
+    for text in expected:
+        if text not in printed:
+            raise Failed(f"the ticket does not say {text!r}")
+
+
+def ticket_note(args):
+    if len(args) != 2:
+        raise Failed("ticket note takes a ticket ID and the note")
+    person = signed_in()
+    shown = person.get(f"/tickets/{args[0]}")
+    if shown.status != 200:
+        raise Failed(f"/tickets/{args[0]}: {shown.status} {sentence(shown)}")
+    noted = person.post(f"/tickets/{args[0]}/notes",
+                        {"form_token": form_token(shown), "kind": "note", "note": args[1]})
+    if noted.status != 303:
+        raise Failed(f"the note was not added: {noted.status} {sentence(noted)}")
+    print(f"ticket note: noted {args[0]}")
+
+
+def ticket_work(args):
+    status_wanted = option(args, "--expect-status", None)
+    fields = dict(pairs(args))
+    if len(args) != 1 or "act" not in fields:
+        raise Failed("ticket work takes a ticket ID and act=ACT")
+    if fields.get("owner") and "|" not in fields["owner"]:
+        fields["owner"] = f"local|{fields['owner']}"
+    person = signed_in()
+    shown = person.get(f"/tickets/{args[0]}")
+    if shown.status != 200 and status_wanted is not None and shown.status == int(status_wanted):
+        # A ticket the person may not see is not found, its page included.
+        print(f"ticket work: {shown.status}")
+        return
+    if shown.status != 200:
+        raise Failed(f"/tickets/{args[0]}: {shown.status} {sentence(shown)}")
+    notes = len(re.findall(r'<li data-number="\d+"', shown.body))
+    done = person.post(f"/tickets/{args[0]}/work",
+                       {"form_token": form_token(shown), "against_notes": str(notes), **fields})
+    if status_wanted is not None:
+        if done.status != int(status_wanted):
+            raise Failed(f"the act answered {done.status}, not {status_wanted}: {sentence(done)}")
+        print(f"ticket work: {done.status}")
+        return
+    if done.status != 303:
+        raise Failed(f"the act was not taken: {done.status} {sentence(done)}")
+    said = urllib.parse.parse_qs(urllib.parse.urlsplit(done.location or "").query).get("done", [""])[0]
+    print(f"ticket work: {said}")
+
+
+def ticket(args):
+    verbs = {"file": ticket_file, "list": ticket_list, "read": ticket_read,
+             "note": ticket_note, "work": ticket_work}
+    if not args or args[0] not in verbs:
+        raise Failed(f"ticket takes {', '.join(verbs)}")
+    verbs[args.pop(0)](args)
+
+
+def inbox(args):
+    wanted = option(args, "--expect", None)
+    kinds = options(args, "--expect-kind")
+    if args:
+        raise Failed(f"inbox takes no {args[0]!r}")
+    person = signed_in()
+    status, said = json_get(person, "/inbox")
+    if status != 200 or said is None:
+        raise Failed(f"/inbox: {status}")
+    for notice in said["notices"]:
+        print(f"{notice['ticket_id']}\t{notice['kind']}")
+    if wanted is not None and len(said["notices"]) != int(wanted):
+        raise Failed(f"the inbox holds {len(said['notices'])} new, not {wanted}")
+    missing = [k for k in kinds if k not in [n["kind"] for n in said["notices"]]]
+    if missing:
+        raise Failed(f"no notice of kind {', '.join(missing)}")
+
+
 def mcp(args):
     verbs = {"connect": mcp_connect, "list": mcp_list, "call": mcp_call,
              "complete": mcp_complete, "calls": mcp_calls}
@@ -1115,7 +1360,8 @@ def mcp(args):
 
 COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
-            "instruments": instruments, "instrument": instrument, "mcp": mcp}
+            "instruments": instruments, "instrument": instrument, "mcp": mcp,
+            "ticket": ticket, "inbox": inbox}
 
 
 def main(argv):
@@ -1123,8 +1369,19 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 2
     command, args = argv[0], list(argv[1:])
+    global AS, MCP_STATE
     try:
         acting_on(option(args, "--instance", INSTANCE))
+        AS = option(args, "--as", None)
+        if AS is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", AS):
+            raise Failed(f"--as names one of the run's people, not {AS!r}")
+        client = "harness agent"
+        if command == "mcp" and "--client" in args:
+            at = args.index("--client")
+            client = args[at + 1] if at + 1 < len(args) else client
+            if args[:1] != ["connect"]:
+                option(args, "--client", None)
+        MCP_STATE = mcp_state_for(client)
         COMMANDS[command](args)
     except Failed as failed:
         print(f"harness {command} FAILED: {failed}", file=sys.stderr)

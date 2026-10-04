@@ -21,6 +21,10 @@ Phases:
                stands and refreshes, a refresh token presented twice revokes
                it, the admin revokes one client's and the other's works on,
                and the client revokes its own (W6.14, W6.18)
+  tickets   -- the admin reports a problem on a page, her agent files one
+               through /mcp, and she works hers at its page: assigned,
+               resolved citing a note, closed; and nothing of either reaches
+               the platform (contract v13, W6.21 to W6.23)
   locked    -- and enough wrong passwords stop it being usable at all
 """
 import base64
@@ -236,8 +240,9 @@ def token_endpoint(fields):
         return answer.status, {"body": answer.body[:200]}
 
 
-def delegated(browser=None):
-    """`meridian connect`, by delegation: the token answer and the client."""
+def delegated(browser=None, resource="/terminal", covers=None):
+    """`meridian connect`, by delegation: the token answer and the client.
+    For another resource, `/mcp`, consenting to what `covers` names."""
     registered = urllib.request.Request(
         dash("/oauth/register"), method="POST",
         data=json.dumps({
@@ -265,7 +270,7 @@ def delegated(browser=None):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": "e2e-delegate",
-        "resource": dash("/terminal"),
+        "resource": dash(resource),
     })))
     request = hidden(asked, "authorize")
     check(asked.status == 200 and request, f"the authorisation is the sign-in form: {asked.status}")
@@ -278,15 +283,15 @@ def delegated(browser=None):
         "request": hidden(consenting, "request"),
         "confirm": hidden(consenting, "confirm"),
         "decision": "allow",
-        "covers": "everything",
         "days": "90",
+        **(covers or {"covers": "everything"}),
     })
     back = urllib.parse.urlparse(decided.location or "")
     code = urllib.parse.parse_qs(back.query).get("code", [""])[0]
     check(decided.status == 302 and code, f"the loopback address gets a code: {decided.status}")
     status, pair = token_endpoint({
         "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
-        "redirect_uri": BACK, "client_id": client_id, "resource": dash("/terminal"),
+        "redirect_uri": BACK, "client_id": client_id, "resource": dash(resource),
     })
     check(status == 200 and pair.get("access_token", "").startswith("mda_")
           and pair.get("refresh_token", "").startswith("mdr_"),
@@ -356,6 +361,74 @@ def delegation_restarted_phase():
     check(status == 401 and "revoked" in body, f"and refused from then on: {status} {body[:200]}")
 
 
+PLATFORM = os.environ.get("E2E_PLATFORM_ADDRESS", "http://fake-platform:8000")
+
+
+def platform_heard():
+    with urllib.request.urlopen(PLATFORM + "/e2e/requests", timeout=10) as answer:
+        return json.loads(answer.read())["requests"]
+
+
+def mcp_call(access, name, arguments):
+    request = urllib.request.Request(
+        dash("/mcp"), method="POST",
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": name, "arguments": arguments}}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {access}"})
+    with urllib.request.urlopen(request, timeout=30) as answer:
+        return json.loads(answer.read())["result"]["structuredContent"]
+
+
+def tickets_phase():
+    say("M: a problem reported on a page reaches the deployment admin, and nothing leaves")
+    before = len(platform_heard())
+    ada = Browser()
+    sign_in(ada, NAME, PASSWORD)
+    form = ada.get(dash("/tickets/new?concerns=dashboard"))
+    check(form.status == 200 and "Report a problem" in form.body,
+          f"Report a problem, from the dashboard: {form.status}")
+    filed = ada.post(dash("/tickets"), {
+        "form_token": form_token(form), "concerns": "dashboard", "kind": "defect",
+        "title": "The plugins list is slow", "seen": "It takes a minute to load.",
+    })
+    check(filed.status == 303 and (filed.location or "").startswith("/tickets/TKT-"),
+          f"filed on the page: {filed.status} {filed.location!r}")
+    ticket = (filed.location or "").split("?", 1)[0]
+    page = ada.get(dash(ticket))
+    check(page.status == 200 and "Route: Open Meridian" in page.body.replace("&#39;", "'")
+          and "later release" in page.body,
+          f"the rules advise Open Meridian's route, with nothing sent: {page.status}")
+
+    say("N: her agent files through /mcp, as her through it")
+    _, pair = delegated(resource="/mcp", covers={"covers": "some", "deployment_admin": "1"})
+    answered = mcp_call(pair.get("access_token", ""), "dashboard__file_ticket", {
+        "title": "The chart's ingress needs a note", "kind": "request",
+        "concerns": {"kind": "chart"},
+    })
+    check(answered.get("outcome") == "made", f"filed through /mcp: {answered}")
+    read = mcp_call(pair.get("access_token", ""), "dashboard__read_ticket",
+                    {"ticket_id": answered.get("data", {}).get("ticket_id", "")})
+    check(read.get("data", {}).get("filed_by", {}).get("provenance") == "client",
+          f"recorded as hers, through the client: {read}")
+
+    say("O: only she works it, at its page")
+    for act in [{"act": "assign", "owner": "local|" + NAME},
+                {"act": "resolve", "resolution": "note", "cites": "1"},
+                {"act": "reopen"},
+                {"act": "close", "resolution": "not_a_problem"}]:
+        shown = ada.get(dash(ticket))
+        notes = len(re.findall(r'<li data-number="\d+"', shown.body))
+        done = ada.post(dash(ticket + "/work"),
+                        {"form_token": form_token(shown), "against_notes": str(notes), **act})
+        check(done.status == 303, f"{act['act']}: {done.status}")
+    page = ada.get(dash(ticket))
+    check('data-state="closed"' in page.body, "and it is closed")
+
+    heard = platform_heard()[before:]
+    leaked = [r for r in heard if "ticket" in (r["path"] + r["body"]).lower() or "TKT-" in r["body"]]
+    check(not leaked, f"the platform heard nothing of a ticket: {leaked}")
+
+
 def locked_phase():
     say("D: enough wrong passwords and the account stops being usable")
     guesser = Browser()
@@ -387,6 +460,8 @@ def main():
     elif phase == "restarted":
         restarted_phase()
         delegation_restarted_phase()
+    elif phase == "tickets":
+        tickets_phase()
     elif phase == "locked":
         locked_phase()
     else:

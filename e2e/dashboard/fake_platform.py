@@ -8,8 +8,10 @@ expiry) but not its signature: this stand-in holds no registered public key,
 and the platform's verification is the platform's to test.
 
 GET /e2e/redemptions lists every redemption attempt, for the runner's
-evidence. Everything else is 404, which the conductor's periodic reporting
-logs and carries on past.
+evidence; GET /e2e/requests lists every request that reached it, its method,
+path and body, so a run can say what did not (contract v13: nothing of a
+ticket leaves the deployment). Everything else is 404, which the conductor's
+periodic reporting logs and carries on past.
 """
 import base64
 import json
@@ -26,6 +28,8 @@ REDEEM = "/api/v1/reference/deployments/claim-codes/redeem"
 lock = threading.Lock()
 spent = False
 attempts = []
+# Every request but the runner's own reads of these lists.
+heard = []
 
 
 def note_claims(header):
@@ -62,11 +66,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/e2e/redemptions":
             with lock:
                 return self.reply(200, {"attempts": attempts})
+        if self.path == "/e2e/requests":
+            with lock:
+                return self.reply(200, {"requests": heard})
+        with lock:
+            heard.append({"method": "GET", "path": self.path, "body": ""})
         self.reply(404, {"detail": "not served by the stand-in platform"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
+        with lock:
+            heard.append({"method": "POST", "path": self.path,
+                          "body": raw.decode("utf-8", errors="replace")})
         if self.path != REDEEM:
             return self.reply(404, {"detail": "not served by the stand-in platform"})
         claims, refusal = note_claims(self.headers.get("Authorization"))

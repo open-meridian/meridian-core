@@ -71,16 +71,26 @@ services:
         for user in runtime first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
           [ -s "/secrets/nats/$$user" ] || drawn > "/secrets/nats/$$user"
         done
-        if [ ! -s /secrets/admin/hash ]; then
-          drawn > /secrets/admin/password
+        b64() { xxd -r -p | base64 | tr -d '=\n'; }
+        # A password drawn into DIR, and its Argon2id hash beside it.
+        account() {
+          [ -s "$$1/hash" ] && return 0
+          mkdir -p "$$1"
+          drawn > "$$1/password"
           salt=$$(openssl rand -hex 16)
-          key=$$(openssl kdf -keylen 32 -kdfopt pass:"$$(cat /secrets/admin/password)" -kdfopt hexsalt:$$salt \
+          key=$$(openssl kdf -keylen 32 -kdfopt pass:"$$(cat "$$1/password")" -kdfopt hexsalt:$$salt \
             -kdfopt iter:2 -kdfopt memcost:19456 -kdfopt lanes:1 ARGON2ID | tr -d :)
-          b64() { xxd -r -p | base64 | tr -d '=\n'; }
           printf '$$argon2id$$v=19$$m=19456,t=2,p=1$$%s$$%s' \
-            "$$(printf %s "$$salt" | b64)" "$$(printf %s "$$key" | b64)" > /secrets/admin/hash
-        fi
+            "$$(printf %s "$$salt" | b64)" "$$(printf %s "$$key" | b64)" > "$$1/hash"
+        }
+        account /secrets/admin
+        # The run's other people, when it names any: a password each.
+        for person in $$(printf '%s' "$${MERIDIAN_HARNESS_PEOPLE:-}" | tr ',' '\n' | cut -d= -f1); do
+          account "/secrets/people/$$person"
+        done
         chmod -R a+rX /keys /secrets
+    environment:
+      MERIDIAN_HARNESS_PEOPLE: ${MERIDIAN_HARNESS_PEOPLE:-}
     volumes:
       - keys:/keys
       - secrets:/secrets
@@ -236,6 +246,35 @@ services:
       - keys:/keys:ro
       - secrets:/secrets:ro
 
+  # The run's other people (MERIDIAN_HARNESS_PEOPLE, `name=Display Name`
+  # comma separated; none unless a run names them), each an account the
+  # dashboard holds, made from the hash `keys` drew for them, as the first
+  # administrator's is: a run that proves who sees what needs more than one
+  # person. Only when absent, so a restart changes nobody's.
+  people:
+    image: postgres:16-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        PGPASSWORD=$$(cat /secrets/postgres)
+        export PGPASSWORD
+        printf '%s\n' "$${MERIDIAN_HARNESS_PEOPLE:-}" | tr ',' '\n' | while IFS='=' read -r name display; do
+          [ -n "$$name" ] || continue
+          printf '%s\n' "INSERT INTO dashboard_local_account (name, display_name, password_hash, created_at_ns)
+            VALUES (:'name', :'display', :'hash', 0) ON CONFLICT (name) DO NOTHING;" \
+            | psql -h postgres -U meridian -d meridian -q -v ON_ERROR_STOP=1 -v name="$$name" \
+                -v display="$${display:-$$name}" -v hash="$$(cat "/secrets/people/$$name/hash")"
+        done
+    environment:
+      MERIDIAN_HARNESS_PEOPLE: ${MERIDIAN_HARNESS_PEOPLE:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - secrets:/secrets:ro
+    networks: [harness]
+
   # A development deployment's dashboard (MERIDIAN_DEVELOPMENT): every page
   # says so, and a plugin's developer settings are shown and accepted. It
   # holds the harness's one account, made at its start from the hash `keys`
@@ -251,7 +290,10 @@ services:
         export MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
         export MERIDIAN_LOCAL_ACCOUNT_PASSWORD_HASH="$$hash"
         exec meridian-dashboard
-    depends_on: *serving
+    depends_on:
+      <<: *serving
+      people:
+        condition: service_completed_successfully
     environment:
       MERIDIAN_INSTANCE_ID: dashboard-1
       MERIDIAN_DASHBOARD_LISTEN: 0.0.0.0:8080
@@ -287,7 +329,7 @@ services:
     networks: [harness]
 
   # A store, printed by name as stable, sorted lines: `run --rm -T store
-  # street` or `store book` (README.md has their formats). Whoever reads a
+  # street`, `store book` or `store tickets` (README.md has their formats). Whoever reads a
   # store here needs no database user, file or query of their own.
   store:
     profiles: [runner]
@@ -298,8 +340,8 @@ services:
       - |
         set -e
         case "$${1:-}" in
-          street|book) ;;
-          *) echo "store takes the name of a store: street or book" >&2; exit 2 ;;
+          street|book|tickets) ;;
+          *) echo "store takes the name of a store: street, book or tickets" >&2; exit 2 ;;
         esac
         PGPASSWORD=$$(cat /secrets/postgres)
         export PGPASSWORD
@@ -308,6 +350,7 @@ services:
     volumes:
       - ./street.sql:/harness/street.sql:ro
       - ./book.sql:/harness/book.sql:ro
+      - ./tickets.sql:/harness/tickets.sql:ro
       - secrets:/secrets:ro
     networks: [harness]
 

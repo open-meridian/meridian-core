@@ -73,7 +73,7 @@ FROM scratch AS harness
 LABEL org.opencontainers.image.source=https://github.com/open-meridian/meridian-core \
       org.opencontainers.image.description="The plugin harness: files to copy out, never to run"
 COPY deploy/harness/compose.yaml deploy/harness/harness.py deploy/harness/street.sql \
-     deploy/harness/book.sql deploy/harness/README.md /harness/
+     deploy/harness/book.sql deploy/harness/tickets.sql deploy/harness/README.md /harness/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

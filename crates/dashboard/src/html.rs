@@ -61,7 +61,7 @@ header.bar .bar-link:hover{background:var(--hover);color:var(--ink);text-decorat
 header.bar .bar-link.here{background:var(--accent-wash);color:var(--accent)}\
 header.bar .bar-link.side{padding:.4rem}header.bar .bar-link.side svg{display:block;width:20px;height:20px}\
 header.bar .bar-link.icon svg{display:block;width:18px;height:18px;flex-shrink:0}\
-header.bar .inbox-count{min-width:1.15rem;padding:0 .3rem;border-radius:999px;background:var(--accent);color:var(--card);\
+header.bar .inbox-count{min-width:1.15rem;padding:0 .3rem;border-radius:999px;background:var(--primary);color:var(--primary-ink);\
 font-size:.72rem;font-weight:650;line-height:1.15rem;text-align:center}\
 @media (max-width:60rem){header.bar .bar-link .bar-label{display:none}header.bar .bar-link.icon{padding:.4rem}}\
 .plugin-area .report-problem{display:inline-flex;align-items:center;gap:.35rem;white-space:nowrap}\
@@ -84,7 +84,7 @@ ul.references{margin:0;padding-left:1.1rem}\
 .ticket-acts .acts{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:1rem}\
 form.act{display:flex;flex-direction:column;gap:.5rem;align-items:stretch;margin:0}\
 form.act button{align-self:flex-start}form.inline{display:inline}\
-.ticket-filter{display:flex;flex-wrap:wrap;gap:.75rem;align-items:flex-end;margin:.75rem 0}\
+.ticket-filter{display:flex;flex-wrap:wrap;gap:.75rem;align-items:flex-end;margin:1rem 0 .75rem}\
 .ticket-filter label{margin:0}\
 @media (max-width:36rem){dl.ticket-facts{grid-template-columns:minmax(0,1fr)}.ticket-filter>*{flex:1 1 100%}}\
 header.bar .person>summary{display:flex;align-items:center;gap:.5rem;padding:.3rem .5rem}\

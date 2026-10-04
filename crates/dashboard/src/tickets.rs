@@ -779,7 +779,9 @@ fn workers(records: &AccessRecords, ticket: &Ticket) -> Vec<String> {
 }
 
 /// The people a change concerns -- its filer, its owner, those who noted
-/// it, and `also` -- who may see it now, the change's own author left out.
+/// it, the person who made the change, and `also` -- who may see it now.
+/// The person who made it is told too, so each of their clients reads it
+/// once in the inbox, as the person's own page already shows it.
 fn concerned(
     records: &AccessRecords,
     ticket: &Ticket,
@@ -797,9 +799,10 @@ fn concerned(
         }
     }
     people.extend(also.iter().cloned());
+    people.insert(author.to_string());
     people
         .into_iter()
-        .filter(|subject| !subject.is_empty() && subject != author)
+        .filter(|subject| !subject.is_empty())
         .filter(|subject| {
             visibility::may_see(
                 &Reader {
