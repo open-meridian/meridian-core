@@ -554,6 +554,13 @@ message MissEntry {
   int64 last_seen_ns = 7;
   // The stub it minted or found, if it was escalated.
   string stub_instrument_id = 8;
+  // W1.14, for a miss an agent assigning asset classes classed: which
+  // allowed source stated the class, the note saying how, and who set it
+  // (the agent, the admin it acts for and the delegation). Empty for a miss
+  // whose class a deployment reported, or that has none.
+  string class_source = 10;
+  string class_note = 11;
+  ChangeActor class_set_by = 12;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.

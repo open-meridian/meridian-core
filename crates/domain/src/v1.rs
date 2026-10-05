@@ -485,6 +485,16 @@ pub struct MissEntry {
     /// The stub it minted or found, if it was escalated.
     #[prost(string, tag = "8")]
     pub stub_instrument_id: ::prost::alloc::string::String,
+    /// W1.14, for a miss an agent assigning asset classes classed: which
+    /// allowed source stated the class, the note saying how, and who set it
+    /// (the agent, the admin it acts for and the delegation). Empty for a miss
+    /// whose class a deployment reported, or that has none.
+    #[prost(string, tag = "10")]
+    pub class_source: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub class_note: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "12")]
+    pub class_set_by: ::core::option::Option<ChangeActor>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListMissesRequest {
