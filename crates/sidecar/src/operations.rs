@@ -164,6 +164,16 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.street.query.list-activities", "meridian.v1.ListActivitiesRequest", message, account, None).await
     }
 
+    /// W2.14: `platform.street.query.list-sync-statuses` (preview).
+    async fn list_sync_statuses(
+        &self,
+        request: Request<plugin::ListSyncStatusesParams>,
+    ) -> Result<Response<plugin::ListSyncStatusesResult>, Status> {
+        let message: domain::ListSyncStatusesRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.street.query.list-sync-statuses", "meridian.v1.ListSyncStatusesRequest", message, account, None).await
+    }
+
     /// W3.1: `platform.reference.query.resolve-identifier` (stable).
     async fn resolve_identifier(
         &self,
@@ -517,6 +527,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.ActivityRecordedEvent",
         read: activity_recorded,
     },
+    crate::receive::Row {
+        name: "SyncStatusRecorded",
+        step: "W2.13",
+        topic: "platform.street.event.sync-status-recorded",
+        payload_type: "meridian.v1.SyncStatusRecordedEvent",
+        read: sync_status_recorded,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -593,5 +610,16 @@ fn activity_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Deco
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::ActivityRecorded(message),
+    })
+}
+
+/// W2.13: a SyncStatusRecordedEvent, its account at `status.account_id`.
+fn sync_status_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::SyncStatusRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.status.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::SyncStatusRecorded(message),
     })
 }

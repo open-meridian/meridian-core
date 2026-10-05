@@ -979,6 +979,54 @@ message ListActivitiesReply {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// W2.13, W2.14 — the street's record of each sync status (contract v14)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A sync status was recorded (W2.13): the street heard a custody plugin's
+// sync status (W2.1) and kept it, so operations tells a connection that needs
+// a person to sign in again apart from data that is merely old. The whole
+// record; also each item of a read (W2.14), as it was announced.
+message SyncStatusRecordedEvent {
+  // As the custody plugin published it, its account as the sidecar stamped
+  // it: empty when the external account is not linked, and then delivered to
+  // no plugin.
+  SyncStatusEvent status = 1;
+
+  int64 recorded_at_ns = 2;
+
+  // The record's number in the street's partition, chained per account with
+  // the sync statuses before it, and who caused it (W2.13, W4.3).
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+// Read the latest sync status of each account in scope, or those recorded
+// since a watermark (W2.14), paged.
+message ListSyncStatusesRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+
+  // Only sync statuses recorded after it, every one in the order recorded;
+  // unset, the latest per account.
+  Watermark since = 2;
+
+  int32 page_size = 3;
+
+  // Opaque: the previous reply's `next_cursor`, or empty for the first page.
+  string cursor = 4;
+}
+
+message ListSyncStatusesReply {
+  // Each as it was announced (W2.13).
+  repeated SyncStatusRecordedEvent statuses = 1;
+
+  string next_cursor = 2;
+
+  // The point in the store's record the page was read at.
+  Watermark as_of = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W2.8 — the accounts a connection reaches
 // ─────────────────────────────────────────────────────────────────────────────
 

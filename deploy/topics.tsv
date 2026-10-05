@@ -49,7 +49,7 @@ platform.config.query.plugin-access	query	sidecar	conductor
 platform.config.query.plugin-catalogue	query	dashboard	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor
 platform.custody.*.event.external-accounts	event	custody	dashboard
-platform.custody.*.event.sync-status	event	custody	dashboard
+platform.custody.*.event.sync-status	event	custody	dashboard,street
 platform.deployment.command.create-plugin	command	conductor	launcher
 platform.deployment.command.remove-plugin	command	conductor	launcher
 platform.deployment.event.component-report	event	street,bor	conductor
@@ -71,6 +71,8 @@ platform.street.command.record-statement	command	custody	street
 platform.street.event.activity-recorded	event	street	operations
 platform.street.event.custodial-position-updated	event	street	dashboard,operations
 platform.street.event.statement-recorded	event	street	dashboard,operations
+platform.street.event.sync-status-recorded	event	street	operations
 platform.street.query.list-activities	query	operations,dashboard	street
 platform.street.query.list-custodial-positions	query	dashboard,operations	street
 platform.street.query.list-statements	query	operations	street
+platform.street.query.list-sync-statuses	query	operations,dashboard	street

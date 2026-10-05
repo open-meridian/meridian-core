@@ -3390,6 +3390,54 @@ pub struct ListActivitiesReply {
     #[prost(string, tag = "4")]
     pub history_from: ::prost::alloc::string::String,
 }
+/// A sync status was recorded (W2.13): the street heard a custody plugin's
+/// sync status (W2.1) and kept it, so operations tells a connection that needs
+/// a person to sign in again apart from data that is merely old. The whole
+/// record; also each item of a read (W2.14), as it was announced.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SyncStatusRecordedEvent {
+    /// As the custody plugin published it, its account as the sidecar stamped
+    /// it: empty when the external account is not linked, and then delivered to
+    /// no plugin.
+    #[prost(message, optional, tag = "1")]
+    pub status: ::core::option::Option<SyncStatusEvent>,
+    #[prost(int64, tag = "2")]
+    pub recorded_at_ns: i64,
+    /// The record's number in the street's partition, chained per account with
+    /// the sync statuses before it, and who caused it (W2.13, W4.3).
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "4")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+/// Read the latest sync status of each account in scope, or those recorded
+/// since a watermark (W2.14), paged.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSyncStatusesRequest {
+    /// Empty: every account in the reader's scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Only sync statuses recorded after it, every one in the order recorded;
+    /// unset, the latest per account.
+    #[prost(message, optional, tag = "2")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSyncStatusesReply {
+    /// Each as it was announced (W2.13).
+    #[prost(message, repeated, tag = "1")]
+    pub statuses: ::prost::alloc::vec::Vec<SyncStatusRecordedEvent>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// The point in the store's record the page was read at.
+    #[prost(message, optional, tag = "3")]
+    pub as_of: ::core::option::Option<Watermark>,
+}
 /// Every external account a connection reaches, as the connector sees it now.
 ///
 /// Published before anything is recorded against any of them, so linking one
