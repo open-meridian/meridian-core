@@ -132,6 +132,38 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.street.query.list-statements", "meridian.v1.ListStatementsRequest", message, account, None).await
     }
 
+    /// W2.10: `platform.street.command.record-activity` (preview).
+    async fn record_activity(
+        &self,
+        request: Request<plugin::RecordActivityParams>,
+    ) -> Result<Response<plugin::RecordActivityResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordActivityRequest = self.as_domain(params)?;
+        if let Some(held0) = message.activity.as_ref() {
+            self.known("activity.kind", held0.kind, domain::ActivityKind::try_from(held0.kind).is_ok())?;
+            self.exact("activity.units", held0.units.as_ref())?;
+            self.exact_money("activity.price", held0.price.as_ref())?;
+            self.exact_money("activity.amount", held0.amount.as_ref())?;
+            for (i1, held1) in held0.provenance.iter().enumerate() {
+                self.known(&format!("activity.provenance[{i1}].kind"), held1.kind, meridian_pb::v1::ProvenanceKind::try_from(held1.kind).is_ok())?;
+            }
+        }
+        message.account_id = self.linked_account("meridian.v1.RecordActivityRequest", &message.external_account_id).await?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.street.command.record-activity", "meridian.v1.RecordActivityRequest", message, account, acting_for).await
+    }
+
+    /// W2.11: `platform.street.query.list-activities` (preview).
+    async fn list_activities(
+        &self,
+        request: Request<plugin::ListActivitiesParams>,
+    ) -> Result<Response<plugin::ListActivitiesResult>, Status> {
+        let message: domain::ListActivitiesRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.street.query.list-activities", "meridian.v1.ListActivitiesRequest", message, account, None).await
+    }
+
     /// W3.1: `platform.reference.query.resolve-identifier` (stable).
     async fn resolve_identifier(
         &self,
@@ -478,6 +510,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.AccountAttributeChangedEvent",
         read: account_attribute_changed,
     },
+    crate::receive::Row {
+        name: "ActivityRecorded",
+        step: "W2.12",
+        topic: "platform.street.event.activity-recorded",
+        payload_type: "meridian.v1.ActivityRecordedEvent",
+        read: activity_recorded,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -543,5 +582,16 @@ fn account_attribute_changed(payload: &[u8]) -> Result<crate::receive::Read, pro
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::AccountAttributeChanged(message),
+    })
+}
+
+/// W2.12: a ActivityRecordedEvent, its account at `account_id`.
+fn activity_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::ActivityRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.account_id.clone()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::ActivityRecorded(message),
     })
 }

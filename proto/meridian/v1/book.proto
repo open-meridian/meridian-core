@@ -417,6 +417,9 @@ enum BreakCauseCategory {
   BREAK_CAUSE_CATEGORY_FAIL = 5;
   BREAK_CAUSE_CATEGORY_CUSTODIAN_ERROR = 6;
   BREAK_CAUSE_CATEGORY_UNKNOWN = 7;
+  // Income the custodian reinvested in units, which the book has not
+  // booked: a money market fund's monthly dividend (contract v14).
+  BREAK_CAUSE_CATEGORY_INCOME_REINVESTED = 8;
 }
 
 message PositionKey {
@@ -465,8 +468,21 @@ message BreakCause {
     // A corporate action's reference, as reported.
     string event_reference = 5;
     bool none_found = 6;
+    // The custodian's activity that explains it (contract v14).
+    ActivityRef activity = 8;
   }
   string note = 7;
+}
+
+// An activity the street recorded (W2.12), named by value: never a key the
+// book follows, and recorded as given (decisions/012).
+message ActivityRef {
+  // The street's identifier for the activity.
+  string activity_id = 1;
+  // Its record in the street's partition.
+  JournalRef change = 2;
+  // ISO 8601: the activity's trade date, as the custodian stated it.
+  string trade_date = 3;
 }
 
 message BreakHandling {
@@ -592,7 +608,9 @@ message Adjustment {
   string effective_date = 1;
   repeated MovementLine lines = 2;
   repeated BasisAdjustment basis_adjustments = 3;
-  // A corporate action's reference, as reported, where it records one.
+  // A corporate action's reference, as reported, where it records one; from
+  // contract v14, the activity's identifier (W2.12) where the adjustment was
+  // proposed from the custodian's activity.
   string event_reference = 4;
 }
 

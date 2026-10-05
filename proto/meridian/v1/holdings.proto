@@ -90,6 +90,11 @@ message SyncStatusEvent {
   // does not say.
   int64 holdings_as_of_ns = 9;
   int64 history_as_of_ns = 10;
+
+  // The first date the source can read the account's activity from, ISO
+  // 8601 (contract v14, W2.10): how far back a backfill reaches, beside how
+  // fresh the history is. Empty where the source does not say.
+  string history_from = 11;
 }
 
 // Why a connection's data is, or is not, current.
@@ -776,6 +781,201 @@ message ListStatementsReply {
 
   // The point in the store's record the page was read at.
   Watermark as_of = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.10 to W2.12 — the account's activity (contract v14)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One activity on an account, as the custodian states it: a purchase, a
+// sale, a reinvested dividend, a dividend or interest, a fee or a tax, a
+// split or another corporate action, a transfer, a contribution, a
+// withdrawal or a journal (spec/the-custodians-activity-explains-a-break).
+//
+// Evidence, never a source: the street keeps it as reported and derives no
+// position, lot or cash figure from it, and nothing here moves the book. It
+// explains a break and proposes an adjustment for a person to confirm
+// (W9.4, W9.7). Never netted or deduplicated against holdings: a sweep
+// fund's purchases appear as the custodian lists them.
+//
+// The account it is on is named beside it, by the request that records it
+// and the record the street keeps, so the account the sidecar stamped is the
+// only one.
+message CustodialActivity {
+  // The custodian's own identifier for the activity: what lets the street
+  // recognise one sent twice. A custodian restating an activity under a new
+  // identifier is a new activity, reported, never merged.
+  string external_activity_id = 1;
+
+  // What happened, in the platform's own words, converted by the plugin
+  // from the custodian's type.
+  ActivityKind kind = 2;
+
+  // The custodian's type as reported, set only when `kind` is not known
+  // because the type did not convert. For a person to map; never read.
+  AsReported kind_as_reported = 3;
+
+  // The instrument it concerns, resolved at the edge as a holding's is
+  // (W3.1): the deployment's record, or the currency's cash instrument.
+  // Empty where the activity concerns none, or where the custodian's code
+  // did not resolve, and then `instrument_as_reported` carries it.
+  string instrument_id = 4;
+
+  // The custodian's code for the instrument as reported, set only when it
+  // did not resolve: a plan's own fund code no person has linked yet.
+  AsReported instrument_as_reported = 5;
+
+  // ISO 8601: when it was traded or took effect, and when it settles or
+  // settled. The settlement date is empty where the custodian does not
+  // state it.
+  string trade_date = 6;
+  string settlement_date = 7;
+
+  // The units of the instrument it moved, signed by what it did to the
+  // account: positive added units (a purchase, a reinvestment, the shares a
+  // split added, a transfer in), negative removed them (a sale, a fee taken
+  // in units, a transfer out). Unset where it moved none, a cash dividend's
+  // say, which is not zero.
+  optional Decimal units = 8;
+
+  // The price per unit, as stated. Unset where the custodian states none;
+  // never worked out from the amount and the units.
+  optional Money price = 9;
+
+  // The amount of cash it moved, in its currency, signed by what it did to
+  // the account's cash: positive in (a sale, a dividend, a contribution),
+  // negative out (a purchase, a fee, a withdrawal). Unset where it moved
+  // none, a split's say, which is not zero.
+  optional Money amount = 10;
+
+  // The custodian's own description, as reported. Diagnostic and for a
+  // person; nothing branches on it.
+  string description = 11;
+
+  // The raw record it was converted from, in the plugin's own storage
+  // (decisions/028), and the provenance of each value the plugin closed
+  // rather than read: an instrument linked once by a named person, a
+  // settlement date derived by a named rule.
+  RawRecordRef raw_record = 12;
+  repeated Provenance provenance = 13;
+}
+
+// What an activity was (contract v14): a closed list, the platform's own
+// words, never a custodian's.
+enum ActivityKind {
+  // Not known: the custodian's type converts to none of these, and travels
+  // beside it as reported.
+  ACTIVITY_KIND_UNSPECIFIED = 0;
+  // Units bought.
+  ACTIVITY_KIND_PURCHASE = 1;
+  // Units sold.
+  ACTIVITY_KIND_SALE = 2;
+  // Income the custodian reinvested in units, as a money market fund's
+  // monthly dividend is.
+  ACTIVITY_KIND_REINVESTMENT = 3;
+  // A dividend paid in cash.
+  ACTIVITY_KIND_DIVIDEND = 4;
+  // Interest paid in cash.
+  ACTIVITY_KIND_INTEREST = 5;
+  // A fee, in cash or in units.
+  ACTIVITY_KIND_FEE = 6;
+  // A tax withheld or paid.
+  ACTIVITY_KIND_TAX = 7;
+  // A split, the units it added or removed.
+  ACTIVITY_KIND_SPLIT = 8;
+  // Another corporate action, as the custodian states it.
+  ACTIVITY_KIND_CORPORATE_ACTION = 9;
+  // Units or cash moved in from another account.
+  ACTIVITY_KIND_TRANSFER_IN = 10;
+  // Units or cash moved out to another account.
+  ACTIVITY_KIND_TRANSFER_OUT = 11;
+  // Cash paid into the account.
+  ACTIVITY_KIND_CONTRIBUTION = 12;
+  // Cash taken out of the account.
+  ACTIVITY_KIND_WITHDRAWAL = 13;
+  // A movement between the account's own positions or sub-accounts, as the
+  // custodian journals it.
+  ACTIVITY_KIND_JOURNAL = 14;
+}
+
+// Record one activity (W2.10), as a holding row is recorded.
+message RecordActivityRequest {
+  // The account the external account is linked to (W6.4), set by the
+  // sidecar; the activity is refused when there is no link.
+  string account_id = 1;
+
+  // The account as the rail knows it, which the sidecar translates.
+  string external_account_id = 2;
+
+  // The plugin's scheme for its source, as on a statement.
+  string source = 3;
+
+  CustodialActivity activity = 4;
+}
+
+message RecordActivityReply {
+  // Street-assigned.
+  string activity_id = 1;
+
+  // True when the activity had already been recorded, by its source,
+  // account and external_activity_id, and the existing one is returned.
+  // Makes redelivery a no-op rather than a duplicate.
+  bool already_recorded = 2;
+}
+
+// An activity was recorded (W2.12): the whole record, so a reconciliation
+// waiting on a cause re-runs its candidates without a second read. Also each
+// item of a read (W2.11), as it was announced.
+message ActivityRecordedEvent {
+  string activity_id = 1;
+
+  // The account it is on, and as the rail knows it.
+  string account_id = 2;
+  string external_account_id = 3;
+  string source = 4;
+
+  CustodialActivity activity = 5;
+
+  int64 recorded_at_ns = 6;
+
+  // The record's number in the street's partition, chained per account with
+  // the activities before it, and who caused it (W2.12, W4.3).
+  JournalRef journal = 7;
+  ChangeCause cause = 8;
+}
+
+// Read an account's activity (W2.11), by trade date, paged.
+message ListActivitiesRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+
+  // ISO 8601, inclusive; empty for no bound on that side.
+  string trade_date_from = 2;
+  string trade_date_to = 3;
+
+  // Only activities recorded after it.
+  Watermark since = 4;
+
+  int32 page_size = 5;
+
+  // Opaque: the previous reply's `next_cursor`, or empty for the first page.
+  string cursor = 6;
+}
+
+message ListActivitiesReply {
+  // Each as it was announced (W2.12), by trade date.
+  repeated ActivityRecordedEvent activities = 1;
+
+  string next_cursor = 2;
+
+  // The point in the store's record the page was read at.
+  Watermark as_of = 3;
+
+  // The first date the source can read the named account's activity from,
+  // as its sync status last said (W2.1): an opening balance older than it
+  // has no activity to explain it. Empty where the request names no account
+  // or the source has not said.
+  string history_from = 4;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
