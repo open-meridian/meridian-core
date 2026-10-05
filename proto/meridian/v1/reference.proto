@@ -449,6 +449,11 @@ message ChangelogEntry {
   // The miss a close_miss entry closed, as MissEntry names it; empty for
   // every other operation.
   string miss_id = 13;
+  // When the change became true, beside when the store recorded it
+  // (record_time_ns): when it took effect, or, for an entry backfilled
+  // after the event, the event's own time. Filled by the platform on every
+  // entry; never 0.
+  int64 valid_from_ns = 14;
 }
 
 message InstrumentChangelogRequest {

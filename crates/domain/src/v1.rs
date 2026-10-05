@@ -350,6 +350,12 @@ pub struct ChangelogEntry {
     /// every other operation.
     #[prost(string, tag = "13")]
     pub miss_id: ::prost::alloc::string::String,
+    /// When the change became true, beside when the store recorded it
+    /// (record_time_ns): when it took effect, or, for an entry backfilled
+    /// after the event, the event's own time. Filled by the platform on every
+    /// entry; never 0.
+    #[prost(int64, tag = "14")]
+    pub valid_from_ns: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentChangelogRequest {
