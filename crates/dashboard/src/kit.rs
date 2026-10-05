@@ -84,7 +84,13 @@ impl Kit {
 
     /// Where a page links the kit's stylesheet.
     pub fn stylesheet(&self) -> String {
-        format!("{PATH}{}/meridian.css", self.version())
+        format!("{}meridian.css", self.base())
+    }
+
+    /// Where the deployment's version of the kit is: its stylesheet, its
+    /// script and its components below it.
+    pub fn base(&self) -> String {
+        format!("{PATH}{}/", self.version())
     }
 
     /// The version that answers for `asked`: the newest carried of its major.

@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-activity \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -24,6 +24,7 @@ help:
 	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
+	@echo "  make e2e-settings-page  a plugin's Settings pages in a real browser: the entry grid, its most, one screen"
 	@echo "  make harness-check  the plugin harness image runs three plugins, end to end"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
@@ -34,7 +35,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-activity e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -790,6 +791,59 @@ e2e-plugin-page: network
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
 	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; each settings change its own record naming who, a secret's only as set, the Settings tab saying who last changed them; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level"
+
+# A plugin's Settings pages in a real browser (the product owner, 2026-10-05,
+# of SnapTrade's: "why does this screen force scrolling again and do we assume
+# only 4 plan-code links will be needed?"). The dashboard's own pages for a
+# SnapTrade-shaped instance, served by its ignored test server
+# (crates/dashboard/src/admin/tests/served.rs) on the runtime image, with the kit
+# that image carries and a stand-in conductor checking and stamping each
+# table as the real one does; headless Chromium (e2e/settings-page/browser.py)
+# proves the kit's entry grid upgrades on a table's tab, adds rows past four
+# and posts them, takes 200 rows and refuses 201, that the plain table still
+# posts without script, and that every Settings page and tab fits one screen
+# at 1440x900 and 390x844 by the kit's own check; then again, the fit alone,
+# as a development deployment draws it. Its own network and no published
+# port. SHOTS=<dir> keeps a screenshot of each page and size.
+SETTINGS_PAGE_IMAGE := meridian-settings-page:local
+SETTINGS_BROWSER_IMAGE := meridian-e2e-settings-browser:local
+SETTINGS_NET := meridian-core-settings-page
+SHOTS ?=
+
+e2e-settings-page:
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build -f Dockerfile.rust --target settings-page --build-arg RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
+		-t $(SETTINGS_PAGE_IMAGE) . >.e2e-settings-page.log 2>&1 \
+		|| { echo "e2e-settings-page FAILED: the server did not build; see .e2e-settings-page.log" >&2; exit 1; }
+	@$(DOCKER) build -q -f e2e/settings-page/browser.Dockerfile -t $(SETTINGS_BROWSER_IMAGE) e2e/settings-page >/dev/null
+	@docker rm -f settings-page >/dev/null 2>&1 || true
+	@docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true
+	@docker network create $(SETTINGS_NET) >/dev/null
+	@set -e; status=0; \
+	for pass in all fit; do \
+		development=0; [ "$$pass" = fit ] && development=1; \
+		docker run -d --name settings-page --network $(SETTINGS_NET) -e MERIDIAN_SETTINGS_DEVELOPMENT=$$development \
+			$(SETTINGS_PAGE_IMAGE) >/dev/null; \
+		session=""; \
+		for i in $$(seq 1 60); do \
+			session="$$(docker logs settings-page 2>/dev/null | sed -n 's/^SESSION=//p')"; \
+			[ -n "$$session" ] && docker logs settings-page 2>/dev/null | grep -q '^serving' && break; \
+			session=""; sleep 1; \
+		done; \
+		if [ -z "$$session" ]; then echo "e2e-settings-page FAILED: the server did not start" >&2; \
+			docker logs settings-page >>.e2e-settings-page.log 2>&1; status=1; \
+		else \
+			docker run --rm --network $(SETTINGS_NET) -e E2E_SESSION="$$session" -e PASS=$$pass -e OUT=/out \
+				$(if $(SHOTS),-v $(abspath $(SHOTS)):/out,--tmpfs /out) \
+				$(SETTINGS_BROWSER_IMAGE) >>.e2e-settings-page.log 2>&1 || status=1; \
+		fi; \
+		docker rm -f settings-page >/dev/null 2>&1; \
+		[ $$status -eq 0 ] || break; \
+	done; \
+	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
+	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
+		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,

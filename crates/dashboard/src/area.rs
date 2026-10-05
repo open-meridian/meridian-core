@@ -106,18 +106,31 @@ impl Tab {
 /// before keeps its admin page; from a plugin built for v5, there is none.
 ///
 /// At `admin`, before them all, the dashboard's own Summary and Settings tabs
-/// ([`SUMMARY`], [`SETTINGS`]): a page of the plugin's titled "Summary" or
-/// "Settings" is then `summary-2` or `settings-2` in the query.
-pub fn tabs(report: Option<&PluginReport>, level: AccessLevel) -> Vec<Tab> {
+/// ([`SUMMARY`], [`SETTINGS`]), and after Settings a tab of the dashboard's
+/// for each of the plugin's table settings, `tables` as their keys and
+/// labels (the product owner, 2026-10-05: "two tabs - plan code links vs
+/// cash links"): a page of the plugin's titled "Summary" or "Settings" is
+/// then `summary-2` or `settings-2` in the query.
+pub fn tabs(
+    report: Option<&PluginReport>,
+    level: AccessLevel,
+    tables: &[(String, String)],
+) -> Vec<Tab> {
     let interface = report.and_then(|report| report.declared_interface.as_ref());
     let declared = interface
         .map(|interface| interface.pages.as_slice())
         .unwrap_or_default();
     let mut tabs: Vec<Tab> = Vec::new();
     if level == AccessLevel::Admin {
-        for (key, title) in [(SUMMARY, "Summary"), (SETTINGS, "Settings")] {
+        let own = [(SUMMARY, "Summary"), (SETTINGS, "Settings")];
+        let own = own.iter().map(|(key, title)| (*key, *title));
+        let tables = tables
+            .iter()
+            .map(|(key, title)| (key.as_str(), title.as_str()));
+        for (key, title) in own.chain(tables) {
+            let key = unique(key.into(), &tabs);
             tabs.push(Tab {
-                key: key.into(),
+                key,
                 title: title.into(),
                 path: String::new(),
                 drawn: true,
@@ -432,7 +445,7 @@ mod tests {
             ("/admin/accounts", "Account links", ADMIN),
         ]);
         let titles = |level| -> Vec<String> {
-            tabs(Some(&snaptrade), level)
+            tabs(Some(&snaptrade), level, &[])
                 .into_iter()
                 .map(|tab| format!("{} {}", tab.key, tab.path))
                 .collect()
@@ -448,14 +461,16 @@ mod tests {
                 "account-links /admin/accounts"
             ]
         );
-        let manage = tabs(Some(&snaptrade), AccessLevel::Admin);
+        let manage = tabs(Some(&snaptrade), AccessLevel::Admin, &[]);
         assert!(manage[0].drawn && manage[0].title == "Summary");
         assert!(manage[1].drawn && manage[1].title == "Settings");
         assert!(manage[2..].iter().all(|tab| !tab.drawn));
         assert!(
             [AccessLevel::Write, AccessLevel::Read]
                 .into_iter()
-                .all(|level| tabs(Some(&snaptrade), level).iter().all(|tab| !tab.drawn)),
+                .all(|level| tabs(Some(&snaptrade), level, &[])
+                    .iter()
+                    .all(|tab| !tab.drawn)),
             "no Summary or Settings under Open or View"
         );
         assert_eq!(titles(AccessLevel::Write), ["statements /statements"]);
@@ -470,14 +485,14 @@ mod tests {
     fn a_plugin_with_no_page_at_write_or_read_has_its_root_and_none_at_admin_the_dashboards_tabs_alone(
     ) {
         let only_admin = report(&[("/admin", "Admin", ADMIN)]);
-        let open = tabs(Some(&only_admin), AccessLevel::Write);
+        let open = tabs(Some(&only_admin), AccessLevel::Write, &[]);
         assert_eq!(open.len(), 1);
         assert_eq!(
             (open[0].path.as_str(), open[0].title.as_str()),
             ("/", "SnapTrade")
         );
         let only_data = report(&[("/", "Home", DATA)]);
-        let keys: Vec<(String, bool)> = tabs(Some(&only_data), AccessLevel::Admin)
+        let keys: Vec<(String, bool)> = tabs(Some(&only_data), AccessLevel::Admin, &[])
             .into_iter()
             .map(|tab| (tab.key, tab.drawn))
             .collect();
@@ -485,7 +500,7 @@ mod tests {
             keys,
             [(SUMMARY.to_string(), true), (SETTINGS.to_string(), true)]
         );
-        assert_eq!(tabs(None, AccessLevel::Read)[0].path, "/");
+        assert_eq!(tabs(None, AccessLevel::Read, &[])[0].path, "/");
     }
 
     #[test]
@@ -494,7 +509,7 @@ mod tests {
             contract_version: "v4".into(),
             ..report(&[])
         };
-        let manage = tabs(Some(&older), AccessLevel::Admin);
+        let manage = tabs(Some(&older), AccessLevel::Admin, &[]);
         assert_eq!(manage.len(), 3);
         assert!(manage[0].drawn && manage[1].drawn);
         assert_eq!(
@@ -505,7 +520,7 @@ mod tests {
             contract_version: "v5".into(),
             ..report(&[])
         };
-        let manage = tabs(Some(&newer), AccessLevel::Admin);
+        let manage = tabs(Some(&newer), AccessLevel::Admin, &[]);
         assert!(
             manage.len() == 2 && manage.iter().all(|tab| tab.drawn),
             "the dashboard's tabs alone"
@@ -522,7 +537,7 @@ mod tests {
             ("/b", "Settings", ADMIN),
             ("/c", "Summary", ADMIN),
         ]);
-        let keys: Vec<String> = tabs(Some(&odd), AccessLevel::Admin)
+        let keys: Vec<String> = tabs(Some(&odd), AccessLevel::Admin, &[])
             .into_iter()
             .map(|tab| tab.key)
             .collect();
@@ -634,6 +649,59 @@ mod tests {
         assert_eq!(page.matches(HOUSE).count(), 1);
     }
 
+    /// Each of the plugin's table settings is a tab of the dashboard's own
+    /// under Manage, after Settings and before the plugin's pages, titled
+    /// with its label (the product owner, 2026-10-05: "two tabs - plan code
+    /// links vs cash links"); none under Open or View.
+    #[test]
+    fn each_table_setting_is_a_drawn_tab_after_settings_under_manage_alone() {
+        let report = report(&[
+            ("/admin/accounts", "Account links", ADMIN),
+            ("/", "Home", DATA),
+        ]);
+        let tables = [
+            (
+                "setting-plan_code_links".to_string(),
+                "Plan-code links".to_string(),
+            ),
+            (
+                "setting-counted_as_cash".to_string(),
+                "Cash links".to_string(),
+            ),
+        ];
+        let manage: Vec<(String, String, bool)> = tabs(Some(&report), AccessLevel::Admin, &tables)
+            .into_iter()
+            .map(|tab| (tab.key, tab.title, tab.drawn))
+            .collect();
+        assert_eq!(
+            manage,
+            [
+                ("summary".to_string(), "Summary".to_string(), true),
+                ("settings".to_string(), "Settings".to_string(), true),
+                (
+                    "setting-plan_code_links".to_string(),
+                    "Plan-code links".to_string(),
+                    true
+                ),
+                (
+                    "setting-counted_as_cash".to_string(),
+                    "Cash links".to_string(),
+                    true
+                ),
+                (
+                    "account-links".to_string(),
+                    "Account links".to_string(),
+                    false
+                ),
+            ]
+        );
+        for level in [AccessLevel::Write, AccessLevel::Read] {
+            assert!(tabs(Some(&report), level, &tables)
+                .iter()
+                .all(|tab| !tab.drawn));
+        }
+    }
+
     /// The dashboard's own Summary and Settings tabs sit in the one tab row
     /// with the plugin's framed pages, first, and are drawn in the area's
     /// page, not framed: no frame, no page to tell a status or actions, and
@@ -644,7 +712,7 @@ mod tests {
             ("/admin/connections", "Connections", ADMIN),
             ("/admin/accounts", "Account links", ADMIN),
         ]);
-        let manage = tabs(Some(&report), AccessLevel::Admin);
+        let manage = tabs(Some(&report), AccessLevel::Admin, &[]);
         let held = Held {
             admin: true,
             ..Default::default()
@@ -705,7 +773,7 @@ mod tests {
             ("/admin/accounts", "Account links", ADMIN),
             ("/statements", "Statements", DATA),
         ]);
-        let manage = tabs(Some(&report), AccessLevel::Admin);
+        let manage = tabs(Some(&report), AccessLevel::Admin, &[]);
         let held = Held {
             admin: true,
             data: Some(AccessLevel::Write),

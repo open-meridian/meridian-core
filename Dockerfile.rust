@@ -9,6 +9,9 @@
 # VM raced, and cargo intermittently failed to create its own target directory.
 
 ARG RUST_VERSION=1.90
+# The runtime image, for the settings pages' server below: the dashboard's
+# base and the kit the image carries. Built first by the target that uses it.
+ARG RUNTIME_IMAGE=meridian-runtime:local
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS base
 RUN apt-get update \
@@ -79,3 +82,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo deny --locked check advisories
 
+# A plugin's Settings pages served for a real browser (make e2e-settings-page):
+# the dashboard's unit-test binary, whose ignored server
+# (crates/dashboard/src/admin/tests/served.rs) stands up its own world in-process,
+# on the runtime image so it serves the kit that image carries.
+FROM base AS settings-page-build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/w/target \
+    cargo test --locked -p meridian-dashboard --lib --no-run --message-format=json \
+      | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | head -1 | xargs -I{} cp {} /settings-page \
+ && test -x /settings-page
+
+FROM ${RUNTIME_IMAGE} AS settings-page
+COPY --from=settings-page-build /settings-page /usr/local/bin/settings-page
+ENTRYPOINT ["settings-page", "--ignored", "--exact", "admin::tests::served::serve_a_plugins_settings_pages_for_a_browser", "--nocapture"]

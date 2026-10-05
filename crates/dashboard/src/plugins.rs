@@ -751,7 +751,7 @@ pub(crate) async fn frame(
         };
     let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
     let reports = app.health.view();
-    let tabs = crate::area::tabs(reports.get(&instance), level);
+    let tabs = crate::area::tabs(reports.get(&instance), level, &table_tabs(&app, &instance));
     // A path asked for directly is its tab's, or one of its own under the
     // level's pages; otherwise the tab asked for, or the first: under Manage,
     // the dashboard's own Summary, drawn here rather than framed. A path
@@ -825,13 +825,12 @@ pub(crate) async fn frame(
                 notice,
                 now,
             };
-            crate::area::Shown::Drawn(
-                if current.is_some_and(|tab| tab.key == crate::area::SETTINGS) {
-                    crate::admin::settings_tab(&manage)
-                } else {
-                    crate::admin::summary_tab(&manage)
-                },
-            )
+            crate::area::Shown::Drawn(match current.map(|tab| tab.key.as_str()) {
+                Some(crate::area::SETTINGS) => crate::admin::settings_tab(&manage),
+                Some(crate::area::SUMMARY) | None => crate::admin::summary_tab(&manage),
+                // A table setting's tab, the only other the dashboard draws.
+                Some(key) => crate::admin::table_tab(&manage, key),
+            })
         }
     };
     let held = access.held(&instance);
@@ -872,13 +871,38 @@ pub(crate) async fn frame(
     .into_response()
 }
 
+/// The plugin's table settings as tabs of its area under Manage, each its
+/// key and label; none while its settings are not known.
+fn table_tabs(app: &App, instance: &str) -> Vec<(String, String)> {
+    let Ok(records) = app.records.current(app.clock.now_ns()) else {
+        return Vec::new();
+    };
+    records
+        .plugin_settings
+        .iter()
+        .find(|record| record.plugin_instance_id == instance)
+        .map(|record| {
+            crate::admin::settings::tables(record, crate::html::is_development())
+                .into_iter()
+                .map(|table| {
+                    (
+                        crate::admin::settings::table_key(table),
+                        crate::admin::settings::label(table).to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Where a person entering at `level` with no page named lands: the first
 /// page the plugin declares at that level, the area's first framed tab
 /// there (under Manage, the one after the dashboard's own Summary and
 /// Settings), and its `/` only where it declares none. A `/` serving Open
 /// and View alone would refuse Manage with the plugin's 403.
 fn first_page(app: &App, instance: &str, level: AccessLevel) -> String {
-    crate::area::tabs(app.health.view().get(instance), level)
+    // The dashboard's own tabs, its table settings' among them, frame nothing.
+    crate::area::tabs(app.health.view().get(instance), level, &[])
         .into_iter()
         .find(|tab| !tab.drawn)
         .map(|tab| tab.path)

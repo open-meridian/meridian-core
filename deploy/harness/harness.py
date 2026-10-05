@@ -375,12 +375,22 @@ def settings(args):
     # rows given are the table's whole, as the form posts it.
     base = lambda name: name.split("[", 1)[0]
 
+    # A table setting is on a tab of its own beside Settings (core 2026-10-05),
+    # its grid named for it; every other setting is on Settings.
+    def page(name):
+        tab = f"setting-{base(name)}" if "[" in name else "settings"
+        return admin.get(f"{VIEW}?tab={tab}")
+
+    def offers(name, body):
+        if "[" in name:
+            return f'name="table.{base(name)}"' in body
+        return f'data-setting="{name}"' in body
+
     def declared():
         form = admin.get(f"{VIEW}?tab=settings")
         if form.status != 200:
             raise Failed(f"its settings: {form.status} {sentence(form)}")
-        missing = sorted({base(name) for name, _ in asked
-                          if f'data-setting="{base(name)}"' not in form.body})
+        missing = sorted({base(name) for name, _ in asked if not offers(name, page(name).body)})
         if missing:
             raise Failed(f"the plugin has not declared {', '.join(missing)}")
         return form

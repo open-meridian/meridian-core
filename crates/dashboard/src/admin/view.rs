@@ -53,8 +53,10 @@ pub struct Tab {
 }
 
 /// The tabs every plugin has, as far as they are built, for this viewer:
-/// Settings only for an admin of the plugin (W6.11).
-pub fn tabs(may_set: bool) -> Vec<Tab> {
+/// Settings only for an admin of the plugin (W6.11), and after it a tab for
+/// each table setting it declares, titled with its label (the product owner,
+/// 2026-10-05).
+pub fn tabs(may_set: bool, record: Option<&PluginSettingsRecord>, development: bool) -> Vec<Tab> {
     let tab = |key: &str, title: &str| Tab {
         key: key.into(),
         title: title.into(),
@@ -62,6 +64,12 @@ pub fn tabs(may_set: bool) -> Vec<Tab> {
     let mut tabs = vec![tab(OVERVIEW, "Overview")];
     if may_set {
         tabs.push(tab(SETTINGS, "Settings"));
+        for table in record
+            .map(|record| settings::tables(record, development))
+            .unwrap_or_default()
+        {
+            tabs.push(tab(&settings::table_key(table), settings::label(table)));
+        }
     }
     tabs.push(tab(ACCESS, "Access"));
     tabs
@@ -487,36 +495,30 @@ pub fn render(view: &View) -> String {
     let line = view.line;
     let instance = escape(&line.instance);
     let title = escape(line.name.as_deref().unwrap_or(&line.instance));
-    let notice = if view.notice.is_empty() {
-        String::new()
-    } else {
-        format!("<p class=\"notice good\">{}</p>", escape(view.notice))
-    };
-    let body = match view.current.key.as_str() {
-        SETTINGS => {
-            let form = match view.record {
-                Some(record) => settings::form_with(
-                    record,
-                    view.token,
-                    view.development,
-                    &settings::path(&record.plugin_instance_id),
-                    view.choices,
-                ),
-                None => "<p class=\"empty\">Its settings are not known yet: the plugin has not \
-                         reported what it needs.</p>"
-                    .to_string(),
-            };
-            let changed = view
-                .record
-                .map(|record| super::last_changed(view.records, record))
-                .unwrap_or_default();
-            format!(
-                "{notice}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
-                 <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
-                 once set: type a new value to replace it.</p>{changed}{form}</section>"
-            )
-        }
-        ACCESS => format!(
+    // One of its table settings, where the tab asked for is one's.
+    let table = view.record.and_then(|record| {
+        settings::table_named(record, &view.current.key, view.development)
+            .map(|table| (record, table))
+    });
+    let body = match (view.current.key.as_str(), table) {
+        (SETTINGS, _) => super::settings_section(
+            view.records,
+            view.record,
+            view.token,
+            view.development,
+            &settings::path(&line.instance),
+            view.notice,
+        ),
+        (key, Some((record, table))) => super::table_section(
+            view.records,
+            record,
+            table,
+            view.token,
+            &super::with_tab(&settings::path(&line.instance), key),
+            view.choices,
+            view.notice,
+        ),
+        (ACCESS, _) => format!(
             "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
             access(view.records, &line.instance, view.may_grant)
         ),

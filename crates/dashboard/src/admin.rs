@@ -535,7 +535,11 @@ async fn plugin_view(
     let administers = access.administers(&instance);
     let reports = app.health.view();
     let report = reports.get(&instance);
-    let tabs = view::tabs(administers);
+    let tabs = view::tabs(
+        administers,
+        settings_of(&records, &instance),
+        crate::html::is_development(),
+    );
     let current = view::chosen(&tabs, field(&query, "tab"));
     let choices = match settings_of(&records, &instance) {
         Some(record) => choices(&app, &instance, record, &records).await,
@@ -620,26 +624,35 @@ async fn settings_page(
         .into_response()
 }
 
-/// The form, from the admin portal's Settings tab, back to it.
+/// The form, from the admin portal's Settings tab or a table's, back to it.
 async fn set_settings(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Path(instance): Path<String>,
+    Query(asked): Query<HashMap<String, String>>,
     Form(fields): Form<Fields>,
 ) -> Response {
-    let back = view::tab_href(&instance, view::SETTINGS);
+    let tab = table_tab_posted(&app, &instance, &asked);
+    let back = view::tab_href(&instance, tab.as_deref().unwrap_or(view::SETTINGS));
     save_settings(&app, &headers, &instance, &fields, &back).await
 }
 
 /// `POST /plugins/{instance}/settings`: the form, from the plugin's area
-/// under Manage ([`settings_tab`]), back to its Settings tab there.
+/// under Manage ([`settings_tab`], [`table_tab`]), back to the tab it came
+/// from there.
 async fn set_settings_in_area(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Path(instance): Path<String>,
+    Query(asked): Query<HashMap<String, String>>,
     Form(fields): Form<Fields>,
 ) -> Response {
-    let back = crate::area::href(&instance, AccessLevel::Admin, Some(crate::area::SETTINGS));
+    let tab = table_tab_posted(&app, &instance, &asked);
+    let back = crate::area::href(
+        &instance,
+        AccessLevel::Admin,
+        Some(tab.as_deref().unwrap_or(crate::area::SETTINGS)),
+    );
     save_settings(&app, &headers, &instance, &fields, &back).await
 }
 
@@ -806,32 +819,115 @@ fn tools_section(report: Option<&meridian_domain::v1::PluginReport>) -> String {
 /// Nothing of the deployment's and no account's data: a plugin admin's, of
 /// this plugin alone.
 pub(crate) fn settings_tab(manage: &Manage) -> String {
-    let instance = manage.instance;
-    let form = match settings_of(manage.records, instance) {
-        Some(record) => settings::form_with(
+    settings_section(
+        manage.records,
+        settings_of(manage.records, manage.instance),
+        &token_input(manage.session),
+        crate::html::is_development(),
+        &crate::area::settings_path(manage.instance),
+        manage.notice,
+    )
+}
+
+/// The dashboard's tab for one of the plugin's table settings, in its area
+/// under Manage (the product owner, 2026-10-05: each table setting a tab of
+/// its own beside Settings, titled with its label): the table's page alone,
+/// posted to the area's own address and back to this tab.
+pub(crate) fn table_tab(manage: &Manage, key: &str) -> String {
+    let development = crate::html::is_development();
+    match settings_of(manage.records, manage.instance)
+        .and_then(|record| Some((record, settings::table_named(record, key, development)?)))
+    {
+        Some((record, table)) => table_section(
+            manage.records,
             record,
+            table,
             &token_input(manage.session),
-            crate::html::is_development(),
-            &crate::area::settings_path(instance),
+            &with_tab(&crate::area::settings_path(manage.instance), key),
             manage.choices,
+            manage.notice,
         ),
-        None => "<p class=\"empty\">Its settings are not known yet: the plugin has not \
-                 reported what it needs.</p>"
-            .to_string(),
-    };
-    let notice = if manage.notice.is_empty() {
+        None => not_known_yet(manage.notice),
+    }
+}
+
+fn not_known_yet(notice: &str) -> String {
+    format!(
+        "{}<section class=\"panel padded\" id=\"settings\"><p class=\"empty\">Its settings are not \
+         known yet: the plugin has not reported what it needs.</p></section>",
+        notice_line(notice)
+    )
+}
+
+fn notice_line(notice: &str) -> String {
+    if notice.is_empty() {
         String::new()
     } else {
-        format!("<p class=\"notice good\">{}</p>", escape(manage.notice))
+        format!("<p class=\"notice good\">{}</p>", escape(notice))
+    }
+}
+
+/// `path?tab=<key>`: where a table's page posts, so the save comes back to
+/// its tab.
+pub(crate) fn with_tab(path: &str, key: &str) -> String {
+    let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("a fixed address");
+    url.query_pairs_mut().append_pair("tab", key);
+    format!("{path}?{}", url.query().unwrap_or_default())
+}
+
+/// A plugin's Settings tab, in its area and in the admin portal alike, to
+/// fit one screen (the product owner, 2026-10-04): its head on one line --
+/// "Settings" and who last changed them -- then the form, its groups as
+/// tabs ([`settings::form_with`]); its tables are tabs of their own.
+pub(crate) fn settings_section(
+    records: &AccessRecords,
+    record: Option<&PluginSettingsRecord>,
+    token: &str,
+    development: bool,
+    action: &str,
+    notice: &str,
+) -> String {
+    let Some(record) = record else {
+        return not_known_yet(notice);
     };
-    let changed = settings_of(manage.records, instance)
-        .map(|record| last_changed(manage.records, record))
-        .unwrap_or_default();
     format!(
-        "{notice}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
-         <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
-         once set: type a new value to replace it.</p>{changed}{form}</section>"
+        "{notice}<section class=\"panel padded settings-page\" id=\"settings\"><div class=\"settings-head\">\
+         <h2>Settings</h2>{changed}</div>{form}</section>",
+        notice = notice_line(notice),
+        changed = last_changed(records, record),
+        form = settings::form_with(record, token, development, action),
     )
+}
+
+/// One of a plugin's table settings on its own tab, in its area and in the
+/// admin portal alike ([`settings::table_form`]).
+pub(crate) fn table_section(
+    records: &AccessRecords,
+    record: &PluginSettingsRecord,
+    table: &meridian_pb::v1::SettingDeclaration,
+    token: &str,
+    action: &str,
+    choices: &settings::Choices,
+    notice: &str,
+) -> String {
+    format!(
+        "{notice}<section class=\"panel padded settings-page\" id=\"table-setting\" data-table=\"{name}\">\
+         {form}</section>",
+        notice = notice_line(notice),
+        name = escape(&table.name),
+        form = settings::table_form(record, table, token, action, choices, &|subject| {
+            crate::tickets::display_name(records, subject)
+        }),
+    )
+}
+
+/// The tab a table's page posted from, `?tab=<key>`, where it names one of
+/// the plugin's table settings: where the save comes back to.
+fn table_tab_posted(app: &App, instance: &str, asked: &HashMap<String, String>) -> Option<String> {
+    let key = asked.get("tab")?;
+    let records = app.records.current(app.clock.now_ns()).ok()?;
+    let record = settings_of(&records, instance)?;
+    settings::table_named(record, key, crate::html::is_development()).map(settings::table_key)
 }
 
 /// What a plugin's table settings offer (W6.11, contract v14): the external
@@ -891,16 +987,24 @@ pub(crate) fn last_changed(records: &AccessRecords, record: &PluginSettingsRecor
         if record.updated_at_ns == 0 {
             return String::new();
         }
-        return format!(
-            "<p class=\"hint\" data-last-changed>Last changed by the plugin's re-declaring a \
-             setting, which cleared it, {when}.</p>",
-            when = escape(&crate::custody::utc(record.updated_at_ns)),
-        );
+        return changed_line(&format!(
+            "Last changed by the plugin's re-declaring a setting, which cleared it, {}.",
+            crate::custody::utc(record.updated_at_ns)
+        ));
     }
+    changed_line(&format!(
+        "Last changed by {}, {}.",
+        crate::tickets::display_name(records, &record.updated_by),
+        crate::custody::utc(record.updated_at_ns)
+    ))
+}
+
+/// A head's "last changed" on one line, cut short where it must be, the
+/// whole of it on hover.
+fn changed_line(said: &str) -> String {
     format!(
-        "<p class=\"hint\" data-last-changed>Last changed by {who}, {when}.</p>",
-        who = escape(&crate::tickets::display_name(records, &record.updated_by)),
-        when = escape(&crate::custody::utc(record.updated_at_ns)),
+        "<span class=\"changed\" title=\"{said}\" data-last-changed>{said}</span>",
+        said = escape(said)
     )
 }
 

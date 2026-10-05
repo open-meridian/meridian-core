@@ -19,6 +19,9 @@ use crate::records::RecordsCache;
 use crate::session::Sessions;
 use crate::web::{router, SESSION_COOKIE};
 
+/// A plugin's Settings pages served for a real browser (make e2e-settings-page).
+mod served;
+
 struct At(i64);
 impl Clock for At {
     fn now_ns(&self) -> i64 {
@@ -905,7 +908,7 @@ fn the_settings_tab_names_who_last_changed_them() {
     record.updated_by = String::new();
     let cleared = last_changed(&records, &record);
     assert!(
-        cleared.contains("Last changed by the plugin's re-declaring a setting"),
+        cleared.contains("Last changed by the plugin&#39;s re-declaring a setting"),
         "{cleared}"
     );
 }
@@ -969,19 +972,20 @@ fn the_form_says_what_to_fill_in() {
         "escaped"
     );
 
-    // A developer's setting only on a development deployment, under
-    // "Developer".
+    // A developer's setting only on a development deployment, on a
+    // "Developer" tab of its own.
     assert!(!form.contains("data-setting=\"synthetic\""));
-    assert!(!form.contains("<details"));
+    assert!(!form.contains("settings-developer"));
     let developing = settings::form(&record, "", true);
     let synthetic = setting(&developing, "synthetic");
     assert!(synthetic.contains("name=\"value.synthetic\""));
-    let details = developing
-        .split("<details class=\"developer\">")
-        .nth(1)
-        .unwrap();
-    assert!(details.starts_with("<summary>Developer "), "{details}");
-    assert!(details.contains("data-setting=\"synthetic\""));
+    assert!(developing.contains("<a href=\"#settings-developer\">Developer</a>"));
+    let group = between(
+        &developing,
+        "<section class=\"setting-group\" id=\"settings-developer\"",
+        "</section>",
+    );
+    assert!(group.contains("data-setting=\"synthetic\""), "{group}");
 }
 
 #[test]
@@ -1119,7 +1123,7 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
             "{name} is {size}"
         );
     }
-    let fields = between(&form, "<div class=\"fields\">", "<details");
+    let fields = between(&form, "<div class=\"fields\">", "</section>");
     assert!(!fields.contains("data-setting=\"synthetic\""));
 
     // A choice's options on one line, each its label alone: what each
@@ -1159,11 +1163,11 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
     // applies stay in view, small.
     let user = setting(&form, "user_secret");
     assert!(user.contains(
-        "<span class=\"badge warn\">Required</span> <span class=\"badge\">not set</span> \
+        "<span class=\"badge warn need\">Required</span> <span class=\"badge\">not set</span> \
          <span class=\"badge info applies\">Only when Key is Commercial key</span>"
     ));
     let stale = setting(&form, "stale_after_hours");
-    assert!(stale.contains("<span class=\"badge\">Optional</span>"));
+    assert!(stale.contains("<span class=\"badge need\">Optional</span>"));
     assert!(stale.contains(">default 24 hours</span>"));
     assert!(stale.contains("<span class=\"unit\">hours</span>"));
 
@@ -1183,17 +1187,62 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
     // A field that does not apply still collapses by the script alone.
     assert!(script.contains("holder.hidden = oneOf.indexOf("));
 
-    // A developer's settings under a closed "Developer", and Save last.
-    assert!(form.contains(
-        "<details class=\"developer\"><summary>Developer \
-         <span class=\"summary-note\">1 setting for whoever develops the plugin</span></summary>"
+    // Every page fits one screen (the product owner, 2026-10-04): the
+    // settings in groups, each a tab -- what must be filled in, what may be
+    // left, and a developer's -- each a fragment of the page the script
+    // shows alone, and every group in the one form, so Save posts them all.
+    let nav = between(
+        &form,
+        "<nav class=\"tabs setting-groups\" data-sections",
+        "</nav>",
+    );
+    assert_eq!(
+        nav.matches("<a href=\"#").count(),
+        3,
+        "Required, Optional and Developer: {nav}"
+    );
+    assert!(nav.contains(
+        "<a href=\"#settings-required\">Required <span class=\"badge warn\">1 missing</span></a>"
     ));
+    assert!(nav.contains("<a href=\"#settings-optional\">Optional</a>"));
+    for (group, names) in [
+        (
+            "settings-required",
+            &[
+                "key_type",
+                "snaptrade_client_id",
+                "snaptrade_consumer_key",
+                "user_secret",
+            ][..],
+        ),
+        (
+            "settings-optional",
+            &["poll_seconds", "stale_after_hours"][..],
+        ),
+        ("settings-developer", &["synthetic"][..]),
+    ] {
+        let section = between(
+            &form,
+            &format!("<section class=\"setting-group\" id=\"{group}\""),
+            "</section>",
+        );
+        for name in names {
+            assert!(
+                section.contains(&format!("data-setting=\"{name}\"")),
+                "{name} in {group}"
+            );
+        }
+    }
+    assert_eq!(form.matches("<form ").count(), 1);
+    assert!(script.contains("window.addEventListener(\"hashchange\", group);"));
+    assert!(script.contains("section.hidden = id !== want;"));
+    // Save last, kept in view.
     assert!(form.contains(
-        "</details><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button>\
+        "</section><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button>\
          </div></form>"
     ));
 
-    // Open while a developer's setting is required and missing.
+    // A developer's setting required and missing is said on its tab.
     let mut needed = snaptrade();
     needed
         .declared_settings
@@ -1201,7 +1250,21 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
         .find(|declaration| declaration.name == "synthetic")
         .unwrap()
         .required = true;
-    assert!(settings::form(&needed, "", true).contains("<details class=\"developer\" open>"));
+    assert!(settings::form(&needed, "", true).contains(
+        "<a href=\"#settings-developer\">Developer <span class=\"badge warn\">1 missing</span></a>"
+    ));
+
+    // A group past six fields goes on in a tab of its own.
+    let mut many = snaptrade();
+    for n in 0..8 {
+        many.declared_settings.push(SettingDeclaration {
+            label: format!("Extra {n}"),
+            ..declared(&format!("extra_{n}"), SettingType::Integer, false, false)
+        });
+    }
+    let form = settings::form(&many, "", false);
+    assert!(form.contains("<a href=\"#settings-optional\">Optional</a>"));
+    assert!(form.contains("<a href=\"#settings-optional-2\">Optional 2</a>"));
 }
 
 /// What a browser posts of a form as it stands: each named input's value, a
@@ -2576,4 +2639,237 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
     ] {
         assert!(body.contains(held), "{held}");
     }
+}
+
+// ── Each table setting a tab of its own (the product owner, 2026-10-05) ────
+
+/// SnapTrade's shape with its two tables, "Plan-code links" and "Cash
+/// links", of at most 200 rows each, and one link held.
+fn with_tables() -> PluginSettingsRecord {
+    use meridian_pb::v1::{SettingColumn, SettingColumnType};
+    let column = |name: &str, kind: SettingColumnType, label: &str| SettingColumn {
+        name: name.into(),
+        r#type: kind as i32,
+        label: label.into(),
+        required: true,
+        ..Default::default()
+    };
+    let mut record = snaptrade();
+    record.declared_settings.push(SettingDeclaration {
+        label: "Plan-code links".into(),
+        most_rows: 200,
+        columns: vec![
+            column("account", SettingColumnType::Text, "Account"),
+            column("code", SettingColumnType::Text, "Plan code"),
+        ],
+        ..declared("plan_code_links", SettingType::Table, false, false)
+    });
+    record.declared_settings.push(SettingDeclaration {
+        label: "Cash links".into(),
+        most_rows: 200,
+        columns: vec![
+            column("symbol", SettingColumnType::Text, "Symbol"),
+            column("currency", SettingColumnType::Text, "Currency"),
+        ],
+        ..declared("counted_as_cash", SettingType::Table, false, false)
+    });
+    record.values.push(PluginSettingValue {
+        name: "plan_code_links".into(),
+        value: meridian_domain::setting_table::written(&[meridian_domain::setting_table::Row {
+            cells: [
+                ("account".to_string(), "SNAP-1".to_string()),
+                ("code".to_string(), "OQKR".to_string()),
+            ]
+            .into(),
+            changed_by: ADA.into(),
+            changed_at: "2026-10-05T12:00:00.000000Z".into(),
+        }]),
+    });
+    record
+}
+
+#[test]
+fn the_settings_form_holds_no_table_and_each_table_has_a_page_of_its_own() {
+    let record = with_tables();
+    let form = settings::form(&record, "", false);
+    assert!(!form.contains("om-entry-grid"), "{form}");
+    assert!(!form.contains("table.plan_code_links"));
+    let tables: Vec<(String, &str)> = settings::tables(&record, false)
+        .into_iter()
+        .map(|table| (settings::table_key(table), settings::label(table)))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("setting-plan_code_links".to_string(), "Plan-code links"),
+            ("setting-counted_as_cash".to_string(), "Cash links"),
+        ]
+    );
+
+    // Its page: the kit's grid, to the table's most, over the plain table of
+    // the rows held and three blank, posted with the token, back to its tab.
+    let table = settings::table_named(&record, "setting-plan_code_links", false).unwrap();
+    let page = settings::table_form(
+        &record,
+        table,
+        "<input type=\"hidden\" name=\"form_token\" value=\"t\">",
+        "/plugins/snaptrade-1/settings?tab=setting-plan_code_links",
+        &settings::Choices::default(),
+        &|subject| format!("<{subject}>"),
+    );
+    assert!(page.starts_with(
+        "<form method=\"post\" action=\"/plugins/snaptrade-1/settings?tab=setting-plan_code_links\" \
+         class=\"table-setting\" autocomplete=\"off\" data-table-setting>\
+         <input type=\"hidden\" name=\"form_token\" value=\"t\">"
+    ));
+    assert!(page.contains(
+        "<om-entry-grid name=\"table.plan_code_links\" caption=\"Plan-code links\" max-rows=\"200\">"
+    ));
+    assert!(
+        !page.contains("narrow="),
+        "one line a row on a phone, as the kit draws it"
+    );
+    assert_eq!(
+        page.matches("<tr><td>").count(),
+        4,
+        "the row held and three blank"
+    );
+    assert!(page.contains("<span class=\"badge\" data-rows>1 of at most 200 rows</span>"));
+    assert!(
+        page.contains("The latest changed by &lt;"),
+        "who, as a person reads it, escaped"
+    );
+    assert!(page.contains("<input type=\"hidden\" name=\"table.plan_code_links\" value=\"1\">"));
+    assert!(
+        !page.contains("table.counted_as_cash"),
+        "the one table alone"
+    );
+
+    // A table held sealed is a secret, on the form, and has no page.
+    let mut sealed = with_tables();
+    sealed.secrets_set.push("counted_as_cash".into());
+    assert!(settings::table_named(&sealed, "setting-counted_as_cash", false).is_none());
+    assert!(settings::form(&sealed, "", false).contains("name=\"secret.counted_as_cash\""));
+}
+
+#[test]
+fn a_table_of_its_most_rows_is_sent_and_one_more_refused() {
+    let record = with_tables();
+    let rows = |n: usize| -> Fields {
+        let mut fields = Fields::new();
+        fields.insert("table.counted_as_cash".into(), "1".into());
+        for row in 0..n {
+            fields.insert(
+                format!("table.counted_as_cash[{row}].symbol"),
+                format!("FDIC{row}"),
+            );
+            fields.insert(
+                format!("table.counted_as_cash[{row}].currency"),
+                "USD".into(),
+            );
+        }
+        fields
+    };
+    let choices = settings::Choices::default();
+    assert!(settings::table_problems(&record, &rows(200), &choices).is_empty());
+    let sent = settings::request(&record, &rows(200), false).unwrap();
+    assert_eq!(sent.values.len(), 1, "the one table, and nothing else");
+    assert_eq!(
+        meridian_domain::setting_table::parse(&sent.values[0].value)
+            .unwrap()
+            .len(),
+        200
+    );
+    let refused = settings::table_problems(&record, &rows(201), &choices);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].path, "counted_as_cash");
+    assert_eq!(refused[0].message, "at most 200 rows");
+}
+
+#[tokio::test]
+async fn a_tables_tab_is_in_the_admin_view_and_its_save_comes_back_to_it() {
+    let mut records = admin_records();
+    records.plugin_settings = vec![with_tables()];
+    let h = harness(records, None);
+    let (_, body) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
+    let (tabs, here) = tabs_of(&body);
+    let names: Vec<&str> = tabs.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Overview",
+            "Settings",
+            "Plan-code links",
+            "Cash links",
+            "Access"
+        ]
+    );
+    assert_eq!(here, "Settings");
+    assert!(
+        !body.contains("<om-entry-grid"),
+        "the Settings tab holds no table"
+    );
+
+    let (status, body) = send(
+        &h,
+        get(&h, &format!("{VIEW}?tab=setting-plan_code_links"), true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<om-entry-grid name=\"table.plan_code_links\""));
+    assert!(body.contains(&format!(
+        "action=\"{SETTINGS}?tab=setting-plan_code_links\""
+    )));
+    assert_eq!(tabs_of(&body).1, "Plan-code links");
+
+    let asked = conductor_setting(&h, None);
+    let form = format!(
+        "form_token={}&table.plan_code_links=1&table.plan_code_links%5B0%5D.account=SNAP-1\
+         &table.plan_code_links%5B0%5D.code=OQKR&table.plan_code_links%5B1%5D.account=SNAP-2\
+         &table.plan_code_links%5B1%5D.code=QQQX",
+        h.form_token
+    );
+    for (posted_to, back) in [
+        (
+            format!("{SETTINGS}?tab=setting-plan_code_links"),
+            format!("{VIEW}?tab=setting-plan_code_links&saved=1"),
+        ),
+        (
+            "/plugins/snaptrade-1/settings?tab=setting-plan_code_links".to_string(),
+            "/plugins/snaptrade-1?level=admin&tab=setting-plan_code_links&saved=1".to_string(),
+        ),
+        // A tab that is no table's comes back to Settings.
+        (
+            format!("{SETTINGS}?tab=access"),
+            format!("{VIEW}?tab=settings&saved=1"),
+        ),
+    ] {
+        let response = router(Arc::clone(&h.app))
+            .oneshot(post(&h, &posted_to, &form))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{posted_to}");
+        assert_eq!(response.headers()["location"], back.as_str(), "{posted_to}");
+    }
+    {
+        let sent = asked.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        let (request, by) = &sent[0];
+        assert_eq!(by, ADA);
+        assert_eq!(request.values.len(), 1, "the table alone: {request:?}");
+        assert_eq!(request.values[0].name, "plan_code_links");
+        assert!(request.cleared.is_empty(), "nothing else cleared");
+    }
+
+    // Without the token, nothing.
+    let response = router(Arc::clone(&h.app))
+        .oneshot(post(
+            &h,
+            &format!("{SETTINGS}?tab=setting-plan_code_links"),
+            "table.plan_code_links=1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(asked.lock().unwrap().len(), 3, "and nothing sent");
 }

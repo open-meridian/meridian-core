@@ -185,7 +185,7 @@ fn run() -> Result<(), String> {
     ) {
         Ok(kit) => {
             tracing::info!(version = kit.version(), "serving the plugin UI kit");
-            meridian_dashboard::html::use_kit(kit.stylesheet());
+            meridian_dashboard::html::use_kit(kit.base());
             Some(Arc::new(kit))
         }
         Err(reason) => {

@@ -319,7 +319,7 @@ def settings_record_names_who(ada):
     it, on the Settings tab."""
     page = admin_until(ada, lambda page: "data-last-changed" in page.body,
                        path=f"{VIEW}?tab=settings", seconds=45)
-    said = page.body.split("data-last-changed>", 1)[-1].split("</p>", 1)[0]
+    said = page.body.split("data-last-changed>", 1)[-1].split("<", 1)[0]
     check(said.startswith("Last changed by "), f"the Settings tab says who last changed them: {said!r}")
 
 

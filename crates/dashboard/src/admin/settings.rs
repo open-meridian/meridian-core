@@ -18,14 +18,17 @@
 //! development deployment, and a form posted anywhere else never changes one.
 //!
 //! **It fits one screen** (the product owner, 2026-09-30: "compact ... and
-//! make the form short enough to display in one page"): each field's label
-//! on one line with small tags for required or optional, its default, "set"
-//! or "not set", and when it applies; short fields, numbers, on/offs and a
-//! choice nothing hangs on, two to a row on a wide screen and one on a
-//! phone, and long ones, secrets and text, across; a choice's options on one
-//! line; a field's hint one small line without script, and with it a bubble
-//! shown while the field is focused or its marker pointed at; a developer's
-//! settings under a closed "Developer"; and Save kept in view at the foot.
+//! make the form short enough to display in one page"; 2026-10-04: "target
+//! our display to one page without scrolling (use pagination or tab
+//! instead)"): each field's label on one line with small tags for required
+//! or optional, its default, "set" or "not set", and when it applies; short
+//! fields, numbers, on/offs and a choice nothing hangs on, two to a row on a
+//! wide screen and one on a phone, and long ones, secrets and text, across; a
+//! choice's options on one line; a field's hint one small line without
+//! script, and with it a bubble shown while the field is focused or its
+//! marker pointed at; the settings in groups, each a tab of the one form --
+//! Required, Optional and, on a development deployment, Developer, a group
+//! past six fields going on in another -- and Save kept in view at the foot.
 //! None of it changes what the form posts.
 //!
 //! **A secret is write-only here.** The record names which secrets are set
@@ -35,14 +38,18 @@
 //! declares of it now. The fields' names carry the setting's name and nothing
 //! else, and nothing here logs a field.
 //!
-//! **A table setting** (contract v14; W4.8, W6.11) is an editable typed table:
-//! the kit's `om-entry-grid`, one line a row, a typed input per column -- an
-//! external account chosen from those the plugin reported, an instrument
-//! from the deployment's records, held by its ID and never a symbol -- each
-//! cell checked in the browser as typed, and again here before anything is
-//! sent ([`table_problems`], [`meridian_domain::setting_table`]), a refusal
-//! naming each cell. Without the kit it is a plain table of inputs. The rows'
-//! `changed_by` and `changed_at` are the conductor's to stamp.
+//! **A table setting** (contract v14; W4.8, W6.11) is an editable typed table
+//! on a page of its own, a tab beside Settings titled with its label (the
+//! product owner, 2026-10-05: "two tabs - plan code links vs cash links"):
+//! the kit's `om-entry-grid`, which the dashboard loads, one line a row,
+//! paged to the screen, rows added to the table's most, a typed input per
+//! column -- an external account chosen from those the plugin reported, an
+//! instrument from the deployment's records, held by its ID and never a
+//! symbol -- each cell checked in the browser as typed, and again here before
+//! anything is sent ([`table_problems`], [`meridian_domain::setting_table`]), a
+//! refusal naming each cell. Without script it is a plain table of inputs,
+//! the rows held and a few blank. The rows' `changed_by` and `changed_at` are
+//! the conductor's to stamp.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -367,9 +374,9 @@ fn heading(
         )
     };
     let need = if declaration.required {
-        "<span class=\"badge warn\">Required</span>"
+        "<span class=\"badge warn need\">Required</span>"
     } else {
-        "<span class=\"badge\">Optional</span>"
+        "<span class=\"badge need\">Optional</span>"
     };
     format!(
         "<span class=\"setting-head\">{name}{mark} {need}{extra}{default}{applies}\
@@ -557,13 +564,12 @@ fn field(
     declaration: &SettingDeclaration,
     record: &PluginSettingsRecord,
     declared: &[SettingDeclaration],
-    choices: &Choices,
 ) -> String {
     let secret = is_secret(record, declaration);
     let about = about(declaration, secret);
-    let inner = if setting_table::is_table(declaration) && !secret {
-        table_field(declaration, record, declared, &about, choices)
-    } else if secret {
+    // A table is on a page of its own (`table_form`) unless it is held
+    // sealed, and then it is a secret like any other.
+    let inner = if secret {
         secret_field(declaration, record, declared, &about)
     } else if kind(declaration) == SettingType::Choice {
         choice_field(declaration, record, declared, &about)
@@ -578,11 +584,87 @@ fn field(
     )
 }
 
-/// The form: every setting the plugin declared that this deployment shows,
-/// deciding choices first, in a grid a short field shares with another; a
-/// developer's settings under a closed "Developer", opened while one of them
-/// is required and missing; and the Save button kept in view. Its table
-/// settings offer nothing to choose: the tests' form.
+/// The table settings this deployment shows, each on a page of its own
+/// (the product owner, 2026-10-05: "two tabs - plan code links vs cash
+/// links"): a tab beside Settings titled with its label, holding its entry
+/// grid alone. A table held sealed is a secret, and stays on the form.
+pub fn tables(record: &PluginSettingsRecord, development: bool) -> Vec<&SettingDeclaration> {
+    record
+        .declared_settings
+        .iter()
+        .filter(|declaration| {
+            setting_table::is_table(declaration)
+                && !is_secret(record, declaration)
+                && shown(declaration, development)
+        })
+        .collect()
+}
+
+/// What a table setting's page is called in a tab's query: its name, after
+/// a prefix no tab of the dashboard's own has.
+pub fn table_key(declaration: &SettingDeclaration) -> String {
+    format!("setting-{}", declaration.name)
+}
+
+/// The table setting a tab's query names, of those this deployment shows.
+pub fn table_named<'a>(
+    record: &'a PluginSettingsRecord,
+    key: &str,
+    development: bool,
+) -> Option<&'a SettingDeclaration> {
+    tables(record, development)
+        .into_iter()
+        .find(|declaration| table_key(declaration) == key)
+}
+
+/// The most fields a group's tab holds, so a tab fits one screen on a phone;
+/// a group with more is two tabs.
+const MOST_A_TAB: usize = 6;
+
+/// One tab of the form: its fragment, what it is called, and its settings.
+struct Group<'a> {
+    id: String,
+    title: String,
+    settings: Vec<&'a SettingDeclaration>,
+}
+
+/// The form's settings in groups, each a tab (every page fits one screen,
+/// the product owner, 2026-10-04): what must be filled in, what has a
+/// default or may be left, and a developer's, each as the plugin declared
+/// them, deciding choices first; a group past [`MOST_A_TAB`] fields
+/// continues on another tab.
+fn groups<'a>(settings: &[&'a SettingDeclaration]) -> Vec<Group<'a>> {
+    let of = |want: fn(&SettingDeclaration) -> bool| -> Vec<&'a SettingDeclaration> {
+        settings.iter().copied().filter(|d| want(d)).collect()
+    };
+    let mut out = Vec::new();
+    for (key, title, these) in [
+        ("required", "Required", of(|d| !d.developer && d.required)),
+        ("optional", "Optional", of(|d| !d.developer && !d.required)),
+        ("developer", "Developer", of(|d| d.developer)),
+    ] {
+        for (n, chunk) in these.chunks(MOST_A_TAB).enumerate() {
+            let (id, title) = if n == 0 {
+                (format!("settings-{key}"), title.to_string())
+            } else {
+                (
+                    format!("settings-{key}-{}", n + 1),
+                    format!("{title} {}", n + 1),
+                )
+            };
+            out.push(Group {
+                id,
+                title,
+                settings: chunk.to_vec(),
+            });
+        }
+    }
+    out
+}
+
+/// The form: every setting the plugin declared that this deployment shows
+/// but its tables, which have pages of their own ([`table_form`]): the
+/// tests' form.
 #[cfg(test)]
 pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> String {
     form_with(
@@ -590,65 +672,128 @@ pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> St
         token,
         development,
         &path(&record.plugin_instance_id),
-        &Choices::default(),
     )
 }
 
-/// The same form, its table settings offering `choices`.
+/// The form of a plugin's settings but its tables, fitting one screen: its
+/// groups as tabs ([`groups`]), each a fragment of the page, so each opens
+/// by its address; within one, fields in a grid a short field shares with
+/// another; and the Save button kept in view. One form, so Save posts every
+/// group as it stands, a hidden one too, and what it posts is what the form
+/// always posted. Without script every group shows, one under another, each
+/// under its title. A tab says how many of its required settings are
+/// missing, so none is left behind a tab unseen.
 pub fn form_with(
     record: &PluginSettingsRecord,
     token: &str,
     development: bool,
     action: &str,
-    choices: &Choices,
 ) -> String {
     let declared = &record.declared_settings;
-    let (developer, settings): (Vec<_>, Vec<_>) = in_order(declared)
+    let tables: Vec<&str> = tables(record, development)
+        .iter()
+        .map(|declaration| declaration.name.as_str())
+        .collect();
+    let settings: Vec<&SettingDeclaration> = in_order(declared)
         .into_iter()
         .filter(|declaration| shown(declaration, development))
-        .partition(|declaration| declaration.developer);
-    if settings.is_empty() && developer.is_empty() {
-        return "<p class=\"empty\">This plugin declares no settings.</p>".to_string();
+        .filter(|declaration| !tables.contains(&declaration.name.as_str()))
+        .collect();
+    if settings.is_empty() {
+        return if tables.is_empty() {
+            "<p class=\"empty\">This plugin declares no settings.</p>".to_string()
+        } else {
+            "<p class=\"empty\">This plugin declares no settings but its tables, each on a tab \
+             of its own.</p>"
+                .to_string()
+        };
     }
-    let fields = |these: &[&SettingDeclaration]| -> String {
-        these
-            .iter()
-            .map(|declaration| field(declaration, record, declared, choices))
-            .collect()
-    };
-    let main = if settings.is_empty() {
+    let missing: Vec<&str> = missing(record, development)
+        .iter()
+        .map(|declaration| declaration.name.as_str())
+        .collect();
+    let groups = groups(&settings);
+    let nav = if groups.len() < 2 {
         String::new()
     } else {
-        format!("<div class=\"fields\">{}</div>", fields(&settings))
-    };
-    let developer = if developer.is_empty() {
-        String::new()
-    } else {
-        let needed = missing(record, development)
+        let links: String = groups
             .iter()
-            .any(|declaration| declaration.developer);
+            .map(|group| {
+                let needed = group
+                    .settings
+                    .iter()
+                    .filter(|declaration| missing.contains(&declaration.name.as_str()))
+                    .count();
+                let needed = if needed == 0 {
+                    String::new()
+                } else {
+                    format!(" <span class=\"badge warn\">{needed} missing</span>")
+                };
+                format!(
+                    "<a href=\"#{id}\">{title}{needed}</a>",
+                    id = group.id,
+                    title = escape(&group.title),
+                )
+            })
+            .collect();
         format!(
-            "<details class=\"developer\"{open}><summary>Developer \
-             <span class=\"summary-note\">{count} for whoever develops the plugin</span></summary>\
-             <div class=\"fields\">{fields}</div></details>",
-            open = if needed { " open" } else { "" },
-            count = if developer.len() == 1 {
-                "1 setting".to_string()
-            } else {
-                format!("{} settings", developer.len())
-            },
-            fields = fields(&developer),
+            "<nav class=\"tabs setting-groups\" data-sections aria-label=\"The settings by group\">{links}</nav>"
         )
     };
+    let sections: String = groups
+        .iter()
+        .map(|group| {
+            let fields: String = group
+                .settings
+                .iter()
+                .map(|declaration| field(declaration, record, declared))
+                .collect();
+            format!(
+                "<section class=\"setting-group\" id=\"{id}\" aria-label=\"{title}\">\
+                 <h3 class=\"group-title\">{title}</h3><div class=\"fields\">{fields}</div></section>",
+                id = group.id,
+                title = escape(&group.title),
+            )
+        })
+        .collect();
     format!(
         "<form method=\"post\" action=\"{action}\" class=\"settings\" autocomplete=\"off\" data-settings>{token}\
-         {main}{developer}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button></div>\
+         {nav}{sections}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button></div>\
          </form><div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>\
          <script>{SCRIPT}</script>",
         action = escape(action),
     )
 }
 
+/// A table setting's page: its entry grid alone, paged to the screen, one
+/// line a row ([`table_field`]), and Save; posted to `action` with the
+/// session's token as the form is, and checked as the form's tables are.
+/// What it posts names this table alone, so every other setting is left as
+/// it stands.
+///
+/// `named` is what a person reads for the subject a row's stamp names.
+pub fn table_form(
+    record: &PluginSettingsRecord,
+    declaration: &SettingDeclaration,
+    token: &str,
+    action: &str,
+    choices: &Choices,
+    named: &dyn Fn(&str) -> String,
+) -> String {
+    let about = about(declaration, false);
+    format!(
+        "<form method=\"post\" action=\"{action}\" class=\"table-setting\" autocomplete=\"off\" \
+         data-table-setting>{token}{grid}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">\
+         Save</button></div></form>",
+        action = escape(action),
+        grid = table_field(declaration, record, &about, choices, named),
+    )
+}
+
+/// Shows one group of the form at a time, the one the address names or else
+/// the first, its tab marked; without this every group shows, under its
+/// title.
+///
 /// Shows a conditional field only while the setting it names holds one of
 /// its values: the radio chosen, what is typed, or else that setting's
 /// default. Hidden, its inputs are still posted as they stand, which changes
@@ -667,6 +812,26 @@ const SCRIPT: &str = r#"(function () {
   form.classList.add("js");
   var bubble = document.getElementById("settings-hint-bubble");
   var shown = null;
+  var nav = form.querySelector("nav[data-sections]");
+  function group() {
+    if (!nav) return;
+    var tabs = [].slice.call(nav.querySelectorAll("a[href^='#']"));
+    var ids = tabs.map(function (a) { return a.getAttribute("href").slice(1); });
+    var asked = decodeURIComponent(location.hash.slice(1));
+    var want = ids.indexOf(asked) >= 0 ? asked : ids[0];
+    tabs.forEach(function (a) {
+      var on = a.getAttribute("href").slice(1) === want;
+      a.classList.toggle("on", on);
+      if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+    });
+    ids.forEach(function (id) {
+      var section = document.getElementById(id);
+      if (section) section.hidden = id !== want;
+    });
+    hide();
+  }
+  window.addEventListener("hashchange", group);
+  group();
   function value(name) {
     var field = form.elements["value." + name];
     if (field && field.value) return field.value;
@@ -1102,14 +1267,19 @@ fn cell_input(
     }
 }
 
-/// A table setting: the kit's entry grid over a plain table of inputs, the
-/// rows held and a few blank ones, one line each, within the table's most.
+/// A table setting: its head on one line -- its label, how many rows of its
+/// most it holds, and who changed the latest row when -- what it is for on
+/// one line under it, cut short with the whole on hover; then the kit's entry
+/// grid over a plain table of inputs, the rows held and a few blank ones, one
+/// line each, within the table's most. The grid adds rows to the most, pages
+/// them to the screen and checks each cell as it is typed; without it, the
+/// plain table posts the same names.
 fn table_field(
     declaration: &SettingDeclaration,
     record: &PluginSettingsRecord,
-    declared: &[SettingDeclaration],
     about: &str,
     choices: &Choices,
+    named: &dyn Fn(&str) -> String,
 ) -> String {
     let name = &declaration.name;
     let held = current(record, name)
@@ -1151,19 +1321,35 @@ fn table_field(
             escape(&choices.unread)
         )
     };
+    let count = format!(
+        "<span class=\"badge\" data-rows>{} of at most {most} {}</span>",
+        held.len(),
+        if most == 1 { "row" } else { "rows" }
+    );
+    // Who changed the latest row, and when: the conductor's stamps.
     let who = held
         .iter()
         .max_by(|a, b| a.changed_at.cmp(&b.changed_at))
         .map(|row| {
+            let said = format!(
+                "The latest changed by {} at {}",
+                named(&row.changed_by),
+                row.changed_at
+            );
             format!(
-                r#"<p class="hint">{} {}; the latest changed by {} at {}.</p>"#,
-                held.len(),
-                if held.len() == 1 { "row" } else { "rows" },
-                escape(&row.changed_by),
-                escape(&row.changed_at)
+                "<span class=\"changed\" title=\"{said}\" data-last-changed>{said}</span>",
+                said = escape(&said)
             )
         })
         .unwrap_or_default();
+    let about = if about.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"hint about-line\" title=\"{about}\">{about}</p>",
+            about = escape(about)
+        )
+    };
     // The grid's JSON escapes `<`, `>` and `&` so no cell closes the script.
     let json = grid
         .to_string()
@@ -1171,13 +1357,12 @@ fn table_field(
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
     format!(
-        "{}{unread}<input type=\"hidden\" name=\"{TABLE_FIELD}{field}\" value=\"1\">\
-         <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\" narrow=\"none\">\
+        "<div class=\"table-head\"><h2>{caption}</h2>{count}{who}</div>{about}{unread}\
+         <input type=\"hidden\" name=\"{TABLE_FIELD}{field}\" value=\"1\">\
+         <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\">\
          <script type=\"application/json\">{json}</script>\
          <div class=\"table-wrap\"><table class=\"one-line\"><caption>{caption}</caption>\
-         <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>{who}{}",
-        heading(declaration, declared, false, "", about),
-        hint(declaration, about),
+         <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>",
         field = escape(name),
     )
 }

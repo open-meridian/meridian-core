@@ -109,11 +109,11 @@ main.sheet h1{margin:0 0 .35rem}h2{margin:0 0 .75rem}h3{font-size:.95rem;margin:
 p{margin:.5rem 0}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 a.button{color:var(--ink)}a.button.primary{color:var(--primary-ink)}a.button:hover{text-decoration:none}\
 code{font-family:var(--mono);font-size:.86em}\
-table{border-collapse:collapse;width:100%;font-size:.93rem}\
-td,th{padding:.5rem .6rem;border-bottom:1px solid var(--line-soft);text-align:left}\
-th{font:600 .68rem var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint)}\
-label{display:block;margin:0 0 .9rem;font-size:.84rem;font-weight:550}\
-input:not([type=checkbox]):not([type=radio]):not([type=hidden]),select,textarea{padding:.5rem .65rem;\
+table:not(om-entry-grid *){border-collapse:collapse;width:100%;font-size:.93rem}\
+td:not(om-entry-grid *),th:not(om-entry-grid *){padding:.5rem .6rem;border-bottom:1px solid var(--line-soft);text-align:left}\
+th:not(om-entry-grid *){font:600 .68rem var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint)}\
+label:not(om-entry-grid *){display:block;margin:0 0 .9rem;font-size:.84rem;font-weight:550}\
+input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not(om-entry-grid *),select:not(om-entry-grid *),textarea:not(om-entry-grid *){padding:.5rem .65rem;\
 font:inherit;font-size:14.5px;font-weight:400;color:var(--ink);background:var(--card);\
 border:1px solid var(--line-strong);border-radius:var(--radius);max-width:100%}\
 label>input:not([type=checkbox]):not([type=radio]),label>select,label>textarea{display:block;width:100%;margin-top:.3rem}\
@@ -123,16 +123,16 @@ input::placeholder{color:var(--ink-faint)}\
 .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 .75rem}\
 .grid-wide{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,1fr);gap:0 .75rem}\
 @media (max-width:36rem){.grid-2,.grid-wide{grid-template-columns:minmax(0,1fr)}}\
-button{display:inline-flex;align-items:center;gap:.4rem;font:inherit;font-weight:550;padding:.48rem .9rem;\
+button:not(om-entry-grid *){display:inline-flex;align-items:center;gap:.4rem;font:inherit;font-weight:550;padding:.48rem .9rem;\
 border-radius:var(--radius);border:1px solid var(--line-strong);background:var(--card);color:var(--ink);\
 cursor:pointer;margin:.5rem .5rem 0 0}\
-button:hover{background:var(--hover)}\
+button:not(om-entry-grid *):hover{background:var(--hover)}\
 button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-ink)}\
 button.primary:hover{filter:brightness(1.1)}\
 button.danger{background:var(--danger-wash);border-color:var(--danger);color:var(--danger)}\
 button:disabled{opacity:.5;cursor:not-allowed}\
 button.reveal{margin:.35rem 0 0;padding:.15rem .6rem;font-size:.8rem;font-weight:500}\
-.hint{display:block;color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
+.hint:not(om-entry-grid *){display:block;color:var(--ink-soft);font-size:.88rem;font-weight:400;margin:.25rem 0 .9rem}\
 .refused,.warn,.passed,ul.refusal{border-radius:var(--radius);padding:.65rem .9rem;margin:.75rem 0;font-size:.93rem}\
 .refused,ul.refusal{color:var(--danger);background:var(--danger-wash);border:1px solid var(--danger)}\
 ul.refusal{padding-left:2rem}\
@@ -154,11 +154,11 @@ padding:.5rem 1.25rem;margin:0;font-size:.9rem}\
 .page-head{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap}\
 .page-head h1{margin:0}.page-head p{margin:.3rem 0 0}\
 .page-head .actions{display:flex;gap:.5rem;flex-wrap:wrap}.page-head .actions button{margin:0}\
-nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;padding-bottom:.75rem;\
-border-bottom:1px solid var(--line);font-size:.88rem}\
-nav.tabs a{padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
+nav.tabs{display:flex;gap:.25rem;margin:1rem 0 1.25rem;padding-bottom:.75rem;\
+border-bottom:1px solid var(--line);font-size:.88rem;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}\
+nav.tabs a{flex:none;white-space:nowrap;padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
 nav.tabs a:hover{text-decoration:none;background:var(--hover)}\
-nav.tabs a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
+nav.tabs a.here,nav.tabs a[aria-current]{background:var(--accent-wash);color:var(--accent);font-weight:600}\
 .admin:not(.js) nav.tabs{display:none}\
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
@@ -357,10 +357,19 @@ label.option input{margin:0;accent-color:var(--accent)}label.option .option-labe
 .with-unit .unit{display:flex;align-items:center;padding:0 .75rem;border:1px solid var(--line-strong);border-left:0;\
 border-radius:0 var(--radius) var(--radius) 0;background:var(--accent-wash);color:var(--accent);font-weight:600;font-size:.86rem}\
 label.check{display:flex;gap:.5rem;align-items:center;font-weight:400;font-size:.88rem;margin:.5rem 0 0}\
-details.developer{margin:.7rem 0 0;padding-top:.5rem;border-top:1px solid var(--line-soft)}\
-details.developer>summary{cursor:pointer;font-size:.86rem;font-weight:600;color:var(--ink-soft)}\
-details.developer .summary-note{margin-left:.35rem;font-weight:400;color:var(--ink-faint)}\
-details.developer>.fields{margin-top:.6rem}\
+.settings-head,.table-head{display:flex;align-items:baseline;gap:.4rem .75rem;min-width:0;margin:0 0 .4rem}\
+.settings-head h2,.table-head h2{flex:none;margin:0;font-size:1.05rem}.table-head .badge{flex:none}\
+.settings-head .changed,.table-head .changed{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;\
+color:var(--ink-soft);font-size:.82rem}\
+nav.setting-groups{display:block;white-space:nowrap;margin:0 0 .75rem;padding-bottom:.4rem;font-size:.84rem}\
+nav.setting-groups a{display:inline-block;margin-right:.25rem;padding:.25rem .7rem}\
+nav.setting-groups .badge{margin:0 0 0 .3rem;padding:.02rem .4rem;font-size:.7rem;border-radius:var(--radius-pill)}\
+form.settings .group-title{margin:.9rem 0 .4rem}form.settings.js .group-title{display:none}\
+form.settings.js .setting-group:not([id^=settings-developer]) .setting-head .need{display:none}\
+@media (max-width:40rem){form.settings .setting-head{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}\
+form.settings .setting-head .id{display:none}\
+section.settings-page{padding:.85rem .9rem}form.settings .fields{gap:.5rem 1.25rem}}\
+.table-setting .about-line{margin:0 0 .5rem;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
 .form-foot{position:sticky;bottom:0;z-index:5;display:flex;justify-content:flex-end;margin-top:.7rem;padding:.5rem 0;\
 border-top:1px solid var(--line-soft);background:var(--card)}\
 .form-foot button{margin:0}\
@@ -395,13 +404,52 @@ pub fn is_development() -> bool {
     DEVELOPMENT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The kit's stylesheet on this dashboard's origin, once it is known to be
-/// served (set once at start, from [`crate::kit::Kit`]). Unset, a page is
-/// its layout alone, as it is in a test.
-static KIT_STYLESHEET: OnceLock<String> = OnceLock::new();
+/// Where the kit is on this dashboard's origin, `/.meridian/ui/<version>/`,
+/// once it is known to be served (set once at start, from
+/// [`crate::kit::Kit::base`]). Unset, a page is its layout alone, as it is
+/// in a test.
+static KIT_BASE: OnceLock<String> = OnceLock::new();
 
-pub fn use_kit(stylesheet: String) {
-    let _ = KIT_STYLESHEET.set(stylesheet);
+pub fn use_kit(base: String) {
+    let _ = KIT_BASE.set(base);
+}
+
+/// The kit's components a page uses, each once, in the order the page first
+/// names them: every `<om-…>` element in its markup. Text a page shows is
+/// escaped, so only markup the dashboard wrote can name one.
+fn components(body: &str) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+    for (at, _) in body.match_indices("<om-") {
+        let name = &body[at + 1..];
+        let end = name
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+            .unwrap_or(name.len());
+        let name = &name[..end];
+        if name.len() > "om-".len() && !found.contains(&name) {
+            found.push(name);
+        }
+    }
+    found
+}
+
+/// The kit, linked: its stylesheet, and each component the page uses as a
+/// module from the same origin (the kit's `components/<element>.js`, which
+/// brings what it imports), so an `om-entry-grid` is the kit's grid rather
+/// than the plain table inside it (the product owner, 2026-10-05: "do we
+/// assume only 4 plan-code links will be needed?"). A browser without
+/// modules, or without script, keeps the plain markup, which posts the same.
+fn kit_links(body: &str) -> String {
+    let Some(base) = KIT_BASE.get() else {
+        return String::new();
+    };
+    let base = escape(base);
+    let mut links = format!("<link rel=\"stylesheet\" href=\"{base}meridian.css\">");
+    for name in components(body) {
+        links.push_str(&format!(
+            "<script type=\"module\" src=\"{base}components/{name}.js\"></script>"
+        ));
+    }
+    links
 }
 
 /// The mark, as on the platform's pages. It takes the colour it is set in.
@@ -1019,10 +1067,7 @@ fn report_link(part: &str) -> String {
 
 fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> String {
     let banner = if development { DEVELOPMENT_BANNER } else { "" };
-    let kit = KIT_STYLESHEET
-        .get()
-        .map(|href| format!("<link rel=\"stylesheet\" href=\"{}\">", escape(href)))
-        .unwrap_or_default();
+    let kit = kit_links(body);
     let main = if chrome.main.is_empty() {
         "sheet"
     } else {
@@ -1072,6 +1117,19 @@ mod tests {
         ] {
             assert!(STYLE.contains(rule), "{rule}");
         }
+    }
+
+    /// The kit's components a page uses are loaded as modules from the kit
+    /// (the product owner, 2026-10-05: "do we assume only 4 plan-code links
+    /// will be needed?"): each element named once, in order; text a page
+    /// shows is escaped, so it names none.
+    #[test]
+    fn a_page_loads_each_kit_component_it_uses_once() {
+        let body = "<om-entry-grid name=\"a\"><script type=\"application/json\">{}</script></om-entry-grid>\
+                    <p>&lt;om-chart&gt;</p><om-pager total=\"3\"></om-pager><om-entry-grid name=\"b\">\
+                    </om-entry-grid><om->";
+        assert_eq!(components(body), ["om-entry-grid", "om-pager"]);
+        assert!(components("<p>no components</p>").is_empty());
     }
 
     #[test]
@@ -1158,8 +1216,7 @@ mod tests {
     fn the_areas_page_sits_one_space_below_its_tab_row_as_under_every_tab_row() {
         assert!(STYLE.contains(".plugin-area nav.tabs{margin-bottom:var(--space-5)}"));
         // --space-5 is the kit's 20px, the 1.25rem every other tab row keeps.
-        assert!(STYLE
-            .contains("nav.tabs{display:flex;flex-wrap:wrap;gap:.25rem;margin:1rem 0 1.25rem;"));
+        assert!(STYLE.contains("nav.tabs{display:flex;gap:.25rem;margin:1rem 0 1.25rem;"));
         assert!(!STYLE.contains(".plugin-area nav.tabs{margin-bottom:0}"));
     }
 
