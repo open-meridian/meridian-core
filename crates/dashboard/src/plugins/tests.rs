@@ -1494,7 +1494,7 @@ async fn the_area_draws_one_heading_and_one_tab_row_around_the_page_in_a_seamles
     );
     // The page below, entered through the dashboard at the session's level
     // with the theme on its address, seamless: framed, told so by message on
-    // every load to its origin alone, as tall as it says, its header actions
+    // every load to its origin alone, the screen under the chrome, its header actions
     // and status drawn by the dashboard.
     assert!(
         body.contains(&format!(

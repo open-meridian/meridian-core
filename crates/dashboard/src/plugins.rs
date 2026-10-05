@@ -36,7 +36,8 @@
 //! the plugin declared at the session's level, around the page in a seamless
 //! frame, which enters the plugin's host through `/plugins/{instance}/enter`:
 //! `om-framed=1` on the address, `framed: true` in a version-3 message, and
-//! the frame as tall as the page says it is by `meridian:size`, so the
+//! the frame the viewport's height under the dashboard's chrome (every page
+//! fits one screen: the frame is the page's height budget), so the
 //! dashboard's heading and tab row are the only ones; the page's header
 //! actions (`meridian:actions`) are drawn in the area's head, and its status
 //! dot (`meridian:status`, kit 0.7.0) right after the plugin's name title.

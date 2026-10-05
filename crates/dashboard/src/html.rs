@@ -321,8 +321,13 @@ ul.plugins.tiles .plugin-card{padding:.85rem}}\
 .flag{display:block;padding:.55rem .8rem;border-radius:var(--radius);\
 background:var(--warn-wash);color:var(--warn-ink);font-size:.9rem;margin:.75rem 0 0}\
 .flag a{color:inherit;text-decoration:underline}\
-.plugin-frame{display:block;width:100%;height:70vh;min-height:28rem;border:0;border-radius:0;background:none;\
-color-scheme:light dark}.plugin-frame[data-sized]{min-height:0}\
+.plugin-frame{display:block;width:100%;height:70vh;min-height:16rem;border:0;border-radius:0;background:none;\
+color-scheme:light dark}\
+body:has(.plugin-frame[data-seamless]){height:100vh;height:100dvh;min-height:0}\
+main:has(.plugin-frame[data-seamless]){flex:1 1 0;min-height:0;display:flex;flex-direction:column;padding-bottom:var(--space-4)}\
+main:has(.plugin-frame[data-seamless])>.plugin-area{flex:1 1 0;min-height:0;display:flex;flex-direction:column}\
+.plugin-area>.tab-body:has(>.plugin-frame[data-seamless]){flex:1 1 0;min-height:16rem;display:flex;flex-direction:column}\
+.tab-body>.plugin-frame[data-seamless]{flex:1 1 0;height:auto;min-height:0}\
 html[data-om-mode=light] .plugin-frame{color-scheme:light}html[data-om-mode=dark] .plugin-frame{color-scheme:dark}\
 form.settings{max-width:60rem}\
 form.settings .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.7rem 1.25rem;align-items:start}\
@@ -515,8 +520,9 @@ pub fn noted_badge(class: &str, word: &str, note: &str, id: &str) -> (String, St
 /// message (meridian-ui's contract), as each frame's load does, so a
 /// navigation inside it keeps the person's theme. A seamless frame
 /// (`data-seamless`, the plugin area's) is told version 3 with `framed: true`,
-/// and is as tall as its page says it is, and its page's header actions and
-/// status dot are drawn by the dashboard; the full-page frame is told
+/// and takes the viewport's height under the dashboard's chrome (the
+/// stylesheet's: every page fits one screen), and its page's header actions
+/// and status dot are drawn by the dashboard; the full-page frame is told
 /// version 2, which says nothing of framing, so its page keeps its own. And
 /// a note on hover for whatever on the page carries one (`data-note`).
 const CHROME_SCRIPT: &str = r#"(function () {
@@ -541,30 +547,21 @@ const CHROME_SCRIPT: &str = r#"(function () {
     frame.addEventListener("load", function () { draw(frame, []); status(frame, null); tell(frame); });
     tell(frame);
   });
-  // A seamless frame's height is its page's, by meridian:size (meridian-ui's
-  // README, "The frame: seamless"): taken only from that frame's own window,
-  // from exactly the origin its theme is told to, as a whole number of
-  // pixels, and never more than TALLEST, since a height is only the page's
-  // request. Until the first, the stylesheet's height holds, so a page on a
-  // kit without the message still shows and the frame is never 0 tall.
-  var TALLEST = 20000;
-  window.addEventListener("message", function (event) {
-    var data = event.data;
-    frames.forEach(function (frame) {
-      if (!frame.hasAttribute("data-seamless") || !frame.contentWindow) return;
-      if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;
-      if (!data || data.type !== "meridian:size" || data.version !== 1) return;
-      if (!Number.isInteger(data.height) || data.height < 0) return;
-      frame.style.height = Math.min(data.height, TALLEST) + "px";
-      frame.setAttribute("data-sized", "");
-    });
-  });
+  // A seamless frame's height is the viewport's under the dashboard's chrome,
+  // the stylesheet's, whatever its page says it needs (the product owner,
+  // 2026-10-04: every page fits one screen; meridian-design
+  // tasks/design/every-page-fits-one-screen.md). That is the page's height
+  // budget: its own viewport, which meridian-ui (0.10.0) gives the page as
+  // --om-page-height, so no message carries it. A page that fits it has no
+  // scrollbar; one that does not scrolls inside the frame, never this page.
+  // meridian:size, which pages still post, grows nothing.
   // A seamless frame's header actions, by meridian:actions (meridian-ui's
   // README, "The frame: seamless"): the page's own buttons, drawn in the
   // header's area its frame names (data-actions), immediately left of the
   // level switch, which stays the rightmost, so actions grow leftward and
   // never move it (the product owner, 2026-10-01: "maybe the circular arrow
-  // to the left of the toggle"); under the size's guards and only in the kit's shape, else not
+  // to the left of the toggle"); taken only from that frame's own window, from
+  // exactly the origin its theme is told to, and only in the kit's shape, else not
   // at all. A label is text, never markup; an icon this dashboard draws (kit
   // 0.8.0's icon, ICONS) is drawn as it, the label its name and tooltip, and
   // any other is its label. A click is told back to the page, at the plugin's
@@ -645,7 +642,7 @@ const CHROME_SCRIPT: &str = r#"(function () {
   // meridian-ui's README, "The frame: seamless"): the page's own status dot,
   // drawn right after the plugin's name title in the area's heading, in the
   // place its frame names (data-status), so the page spends no line of its
-  // own on it (the product owner, 2026-09-30). Taken under the size's guards and only in the
+  // own on it (the product owner, 2026-09-30). Taken under the actions' guards and only in the
   // kit's shape, else not at all; state null takes the page's dot away, as a
   // new load of the frame does, and puts back what the place held when the
   // dashboard drew it: under Manage, the plugin's health as the dashboard
@@ -1087,46 +1084,23 @@ mod tests {
             .contains("class=\"development\""));
     }
 
-    /// The size listener, as it is written: the workspace runs no script, so
-    /// what it takes is held here line by line (and was run in a browser
-    /// against a stand-in plugin page on another origin when written).
+    /// Every page fits one screen (the product owner, 2026-10-04): a seamless
+    /// frame keeps the viewport's height under the dashboard's chrome
+    /// whatever its page says, so nothing in the script sets its height from
+    /// a message; the page's own viewport is its height budget. The theme is
+    /// told as before.
     #[test]
-    fn a_seamless_frame_takes_its_height_only_from_its_own_page_as_a_whole_number() {
-        let listener = CHROME_SCRIPT
-            .split("window.addEventListener(\"message\"")
-            .nth(1)
-            .expect("the size listener")
-            .split("\n  });\n")
-            .next()
-            .unwrap();
-        for guard in [
-            // Only a seamless frame, and only from its own window,
-            "if (!frame.hasAttribute(\"data-seamless\") || !frame.contentWindow) return;",
-            // from exactly the plugin's origin its theme is told to,
-            "if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;",
-            // as the message it is, at the version it is,
-            "if (!data || data.type !== \"meridian:size\" || data.version !== 1) return;",
-            // and a whole number of pixels, none less than none;
-            "if (!Number.isInteger(data.height) || data.height < 0) return;",
-            // then no taller than the dashboard's cap.
-            "frame.style.height = Math.min(data.height, TALLEST) + \"px\";",
-        ] {
-            assert!(listener.contains(guard), "{guard}\nnot in:{listener}");
-        }
-        let guards = [
-            "hasAttribute",
-            "event.source",
-            "\"meridian:size\"",
-            "Number.isInteger",
-            "Math.min",
-        ];
-        let at: Vec<usize> = guards.iter().map(|g| listener.find(g).unwrap()).collect();
+    fn a_seamless_frame_keeps_its_height_whatever_its_page_says() {
         assert!(
-            at.windows(2).all(|w| w[0] < w[1]),
-            "every check before the height is set"
+            !CHROME_SCRIPT.contains("style.height"),
+            "no message sets a frame's height"
         );
-        assert!(CHROME_SCRIPT.contains("var TALLEST = 20000;"));
-
+        assert!(!CHROME_SCRIPT.contains("data-sized"));
+        assert!(!CHROME_SCRIPT.contains("TALLEST"));
+        assert!(
+            !CHROME_SCRIPT.contains("data.type !== \"meridian:size\""),
+            "the size message is taken by nothing"
+        );
         // A seamless frame is told it is framed, at version 3; the full-page
         // frame is told version 2, which says nothing of framing.
         assert!(CHROME_SCRIPT.contains("version: seamless ? 3 : 2,"));
@@ -1136,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn a_seamless_frame_has_no_edge_of_its_own_and_a_height_until_its_page_says() {
+    fn a_seamless_frame_has_no_edge_of_its_own_and_the_screen_under_the_chrome() {
         let frame = STYLE
             .split(".plugin-frame{")
             .nth(1)
@@ -1149,13 +1123,25 @@ mod tests {
             "border-radius:0",
             "background:none",
             "width:100%",
-            "height:70vh",
-            "min-height:28rem",
+            "min-height:16rem",
         ] {
             assert!(frame.contains(rule), "{rule} not in {frame}");
         }
-        // Once the page has said, its height alone, however small.
-        assert!(STYLE.contains(".plugin-frame[data-sized]{min-height:0}"));
+        // The page holding a seamless frame is the viewport's height, and the
+        // frame takes what its chrome leaves: the header, the area's head
+        // and tab row, a small gap under it.
+        for rule in [
+            "body:has(.plugin-frame[data-seamless]){height:100vh;height:100dvh;min-height:0}",
+            "main:has(.plugin-frame[data-seamless]){flex:1 1 0;min-height:0;display:flex;flex-direction:column;\
+             padding-bottom:var(--space-4)}",
+            "main:has(.plugin-frame[data-seamless])>.plugin-area{flex:1 1 0;min-height:0;display:flex;flex-direction:column}",
+            ".plugin-area>.tab-body:has(>.plugin-frame[data-seamless]){flex:1 1 0;min-height:16rem;display:flex;\
+             flex-direction:column}",
+            ".tab-body>.plugin-frame[data-seamless]{flex:1 1 0;height:auto;min-height:0}",
+        ] {
+            assert!(STYLE.contains(rule), "{rule}");
+        }
+        assert!(!STYLE.contains("data-sized"), "no height of its page's");
         // The person's mode, as the page's, so the transparent page sits on
         // the dashboard rather than on an opaque canvas.
         assert!(frame.contains("color-scheme:light dark"));
@@ -1324,14 +1310,15 @@ mod tests {
         ));
     }
 
-    /// The header-actions listener, as it is written (as the size's is held
-    /// above): the same guards as the size's, then the kit's shape, before
-    /// anything is drawn; drawn as text; a click told to the plugin alone.
+    /// The header-actions listener, as it is written: the workspace runs no
+    /// script, so what it takes is held here line by line: only from its own
+    /// page's window and origin, then the kit's shape, before anything is
+    /// drawn; drawn as text; a click told to the plugin alone.
     #[test]
     fn a_seamless_frames_header_actions_are_taken_only_from_its_own_page_in_the_kits_shape() {
         let listener = CHROME_SCRIPT
             .split("window.addEventListener(\"message\"")
-            .nth(2)
+            .nth(1)
             .expect("the actions listener")
             .split("\n  });\n")
             .next()
@@ -1454,7 +1441,7 @@ mod tests {
 
     /// The header-status listener, as it is written (kit 0.7.0's
     /// `meridian:status`; the product owner, 2026-09-30: "put the green icon
-    /// ... next to the plugin name"): the size's guards, its own type at
+    /// ... next to the plugin name"): the actions' guards, its own type at
     /// version 1, then the kit's shape, before anything is drawn; drawn
     /// right after the plugin's name title as text (the product owner,
     /// 2026-09-30: "green check circle should be next to plugin name title of
@@ -1463,7 +1450,7 @@ mod tests {
     fn a_seamless_frames_status_is_taken_only_from_its_own_page_and_drawn_beside_the_name() {
         let listener = CHROME_SCRIPT
             .split("window.addEventListener(\"message\"")
-            .nth(3)
+            .nth(2)
             .expect("the status listener")
             .split("\n  });\n")
             .next()

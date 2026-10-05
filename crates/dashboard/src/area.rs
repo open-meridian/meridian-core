@@ -15,9 +15,11 @@
 //! before the plugin's name (the product owner, 2026-09-30: "in front of the
 //! plugin name title, add the house icon as a link to go back to the
 //! homepage") -- and one tab row, and under them the page, framed
-//! **seamlessly** -- no border and no scroll of its own, as tall as the page
-//! says it is by `meridian:size`, with `om-framed=1` on its address so the
-//! kit draws no heading or tab row of its own. The page's header actions
+//! **seamlessly** -- no border of its own, the viewport's height under the
+//! dashboard's chrome whatever its page says (the product owner, 2026-10-04:
+//! every page fits one screen; the page's own viewport is its height budget,
+//! and a page taller than it scrolls inside the frame), with `om-framed=1` on
+//! its address so the kit draws no heading or tab row of its own. The page's header actions
 //! (`meridian:actions`) are drawn in the area's head, as the admin view drew
 //! them for its pages before they moved here (meridian-core 1b2a9ad), and its
 //! status dot (`meridian:status`, kit 0.7.0) right after the plugin's name
