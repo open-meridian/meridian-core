@@ -576,6 +576,43 @@ message ListMissesReply {
   string next_cursor = 2;
 }
 
+// W1.14. The records with no asset class, for a delegation that assigns
+// asset classes (W1.12) and refused for any other. What deployments reported
+// in them is a lead, never a source.
+message ListUnclassifiedRequest {
+  int32 page_size = 1;
+}
+
+message ListUnclassifiedReply {
+  // Instruments with no class, stubs minted from deployments' misses among
+  // them, oldest first.
+  repeated InstrumentRecord instruments = 1;
+  // Misses no stub was minted for, with no class, most wanted first.
+  repeated MissEntry misses = 2;
+}
+
+// W1.14. Set the class of one record that has none: an instrument, or a miss
+// no stub was minted for; exactly one of the two is named, and `{id}` in the
+// route is that one's ID. Any class the enum defines, whatever the
+// delegation's classes; made directly, and nothing else about the record
+// changes. Refused for a record that has a class and for a delegation that
+// does not assign asset classes. The source and note are required, as on
+// every agent write: which allowed source stated the class, and how.
+message AssignClassRequest {
+  string instrument_id = 1;
+  string miss_id = 2;
+  AssetClass asset_class = 3;
+  string source = 4;
+  string note = 5;
+}
+
+// The record with its class: the instrument at its next version, or the
+// miss.
+message AssignClassReply {
+  InstrumentRecord instrument = 1;
+  MissEntry miss = 2;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // W3 — resolution
 // ─────────────────────────────────────────────────────────────────────────────

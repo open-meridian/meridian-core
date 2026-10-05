@@ -805,6 +805,11 @@ message ResearchScope {
   // Optional narrowing, by listing venue and by identifier scheme.
   repeated string venue_mics = 2;
   repeated string schemes = 3;
+  // Apart from the classes, whether the delegation assigns asset classes
+  // (W1.12, shown as "Assigns asset classes"): only a delegation holding it
+  // sees the records with no class, and works them by W1.14. A delegation
+  // may hold this, classes, both or neither.
+  bool assigns_classes = 5;
 
   // Once strings, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.

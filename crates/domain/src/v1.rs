@@ -503,6 +503,53 @@ pub struct ListMissesReply {
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
 }
+/// W1.14. The records with no asset class, for a delegation that assigns
+/// asset classes (W1.12) and refused for any other. What deployments reported
+/// in them is a lead, never a source.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListUnclassifiedRequest {
+    #[prost(int32, tag = "1")]
+    pub page_size: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListUnclassifiedReply {
+    /// Instruments with no class, stubs minted from deployments' misses among
+    /// them, oldest first.
+    #[prost(message, repeated, tag = "1")]
+    pub instruments: ::prost::alloc::vec::Vec<InstrumentRecord>,
+    /// Misses no stub was minted for, with no class, most wanted first.
+    #[prost(message, repeated, tag = "2")]
+    pub misses: ::prost::alloc::vec::Vec<MissEntry>,
+}
+/// W1.14. Set the class of one record that has none: an instrument, or a miss
+/// no stub was minted for; exactly one of the two is named, and `{id}` in the
+/// route is that one's ID. Any class the enum defines, whatever the
+/// delegation's classes; made directly, and nothing else about the record
+/// changes. Refused for a record that has a class and for a delegation that
+/// does not assign asset classes. The source and note are required, as on
+/// every agent write: which allowed source stated the class, and how.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AssignClassRequest {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub miss_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "AssetClass", tag = "3")]
+    pub asset_class: i32,
+    #[prost(string, tag = "4")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The record with its class: the instrument at its next version, or the
+/// miss.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AssignClassReply {
+    #[prost(message, optional, tag = "1")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+    #[prost(message, optional, tag = "2")]
+    pub miss: ::core::option::Option<MissEntry>,
+}
 /// Reverse resolution: identifiers to an instrument, as of a date.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveIdentifierRequest {
@@ -2043,6 +2090,12 @@ pub struct ResearchScope {
     pub venue_mics: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "3")]
     pub schemes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Apart from the classes, whether the delegation assigns asset classes
+    /// (W1.12, shown as "Assigns asset classes"): only a delegation holding it
+    /// sees the records with no class, and works them by W1.14. A delegation
+    /// may hold this, classes, both or neither.
+    #[prost(bool, tag = "5")]
+    pub assigns_classes: bool,
 }
 /// A record the platform owns; every authorisation of an agent reads it.
 #[derive(Clone, PartialEq, ::prost::Message)]
