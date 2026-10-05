@@ -112,12 +112,16 @@ pub struct SettingChangeRecord {
     pub note: String,
 }
 
-/// Set or replaced, cleared, or a gap: nothing known before this record.
+/// Set or replaced, cleared, a gap (nothing known before this record), or a
+/// redaction: the values earlier records held blanked, because the setting
+/// became secret (the product owner, 2026-10-05). A redaction blanks the value
+/// and nothing else: no record is deleted, and none changes who or when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     Set,
     Cleared,
     NotKnownBefore,
+    Redacted,
 }
 
 impl ChangeKind {
@@ -127,6 +131,7 @@ impl ChangeKind {
             ChangeKind::Set => 1,
             ChangeKind::Cleared => 2,
             ChangeKind::NotKnownBefore => 3,
+            ChangeKind::Redacted => 4,
         }
     }
 
@@ -135,6 +140,7 @@ impl ChangeKind {
             1 => Some(ChangeKind::Set),
             2 => Some(ChangeKind::Cleared),
             3 => Some(ChangeKind::NotKnownBefore),
+            4 => Some(ChangeKind::Redacted),
             _ => None,
         }
     }
@@ -155,7 +161,75 @@ pub struct Snapshot {
     pub declared_settings: BTreeMap<String, Vec<SettingDeclaration>>,
     /// Every setting given to any plugin, secrets sealed (W6.11).
     pub settings: Vec<StoredSetting>,
+    /// Each plugin's latest change to its settings, a clear included, from
+    /// the change records: who the settings record says last changed them,
+    /// and when. Empty `by` for a clear the plugin's re-declaration made.
+    pub settings_changed: BTreeMap<String, LastChange>,
 }
+
+/// Who made a plugin's latest settings change, and when.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LastChange {
+    pub by: String,
+    pub at_ns: i64,
+}
+
+/// Why a re-declaration clears a setting's held value: its type or whether it
+/// is secret changed, or it was declared again after a declaration without
+/// it, so the value held was set under a declaration no longer known.
+/// `None` when the value held still stands under the new declaration.
+pub fn redeclared(before: Option<&SettingDeclaration>, now: &SettingDeclaration) -> Option<String> {
+    let kind = |declaration: &SettingDeclaration| -> String {
+        let named = meridian_pb::v1::SettingType::try_from(declaration.r#type)
+            .map(|kind| {
+                kind.as_str_name()
+                    .trim_start_matches("SETTING_TYPE_")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_else(|_| format!("type {}", declaration.r#type));
+        if declaration.secret {
+            format!("a secret {named}")
+        } else {
+            format!("{named}, not secret")
+        }
+    };
+    match before {
+        None => Some(format!(
+            "cleared by the plugin's re-declaration, no person: {} was declared again, as {}, \
+             after a declaration without it, and its value was set under one no longer known",
+            now.name,
+            kind(now)
+        )),
+        Some(before) if before.r#type != now.r#type || before.secret != now.secret => {
+            Some(format!(
+                "cleared by the plugin's re-declaration, no person: {} was {} and is now {}, \
+                 and its value was set under the earlier declaration",
+                now.name,
+                kind(before),
+                kind(now)
+            ))
+        }
+        Some(_) => None,
+    }
+}
+
+/// What a redaction record says: which records' values it blanked, and why.
+pub fn redaction_note(change_ids: &[i64], why: &str) -> String {
+    let ids: Vec<String> = change_ids.iter().map(ToString::to_string).collect();
+    format!(
+        "redacted the value of change record{} {}: {why}",
+        if ids.len() == 1 { "" } else { "s" },
+        ids.join(", ")
+    )
+}
+
+/// Why a re-declaration redacts: the setting became secret.
+pub const REDACTED_BY_REDECLARATION: &str =
+    "the setting became secret; by the plugin's re-declaration, no person";
+
+/// Why storing a sealed value redacts: the setting's value became sealed.
+pub const REDACTED_BY_SEALING: &str =
+    "the setting's value became sealed, a secret; by its being set so";
 
 /// How a live launch ended: stopped by an administrator, or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,15 +301,24 @@ pub trait Store: Send + Sync {
     /// Replace what a plugin declared it needs. Written only from the report
     /// of a registered plugin, so one that is between registrations keeps
     /// what it last declared.
+    ///
+    /// In the same step, a value held for a setting [`redeclared`] is
+    /// cleared, the clear its own change record naming the re-declaration,
+    /// no person, as its cause; and a setting declared secret has every
+    /// value its earlier change records hold redacted, the redaction its own
+    /// record ([`ChangeKind::Redacted`]). Returns the settings cleared.
     fn record_declared_settings(
         &self,
         plugin_instance_id: &str,
         declared: &[SettingDeclaration],
-    ) -> Result<()>;
+        at_ns: i64,
+    ) -> Result<Vec<String>>;
 
     /// Apply every change to one plugin's settings, and record each as its
     /// own change -- the value of one that is not secret, never a secret's --
-    /// with who made it and when, all in one step.
+    /// with who made it and when, all in one step. A sealed value stored
+    /// redacts the values that setting's earlier records hold, as a
+    /// re-declaration as secret does.
     fn put_plugin_settings(
         &self,
         plugin_instance_id: &str,

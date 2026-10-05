@@ -668,7 +668,19 @@ async fn save_settings(
     // A table's cells, each checked as the conductor checks it, an external
     // account one the plugin reported and an instrument one the deployment
     // holds; nothing is sent while one does not read (W6.11, contract v14).
-    let offered = choices(app, instance, record, &records).await;
+    let mut offered = choices(app, instance, record, &records).await;
+    // An instrument typed is checked by its ID, not against the list the
+    // grid offers, which holds the first thousand records at most.
+    for id in settings::posted_instruments(record, fields) {
+        if offered.instruments.iter().any(|(held, _)| *held == id) {
+            continue;
+        }
+        match instruments::record_held(&app.bus, &id).await {
+            Ok(true) => offered.instruments.push((id.clone(), id)),
+            Ok(false) => {}
+            Err(why) => offered.unread = why,
+        }
+    }
     let problems = settings::table_problems(record, fields, &offered);
     if !problems.is_empty() {
         return after_to(Err(settings::said(record, &problems)), back, back);
@@ -871,10 +883,19 @@ pub(crate) async fn choices(
 }
 
 /// Who last changed a plugin's settings, and when (W6.11), as the conductor
-/// recorded it: on the dashboard's form, the one way a setting is set.
+/// recorded it: on the dashboard's form, the one way a person sets one, or
+/// the plugin's re-declaring one with another type, or as secret or not,
+/// which cleared it and names no person.
 pub(crate) fn last_changed(records: &AccessRecords, record: &PluginSettingsRecord) -> String {
     if record.updated_by.is_empty() {
-        return String::new();
+        if record.updated_at_ns == 0 {
+            return String::new();
+        }
+        return format!(
+            "<p class=\"hint\" data-last-changed>Last changed by the plugin's re-declaring a \
+             setting, which cleared it, {when}.</p>",
+            when = escape(&crate::custody::utc(record.updated_at_ns)),
+        );
     }
     format!(
         "<p class=\"hint\" data-last-changed>Last changed by {who}, {when}.</p>",

@@ -5529,10 +5529,9 @@ pub struct PluginSettingValue {
     pub value: ::prost::alloc::string::String,
 }
 /// Sets or clears a plugin's settings, for an admin of the plugin.
-/// Sent by the dashboard from the plugin's Settings form, or by the plugin from
-/// one of its own pages at admin, acting for the admin viewing it in a session
-/// opened by Manage (W6.11, W4.9), its sidecar stamping plugin_instance_id. A
-/// plugin's page never names a secret.
+/// Sent by the dashboard alone, from the plugin's Settings form, for the admin
+/// signed in (W6.11). A plugin sets none of its settings: it reads them as
+/// they are delivered (W4.7).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetPluginSettingsRequest {
     #[prost(string, tag = "1")]
@@ -5562,9 +5561,10 @@ pub struct PluginSettingsRecord {
     pub declared_settings: ::prost::alloc::vec::Vec<
         ::meridian_pb::v1::SettingDeclaration,
     >,
-    /// Who changed a setting at updated_at_ns: the deployment-local subject of
-    /// the admin the dashboard or the plugin's sidecar stamped, from the form
-    /// and the plugin's page alike (W6.11). Empty while nothing is set.
+    /// Who made the latest change to the settings, a clear included, at
+    /// updated_at_ns: the deployment-local subject of the admin the dashboard
+    /// stamped on the Settings form (W6.11). Empty while nothing was ever
+    /// changed, and for a clear the plugin's re-declaring a setting made.
     #[prost(string, tag = "6")]
     pub updated_by: ::prost::alloc::string::String,
 }

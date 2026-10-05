@@ -10,9 +10,10 @@
 //! it stores anything, and the two must refuse alike, naming the same cell
 //! (`plan_code_links[2].instrument`).
 //!
-//! What only one side can know is that side's: the dashboard checks an
+//! What neither side can know from the declaration alone -- that an
 //! instrument cell names a record the instrument store holds, and an
-//! external account cell one the plugin reported; here, their shape.
+//! external account cell one the plugin reported or links -- each side
+//! checks too, the conductor as the authority; here, their shape.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -285,7 +286,10 @@ fn cell(column: &SettingColumn, typed: &str) -> Result<String, String> {
             }
         }
         SettingColumnType::ExternalAccount | SettingColumnType::Instrument => {
-            if typed.chars().count() > MOST_ID || typed.chars().any(char::is_whitespace) {
+            if typed.chars().count() > MOST_ID
+                || typed.chars().any(char::is_whitespace)
+                || crate::text::refused(typed).is_some()
+            {
                 Err(format!(
                     "an identifier, at most {MOST_ID} characters, no spaces"
                 ))
@@ -293,9 +297,17 @@ fn cell(column: &SettingColumn, typed: &str) -> Result<String, String> {
                 Ok(typed.to_string())
             }
         }
+        // Plain text as a ticket's is (crate::text): no control character,
+        // bidirectional override or isolate, zero-width, tag or private-use
+        // character, each of which can hide or reorder what a reader sees.
+        // One line, so neither a newline nor a tab either.
         SettingColumnType::Text | SettingColumnType::Unspecified => {
             if typed.chars().count() > MOST_TEXT {
                 Err(format!("at most {MOST_TEXT} characters"))
+            } else if let Some(found) = crate::text::refused(typed) {
+                Err(found.to_string())
+            } else if typed.contains(['\n', '\t']) {
+                Err("one line of plain text: no newline or tab".to_string())
             } else {
                 Ok(typed.to_string())
             }
@@ -489,6 +501,38 @@ mod tests {
         let three = vec![given[0].clone(), given[0].clone(), given[0].clone()];
         let too_many = checked(&plan_codes(), &three).unwrap_err();
         assert_eq!(too_many[0].path, "plan_code_links");
+    }
+
+    #[test]
+    fn a_text_cell_is_plain_text_as_a_tickets_is() {
+        let row = |code: &str, instrument: &str| {
+            vec![cells(&[
+                ("account", "st-1"),
+                ("code", code),
+                ("instrument", instrument),
+            ])]
+        };
+        for hidden in [
+            "OQ\u{202E}KR",
+            "OQ\u{2066}KR",
+            "OQ\u{200B}KR",
+            "OQ\u{0007}KR",
+            "OQ\nKR",
+            "OQ\tKR",
+            "OQ\u{E000}KR",
+        ] {
+            let problems = checked(&plan_codes(), &row(hidden, "INS-7")).unwrap_err();
+            assert_eq!(problems.len(), 1, "{hidden:?}");
+            assert_eq!(problems[0].path, "plan_code_links[0].code");
+            assert!(
+                !problems[0].message.contains("OQ"),
+                "never the value: {}",
+                problems[0].message
+            );
+        }
+        let problems = checked(&plan_codes(), &row("OQKR", "INS\u{202E}7")).unwrap_err();
+        assert_eq!(problems[0].path, "plan_code_links[0].instrument");
+        assert!(checked(&plan_codes(), &row("Plan Ü-7 · ok", "INS-7")).is_ok());
     }
 
     #[test]

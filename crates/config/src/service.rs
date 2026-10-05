@@ -1,8 +1,9 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
 //! Eleven commands and queries from the dashboard, two queries from sidecars,
-//! a command and a query from a plugin acting for its admin, two events
-//! heard, one announced. Every change is written the same way:
+//! a command and a query from a plugin acting for its admin, three events
+//! heard, a query asked of the instrument store, one announced. Every change
+//! is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
 //! again only when something it would be told has changed.
@@ -28,7 +29,17 @@
 //! change (`updated_by`). Only the dashboard's form sets a setting: a plugin
 //! reads its settings and sets none (W6.11, option A). A table setting's
 //! rows are checked cell by cell, and each row added or changed is stamped
-//! with `changed_by` and `changed_at` ([`meridian_domain::setting_table`]).
+//! with `changed_by` and `changed_at` ([`meridian_domain::setting_table`]);
+//! an external account cell names one the plugin reported or links, and an
+//! instrument cell a record the instrument store holds, asked by its ID.
+//!
+//! A setting re-declared with another type, or as secret or not, has its
+//! value cleared as the declaration is kept, the clear its own record naming
+//! the re-declaration and no person; one declared secret has the values its
+//! earlier records hold redacted (the product owner, 2026-10-05). And a value
+//! held is re-read against its declaration as it stands before it is
+//! delivered, shown, or its rows' stamps kept: one that does not read is
+//! withheld.
 //!
 //! # Who asked
 //!
@@ -46,8 +57,8 @@
 //! nobody is refused, a plugin links only its own external accounts, and a
 //! link naming a new account creates and links it in one step.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use meridian_bus::{Bus, Envelope};
 use meridian_domain::setting_table;
@@ -60,7 +71,10 @@ use meridian_domain::v1::{
     PluginSettingsRecord, RedeemClaimCodeReply, RedeemClaimCodeRequest, SetPluginSettingsRequest,
     SignInRecord, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
-use meridian_pb::v1::PluginAccessRequest;
+use meridian_domain::v1::{
+    ExternalAccountsEvent, ResolveInstrumentReply, ResolveInstrumentRequest,
+};
+use meridian_pb::v1::{PluginAccessRequest, SettingColumnType, SettingDeclaration};
 use prost::Message;
 
 use crate::ids;
@@ -89,6 +103,16 @@ pub const PLUGIN_CONFIGURATION: &str = "platform.config.query.plugin-configurati
 pub const PLUGIN_CONFIGURATION_CHANGED: &str = "platform.config.event.plugin-configuration-changed";
 pub const PLUGIN_ACCESS: &str = "platform.config.query.plugin-access";
 pub const PLUGIN_REPORT: &str = "platform.deployment.event.plugin-report";
+/// W2.8: the external accounts each custody connection reaches, which a
+/// table's external account cell is checked against (W6.11).
+pub const EXTERNAL_ACCOUNTS: &str = "platform.custody.*.event.external-accounts";
+/// W3.6: a record by its ID, which a table's instrument cell is checked
+/// against (W6.11).
+pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
+
+/// How long a settings update waits for the instrument store to say whether
+/// a record exists.
+const INSTRUMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where the time comes from: the deployment's one clock (decisions/024),
 /// given by whoever wires this up, so a test does not wait for it.
@@ -167,15 +191,49 @@ fn stored_settings<'a>(
     snapshot: &'a Snapshot,
     plugin_instance_id: &'a str,
 ) -> impl Iterator<Item = &'a StoredSetting> {
+    declared_and_stored(snapshot, plugin_instance_id).map(|(_, held)| held)
+}
+
+/// Each setting a plugin declared and has a value held for, with its
+/// declaration as it stands.
+fn declared_and_stored<'a>(
+    snapshot: &'a Snapshot,
+    plugin_instance_id: &'a str,
+) -> impl Iterator<Item = (&'a SettingDeclaration, &'a StoredSetting)> {
     let declared = snapshot
         .declared_settings
         .get(plugin_instance_id)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    snapshot.settings.iter().filter(move |held| {
-        held.plugin_instance_id == plugin_instance_id
-            && declared.iter().any(|d| d.name == held.name)
+    snapshot.settings.iter().filter_map(move |held| {
+        if held.plugin_instance_id != plugin_instance_id {
+            return None;
+        }
+        declared
+            .iter()
+            .find(|d| d.name == held.name)
+            .map(|declaration| (declaration, held))
     })
+}
+
+/// A value held, if it reads under its declaration as it stands
+/// ([`rules::held_reads`]); one that does not is said, naming the setting
+/// and never the value, and withheld.
+fn held_reading<'a>(
+    declaration: &SettingDeclaration,
+    held: &'a StoredSetting,
+    plugin_instance_id: &str,
+) -> Option<&'a Held> {
+    match rules::held_reads(declaration, &held.held) {
+        Ok(()) => Some(&held.held),
+        Err(why) => {
+            tracing::warn!(
+                plugin = plugin_instance_id,
+                "{why}; withheld until it is set again"
+            );
+            None
+        }
+    }
 }
 
 /// What a sidecar is told about its plugin, but for its settings: those are
@@ -226,9 +284,9 @@ pub fn configuration(
     key: &SettingsKey,
 ) -> PluginConfiguration {
     let mut configuration = told(snapshot, plugin_instance_id);
-    configuration.settings = stored_settings(snapshot, plugin_instance_id)
-        .filter_map(|held| {
-            let value = match &held.held {
+    configuration.settings = declared_and_stored(snapshot, plugin_instance_id)
+        .filter_map(|(declaration, held)| {
+            let value = match held_reading(declaration, held, plugin_instance_id)? {
                 Held::Plain(value) => value.clone(),
                 Held::Sealed(sealed) => match key.open(plugin_instance_id, &held.name, sealed) {
                     Ok(value) => value,
@@ -248,10 +306,13 @@ pub fn configuration(
 }
 
 /// What the dashboard may show of a plugin's settings (W6.11): what it
-/// declared, the values that are not secret, and which secrets are set.
+/// declared, the values that are not secret, and which secrets are set; and
+/// who made the latest change, and when, from the change records, a clear
+/// included.
 ///
 /// A setting declared secret, or held sealed, is only ever named: whatever
-/// the plugin declares later, nothing sealed is shown.
+/// the plugin declares later, nothing sealed is shown. A value that is not
+/// secret is shown only if it reads under its declaration as it stands.
 pub fn settings_record(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginSettingsRecord {
     let declared = snapshot
         .declared_settings
@@ -262,19 +323,22 @@ pub fn settings_record(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginS
         plugin_instance_id: plugin_instance_id.to_string(),
         ..Default::default()
     };
-    for held in stored_settings(snapshot, plugin_instance_id) {
-        let secret = declared.iter().any(|d| d.name == held.name && d.secret);
+    for (declaration, held) in declared_and_stored(snapshot, plugin_instance_id) {
         match &held.held {
-            Held::Plain(value) if !secret => record.values.push(PluginSettingValue {
-                name: held.name.clone(),
-                value: value.clone(),
-            }),
+            Held::Plain(value) if !declaration.secret => {
+                if held_reading(declaration, held, plugin_instance_id).is_some() {
+                    record.values.push(PluginSettingValue {
+                        name: held.name.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
             _ => record.secrets_set.push(held.name.clone()),
         }
-        if held.set_at_ns >= record.updated_at_ns {
-            record.updated_at_ns = held.set_at_ns;
-            record.updated_by = held.set_by.clone();
-        }
+    }
+    if let Some(last) = snapshot.settings_changed.get(plugin_instance_id) {
+        record.updated_at_ns = last.at_ns;
+        record.updated_by = last.by.clone();
     }
     record.declared_settings = declared;
     record
@@ -324,11 +388,131 @@ struct Context {
     clock: Arc<dyn Clock>,
     upstream: Arc<dyn Upstream>,
     key: Arc<SettingsKey>,
+    /// The external accounts each custody instance last reported (W2.8),
+    /// as heard since this started: in memory, since a connector reports its
+    /// whole list on each read, as the dashboard keeps it.
+    reported: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Context {
     fn snapshot(&self) -> Result<Snapshot, String> {
         self.store.snapshot().map_err(|failed| failed.to_string())
+    }
+
+    /// Whether the instrument store holds a record by this ID, asked from a
+    /// handler's blocking thread; or why it could not be told.
+    fn instrument_held(&self, instrument_id: &str) -> Result<bool, String> {
+        let unavailable = |why: String| {
+            format!("the instrument store did not say whether it holds the record, and nothing was stored: {why}")
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|failed| unavailable(failed.to_string()))?;
+        let (payload_type, payload) = handle
+            .block_on(
+                self.bus.call(
+                    RESOLVE_INSTRUMENT,
+                    "meridian.v1.ResolveInstrumentRequest",
+                    ResolveInstrumentRequest {
+                        instrument_id: instrument_id.to_string(),
+                        as_of_ns: self.clock.now_ns(),
+                    }
+                    .encode_to_vec(),
+                    None,
+                    Some(INSTRUMENT_WAIT),
+                ),
+            )
+            .map_err(|failed| unavailable(failed.to_string()))?;
+        if payload_type != "meridian.v1.ResolveInstrumentReply" {
+            return Err(unavailable(format!("it answered {payload_type}")));
+        }
+        let reply = ResolveInstrumentReply::decode(&payload[..])
+            .map_err(|failed| unavailable(failed.to_string()))?;
+        Ok(reply.found && reply.instrument.is_some())
+    }
+
+    /// Every cell of a table update that names what this deployment does not
+    /// hold, by its path as given (W6.11): an external account the plugin
+    /// has not reported and does not link, an instrument the instrument
+    /// store holds no record of. The conductor is the authority on both; the
+    /// dashboard checks the same to say it on the form first.
+    fn references_refused(
+        &self,
+        snapshot: &Snapshot,
+        request: &SetPluginSettingsRequest,
+    ) -> Result<(), String> {
+        let plugin = request.plugin_instance_id.as_str();
+        let Some(declared) = snapshot.declared_settings.get(plugin) else {
+            return Ok(());
+        };
+        let reported: BTreeSet<String> = self
+            .reported
+            .lock()
+            .map(|heard| heard.get(plugin).cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let linked = |id: &str| {
+            snapshot
+                .links
+                .iter()
+                .any(|l| l.plugin_instance_id == plugin && l.external_account_id == id)
+        };
+        let mut instruments: BTreeMap<String, bool> = BTreeMap::new();
+        let mut problems = Vec::new();
+        for given in &request.values {
+            let Some(declaration) = declared
+                .iter()
+                .find(|d| d.name == given.name && setting_table::is_table(d))
+            else {
+                continue;
+            };
+            let rows = setting_table::parse(&given.value)
+                .map_err(|why| format!("setting {}: {why}", given.name))?;
+            for (n, row) in rows.iter().enumerate() {
+                for column in &declaration.columns {
+                    let typed = row
+                        .cells
+                        .get(&column.name)
+                        .map(|v| v.trim())
+                        .unwrap_or_default();
+                    if typed.is_empty() {
+                        continue;
+                    }
+                    let path = format!("{}[{n}].{}", given.name, column.name);
+                    match SettingColumnType::try_from(column.r#type) {
+                        Ok(SettingColumnType::ExternalAccount)
+                            if !reported.contains(typed) && !linked(typed) =>
+                        {
+                            problems.push(format!(
+                                "{path}: names no external account this plugin reported or links"
+                            ));
+                        }
+                        Ok(SettingColumnType::Instrument) => {
+                            let held = match instruments.get(typed) {
+                                Some(held) => *held,
+                                None => {
+                                    let held = self.instrument_held(typed)?;
+                                    instruments.insert(typed.to_string(), held);
+                                    held
+                                }
+                            };
+                            if !held {
+                                problems.push(format!(
+                                    "{path}: names no instrument record this deployment holds"
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the settings name what this deployment does not hold, and nothing was stored: {}",
+                problems.join("; ")
+            ))
+        }
     }
 
     /// Announce each plugin whose configuration a change moved. Carries no
@@ -500,6 +684,7 @@ pub fn serve(
         clock,
         upstream,
         key,
+        reported: Mutex::new(BTreeMap::new()),
     });
 
     // Links made before an account held one external account at most are
@@ -574,9 +759,23 @@ pub fn serve(
             let now = cx.clock.now_ns();
             // Every value checked, and every secret sealed, before anything
             // is written: a refusal part-way through changes nothing.
+            let checked = rules::plugin_settings(&before, &request)?;
+            cx.references_refused(&before, &request)?;
             let mut changes = Vec::new();
-            for (declaration, value) in rules::plugin_settings(&before, &request)? {
+            for (declaration, value) in checked {
                 let name = declaration.name.clone();
+                // Never a value that is not secret over one held sealed: the
+                // form shows a sealed value as a secret's field, and what is
+                // typed there is stored in plain text and recorded. Cleared
+                // first, it may be set.
+                let sealed = stored_settings(&before, plugin)
+                    .any(|held| held.name == name && matches!(held.held, Held::Sealed(_)));
+                if value.is_some() && sealed && !declaration.secret {
+                    return Err(format!(
+                        "setting {name} holds a sealed value and is no longer declared secret; \
+                         clear it, then set it"
+                    ));
+                }
                 let held = match value {
                     None => None,
                     // A table's rows, each added or changed stamped with who
@@ -584,9 +783,13 @@ pub fn serve(
                     Some(value) if setting_table::is_table(declaration) => {
                         let rows = setting_table::parse(&value)
                             .map_err(|why| format!("setting {name}: {why}"))?;
-                        let standing = stored_settings(&before, plugin)
-                            .find(|held| held.name == name)
-                            .and_then(|held| match &held.held {
+                        // The stamps of the rows held, only where what is
+                        // held reads as this table: a value from an earlier
+                        // declaration lends no row its stamps.
+                        let standing = declared_and_stored(&before, plugin)
+                            .find(|(_, held)| held.name == name)
+                            .and_then(|(declared, held)| held_reading(declared, held, plugin))
+                            .and_then(|held| match held {
                                 Held::Plain(text) => setting_table::parse(text).ok(),
                                 Held::Sealed(_) => None,
                             })
@@ -1090,6 +1293,44 @@ pub fn serve(
         }
     });
 
+    // The external accounts each custody instance reports, by the instance
+    // its topic names, which the broker lets only that instance publish.
+    let mut accounts = bus.subscribe(EXTERNAL_ACCOUNTS);
+    let hearing = Arc::clone(&context);
+    tokio::spawn(async move {
+        while let Some(delivery) = accounts.recv().await {
+            let topic = delivery
+                .envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.topic.clone())
+                .unwrap_or_default();
+            let instance = match topic.split('.').collect::<Vec<_>>()[..] {
+                ["platform", "custody", instance, ..] if !instance.is_empty() => {
+                    instance.to_string()
+                }
+                _ => continue,
+            };
+            match ExternalAccountsEvent::decode(&delivery.envelope.payload[..]) {
+                Ok(event) => {
+                    if let Ok(mut heard) = hearing.reported.lock() {
+                        heard.insert(
+                            instance,
+                            event
+                                .accounts
+                                .into_iter()
+                                .map(|account| account.external_account_id)
+                                .collect(),
+                        );
+                    }
+                }
+                Err(failed) => {
+                    tracing::warn!(instance, "an account report did not decode: {failed}")
+                }
+            }
+        }
+    });
+
     let mut reports = bus.subscribe(PLUGIN_REPORT);
     let noting = Arc::clone(&context);
     tokio::spawn(async move {
@@ -1111,17 +1352,42 @@ pub fn serve(
             let own = publisher(&delivery.envelope) == plugin.plugin_instance_id;
             let declared = (report.registered && own).then_some(report.declared_settings);
             let store = Arc::clone(&noting.store);
-            let keeping = move || {
+            let instance = plugin.plugin_instance_id.clone();
+            // A value held for a setting re-declared with another type, or
+            // as secret or not, is cleared as the declaration is kept, the
+            // clear its own record naming the re-declaration (W6.11).
+            let now = noting.clock.now_ns();
+            let keeping = move || -> Result<Vec<String>, crate::StoreError> {
                 store.record_plugin(&plugin)?;
                 match declared {
                     Some(declared) => {
-                        store.record_declared_settings(&plugin.plugin_instance_id, &declared)
+                        store.record_declared_settings(&plugin.plugin_instance_id, &declared, now)
                     }
-                    None => Ok(()),
+                    None => Ok(Vec::new()),
                 }
             };
             match tokio::task::spawn_blocking(keeping).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(cleared)) if cleared.is_empty() => {}
+                Ok(Ok(cleared)) => {
+                    tracing::info!(
+                        plugin = instance,
+                        cleared = cleared.join(","),
+                        "plugin settings cleared: re-declared with another type, or secret or not"
+                    );
+                    let event = PluginConfigurationChangedEvent {
+                        plugin_instance_id: instance,
+                        changed_at_ns: noting.clock.now_ns(),
+                    };
+                    if let Err(failed) = noting.bus.publish(
+                        PLUGIN_CONFIGURATION_CHANGED,
+                        "meridian.v1.PluginConfigurationChangedEvent",
+                        event.encode_to_vec(),
+                        None,
+                        None,
+                    ) {
+                        tracing::warn!("a settings clear was not announced: {failed}");
+                    }
+                }
                 Ok(Err(failed)) => tracing::warn!("a plugin report was not kept: {failed}"),
                 Err(failed) => tracing::warn!("a plugin report was not kept: {failed}"),
             }

@@ -24,8 +24,9 @@ use prost::Message;
 
 use crate::migrations;
 use crate::store::{
-    ChangeKind, Ending, Held, KnownPlugin, Result, SettingChange, SettingChangeRecord,
-    SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
+    redeclared, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result, SettingChange,
+    SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
+    REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -300,6 +301,28 @@ impl Store for PostgresStore {
                 set_by: row.get(4),
                 set_at_ns: row.get(5),
             });
+        }
+
+        // Each plugin's latest change, a clear included: not a gap, which
+        // changes nothing, nor a redaction, which blanks a record's value.
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (plugin_instance_id) plugin_instance_id, changed_by,
+                        changed_at_ns
+                   FROM config_plugin_setting_change
+                  WHERE action IN (1, 2)
+                  ORDER BY plugin_instance_id, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.settings_changed.insert(
+                row.get(0),
+                LastChange {
+                    by: row.get(1),
+                    at_ns: row.get(2),
+                },
+            );
         }
 
         for row in tx
@@ -624,9 +647,36 @@ impl Store for PostgresStore {
         &self,
         plugin_instance_id: &str,
         declared: &[SettingDeclaration],
-    ) -> Result<()> {
+        at_ns: i64,
+    ) -> Result<Vec<String>> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // What it declared before, as far as a held value is concerned: each
+        // setting's type and whether it is secret.
+        let before: Vec<SettingDeclaration> = tx
+            .query(
+                "SELECT name, type, secret FROM config_plugin_setting_declaration
+                  WHERE plugin_instance_id = $1",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| SettingDeclaration {
+                name: row.get(0),
+                r#type: i32::from(row.get::<_, i16>(1)),
+                secret: row.get(2),
+                ..Default::default()
+            })
+            .collect();
+        let held: Vec<String> = tx
+            .query(
+                "SELECT name FROM config_plugin_setting WHERE plugin_instance_id = $1 FOR UPDATE",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
         tx.execute(
             "DELETE FROM config_plugin_setting_declaration WHERE plugin_instance_id = $1",
             &[&plugin_instance_id],
@@ -651,7 +701,42 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
-        tx.commit().map_err(unavailable)
+        let mut cleared = Vec::new();
+        for now in declared {
+            let earlier = before.iter().find(|d| d.name == now.name);
+            if let (true, Some(why)) = (held.contains(&now.name), redeclared(earlier, now)) {
+                tx.execute(
+                    "DELETE FROM config_plugin_setting WHERE plugin_instance_id = $1 AND name = $2",
+                    &[&plugin_instance_id, &now.name],
+                )
+                .map_err(unavailable)?;
+                tx.execute(
+                    "INSERT INTO config_plugin_setting_change
+                            (plugin_instance_id, name, action, changed_by, changed_at_ns, note)
+                     VALUES ($1, $2, $3, '', $4, $5)",
+                    &[
+                        &plugin_instance_id,
+                        &now.name,
+                        &ChangeKind::Cleared.code(),
+                        &at_ns,
+                        &why,
+                    ],
+                )
+                .map_err(unavailable)?;
+                cleared.push(now.name.clone());
+            }
+            if now.secret {
+                migrations::redact_values(
+                    &mut tx,
+                    plugin_instance_id,
+                    &now.name,
+                    at_ns,
+                    REDACTED_BY_REDECLARATION,
+                )?;
+            }
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(cleared)
     }
 
     fn put_plugin_settings(
@@ -719,6 +804,15 @@ impl Store for PostgresStore {
                 ],
             )
             .map_err(unavailable)?;
+            if secret {
+                migrations::redact_values(
+                    &mut tx,
+                    plugin_instance_id,
+                    &change.name,
+                    at_ns,
+                    REDACTED_BY_SEALING,
+                )?;
+            }
         }
         tx.commit().map_err(unavailable)
     }

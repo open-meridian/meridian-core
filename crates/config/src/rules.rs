@@ -24,7 +24,7 @@ use meridian_pb::bounds::{
 };
 use meridian_pb::v1::{SettingDeclaration, SettingType};
 
-use crate::store::Snapshot;
+use crate::store::{Held, Snapshot};
 use crate::DEPLOYMENT_ADMIN;
 
 pub type Verdict = Result<(), String>;
@@ -556,6 +556,53 @@ pub fn setting_value(declaration: &SettingDeclaration, value: &str) -> Result<St
         });
     }
     Ok(value.to_string())
+}
+
+/// Whether a value held reads under its setting's declaration as it stands
+/// now, checked before it is delivered, shown, or its rows' stamps kept: a
+/// secret held sealed, anything else held plain and read by its type, and a
+/// table's every row stamped and every cell read by its column. A value held
+/// from an earlier declaration that does not read is withheld, never used as
+/// what the declaration now says it is.
+pub fn held_reads(declaration: &SettingDeclaration, held: &Held) -> Result<(), String> {
+    let name = &declaration.name;
+    let value = match (held, declaration.secret) {
+        (Held::Sealed(_), true) => return Ok(()),
+        (Held::Plain(value), false) => value,
+        (Held::Sealed(_), false) => {
+            return Err(format!(
+                "setting {name} is held sealed and is not declared secret"
+            ))
+        }
+        (Held::Plain(_), true) => {
+            return Err(format!(
+                "setting {name} is declared secret and is not held sealed"
+            ))
+        }
+    };
+    if !setting_table::is_table(declaration) {
+        return setting_value(declaration, value).map(|_| ());
+    }
+    let rows = setting_table::parse(value).map_err(|why| format!("setting {name}: {why}"))?;
+    if rows
+        .iter()
+        .any(|row| row.changed_by.is_empty() || row.changed_at.is_empty())
+    {
+        return Err(format!("setting {name}: a row the conductor did not stamp"));
+    }
+    let cells: Vec<_> = rows.into_iter().map(|row| row.cells).collect();
+    setting_table::checked(declaration, &cells)
+        .map(|_| ())
+        .map_err(|problems| {
+            format!(
+                "setting {name} does not read: {}",
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })
 }
 
 /// W6.11. Every setting named is one the plugin declared when it last

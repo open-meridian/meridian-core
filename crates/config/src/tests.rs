@@ -102,6 +102,24 @@ fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
             last_reported_at_ns: 0,
         })
         .unwrap();
+    // The instrument store, as far as a table's instrument cell needs it:
+    // a record for every ID beginning INS-.
+    bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+        let asked =
+            meridian_domain::v1::ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+        let found = asked.instrument_id.starts_with("INS-");
+        let reply = meridian_domain::v1::ResolveInstrumentReply {
+            found,
+            instrument: found.then(|| meridian_domain::v1::InstrumentRecord {
+                instrument_id: asked.instrument_id.clone(),
+                ..Default::default()
+            }),
+        };
+        Ok((
+            "meridian.v1.ResolveInstrumentReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
     Harness {
         bus,
         backend,
@@ -1596,12 +1614,14 @@ async fn a_secret_is_stored_sealed_and_only_ever_named() {
     assert_eq!(held.set_by, ADA);
     assert!(!format!("{snapshot:?}").contains(SECRET), "nor in a Debug");
 
-    // Declared plain later, it is still only named: nothing sealed is shown.
+    // Declared plain later, it is cleared, never shown: a value sealed under
+    // one declaration is not another's (W6.11).
     let mut plainer = declared();
-    plainer[0].secret = false;
+    plainer[1].secret = false;
     reported(&h, true, plainer, 2).await;
     let form = records(&h).await.plugin_settings;
-    assert_eq!(form[0].secrets_set, ["api_key"]);
+    assert!(form[0].secrets_set.is_empty());
+    assert!(form[0].values.iter().all(|v| v.name != "api_key"));
     assert!(!contains(&form[0].encode_to_vec(), SECRET));
 }
 
@@ -1806,12 +1826,113 @@ fn rows_of(record: &PluginSettingsRecord) -> Vec<meridian_domain::setting_table:
     meridian_domain::setting_table::parse(value).unwrap()
 }
 
+/// oms-1 links these external accounts, as a table's account cell needs.
+fn linked(h: &Harness, accounts: &[&str]) {
+    for account in accounts {
+        h.store
+            .put_link(&ExternalAccountLink {
+                plugin_instance_id: "oms-1".into(),
+                external_account_id: (*account).into(),
+                account_id: format!("ACC-{account}"),
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_table_cell_names_an_account_the_plugin_reported_or_links_and_an_instrument_held() {
+    let h = harness("dashboard-1");
+    let mut declared = declared();
+    declared.push(plan_codes());
+    reported(&h, true, declared, 1).await;
+    linked(&h, &["st-1"]);
+
+    // Neither reported nor linked, and no record: each cell named, nothing
+    // stored, the value never repeated.
+    let unheld = r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"},{"account":"st-9","code":"ABCD","instrument":"NOPE-1"}]"#;
+    let refused = set(&h, "oms-1", &[("plan_code_links", unheld)], &[])
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("plan_code_links[1].account: names no external account"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("plan_code_links[1].instrument: names no instrument record"),
+        "{refused}"
+    );
+    assert!(!refused.contains("plan_code_links[0]"), "{refused}");
+    assert!(h.store.snapshot().unwrap().settings.is_empty());
+
+    // Reported by the plugin's custody connection, st-9 reads; its topic
+    // names the instance, which only that instance may publish on.
+    let custody = Bus::single(
+        "oms-1",
+        h.backend.clone(),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    custody
+        .publish(
+            "platform.custody.oms-1.event.external-accounts",
+            "meridian.v1.ExternalAccountsEvent",
+            meridian_domain::v1::ExternalAccountsEvent {
+                accounts: vec![meridian_domain::v1::ExternalAccount {
+                    external_account_id: "st-9".into(),
+                    ..Default::default()
+                }],
+            }
+            .encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+    let held = r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"},{"account":"st-9","code":"ABCD","instrument":"INS-8"}]"#;
+    let mut outcome = Err(String::new());
+    for _ in 0..200 {
+        outcome = set(&h, "oms-1", &[("plan_code_links", held)], &[]).await;
+        if outcome.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(rows_of(&outcome.unwrap()).len(), 2);
+
+    // Another instance's report is not this plugin's.
+    let other = r#"[{"account":"st-9","code":"ABCD","instrument":"INS-8"},{"account":"st-5","code":"X","instrument":"INS-8"}]"#;
+    let elsewhere = Bus::single(
+        "oms-2",
+        h.backend.clone(),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    elsewhere
+        .publish(
+            "platform.custody.oms-2.event.external-accounts",
+            "meridian.v1.ExternalAccountsEvent",
+            meridian_domain::v1::ExternalAccountsEvent {
+                accounts: vec![meridian_domain::v1::ExternalAccount {
+                    external_account_id: "st-5".into(),
+                    ..Default::default()
+                }],
+            }
+            .encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let refused = set(&h, "oms-1", &[("plan_code_links", other)], &[])
+        .await
+        .unwrap_err();
+    assert!(refused.contains("plan_code_links[1].account"), "{refused}");
+}
+
 #[tokio::test]
 async fn a_table_settings_rows_are_checked_and_each_row_changed_is_stamped() {
     let h = harness("dashboard-1");
     let mut declared = declared();
     declared.push(plan_codes());
     reported(&h, true, declared, 1).await;
+    linked(&h, &["st-1", "st-2"]);
 
     let one = r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"}]"#;
     let record = set(&h, "oms-1", &[("plan_code_links", one)], &[])
@@ -1863,6 +1984,7 @@ async fn an_unchanged_row_keeps_who_changed_it_and_when() {
     let mut declared = declared();
     declared.push(plan_codes());
     reported(&h, true, declared, 1).await;
+    linked(&h, &["st-1", "st-2"]);
     // A row Ben stamped earlier, as held.
     let ben = meridian_domain::setting_table::Row {
         cells: [
@@ -1900,6 +2022,351 @@ async fn an_unchanged_row_keeps_who_changed_it_and_when() {
     );
     assert_eq!(rows[1], ben, "unchanged, it keeps Ben and his time");
     assert_eq!(rows[0].changed_by, ADA, "the row added is Ada's");
+}
+
+// ── A setting re-declared; who last changed them; redaction (W6.11) ─────────
+
+/// Set as `by`, as the dashboard's form does for whoever is signed in.
+async fn set_as(
+    h: &Harness,
+    by: &str,
+    values: &[(&str, &str)],
+    cleared: &[&str],
+) -> Result<PluginSettingsRecord, String> {
+    let request = SetPluginSettingsRequest {
+        plugin_instance_id: "oms-1".into(),
+        values: values
+            .iter()
+            .map(|(name, value)| PluginSettingValue {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect(),
+        cleared: cleared.iter().map(|name| (*name).into()).collect(),
+    };
+    let (_, bytes) = h
+        .bus
+        .call_for(
+            SET_PLUGIN_SETTINGS,
+            "meridian.v1.SetPluginSettingsRequest",
+            request.encode_to_vec(),
+            None,
+            None,
+            by,
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    Ok(PluginSettingsRecord::decode(&bytes[..]).unwrap())
+}
+
+/// What oms-1's sidecar would be told now.
+fn delivered(h: &Harness) -> Vec<PluginSettingValue> {
+    configuration(
+        &h.store.snapshot().unwrap(),
+        "oms-1",
+        &SettingsKey::holding(&[7u8; 32]),
+    )
+    .settings
+}
+
+/// A text value forged to read as a table's rows, stamps and all.
+const FORGED: &str = r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7","changed_by":"local|mallory","changed_at":"2020-01-01T00:00:00.000000Z"}]"#;
+
+/// What oms-1 declares, plan_code_links being text.
+fn plan_codes_as_text() -> Vec<SettingDeclaration> {
+    let mut declared = declared();
+    declared.push(declaration(
+        "plan_code_links",
+        SettingType::String,
+        false,
+        false,
+    ));
+    declared
+}
+
+#[tokio::test]
+async fn a_value_held_is_cleared_when_its_setting_is_redeclared_with_another_type() {
+    let h = harness("dashboard-1");
+    linked(&h, &["st-1"]);
+    reported(&h, true, plan_codes_as_text(), 1).await;
+    // Text reads anything, the forgery included.
+    set_as(&h, "local|mallory", &[("plan_code_links", FORGED)], &[])
+        .await
+        .unwrap();
+    let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+
+    // A later version declares the name a table.
+    let mut declared = declared();
+    declared.push(plan_codes());
+    reported(&h, true, declared.clone(), 2).await;
+
+    let form = &records(&h).await.plugin_settings[0];
+    assert!(form.values.iter().all(|v| v.name != "plan_code_links"));
+    assert!(delivered(&h).iter().all(|v| v.name != "plan_code_links"));
+    let last = h.store.plugin_setting_changes("oms-1").unwrap();
+    let clear = last.last().unwrap();
+    assert_eq!(
+        (clear.name.as_str(), clear.kind, clear.by.as_str()),
+        ("plan_code_links", crate::ChangeKind::Cleared, ""),
+        "the clear is its own record, naming no person"
+    );
+    assert!(clear.note.contains("re-declaration"), "{}", clear.note);
+    let event = tokio::time::timeout(Duration::from_secs(2), changes.recv())
+        .await
+        .expect("announced")
+        .expect("open");
+    assert_eq!(
+        PluginConfigurationChangedEvent::decode(&event.envelope.payload[..])
+            .unwrap()
+            .plugin_instance_id,
+        "oms-1"
+    );
+
+    // Declared the same again, nothing more is cleared.
+    let count = last.len();
+    reported(&h, true, declared, 3).await;
+    assert_eq!(
+        h.store.plugin_setting_changes("oms-1").unwrap().len(),
+        count
+    );
+
+    // The next save carries no forged stamp: every row is Ada's.
+    let rows = rows_of(
+        &set(
+            &h,
+            "oms-1",
+            &[(
+                "plan_code_links",
+                r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"}]"#,
+            )],
+            &[],
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(rows[0].changed_by, ADA);
+}
+
+#[tokio::test]
+async fn a_value_held_from_an_earlier_declaration_that_does_not_read_is_withheld() {
+    let h = harness("dashboard-1");
+    linked(&h, &["st-1"]);
+    let mut declared = declared();
+    declared.push(plan_codes());
+    reported(&h, true, declared, 1).await;
+    // Held under the table's declaration, though nothing here wrote it so:
+    // as a store from before re-declarations cleared would hold it.
+    let author = crate::store::SettingsAuthor {
+        by: "local|mallory".into(),
+        delegation: String::new(),
+    };
+    for unread in [
+        // Rows without the conductor's stamps.
+        r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"}]"#,
+        // A cell the declaration has no column for.
+        r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7","secret":"x","changed_by":"a","changed_at":"b"}]"#,
+        // Not rows at all.
+        "OQKR",
+    ] {
+        h.store
+            .put_plugin_settings(
+                "oms-1",
+                &[crate::store::SettingChange {
+                    name: "plan_code_links".into(),
+                    held: Some(Held::Plain(unread.into())),
+                }],
+                &author,
+                1,
+            )
+            .unwrap();
+        assert!(delivered(&h).iter().all(|v| v.name != "plan_code_links"));
+        let form = &records(&h).await.plugin_settings[0];
+        assert!(form.values.iter().all(|v| v.name != "plan_code_links"));
+        assert!(form.secrets_set.is_empty());
+    }
+    // A save over it stamps every row afresh, lending none the held stamps.
+    let rows = rows_of(
+        &set(
+            &h,
+            "oms-1",
+            &[(
+                "plan_code_links",
+                r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"}]"#,
+            )],
+            &[],
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(rows[0].changed_by, ADA);
+}
+
+#[tokio::test]
+async fn a_sealed_value_redeclared_as_a_table_is_cleared_and_no_table_is_stored_over_one() {
+    let h = harness("dashboard-1");
+    linked(&h, &["st-1"]);
+    let mut secret = declared();
+    secret.push(declaration(
+        "plan_code_links",
+        SettingType::String,
+        false,
+        true,
+    ));
+    reported(&h, true, secret, 1).await;
+    set(&h, "oms-1", &[("plan_code_links", SECRET)], &[])
+        .await
+        .unwrap();
+
+    let mut table = declared();
+    table.push(plan_codes());
+    reported(&h, true, table, 2).await;
+    let form = &records(&h).await.plugin_settings[0];
+    assert!(form.secrets_set.is_empty(), "not shown as a secret's field");
+    assert!(h
+        .store
+        .snapshot()
+        .unwrap()
+        .settings
+        .iter()
+        .all(|s| s.name != "plan_code_links"));
+
+    // Defensively: a sealed value held under the table, as a store from
+    // before would hold it, is never delivered as rows, and no table is
+    // stored over it until it is cleared.
+    let key = SettingsKey::holding(&[7u8; 32]);
+    h.store
+        .put_plugin_settings(
+            "oms-1",
+            &[crate::store::SettingChange {
+                name: "plan_code_links".into(),
+                held: Some(Held::Sealed(
+                    key.seal("oms-1", "plan_code_links", SECRET).unwrap(),
+                )),
+            }],
+            &crate::store::SettingsAuthor {
+                by: ADA.into(),
+                delegation: String::new(),
+            },
+            3,
+        )
+        .unwrap();
+    assert!(delivered(&h).iter().all(|v| v.name != "plan_code_links"));
+    let one = r#"[{"account":"st-1","code":"OQKR","instrument":"INS-7"}]"#;
+    let refused = set(&h, "oms-1", &[("plan_code_links", one)], &[])
+        .await
+        .unwrap_err();
+    assert!(refused.contains("holds a sealed value"), "{refused}");
+    set(&h, "oms-1", &[], &["plan_code_links"]).await.unwrap();
+    assert_eq!(
+        rows_of(
+            &set(&h, "oms-1", &[("plan_code_links", one)], &[])
+                .await
+                .unwrap()
+        )
+        .len(),
+        1
+    );
+    let changes = h.store.plugin_setting_changes("oms-1").unwrap();
+    assert!(!format!("{changes:?}").contains(SECRET));
+}
+
+#[tokio::test]
+async fn who_last_changed_the_settings_is_the_latest_change_a_clear_included() {
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    set(
+        &h,
+        "oms-1",
+        &[("poll_minutes", "15"), ("synthetic", "true")],
+        &[],
+    )
+    .await
+    .unwrap();
+    let record = set_as(&h, "local|ben", &[], &["poll_minutes"])
+        .await
+        .unwrap();
+    assert_eq!(record.updated_by, "local|ben");
+    assert_eq!(records(&h).await.plugin_settings[0].updated_by, "local|ben");
+    // Everything cleared, it still says who cleared it, and when.
+    let record = set_as(&h, "local|grace", &[], &["synthetic"])
+        .await
+        .unwrap();
+    assert_eq!(record.updated_by, "local|grace");
+    assert_eq!(record.updated_at_ns, FixedClock.now_ns());
+    assert!(record.values.is_empty());
+}
+
+#[tokio::test]
+async fn a_setting_redeclared_secret_has_its_earlier_values_redacted() {
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    set(&h, "oms-1", &[("poll_minutes", "15")], &[])
+        .await
+        .unwrap();
+    set_as(&h, "local|ben", &[("poll_minutes", "20")], &[])
+        .await
+        .unwrap();
+    let before = h.store.plugin_setting_changes("oms-1").unwrap();
+
+    let mut secret = declared();
+    secret[2].secret = true;
+    reported(&h, true, secret.clone(), 2).await;
+    let after = h.store.plugin_setting_changes("oms-1").unwrap();
+    // Nothing deleted, who and when kept, only the value blanked.
+    assert_eq!(
+        after.len(),
+        before.len() + 2,
+        "the clear, then the redaction"
+    );
+    for (was, is) in before.iter().zip(&after) {
+        assert_eq!(
+            (&was.name, was.kind, &was.by, was.at_ns),
+            (&is.name, is.kind, &is.by, is.at_ns)
+        );
+        assert_eq!(is.value, None);
+    }
+    let redaction = after.last().unwrap();
+    assert_eq!(redaction.kind, crate::ChangeKind::Redacted);
+    assert_eq!(redaction.by, "");
+    assert!(
+        redaction.note.contains("records 1, 2"),
+        "{}",
+        redaction.note
+    );
+    assert!(
+        redaction.note.contains("became secret"),
+        "{}",
+        redaction.note
+    );
+    // Reported again, nothing more is redacted.
+    reported(&h, true, secret, 3).await;
+    assert_eq!(
+        h.store.plugin_setting_changes("oms-1").unwrap().len(),
+        after.len()
+    );
+
+    // A value stored sealed redacts what earlier records of it hold, as a
+    // store from before would keep a secret's plain value.
+    h.store
+        .put_plugin_settings(
+            "oms-1",
+            &[crate::store::SettingChange {
+                name: "api_key".into(),
+                held: Some(Held::Plain("plain-before".into())),
+            }],
+            &crate::store::SettingsAuthor {
+                by: ADA.into(),
+                delegation: String::new(),
+            },
+            4,
+        )
+        .unwrap();
+    set(&h, "oms-1", &[("api_key", SECRET)], &[]).await.unwrap();
+    let changes = h.store.plugin_setting_changes("oms-1").unwrap();
+    let last = changes.last().unwrap();
+    assert_eq!(last.kind, crate::ChangeKind::Redacted);
+    assert!(last.note.contains("sealed"), "{}", last.note);
+    assert!(!format!("{changes:?}").contains("plain-before"));
 }
 
 // ── A plugin has admins; the built-in groups (2026-09-30) ─────────────────

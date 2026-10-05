@@ -531,14 +531,14 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
         },
     ];
     store
-        .record_declared_settings("snaptrade-1", &declared)
+        .record_declared_settings("snaptrade-1", &declared, 1)
         .unwrap();
     assert_eq!(
         store.snapshot().unwrap().declared_settings["snaptrade-1"],
         declared
     );
     store
-        .record_declared_settings("snaptrade-1", &declared[1..])
+        .record_declared_settings("snaptrade-1", &declared[1..], 2)
         .unwrap();
     assert_eq!(
         store.snapshot().unwrap().declared_settings["snaptrade-1"],
@@ -1242,4 +1242,254 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
     let after = store.plugin_setting_changes("snaptrade-1").unwrap();
     assert_eq!(after.len(), 6);
     assert_eq!(after[5].value.as_deref(), Some("45"));
+}
+
+#[test]
+fn a_redeclared_settings_value_is_cleared_and_a_secrets_earlier_values_redacted() {
+    let (store, url) = store_at("redeclared");
+    store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "snaptrade-1".into(),
+            roles: vec!["custody".into()],
+            last_reported_at_ns: 1,
+        })
+        .unwrap();
+    let declared = vec![
+        declaration("note", SettingType::String, false),
+        declaration("poll_minutes", SettingType::Integer, false),
+        declaration("synthetic", SettingType::Boolean, false),
+    ];
+    assert!(store
+        .record_declared_settings("snaptrade-1", &declared, 1)
+        .unwrap()
+        .is_empty());
+    let plain = |name: &str, value: &str| SettingChange {
+        name: name.into(),
+        held: Some(Held::Plain(value.into())),
+    };
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[
+                plain("note", "[]"),
+                plain("poll_minutes", "15"),
+                plain("synthetic", "true"),
+            ],
+            &author("local|ada"),
+            5,
+        )
+        .unwrap();
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[plain("poll_minutes", "20")],
+            &author("local|ben"),
+            6,
+        )
+        .unwrap();
+
+    // Declared the same again: nothing is cleared or redacted.
+    assert!(store
+        .record_declared_settings("snaptrade-1", &declared, 7)
+        .unwrap()
+        .is_empty());
+
+    // note becomes a table, poll_minutes a secret; synthetic stays.
+    let mut table = declaration("note", SettingType::Table, false);
+    table.columns = vec![meridian_pb::v1::SettingColumn {
+        name: "code".into(),
+        r#type: meridian_pb::v1::SettingColumnType::Text as i32,
+        ..Default::default()
+    }];
+    let again = vec![
+        table,
+        declaration("poll_minutes", SettingType::Integer, true),
+        declaration("synthetic", SettingType::Boolean, false),
+    ];
+    let cleared = store
+        .record_declared_settings("snaptrade-1", &again, 8)
+        .unwrap();
+    assert_eq!(cleared, ["note", "poll_minutes"]);
+    let snapshot = store.snapshot().unwrap();
+    let held: Vec<&str> = snapshot.settings.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(held, ["synthetic"]);
+    // The latest change is the re-declaration's clear: no person, at 8.
+    assert_eq!(
+        snapshot.settings_changed["snaptrade-1"],
+        meridian_config::LastChange {
+            by: String::new(),
+            at_ns: 8
+        }
+    );
+
+    let changes = store.plugin_setting_changes("snaptrade-1").unwrap();
+    let seen: Vec<_> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.kind,
+                c.value.as_deref(),
+                c.by.as_str(),
+                c.at_ns,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("note", ChangeKind::Set, Some("[]"), "local|ada", 5),
+            // Redacted: the value blanked, who and when kept.
+            ("poll_minutes", ChangeKind::Set, None, "local|ada", 5),
+            ("synthetic", ChangeKind::Set, Some("true"), "local|ada", 5),
+            ("poll_minutes", ChangeKind::Set, None, "local|ben", 6),
+            ("note", ChangeKind::Cleared, None, "", 8),
+            ("poll_minutes", ChangeKind::Cleared, None, "", 8),
+            ("poll_minutes", ChangeKind::Redacted, None, "", 8),
+        ]
+    );
+    assert!(
+        changes[4].note.contains("re-declaration"),
+        "{}",
+        changes[4].note
+    );
+    assert!(changes[4].note.contains("table"), "{}", changes[4].note);
+    assert!(changes[6].secret);
+    assert!(
+        changes[6].note.contains("became secret"),
+        "{}",
+        changes[6].note
+    );
+    // The records it redacted, by id: the two that held a value.
+    let mut dump = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let ids: Vec<i64> = dump
+        .query(
+            "SELECT change_id FROM config_plugin_setting_change
+              WHERE name = 'poll_minutes' AND action = 1 ORDER BY change_id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        changes[6]
+            .note
+            .contains(&format!("records {}, {}", ids[0], ids[1])),
+        "{}",
+        changes[6].note
+    );
+
+    // A secret set later redacts nothing more, and is recorded as set.
+    let key = SettingsKey::holding(&[7u8; 32]);
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[SettingChange {
+                name: "poll_minutes".into(),
+                held: Some(Held::Sealed(
+                    key.seal("snaptrade-1", "poll_minutes", "25").unwrap(),
+                )),
+            }],
+            &author("local|ada"),
+            9,
+        )
+        .unwrap();
+    assert_eq!(
+        store.plugin_setting_changes("snaptrade-1").unwrap().len(),
+        8
+    );
+}
+
+#[test]
+fn migration_12_redacts_what_a_secret_settings_records_hold() {
+    // A store at migration 11 whose api_key became secret before redaction
+    // was ruled: its records, a backfilled one among them, hold its values.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_redact_{seq}_{}", std::process::id());
+    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .unwrap();
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 11)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    db.batch_execute(
+        "INSERT INTO config_known_plugin (plugin_instance_id, roles, last_reported_at_ns)
+         VALUES ('snaptrade-1', '{custody}', 1);
+         INSERT INTO config_plugin_setting_declaration
+                (plugin_instance_id, position, name, type, required, secret)
+         VALUES ('snaptrade-1', 0, 'api_key', 1, true, true),
+                ('snaptrade-1', 1, 'poll_minutes', 2, false, false);
+         INSERT INTO config_plugin_setting (plugin_instance_id, name, value, sealed, set_by, set_at_ns)
+         VALUES ('snaptrade-1', 'api_key', 'plain-before', NULL, 'local|ada', 10),
+                ('snaptrade-1', 'poll_minutes', '30', NULL, 'local|grace', 20);
+         INSERT INTO config_plugin_setting_change
+                (plugin_instance_id, name, action, changed_by, changed_at_ns, value, backfilled)
+         VALUES ('snaptrade-1', 'api_key', 1, 'local|ada', 10, 'plain-before', true),
+                ('snaptrade-1', 'poll_minutes', 1, 'local|grace', 20, '30', true);",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    store
+        .migrate(&At(2_000))
+        .expect("migrating twice is a no-op");
+
+    let changes = store.plugin_setting_changes("snaptrade-1").unwrap();
+    let seen: Vec<_> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.kind,
+                c.value.as_deref(),
+                c.by.as_str(),
+                c.at_ns,
+                c.backfilled,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("api_key", ChangeKind::Set, None, "local|ada", 10, true),
+            (
+                "poll_minutes",
+                ChangeKind::Set,
+                Some("30"),
+                "local|grace",
+                20,
+                true
+            ),
+            ("api_key", ChangeKind::Redacted, None, "", 1_000, false),
+        ]
+    );
+    assert!(
+        changes[2].note.contains("migration 12"),
+        "{}",
+        changes[2].note
+    );
+    let text: String = db
+        .query_one(
+            "SELECT coalesce(string_agg(c::text, '|'), '')
+               FROM (SELECT * FROM config_plugin_setting_change) c",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!text.contains("plain-before"), "redacted: {text}");
 }

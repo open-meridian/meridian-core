@@ -805,7 +805,7 @@ fn snaptrade() -> PluginSettingsRecord {
             },
         ],
         secrets_set: vec!["snaptrade_client_id".into()],
-        updated_at_ns: T0,
+        updated_at_ns: 0,
         updated_by: String::new(),
         declared_settings: vec![
             SettingDeclaration {
@@ -900,6 +900,13 @@ fn the_settings_tab_names_who_last_changed_them() {
     assert!(
         unknown.contains("local|&lt;grace&gt;"),
         "escaped, by subject: {unknown}"
+    );
+    // A clear the plugin's re-declaration made names no person.
+    record.updated_by = String::new();
+    let cleared = last_changed(&records, &record);
+    assert!(
+        cleared.contains("Last changed by the plugin's re-declaring a setting"),
+        "{cleared}"
     );
 }
 
@@ -1931,6 +1938,94 @@ async fn a_settings_form_without_the_sessions_token_sends_nothing() {
         format!("{VIEW}?tab=settings&saved=none").as_str()
     );
     assert!(asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_instrument_cell_is_checked_by_its_id_not_against_a_capped_list() {
+    use meridian_domain::v1::{
+        InstrumentRecord, InstrumentToComplete, ListInstrumentsToCompleteReply,
+        ListInstrumentsToCompleteRequest,
+    };
+    use meridian_pb::v1::{SettingColumn, SettingColumnType};
+    let column = |name: &str, kind: SettingColumnType| SettingColumn {
+        name: name.into(),
+        r#type: kind as i32,
+        required: true,
+        ..Default::default()
+    };
+    let mut record = snaptrade();
+    record.declared_settings.push(SettingDeclaration {
+        columns: vec![
+            column("account", SettingColumnType::ExternalAccount),
+            column("code", SettingColumnType::Text),
+            column("instrument", SettingColumnType::Instrument),
+        ],
+        ..declared("plan_code_links", SettingType::Table, false, false)
+    });
+    let mut records = admin_records();
+    records.plugin_settings = vec![record];
+    let h = harness(records, None);
+    h.app.custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: vec![ExternalAccount {
+                external_account_id: "SNAP-1".into(),
+                ..Default::default()
+            }],
+        },
+    );
+    // The list holds only its first records; INS-2000 is beyond it, and
+    // asked by its ID, held.
+    h.app.bus.serve(
+        "platform.reference.query.list-instruments-to-complete",
+        |envelope| {
+            let asked = ListInstrumentsToCompleteRequest::decode(&envelope.payload[..]).unwrap();
+            let held = |id: &str| InstrumentToComplete {
+                instrument: Some(InstrumentRecord {
+                    instrument_id: id.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let instruments = match asked.instrument_id.as_str() {
+                "" => vec![held("INS-1")],
+                "INS-2000" => vec![held("INS-2000")],
+                _ => vec![],
+            };
+            Ok((
+                "meridian.v1.ListInstrumentsToCompleteReply".into(),
+                ListInstrumentsToCompleteReply {
+                    instruments,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
+    let asked = conductor_setting(&h, None);
+    let form = |instrument: &str| {
+        format!(
+            "form_token={}&table.plan_code_links=1&table.plan_code_links%5B0%5D.account=SNAP-1\
+             &table.plan_code_links%5B0%5D.code=OQKR&table.plan_code_links%5B0%5D.instrument={instrument}",
+            h.form_token
+        )
+    };
+    let response = router(Arc::clone(&h.app))
+        .oneshot(post(&h, SETTINGS, &form("INS-2000")))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["location"],
+        format!("{VIEW}?tab=settings&saved=1").as_str()
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1, "sent");
+
+    let (_, body) = send(&h, post(&h, SETTINGS, &form("NOPE-1"))).await;
+    assert!(
+        body.contains("names no instrument record this deployment holds"),
+        "{body}"
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1, "nothing more was sent");
 }
 
 #[test]

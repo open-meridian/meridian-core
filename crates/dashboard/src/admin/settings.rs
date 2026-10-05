@@ -44,7 +44,7 @@
 //! naming each cell. Without the kit it is a plain table of inputs. The rows'
 //! `changed_by` and `changed_at` are the conductor's to stamp.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use meridian_domain::setting_table::{self, Cells, Problem};
 use meridian_domain::v1::{PluginSettingValue, PluginSettingsRecord, SetPluginSettingsRequest};
@@ -859,6 +859,35 @@ fn posted_rows(fields: &HashMap<String, String>, name: &str) -> Option<Vec<Cells
             .map(|n| rows.remove(&n).unwrap_or_default())
             .collect(),
     )
+}
+
+/// Every instrument the form's tables name, typed into an instrument column,
+/// each once: what is checked by its ID before anything is sent.
+pub fn posted_instruments(
+    record: &PluginSettingsRecord,
+    fields: &HashMap<String, String>,
+) -> BTreeSet<String> {
+    let mut named = BTreeSet::new();
+    for declaration in &record.declared_settings {
+        if !setting_table::is_table(declaration) {
+            continue;
+        }
+        let Some(rows) = posted_rows(fields, &declaration.name) else {
+            continue;
+        };
+        for row in &rows {
+            for column in &declaration.columns {
+                if column_kind(column) != SettingColumnType::Instrument {
+                    continue;
+                }
+                let typed = row.get(&column.name).map(|v| v.trim()).unwrap_or_default();
+                if !typed.is_empty() {
+                    named.insert(typed.to_string());
+                }
+            }
+        }
+    }
+    named
 }
 
 /// Every cell of every table the form posted that does not read, by its

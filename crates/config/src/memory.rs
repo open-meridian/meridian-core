@@ -12,8 +12,9 @@ use meridian_domain::v1::{
 use meridian_pb::v1::SettingDeclaration;
 
 use crate::store::{
-    ChangeKind, Ending, Held, KnownPlugin, Result, SettingChange, SettingChangeRecord,
-    SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
+    redaction_note, redeclared, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
+    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
+    REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -57,9 +58,74 @@ fn upsert<T: Clone>(items: &mut Vec<T>, item: &T, same: impl Fn(&T) -> bool) {
     }
 }
 
+/// A record a store writes itself, naming no person: a clear a
+/// re-declaration made, or a redaction.
+fn unauthored(
+    plugin_instance_id: &str,
+    name: &str,
+    kind: ChangeKind,
+    at_ns: i64,
+    note: String,
+) -> SettingChangeRecord {
+    SettingChangeRecord {
+        plugin_instance_id: plugin_instance_id.to_string(),
+        name: name.to_string(),
+        kind,
+        value: None,
+        secret: kind == ChangeKind::Redacted,
+        by: String::new(),
+        delegation: String::new(),
+        at_ns,
+        backfilled: false,
+        note,
+    }
+}
+
+/// Blank every value a setting's records hold, and record the redaction, as
+/// the Postgres store does; a record's place, from 1, stands for its id.
+fn redact(
+    journal: &mut Vec<SettingChangeRecord>,
+    plugin_instance_id: &str,
+    name: &str,
+    at_ns: i64,
+    why: &str,
+) {
+    let mut ids = Vec::new();
+    for (at, change) in journal.iter_mut().enumerate() {
+        if change.plugin_instance_id == plugin_instance_id
+            && change.name == name
+            && change.value.is_some()
+        {
+            change.value = None;
+            ids.push(at as i64 + 1);
+        }
+    }
+    if !ids.is_empty() {
+        journal.push(unauthored(
+            plugin_instance_id,
+            name,
+            ChangeKind::Redacted,
+            at_ns,
+            redaction_note(&ids, why),
+        ));
+    }
+}
+
 impl Store for MemoryStore {
     fn snapshot(&self) -> Result<Snapshot> {
-        Ok(self.state.lock().expect("store lock poisoned").clone())
+        let mut snapshot = self.state.lock().expect("store lock poisoned").clone();
+        for change in self.changes.lock().expect("store lock poisoned").iter() {
+            if matches!(change.kind, ChangeKind::Set | ChangeKind::Cleared) {
+                snapshot.settings_changed.insert(
+                    change.plugin_instance_id.clone(),
+                    LastChange {
+                        by: change.by.clone(),
+                        at_ns: change.at_ns,
+                    },
+                );
+            }
+        }
+        Ok(snapshot)
     }
 
     fn put_account(&self, account: &AccountRecord) -> Result<()> {
@@ -187,12 +253,45 @@ impl Store for MemoryStore {
         &self,
         plugin_instance_id: &str,
         declared: &[SettingDeclaration],
-    ) -> Result<()> {
+        at_ns: i64,
+    ) -> Result<Vec<String>> {
         let mut state = self.state.lock().expect("store lock poisoned");
-        state
+        let mut journal = self.changes.lock().expect("store lock poisoned");
+        let before = state
             .declared_settings
-            .insert(plugin_instance_id.to_string(), declared.to_vec());
-        Ok(())
+            .insert(plugin_instance_id.to_string(), declared.to_vec())
+            .unwrap_or_default();
+        let mut cleared = Vec::new();
+        for now in declared {
+            let held = state
+                .settings
+                .iter()
+                .any(|s| s.plugin_instance_id == plugin_instance_id && s.name == now.name);
+            let earlier = before.iter().find(|d| d.name == now.name);
+            if let (true, Some(why)) = (held, redeclared(earlier, now)) {
+                state.settings.retain(|s| {
+                    !(s.plugin_instance_id == plugin_instance_id && s.name == now.name)
+                });
+                journal.push(unauthored(
+                    plugin_instance_id,
+                    &now.name,
+                    ChangeKind::Cleared,
+                    at_ns,
+                    why,
+                ));
+                cleared.push(now.name.clone());
+            }
+            if now.secret {
+                redact(
+                    &mut journal,
+                    plugin_instance_id,
+                    &now.name,
+                    at_ns,
+                    REDACTED_BY_REDECLARATION,
+                );
+            }
+        }
+        Ok(cleared)
     }
 
     fn put_plugin_settings(
@@ -236,6 +335,15 @@ impl Store for MemoryStore {
                 backfilled: false,
                 note: String::new(),
             });
+            if matches!(change.held, Some(Held::Sealed(_))) {
+                redact(
+                    &mut journal,
+                    plugin_instance_id,
+                    &change.name,
+                    at_ns,
+                    REDACTED_BY_SEALING,
+                );
+            }
         }
         Ok(())
     }

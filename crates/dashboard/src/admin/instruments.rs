@@ -145,6 +145,17 @@ pub async fn list(
     .await
 }
 
+/// Whether the deployment holds a record by this ID, asked by the ID rather
+/// than read from a list, which is capped (W6.11, a table's instrument cell).
+pub async fn record_held(bus: &meridian_bus::Bus, instrument_id: &str) -> Result<bool, String> {
+    let reply = list(bus, instrument_id).await?;
+    Ok(reply
+        .instruments
+        .iter()
+        .filter_map(|each| each.instrument.as_ref())
+        .any(|record| record.instrument_id == instrument_id))
+}
+
 /// Every record the deployment holds, complete or not, each as its ID and
 /// what a person reads -- its symbol or first identifier, and its
 /// description -- for a table setting's instrument column (W6.11, contract

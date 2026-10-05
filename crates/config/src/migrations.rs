@@ -91,7 +91,81 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0011_each_setting_change_its_own_record.sql"),
         then: Some(settings_not_known_before),
     },
+    Migration {
+        version: 12,
+        name: "a_secret_settings_earlier_values_redacted",
+        sql: include_str!("../migrations/0012_a_secret_settings_earlier_values_redacted.sql"),
+        then: Some(secret_settings_redacted),
+    },
 ];
+
+/// Migration 12's redactions: each setting declared secret now, or held
+/// sealed, whose earlier change records still hold a value.
+fn secret_settings_redacted(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    let secret = tx
+        .query(
+            "SELECT plugin_instance_id, name FROM config_plugin_setting_declaration
+              WHERE secret
+             UNION
+             SELECT plugin_instance_id, name FROM config_plugin_setting
+              WHERE sealed IS NOT NULL
+             ORDER BY 1, 2",
+            &[],
+        )
+        .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+    for row in secret {
+        let (plugin, name): (String, String) = (row.get(0), row.get(1));
+        redact_values(
+            tx,
+            &plugin,
+            &name,
+            at_ns,
+            "the setting is secret; by migration 12, no person",
+        )?;
+    }
+    Ok(())
+}
+
+/// Blank every value one setting's change records hold, and record the
+/// redaction as its own change (action 4) naming the records and `why`, by
+/// no person, at `at_ns`: the product owner's one exception to a record never
+/// changing (2026-10-05), and only its value. Nothing when none holds one.
+pub(crate) fn redact_values(
+    tx: &mut Transaction<'_>,
+    plugin_instance_id: &str,
+    name: &str,
+    at_ns: i64,
+    why: &str,
+) -> Result<Vec<i64>> {
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    let mut ids: Vec<i64> = tx
+        .query(
+            "UPDATE config_plugin_setting_change SET value = NULL
+              WHERE plugin_instance_id = $1 AND name = $2 AND value IS NOT NULL
+             RETURNING change_id",
+            &[&plugin_instance_id, &name],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    ids.sort_unstable();
+    if !ids.is_empty() {
+        tx.execute(
+            "INSERT INTO config_plugin_setting_change
+                    (plugin_instance_id, name, action, changed_by, changed_at_ns, secret, note)
+             VALUES ($1, $2, 4, '', $3, true, $4)",
+            &[
+                &plugin_instance_id,
+                &name,
+                &at_ns,
+                &crate::store::redaction_note(&ids, why),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(ids)
+}
 
 /// Migration 11's gap records (decisions/031, point 4): for each setting of
 /// each plugin with a change recorded before it, one record saying the
