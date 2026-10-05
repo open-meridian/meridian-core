@@ -95,17 +95,16 @@ pub const MIGRATIONS: &[Migration] = &[
 
 /// Migration 11's gap records (decisions/031, point 4): for each setting of
 /// each plugin with a change recorded before it, one record saying the
-/// earlier changes' values and where each was made are not known before
+/// earlier changes' values are not known before
 /// `at_ns`, the moment the migration ran, by the deployment's clock. A
 /// setting already given one is left as it is.
 fn settings_not_known_before(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
     tx.execute(
         "INSERT INTO config_plugin_setting_change
-                (plugin_instance_id, name, action, changed_by, changed_at_ns, made_on, note)
-         SELECT DISTINCT change.plugin_instance_id, change.name, 3, '', $1::bigint, '',
+                (plugin_instance_id, name, action, changed_by, changed_at_ns, note)
+         SELECT DISTINCT change.plugin_instance_id, change.name, 3, '', $1::bigint,
                 'not known before: until migration 11 a settings change recorded who and when, '
-                || 'never the value it set or whether it was made on the dashboard''s form or '
-                || 'the plugin''s page; each change since records both'
+                || 'never the value it set; each change since records it'
            FROM config_plugin_setting_change change
           WHERE change.action IN (1, 2)
             AND NOT EXISTS (SELECT 1 FROM config_plugin_setting_change gap

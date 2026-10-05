@@ -12,11 +12,14 @@
 //! bounds on a value -- an account's free text, a Decimal's places and digits --
 //! are the data dictionary's, generated into `meridian_pb::bounds`. And
 //! [`text`], the characters a ticket's text may hold, which a plugin's
-//! sidecar and the dashboard both refuse alike (W4.12, W6.21).
+//! sidecar and the dashboard both refuse alike (W4.12, W6.21). And
+//! [`setting_table`], a table setting's rows, which the dashboard and the
+//! conductor check alike, cell by cell (W6.11, contract v14).
 
 pub mod asset_class;
 pub mod exact;
 pub mod instrument_type;
+pub mod setting_table;
 pub mod text;
 
 /// The roles at the edge, which alone may own storage for their raw external

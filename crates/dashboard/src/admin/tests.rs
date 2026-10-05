@@ -875,7 +875,7 @@ fn setting<'a>(body: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn the_settings_tab_names_who_last_changed_them_from_the_form_or_the_plugins_page() {
+fn the_settings_tab_names_who_last_changed_them() {
     let mut records = with_settings();
     records.people.push(meridian_domain::v1::SignInRecord {
         subject: ADA.into(),

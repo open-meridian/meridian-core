@@ -705,8 +705,8 @@ impl Store for PostgresStore {
             tx.execute(
                 "INSERT INTO config_plugin_setting_change
                         (plugin_instance_id, name, action, changed_by, changed_at_ns,
-                         value, secret, through_delegation, made_on)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                         value, secret, through_delegation)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &plugin_instance_id,
                     &change.name,
@@ -716,7 +716,6 @@ impl Store for PostgresStore {
                     &recorded,
                     &secret,
                     &author.delegation,
-                    &author.made_on.code(),
                 ],
             )
             .map_err(unavailable)?;
@@ -728,7 +727,7 @@ impl Store for PostgresStore {
         let rows = self
             .conn()?
             .query(
-                "SELECT name, action, value, secret, changed_by, through_delegation, made_on,
+                "SELECT name, action, value, secret, changed_by, through_delegation,
                         changed_at_ns, backfilled, note
                    FROM config_plugin_setting_change
                   WHERE plugin_instance_id = $1
@@ -751,10 +750,9 @@ impl Store for PostgresStore {
                     secret: row.get(3),
                     by: row.get(4),
                     delegation: row.get(5),
-                    made_on: row.get(6),
-                    at_ns: row.get(7),
-                    backfilled: row.get(8),
-                    note: row.get(9),
+                    at_ns: row.get(6),
+                    backfilled: row.get(7),
+                    note: row.get(8),
                 })
             })
             .collect()

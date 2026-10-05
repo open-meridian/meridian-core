@@ -5,17 +5,17 @@
 -- Since 0005 a change recorded which setting, set or cleared, who and when,
 -- and never the value. From here it also records what it was set to, for a
 -- setting that is not secret (a secret's value never, only that one was set),
--- the delegation its person acted through where they used one, and where it
--- was made: the dashboard's Settings form, or the plugin's own page at admin.
+-- and the delegation its person acted through where they used one. A setting
+-- is set only on the dashboard's Settings form (option A, 2026-10-05).
 --
--- The changes recorded before this lack the value and the place. Where the
+-- The changes recorded before this lack the value. Where the
 -- facts exist they are backfilled: the latest change of each setting still
 -- held, made by whoever the setting says set it and at that moment, carries
 -- the value the setting holds (or is marked secret), saying it was
 -- backfilled and from what; its time is its own, never moved. What cannot be
 -- backfilled is recorded as a gap: one record per setting of each plugin
--- with any change before this, saying the earlier values and every earlier
--- change's place are not known before the moment this migration ran. That
+-- with any change before this, saying the earlier values are not known
+-- before the moment this migration ran. That
 -- record's time is the deployment's clock at the migration, written by the
 -- conductor in the same transaction (migrations.rs), never back-dated.
 
@@ -25,9 +25,6 @@ ALTER TABLE config_plugin_setting_change
     ADD COLUMN IF NOT EXISTS value      text,
     ADD COLUMN IF NOT EXISTS secret     boolean NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS through_delegation text NOT NULL DEFAULT '',
-    -- form or page; '' where it is not known (before this, and on a gap).
-    ADD COLUMN IF NOT EXISTS made_on    text    NOT NULL DEFAULT ''
-        CHECK (made_on IN ('', 'form', 'page')),
     ADD COLUMN IF NOT EXISTS backfilled boolean NOT NULL DEFAULT false,
     -- Why, for a gap and for a backfill: what is not known, or what it was
     -- filled in from.
@@ -51,7 +48,7 @@ UPDATE config_plugin_setting_change change
        secret     = held.sealed IS NOT NULL,
        backfilled = true,
        note       = 'value backfilled by migration 11 from the setting as held, set by '
-                    'this person at this moment; where it was made is not known'
+                    'this person at this moment'
   FROM config_plugin_setting held
  WHERE change.action = 1
    AND change.plugin_instance_id = held.plugin_instance_id

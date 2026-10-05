@@ -145,6 +145,53 @@ pub async fn list(
     .await
 }
 
+/// Every record the deployment holds, complete or not, each as its ID and
+/// what a person reads -- its symbol or first identifier, and its
+/// description -- for a table setting's instrument column (W6.11, contract
+/// v14), sorted by what is read. At most the first thousand.
+pub async fn every_record(bus: &meridian_bus::Bus) -> Result<Vec<(String, String)>, String> {
+    let reply: ListInstrumentsToCompleteReply = ask(
+        bus,
+        LIST_INSTRUMENTS_TO_COMPLETE,
+        "meridian.v1.ListInstrumentsToCompleteRequest",
+        ListInstrumentsToCompleteRequest {
+            include_complete: true,
+            instrument_id: String::new(),
+            page_size: 1000,
+            cursor: String::new(),
+        },
+        None,
+        WAIT,
+    )
+    .await?;
+    let mut found: Vec<(String, String)> = reply
+        .instruments
+        .into_iter()
+        .filter_map(|each| each.instrument)
+        .map(|record| {
+            let named = record
+                .identifiers
+                .iter()
+                .find(|i| i.scheme == "symbol")
+                .or_else(|| record.identifiers.first())
+                .map(|i| i.value.clone())
+                .unwrap_or_default();
+            let shown = match (named.is_empty(), record.description.is_empty()) {
+                (false, false) => format!(
+                    "{named} · {} ({})",
+                    record.description, record.instrument_id
+                ),
+                (false, true) => format!("{named} ({})", record.instrument_id),
+                (true, false) => format!("{} ({})", record.description, record.instrument_id),
+                (true, true) => record.instrument_id.clone(),
+            };
+            (record.instrument_id, shown)
+        })
+        .collect();
+    found.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(found)
+}
+
 /// W3.12.
 pub async fn history(
     bus: &meridian_bus::Bus,

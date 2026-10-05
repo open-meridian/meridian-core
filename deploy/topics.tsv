@@ -33,7 +33,7 @@ platform.config.command.link-external-account	command	custody	conductor
 platform.config.command.record-plugin-upload	command	dashboard	conductor
 platform.config.command.redeem-claim-code	command	dashboard	conductor
 platform.config.command.send-diagnostic-bundle	command	dashboard	conductor
-platform.config.command.set-plugin-settings	command	dashboard,ccm,compliance,custody,dgm,ems,match,oms,operations,portfolio,reporting,servicing,settlement,signal	conductor
+platform.config.command.set-plugin-settings	command	dashboard	conductor
 platform.config.command.stop-plugin	command	dashboard	conductor
 platform.config.command.withdraw-permission	command	dashboard	conductor
 platform.config.event.person-signed-in	event	dashboard	conductor

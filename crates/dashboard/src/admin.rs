@@ -537,8 +537,13 @@ async fn plugin_view(
     let report = reports.get(&instance);
     let tabs = view::tabs(administers);
     let current = view::chosen(&tabs, field(&query, "tab"));
+    let choices = match settings_of(&records, &instance) {
+        Some(record) => choices(&app, &instance, record, &records).await,
+        None => settings::Choices::default(),
+    };
     let body = view::render(&view::View {
         line,
+        choices: &choices,
         record: settings_of(&records, &instance),
         report,
         records: &records,
@@ -660,6 +665,14 @@ async fn save_settings(
     let Some(record) = settings_of(&records, instance) else {
         return no_such_plugin(instance);
     };
+    // A table's cells, each checked as the conductor checks it, an external
+    // account one the plugin reported and an instrument one the deployment
+    // holds; nothing is sent while one does not read (W6.11, contract v14).
+    let offered = choices(app, instance, record, &records).await;
+    let problems = settings::table_problems(record, fields, &offered);
+    if !problems.is_empty() {
+        return after_to(Err(settings::said(record, &problems)), back, back);
+    }
     let Some(request) = settings::request(record, fields, crate::html::is_development()) else {
         return after_to(Ok(()), &format!("{back}&saved=none"), back);
     };
@@ -678,6 +691,8 @@ async fn save_settings(
 /// What the dashboard's own tabs in a plugin's area under Manage show.
 pub(crate) struct Manage<'a> {
     pub instance: &'a str,
+    /// What its table settings' columns offer (W6.11, contract v14).
+    pub choices: &'a settings::Choices,
     pub records: &'a AccessRecords,
     pub report: Option<&'a meridian_domain::v1::PluginReport>,
     /// The version the catalogue launched, where it launched the plugin.
@@ -781,11 +796,12 @@ fn tools_section(report: Option<&meridian_domain::v1::PluginReport>) -> String {
 pub(crate) fn settings_tab(manage: &Manage) -> String {
     let instance = manage.instance;
     let form = match settings_of(manage.records, instance) {
-        Some(record) => settings::form_to(
+        Some(record) => settings::form_with(
             record,
             &token_input(manage.session),
             crate::html::is_development(),
             &crate::area::settings_path(instance),
+            manage.choices,
         ),
         None => "<p class=\"empty\">Its settings are not known yet: the plugin has not \
                  reported what it needs.</p>"
@@ -806,8 +822,56 @@ pub(crate) fn settings_tab(manage: &Manage) -> String {
     )
 }
 
-/// Who last changed a plugin's settings, and when (W6.11): from this form
-/// or the plugin's own page alike, as the conductor recorded it.
+/// What a plugin's table settings offer (W6.11, contract v14): the external
+/// accounts it reported or links, and the deployment's instrument records,
+/// read only where a table has such a column.
+pub(crate) async fn choices(
+    app: &App,
+    instance: &str,
+    record: &PluginSettingsRecord,
+    records: &AccessRecords,
+) -> settings::Choices {
+    use meridian_pb::v1::SettingColumnType;
+    let mut offered = settings::Choices::default();
+    if settings::wants(record, SettingColumnType::ExternalAccount) {
+        let heard = app.custody.view();
+        let mut seen = std::collections::BTreeSet::new();
+        for account in heard.reported.get(instance).into_iter().flatten() {
+            if seen.insert(account.external_account_id.clone()) {
+                let shown = if account.name.is_empty() {
+                    account.external_account_id.clone()
+                } else {
+                    format!("{} ({})", account.name, account.external_account_id)
+                };
+                offered
+                    .external_accounts
+                    .push((account.external_account_id.clone(), shown));
+            }
+        }
+        for link in records
+            .links
+            .iter()
+            .filter(|l| l.plugin_instance_id == instance)
+        {
+            if seen.insert(link.external_account_id.clone()) {
+                offered.external_accounts.push((
+                    link.external_account_id.clone(),
+                    link.external_account_id.clone(),
+                ));
+            }
+        }
+    }
+    if settings::wants(record, SettingColumnType::Instrument) {
+        match instruments::every_record(&app.bus).await {
+            Ok(found) => offered.instruments = found,
+            Err(why) => offered.unread = why,
+        }
+    }
+    offered
+}
+
+/// Who last changed a plugin's settings, and when (W6.11), as the conductor
+/// recorded it: on the dashboard's form, the one way a setting is set.
 pub(crate) fn last_changed(records: &AccessRecords, record: &PluginSettingsRecord) -> String {
     if record.updated_by.is_empty() {
         return String::new();

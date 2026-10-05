@@ -444,6 +444,8 @@ fn health_panel(line: &Line, report: Option<&PluginReport>, admin_pages: Option<
 /// What the view shows: the tabs, and the one asked for.
 pub struct View<'a> {
     pub line: &'a Line,
+    /// What its table settings' columns offer (W6.11, contract v14).
+    pub choices: &'a settings::Choices,
     pub record: Option<&'a PluginSettingsRecord>,
     pub report: Option<&'a PluginReport>,
     pub records: &'a AccessRecords,
@@ -493,7 +495,13 @@ pub fn render(view: &View) -> String {
     let body = match view.current.key.as_str() {
         SETTINGS => {
             let form = match view.record {
-                Some(record) => settings::form(record, view.token, view.development),
+                Some(record) => settings::form_with(
+                    record,
+                    view.token,
+                    view.development,
+                    &settings::path(&record.plugin_instance_id),
+                    view.choices,
+                ),
                 None => "<p class=\"empty\">Its settings are not known yet: the plugin has not \
                          reported what it needs.</p>"
                     .to_string(),

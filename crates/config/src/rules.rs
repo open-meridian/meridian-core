@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 
 use meridian_access::{is_built_in_access_group, AccessLevel, ALL_ACCOUNTS};
+use meridian_domain::setting_table;
 use meridian_domain::v1::{
     AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
     LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
@@ -493,6 +494,32 @@ pub fn setting_value(declaration: &SettingDeclaration, value: &str) -> Result<St
     let name = &declaration.name;
     if value.is_empty() {
         return Err(format!("setting {name} is empty; clear it instead"));
+    }
+    // A table: its rows' cells as sent, every one checked against its column,
+    // refused whole naming each cell that does not read (W6.11, contract
+    // v14). Its stamps are the conductor's to add, never the sender's.
+    if setting_table::is_table(declaration) {
+        let rows = setting_table::parse(value).map_err(|why| format!("setting {name}: {why}"))?;
+        if rows
+            .iter()
+            .any(|row| !row.changed_by.is_empty() || !row.changed_at.is_empty())
+        {
+            return Err(format!(
+                "setting {name}: a row names who changed it or when, which the conductor stamps"
+            ));
+        }
+        let cells: Vec<_> = rows.into_iter().map(|row| row.cells).collect();
+        let kept = setting_table::checked(declaration, &cells).map_err(|problems| {
+            format!(
+                "setting {name} does not read: {}",
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })?;
+        return Ok(setting_table::cells_written(&kept));
     }
     if declaration.r#type == SettingType::Integer as i32 {
         return value

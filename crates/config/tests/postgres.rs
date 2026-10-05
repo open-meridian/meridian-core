@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use meridian_config::store::{
-    ChangeKind, Ending, Held, KnownPlugin, MadeOn, SettingChange, SettingsAuthor, Store, Withdrawal,
+    ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
 };
 use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
@@ -564,7 +564,7 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
                     held: Some(Held::Plain("15".into())),
                 },
             ],
-            &author("local|ada", MadeOn::Form),
+            &author("local|ada"),
             5,
         )
         .unwrap();
@@ -624,7 +624,6 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
             &SettingsAuthor {
                 by: "local|grace".into(),
                 delegation: "DLG-7".into(),
-                made_on: MadeOn::Page,
             },
             9,
         )
@@ -639,7 +638,7 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
     assert_eq!(names, ["poll_minutes"], "cleared");
 
     // Each change its own record: what, to what (never a secret's value),
-    // who, through which delegation, where and when.
+    // who, through which delegation, and when.
     let changes: Vec<_> = store
         .plugin_setting_changes("snaptrade-1")
         .unwrap()
@@ -652,7 +651,6 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
                 c.secret,
                 c.by,
                 c.delegation,
-                c.made_on,
                 c.at_ns,
             )
         })
@@ -663,7 +661,6 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
                     secret: bool,
                     by: &str,
                     delegation: &str,
-                    made_on: &str,
                     at: i64| {
         (
             name.to_string(),
@@ -672,23 +669,13 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
             secret,
             by.to_string(),
             delegation.to_string(),
-            made_on.to_string(),
             at,
         )
     };
     assert_eq!(
         changes,
         [
-            expected(
-                "api_key",
-                ChangeKind::Set,
-                None,
-                true,
-                "local|ada",
-                "",
-                "form",
-                5
-            ),
+            expected("api_key", ChangeKind::Set, None, true, "local|ada", "", 5),
             expected(
                 "poll_minutes",
                 ChangeKind::Set,
@@ -696,7 +683,6 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
                 false,
                 "local|ada",
                 "",
-                "form",
                 5
             ),
             expected(
@@ -706,7 +692,6 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
                 false,
                 "local|grace",
                 "DLG-7",
-                "page",
                 9
             ),
         ]
@@ -1106,11 +1091,10 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
     ));
 }
 
-fn author(by: &str, made_on: MadeOn) -> SettingsAuthor {
+fn author(by: &str) -> SettingsAuthor {
     SettingsAuthor {
         by: by.into(),
         delegation: String::new(),
-        made_on,
     }
 }
 
@@ -1175,7 +1159,6 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 c.by.as_str(),
                 c.at_ns,
                 c.backfilled,
-                c.made_on.as_str(),
             )
         })
         .collect();
@@ -1190,8 +1173,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 true,
                 "local|ada",
                 10,
-                true,
-                ""
+                true
             ),
             // An earlier change: its value is not known, so it stays unknown.
             (
@@ -1201,8 +1183,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 false,
                 "local|ada",
                 10,
-                false,
-                ""
+                false
             ),
             // The latest, the one the setting says: its value as held.
             (
@@ -1212,8 +1193,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 false,
                 "local|grace",
                 20,
-                true,
-                ""
+                true
             ),
             // One gap per setting, at the migration's own time, once.
             (
@@ -1223,8 +1203,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 false,
                 "",
                 1_000,
-                false,
-                ""
+                false
             ),
             (
                 "poll_minutes",
@@ -1233,8 +1212,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 false,
                 "",
                 1_000,
-                false,
-                ""
+                false
             ),
         ]
     );
@@ -1257,12 +1235,11 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
                 name: "poll_minutes".into(),
                 held: Some(Held::Plain("45".into())),
             }],
-            &author("local|ada", MadeOn::Page),
+            &author("local|ada"),
             3_000,
         )
         .unwrap();
     let after = store.plugin_setting_changes("snaptrade-1").unwrap();
     assert_eq!(after.len(), 6);
     assert_eq!(after[5].value.as_deref(), Some("45"));
-    assert_eq!(after[5].made_on, "page");
 }

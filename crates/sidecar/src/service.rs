@@ -324,6 +324,21 @@ impl SidecarService for Sidecar {
             }));
         }
 
+        // A table setting's columns (contract v14, W4.8): at least one, each
+        // named once and never as a stamp the conductor adds, a choice with
+        // its options, and the table never secret. Refused naming it.
+        if let Some(refusal_reason) = req
+            .settings
+            .iter()
+            .find_map(meridian_domain::setting_table::declaration_refused)
+        {
+            return Ok(Response::new(RegisterReply {
+                admitted: false,
+                refusal_reason,
+                ..Default::default()
+            }));
+        }
+
         // The version's declaration, where it gives one (contract v11): each
         // bound the dictionary's, a secret setting's name one it declares
         // secret, a reason for what it does not carry, and storage only at
@@ -595,6 +610,45 @@ mod tests {
             .into_inner();
         assert!(reply.admitted);
         sc
+    }
+
+    #[tokio::test]
+    async fn a_table_setting_is_admitted_only_with_its_columns_named_once_and_not_secret() {
+        use meridian_pb::v1::{SettingColumn, SettingColumnType, SettingDeclaration, SettingType};
+        let table = |columns: Vec<&str>, secret: bool| SettingDeclaration {
+            name: "plan_code_links".into(),
+            r#type: SettingType::Table as i32,
+            secret,
+            columns: columns
+                .into_iter()
+                .map(|name| SettingColumn {
+                    name: name.into(),
+                    r#type: SettingColumnType::Text as i32,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for (declared, admitted) in [
+            (table(vec!["account", "code"], false), true),
+            (table(vec![], false), false),
+            (table(vec!["code", "code"], false), false),
+            (table(vec!["changed_by"], false), false),
+            (table(vec!["code"], true), false),
+        ] {
+            let reply = sidecar()
+                .register(Request::new(RegisterRequest {
+                    settings: vec![declared],
+                    ..register_req()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(reply.admitted, admitted, "{}", reply.refusal_reason);
+            if !admitted {
+                assert!(reply.refusal_reason.contains("plan_code_links"));
+            }
+        }
     }
 
     #[tokio::test]

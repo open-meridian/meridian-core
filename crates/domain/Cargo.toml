@@ -8,5 +8,7 @@ description = "The domain messages the runtime carries past its sidecar, generat
 
 [dependencies]
 prost.workspace = true
+# A table setting's rows travel as JSON (setting_table.rs, contract v14).
+serde_json.workspace = true
 # The envelope's metadata is plugin-facing, and generated there.
 meridian-pb.workspace = true

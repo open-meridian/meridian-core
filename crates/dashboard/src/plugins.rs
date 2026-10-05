@@ -807,8 +807,17 @@ pub(crate) async fn frame(
                 Some("none") => "Nothing was changed.",
                 _ => "",
             };
+            let choices = match records
+                .plugin_settings
+                .iter()
+                .find(|record| record.plugin_instance_id == instance)
+            {
+                Some(record) => crate::admin::choices(&app, &instance, record, &records).await,
+                None => crate::admin::settings::Choices::default(),
+            };
             let manage = crate::admin::Manage {
                 instance: &instance,
+                choices: &choices,
                 records: &records,
                 report: reports.get(&instance),
                 version: launch.map(|launch| launch.version.as_str()),

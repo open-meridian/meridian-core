@@ -83,38 +83,18 @@ pub struct SettingChange {
     pub held: Option<Held>,
 }
 
-/// Where a settings change was made (W6.11): the dashboard's Settings form,
-/// or one of the plugin's own pages at admin. Recorded with each change, so
-/// its record says why as well as who (decisions/031).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MadeOn {
-    Form,
-    Page,
-}
-
-impl MadeOn {
-    /// As the change record holds it.
-    pub fn code(self) -> &'static str {
-        match self {
-            MadeOn::Form => "form",
-            MadeOn::Page => "page",
-        }
-    }
-}
-
-/// Who made a settings change, and where: the person the dashboard or the
-/// plugin's sidecar stamped, the delegation they acted through when they
-/// acted through a client (empty otherwise), and the place.
+/// Who made a settings change: the person the dashboard stamped, and the
+/// delegation they acted through when they acted through a client (empty
+/// otherwise). A plugin sets none of its settings (W6.11, option A).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsAuthor {
     pub by: String,
     pub delegation: String,
-    pub made_on: MadeOn,
 }
 
 /// What a change to one setting left as its own record (W6.11,
 /// decisions/031): which setting, set or cleared, the value a setting that
-/// is not secret was set to, who, through which delegation, when and where.
+/// is not secret was set to, who, through which delegation, and when.
 /// A gap record names no setting's value: it says what is not known before
 /// its time, and why (`note`), as a backfill does what it filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +107,6 @@ pub struct SettingChangeRecord {
     pub secret: bool,
     pub by: String,
     pub delegation: String,
-    /// `form` or `page`; empty where it is not known (before contract v14).
-    pub made_on: String,
     pub at_ns: i64,
     pub backfilled: bool,
     pub note: String,
@@ -257,7 +235,7 @@ pub trait Store: Send + Sync {
 
     /// Apply every change to one plugin's settings, and record each as its
     /// own change -- the value of one that is not secret, never a secret's --
-    /// with who made it, where and when, all in one step.
+    /// with who made it and when, all in one step.
     fn put_plugin_settings(
         &self,
         plugin_instance_id: &str,

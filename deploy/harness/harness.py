@@ -29,11 +29,13 @@ the same image with the list on stdin:
       Until the plugin has registered with its sidecar and the dashboard lists
       it (healthy or not): the first command of a run.
 
-  settings NAME=VALUE ... [--seconds N]
+  settings NAME=VALUE ... [--seconds N] [--expect TEXT]
       Sets the plugin's settings in its settings form, as its admin does
       (W6.11), once the plugin has declared each. A secret goes in its secret
       field; a developer's setting is accepted because the harness's dashboard
-      is a development one.
+      is a development one. A table setting's cell is NAME[ROW].COLUMN=VALUE,
+      the rows given its whole (contract v14). --expect reads the Settings
+      tab after and fails unless it says TEXT.
 
   account NAME [--seconds N]
       Defines an account (W6.3) and prints its ID, for a plugin whose page
@@ -364,16 +366,21 @@ def ready(args):
 
 def settings(args):
     seconds = number(args, "--seconds", 60)
+    wanted = option(args, "--expect", None)
     asked = pairs(args)
     if args or not asked:
         raise Failed("settings takes NAME=VALUE, at least one")
     admin = signed_in()
+    # A table setting's cell is NAME[ROW].COLUMN=VALUE (contract v14): the
+    # rows given are the table's whole, as the form posts it.
+    base = lambda name: name.split("[", 1)[0]
 
     def declared():
         form = admin.get(f"{VIEW}?tab=settings")
         if form.status != 200:
             raise Failed(f"its settings: {form.status} {sentence(form)}")
-        missing = [name for name, _ in asked if f'data-setting="{name}"' not in form.body]
+        missing = sorted({base(name) for name, _ in asked
+                          if f'data-setting="{base(name)}"' not in form.body})
         if missing:
             raise Failed(f"the plugin has not declared {', '.join(missing)}")
         return form
@@ -381,12 +388,22 @@ def settings(args):
     form = until(seconds, declared, "the settings form never offered them")
     fields = {"form_token": form_token(form)}
     for name, value in asked:
+        if "[" in name:
+            fields[f"table.{base(name)}"] = "1"
+            fields[f"table.{name}"] = value
+            continue
         secret = f'name="secret.{name}"' in form.body
         fields[("secret." if secret else "value.") + name] = value
     saved = admin.post(f"{VIEW}/settings", fields)
     if saved.status != 303:
         raise Failed(f"the settings were not saved: {saved.status} {sentence(saved)}")
-    print(f"settings: saved {', '.join(name for name, _ in asked)}")
+    print(f"settings: saved {', '.join(sorted({base(name) for name, _ in asked}))}")
+    if wanted is not None:
+        shown = admin.get(f"{VIEW}?tab=settings")
+        if wanted not in shown.body:
+            raise Failed(f"the settings page does not say {wanted!r}")
+        said = re.search(r"data-last-changed>([^<]*)<", shown.body)
+        print(f"settings: {said.group(1) if said else wanted}")
 
 
 def account(args):

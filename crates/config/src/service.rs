@@ -1,7 +1,7 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
 //! Eleven commands and queries from the dashboard, two queries from sidecars,
-//! two commands and a query from a plugin acting for its admin, two events
+//! a command and a query from a plugin acting for its admin, two events
 //! heard, one announced. Every change is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
@@ -24,10 +24,11 @@
 //! secret is that it is set; no reply, log line or record here carries its
 //! value. Each change is its own record (decisions/031): which setting, set
 //! or cleared, the value of one that is not secret, who, through which
-//! delegation, when, and where -- the dashboard's form or the plugin's own
-//! page at admin, which a plugin sends acting for its admin, for its own
-//! settings, never naming a secret (W6.11). The settings record names who
-//! made its latest change (`updated_by`).
+//! delegation, and when; the settings record names who made its latest
+//! change (`updated_by`). Only the dashboard's form sets a setting: a plugin
+//! reads its settings and sets none (W6.11, option A). A table setting's
+//! rows are checked cell by cell, and each row added or changed is stamped
+//! with `changed_by` and `changed_at` ([`meridian_domain::setting_table`]).
 //!
 //! # Who asked
 //!
@@ -49,6 +50,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use meridian_bus::{Bus, Envelope};
+use meridian_domain::setting_table;
 use meridian_domain::v1::{
     AccessRecordsRequest, AccountRecord, AccountState, Accounts, AccountsRequest, ClaimCodePurpose,
     CloseAccountRequest, DefineAccessGroupRequest, DefineAccountGroupRequest, DefineAccountRequest,
@@ -65,8 +67,7 @@ use crate::ids;
 use crate::rules;
 use crate::sealing::SettingsKey;
 use crate::store::{
-    Held, KnownPlugin, MadeOn, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting,
-    Withdrawal,
+    Held, KnownPlugin, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -429,63 +430,6 @@ fn delegation(envelope: &Envelope) -> String {
         .unwrap_or_default()
 }
 
-/// Where a settings update was made (W6.11), or the refusal. Sent by a
-/// plugin -- published by its own instance, or by any plugin the deployment
-/// has heard report -- it is from one of the plugin's pages at admin: for an
-/// admin its sidecar vouched for and stamped, for its own settings only, and
-/// naming no secret, to set or to clear, since a secret is set only in the
-/// dashboard's form. Anything else is the dashboard's form, which only the
-/// dashboard may publish here.
-fn made_on(
-    snapshot: &Snapshot,
-    envelope: &Envelope,
-    request: &SetPluginSettingsRequest,
-) -> Result<MadeOn, String> {
-    let from = publisher(envelope);
-    let plugin = request.plugin_instance_id.as_str();
-    let a_plugin = from == plugin
-        || snapshot
-            .plugins
-            .iter()
-            .any(|known| known.plugin_instance_id == from);
-    if !a_plugin {
-        return Ok(MadeOn::Form);
-    }
-    if from != plugin {
-        return Err(format!(
-            "a plugin sets only its own settings, and this names {plugin}"
-        ));
-    }
-    admin_acting(envelope, "a plugin's settings")?;
-    let declared = snapshot
-        .declared_settings
-        .get(plugin)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let secret = |name: &str| {
-        declared.iter().any(|d| d.name == name && d.secret)
-            || snapshot.settings.iter().any(|held| {
-                held.plugin_instance_id == plugin
-                    && held.name == name
-                    && matches!(held.held, Held::Sealed(_))
-            })
-    };
-    let named = request
-        .values
-        .iter()
-        .map(|value| value.name.as_str())
-        .chain(request.cleared.iter().map(String::as_str));
-    for name in named {
-        if secret(name) {
-            return Err(format!(
-                "setting {name} is secret: a secret is set only in the dashboard's Settings form, \
-                 never from a plugin's page, and nothing in this update was stored"
-            ));
-        }
-    }
-    Ok(MadeOn::Page)
-}
-
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -612,7 +556,22 @@ pub fn serve(
         |cx, request: SetPluginSettingsRequest, envelope| {
             let before = cx.snapshot()?;
             let plugin = request.plugin_instance_id.as_str();
-            let made_on = made_on(&before, envelope, &request)?;
+            // The dashboard's form alone sets a setting (W6.11, option A):
+            // a plugin's sidecar has no grant to publish here, and one that
+            // did would be refused.
+            if before
+                .plugins
+                .iter()
+                .any(|known| known.plugin_instance_id == publisher(envelope))
+            {
+                return Err(
+                    "a plugin sets none of its settings: an admin of the plugin sets \
+                            them in the dashboard's Settings form"
+                        .to_string(),
+                );
+            }
+            let by = subject(envelope);
+            let now = cx.clock.now_ns();
             // Every value checked, and every secret sealed, before anything
             // is written: a refusal part-way through changes nothing.
             let mut changes = Vec::new();
@@ -620,6 +579,23 @@ pub fn serve(
                 let name = declaration.name.clone();
                 let held = match value {
                     None => None,
+                    // A table's rows, each added or changed stamped with who
+                    // and when, an unchanged one keeping its own (W6.11).
+                    Some(value) if setting_table::is_table(declaration) => {
+                        let rows = setting_table::parse(&value)
+                            .map_err(|why| format!("setting {name}: {why}"))?;
+                        let standing = stored_settings(&before, plugin)
+                            .find(|held| held.name == name)
+                            .and_then(|held| match &held.held {
+                                Held::Plain(text) => setting_table::parse(text).ok(),
+                                Held::Sealed(_) => None,
+                            })
+                            .unwrap_or_default();
+                        let cells: Vec<_> = rows.into_iter().map(|row| row.cells).collect();
+                        Some(Held::Plain(setting_table::written(
+                            &setting_table::stamped(&cells, &standing, &by, now),
+                        )))
+                    }
                     Some(value) if declaration.secret => Some(Held::Sealed(
                         cx.key.seal(plugin, &name, &value).map_err(|why| {
                             format!("secret setting {name} was not stored, and nothing was: {why}")
@@ -630,14 +606,12 @@ pub fn serve(
                 changes.push(SettingChange { name, held });
             }
             if !changes.is_empty() {
-                let by = subject(envelope);
                 let author = SettingsAuthor {
                     by: by.clone(),
                     delegation: delegation(envelope),
-                    made_on,
                 };
                 cx.store
-                    .put_plugin_settings(plugin, &changes, &author, cx.clock.now_ns())
+                    .put_plugin_settings(plugin, &changes, &author, now)
                     .map_err(|f| f.to_string())?;
                 let named = |set: bool| -> String {
                     changes
@@ -653,7 +627,6 @@ pub fn serve(
                     set = named(true),
                     cleared = named(false),
                     by,
-                    on = made_on.code(),
                     "plugin settings changed"
                 );
                 cx.announce(&before)?;

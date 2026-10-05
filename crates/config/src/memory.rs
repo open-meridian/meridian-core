@@ -232,7 +232,6 @@ impl Store for MemoryStore {
                 secret: matches!(change.held, Some(Held::Sealed(_))),
                 by: author.by.clone(),
                 delegation: author.delegation.clone(),
-                made_on: author.made_on.code().to_string(),
                 at_ns,
                 backfilled: false,
                 note: String::new(),

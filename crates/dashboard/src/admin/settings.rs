@@ -34,11 +34,21 @@
 //! into. A setting held sealed is treated as secret whatever the plugin
 //! declares of it now. The fields' names carry the setting's name and nothing
 //! else, and nothing here logs a field.
+//!
+//! **A table setting** (contract v14; W4.8, W6.11) is an editable typed table:
+//! the kit's `om-entry-grid`, one line a row, a typed input per column -- an
+//! external account chosen from those the plugin reported, an instrument
+//! from the deployment's records, held by its ID and never a symbol -- each
+//! cell checked in the browser as typed, and again here before anything is
+//! sent ([`table_problems`], [`meridian_domain::setting_table`]), a refusal
+//! naming each cell. Without the kit it is a plain table of inputs. The rows'
+//! `changed_by` and `changed_at` are the conductor's to stamp.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use meridian_domain::setting_table::{self, Cells, Problem};
 use meridian_domain::v1::{PluginSettingValue, PluginSettingsRecord, SetPluginSettingsRequest};
-use meridian_pb::v1::{SettingDeclaration, SettingType};
+use meridian_pb::v1::{SettingColumn, SettingColumnType, SettingDeclaration, SettingType};
 
 use crate::html::escape;
 
@@ -48,6 +58,46 @@ pub const SECRET_FIELD: &str = "secret.";
 pub const VALUE_FIELD: &str = "value.";
 /// Ticked, clears a secret that is set.
 pub const CLEAR_FIELD: &str = "clear.";
+/// A table setting's cells: `table.<setting>[<row>].<column>`.
+pub const TABLE_FIELD: &str = "table.";
+/// Blank rows the plain table offers below those held, for more.
+const BLANK_ROWS: usize = 3;
+
+/// What a table setting's typed columns offer (W6.11): the external accounts
+/// the plugin reported, and the deployment's instrument records, each as its
+/// identifier and what a person reads. Empty where the form has no such
+/// column; `unread` says why the instruments could not be listed.
+#[derive(Debug, Clone, Default)]
+pub struct Choices {
+    pub external_accounts: Vec<(String, String)>,
+    pub instruments: Vec<(String, String)>,
+    pub unread: String,
+}
+
+impl Choices {
+    fn of(&self, kind: SettingColumnType) -> Option<&[(String, String)]> {
+        match kind {
+            SettingColumnType::ExternalAccount => Some(&self.external_accounts),
+            SettingColumnType::Instrument => Some(&self.instruments),
+            _ => None,
+        }
+    }
+}
+
+/// Whether any setting a record declares is a table with a column of `kind`.
+pub fn wants(record: &PluginSettingsRecord, kind: SettingColumnType) -> bool {
+    record.declared_settings.iter().any(|declaration| {
+        setting_table::is_table(declaration)
+            && declaration
+                .columns
+                .iter()
+                .any(|column| column.r#type == kind as i32)
+    })
+}
+
+fn column_kind(column: &SettingColumn) -> SettingColumnType {
+    SettingColumnType::try_from(column.r#type).unwrap_or(SettingColumnType::Unspecified)
+}
 
 /// Where a plugin instance's settings are posted. The instance goes in the
 /// path, so it is escaped where it is written into a page.
@@ -507,10 +557,13 @@ fn field(
     declaration: &SettingDeclaration,
     record: &PluginSettingsRecord,
     declared: &[SettingDeclaration],
+    choices: &Choices,
 ) -> String {
     let secret = is_secret(record, declaration);
     let about = about(declaration, secret);
-    let inner = if secret {
+    let inner = if setting_table::is_table(declaration) && !secret {
+        table_field(declaration, record, declared, &about, choices)
+    } else if secret {
         secret_field(declaration, record, declared, &about)
     } else if kind(declaration) == SettingType::Choice {
         choice_field(declaration, record, declared, &about)
@@ -528,24 +581,26 @@ fn field(
 /// The form: every setting the plugin declared that this deployment shows,
 /// deciding choices first, in a grid a short field shares with another; a
 /// developer's settings under a closed "Developer", opened while one of them
-/// is required and missing; and the Save button kept in view.
+/// is required and missing; and the Save button kept in view. Its table
+/// settings offer nothing to choose: the tests' form.
+#[cfg(test)]
 pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> String {
-    form_to(
+    form_with(
         record,
         token,
         development,
         &path(&record.plugin_instance_id),
+        &Choices::default(),
     )
 }
 
-/// The same form, posted to `action`: the plugin's area under Manage posts
-/// it to its own address, which comes back to the area
-/// ([`crate::area::settings_path`]).
-pub fn form_to(
+/// The same form, its table settings offering `choices`.
+pub fn form_with(
     record: &PluginSettingsRecord,
     token: &str,
     development: bool,
     action: &str,
+    choices: &Choices,
 ) -> String {
     let declared = &record.declared_settings;
     let (developer, settings): (Vec<_>, Vec<_>) = in_order(declared)
@@ -558,7 +613,7 @@ pub fn form_to(
     let fields = |these: &[&SettingDeclaration]| -> String {
         these
             .iter()
-            .map(|declaration| field(declaration, record, declared))
+            .map(|declaration| field(declaration, record, declared, choices))
             .collect()
     };
     let main = if settings.is_empty() {
@@ -708,6 +763,34 @@ pub fn request(
             continue;
         }
         let name = &declaration.name;
+        if setting_table::is_table(declaration) && !is_secret(record, declaration) {
+            let Some(rows) = posted_rows(fields, name) else {
+                continue;
+            };
+            // Checked before this is called (`table_problems`); what does not
+            // read here is sent as typed, for the conductor to refuse.
+            let rows = setting_table::checked(declaration, &rows).unwrap_or(rows);
+            let held: Vec<Cells> = current(record, name)
+                .and_then(|text| setting_table::parse(text).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row.cells)
+                .collect();
+            if rows == held {
+                continue;
+            }
+            if rows.is_empty() {
+                if current(record, name).is_some() {
+                    request.cleared.push(name.clone());
+                }
+            } else {
+                request.values.push(PluginSettingValue {
+                    name: name.clone(),
+                    value: setting_table::cells_written(&rows),
+                });
+            }
+            continue;
+        }
         if is_secret(record, declaration) {
             let typed = given(SECRET_FIELD, name).unwrap_or_default();
             if !typed.is_empty() {
@@ -739,4 +822,333 @@ pub fn request(
         }
     }
     (!request.values.is_empty() || !request.cleared.is_empty()).then_some(request)
+}
+
+// ── A table setting (contract v14; W4.8, W6.11) ─────────────────────────────
+
+/// The rows a form posted for a table setting, in their order, each wholly
+/// blank row kept so a problem's path names the row as the form numbered it;
+/// None where the form did not post the table at all.
+fn posted_rows(fields: &HashMap<String, String>, name: &str) -> Option<Vec<Cells>> {
+    let prefix = format!("{TABLE_FIELD}{name}[");
+    let mut rows: BTreeMap<usize, Cells> = BTreeMap::new();
+    for (field, value) in fields {
+        let Some(rest) = field.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((index, column)) = rest.split_once("].") else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        if index > setting_table::MOST_ROWS + BLANK_ROWS {
+            continue;
+        }
+        rows.entry(index)
+            .or_default()
+            .insert(column.to_string(), value.clone());
+    }
+    let present = fields.contains_key(&format!("{TABLE_FIELD}{name}"));
+    if rows.is_empty() && !present {
+        return None;
+    }
+    let last = rows.keys().next_back().copied().map_or(0, |n| n + 1);
+    Some(
+        (0..last)
+            .map(|n| rows.remove(&n).unwrap_or_default())
+            .collect(),
+    )
+}
+
+/// Every cell of every table the form posted that does not read, by its
+/// path: as the conductor checks it, and an external account one the plugin
+/// reported, an instrument one the deployment holds. Nothing is sent while
+/// any is said.
+pub fn table_problems(
+    record: &PluginSettingsRecord,
+    fields: &HashMap<String, String>,
+    choices: &Choices,
+) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    for declaration in &record.declared_settings {
+        if !setting_table::is_table(declaration) {
+            continue;
+        }
+        let Some(rows) = posted_rows(fields, &declaration.name) else {
+            continue;
+        };
+        if let Err(found) = setting_table::checked(declaration, &rows) {
+            problems.extend(found);
+        }
+        for (n, row) in rows.iter().enumerate() {
+            for column in &declaration.columns {
+                let Some(offered) = choices.of(column_kind(column)) else {
+                    continue;
+                };
+                let typed = row.get(&column.name).map(|v| v.trim()).unwrap_or_default();
+                if typed.is_empty() || offered.iter().any(|(id, _)| id == typed) {
+                    continue;
+                }
+                problems.push(Problem {
+                    path: format!("{}[{n}].{}", declaration.name, column.name),
+                    message: match column_kind(column) {
+                        SettingColumnType::Instrument if !choices.unread.is_empty() => {
+                            format!("the instruments could not be read: {}", choices.unread)
+                        }
+                        SettingColumnType::Instrument => {
+                            "names no instrument record this deployment holds".to_string()
+                        }
+                        _ => "names no external account this plugin reported".to_string(),
+                    },
+                });
+            }
+        }
+    }
+    problems
+}
+
+/// A refusal of table cells, as a person reads it: each by its row and
+/// column's label.
+pub fn said(record: &PluginSettingsRecord, problems: &[Problem]) -> String {
+    let named = |path: &str| -> String {
+        for declaration in &record.declared_settings {
+            let Some(rest) = path.strip_prefix(&format!("{}[", declaration.name)) else {
+                continue;
+            };
+            if let Some((n, column)) = rest.split_once("].") {
+                let heading = declaration
+                    .columns
+                    .iter()
+                    .find(|c| c.name == column)
+                    .map(setting_table::label)
+                    .unwrap_or(column);
+                let row = n.parse::<usize>().map_or(0, |n| n + 1);
+                return format!("{}, row {row}, {heading}", label(declaration));
+            }
+        }
+        path.to_string()
+    };
+    problems
+        .iter()
+        .map(|problem| {
+            format!(
+                "{}: {} ({})",
+                named(&problem.path),
+                problem.message,
+                problem.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn grid_column(column: &SettingColumn, choices: &Choices) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert("key".into(), column.name.clone().into());
+    out.insert("label".into(), setting_table::label(column).into());
+    if column.required {
+        out.insert("required".into(), true.into());
+    }
+    if !column.description.is_empty() {
+        out.insert("hint".into(), column.description.clone().into());
+    }
+    let options = |pairs: Vec<(String, String)>| -> serde_json::Value {
+        pairs
+            .into_iter()
+            .map(|(value, label)| serde_json::json!({"value": value, "label": label}))
+            .collect::<Vec<_>>()
+            .into()
+    };
+    match column_kind(column) {
+        SettingColumnType::Integer => {
+            out.insert("type".into(), "decimal".into());
+            out.insert("places".into(), 0.into());
+        }
+        SettingColumnType::Decimal => {
+            out.insert("type".into(), "decimal".into());
+            out.insert("places".into(), 18.into());
+        }
+        SettingColumnType::Date => {
+            out.insert("type".into(), "date".into());
+        }
+        SettingColumnType::Choice => {
+            out.insert("type".into(), "choice".into());
+            out.insert(
+                "options".into(),
+                options(
+                    column
+                        .choices
+                        .iter()
+                        .map(|c| {
+                            let shown = if c.label.is_empty() {
+                                &c.value
+                            } else {
+                                &c.label
+                            };
+                            (c.value.clone(), shown.clone())
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        kind @ (SettingColumnType::ExternalAccount | SettingColumnType::Instrument) => {
+            out.insert("type".into(), "choice".into());
+            out.insert(
+                "options".into(),
+                options(choices.of(kind).unwrap_or_default().to_vec()),
+            );
+        }
+        SettingColumnType::Text | SettingColumnType::Unspecified => {
+            out.insert("max_length".into(), setting_table::MOST_TEXT.into());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn cell_input(
+    name: &str,
+    n: usize,
+    column: &SettingColumn,
+    value: &str,
+    choices: &Choices,
+) -> String {
+    let field = escape(&format!("{TABLE_FIELD}{name}[{n}].{}", column.name));
+    let aria = escape(&format!("{}, row {}", setting_table::label(column), n + 1));
+    let select = |pairs: Vec<(String, String)>| -> String {
+        let mut known = pairs.iter().any(|(id, _)| id == value);
+        let mut out =
+            format!(r#"<select name="{field}" aria-label="{aria}"><option value=""></option>"#);
+        for (id, shown) in &pairs {
+            out.push_str(&format!(
+                r#"<option value="{}"{}>{}</option>"#,
+                escape(id),
+                if id == value { " selected" } else { "" },
+                escape(shown)
+            ));
+        }
+        if !value.is_empty() && !known {
+            // Held, and no longer offered: kept, and said.
+            out.push_str(&format!(
+                r#"<option value="{}" selected>{} (not offered now)</option>"#,
+                escape(value),
+                escape(value)
+            ));
+            known = true;
+        }
+        let _ = known;
+        out.push_str("</select>");
+        out
+    };
+    match column_kind(column) {
+        SettingColumnType::Choice => select(
+            column
+                .choices
+                .iter()
+                .map(|c| {
+                    (
+                        c.value.clone(),
+                        if c.label.is_empty() {
+                            c.value.clone()
+                        } else {
+                            c.label.clone()
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        kind @ (SettingColumnType::ExternalAccount | SettingColumnType::Instrument) => {
+            select(choices.of(kind).unwrap_or_default().to_vec())
+        }
+        kind => format!(
+            r#"<input name="{field}" value="{}" aria-label="{aria}" autocomplete="off"{}>"#,
+            escape(value),
+            match kind {
+                SettingColumnType::Integer | SettingColumnType::Decimal =>
+                    r#" inputmode="decimal""#,
+                SettingColumnType::Date => r#" placeholder="YYYY-MM-DD""#,
+                _ => "",
+            }
+        ),
+    }
+}
+
+/// A table setting: the kit's entry grid over a plain table of inputs, the
+/// rows held and a few blank ones, one line each, within the table's most.
+fn table_field(
+    declaration: &SettingDeclaration,
+    record: &PluginSettingsRecord,
+    declared: &[SettingDeclaration],
+    about: &str,
+    choices: &Choices,
+) -> String {
+    let name = &declaration.name;
+    let held = current(record, name)
+        .and_then(|text| setting_table::parse(text).ok())
+        .unwrap_or_default();
+    let most = setting_table::most_rows(declaration);
+    let grid = serde_json::json!({
+        "columns": declaration.columns.iter().map(|c| grid_column(c, choices)).collect::<Vec<_>>(),
+        "rows": held.iter().map(|row| row.cells.clone()).collect::<Vec<_>>(),
+    });
+    let blank = BLANK_ROWS.min(most.saturating_sub(held.len()));
+    let mut body = String::new();
+    for n in 0..held.len() + blank {
+        let cells = held.get(n).map(|row| &row.cells);
+        body.push_str("<tr>");
+        for column in &declaration.columns {
+            let value = cells
+                .and_then(|cells| cells.get(&column.name))
+                .map(String::as_str)
+                .unwrap_or_default();
+            body.push_str(&format!(
+                "<td>{}</td>",
+                cell_input(name, n, column, value, choices)
+            ));
+        }
+        body.push_str("</tr>");
+    }
+    let heads: String = declaration
+        .columns
+        .iter()
+        .map(|c| format!("<th>{}</th>", escape(setting_table::label(c))))
+        .collect();
+    let caption = escape(label(declaration));
+    let unread = if choices.unread.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="hint bad-ink">The instruments could not be read: {}</p>"#,
+            escape(&choices.unread)
+        )
+    };
+    let who = held
+        .iter()
+        .max_by(|a, b| a.changed_at.cmp(&b.changed_at))
+        .map(|row| {
+            format!(
+                r#"<p class="hint">{} {}; the latest changed by {} at {}.</p>"#,
+                held.len(),
+                if held.len() == 1 { "row" } else { "rows" },
+                escape(&row.changed_by),
+                escape(&row.changed_at)
+            )
+        })
+        .unwrap_or_default();
+    // The grid's JSON escapes `<`, `>` and `&` so no cell closes the script.
+    let json = grid
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    format!(
+        "{}{unread}<input type=\"hidden\" name=\"{TABLE_FIELD}{field}\" value=\"1\">\
+         <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\" narrow=\"none\">\
+         <script type=\"application/json\">{json}</script>\
+         <div class=\"table-wrap\"><table class=\"one-line\"><caption>{caption}</caption>\
+         <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>{who}{}",
+        heading(declaration, declared, false, "", about),
+        hint(declaration, about),
+        field = escape(name),
+    )
 }
