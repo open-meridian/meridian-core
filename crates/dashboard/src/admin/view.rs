@@ -498,10 +498,14 @@ pub fn render(view: &View) -> String {
                          reported what it needs.</p>"
                     .to_string(),
             };
+            let changed = view
+                .record
+                .map(|record| super::last_changed(view.records, record))
+                .unwrap_or_default();
             format!(
                 "{notice}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
                  <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
-                 once set: type a new value to replace it.</p>{form}</section>"
+                 once set: type a new value to replace it.</p>{changed}{form}</section>"
             )
         }
         ACCESS => format!(
