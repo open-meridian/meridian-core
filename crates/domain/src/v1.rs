@@ -322,7 +322,10 @@ pub struct ChangelogEntry {
     #[prost(int64, tag = "3")]
     pub version: i64,
     /// The step that made it: define, amend, activate, decommission,
-    /// reactivate, map, mint.
+    /// reactivate, map, mint; or close_miss, a miss closed as found (W1.13),
+    /// which changes no instrument: at the version that holds what the miss
+    /// asked for, its identifiers before and after the same, naming the miss
+    /// (miss_id) and, in the note, why.
     #[prost(string, tag = "4")]
     pub operation: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "5")]
@@ -343,6 +346,10 @@ pub struct ChangelogEntry {
     pub accepted_by_person_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "12")]
     pub record_time_ns: i64,
+    /// The miss a close_miss entry closed, as MissEntry names it; empty for
+    /// every other operation.
+    #[prost(string, tag = "13")]
+    pub miss_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentChangelogRequest {

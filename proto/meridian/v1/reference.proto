@@ -431,7 +431,10 @@ message ChangelogEntry {
   string instrument_id = 2;
   int64 version = 3;
   // The step that made it: define, amend, activate, decommission,
-  // reactivate, map, mint.
+  // reactivate, map, mint; or close_miss, a miss closed as found (W1.13),
+  // which changes no instrument: at the version that holds what the miss
+  // asked for, its identifiers before and after the same, naming the miss
+  // (miss_id) and, in the note, why.
   string operation = 4;
   repeated Identifier identifiers_before = 5;
   repeated Identifier identifiers_after = 6;
@@ -443,6 +446,9 @@ message ChangelogEntry {
   // The person who accepted it, when it was.
   string accepted_by_person_id = 11;
   int64 record_time_ns = 12;
+  // The miss a close_miss entry closed, as MissEntry names it; empty for
+  // every other operation.
+  string miss_id = 13;
 }
 
 message InstrumentChangelogRequest {
