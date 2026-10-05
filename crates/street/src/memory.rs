@@ -14,6 +14,7 @@ use crate::store::{
     ActivityPage, Amended, Amendment, Cause, Chain, Change, Completed, Completion, Counts,
     CustodialPosition, Holding, Kept, Key, Opened, Page, Read, Result, Settled, Side, Statement,
     StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead,
+    SYNC_STATUS_NOT_KNOWN_BEFORE,
 };
 
 #[derive(Debug, Default)]
@@ -746,6 +747,16 @@ impl Held {
         status.recorded = Completed {
             change,
             cause: cause.clone(),
+        };
+        // The connection's first: nothing is known of it before this one.
+        let heard_before = self
+            .sync_statuses
+            .iter()
+            .any(|held| connection(held) == connection(&status));
+        status.not_known_before = if heard_before {
+            String::new()
+        } else {
+            SYNC_STATUS_NOT_KNOWN_BEFORE.to_string()
         };
         self.sync_statuses.push(status.clone());
         status

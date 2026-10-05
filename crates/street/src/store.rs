@@ -955,7 +955,20 @@ pub struct SyncStatus {
     /// The SyncStatusEvent, encoded as it was published.
     pub record: Vec<u8>,
     pub recorded: Completed,
+    /// Set by the store, never by a caller, on the first sync status it keeps
+    /// for a connection and only there: why nothing is known of the
+    /// connection's sync status before this one's recorded time
+    /// (decisions/031, point 4). Empty on every later one.
+    pub not_known_before: String,
 }
+
+/// Why nothing is known of a connection's sync status before the first one
+/// the street kept (decisions/031, point 4): the street keeps each from
+/// contract v14, and before then the dashboard held only the latest, in
+/// memory, so there is nothing to backfill from.
+pub const SYNC_STATUS_NOT_KNOWN_BEFORE: &str = "not known before: the street keeps each sync \
+     status from the first it hears for a connection, and none was kept before it to backfill \
+     from";
 
 /// What a read of activity asks (W2.11).
 #[derive(Debug, Clone)]

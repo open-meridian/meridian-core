@@ -132,6 +132,7 @@ pub fn record_sync_status(
             history_from: event.history_from.clone(),
             record: event.encode_to_vec(),
             recorded: Completed::default(),
+            not_known_before: String::new(),
         },
         cause,
     )?;
@@ -579,6 +580,72 @@ mod tests {
         .unwrap();
         let journal = again.journal.unwrap();
         assert_eq!((journal.sequence, journal.previous_sequence), (2, 1));
+    }
+
+    #[test]
+    fn a_connections_first_sync_status_records_that_nothing_is_known_before_it() {
+        // decisions/031, point 4: once per connection, at the first the
+        // street heard, and never on the wire to a plugin.
+        let store = MemoryStore::new();
+        let first = record_sync_status(
+            &store,
+            &sync("ACC-1", SyncState::Current, ""),
+            &by("c", NOW),
+        )
+        .unwrap();
+        record_sync_status(
+            &store,
+            &sync("ACC-1", SyncState::NeedsSignIn, ""),
+            &by("c", NOW + 1),
+        )
+        .unwrap();
+        record_sync_status(
+            &store,
+            &sync("ACC-2", SyncState::Stale, ""),
+            &by("c", NOW + 2),
+        )
+        .unwrap();
+        let mut unlinked = sync("", SyncState::Current, "");
+        unlinked.external_account_id = "SNAP-ACC-9".into();
+        record_sync_status(&store, &unlinked, &by("c", NOW + 3)).unwrap();
+        record_sync_status(&store, &unlinked, &by("c", NOW + 4)).unwrap();
+
+        let every = store
+            .sync_statuses(&SyncStatusesRead {
+                scope: Scope::Everything,
+                account_id: String::new(),
+                limit: 10,
+                cursor: String::new(),
+                since: Some(0),
+            })
+            .unwrap();
+        let gaps: Vec<(&str, bool, i64)> = every
+            .statuses
+            .iter()
+            .map(|s| {
+                (
+                    s.account_id.as_str(),
+                    !s.not_known_before.is_empty(),
+                    s.recorded.cause.committed_at_ns,
+                )
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                ("ACC-1", true, NOW),
+                ("ACC-1", false, NOW + 1),
+                ("ACC-2", true, NOW + 2),
+                ("", true, NOW + 3),
+                ("", false, NOW + 4),
+            ]
+        );
+        assert_eq!(
+            every.statuses[0].not_known_before,
+            crate::SYNC_STATUS_NOT_KNOWN_BEFORE
+        );
+        // The record announced is the sync status as published, nothing more.
+        assert_eq!(first.status.unwrap(), sync("ACC-1", SyncState::Current, ""));
     }
 
     #[test]

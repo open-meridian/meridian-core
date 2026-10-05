@@ -88,6 +88,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "the_custodians_activity",
         sql: include_str!("../migrations/0008_the_custodians_activity.sql"),
     },
+    Migration {
+        version: 9,
+        name: "the_gap_before_the_street_listened",
+        sql: include_str!("../migrations/0009_the_gap_before_the_street_listened.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -106,4 +106,5 @@ pub use store::{
     Completed, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures,
     Holding, Kept, Key, Lot, Opened, Pending, Provenance, RawRecord, Scope, Settled, Side,
     Statement, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead, PARTITION,
+    SYNC_STATUS_NOT_KNOWN_BEFORE,
 };

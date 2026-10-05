@@ -35,7 +35,7 @@ use crate::store::{
     Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures, Holding, Identifier, Kept,
     Key, Lot, Opened, Page, Pending, Provenance, RawRecord, Read, Result, Scope, Settled, Side,
     Statement, StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage,
-    SyncStatusesRead, PARTITION,
+    SyncStatusesRead, PARTITION, SYNC_STATUS_NOT_KNOWN_BEFORE,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -128,7 +128,7 @@ const ACTIVITY_COLUMNS: &str = "activity_id, account_id, external_account_id, so
 /// A sync status's columns, in the order [`sync_status_of`] reads them.
 const SYNC_STATUS_COLUMNS: &str = "account_id, external_account_id, source, state, history_from,
         record, recorded_at_ns, sequence, previous_sequence, cause_instance_id,
-        cause_acting_for_subject, cause_correlation_id, cause_causation_id";
+        cause_acting_for_subject, cause_correlation_id, cause_causation_id, not_known_before";
 
 impl Store for PostgresStore {
     fn open(&self, statement: Statement, cause: &Cause) -> Result<(Statement, Opened, Completion)> {
@@ -1087,12 +1087,34 @@ impl Store for PostgresStore {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let change = next_change(&mut tx, Chain::SyncStatus, &status.account_id)?;
+        // The connection's first: nothing is known of it before this one.
+        // Read after numbering, so under the partition's lock: two first
+        // sync statuses cannot both be the first.
+        let heard_before: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM sync_status
+                                 WHERE account_id = $1 AND source = $2
+                                   AND external_account_id = $3)",
+                &[
+                    &status.account_id,
+                    &status.source,
+                    &status.external_account_id,
+                ],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        let not_known_before = if heard_before {
+            String::new()
+        } else {
+            SYNC_STATUS_NOT_KNOWN_BEFORE.to_string()
+        };
         tx.execute(
             "INSERT INTO sync_status
                     (sequence, previous_sequence, account_id, external_account_id, source, state,
                      history_from, record, recorded_at_ns, cause_instance_id,
-                     cause_acting_for_subject, cause_correlation_id, cause_causation_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                     cause_acting_for_subject, cause_correlation_id, cause_causation_id,
+                     not_known_before)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             &[
                 &(change.sequence as i64),
                 &(change.previous as i64),
@@ -1107,6 +1129,7 @@ impl Store for PostgresStore {
                 &cause.acting_for_subject,
                 &cause.correlation_id,
                 &cause.causation_id,
+                &not_known_before,
             ],
         )
         .map_err(unavailable)?;
@@ -1116,6 +1139,7 @@ impl Store for PostgresStore {
                 change,
                 cause: cause.clone(),
             },
+            not_known_before,
             ..status
         })
     }
@@ -1271,6 +1295,7 @@ fn sync_status_of(row: &Row) -> Result<SyncStatus> {
                 committed_at_ns: row.get(6),
             },
         },
+        not_known_before: row.get(13),
     })
 }
 

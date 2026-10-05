@@ -2014,3 +2014,137 @@ fn an_unlinked_connections_sync_status_is_kept_and_answered_to_no_plugin() {
     .unwrap();
     assert!(scoped.statuses.is_empty());
 }
+
+// ── The gap before the street listened (decisions/031, point 4) ───────────
+
+/// Whether each sync status kept for `external`'s connections, in the order
+/// recorded, says nothing is known before it.
+fn gaps(client: &mut postgres::Client, external: &str) -> Vec<(String, bool)> {
+    client
+        .query(
+            "SELECT account_id, not_known_before <> '' FROM sync_status
+              WHERE external_account_id = $1 ORDER BY sequence",
+            &[&external],
+        )
+        .expect("could not read the sync statuses")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+#[test]
+fn a_connections_first_sync_status_records_that_nothing_is_known_before_it() {
+    let store = store();
+    let account = unique("ACC");
+    let external = format!("SNAP-{account}");
+    use meridian_domain::v1::SyncState;
+    // Unlinked first, then linked: two connections, each its own first.
+    let mut unlinked = sync("", SyncState::Current, "");
+    unlinked.external_account_id = external.clone();
+    meridian_street::record_sync_status(&store, &unlinked, &at(NOW)).unwrap();
+    for (n, state) in [SyncState::Current, SyncState::NeedsSignIn]
+        .into_iter()
+        .enumerate()
+    {
+        meridian_street::record_sync_status(
+            &store,
+            &sync(&account, state, ""),
+            &at(NOW + 1 + n as i64),
+        )
+        .unwrap();
+    }
+
+    let mut client = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    assert_eq!(
+        gaps(&mut client, &external),
+        vec![
+            (String::new(), true),
+            (account.clone(), true),
+            (account.clone(), false),
+        ]
+    );
+    let read = store
+        .sync_statuses(&meridian_street::SyncStatusesRead {
+            scope: Scope::Everything,
+            account_id: account.clone(),
+            limit: 10,
+            cursor: String::new(),
+            since: Some(0),
+        })
+        .unwrap();
+    assert_eq!(
+        read.statuses
+            .iter()
+            .map(|s| s.not_known_before.as_str())
+            .collect::<Vec<_>>(),
+        vec![meridian_street::SYNC_STATUS_NOT_KNOWN_BEFORE, ""]
+    );
+
+    // Once per connection: the database refuses a second.
+    let second = client.execute(
+        "UPDATE sync_status SET not_known_before = 'again'
+          WHERE account_id = $1 AND not_known_before = ''",
+        &[&account],
+    );
+    assert!(second.is_err(), "a connection was marked twice");
+}
+
+#[test]
+fn sync_statuses_kept_before_the_gap_was_recorded_have_their_first_marked() {
+    // A database that kept sync statuses under 0008: migrating marks each
+    // connection's first, saying the migration did, and leaves the rest.
+    let (url, mut client) = own_schema("gap");
+    client
+        .batch_execute(meridian_street::migrations::HISTORY)
+        .unwrap();
+    for migration in &meridian_street::migrations::MIGRATIONS[..8] {
+        client.batch_execute(migration.sql).unwrap();
+        client
+            .execute(
+                "INSERT INTO schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+                &[&migration.version, &migration.name],
+            )
+            .unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO sync_status
+                    (sequence, previous_sequence, account_id, external_account_id, source,
+                     record, recorded_at_ns)
+             VALUES (1, 0, 'ACC-1', 'SNAP-1', 'snaptrade', '', 10),
+                    (2, 1, 'ACC-1', 'SNAP-1', 'snaptrade', '', 20),
+                    (3, 0, '', 'SNAP-9', 'snaptrade', '', 30);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 1).unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    let marked: Vec<(i64, String, i64)> = client
+        .query(
+            "SELECT sequence, not_known_before, recorded_at_ns FROM sync_status ORDER BY sequence",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert!(marked[0].1.contains("marked by migration 0009"));
+    assert!(marked[1].1.is_empty());
+    assert!(marked[2].1.contains("marked by migration 0009"));
+    assert_eq!(
+        marked.iter().map(|m| m.2).collect::<Vec<_>>(),
+        vec![10, 20, 30],
+        "a recorded time is never back-dated"
+    );
+
+    // And again, nothing changes.
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    let again: i64 = client
+        .query_one(
+            "SELECT count(*) FROM sync_status WHERE not_known_before <> ''",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(again, 2);
+}
