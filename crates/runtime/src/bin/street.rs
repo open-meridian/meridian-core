@@ -103,6 +103,13 @@ fn run() -> Result<(), String> {
             Arc::clone(&store),
         ));
 
+        // W2.13 (contract v14): every custody plugin's sync status, kept
+        // and announced. Subscribed before this returns, as above.
+        tokio::spawn(meridian_street::service::follow_sync_statuses(
+            bus.clone(),
+            Arc::clone(&store),
+        ));
+
         // And asked about, for a replacement said while this process was
         // not listening.
         tokio::spawn(meridian_street::service::sweep_forever(

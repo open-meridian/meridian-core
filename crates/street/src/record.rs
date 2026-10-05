@@ -679,7 +679,7 @@ pub(crate) fn to_wire_journal(change: Change) -> JournalRef {
     }
 }
 
-fn to_wire_cause(cause: &Cause) -> ChangeCause {
+pub(crate) fn to_wire_cause(cause: &Cause) -> ChangeCause {
     ChangeCause {
         instance_id: cause.instance_id.clone(),
         acting_for_subject: cause.acting_for_subject.clone(),

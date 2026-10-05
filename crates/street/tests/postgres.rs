@@ -1773,3 +1773,244 @@ fn migration_five_numbers_nothing_old_and_moves_a_statements_figures_into_a_set(
 fn statement_open(store: &PostgresStore, account: &str) -> Statement {
     store.open(statement(account), &at(NOW)).unwrap().0
 }
+
+// ── The custodian's activity and each sync status (contract v14: W2.10 to W2.14) ──
+
+fn decimal(text: &str) -> Option<meridian_pb::v1::Decimal> {
+    Some(text.parse::<Exact>().unwrap().to_wire())
+}
+
+fn reinvestment(
+    account: &str,
+    id: &str,
+    trade_date: &str,
+) -> meridian_domain::v1::RecordActivityRequest {
+    meridian_domain::v1::RecordActivityRequest {
+        account_id: account.into(),
+        external_account_id: format!("SNAP-{account}"),
+        source: "snaptrade".into(),
+        activity: Some(meridian_domain::v1::CustodialActivity {
+            external_activity_id: id.into(),
+            kind: meridian_domain::v1::ActivityKind::Reinvestment as i32,
+            instrument_id: "INS-SPAXX".into(),
+            trade_date: trade_date.into(),
+            units: decimal("3.27"),
+            description: "REINVESTMENT SPAXX".into(),
+            ..Default::default()
+        }),
+    }
+}
+
+fn sync(
+    account: &str,
+    state: meridian_domain::v1::SyncState,
+    history_from: &str,
+) -> meridian_domain::v1::SyncStatusEvent {
+    meridian_domain::v1::SyncStatusEvent {
+        source: "snaptrade".into(),
+        account_id: account.into(),
+        external_account_id: format!("SNAP-{account}"),
+        state: state as i32,
+        history_from: history_from.into(),
+        ..Default::default()
+    }
+}
+
+fn named(account: &str) -> meridian_domain::v1::ListActivitiesRequest {
+    meridian_domain::v1::ListActivitiesRequest {
+        account_id: account.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_activity_is_kept_once_whole_and_numbered_in_the_partition() {
+    let store = store();
+    let account = unique("ACC");
+    let request = reinvestment(&account, "a3f0", "2026-09-30");
+
+    let first = meridian_street::record_activity(&store, &request, &at(NOW)).unwrap();
+    assert!(!first.reply.already_recorded);
+    let event = first.event.expect("announced");
+    assert_eq!(event.activity, request.activity, "kept whole, as sent");
+    let journal = event.journal.clone().unwrap();
+    assert!(journal.sequence > 0);
+    assert_eq!(journal.previous_sequence, 0, "the account's first activity");
+
+    let again = meridian_street::record_activity(&store, &request, &at(NOW + 1)).unwrap();
+    assert!(again.reply.already_recorded);
+    assert_eq!(again.reply.activity_id, first.reply.activity_id);
+    assert!(again.event.is_none());
+
+    let read =
+        meridian_street::list_activities(&store, &named(&account), &Scope::Everything).unwrap();
+    assert_eq!(read.activities, vec![event]);
+
+    // Nothing is derived from it.
+    assert!(store
+        .custodial_position(&account, "INS-SPAXX", Side::Long)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn activity_is_read_by_trade_date_paged_and_since_in_the_order_recorded() {
+    let store = store();
+    let account = unique("ACC");
+    let mut sequences = Vec::new();
+    for (id, date) in [
+        ("c", "2026-09-30"),
+        ("a", "2026-09-09"),
+        ("b", "2026-09-15"),
+    ] {
+        let recorded =
+            meridian_street::record_activity(&store, &reinvestment(&account, id, date), &at(NOW))
+                .unwrap();
+        sequences.push(recorded.event.unwrap().journal.unwrap().sequence);
+    }
+    let trade_dates = |reply: &meridian_domain::v1::ListActivitiesReply| -> Vec<String> {
+        reply
+            .activities
+            .iter()
+            .map(|a| a.activity.as_ref().unwrap().trade_date.clone())
+            .collect()
+    };
+
+    let mut request = named(&account);
+    request.trade_date_from = "2026-09-09".into();
+    request.trade_date_to = "2026-09-30".into();
+    request.page_size = 2;
+    let first = meridian_street::list_activities(&store, &request, &Scope::Everything).unwrap();
+    assert_eq!(trade_dates(&first), ["2026-09-09", "2026-09-15"]);
+    request.cursor = first.next_cursor.clone();
+    let second = meridian_street::list_activities(&store, &request, &Scope::Everything).unwrap();
+    assert_eq!(trade_dates(&second), ["2026-09-30"]);
+    assert!(second.next_cursor.is_empty());
+
+    let mut since = named(&account);
+    since.since = Some(meridian_domain::v1::Watermark {
+        partitions: vec![meridian_domain::v1::PartitionSequence {
+            partition: "street".into(),
+            sequence: sequences[0],
+        }],
+    });
+    let read = meridian_street::list_activities(&store, &since, &Scope::Everything).unwrap();
+    assert_eq!(
+        trade_dates(&read),
+        ["2026-09-09", "2026-09-15"],
+        "in the order recorded"
+    );
+}
+
+#[test]
+fn a_plugins_read_of_activity_is_within_its_scope() {
+    let store = store();
+    let mine = unique("ACC");
+    let other = unique("ACC");
+    meridian_street::record_activity(&store, &reinvestment(&mine, "1", "2026-09-01"), &at(NOW))
+        .unwrap();
+    meridian_street::record_activity(&store, &reinvestment(&other, "2", "2026-09-01"), &at(NOW))
+        .unwrap();
+    let scope = Scope::Within([mine.clone()].into_iter().collect());
+    let read = meridian_street::list_activities(
+        &store,
+        &meridian_domain::v1::ListActivitiesRequest::default(),
+        &scope,
+    )
+    .unwrap();
+    assert!(read.activities.iter().all(|a| a.account_id == mine));
+    assert!(!read.activities.is_empty());
+    assert!(meridian_street::list_activities(&store, &named(&other), &scope).is_err());
+}
+
+#[test]
+fn every_sync_status_is_kept_and_the_latest_answers_history_from() {
+    let store = store();
+    let account = unique("ACC");
+    use meridian_domain::v1::SyncState;
+    let first = meridian_street::record_sync_status(
+        &store,
+        &sync(&account, SyncState::Current, "2024-09-08"),
+        &at(NOW),
+    )
+    .unwrap();
+    let second = meridian_street::record_sync_status(
+        &store,
+        &sync(&account, SyncState::NeedsSignIn, "2024-10-04"),
+        &at(NOW + 1),
+    )
+    .unwrap();
+    assert_eq!(
+        second.journal.as_ref().unwrap().previous_sequence,
+        first.journal.as_ref().unwrap().sequence
+    );
+
+    assert_eq!(
+        meridian_street::list_activities(&store, &named(&account), &Scope::Everything)
+            .unwrap()
+            .history_from,
+        "2024-10-04"
+    );
+
+    let latest = meridian_street::list_sync_statuses(
+        &store,
+        &meridian_domain::v1::ListSyncStatusesRequest {
+            account_id: account.clone(),
+            ..Default::default()
+        },
+        &Scope::Everything,
+    )
+    .unwrap();
+    assert_eq!(latest.statuses, vec![second.clone()]);
+
+    let since = meridian_street::list_sync_statuses(
+        &store,
+        &meridian_domain::v1::ListSyncStatusesRequest {
+            account_id: account.clone(),
+            since: Some(meridian_domain::v1::Watermark {
+                partitions: vec![meridian_domain::v1::PartitionSequence {
+                    partition: "street".into(),
+                    sequence: first.journal.as_ref().unwrap().sequence - 1,
+                }],
+            }),
+            ..Default::default()
+        },
+        &Scope::Everything,
+    )
+    .unwrap();
+    assert_eq!(since.statuses, vec![first, second]);
+}
+
+#[test]
+fn an_unlinked_connections_sync_status_is_kept_and_answered_to_no_plugin() {
+    let store = store();
+    let external = unique("SNAP-ROTH");
+    let mut unlinked = sync("", meridian_domain::v1::SyncState::Disabled, "");
+    unlinked.external_account_id = external.clone();
+    meridian_street::record_sync_status(&store, &unlinked, &at(NOW)).unwrap();
+
+    let everything = meridian_street::list_sync_statuses(
+        &store,
+        &meridian_domain::v1::ListSyncStatusesRequest {
+            page_size: 500,
+            ..Default::default()
+        },
+        &Scope::Everything,
+    )
+    .unwrap();
+    assert!(everything
+        .statuses
+        .iter()
+        .any(|s| s.status.as_ref().unwrap().external_account_id == external));
+
+    let scoped = meridian_street::list_sync_statuses(
+        &store,
+        &meridian_domain::v1::ListSyncStatusesRequest {
+            page_size: 500,
+            ..Default::default()
+        },
+        &Scope::Within(Default::default()),
+    )
+    .unwrap();
+    assert!(scoped.statuses.is_empty());
+}

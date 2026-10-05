@@ -1,4 +1,5 @@
-//! The deployment's street store: statements, holdings and positions.
+//! The deployment's street store: statements, holdings and positions, and
+//! from contract v14 the custodian's activity and each sync status heard.
 //!
 //! W2's street half. A connector reads a brokerage, opens a statement, and
 //! publishes one row per account, instrument and side; this records them,
@@ -82,6 +83,7 @@
 //! beyond the count do not announce it again, because a subscriber's arithmetic
 //! should not depend on how many times it heard.
 
+pub mod activity;
 pub mod amounts;
 pub mod ids;
 pub mod migrations;
@@ -93,13 +95,15 @@ pub mod store;
 
 mod memory;
 
+pub use activity::{list_activities, list_sync_statuses, record_activity, record_sync_status};
 pub use amounts::{Money, Quantity};
 pub use memory::MemoryStore;
 pub use positions::{list_positions, list_statements};
 pub use postgres::PostgresStore;
 pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
-    Amended, Amendment, Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts,
-    CustodialPosition, Direction, Encumbrance, Figures, Holding, Key, Lot, Opened, Pending,
-    Provenance, RawRecord, Scope, Settled, Side, Statement, Store, StoreError, PARTITION,
+    ActivitiesRead, Activity, ActivityPage, Amended, Amendment, Cause, Chain, Change, Collateral,
+    Completed, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures,
+    Holding, Kept, Key, Lot, Opened, Pending, Provenance, RawRecord, Scope, Settled, Side,
+    Statement, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead, PARTITION,
 };

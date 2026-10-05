@@ -725,6 +725,68 @@ async fn a_break_is_a_finding_that_moves_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_cause_linking_the_custodians_activity_is_recorded_as_given() {
+    // Contract v14 (the plan's Q3): income the custodian reinvested, linked to
+    // the activity that explains it, and a split under corporate action,
+    // recorded as given; the book reads no other store, so an activity it has
+    // never heard of is recorded too, and nothing moves.
+    let (bus, _) = wired();
+    open(&bus).await;
+    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let reinvested = BreakCause {
+        category: BreakCauseCategory::IncomeReinvested as i32,
+        item: Some(break_cause::Item::Activity(ActivityRef {
+            activity_id: "ACT-01J8XQ5N2P0000000000001".into(),
+            change: journal("street", 71, 0),
+            trade_date: "2026-09-30".into(),
+        })),
+        note: "SPAXX's September dividend, reinvested".into(),
+    };
+    let split = BreakCause {
+        category: BreakCauseCategory::CorporateAction as i32,
+        item: Some(break_cause::Item::Activity(ActivityRef {
+            activity_id: "ACT-NEVER-HEARD-OF".into(),
+            change: None,
+            trade_date: String::new(),
+        })),
+        note: String::new(),
+    };
+    let mut request = aapl_break();
+    request.candidate_causes = vec![reinvested.clone(), split.clone()];
+
+    let reply = record_break(&bus, &request).await.unwrap();
+    assert_eq!(
+        reply.breaks[0].candidate_causes,
+        vec![reinvested.clone(), split]
+    );
+    assert!(quiet(&mut positions).await, "a break moved a position");
+
+    // Confirmed by a person under the new category, it is kept as given too.
+    let handled = send(
+        &bus,
+        HANDLE_BREAK,
+        "meridian.v1.HandleBreakRequest",
+        &HandleBreakRequest {
+            account_id: ACC.into(),
+            break_id: reply.breaks[0].break_id.clone(),
+            confirmed_cause: Some(reinvested.clone()),
+            handling: None,
+            reason: "Fidelity reinvested the dividend".into(),
+            idempotency_key: String::new(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    let handled = BookEntryReply::decode(&handled[..]).unwrap();
+    assert_eq!(handled.breaks[0].confirmed_cause, Some(reinvested));
+    assert!(
+        quiet(&mut positions).await,
+        "confirming a cause moved a position"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_break_needs_an_opening_balance() {
     let (bus, _) = wired();
     let refused = record_break(&bus, &aapl_break()).await.unwrap_err();

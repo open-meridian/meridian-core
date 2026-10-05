@@ -46,6 +46,12 @@ pub fn holding(now_ns: i64) -> String {
     mint("HLD", millis(now_ns))
 }
 
+/// An activity the street recorded (W2.12, contract v14): `ACT-`, the shape
+/// the fixtures show.
+pub fn activity(now_ns: i64) -> String {
+    mint("ACT", millis(now_ns))
+}
+
 fn millis(now_ns: i64) -> u64 {
     (now_ns.max(0) / 1_000_000) as u64
 }

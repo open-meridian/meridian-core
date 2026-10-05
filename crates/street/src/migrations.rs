@@ -83,6 +83,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "the_edge_keeps_its_own",
         sql: include_str!("../migrations/0007_the_edge_keeps_its_own.sql"),
     },
+    Migration {
+        version: 8,
+        name: "the_custodians_activity",
+        sql: include_str!("../migrations/0008_the_custodians_activity.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

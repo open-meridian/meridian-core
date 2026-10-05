@@ -9,9 +9,11 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    from_statement_cursor, statement_cursor, Amended, Amendment, Cause, Chain, Change, Completed,
-    Completion, Counts, CustodialPosition, Holding, Key, Opened, Page, Read, Result, Settled, Side,
-    Statement, StatementPage, StatementsRead, Store, StoreError,
+    activity_cursor, check_activity, connection, from_activity_cursor, from_statement_cursor,
+    from_sync_status_cursor, statement_cursor, sync_status_cursor, ActivitiesRead, Activity,
+    ActivityPage, Amended, Amendment, Cause, Chain, Change, Completed, Completion, Counts,
+    CustodialPosition, Holding, Kept, Key, Opened, Page, Read, Result, Settled, Side, Statement,
+    StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead,
 };
 
 #[derive(Debug, Default)]
@@ -107,6 +109,22 @@ impl Store for MemoryStore {
         instruments.dedup();
         Ok(instruments)
     }
+
+    fn record_activity(&self, activity: Activity, cause: &Cause) -> Result<(Activity, Kept)> {
+        self.write()?.record_activity(activity, cause)
+    }
+
+    fn activities(&self, read: &ActivitiesRead) -> Result<ActivityPage> {
+        self.read()?.activities_page(read)
+    }
+
+    fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus> {
+        Ok(self.write()?.record_sync_status(status, cause))
+    }
+
+    fn sync_statuses(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage> {
+        self.read()?.sync_statuses_page(read)
+    }
 }
 
 /// The street store's contents, and every rule about them.
@@ -136,6 +154,14 @@ pub(crate) struct Held {
     /// the row's identifier, the amendment and its cause, in the order they
     /// were journaled. The row in `holdings` stays as first recorded.
     pub(crate) amendments: Vec<(String, Amendment, Cause)>,
+
+    /// Each activity in the order recorded (W2.10, contract v14), and its
+    /// source, account and the custodian's identifier to its place there.
+    pub(crate) activities: Vec<Activity>,
+    pub(crate) activity_by_external: HashMap<(String, String, String), usize>,
+
+    /// Each sync status heard, in the order recorded (W2.13).
+    pub(crate) sync_statuses: Vec<SyncStatus>,
 }
 
 impl Held {
@@ -604,6 +630,174 @@ impl Held {
                 .into_iter()
                 .map(|statement| Ok(((*statement).clone(), self.counts(&statement.statement_id)?)))
                 .collect::<Result<_>>()?,
+            next_cursor,
+            as_of: self.head,
+        })
+    }
+}
+
+impl Held {
+    pub(crate) fn record_activity(
+        &mut self,
+        mut activity: Activity,
+        cause: &Cause,
+    ) -> Result<(Activity, Kept)> {
+        check_activity(&activity)?;
+        let key = (
+            activity.source.clone(),
+            activity.account_id.clone(),
+            activity.external_activity_id.clone(),
+        );
+        if let Some(&at) = self.activity_by_external.get(&key) {
+            return Ok((self.activities[at].clone(), Kept::AlreadyRecorded));
+        }
+        let change = self.next(Chain::Activity, &activity.account_id);
+        activity.recorded = Completed {
+            change,
+            cause: cause.clone(),
+        };
+        self.activity_by_external.insert(key, self.activities.len());
+        self.activities.push(activity.clone());
+        Ok((activity, Kept::Recorded))
+    }
+
+    pub(crate) fn activities_page(&self, read: &ActivitiesRead) -> Result<ActivityPage> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
+            None
+        } else {
+            Some(from_activity_cursor(&read.cursor)?)
+        };
+        let mut held: Vec<&Activity> = self
+            .activities
+            .iter()
+            .filter(|activity| read.scope.answers(&read.account_id, &activity.account_id))
+            .filter(|activity| {
+                read.trade_date_from.is_empty() || activity.trade_date >= read.trade_date_from
+            })
+            .filter(|activity| {
+                read.trade_date_to.is_empty() || activity.trade_date <= read.trade_date_to
+            })
+            .filter(|activity| {
+                read.since
+                    .is_none_or(|since| activity.recorded.change.sequence > since)
+            })
+            .collect();
+        let by_record = read.since.is_some();
+        let place = |activity: &Activity| {
+            if by_record {
+                (String::new(), activity.recorded.change.sequence)
+            } else {
+                (
+                    activity.trade_date.clone(),
+                    activity.recorded.change.sequence,
+                )
+            }
+        };
+        held.sort_by_key(|activity| place(activity));
+        let mut page: Vec<&Activity> = held
+            .into_iter()
+            .filter(|activity| {
+                after.as_ref().is_none_or(|(trade_date, sequence)| {
+                    let after = if by_record {
+                        (String::new(), *sequence)
+                    } else {
+                        (trade_date.clone(), *sequence)
+                    };
+                    place(activity) > after
+                })
+            })
+            .take(read.limit + 1)
+            .collect();
+        let more = page.len() > read.limit;
+        page.truncate(read.limit);
+        let next_cursor = match page.last() {
+            Some(last) if more => activity_cursor(last),
+            _ => String::new(),
+        };
+        Ok(ActivityPage {
+            activities: page.into_iter().cloned().collect(),
+            next_cursor,
+            as_of: self.head,
+            history_from: self.history_from(&read.account_id),
+        })
+    }
+
+    /// The named account's `history_from`, as its latest sync status said
+    /// it; empty where none is named or none was heard.
+    fn history_from(&self, account_id: &str) -> String {
+        if account_id.is_empty() {
+            return String::new();
+        }
+        self.sync_statuses
+            .iter()
+            .rev()
+            .find(|status| status.account_id == account_id)
+            .map(|status| status.history_from.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_sync_status(
+        &mut self,
+        mut status: SyncStatus,
+        cause: &Cause,
+    ) -> SyncStatus {
+        let change = self.next(Chain::SyncStatus, &status.account_id);
+        status.recorded = Completed {
+            change,
+            cause: cause.clone(),
+        };
+        self.sync_statuses.push(status.clone());
+        status
+    }
+
+    pub(crate) fn sync_statuses_page(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
+            None
+        } else {
+            Some(from_sync_status_cursor(&read.cursor)?)
+        };
+        let answered =
+            |status: &&SyncStatus| read.scope.answers(&read.account_id, &status.account_id);
+        let mut page: Vec<&SyncStatus> = match read.since {
+            Some(since) => self
+                .sync_statuses
+                .iter()
+                .filter(answered)
+                .filter(|status| status.recorded.change.sequence > since)
+                .filter(|status| {
+                    after
+                        .as_ref()
+                        .is_none_or(|(_, sequence)| status.recorded.change.sequence > *sequence)
+                })
+                .take(read.limit + 1)
+                .collect(),
+            None => {
+                let mut latest: BTreeMap<(String, String, String), &SyncStatus> = BTreeMap::new();
+                for status in self.sync_statuses.iter().filter(answered) {
+                    latest.insert(connection(status), status);
+                }
+                latest
+                    .into_iter()
+                    .filter(|(held, _)| {
+                        after
+                            .as_ref()
+                            .is_none_or(|(connection, _)| held > connection)
+                    })
+                    .map(|(_, status)| status)
+                    .take(read.limit + 1)
+                    .collect()
+            }
+        };
+        let more = page.len() > read.limit;
+        page.truncate(read.limit);
+        let next_cursor = match page.last() {
+            Some(last) if more => sync_status_cursor(last),
+            _ => String::new(),
+        };
+        Ok(SyncStatusPage {
+            statuses: page.into_iter().cloned().collect(),
             next_cursor,
             as_of: self.head,
         })

@@ -1,7 +1,8 @@
 //! Where the street store meets the bus.
 //!
-//! Two commands in, two queries in, one event heard, one query asked, two
-//! events out. W2.2 and W2.3 arrive as commands from a connector, W2.7 and
+//! Three commands in, four queries in, two events heard, one query asked,
+//! four events out; from contract v14 the custodian's activity (W2.10 to
+//! W2.12) and each sync status heard (W2.13, W2.14), below the first. W2.2 and W2.3 arrive as commands from a connector, W2.7 and
 //! W2.9 as queries from the dashboard or an `operations` plugin, a
 //! placeholder's replacement (W3.8) as an event from the instrument store,
 //! W3.6 is asked of the instrument store by the sweep below, W2.5 leaves when
@@ -48,12 +49,14 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, Delivery, Envelope};
 use meridian_domain::v1::{
-    InstrumentReplacedEvent, ListCustodialPositionsRequest, ListStatementsRequest,
-    RecordHoldingRequest, RecordHoldingsStatementRequest, ResolveInstrumentReply,
-    ResolveInstrumentRequest,
+    InstrumentReplacedEvent, ListActivitiesRequest, ListCustodialPositionsRequest,
+    ListStatementsRequest, ListSyncStatusesRequest, RecordActivityRequest, RecordHoldingRequest,
+    RecordHoldingsStatementRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    SyncStatusEvent,
 };
 use prost::Message;
 
+use crate::activity::{list_activities, list_sync_statuses, record_activity, record_sync_status};
 use crate::positions::{list_positions, list_statements};
 use crate::record::{move_positions, open_statement, record_holding};
 use crate::store::{Cause, Scope, Store};
@@ -75,6 +78,26 @@ pub const LIST_CUSTODIAL_POSITIONS: &str = "platform.street.query.list-custodial
 
 /// W2.9. An `operations` plugin asking for completed statements.
 pub const LIST_STATEMENTS: &str = "platform.street.query.list-statements";
+
+/// W2.10. A custody plugin recording one activity (contract v14).
+pub const RECORD_ACTIVITY: &str = "platform.street.command.record-activity";
+
+/// W2.12. An activity was recorded.
+pub const ACTIVITY_RECORDED: &str = "platform.street.event.activity-recorded";
+
+/// W2.11. An `operations` plugin, or the dashboard, reading an account's
+/// activity.
+pub const LIST_ACTIVITIES: &str = "platform.street.query.list-activities";
+
+/// W2.1, heard (contract v14): every custody plugin's sync status, the
+/// instance the topic's.
+pub const SYNC_STATUS: &str = "platform.custody.*.event.sync-status";
+
+/// W2.13. A sync status was recorded.
+pub const SYNC_STATUS_RECORDED: &str = "platform.street.event.sync-status-recorded";
+
+/// W2.14. An `operations` plugin, or the dashboard, reading the sync status.
+pub const LIST_SYNC_STATUSES: &str = "platform.street.query.list-sync-statuses";
 
 /// W3.8, heard. A placeholder's `INS-` ID arrived, and what was held under the
 /// placeholder moves onto it (W3.9).
@@ -228,7 +251,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         ))
     });
 
-    let completed = store;
+    let completed = store.clone();
     bus.serve(LIST_STATEMENTS, move |envelope| {
         expect(&envelope.payload_type, "meridian.v1.ListStatementsRequest")?;
 
@@ -243,6 +266,135 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             reply.encode_to_vec(),
         ))
     });
+
+    // W2.10, and W2.12 when it was recorded now: a redelivery is answered as
+    // already recorded and announces nothing.
+    let activities = store.clone();
+    let activity_clock = clock;
+    let activity_bus = bus.clone();
+    bus.serve(RECORD_ACTIVITY, move |envelope| {
+        expect(&envelope.payload_type, "meridian.v1.RecordActivityRequest")?;
+
+        let request = RecordActivityRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("undecodable activity: {failed}"))?;
+
+        let cause = cause_of(&envelope, activity_clock.now_ns());
+        let recorded = record_activity(activities.as_ref(), &request, &cause)
+            .map_err(|failed| failed.to_string())?;
+
+        if let Some(event) = recorded.event {
+            let meta = envelope.meta.as_ref();
+            activity_bus
+                .publish(
+                    ACTIVITY_RECORDED,
+                    "meridian.v1.ActivityRecordedEvent",
+                    event.encode_to_vec(),
+                    meta.map(|meta| meta.correlation_id.as_str()),
+                    meta.map(|meta| meta.message_id.as_str()),
+                )
+                .map_err(|failed| failed.to_string())?;
+        }
+
+        Ok((
+            "meridian.v1.RecordActivityReply".to_string(),
+            recorded.reply.encode_to_vec(),
+        ))
+    });
+
+    let reading_activity = store.clone();
+    bus.serve(LIST_ACTIVITIES, move |envelope| {
+        expect(&envelope.payload_type, "meridian.v1.ListActivitiesRequest")?;
+
+        let request = ListActivitiesRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("undecodable query: {failed}"))?;
+
+        let reply = list_activities(reading_activity.as_ref(), &request, &scope_of(&envelope))
+            .map_err(|failed| failed.to_string())?;
+
+        Ok((
+            "meridian.v1.ListActivitiesReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
+
+    let reading_sync = store;
+    bus.serve(LIST_SYNC_STATUSES, move |envelope| {
+        expect(
+            &envelope.payload_type,
+            "meridian.v1.ListSyncStatusesRequest",
+        )?;
+
+        let request = ListSyncStatusesRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("undecodable query: {failed}"))?;
+
+        let reply = list_sync_statuses(reading_sync.as_ref(), &request, &scope_of(&envelope))
+            .map_err(|failed| failed.to_string())?;
+
+        Ok((
+            "meridian.v1.ListSyncStatusesReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
+}
+
+/// Subscribe to every custody plugin's sync status, and hand back the loop
+/// that keeps each and announces it (W2.13, contract v14).
+///
+/// Not an `async fn`, for the reason [`follow_replacements`] is not: the
+/// subscription is taken before this returns, since what arrives before a
+/// subscriber exists is dropped. Ends when the bus shuts down: a sync status
+/// that could not be kept is one, and the next one the plugin publishes says
+/// as much again.
+pub fn follow_sync_statuses(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+) -> impl std::future::Future<Output = ()> {
+    let mut statuses = bus.subscribe(SYNC_STATUS);
+
+    async move {
+        while let Some(delivery) = statuses.recv().await {
+            if let Err(why) = keep_sync_status(&bus, &store, delivery).await {
+                tracing::warn!(why, "could not keep a sync status");
+            }
+        }
+    }
+}
+
+/// One sync status heard: kept as published, against the account the
+/// sidecar stamped or none, and announced whole.
+///
+/// Public so a test can drive it without a running loop.
+pub async fn keep_sync_status(
+    bus: &Bus,
+    store: &Arc<dyn Store>,
+    delivery: Delivery,
+) -> Result<(), String> {
+    let envelope = delivery.envelope;
+    expect(&envelope.payload_type, "meridian.v1.SyncStatusEvent")?;
+
+    let event = SyncStatusEvent::decode(&envelope.payload[..])
+        .map_err(|failed| format!("undecodable sync status: {failed}"))?;
+
+    // Caused by the custody plugin that published it, as its sidecar stamped
+    // the envelope; off the runtime, since the store blocks.
+    let cause = cause_of(&envelope, bus.clock().now_ns());
+    let keeping = Arc::clone(store);
+    let recorded =
+        tokio::task::spawn_blocking(move || record_sync_status(keeping.as_ref(), &event, &cause))
+            .await
+            .map_err(|failed| format!("the sync status task failed: {failed}"))?
+            .map_err(|failed| failed.to_string())?;
+
+    let meta = envelope.meta.as_ref();
+    bus.publish(
+        SYNC_STATUS_RECORDED,
+        "meridian.v1.SyncStatusRecordedEvent",
+        recorded.encode_to_vec(),
+        meta.map(|meta| meta.correlation_id.as_str()),
+        meta.map(|meta| meta.message_id.as_str()),
+    )
+    .map(|_| ())
+    .map_err(|failed| failed.to_string())
 }
 
 /// Subscribe to replacements, and hand back the loop that moves positions onto
@@ -452,9 +604,10 @@ mod tests {
 
     use meridian_bus::{MemoryBackend, Subscription};
     use meridian_domain::v1::{
-        CustodialPositionUpdatedEvent, HoldingSide, Identifier as PbIdentifier,
-        ListCustodialPositionsReply, RecordHoldingReply, RecordHoldingsStatementReply,
-        StatementRecordedEvent,
+        ActivityRecordedEvent, CustodialPositionUpdatedEvent, HoldingSide,
+        Identifier as PbIdentifier, ListActivitiesReply, ListCustodialPositionsReply,
+        ListSyncStatusesReply, RecordActivityReply, RecordHoldingReply,
+        RecordHoldingsStatementReply, StatementRecordedEvent, SyncStatusRecordedEvent,
     };
 
     use super::*;
@@ -1054,5 +1207,146 @@ mod tests {
             .unwrap_err();
 
         assert!(failed.to_string().contains("no statement"), "{failed}");
+    }
+
+    // ── The custodian's activity and each sync status (contract v14) ──
+
+    fn reinvestment(id: &str) -> RecordActivityRequest {
+        RecordActivityRequest {
+            account_id: "ACC-1".into(),
+            external_account_id: "SNAP-ACC-1".into(),
+            source: "snaptrade".into(),
+            activity: Some(meridian_domain::v1::CustodialActivity {
+                external_activity_id: id.into(),
+                kind: meridian_domain::v1::ActivityKind::Reinvestment as i32,
+                instrument_id: "INS-SPAXX".into(),
+                trade_date: "2026-09-30".into(),
+                units: quantity("3.27"),
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn record_activity_over(
+        bus: &Bus,
+        request: &RecordActivityRequest,
+    ) -> RecordActivityReply {
+        let (payload_type, payload) = bus
+            .call(
+                RECORD_ACTIVITY,
+                "meridian.v1.RecordActivityRequest",
+                request.encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payload_type, "meridian.v1.RecordActivityReply");
+        RecordActivityReply::decode(&payload[..]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_activity_arrives_over_the_bus_and_is_announced_once() {
+        let (bus, _) = wired();
+        let mut announced = bus.subscribe(ACTIVITY_RECORDED);
+        let request = reinvestment("a3f0");
+
+        let first = record_activity_over(&bus, &request).await;
+        assert!(!first.already_recorded);
+        let event = ActivityRecordedEvent::decode(&next(&mut announced).await.envelope.payload[..])
+            .unwrap();
+        assert_eq!(event.activity_id, first.activity_id);
+        assert_eq!(event.activity, request.activity);
+
+        let again = record_activity_over(&bus, &request).await;
+        assert!(again.already_recorded);
+        assert_eq!(again.activity_id, first.activity_id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), announced.recv())
+                .await
+                .is_err(),
+            "a redelivery was announced again"
+        );
+
+        let (_, payload) = bus
+            .call(
+                LIST_ACTIVITIES,
+                "meridian.v1.ListActivitiesRequest",
+                ListActivitiesRequest {
+                    account_id: "ACC-1".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let read = ListActivitiesReply::decode(&payload[..]).unwrap();
+        assert_eq!(read.activities, vec![event]);
+    }
+
+    #[tokio::test]
+    async fn a_sync_status_heard_is_kept_announced_and_answers_history_from() {
+        let (bus, store) = wired();
+        let store: Arc<dyn Store> = store;
+        tokio::spawn(follow_sync_statuses(bus.clone(), store.clone()));
+        let mut announced = bus.subscribe(SYNC_STATUS_RECORDED);
+        let status = SyncStatusEvent {
+            source: "snaptrade".into(),
+            account_id: "ACC-1".into(),
+            external_account_id: "SNAP-ACC-1".into(),
+            state: meridian_domain::v1::SyncState::NeedsSignIn as i32,
+            history_from: "2024-10-04".into(),
+            ..Default::default()
+        };
+        bus.publish(
+            "platform.custody.custody-snaptrade-1.event.sync-status",
+            "meridian.v1.SyncStatusEvent",
+            status.encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let heard =
+            SyncStatusRecordedEvent::decode(&next(&mut announced).await.envelope.payload[..])
+                .unwrap();
+        assert_eq!(heard.status.as_ref(), Some(&status));
+        assert_eq!(heard.journal.as_ref().unwrap().previous_sequence, 0);
+
+        let (_, payload) = bus
+            .call(
+                LIST_SYNC_STATUSES,
+                "meridian.v1.ListSyncStatusesRequest",
+                ListSyncStatusesRequest::default().encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let read = ListSyncStatusesReply::decode(&payload[..]).unwrap();
+        assert_eq!(read.statuses, vec![heard]);
+
+        let (_, payload) = bus
+            .call(
+                LIST_ACTIVITIES,
+                "meridian.v1.ListActivitiesRequest",
+                ListActivitiesRequest {
+                    account_id: "ACC-1".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ListActivitiesReply::decode(&payload[..])
+                .unwrap()
+                .history_from,
+            "2024-10-04"
+        );
     }
 }

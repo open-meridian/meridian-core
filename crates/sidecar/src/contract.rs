@@ -112,8 +112,15 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// A plugin built on them would meet `UNIMPLEMENTED` at its first filing on
 /// an older sidecar, rather than a refusal at registration naming both
 /// versions, which is why the version rose. A plugin built before files
-/// nothing.
-pub const CONTRACT_CURRENT: u32 = 13;
+/// nothing. v14 is the custodian's activity (spec/the-custodians-activity-
+/// explains-a-break; sdk-contract/the-custodians-activity-contract): a
+/// custody plugin records each activity as the custodian states it and an
+/// operations plugin reads and hears it, with `history_from` on the sync
+/// status and the read; each sync status the street keeps, heard and read
+/// by an operations plugin; and the book's cause for income the custodian
+/// reinvested, and a cause's link to the activity that explains it. A plugin
+/// built before reports and reads no activity.
+pub const CONTRACT_CURRENT: u32 = 14;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -361,7 +368,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v13); rebuild it against v2 or later"
+                 (v2 through v14); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -370,11 +377,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v14"),
+            admit("v15"),
             Err(
-                "the plugin was built against contract v14, newer than this sidecar \
-                 (v2 through v13); upgrade the runtime, or rebuild the plugin against \
-                 v13 or earlier"
+                "the plugin was built against contract v15, newer than this sidecar \
+                 (v2 through v14); upgrade the runtime, or rebuild the plugin against \
+                 v14 or earlier"
                     .into()
             )
         );
@@ -385,7 +392,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v13"
+                "the plugin declared no contract version; this sidecar accepts v2 through v14"
                     .into()
             )
         );

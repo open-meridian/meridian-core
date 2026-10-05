@@ -145,6 +145,10 @@ pub struct Cause {
 pub enum Chain {
     Position,
     Statement,
+    /// The custodian's activity (W2.12, contract v14).
+    Activity,
+    /// Each sync status the street heard (W2.13, contract v14).
+    SyncStatus,
 }
 
 impl Chain {
@@ -152,6 +156,8 @@ impl Chain {
         match self {
             Chain::Position => "position",
             Chain::Statement => "statement",
+            Chain::Activity => "activity",
+            Chain::SyncStatus => "sync_status",
         }
     }
 }
@@ -895,6 +901,173 @@ pub fn from_statement_cursor(cursor: &str) -> Result<(u64, String)> {
     ))
 }
 
+/// One activity as the custodian stated it (W2.10, W2.12; contract v14):
+/// kept as reported, whole, against its account. Nothing derives a position,
+/// a lot or a figure from it (the spec's requirement 8), so the store keeps
+/// the activity as the plugin encoded it and takes out only what a read
+/// selects and orders by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// Minted by the street; empty until it is recorded.
+    pub activity_id: String,
+    pub account_id: String,
+    pub external_account_id: String,
+    pub source: String,
+    /// The custodian's identifier: with the source and the account, what
+    /// makes a redelivery recognisable.
+    pub external_activity_id: String,
+    pub trade_date: String,
+    /// Its kind as the wire numbers it, its instrument (empty where it did not
+    /// resolve) and its units where stated: read by the harness's lines, never
+    /// to change what is held.
+    pub kind: i32,
+    pub instrument_id: String,
+    pub units: Option<Quantity>,
+    /// The CustodialActivity, encoded as it arrived.
+    pub record: Vec<u8>,
+    /// Its change and who caused it, the cause's time when it was recorded.
+    pub recorded: Completed,
+}
+
+/// What recording an activity did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// New, numbered and recorded now: announced (W2.12).
+    Recorded,
+    /// Held already under its source, account and the custodian's
+    /// identifier: the one held is answered, nothing changed, and nothing is
+    /// announced again.
+    AlreadyRecorded,
+}
+
+/// One sync status as the custody plugin published it (W2.13; contract v14),
+/// against the account its external account is linked to, or none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStatus {
+    /// Empty where the external account is not linked.
+    pub account_id: String,
+    pub external_account_id: String,
+    pub source: String,
+    /// Its state as the wire numbers it, and the first date the source can
+    /// read history from: what a read of activity answers (W2.11).
+    pub state: i32,
+    pub history_from: String,
+    /// The SyncStatusEvent, encoded as it was published.
+    pub record: Vec<u8>,
+    pub recorded: Completed,
+}
+
+/// What a read of activity asks (W2.11).
+#[derive(Debug, Clone)]
+pub struct ActivitiesRead {
+    pub scope: Scope,
+    /// Empty: every account in the scope.
+    pub account_id: String,
+    /// Inclusive; empty for no bound on that side.
+    pub trade_date_from: String,
+    pub trade_date_to: String,
+    pub limit: usize,
+    pub cursor: String,
+    /// Only those recorded above it, in the order recorded; without it, by
+    /// trade date.
+    pub since: Option<u64>,
+}
+
+/// A page of activity, the number it was read at, and the named account's
+/// `history_from` as its latest sync status said it.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityPage {
+    pub activities: Vec<Activity>,
+    pub next_cursor: String,
+    pub as_of: u64,
+    pub history_from: String,
+}
+
+/// What a read of sync statuses asks (W2.14).
+#[derive(Debug, Clone)]
+pub struct SyncStatusesRead {
+    pub scope: Scope,
+    /// Empty: every account in the scope.
+    pub account_id: String,
+    pub limit: usize,
+    pub cursor: String,
+    /// Every one recorded above it, in the order recorded; without it, the
+    /// latest of each connection's account.
+    pub since: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncStatusPage {
+    pub statuses: Vec<SyncStatus>,
+    pub next_cursor: String,
+    pub as_of: u64,
+}
+
+/// Where an activity sits in the order it is read in: by trade date, or by
+/// its number when read since a watermark. A page's cursor is its last row's
+/// whole place, the date length-prefixed so no date's own characters are
+/// read as a separator.
+pub fn activity_cursor(activity: &Activity) -> String {
+    format!(
+        "{}:{}{}",
+        activity.trade_date.len(),
+        activity.trade_date,
+        activity.recorded.change.sequence
+    )
+}
+
+/// An activity cursor read back, or refused.
+pub fn from_activity_cursor(cursor: &str) -> Result<(String, u64)> {
+    let unreadable = || StoreError::UnreadableCursor(cursor.to_string());
+    let (trade_date, sequence) = length_prefixed(cursor).ok_or_else(unreadable)?;
+    Ok((
+        trade_date.to_string(),
+        sequence.parse().map_err(|_| unreadable())?,
+    ))
+}
+
+/// The connection a sync status is of: its account, source and external
+/// account, which is also the order the latest of each is read in. An
+/// unlinked one's account is empty, so two unlinked connections stay two.
+pub fn connection(status: &SyncStatus) -> (String, String, String) {
+    (
+        status.account_id.clone(),
+        status.source.clone(),
+        status.external_account_id.clone(),
+    )
+}
+
+/// A sync statuses page's cursor: the last one's connection, each part
+/// length-prefixed, and its number.
+pub fn sync_status_cursor(status: &SyncStatus) -> String {
+    format!(
+        "{}:{}{}:{}{}:{}{}",
+        status.account_id.len(),
+        status.account_id,
+        status.source.len(),
+        status.source,
+        status.external_account_id.len(),
+        status.external_account_id,
+        status.recorded.change.sequence
+    )
+}
+
+/// A sync statuses cursor read back, or refused.
+pub fn from_sync_status_cursor(cursor: &str) -> Result<((String, String, String), u64)> {
+    let unreadable = || StoreError::UnreadableCursor(cursor.to_string());
+    let (account_id, rest) = length_prefixed(cursor).ok_or_else(unreadable)?;
+    let (source, rest) = length_prefixed(rest).ok_or_else(unreadable)?;
+    let (external_account_id, sequence) = length_prefixed(rest).ok_or_else(unreadable)?;
+    Ok((
+        (
+            account_id.to_string(),
+            source.to_string(),
+            external_account_id.to_string(),
+        ),
+        sequence.parse().map_err(|_| unreadable())?,
+    ))
+}
+
 /// Where the street store keeps what it has been told.
 pub trait Store: Send + Sync {
     /// Open a statement, or recognise one already held. W2.2.
@@ -987,4 +1160,46 @@ pub trait Store: Send + Sync {
     /// order: what the sweep asks the instrument store about, for a record
     /// merged into another while the street was not listening (W3.9).
     fn instruments_held(&self) -> Result<Vec<String>>;
+
+    /// Record an activity (W2.10, W2.12): numbered in the partition, chained
+    /// to the account's last activity, and recorded with `cause`, whose time
+    /// is when it was recorded; or, held already under its source, account
+    /// and the custodian's identifier, the one held, changing nothing.
+    /// Refused naming no account or no identifier.
+    fn record_activity(&self, activity: Activity, cause: &Cause) -> Result<(Activity, Kept)>;
+
+    /// W2.11. Activity within the read's scope, by trade date, or since a
+    /// watermark in the order recorded; the number it was read at, and the
+    /// named account's `history_from` from its latest sync status.
+    fn activities(&self, read: &ActivitiesRead) -> Result<ActivityPage>;
+
+    /// Record a sync status (W2.13): every one heard is a record, numbered
+    /// and chained to the last of its account's, '' for an unlinked one.
+    fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus>;
+
+    /// W2.14. The latest sync status of each connection within the read's
+    /// scope, or every one recorded since a watermark, in the order recorded.
+    fn sync_statuses(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage>;
+}
+
+/// Refuse an activity that names no account, source or identifier: the
+/// sidecar refuses an unlinked one first and the wire requires the rest, so
+/// this is the second line.
+pub fn check_activity(activity: &Activity) -> Result<()> {
+    if activity.account_id.is_empty() {
+        return Err(StoreError::Edge(
+            "an activity names no account: its external account is not linked".into(),
+        ));
+    }
+    if activity.source.is_empty() {
+        return Err(StoreError::Edge("source names no source".into()));
+    }
+    if activity.external_activity_id.is_empty() {
+        return Err(StoreError::Edge(
+            "activity.external_activity_id is empty; the custodian's identifier is what \
+             recognises the same activity sent twice"
+                .into(),
+        ));
+    }
+    Ok(())
 }

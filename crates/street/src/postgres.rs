@@ -29,10 +29,13 @@ use r2d2_postgres::PostgresConnectionManager;
 use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
-    from_statement_cursor, statement_cursor, Amended, Amendment, Cause, Chain, Change, Collateral,
-    Completed, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures,
-    Holding, Identifier, Key, Lot, Opened, Page, Pending, Provenance, RawRecord, Read, Result,
-    Scope, Settled, Side, Statement, StatementPage, StatementsRead, Store, StoreError, PARTITION,
+    activity_cursor, check_activity, from_activity_cursor, from_statement_cursor,
+    from_sync_status_cursor, statement_cursor, sync_status_cursor, ActivitiesRead, Activity,
+    ActivityPage, Amended, Amendment, Cause, Chain, Change, Collateral, Completed, Completion,
+    Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures, Holding, Identifier, Kept,
+    Key, Lot, Opened, Page, Pending, Provenance, RawRecord, Read, Result, Scope, Settled, Side,
+    Statement, StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage,
+    SyncStatusesRead, PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -115,6 +118,17 @@ const POSITION_COLUMNS: &str = "account_id, instrument_id, side, quantity::text,
 
 /// A held position, and the row whose lots it carries.
 type Held = (CustodialPosition, Option<String>);
+
+/// An activity's columns, in the order [`activity_of`] reads them.
+const ACTIVITY_COLUMNS: &str = "activity_id, account_id, external_account_id, source,
+        external_activity_id, trade_date, kind, instrument_id, units::text, record,
+        recorded_at_ns, sequence, previous_sequence, cause_instance_id,
+        cause_acting_for_subject, cause_correlation_id, cause_causation_id";
+
+/// A sync status's columns, in the order [`sync_status_of`] reads them.
+const SYNC_STATUS_COLUMNS: &str = "account_id, external_account_id, source, state, history_from,
+        record, recorded_at_ns, sequence, previous_sequence, cause_instance_id,
+        cause_acting_for_subject, cause_correlation_id, cause_causation_id";
 
 impl Store for PostgresStore {
     fn open(&self, statement: Statement, cause: &Cause) -> Result<(Statement, Opened, Completion)> {
@@ -905,6 +919,359 @@ impl Store for PostgresStore {
             .map(|row| row.get(0))
             .collect())
     }
+
+    fn record_activity(&self, activity: Activity, cause: &Cause) -> Result<(Activity, Kept)> {
+        check_activity(&activity)?;
+        let mut conn = self.conn()?;
+
+        // A redelivery is answered without taking a number.
+        if let Some(held) = held_activity(&mut *conn, &activity)? {
+            return Ok((held, Kept::AlreadyRecorded));
+        }
+
+        // Numbered first, which takes the partition head's row lock and so
+        // orders this against every other change: a second delivery racing
+        // this one waits on the lock, then meets the unique constraint and
+        // rolls back, its number with it, so there is no hole.
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let change = next_change(&mut tx, Chain::Activity, &activity.account_id)?;
+        let activity_id = activity.activity_id.clone();
+        let units = activity.units.map(|units| units.to_string());
+        let inserted = tx
+            .execute(
+                "INSERT INTO activity
+                        (activity_id, source, account_id, external_account_id,
+                         external_activity_id, trade_date, kind, instrument_id, units, record,
+                         recorded_at_ns, sequence, previous_sequence, cause_instance_id,
+                         cause_acting_for_subject, cause_correlation_id, cause_causation_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::numeric, $10, $11, $12, $13,
+                         $14, $15, $16, $17)
+                 ON CONFLICT (source, account_id, external_activity_id) DO NOTHING",
+                &[
+                    &activity_id,
+                    &activity.source,
+                    &activity.account_id,
+                    &activity.external_account_id,
+                    &activity.external_activity_id,
+                    &activity.trade_date,
+                    &activity.kind,
+                    &activity.instrument_id,
+                    &units,
+                    &activity.record,
+                    &cause.committed_at_ns,
+                    &(change.sequence as i64),
+                    &(change.previous as i64),
+                    &cause.instance_id,
+                    &cause.acting_for_subject,
+                    &cause.correlation_id,
+                    &cause.causation_id,
+                ],
+            )
+            .map_err(unavailable)?;
+        if inserted == 0 {
+            tx.rollback().map_err(unavailable)?;
+            let held = held_activity(&mut *conn, &activity)?.ok_or_else(|| {
+                StoreError::Unavailable("an activity refused as held already is not held".into())
+            })?;
+            return Ok((held, Kept::AlreadyRecorded));
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok((
+            Activity {
+                recorded: Completed {
+                    change,
+                    cause: cause.clone(),
+                },
+                ..activity
+            },
+            Kept::Recorded,
+        ))
+    }
+
+    fn activities(&self, read: &ActivitiesRead) -> Result<ActivityPage> {
+        read.scope.admit(&read.account_id)?;
+        let (after_date, after_sequence) = if read.cursor.is_empty() {
+            (String::new(), -1_i64)
+        } else {
+            let (trade_date, sequence) = from_activity_cursor(&read.cursor)?;
+            (trade_date, sequence as i64)
+        };
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let as_of = head(&mut tx)?;
+        let wanted = (read.limit as i64) + 1;
+        let since = read.since.map(|since| since as i64);
+        // By trade date, or in the order recorded when read since a
+        // watermark, the cursor's place compared the same way.
+        let rows = match since {
+            Some(since) => tx.query(
+                &format!(
+                    "SELECT {ACTIVITY_COLUMNS}
+                       FROM activity
+                      WHERE ($1 = '' OR account_id = $1)
+                        AND ($2::text[] IS NULL OR account_id = ANY($2))
+                        AND ($3 = '' OR trade_date >= $3)
+                        AND ($4 = '' OR trade_date <= $4)
+                        AND sequence > $5 AND sequence > $6
+                      ORDER BY sequence
+                      LIMIT $7"
+                ),
+                &[
+                    &read.account_id,
+                    &within(&read.scope),
+                    &read.trade_date_from,
+                    &read.trade_date_to,
+                    &since,
+                    &after_sequence,
+                    &wanted,
+                ],
+            ),
+            None => tx.query(
+                &format!(
+                    "SELECT {ACTIVITY_COLUMNS}
+                       FROM activity
+                      WHERE ($1 = '' OR account_id = $1)
+                        AND ($2::text[] IS NULL OR account_id = ANY($2))
+                        AND ($3 = '' OR trade_date >= $3)
+                        AND ($4 = '' OR trade_date <= $4)
+                        AND (trade_date > $5 OR (trade_date = $5 AND sequence > $6))
+                      ORDER BY trade_date, sequence
+                      LIMIT $7"
+                ),
+                &[
+                    &read.account_id,
+                    &within(&read.scope),
+                    &read.trade_date_from,
+                    &read.trade_date_to,
+                    &after_date,
+                    &after_sequence,
+                    &wanted,
+                ],
+            ),
+        }
+        .map_err(unavailable)?;
+        let mut activities: Vec<Activity> = rows.iter().map(activity_of).collect::<Result<_>>()?;
+        let more = activities.len() > read.limit;
+        activities.truncate(read.limit);
+        let next_cursor = match activities.last() {
+            Some(last) if more => activity_cursor(last),
+            _ => String::new(),
+        };
+        let history_from = if read.account_id.is_empty() {
+            String::new()
+        } else {
+            tx.query_opt(
+                "SELECT history_from FROM sync_status WHERE account_id = $1
+                  ORDER BY sequence DESC LIMIT 1",
+                &[&read.account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_default()
+        };
+        tx.commit().map_err(unavailable)?;
+        Ok(ActivityPage {
+            activities,
+            next_cursor,
+            as_of,
+            history_from,
+        })
+    }
+
+    fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let change = next_change(&mut tx, Chain::SyncStatus, &status.account_id)?;
+        tx.execute(
+            "INSERT INTO sync_status
+                    (sequence, previous_sequence, account_id, external_account_id, source, state,
+                     history_from, record, recorded_at_ns, cause_instance_id,
+                     cause_acting_for_subject, cause_correlation_id, cause_causation_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            &[
+                &(change.sequence as i64),
+                &(change.previous as i64),
+                &status.account_id,
+                &status.external_account_id,
+                &status.source,
+                &status.state,
+                &status.history_from,
+                &status.record,
+                &cause.committed_at_ns,
+                &cause.instance_id,
+                &cause.acting_for_subject,
+                &cause.correlation_id,
+                &cause.causation_id,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(SyncStatus {
+            recorded: Completed {
+                change,
+                cause: cause.clone(),
+            },
+            ..status
+        })
+    }
+
+    fn sync_statuses(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage> {
+        read.scope.admit(&read.account_id)?;
+        let ((after_account, after_source, after_external), after_sequence, first) =
+            if read.cursor.is_empty() {
+                (Default::default(), -1_i64, true)
+            } else {
+                let (connection, sequence) = from_sync_status_cursor(&read.cursor)?;
+                (connection, sequence as i64, false)
+            };
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let as_of = head(&mut tx)?;
+        let wanted = (read.limit as i64) + 1;
+        let rows = match read.since {
+            Some(since) => tx.query(
+                &format!(
+                    "SELECT {SYNC_STATUS_COLUMNS}
+                       FROM sync_status
+                      WHERE ($1 = '' OR account_id = $1)
+                        AND ($2::text[] IS NULL OR account_id = ANY($2))
+                        AND sequence > $3 AND sequence > $4
+                      ORDER BY sequence
+                      LIMIT $5"
+                ),
+                &[
+                    &read.account_id,
+                    &within(&read.scope),
+                    &(since as i64),
+                    &after_sequence,
+                    &wanted,
+                ],
+            ),
+            // The latest of each connection, in the order of its account,
+            // source and external account.
+            None => tx.query(
+                &format!(
+                    "SELECT {SYNC_STATUS_COLUMNS}
+                       FROM (SELECT DISTINCT ON (account_id, source, external_account_id) *
+                               FROM sync_status
+                              WHERE ($1 = '' OR account_id = $1)
+                                AND ($2::text[] IS NULL OR account_id = ANY($2))
+                              ORDER BY account_id, source, external_account_id, sequence DESC)
+                            latest
+                      WHERE $3 OR (account_id, source, external_account_id) > ($4, $5, $6)
+                      ORDER BY account_id, source, external_account_id
+                      LIMIT $7"
+                ),
+                &[
+                    &read.account_id,
+                    &within(&read.scope),
+                    &first,
+                    &after_account,
+                    &after_source,
+                    &after_external,
+                    &wanted,
+                ],
+            ),
+        }
+        .map_err(unavailable)?;
+        let mut statuses: Vec<SyncStatus> =
+            rows.iter().map(sync_status_of).collect::<Result<_>>()?;
+        let more = statuses.len() > read.limit;
+        statuses.truncate(read.limit);
+        let next_cursor = match statuses.last() {
+            Some(last) if more => sync_status_cursor(last),
+            _ => String::new(),
+        };
+        tx.commit().map_err(unavailable)?;
+        Ok(SyncStatusPage {
+            statuses,
+            next_cursor,
+            as_of,
+        })
+    }
+}
+
+/// The activity held under an activity's source, account and the
+/// custodian's identifier, if any.
+fn held_activity(client: &mut impl GenericClient, activity: &Activity) -> Result<Option<Activity>> {
+    client
+        .query_opt(
+            &format!(
+                "SELECT {ACTIVITY_COLUMNS} FROM activity
+                  WHERE source = $1 AND account_id = $2 AND external_activity_id = $3"
+            ),
+            &[
+                &activity.source,
+                &activity.account_id,
+                &activity.external_activity_id,
+            ],
+        )
+        .map_err(unavailable)?
+        .as_ref()
+        .map(activity_of)
+        .transpose()
+}
+
+fn activity_of(row: &Row) -> Result<Activity> {
+    Ok(Activity {
+        activity_id: row.get(0),
+        account_id: row.get(1),
+        external_account_id: row.get(2),
+        source: row.get(3),
+        external_activity_id: row.get(4),
+        trade_date: row.get(5),
+        kind: row.get(6),
+        instrument_id: row.get(7),
+        units: reported_quantity_of(row, 8)?,
+        record: row.get(9),
+        recorded: Completed {
+            change: Change {
+                sequence: row.get::<_, i64>(11).max(0) as u64,
+                previous: row.get::<_, i64>(12).max(0) as u64,
+            },
+            cause: Cause {
+                instance_id: row.get(13),
+                acting_for_subject: row.get(14),
+                correlation_id: row.get(15),
+                causation_id: row.get(16),
+                committed_at_ns: row.get(10),
+            },
+        },
+    })
+}
+
+fn sync_status_of(row: &Row) -> Result<SyncStatus> {
+    Ok(SyncStatus {
+        account_id: row.get(0),
+        external_account_id: row.get(1),
+        source: row.get(2),
+        state: row.get(3),
+        history_from: row.get(4),
+        record: row.get(5),
+        recorded: Completed {
+            change: Change {
+                sequence: row.get::<_, i64>(7).max(0) as u64,
+                previous: row.get::<_, i64>(8).max(0) as u64,
+            },
+            cause: Cause {
+                instance_id: row.get(9),
+                acting_for_subject: row.get(10),
+                correlation_id: row.get(11),
+                causation_id: row.get(12),
+                committed_at_ns: row.get(6),
+            },
+        },
+    })
 }
 
 /// The partition's number now.

@@ -39,7 +39,7 @@ const DEFAULT_PAGE: usize = 100;
 /// the read's page_size entry allows, whatever was asked for -- a page size
 /// is a request from a caller, not an instruction, and without a ceiling one
 /// caller asking for everything decides how much memory this process uses.
-fn limit(page_size: i32, bound: Range) -> usize {
+pub(crate) fn limit(page_size: i32, bound: Range) -> usize {
     match page_size {
         size if size <= 0 => DEFAULT_PAGE,
         size => (size as i64).min(bound.most) as usize,
@@ -48,7 +48,7 @@ fn limit(page_size: i32, bound: Range) -> usize {
 
 /// The street's sequence in a watermark a reader gave: everything when it
 /// names none.
-fn since(watermark: Option<&Watermark>) -> Option<u64> {
+pub(crate) fn since(watermark: Option<&Watermark>) -> Option<u64> {
     watermark.map(|watermark| {
         watermark
             .partitions
@@ -59,7 +59,7 @@ fn since(watermark: Option<&Watermark>) -> Option<u64> {
     })
 }
 
-fn as_of(sequence: u64) -> Watermark {
+pub(crate) fn as_of(sequence: u64) -> Watermark {
     Watermark {
         partitions: vec![PartitionSequence {
             partition: PARTITION.to_string(),
