@@ -31,6 +31,7 @@ same tag. The runtime image carries none of it.
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
 | `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
+| `activity.sql` | The custodian's activity and each connection's latest sync status, as the street keeps them, as stable, sorted lines (contract v14), which `store activity` prints |
 
 ## Taking it out of the image
 
@@ -164,6 +165,7 @@ proof that the page links.
     $H run --rm -T store street
     $H run --rm -T store book
     $H run --rm -T store tickets
+    $H run --rm -T store activity
 
 `store tickets` (contract v13) prints the dashboard's tickets, one line each,
 and the records each names and its notes, sorted, and never a text:
@@ -220,6 +222,28 @@ plugin's e2e reads its raw records through the plugin, on its own page.
 An account nothing links has no rows, so a file listing every account proves
 both what a linked account holds and that an unlinked one holds nothing. Pair
 it with `unlinked`, which proves the plugin reported the unlinked ones.
+
+### The custodian's activity
+
+`store activity` (contract v14) prints the activity a custody plugin
+recorded and each connection's latest sync status, ordered bytewise:
+
+    activity|<account>|<source>|<external activity id>|<kind>|<instrument>|<trade date>|<units>
+    sync|<account>|<source>|<external account>|<state>|<history from>
+
+- `<account>` and `<instrument>` as the street store prints them; a sync
+  status of an external account nothing links has an empty `<account>`, and
+  an activity whose instrument did not resolve an empty `<instrument>`.
+- `<kind>` (ActivityKind) and `<state>` (SyncState) are their numbers, 0 for
+  not known. `<units>` is printed at the scale it was stated with, empty
+  where none was stated.
+- An activity is one line however often the plugin sent it; a `sync` line is
+  the latest the street heard for that connection, and `<history from>` the
+  first date the source said it can read history from, empty where it said
+  none.
+
+Its own store rather than lines of `store street`, so a plugin's expected
+street file is not changed by a revision it has not taken up.
 
 ### The book of record
 

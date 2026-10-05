@@ -71,6 +71,21 @@ which the sidecar refuses, since a plugin only files as a person. Written on
 the wire by hand, like its registration, so it does not matter which
 bindings the SDK's image carries. It answers what its sidecar said, as JSON.
 
+From contract v14 it reports and reads the custodian's activity
+(`make e2e-activity`; plans/the-custodians-activity-explains-a-break): as
+`custody`, a POST to /activity records SPAXX-like income the custodian
+reinvested in the linked account's money market fund, as the plugin itself,
+answered as already recorded when sent again; and /report's sync status says
+how far back its history reaches. As `operations`, a GET of
+/activity?account=ID reads the account's activity with its `history_from`, a
+GET of /sync reads the latest sync status of each account in its scope, a
+POST to /open records the money market fund's opening balance for the person
+the request came from, a POST to /break records a break on its units with
+the reinvestment it read as the candidate cause, under income reinvested, as
+the plugin itself, and a POST to /confirm resolves it for the person with the
+lot the reinvestment bought. These use the SDK image's bindings, which carry
+v14 when core's e2e builds the image from the SDK beside it.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -85,6 +100,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from decimal import Decimal
 
 import grpc
 
@@ -344,7 +360,7 @@ def report():
                 state=operations_pb2.SYNC_STATE_NEEDS_SIGN_IN, connection_healthy=False,
                 status_detail="the daily sign-in has lapsed",
                 holdings_as_of_ns=1_790_380_800_000_000_000,
-                observed_at_ns=time.time_ns()),
+                observed_at_ns=time.time_ns(), history_from=HISTORY_FROM),
             timeout=10)
         said["sync"] = "published"
     except grpc.RpcError as refused:
@@ -470,6 +486,190 @@ def read_after_link(external_account_id):
 
 def refused_as(refused):
     return {"ok": False, "code": refused.code().name, "detail": refused.details()}
+
+
+# ── Contract v14: the custodian's activity (make e2e-activity) ──
+#
+# The money market fund the linked account's statement holds (STATEMENT_ROWS'
+# MMF), its September income reinvested, as SnapTrade reports Fidelity's.
+HISTORY_FROM = "2024-10-04"
+REINVESTMENT_ID = "e2e-reinvest-2026-09-30"
+REINVESTED_ON = "2026-09-30"
+REINVESTED_UNITS = "3.27"
+OPENING_UNITS = "500.00"
+
+
+def mmf():
+    """The deployment's record for the fund, as the statement resolved it."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    return ops.ResolveIdentifier(
+        operations_pb2.ResolveIdentifierParams(identifiers=[symbol("MMF")], as_of_ns=time.time_ns()),
+        timeout=10).instrument_id
+
+
+def report_activity():
+    """The reinvestment, as the plugin itself: recorded, or answered as
+    recorded already when sent again."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        recorded = ops.RecordActivity(
+            operations_pb2.RecordActivityParams(
+                external_account_id=EXTERNAL_ACCOUNT, source=SOURCE,
+                activity=operations_pb2.CustodialActivity(
+                    external_activity_id=REINVESTMENT_ID,
+                    kind=operations_pb2.ACTIVITY_KIND_REINVESTMENT,
+                    instrument_id=mmf(), trade_date=REINVESTED_ON, settlement_date=REINVESTED_ON,
+                    units=decimal(REINVESTED_UNITS), price=money("1.00"),
+                    amount=money("-" + REINVESTED_UNITS),
+                    description="REINVESTMENT STAND-IN MONEY MARKET (MMF) (Cash)",
+                    raw_record=operations_pb2.RawRecordRef(
+                        key=f"activities/{EXTERNAL_ACCOUNT}/{REINVESTMENT_ID}"))),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "activity_id": recorded.activity_id,
+            "already_recorded": recorded.already_recorded}
+
+
+def read_activity(account_id):
+    """The account's activity as an operations plugin reads it."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        read = ops.ListActivities(
+            operations_pb2.ListActivitiesParams(account_id=account_id, page_size=500), timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "history_from": read.history_from, "activities": [
+        {"activity_id": a.activity_id, "account_id": a.account_id,
+         "external_activity_id": a.activity.external_activity_id,
+         "kind": operations_pb2.ActivityKind.Name(a.activity.kind),
+         "instrument_id": a.activity.instrument_id, "trade_date": a.activity.trade_date,
+         "sequence": a.journal.sequence, "previous": a.journal.previous_sequence}
+        for a in read.activities]}
+
+
+def read_sync():
+    """The latest sync status of each account in its scope."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        read = ops.ListSyncStatuses(operations_pb2.ListSyncStatusesParams(), timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "statuses": [
+        {"account_id": s.status.account_id, "external_account_id": s.status.external_account_id,
+         "state": operations_pb2.SyncState.Name(s.status.state),
+         "history_from": s.status.history_from}
+        for s in read.statuses]}
+
+
+def open_book(header, account_id):
+    """The fund's opening balance, for the person the header names: its
+    units and the one lot the custodian lists. The fund as the activity it
+    read names it, since an operations plugin resolves no identifier."""
+    activity = the_reinvestment(account_id)
+    if activity is None:
+        return {"ok": False, "detail": "no reinvestment read"}
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        opened = ops.RecordOpeningBalance(
+            operations_pb2.RecordOpeningBalanceParams(
+                account_id=account_id, as_of_date="2026-09-26",
+                sources=[operations_pb2.OpeningSource(
+                    kind=operations_pb2.OPENING_SOURCE_KIND_CUSTODIAN, name="stand-in",
+                    as_of_date="2026-09-26", basis=operations_pb2.POSITION_BASIS_TRADE_DATE)],
+                positions=[operations_pb2.OpeningPosition(
+                    instrument_id=activity["instrument_id"], side=operations_pb2.HOLDING_SIDE_LONG,
+                    trade_date_quantity=decimal(OPENING_UNITS),
+                    settled_quantity=decimal(OPENING_UNITS),
+                    lots=[operations_pb2.OpeningLot(
+                        quantity=decimal(OPENING_UNITS),
+                        terms=operations_pb2.LotTerms(
+                            cost=money(OPENING_UNITS), acquired_date="2026-09-01",
+                            source=operations_pb2.LOT_SOURCE_OPENING_BALANCE))])],
+                reason="Opening balance from the stand-in's statement of 2026-09-26",
+                idempotency_key=f"opening-balance:{account_id}",
+                acting_for=assertion_of(header)),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "entry_id": opened.entry.entry_id}
+
+
+def the_reinvestment(account_id):
+    read = read_activity(account_id)
+    found = [a for a in read.get("activities", [])
+             if a["external_activity_id"] == REINVESTMENT_ID]
+    return found[0] if found else None
+
+
+def record_break(account_id):
+    """A break on the fund's units, the street's above the book's by what
+    the custodian reinvested, with the reinvestment it read as the candidate
+    cause, under income reinvested; as the plugin itself, a finding."""
+    activity = the_reinvestment(account_id)
+    if activity is None:
+        return {"ok": False, "detail": "no reinvestment read"}
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    # Exact decimal, never a float: what the street holds after the reinvestment.
+    street = str(Decimal(OPENING_UNITS) + Decimal(REINVESTED_UNITS))
+    try:
+        recorded = ops.RecordBreak(
+            operations_pb2.RecordBreakParams(
+                account_id=account_id,
+                position=operations_pb2.PositionKey(
+                    instrument_id=activity["instrument_id"], side=operations_pb2.HOLDING_SIDE_LONG),
+                category=operations_pb2.BREAK_CATEGORY_TRADE_DATE_QUANTITY,
+                differences=[operations_pb2.BreakDifference(
+                    field="trade_date_quantity",
+                    book=operations_pb2.BreakValue(quantity=decimal(OPENING_UNITS)),
+                    street=operations_pb2.BreakValue(quantity=decimal(street)))],
+                business_date=REINVESTED_ON,
+                candidate_causes=[operations_pb2.BreakCause(
+                    category=operations_pb2.BREAK_CAUSE_CATEGORY_INCOME_REINVESTED,
+                    activity=operations_pb2.ActivityRef(
+                        activity_id=activity["activity_id"], trade_date=activity["trade_date"],
+                        change=operations_pb2.JournalRef(
+                            partition="street", sequence=activity["sequence"],
+                            previous_sequence=activity["previous"])),
+                    note=f"the custodian reinvested {REINVESTED_UNITS} units on {REINVESTED_ON}")],
+                idempotency_key=f"break:{account_id}:{REINVESTMENT_ID}"),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    held = recorded.breaks[0]
+    cause = held.candidate_causes[0]
+    return {"ok": True, "break_id": held.break_id,
+            "category": operations_pb2.BreakCauseCategory.Name(cause.category),
+            "activity_id": cause.activity.activity_id}
+
+
+def confirm(header, account_id, break_id):
+    """The person confirms: the lot the reinvestment bought, naming it."""
+    activity = the_reinvestment(account_id)
+    if activity is None:
+        return {"ok": False, "detail": "no reinvestment read"}
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        resolved = ops.ResolveBreak(
+            operations_pb2.ResolveBreakParams(
+                account_id=account_id, break_ids=[break_id],
+                reason="The custodian reinvested the month's income",
+                adjustment=operations_pb2.Adjustment(
+                    effective_date=REINVESTED_ON, event_reference=activity["activity_id"],
+                    lines=[operations_pb2.MovementLine(
+                        instrument_id=activity["instrument_id"],
+                        side=operations_pb2.HOLDING_SIDE_LONG,
+                        bucket=operations_pb2.SETTLEMENT_BUCKET_SETTLED,
+                        quantity=decimal(REINVESTED_UNITS),
+                        opens_lot=operations_pb2.LotTerms(
+                            cost=money(REINVESTED_UNITS), acquired_date=REINVESTED_ON,
+                            source=operations_pb2.LOT_SOURCE_ADJUSTMENT))]),
+                idempotency_key=f"confirm:{break_id}",
+                acting_for=assertion_of(header)),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "entry_id": resolved.entry.entry_id}
 
 
 def accounts_for(header):
@@ -610,6 +810,17 @@ def decoded(header):
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         callers = self.headers.get_all("Meridian-Caller") or []
+        path, _, query = self.path.partition("?")
+        if path in ("/activity", "/sync"):
+            asked = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+            said = read_activity(asked.get("account", "")) if path == "/activity" else read_sync()
+            body = json.dumps(said).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path in ("/settings", "/accounts"):
             said = settings_said() if self.path == "/settings" else accounts_for(callers[0])
             body = json.dumps(said).encode()
@@ -668,6 +879,18 @@ class Page(http.server.BaseHTTPRequestHandler):
         elif self.path == "/ticket":
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             done = file_ticket(callers, form)
+        elif self.path in ("/activity", "/open", "/break", "/confirm"):
+            form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
+            if self.path == "/activity":
+                done = report_activity()
+            elif self.path == "/break":
+                done = record_break(form.get("account", ""))
+            elif not callers:
+                done = {"ok": False, "detail": "nobody"}
+            elif self.path == "/open":
+                done = open_book(callers[0], form.get("account", ""))
+            else:
+                done = confirm(callers[0], form.get("account", ""), form.get("break_id", ""))
         else:
             done = write_for(callers[0]) if callers else {"ok": False, "detail": "nobody"}
         body = json.dumps(done).encode()

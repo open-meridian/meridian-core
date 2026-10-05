@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-activity \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -34,7 +34,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page harness-check e2e-tickets e2e-activity e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -812,7 +812,7 @@ e2e-plugin-page: network
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty.
 HARNESS_IMAGE := meridian-harness:local
-HARNESS_FILES := README.md book.sql compose.yaml harness.py street.sql tickets.sql
+HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
@@ -936,6 +936,26 @@ e2e-tickets:
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/harness/plugins.json >.harness/plugins.yaml
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/tickets/run.py
+
+# The custodian's activity explains a break (contract v14), end to end on the
+# plugin harness: core's stand-in as custody and operations, the custody one
+# reporting a reinvestment and a sync status needing sign-in, the operations
+# one reading them and recording a break linked to the reinvestment, the book
+# moving only when the person confirms (e2e/activity/run.py says each step).
+# Its own compose project, so it never meets harness-check's or e2e-tickets'.
+e2e-activity:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "e2e-activity FAILED: the harness image did not build" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-activity FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/harness/plugins.json >.harness/plugins.yaml
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/activity/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

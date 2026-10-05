@@ -215,7 +215,7 @@ jobs:
           docker rm "$id" >/dev/null
           held=$(find /tmp/harness -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')
           echo "held: $held"
-          [ "$held" = "README.md book.sql compose.yaml harness.py street.sql tickets.sql " ]
+          [ "$held" = "README.md activity.sql book.sql compose.yaml harness.py street.sql tickets.sql " ]
 
   # The chart, pushed beside the image it names.
   #
