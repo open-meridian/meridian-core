@@ -16,6 +16,10 @@ pub struct Migration {
     pub version: i64,
     pub name: &'static str,
     pub sql: &'static str,
+    /// What the migration writes that needs the deployment's time
+    /// (decisions/024): a gap record it owes the past (decisions/031), stamped
+    /// at the moment it ran. In the same transaction as `sql`.
+    pub then: Option<fn(&mut Transaction<'_>, i64) -> Result<()>>,
 }
 
 /// In order, and never reordered or edited after release: the record of what
@@ -25,53 +29,94 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 1,
         name: "config",
         sql: include_str!("../migrations/0001_config.sql"),
+        then: None,
     },
     Migration {
         version: 2,
         name: "plugin_roles",
         sql: include_str!("../migrations/0002_plugin_roles.sql"),
+        then: None,
     },
     Migration {
         version: 3,
         name: "plugin_catalogue",
         sql: include_str!("../migrations/0003_plugin_catalogue.sql"),
+        then: None,
     },
     Migration {
         version: 4,
         name: "plugin_launch_live",
         sql: include_str!("../migrations/0004_plugin_launch_live.sql"),
+        then: None,
     },
     Migration {
         version: 5,
         name: "plugin_settings",
         sql: include_str!("../migrations/0005_plugin_settings.sql"),
+        then: None,
     },
     Migration {
         version: 6,
         name: "setting_declaration_whole",
         sql: include_str!("../migrations/0006_setting_declaration_whole.sql"),
+        then: None,
     },
     Migration {
         version: 7,
         name: "access_is_read_or_write",
         sql: include_str!("../migrations/0007_access_is_read_or_write.sql"),
+        then: None,
     },
     Migration {
         version: 8,
         name: "account_attributes",
         sql: include_str!("../migrations/0008_account_attributes.sql"),
+        then: None,
     },
     Migration {
         version: 9,
         name: "a_plugin_has_admins",
         sql: include_str!("../migrations/0009_a_plugin_has_admins.sql"),
+        then: None,
     },
     Migration {
         version: 10,
         name: "plugin_declaration",
         sql: include_str!("../migrations/0010_plugin_declaration.sql"),
+        then: None,
+    },
+    Migration {
+        version: 11,
+        name: "each_setting_change_its_own_record",
+        sql: include_str!("../migrations/0011_each_setting_change_its_own_record.sql"),
+        then: Some(settings_not_known_before),
     },
 ];
+
+/// Migration 11's gap records (decisions/031, point 4): for each setting of
+/// each plugin with a change recorded before it, one record saying the
+/// earlier changes' values and where each was made are not known before
+/// `at_ns`, the moment the migration ran, by the deployment's clock. A
+/// setting already given one is left as it is.
+fn settings_not_known_before(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO config_plugin_setting_change
+                (plugin_instance_id, name, action, changed_by, changed_at_ns, made_on, note)
+         SELECT DISTINCT change.plugin_instance_id, change.name, 3, '', $1::bigint, '',
+                'not known before: until migration 11 a settings change recorded who and when, '
+                || 'never the value it set or whether it was made on the dashboard''s form or '
+                || 'the plugin''s page; each change since records both'
+           FROM config_plugin_setting_change change
+          WHERE change.action IN (1, 2)
+            AND NOT EXISTS (SELECT 1 FROM config_plugin_setting_change gap
+                             WHERE gap.plugin_instance_id = change.plugin_instance_id
+                               AND gap.name = change.name
+                               AND gap.action = 3)",
+        &[&at_ns],
+    )
+    .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+    Ok(())
+}
 
 pub const HISTORY: &str = "\
 CREATE TABLE IF NOT EXISTS config_schema_migration (

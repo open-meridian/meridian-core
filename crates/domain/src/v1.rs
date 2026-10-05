@@ -5528,6 +5528,11 @@ pub struct PluginSettingValue {
     #[prost(string, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
+/// Sets or clears a plugin's settings, for an admin of the plugin.
+/// Sent by the dashboard from the plugin's Settings form, or by the plugin from
+/// one of its own pages at admin, acting for the admin viewing it in a session
+/// opened by Manage (W6.11, W4.9), its sidecar stamping plugin_instance_id. A
+/// plugin's page never names a secret.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetPluginSettingsRequest {
     #[prost(string, tag = "1")]
@@ -5557,6 +5562,11 @@ pub struct PluginSettingsRecord {
     pub declared_settings: ::prost::alloc::vec::Vec<
         ::meridian_pb::v1::SettingDeclaration,
     >,
+    /// Who changed a setting at updated_at_ns: the deployment-local subject of
+    /// the admin the dashboard or the plugin's sidecar stamped, from the form
+    /// and the plugin's page alike (W6.11). Empty while nothing is set.
+    #[prost(string, tag = "6")]
+    pub updated_by: ::prost::alloc::string::String,
 }
 /// Answered for the instance the envelope names, and no other. Secrets travel
 /// only on this reply, never on a broadcast, because the broker narrows

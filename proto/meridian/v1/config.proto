@@ -297,6 +297,11 @@ message PluginSettingValue {
   string value = 2;
 }
 
+// Sets or clears a plugin's settings, for an admin of the plugin.
+// Sent by the dashboard from the plugin's Settings form, or by the plugin from
+// one of its own pages at admin, acting for the admin viewing it in a session
+// opened by Manage (W6.11, W4.9), its sidecar stamping plugin_instance_id. A
+// plugin's page never names a secret.
 message SetPluginSettingsRequest {
   string plugin_instance_id = 1;
 
@@ -318,6 +323,11 @@ message PluginSettingsRecord {
   // What the plugin declared when it last registered (W4.8), which the form
   // is built from and every value is checked against.
   repeated SettingDeclaration declared_settings = 5;
+
+  // Who changed a setting at updated_at_ns: the deployment-local subject of
+  // the admin the dashboard or the plugin's sidecar stamped, from the form
+  // and the plugin's page alike (W6.11). Empty while nothing is set.
+  string updated_by = 6;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

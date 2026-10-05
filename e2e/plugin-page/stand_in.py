@@ -19,7 +19,8 @@ Its admin pages link them (W6.4), as a plugin's own admin page does: a GET of
 -- to an existing account, a new one named, or neither to remove it -- each
 acting for the person the request came from, whom the sidecar admits only in
 a session opened by Manage, and a new account only for a deployment admin.
-/link with "as_itself" sends it as the plugin, which the sidecar refuses.
+/link with "as_itself" sends it as the plugin, which the sidecar refuses. A
+POST to /settings saves its own settings the same way (W6.11, contract v14).
 
 It is a plugin built before contract v5: it registers declaring v4 and two
 admin pages in the list v5 retired (`admin_pages`, field 3), written on the
@@ -709,6 +710,28 @@ def link_for(header, asked):
             "plugin_instance_id": linked.plugin_instance_id}
 
 
+def save_settings_for(header, asked):
+    """Its own settings, saved as a plugin's page saves them (W6.11, contract
+    v14): for the person the header names, or as the plugin itself when asked
+    to. `values` maps each setting to its value; `cleared` names those to
+    clear. Answered with the conductor's record, who changed them with it."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    params = operations_pb2.SetPluginSettingsParams(
+        values=[operations_pb2.PluginSettingValue(name=name, value=value)
+                for name, value in sorted(asked.get("values", {}).items())],
+        cleared=asked.get("cleared", []))
+    if not asked.get("as_itself"):
+        params.acting_for.CopyFrom(assertion_of(header))
+    try:
+        record = ops.SetPluginSettings(params, timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "plugin_instance_id": record.plugin_instance_id,
+            "values": {v.name: v.value for v in record.values},
+            "secrets_set": list(record.secrets_set),
+            "updated_by": record.updated_by, "updated_at_ns": record.updated_at_ns}
+
+
 KIT = "/.meridian/ui/0.3.0/meridian.css"
 # The token its forms carry, as an SDK page's do: one per process, which is
 # enough to show the form was read before it was posted.
@@ -876,6 +899,8 @@ class Page(http.server.BaseHTTPRequestHandler):
             return
         elif self.path == "/link":
             done = link_for(callers[0], json.loads(sent or b"{}"))
+        elif self.path == "/settings":
+            done = save_settings_for(callers[0], json.loads(sent or b"{}"))
         elif self.path == "/ticket":
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             done = file_ticket(callers, form)

@@ -233,6 +233,19 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.config.query.accounts", "meridian.v1.AccountsRequest", message, account, acting_for).await
     }
 
+    /// W6.11: `platform.config.command.set-plugin-settings` (preview).
+    async fn set_plugin_settings(
+        &self,
+        request: Request<plugin::SetPluginSettingsParams>,
+    ) -> Result<Response<plugin::SetPluginSettingsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::SetPluginSettingsRequest = self.as_domain(params)?;
+        message.plugin_instance_id = self.instance_id().to_string();
+        let account = None;
+        self.command_typed("platform.config.command.set-plugin-settings", "meridian.v1.SetPluginSettingsRequest", message, account, acting_for).await
+    }
+
     /// W9.1: `platform.book.command.record-opening-balance` (stable).
     async fn record_opening_balance(
         &self,

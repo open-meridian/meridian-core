@@ -806,6 +806,7 @@ fn snaptrade() -> PluginSettingsRecord {
         ],
         secrets_set: vec!["snaptrade_client_id".into()],
         updated_at_ns: T0,
+        updated_by: String::new(),
         declared_settings: vec![
             SettingDeclaration {
                 label: "Client ID".into(),
@@ -871,6 +872,35 @@ fn setting<'a>(body: &'a str, name: &str) -> &'a str {
         .split("<div class=\"setting ")
         .next()
         .unwrap()
+}
+
+#[test]
+fn the_settings_tab_names_who_last_changed_them_from_the_form_or_the_plugins_page() {
+    let mut records = with_settings();
+    records.people.push(meridian_domain::v1::SignInRecord {
+        subject: ADA.into(),
+        display_name: "Ada Park".into(),
+        ..Default::default()
+    });
+    let mut record = snaptrade();
+    assert_eq!(
+        last_changed(&records, &record),
+        "",
+        "nothing said while nobody set one"
+    );
+    record.updated_by = ADA.into();
+    record.updated_at_ns = T0;
+    let said = last_changed(&records, &record);
+    assert!(
+        said.contains("Last changed by Ada Park, 2026-09-26 00:00 UTC"),
+        "{said}"
+    );
+    record.updated_by = "local|<grace>".into();
+    let unknown = last_changed(&records, &record);
+    assert!(
+        unknown.contains("local|&lt;grace&gt;"),
+        "escaped, by subject: {unknown}"
+    );
 }
 
 #[test]

@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_config::store::{Ending, Held, KnownPlugin, SettingChange, Store, Withdrawal};
+use meridian_config::store::{
+    ChangeKind, Ending, Held, KnownPlugin, MadeOn, SettingChange, SettingsAuthor, Store, Withdrawal,
+};
 use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccountGroup, AccountRecord, AccountState, ExternalAccountLink,
@@ -545,7 +547,7 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
 }
 
 #[test]
-fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() {
+fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_value() {
     let (store, url) = store_at("settings");
     let key = SettingsKey::holding(&[7u8; 32]);
     let sealed = key.seal("snaptrade-1", "api_key", SECRET).unwrap();
@@ -562,7 +564,7 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() 
                     held: Some(Held::Plain("15".into())),
                 },
             ],
-            "local|ada",
+            &author("local|ada", MadeOn::Form),
             5,
         )
         .unwrap();
@@ -619,7 +621,11 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() 
                 name: "api_key".into(),
                 held: None,
             }],
-            "local|grace",
+            &SettingsAuthor {
+                by: "local|grace".into(),
+                delegation: "DLG-7".into(),
+                made_on: MadeOn::Page,
+            },
             9,
         )
         .unwrap();
@@ -632,49 +638,96 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_its_value() 
         .collect();
     assert_eq!(names, ["poll_minutes"], "cleared");
 
-    // Who, what and when; the table has nowhere to put a value.
-    let changes: Vec<(String, String, i16, String, i64)> = dump
-        .query(
-            "SELECT plugin_instance_id, name, action, changed_by, changed_at_ns
-               FROM config_plugin_setting_change ORDER BY change_id",
-            &[],
-        )
+    // Each change its own record: what, to what (never a secret's value),
+    // who, through which delegation, where and when.
+    let changes: Vec<_> = store
+        .plugin_setting_changes("snaptrade-1")
         .unwrap()
-        .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .into_iter()
+        .map(|c| {
+            (
+                c.name,
+                c.kind,
+                c.value,
+                c.secret,
+                c.by,
+                c.delegation,
+                c.made_on,
+                c.at_ns,
+            )
+        })
         .collect();
-    let expected = |name: &str, action: i16, by: &str, at: i64| {
+    let expected = |name: &str,
+                    kind: ChangeKind,
+                    value: Option<&str>,
+                    secret: bool,
+                    by: &str,
+                    delegation: &str,
+                    made_on: &str,
+                    at: i64| {
         (
-            "snaptrade-1".to_string(),
             name.to_string(),
-            action,
+            kind,
+            value.map(str::to_string),
+            secret,
             by.to_string(),
+            delegation.to_string(),
+            made_on.to_string(),
             at,
         )
     };
     assert_eq!(
         changes,
         [
-            expected("api_key", 1, "local|ada", 5),
-            expected("poll_minutes", 1, "local|ada", 5),
-            expected("api_key", 2, "local|grace", 9),
+            expected(
+                "api_key",
+                ChangeKind::Set,
+                None,
+                true,
+                "local|ada",
+                "",
+                "form",
+                5
+            ),
+            expected(
+                "poll_minutes",
+                ChangeKind::Set,
+                Some("15"),
+                false,
+                "local|ada",
+                "",
+                "form",
+                5
+            ),
+            expected(
+                "api_key",
+                ChangeKind::Cleared,
+                None,
+                false,
+                "local|grace",
+                "DLG-7",
+                "page",
+                9
+            ),
         ]
     );
-    let columns: Vec<String> = dump
-        .query(
-            "SELECT column_name::text FROM information_schema.columns
-              WHERE table_schema = current_schema()
-                AND table_name = 'config_plugin_setting_change'",
+    let text: String = dump
+        .query_one(
+            "SELECT coalesce(string_agg(c::text, '|'), '')
+               FROM (SELECT * FROM config_plugin_setting_change) c",
             &[],
         )
         .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    assert!(
-        !columns.iter().any(|c| c == "value" || c == "sealed"),
-        "{columns:?}"
+        .get(0);
+    assert!(!text.contains(SECRET), "no secret in the change records");
+    // The table refuses a secret's value, whoever writes it.
+    let secret_value = dump.execute(
+        "INSERT INTO config_plugin_setting_change
+                (plugin_instance_id, name, action, changed_by, changed_at_ns, value, secret)
+         VALUES ('snaptrade-1', 'api_key', 1, 'someone', 1, 'x', true)",
+        &[],
     );
+    assert!(secret_value.is_err());
 
     // And the table itself refuses a row that is neither, or both.
     let both = dump.execute(
@@ -1051,4 +1104,165 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
     assert!(held.iter().any(
         |g| g.access_group_id == "AX-ADMIN" && g.entries[0].level == AccessLevel::Admin as i32
     ));
+}
+
+fn author(by: &str, made_on: MadeOn) -> SettingsAuthor {
+    SettingsAuthor {
+        by: by.into(),
+        delegation: String::new(),
+        made_on,
+    }
+}
+
+struct At(i64);
+impl meridian_clock::Clock for At {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
+}
+
+#[test]
+fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_gap_said() {
+    // A store at migration 10, as a deployment before contract v14 has it:
+    // two changes to poll_minutes and a secret set, recorded without values.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_backfill_{seq}_{}", std::process::id());
+    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .unwrap();
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 10)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    db.batch_execute(
+        "INSERT INTO config_plugin_setting (plugin_instance_id, name, value, sealed, set_by, set_at_ns)
+         VALUES ('snaptrade-1', 'poll_minutes', '30', NULL, 'local|grace', 20),
+                ('snaptrade-1', 'api_key', NULL, '\\x0102', 'local|ada', 10);
+         INSERT INTO config_plugin_setting_change (plugin_instance_id, name, action, changed_by, changed_at_ns)
+         VALUES ('snaptrade-1', 'api_key', 1, 'local|ada', 10),
+                ('snaptrade-1', 'poll_minutes', 1, 'local|ada', 10),
+                ('snaptrade-1', 'poll_minutes', 1, 'local|grace', 20);",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    store
+        .migrate(&At(2_000))
+        .expect("migrating twice is a no-op");
+
+    let changes = store.plugin_setting_changes("snaptrade-1").unwrap();
+    let seen: Vec<_> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.kind,
+                c.value.as_deref(),
+                c.secret,
+                c.by.as_str(),
+                c.at_ns,
+                c.backfilled,
+                c.made_on.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            // The secret's latest: known secret, its value never.
+            (
+                "api_key",
+                ChangeKind::Set,
+                None,
+                true,
+                "local|ada",
+                10,
+                true,
+                ""
+            ),
+            // An earlier change: its value is not known, so it stays unknown.
+            (
+                "poll_minutes",
+                ChangeKind::Set,
+                None,
+                false,
+                "local|ada",
+                10,
+                false,
+                ""
+            ),
+            // The latest, the one the setting says: its value as held.
+            (
+                "poll_minutes",
+                ChangeKind::Set,
+                Some("30"),
+                false,
+                "local|grace",
+                20,
+                true,
+                ""
+            ),
+            // One gap per setting, at the migration's own time, once.
+            (
+                "api_key",
+                ChangeKind::NotKnownBefore,
+                None,
+                false,
+                "",
+                1_000,
+                false,
+                ""
+            ),
+            (
+                "poll_minutes",
+                ChangeKind::NotKnownBefore,
+                None,
+                false,
+                "",
+                1_000,
+                false,
+                ""
+            ),
+        ]
+    );
+    assert!(
+        changes[2].note.contains("backfilled by migration 11"),
+        "{}",
+        changes[2].note
+    );
+    assert!(
+        changes[3].note.starts_with("not known before"),
+        "{}",
+        changes[3].note
+    );
+
+    // A change since records it whole, and the gap is not said again.
+    store
+        .put_plugin_settings(
+            "snaptrade-1",
+            &[SettingChange {
+                name: "poll_minutes".into(),
+                held: Some(Held::Plain("45".into())),
+            }],
+            &author("local|ada", MadeOn::Page),
+            3_000,
+        )
+        .unwrap();
+    let after = store.plugin_setting_changes("snaptrade-1").unwrap();
+    assert_eq!(after.len(), 6);
+    assert_eq!(after[5].value.as_deref(), Some("45"));
+    assert_eq!(after[5].made_on, "page");
 }

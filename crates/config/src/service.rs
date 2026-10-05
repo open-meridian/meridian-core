@@ -1,7 +1,7 @@
 //! Where the configuration store meets the bus: the `config` domain.
 //!
 //! Eleven commands and queries from the dashboard, two queries from sidecars,
-//! a command and a query from a plugin acting for its admin, two events
+//! two commands and a query from a plugin acting for its admin, two events
 //! heard, one announced. Every change is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
@@ -22,7 +22,12 @@
 //! deployment's settings key before it is written, and opened only to answer
 //! that plugin's sidecar ([`crate::sealing`]). What the dashboard is told of a
 //! secret is that it is set; no reply, log line or record here carries its
-//! value, and who changed a setting is recorded without it.
+//! value. Each change is its own record (decisions/031): which setting, set
+//! or cleared, the value of one that is not secret, who, through which
+//! delegation, when, and where -- the dashboard's form or the plugin's own
+//! page at admin, which a plugin sends acting for its admin, for its own
+//! settings, never naming a secret (W6.11). The settings record names who
+//! made its latest change (`updated_by`).
 //!
 //! # Who asked
 //!
@@ -59,7 +64,10 @@ use prost::Message;
 use crate::ids;
 use crate::rules;
 use crate::sealing::SettingsKey;
-use crate::store::{Held, KnownPlugin, SettingChange, Snapshot, Store, StoredSetting, Withdrawal};
+use crate::store::{
+    Held, KnownPlugin, MadeOn, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting,
+    Withdrawal,
+};
 use crate::DEPLOYMENT_ADMIN;
 
 pub const PERSON_SIGNED_IN: &str = "platform.config.event.person-signed-in";
@@ -262,7 +270,10 @@ pub fn settings_record(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginS
             }),
             _ => record.secrets_set.push(held.name.clone()),
         }
-        record.updated_at_ns = record.updated_at_ns.max(held.set_at_ns);
+        if held.set_at_ns >= record.updated_at_ns {
+            record.updated_at_ns = held.set_at_ns;
+            record.updated_by = held.set_by.clone();
+        }
     }
     record.declared_settings = declared;
     record
@@ -408,6 +419,73 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
     Ok(by)
 }
 
+/// The delegation the person acted through, when they acted through a
+/// client (decisions/029); empty otherwise.
+fn delegation(envelope: &Envelope) -> String {
+    envelope
+        .meta
+        .as_ref()
+        .map(|meta| meta.acting_through_delegation.clone())
+        .unwrap_or_default()
+}
+
+/// Where a settings update was made (W6.11), or the refusal. Sent by a
+/// plugin -- published by its own instance, or by any plugin the deployment
+/// has heard report -- it is from one of the plugin's pages at admin: for an
+/// admin its sidecar vouched for and stamped, for its own settings only, and
+/// naming no secret, to set or to clear, since a secret is set only in the
+/// dashboard's form. Anything else is the dashboard's form, which only the
+/// dashboard may publish here.
+fn made_on(
+    snapshot: &Snapshot,
+    envelope: &Envelope,
+    request: &SetPluginSettingsRequest,
+) -> Result<MadeOn, String> {
+    let from = publisher(envelope);
+    let plugin = request.plugin_instance_id.as_str();
+    let a_plugin = from == plugin
+        || snapshot
+            .plugins
+            .iter()
+            .any(|known| known.plugin_instance_id == from);
+    if !a_plugin {
+        return Ok(MadeOn::Form);
+    }
+    if from != plugin {
+        return Err(format!(
+            "a plugin sets only its own settings, and this names {plugin}"
+        ));
+    }
+    admin_acting(envelope, "a plugin's settings")?;
+    let declared = snapshot
+        .declared_settings
+        .get(plugin)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let secret = |name: &str| {
+        declared.iter().any(|d| d.name == name && d.secret)
+            || snapshot.settings.iter().any(|held| {
+                held.plugin_instance_id == plugin
+                    && held.name == name
+                    && matches!(held.held, Held::Sealed(_))
+            })
+    };
+    let named = request
+        .values
+        .iter()
+        .map(|value| value.name.as_str())
+        .chain(request.cleared.iter().map(String::as_str));
+    for name in named {
+        if secret(name) {
+            return Err(format!(
+                "setting {name} is secret: a secret is set only in the dashboard's Settings form, \
+                 never from a plugin's page, and nothing in this update was stored"
+            ));
+        }
+    }
+    Ok(MadeOn::Page)
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -534,6 +612,7 @@ pub fn serve(
         |cx, request: SetPluginSettingsRequest, envelope| {
             let before = cx.snapshot()?;
             let plugin = request.plugin_instance_id.as_str();
+            let made_on = made_on(&before, envelope, &request)?;
             // Every value checked, and every secret sealed, before anything
             // is written: a refusal part-way through changes nothing.
             let mut changes = Vec::new();
@@ -552,8 +631,13 @@ pub fn serve(
             }
             if !changes.is_empty() {
                 let by = subject(envelope);
+                let author = SettingsAuthor {
+                    by: by.clone(),
+                    delegation: delegation(envelope),
+                    made_on,
+                };
                 cx.store
-                    .put_plugin_settings(plugin, &changes, &by, cx.clock.now_ns())
+                    .put_plugin_settings(plugin, &changes, &author, cx.clock.now_ns())
                     .map_err(|f| f.to_string())?;
                 let named = |set: bool| -> String {
                     changes
@@ -569,6 +653,7 @@ pub fn serve(
                     set = named(true),
                     cleared = named(false),
                     by,
+                    on = made_on.code(),
                     "plugin settings changed"
                 );
                 cx.announce(&before)?;

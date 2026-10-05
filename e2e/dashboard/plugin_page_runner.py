@@ -314,6 +314,35 @@ def link(plugin, **asked):
     return json.loads(body) if status == 200 else {"ok": False, "detail": f"{status} {body[:200]}"}
 
 
+def save_on_page(plugin, **asked):
+    status, body = post_on_plugin_host(plugin, "/settings", asked)
+    return json.loads(body) if status == 200 else {"ok": False, "detail": f"{status} {body[:200]}"}
+
+
+def settings_saved_on_the_page(ada, manager):
+    """W6.11 (contract v14): the plugin's own page at admin saves its setting
+    for the admin viewing it, as a link is sent; never a secret, never as the
+    plugin itself; and the record names her, on the Settings tab too."""
+    itself = save_on_page(manager, values={"poll_minutes": "45"}, as_itself=True)
+    check(itself.get("code") == "PERMISSION_DENIED" and "admin of the plugin" in itself.get("detail", ""),
+          f"as itself, the plugin is refused: {itself}")
+    secret = save_on_page(manager, values={"api_key": "sk-test-page-never-sets-a-secret"})
+    check(secret.get("code") == "ABORTED" and "api_key is secret" in secret.get("detail", "")
+          and "sk-test-page" not in secret.get("detail", ""),
+          f"a secret from the page is refused by the conductor, naming it and not its value: {secret}")
+    saved = save_on_page(manager, values={"poll_minutes": "45"})
+    check(saved.get("ok") and saved.get("values", {}).get("poll_minutes") == "45"
+          and saved.get("plugin_instance_id") == INSTANCE,
+          f"saved for her, this plugin's own: {saved}")
+    check(saved.get("updated_by") == f"local|{NAME}",
+          f"the record names who saved it, as the sidecar stamped her: {saved}")
+    check(saved.get("secrets_set") == ["api_key"], f"the secret still only named: {saved}")
+    page = admin_until(ada, lambda page: "data-last-changed" in page.body,
+                       path=f"{VIEW}?tab=settings", seconds=45)
+    said = page.body.split("data-last-changed>", 1)[-1].split("</p>", 1)[0]
+    check(said.startswith("Last changed by "), f"the Settings tab says who last changed them: {said!r}")
+
+
 def report(plugin):
     status, body = post_on_plugin_host(plugin, "/report")
     return json.loads(body) if status == 200 else {"failed": f"{status} {body[:200]}"}
@@ -802,6 +831,9 @@ def main():
     say("K: a required secret set in the dashboard reaches the running plugin (W6.11)")
     settings_reach_the_running_plugin(ada, viewer, reports)
     ada.get(dash("/admin"))
+
+    say("Q: a setting saved on the plugin's own page, for its admin; never a secret (W6.11)")
+    settings_saved_on_the_page(ada, manager)
 
     say("P: the plugin's figures are drawn on its Summary by core; nine are refused (W4.5, W6.9)")
     figures_are_drawn_on_summary(ada, manager, reports)

@@ -24,8 +24,8 @@ use prost::Message;
 
 use crate::migrations;
 use crate::store::{
-    Ending, Held, KnownPlugin, Result, SettingChange, Snapshot, Store, StoreError, StoredSetting,
-    Withdrawal,
+    ChangeKind, Ending, Held, KnownPlugin, Result, SettingChange, SettingChangeRecord,
+    SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -658,13 +658,14 @@ impl Store for PostgresStore {
         &self,
         plugin_instance_id: &str,
         changes: &[SettingChange],
-        by: &str,
+        author: &SettingsAuthor,
         at_ns: i64,
     ) -> Result<()> {
+        let by = author.by.as_str();
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         for change in changes {
-            let action: i16 = match &change.held {
+            let (kind, recorded, secret): (ChangeKind, Option<&str>, bool) = match &change.held {
                 None => {
                     tx.execute(
                         "DELETE FROM config_plugin_setting
@@ -672,7 +673,7 @@ impl Store for PostgresStore {
                         &[&plugin_instance_id, &change.name],
                     )
                     .map_err(unavailable)?;
-                    2
+                    (ChangeKind::Cleared, None, false)
                 }
                 Some(held) => {
                     let (value, sealed) = match held {
@@ -696,18 +697,67 @@ impl Store for PostgresStore {
                         ],
                     )
                     .map_err(unavailable)?;
-                    1
+                    // The value of a setting that is not secret; a secret's,
+                    // never: only that one was set.
+                    (ChangeKind::Set, value, sealed.is_some())
                 }
             };
             tx.execute(
                 "INSERT INTO config_plugin_setting_change
-                        (plugin_instance_id, name, action, changed_by, changed_at_ns)
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[&plugin_instance_id, &change.name, &action, &by, &at_ns],
+                        (plugin_instance_id, name, action, changed_by, changed_at_ns,
+                         value, secret, through_delegation, made_on)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &plugin_instance_id,
+                    &change.name,
+                    &kind.code(),
+                    &by,
+                    &at_ns,
+                    &recorded,
+                    &secret,
+                    &author.delegation,
+                    &author.made_on.code(),
+                ],
             )
             .map_err(unavailable)?;
         }
         tx.commit().map_err(unavailable)
+    }
+
+    fn plugin_setting_changes(&self, plugin_instance_id: &str) -> Result<Vec<SettingChangeRecord>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT name, action, value, secret, changed_by, through_delegation, made_on,
+                        changed_at_ns, backfilled, note
+                   FROM config_plugin_setting_change
+                  WHERE plugin_instance_id = $1
+                  ORDER BY change_id",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let action: i16 = row.get(1);
+                Ok(SettingChangeRecord {
+                    plugin_instance_id: plugin_instance_id.to_string(),
+                    name: row.get(0),
+                    kind: ChangeKind::from_code(action).ok_or_else(|| {
+                        StoreError::Unavailable(format!(
+                            "a settings change records action {action}, which this binary does not know"
+                        ))
+                    })?,
+                    value: row.get(2),
+                    secret: row.get(3),
+                    by: row.get(4),
+                    delegation: row.get(5),
+                    made_on: row.get(6),
+                    at_ns: row.get(7),
+                    backfilled: row.get(8),
+                    note: row.get(9),
+                })
+            })
+            .collect()
     }
 
     fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
@@ -843,7 +893,11 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         // The migration and the row recording it commit together.
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
-        migrations::record(&mut tx, migration, clock.now_ns())?;
+        let at_ns = clock.now_ns();
+        if let Some(then) = migration.then {
+            then(&mut tx, at_ns)?;
+        }
+        migrations::record(&mut tx, migration, at_ns)?;
         tx.commit().map_err(unavailable)?;
     }
     Ok(())

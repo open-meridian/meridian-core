@@ -12,12 +12,16 @@ use meridian_domain::v1::{
 use meridian_pb::v1::SettingDeclaration;
 
 use crate::store::{
-    Ending, KnownPlugin, Result, SettingChange, Snapshot, Store, StoredSetting, Withdrawal,
+    ChangeKind, Ending, Held, KnownPlugin, Result, SettingChange, SettingChangeRecord,
+    SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
 };
 use crate::DEPLOYMENT_ADMIN;
 
 pub struct MemoryStore {
     state: Mutex<Snapshot>,
+    /// Each settings change's own record (W6.11), as the Postgres store keeps
+    /// them, so the rule is tested on both.
+    changes: Mutex<Vec<SettingChangeRecord>>,
 }
 
 impl MemoryStore {
@@ -35,6 +39,7 @@ impl MemoryStore {
             .push(crate::service::all_accounts());
         Self {
             state: Mutex::new(snapshot),
+            changes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -190,16 +195,15 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    /// Who changed what is not kept here: nothing in memory outlives a
-    /// restart, and the Postgres store is where a deployment's record is.
     fn put_plugin_settings(
         &self,
         plugin_instance_id: &str,
         changes: &[SettingChange],
-        by: &str,
+        author: &SettingsAuthor,
         at_ns: i64,
     ) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
+        let mut journal = self.changes.lock().expect("store lock poisoned");
         for change in changes {
             state.settings.retain(|held| {
                 !(held.plugin_instance_id == plugin_instance_id && held.name == change.name)
@@ -209,12 +213,43 @@ impl Store for MemoryStore {
                     plugin_instance_id: plugin_instance_id.to_string(),
                     name: change.name.clone(),
                     held: held.clone(),
-                    set_by: by.to_string(),
+                    set_by: author.by.clone(),
                     set_at_ns: at_ns,
                 });
             }
+            journal.push(SettingChangeRecord {
+                plugin_instance_id: plugin_instance_id.to_string(),
+                name: change.name.clone(),
+                kind: if change.held.is_some() {
+                    ChangeKind::Set
+                } else {
+                    ChangeKind::Cleared
+                },
+                value: match &change.held {
+                    Some(Held::Plain(value)) => Some(value.clone()),
+                    _ => None,
+                },
+                secret: matches!(change.held, Some(Held::Sealed(_))),
+                by: author.by.clone(),
+                delegation: author.delegation.clone(),
+                made_on: author.made_on.code().to_string(),
+                at_ns,
+                backfilled: false,
+                note: String::new(),
+            });
         }
         Ok(())
+    }
+
+    fn plugin_setting_changes(&self, plugin_instance_id: &str) -> Result<Vec<SettingChangeRecord>> {
+        Ok(self
+            .changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.plugin_instance_id == plugin_instance_id)
+            .cloned()
+            .collect())
     }
 
     fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {

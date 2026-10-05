@@ -1607,36 +1607,77 @@ async fn a_secret_is_stored_sealed_and_only_ever_named() {
 
 #[tokio::test]
 async fn the_plugins_own_sidecar_is_told_its_secret_opened_and_the_change_announced() {
-    // The bus named for the plugin, so the configuration query is its sidecar's.
+    // The bus named for the plugin, so the configuration query is its
+    // sidecar's. The secret is held as the dashboard's form stores it (the
+    // memory bus serves only its own instance's calls, and a plugin's page
+    // never sets a secret); the plugin's page then changes what is not secret.
     let h = harness("oms-1");
     reported(&h, true, declared(), 1).await;
+    let key = SettingsKey::holding(&[7u8; 32]);
+    let form = crate::store::SettingsAuthor {
+        by: ADA.into(),
+        delegation: String::new(),
+        made_on: crate::store::MadeOn::Form,
+    };
+    h.store
+        .put_plugin_settings(
+            "oms-1",
+            &[crate::store::SettingChange {
+                name: "api_key".into(),
+                held: Some(Held::Sealed(key.seal("oms-1", "api_key", SECRET).unwrap())),
+            }],
+            &form,
+            1,
+        )
+        .unwrap();
     let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
-    set(&h, "oms-1", &[("api_key", SECRET)], &[]).await.unwrap();
+    set(&h, "oms-1", &[("poll_minutes", "30")], &[])
+        .await
+        .unwrap();
 
     let delivery = tokio::time::timeout(Duration::from_secs(2), changes.recv())
         .await
         .expect("announced")
         .expect("open");
-    assert!(
-        !contains(&delivery.envelope.payload, SECRET),
-        "the announcement carries no setting"
-    );
+    for value in [SECRET, "30"] {
+        assert!(
+            !contains(&delivery.envelope.payload, value),
+            "the announcement carries no setting"
+        );
+    }
     let event = PluginConfigurationChangedEvent::decode(&delivery.envelope.payload[..]).unwrap();
     assert_eq!(event.plugin_instance_id, "oms-1");
 
-    let configured = told(&h).await;
+    let mut configured = told(&h).await.settings;
+    configured.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(
-        configured.settings,
-        [PluginSettingValue {
-            name: "api_key".into(),
-            value: SECRET.into()
-        }]
+        configured,
+        [
+            PluginSettingValue {
+                name: "api_key".into(),
+                value: SECRET.into()
+            },
+            PluginSettingValue {
+                name: "poll_minutes".into(),
+                value: "30".into()
+            }
+        ]
     );
 
     // Cleared, it is gone from both.
-    let record = set(&h, "oms-1", &[], &["api_key"]).await.unwrap();
-    assert!(record.secrets_set.is_empty());
-    assert!(told(&h).await.settings.is_empty());
+    h.store
+        .put_plugin_settings(
+            "oms-1",
+            &[crate::store::SettingChange {
+                name: "api_key".into(),
+                held: None,
+            }],
+            &form,
+            2,
+        )
+        .unwrap();
+    assert!(records(&h).await.plugin_settings[0].secrets_set.is_empty());
+    assert_eq!(told(&h).await.settings.len(), 1);
 }
 
 #[tokio::test]
@@ -1676,7 +1717,11 @@ async fn a_secret_that_no_longer_opens_is_withheld_rather_than_sent_sealed() {
                     other.seal("oms-1", "api_key", SECRET).unwrap(),
                 )),
             }],
-            ADA,
+            &crate::store::SettingsAuthor {
+                by: ADA.into(),
+                delegation: String::new(),
+                made_on: crate::store::MadeOn::Form,
+            },
             1,
         )
         .unwrap();
@@ -1684,6 +1729,164 @@ async fn a_secret_that_no_longer_opens_is_withheld_rather_than_sent_sealed() {
     assert_eq!(
         records(&h).await.plugin_settings[0].secrets_set,
         ["api_key"]
+    );
+}
+
+// ── A plugin's page saves its own setting (W6.11, contract v14) ───────────
+
+/// An update as a plugin's sidecar sends it: published by the plugin's own
+/// instance, acting for `by` (empty: for nobody).
+async fn set_from_page(
+    h: &Harness,
+    plugin: &str,
+    values: &[(&str, &str)],
+    cleared: &[&str],
+    by: &str,
+) -> Result<PluginSettingsRecord, String> {
+    let request = SetPluginSettingsRequest {
+        plugin_instance_id: plugin.into(),
+        values: values
+            .iter()
+            .map(|(name, value)| PluginSettingValue {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect(),
+        cleared: cleared.iter().map(|name| (*name).into()).collect(),
+    };
+    let (_, bytes) = h
+        .bus
+        .call_for(
+            SET_PLUGIN_SETTINGS,
+            "meridian.v1.SetPluginSettingsRequest",
+            request.encode_to_vec(),
+            None,
+            None,
+            by,
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    Ok(PluginSettingsRecord::decode(&bytes[..]).expect("decodes"))
+}
+
+#[tokio::test]
+async fn a_plugins_page_sets_its_own_setting_for_its_admin_who_the_record_names() {
+    let h = harness("oms-1");
+    reported(&h, true, declared(), 1).await;
+    let record = set_from_page(&h, "oms-1", &[("poll_minutes", "30")], &[], ADA)
+        .await
+        .unwrap();
+    assert_eq!(record.values[0].name, "poll_minutes");
+    assert_eq!(record.values[0].value, "30");
+    assert_eq!(record.updated_by, ADA, "the admin the sidecar stamped");
+    assert_eq!(record.updated_at_ns, FixedClock.now_ns());
+
+    // Its own record: what, to what, who, where and when.
+    let changes = h.store.plugin_setting_changes("oms-1").unwrap();
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.name, "poll_minutes");
+    assert_eq!(change.kind, crate::ChangeKind::Set);
+    assert_eq!(change.value.as_deref(), Some("30"));
+    assert!(!change.secret);
+    assert_eq!(change.by, ADA);
+    assert_eq!(change.made_on, "page");
+    assert_eq!(change.at_ns, FixedClock.now_ns());
+
+    // And what the dashboard's form reads names them too.
+    assert_eq!(records(&h).await.plugin_settings[0].updated_by, ADA);
+}
+
+#[tokio::test]
+async fn a_plugins_page_never_names_a_secret_another_plugin_or_nobody() {
+    let h = harness("oms-1");
+    reported(&h, true, declared(), 1).await;
+
+    let secret = set_from_page(
+        &h,
+        "oms-1",
+        &[("poll_minutes", "30"), ("api_key", SECRET)],
+        &[],
+        ADA,
+    )
+    .await
+    .unwrap_err();
+    assert!(secret.contains("api_key is secret"), "{secret}");
+    assert!(secret.contains("Settings form"), "{secret}");
+    assert!(!secret.contains(SECRET), "a refusal never repeats a value");
+    let cleared = set_from_page(&h, "oms-1", &[], &["api_key"], ADA)
+        .await
+        .unwrap_err();
+    assert!(cleared.contains("api_key is secret"), "{cleared}");
+
+    let another = set_from_page(&h, "oms-2", &[("poll_minutes", "30")], &[], ADA)
+        .await
+        .unwrap_err();
+    assert!(another.contains("only its own settings"), "{another}");
+
+    let nobody = set_from_page(&h, "oms-1", &[("poll_minutes", "30")], &[], "")
+        .await
+        .unwrap_err();
+    assert!(nobody.contains("sent for nobody"), "{nobody}");
+
+    assert!(
+        h.store.snapshot().unwrap().settings.is_empty(),
+        "nothing was stored"
+    );
+    assert!(h.store.plugin_setting_changes("oms-1").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_form_records_each_change_a_secret_only_as_set() {
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    let record = set(
+        &h,
+        "oms-1",
+        &[("api_key", SECRET), ("poll_minutes", "15")],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.updated_by, ADA);
+    set(&h, "oms-1", &[], &["poll_minutes"]).await.unwrap();
+
+    let changes = h.store.plugin_setting_changes("oms-1").unwrap();
+    let seen: Vec<_> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.kind,
+                c.value.as_deref(),
+                c.secret,
+                c.made_on.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("api_key", crate::ChangeKind::Set, None, true, "form"),
+            (
+                "poll_minutes",
+                crate::ChangeKind::Set,
+                Some("15"),
+                false,
+                "form"
+            ),
+            (
+                "poll_minutes",
+                crate::ChangeKind::Cleared,
+                None,
+                false,
+                "form"
+            ),
+        ]
+    );
+    assert!(
+        !format!("{changes:?}").contains(SECRET),
+        "never a secret's value"
     );
 }
 

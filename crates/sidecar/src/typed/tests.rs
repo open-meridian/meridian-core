@@ -10,14 +10,15 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     AccountRecord, AccountState, Accounts, ExternalAccountLink, ExternalAccountsEvent,
     LinkExternalAccountRequest, MissingInstrumentDetectedEvent, PluginConfiguration,
-    PluginConfigurationChangedEvent, RecordHoldingReply, RecordHoldingRequest, SyncState,
-    SyncStatusEvent,
+    PluginConfigurationChangedEvent, PluginSettingsRecord, RecordHoldingReply,
+    RecordHoldingRequest, SetPluginSettingsRequest, SyncState, SyncStatusEvent,
 };
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
     AssetClass, Decimal, ExternalAccount, HoldingSide, Identifier, LinkExternalAccountParams,
-    Money, ReadAccountsForLinkingParams, RecordHoldingParams, RecordHoldingsStatementParams,
-    ReportExternalAccountsParams, ReportMissingInstrumentParams, ReportSyncStatusParams,
+    Money, PluginSettingValue, ReadAccountsForLinkingParams, RecordHoldingParams,
+    RecordHoldingsStatementParams, ReportExternalAccountsParams, ReportMissingInstrumentParams,
+    ReportSyncStatusParams, SetPluginSettingsParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
@@ -45,6 +46,7 @@ fn contract() -> Contract {
          platform.street.command.record-statement\tcommand\tcustody\tstreet\n\
          platform.config.command.link-external-account\tcommand\tcustody\tconductor\n\
          platform.config.query.accounts\tquery\tcustody\tconductor\n\
+         platform.config.command.set-plugin-settings\tcommand\tdashboard,custody\tconductor\n\
          platform.reference.query.resolve-identifier\tquery\tcustody\tinstrument\n\
          platform.street.query.list-custodial-positions\tquery\toperations\tstreet\n\
          platform.street.query.list-statements\tquery\toperations\tstreet\n",
@@ -1218,6 +1220,89 @@ async fn a_link_for_a_deployment_admin_is_stamped_with_them_and_this_plugin() {
             heard[2].0.new_account_name.as_str()
         ),
         ("", "")
+    );
+}
+
+// ── A plugin's page saves its own setting, for its admin (W6.11) ───────────
+
+const SET_PLUGIN_SETTINGS: &str = "platform.config.command.set-plugin-settings";
+
+fn saving(by: Option<CallerAssertion>) -> SetPluginSettingsParams {
+    SetPluginSettingsParams {
+        values: vec![PluginSettingValue {
+            name: "plan_code_links".into(),
+            value: "[]".into(),
+        }],
+        acting_for: by,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_setting_saved_on_the_plugins_page_is_sent_for_its_admin_and_stamped_with_this_plugin() {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier = Arc::new(Verifier::holding(
+        "snaptrade-1",
+        KEY_ID,
+        key.verifying_key(),
+    ));
+    let (sidecar, bus, _) = registered_with(&["custody"], Some(verifier)).await;
+    let heard: Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>> = Arc::default();
+    let keeping = Arc::clone(&heard);
+    bus.serve(SET_PLUGIN_SETTINGS, move |envelope| {
+        let request = SetPluginSettingsRequest::decode(&envelope.payload[..]).unwrap();
+        let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+        keeping.lock().unwrap().push((request.clone(), by.clone()));
+        Ok((
+            "meridian.v1.PluginSettingsRecord".into(),
+            PluginSettingsRecord {
+                plugin_instance_id: request.plugin_instance_id,
+                values: request.values,
+                updated_by: by,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+
+    let saved = sidecar
+        .set_plugin_settings(Request::new(saving(Some(signed(
+            &key,
+            Held::default(),
+            true,
+        )))))
+        .await
+        .expect("admitted")
+        .into_inner();
+    assert_eq!(saved.updated_by, "local|ada", "the record names her");
+    {
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 1);
+        assert_eq!(
+            heard[0].0.plugin_instance_id, "snaptrade-1",
+            "stamped by the sidecar"
+        );
+        assert_eq!(heard[0].1, "local|ada", "sent for her");
+    }
+
+    for (by, said) in [
+        (None, "carries no assertion"),
+        (
+            Some(signed(&key, writing(&["ACC-1"]), false)),
+            "Open (write)",
+        ),
+    ] {
+        let refused = sidecar
+            .set_plugin_settings(Request::new(saving(by)))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(refused.message().contains(said), "{}", refused.message());
+    }
+    assert_eq!(
+        heard.lock().unwrap().len(),
+        1,
+        "nothing more reaches the conductor"
     );
 }
 

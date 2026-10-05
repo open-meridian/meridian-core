@@ -796,10 +796,26 @@ pub(crate) fn settings_tab(manage: &Manage) -> String {
     } else {
         format!("<p class=\"notice good\">{}</p>", escape(manage.notice))
     };
+    let changed = settings_of(manage.records, instance)
+        .map(|record| last_changed(manage.records, record))
+        .unwrap_or_default();
     format!(
         "{notice}<section class=\"panel padded\" id=\"settings\"><h2>Settings</h2>\
          <p class=\"hint\">What the plugin declared it needs. A secret is never shown again \
-         once set: type a new value to replace it.</p>{form}</section>"
+         once set: type a new value to replace it.</p>{changed}{form}</section>"
+    )
+}
+
+/// Who last changed a plugin's settings, and when (W6.11): from this form
+/// or the plugin's own page alike, as the conductor recorded it.
+pub(crate) fn last_changed(records: &AccessRecords, record: &PluginSettingsRecord) -> String {
+    if record.updated_by.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<p class=\"hint\" data-last-changed>Last changed by {who}, {when}.</p>",
+        who = escape(&crate::tickets::display_name(records, &record.updated_by)),
+        when = escape(&crate::custody::utc(record.updated_at_ns)),
     )
 }
 
