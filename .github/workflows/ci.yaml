@@ -172,6 +172,9 @@ jobs:
 
       - name: Keep what the cluster said
         if: failure()
+        # A slow artifact service held a failed run open to the job's limit
+        # (2026-10-06); the job's own log says what failed without it.
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}-logs
