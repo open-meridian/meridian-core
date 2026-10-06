@@ -100,9 +100,9 @@ def main_phase():
 # What `meridian connect` listens on. Nothing listens here: the code is read
 # from the redirect, which is all the loopback address is for.
 BACK = "http://127.0.0.1:53682/callback"
-# The oldest release that must keep working across the change: the session it
-# holds is the same token, presented the same way.
-CLI_VERSION = "0.1.14"
+# A CLI the dashboard serves: from contract v15, 0.1.25 or later, the first
+# connecting by delegation.
+CLI_VERSION = "0.1.34"
 PLUGIN = "e2e-restart"
 
 
