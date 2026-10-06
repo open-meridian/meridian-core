@@ -170,11 +170,29 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET"
 
+      # What failed, in the job's own log, before anything else is tried:
+      # the artifact service timed out creating the upload below (2026-10-06,
+      # "Request timeout: /twirp/github.actions.results.api.v1.ArtifactService/
+      # CreateArtifact", retried five times past its step's limit), and a run
+      # then said nothing of why it failed until it was cancelled.
+      - name: Say what the cluster said
+        if: failure()
+        working-directory: workspace/meridian-core
+        run: |
+          for log in .e2e-*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log, its last 300 lines"
+            tail -n 300 "$log"
+            echo "::endgroup::"
+          done
+
       - name: Keep what the cluster said
         if: failure()
         # A slow artifact service held a failed run open to the job's limit
-        # (2026-10-06); the job's own log says what failed without it.
+        # (2026-10-06); the step above has put what failed in the job's log,
+        # so an upload that fails or times out never decides the run.
         timeout-minutes: 5
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}-logs
