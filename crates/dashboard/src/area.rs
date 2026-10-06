@@ -116,6 +116,21 @@ pub fn tabs(
     level: AccessLevel,
     tables: &[(String, String)],
 ) -> Vec<Tab> {
+    tabs_by_role(report, level, &[], tables)
+}
+
+/// [`tabs`], by role (W6.9, contract v15): a page naming roles shows when,
+/// for at least one of them, the person's level within the button --
+/// `roles`, the session's per-role entries -- is one of the page's levels; a
+/// page naming none, or a session carrying none, by the button's level as
+/// before. Tabs are not grouped or labelled by role: how roles appear inside
+/// the plugin is the vendor's.
+pub fn tabs_by_role(
+    report: Option<&PluginReport>,
+    level: AccessLevel,
+    roles: &[(String, AccessLevel)],
+    tables: &[(String, String)],
+) -> Vec<Tab> {
     let interface = report.and_then(|report| report.declared_interface.as_ref());
     let declared = interface
         .map(|interface| interface.pages.as_slice())
@@ -137,10 +152,15 @@ pub fn tabs(
             });
         }
     }
-    for page in declared
-        .iter()
-        .filter(|page| page.levels.contains(&(level as i32)))
-    {
+    let serves = |page: &&meridian_pb::v1::PageDeclaration| {
+        if page.roles.is_empty() || roles.is_empty() {
+            return page.levels.contains(&(level as i32));
+        }
+        roles
+            .iter()
+            .any(|(role, at)| page.roles.contains(role) && page.levels.contains(&(*at as i32)))
+    };
+    for page in declared.iter().filter(serves) {
         let path = page.path.trim();
         if crate::plugins::page_path(path).is_err() || tabs.iter().any(|t| t.path == path) {
             continue;
@@ -427,6 +447,7 @@ mod tests {
                         path: path.to_string(),
                         title: title.to_string(),
                         levels: levels.iter().map(|l| *l as i32).collect(),
+                        roles: vec![],
                     })
                     .collect(),
             }),
@@ -436,6 +457,54 @@ mod tests {
 
     const ADMIN: &[AccessLevel] = &[AccessLevel::Admin];
     const DATA: &[AccessLevel] = &[AccessLevel::Write, AccessLevel::Read];
+
+    #[test]
+    fn a_page_shows_by_the_persons_level_on_one_of_its_roles() {
+        // A plugin holding custody and operations (contract v15): a page
+        // naming a role shows when the person's level on it within the
+        // button is one of the page's levels.
+        let page = |path: &str, title: &str, levels: &[AccessLevel], roles: &[&str]| PageDeclaration {
+            path: path.into(),
+            title: title.into(),
+            levels: levels.iter().map(|l| *l as i32).collect(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        };
+        let report = PluginReport {
+            declared_interface: Some(InterfaceDeclaration {
+                loopback_port: 8000,
+                title: "Ops".into(),
+                pages: vec![
+                    page("/balances", "Balances", &[AccessLevel::Write, AccessLevel::Read], &["operations"]),
+                    page("/statements", "Statements", &[AccessLevel::Write], &["custody"]),
+                    page("/holdings", "Holdings", &[AccessLevel::Read], &["custody"]),
+                    page("/links", "Account links", &[AccessLevel::Admin], &["custody"]),
+                ],
+            }),
+            ..Default::default()
+        };
+        let titles = |tabs: Vec<Tab>| tabs.into_iter().map(|t| t.title).collect::<Vec<_>>();
+        let open = tabs_by_role(
+            Some(&report),
+            AccessLevel::Write,
+            &[("custody".into(), AccessLevel::Read), ("operations".into(), AccessLevel::Write)],
+            &[],
+        );
+        assert_eq!(titles(open), ["Balances", "Holdings"]);
+        let manage = tabs_by_role(
+            Some(&report),
+            AccessLevel::Admin,
+            &[("operations".into(), AccessLevel::Admin)],
+            &[],
+        );
+        assert_eq!(titles(manage), ["Summary", "Settings"]);
+        let custody_admin = tabs_by_role(
+            Some(&report),
+            AccessLevel::Admin,
+            &[("custody".into(), AccessLevel::Admin)],
+            &[],
+        );
+        assert_eq!(titles(custody_admin), ["Summary", "Settings", "Account links"]);
+    }
 
     #[test]
     fn each_button_shows_the_pages_whose_levels_include_its_level_in_order() {

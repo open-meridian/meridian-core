@@ -173,8 +173,16 @@ pub struct Covers {
     pub everything: bool,
     /// The deployment admin's capabilities, only if named.
     pub deployment_admin: bool,
-    /// Plugin instance and level (`admin`, `write` or `read`).
-    pub plugins: BTreeSet<(String, String)>,
+    /// Plugin instance, role and level (`admin`, `write` or `read`): rows of
+    /// plugin, role and level from contract v15 (W6.17, decisions/033), the
+    /// role empty for a plugin holding none.
+    pub plugins: BTreeSet<(String, String, String)>,
+    /// Rows recorded before v15, naming a plugin and a level, that the
+    /// one-time rewrite could not name a role for -- a plugin holding
+    /// several roles, or none known: kept as recorded, covering nothing, and
+    /// flagged on Connected clients until the person consents again
+    /// ([`rewrite_rows`]; the plan's Q4).
+    pub unmatched: BTreeSet<(String, String)>,
     /// The account groups whose accounts it reaches.
     pub account_groups: BTreeSet<String>,
 }
@@ -187,30 +195,40 @@ impl Covers {
         }
     }
 
-    fn covers(&self, instance: &str, level: &str) -> bool {
+    fn covers(&self, instance: &str, role: &str, level: &str) -> bool {
         self.plugins
-            .contains(&(instance.to_string(), level.to_string()))
+            .contains(&(instance.to_string(), role.to_string(), level.to_string()))
     }
 
-    /// The one level a person picks on a plugin instance (the product owner,
-    /// 2026-10-04, kernel/the-consent-page-at-scale ruling 1): the highest it
-    /// covers there. Manage includes Open and View, as holding it does.
-    pub fn level_on(&self, instance: &str) -> Option<AccessLevel> {
-        LEVELS_DOWN
-            .into_iter()
-            .find(|level| self.covers(instance, meridian_access::level_name(*level)))
+    /// The one level a person picks on a plugin's role (the product owner,
+    /// 2026-10-04, kernel/the-consent-page-at-scale ruling 1; per role from
+    /// v15): the highest it covers there. Manage includes Open and View, as
+    /// holding it does.
+    pub fn level_on(&self, instance: &str, role: &str) -> Option<AccessLevel> {
+        LEVELS_DOWN.into_iter().find(|level| {
+            self.covers(instance, role, meridian_access::level_name(*level))
+        })
     }
 
-    /// Its plugin instances by the level picked on each, Manage first.
-    pub fn by_level(&self) -> Vec<(AccessLevel, Vec<&str>)> {
-        let instances: BTreeSet<&str> = self.plugins.iter().map(|(i, _)| i.as_str()).collect();
+    /// The plugin instances and roles it names, in order.
+    pub fn rows(&self) -> BTreeSet<(&str, &str)> {
+        self.plugins
+            .iter()
+            .map(|(instance, role, _)| (instance.as_str(), role.as_str()))
+            .collect()
+    }
+
+    /// Its rows by the level picked on each, Manage first: "ops-1" for a
+    /// role-less plugin's, "ops-1 custody" for a role's.
+    pub fn by_level(&self) -> Vec<(AccessLevel, Vec<String>)> {
+        let rows = self.rows();
         LEVELS_DOWN
             .into_iter()
             .map(|level| {
-                let at: Vec<&str> = instances
+                let at: Vec<String> = rows
                     .iter()
-                    .copied()
-                    .filter(|instance| self.level_on(instance) == Some(level))
+                    .filter(|(instance, role)| self.level_on(instance, role) == Some(level))
+                    .map(|(instance, role)| row_named(instance, role))
                     .collect();
                 (level, at)
             })
@@ -229,12 +247,16 @@ impl Covers {
         if self.deployment_admin {
             parts.push("deployment admin".to_string());
         }
-        let instances: BTreeSet<&str> = self.plugins.iter().map(|(i, _)| i.as_str()).collect();
-        let plugins: Vec<String> = instances
+        let plugins: Vec<String> = self
+            .rows()
             .into_iter()
-            .filter_map(|instance| {
-                let level = self.level_on(instance)?;
-                Some(format!("{instance} ({})", meridian_access::button(level)))
+            .filter_map(|(instance, role)| {
+                let level = self.level_on(instance, role)?;
+                Some(format!(
+                    "{} ({})",
+                    row_named(instance, role),
+                    meridian_access::button(level)
+                ))
             })
             .collect();
         if plugins.len() <= NAMES_SAID {
@@ -260,6 +282,100 @@ impl Covers {
             parts.join("; ")
         }
     }
+}
+
+/// A row of a delegation, as a person reads it: the plugin, and its role
+/// where it names one.
+pub fn row_named(instance: &str, role: &str) -> String {
+    if role.is_empty() {
+        instance.to_string()
+    } else {
+        format!("{instance} {role}")
+    }
+}
+
+/// Rows recorded before contract v15 -- a plugin and a level -- rewritten
+/// once to name the plugin's one role where the records say it holds exactly
+/// one, or none where it holds none (W6.17; the plan's design): None when
+/// nothing changes, rows already naming a role being skipped, so it is
+/// idempotent. A row on a plugin holding several roles, or one the records
+/// do not list, is kept unmatched, covering nothing.
+pub fn rewrite_rows(covers: &Covers, records: &AccessRecords) -> Option<Covers> {
+    if covers.unmatched.is_empty() {
+        return None;
+    }
+    let mut rewritten = covers.clone();
+    rewritten.unmatched.clear();
+    for (instance, level) in &covers.unmatched {
+        match meridian_access::known_roles(records, instance) {
+            Some([one]) => {
+                rewritten
+                    .plugins
+                    .insert((instance.clone(), one.clone(), level.clone()));
+            }
+            Some([]) => {
+                rewritten
+                    .plugins
+                    .insert((instance.clone(), String::new(), level.clone()));
+            }
+            _ => {
+                rewritten.unmatched.insert((instance.clone(), level.clone()));
+            }
+        }
+    }
+    (rewritten != *covers).then_some(rewritten)
+}
+
+/// The rows rewrite, once the records are first read at v15 (W6.17): tried
+/// every five seconds until they are, then done once, each delegation
+/// rewritten logged. Spawned by the dashboard at start.
+pub async fn rewrite_once_records_are_read(
+    delegations: Arc<Delegations>,
+    records: Arc<crate::records::RecordsCache>,
+    clock: Arc<dyn crate::clock::Clock>,
+) {
+    loop {
+        if let Ok(read) = records.current(clock.now_ns()) {
+            match rewrite_recorded_rows(&delegations, &read).await {
+                Ok(0) => {}
+                Ok(rewritten) => tracing::info!(
+                    rewritten,
+                    "delegations' rows rewritten to name each plugin's role (contract v15)"
+                ),
+                Err(unavailable) => {
+                    tracing::warn!(%unavailable, "delegations' rows were not rewritten yet");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// The rows rewrite: every delegation recorded with rows from before v15,
+/// once the records are first read at v15 (W6.17), each rewrite logged.
+/// Returns how many delegations it rewrote.
+pub async fn rewrite_recorded_rows(
+    delegations: &Delegations,
+    records: &AccessRecords,
+) -> Result<usize, Unavailable> {
+    let mut rewritten = 0;
+    for delegation in delegations.narrowed().await? {
+        let Some(covers) = rewrite_rows(&delegation.covers, records) else {
+            continue;
+        };
+        delegations.rewrite(&delegation.id, &covers).await?;
+        tracing::info!(
+            delegation = delegation.id,
+            subject = delegation.subject,
+            left = covers.unmatched.len(),
+            "a delegation's rows rewritten to name each plugin's role (contract v15)"
+        );
+        rewritten += 1;
+    }
+    Ok(rewritten)
 }
 
 /// The levels from the highest down: Manage, Open, View.
@@ -291,7 +407,8 @@ pub fn listed(names: &[&str]) -> String {
 /// A person's access cut to what a delegation covers: taken per request,
 /// never copied, so a narrowed delegation never grows and an everything one
 /// follows the person (question 2). Nothing here widens anybody: every level
-/// and account kept is one the person holds now.
+/// and account kept is one the person holds now. Per role from v15: a row
+/// covers its plugin's role at its level, and nothing of another role.
 pub fn narrow(
     access: meridian_access::Access,
     covers: &Covers,
@@ -301,16 +418,19 @@ pub fn narrow(
         return access;
     }
     let accounts = meridian_access::accounts_in_groups(records, &covers.account_groups);
-    let instances: BTreeSet<&str> = covers.plugins.iter().map(|(i, _)| i.as_str()).collect();
-    let mut plugins = BTreeMap::new();
-    for instance in instances {
-        let held = access.held(instance);
-        let admin = held.admin && covers.covers(instance, "admin");
+    let mut plugins: meridian_access::PluginLevels = BTreeMap::new();
+    for (instance, role) in covers.rows() {
+        let Some(held) = access.plugin(instance).roles.get(role).cloned() else {
+            continue;
+        };
+        let admin = held.admin && covers.covers(instance, role, "admin");
         let data = match held.data {
-            Some(AccessLevel::Write) if covers.covers(instance, "write") => {
+            Some(AccessLevel::Write) if covers.covers(instance, role, "write") => {
                 Some(AccessLevel::Write)
             }
-            Some(AccessLevel::Write | AccessLevel::Read) if covers.covers(instance, "read") => {
+            Some(AccessLevel::Write | AccessLevel::Read)
+                if covers.covers(instance, role, "read") =>
+            {
                 Some(AccessLevel::Read)
             }
             _ => None,
@@ -333,8 +453,8 @@ pub fn narrow(
             }
         }
         if admin || data.is_some() {
-            plugins.insert(
-                instance.to_string(),
+            plugins.entry(instance.to_string()).or_default().roles.insert(
+                role.to_string(),
                 Held {
                     admin,
                     data,
@@ -350,6 +470,7 @@ pub fn narrow(
         all_plugins_admin: false,
         user_group_ids: access.user_group_ids,
         plugins,
+        known_roles: access.known_roles,
     }
 }
 
@@ -1137,6 +1258,18 @@ impl Delegations {
     pub async fn delegation(&self, id: &str) -> Result<Option<Delegation>, Unavailable> {
         let id = id.to_string();
         self.stored(move |store| store.delegation(&id)).await
+    }
+
+    /// Every delegation narrowed at consent, revoked or not: what the rows
+    /// rewrite reads (W6.17).
+    pub async fn narrowed(&self) -> Result<Vec<Delegation>, Unavailable> {
+        self.stored(|store| store.narrowed()).await
+    }
+
+    /// A delegation's rows as rewritten once to name each plugin's role.
+    pub async fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), Unavailable> {
+        let (id, covers) = (id.to_string(), covers.clone());
+        self.stored(move |store| store.rewrite(&id, &covers)).await
     }
 
     /// Record why a request on a delegation was refused, for the person and

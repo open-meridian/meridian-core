@@ -49,13 +49,13 @@ fn level_name(level: i32) -> &'static str {
     }
 }
 
-/// What an access group gives one plugin, as the form's one choice names it:
-/// `read`, `write` or `admin`, or `admin-read` or `admin-write` for admin
-/// beside a data level (W6.7).
-pub(crate) fn choice_of(entries: &[AccessEntry], plugin: &str) -> &'static str {
+/// What an access group gives one plugin's role, as the form's one choice
+/// names it: `read`, `write` or `admin`, or `admin-read` or `admin-write` for
+/// admin beside a data level (W6.7; per role from v15).
+pub(crate) fn choice_of(entries: &[AccessEntry], plugin: &str, role: &str) -> &'static str {
     let on: Vec<i32> = entries
         .iter()
-        .filter(|e| e.plugin_instance_id == plugin)
+        .filter(|e| e.plugin_instance_id == plugin && e.role == role)
         .map(|e| e.level)
         .collect();
     let admin = on.contains(&(AccessLevel::Admin as i32));
@@ -653,37 +653,70 @@ pub fn render(
         };
         by_name(&name(a), &a.0).cmp(&by_name(&name(b), &b.0))
     });
-    let plugin_choices: Vec<Choice> = instances
+    // One row per role each plugin holds (W6.7, contract v15; the product
+    // owner, 2026-10-04: one line a row, paged, never scrolled): a plugin
+    // holding one role shows one row with its role filled, one holding none
+    // one row with no role; and a row for any entry an access group keeps on a
+    // role the plugin no longer holds, flagged, so editing keeps it as written.
+    let mut editor_rows: Vec<(String, String, String, bool)> = Vec::new();
+    for (id, name) in &instances {
+        let roles = known_roles(records, id);
+        let shown = if name.is_empty() { id.clone() } else { name.clone() };
+        if roles.is_empty() {
+            editor_rows.push((id.clone(), shown.clone(), String::new(), false));
+        }
+        for role in &roles {
+            editor_rows.push((id.clone(), shown.clone(), role.clone(), false));
+        }
+        for g in &records.access_groups {
+            for e in g.entries.iter().filter(|e| &e.plugin_instance_id == id) {
+                let stale = !meridian_access::entry_holds(records, id, &e.role);
+                let listed = editor_rows
+                    .iter()
+                    .any(|(i, _, r, _)| i == id && *r == e.role);
+                if stale && !listed {
+                    editor_rows.push((id.clone(), shown.clone(), e.role.clone(), true));
+                }
+            }
+        }
+    }
+    let editor_lines: String = editor_rows
         .iter()
-        .map(|(id, name)| Choice {
-            value: id.clone(),
-            label: if name.is_empty() {
-                id.clone()
-            } else {
-                name.clone()
-            },
-            detail: id.clone(),
-            after: level_select(id),
-            ..Default::default()
+        .map(|(id, name, role, stale)| {
+            let role_cell = match (role.is_empty(), stale) {
+                (true, false) => "<span class=\"id\">no role</span>".to_string(),
+                (false, false) => escape(role),
+                (_, true) => format!(
+                    "{} <span class=\"flag warn\" title=\"{}\">not held now</span>",
+                    if role.is_empty() { "no role".to_string() } else { escape(role) },
+                    escape(&roles_said(records, id)),
+                ),
+            };
+            format!(
+                "<tr data-instance=\"{i}\" data-role=\"{r}\"{st}><td>{named}</td><td>{role_cell}</td>\
+                 <td>{select}</td></tr>",
+                i = escape(id),
+                r = escape(role),
+                st = if *stale { " data-stale" } else { "" },
+                named = named(name, if name == id { "" } else { id }),
+                select = level_select(id, role),
+            )
         })
         .collect();
     let access_group_fields = format!(
         "<input type=\"hidden\" name=\"access_group_id\" value=\"\" data-record-id>\
          <label>Name<input name=\"name\" value=\"\" required></label>{}\
-         <p class=\"hint\">Each plugin chosen is given admin, to configure it and reach no \
-         account, and at most one data level: read to see what it shows, write to act through it \
-         too, which includes read. A person holding admin and a data level chooses Manage, Open or \
-         View on the home.</p>",
-        if plugin_choices.is_empty() {
+         <p class=\"hint\">Each plugin's role is given admin, to configure that role's side and \
+         reach no account, and at most one data level: read to see what it shows, write to act \
+         through it too, which includes read. A grant on one role reaches nothing of another.</p>",
+        if editor_rows.is_empty() {
             "<p class=\"hint\">No plugins yet: launch one from the catalogue.</p>".to_string()
         } else {
-            picker::many(
-                "access-group-plugins",
-                "plugin",
-                "Plugins",
-                "plugins",
-                &plugin_choices,
-                &HashSet::new(),
+            format!(
+                "<fieldset class=\"access-editor\"><legend>Plugins, a row for each role</legend>\
+                 <om-pager rows=\"6\"><table class=\"list one-line access-roles\" id=\"access-roles\">\
+                 <thead><tr><th>Plugin</th><th>Role</th><th>Level</th></tr></thead>\
+                 <tbody>{editor_lines}</tbody></table></om-pager></fieldset>"
             )
         }
     );
@@ -709,8 +742,18 @@ pub fn render(
                 .entries
                 .iter()
                 .map(|e| {
+                    let stale = if meridian_access::entry_holds(records, &e.plugin_instance_id, &e.role) {
+                        ""
+                    } else {
+                        " (holds nothing: not a role it holds now)"
+                    };
+                    let role = if e.role.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", e.role)
+                    };
                     format!(
-                        "{} {}",
+                        "{}{role} {}{stale}",
                         name_of(&plugin_names, &e.plugin_instance_id),
                         level_name(e.level)
                     )
@@ -727,20 +770,14 @@ pub fn render(
             fields.insert("name".into(), g.name.clone().into());
             for e in &g.entries {
                 fields.insert(
-                    format!("level.{}", e.plugin_instance_id),
-                    choice_of(&g.entries, &e.plugin_instance_id).into(),
+                    format!("level.{}:{}", e.plugin_instance_id, e.role),
+                    choice_of(&g.entries, &e.plugin_instance_id, &e.role).into(),
                 );
             }
-            let mut chosen: Vec<&str> = g
-                .entries
-                .iter()
-                .map(|e| e.plugin_instance_id.as_str())
-                .collect();
-            chosen.dedup();
             edit_button(
                 "access-group",
                 &format!("Edit {}", g.name),
-                &serde_json::json!({ "fields": fields, "checked": { "plugin": chosen } }),
+                &serde_json::json!({ "fields": fields }),
             )
         };
         rows.push_str(&format!(
@@ -1070,18 +1107,42 @@ pub fn render(
     )
 }
 
-/// What an access group gives a plugin: admin, and at most one data level,
-/// read or write, which includes read. One choice, so an entry can never name
-/// read and write both (W6.7).
-fn level_select(instance: &str) -> String {
+/// What an access group gives a plugin's role: nothing, or admin and at most
+/// one data level, read or write, which includes read. One choice, so an
+/// entry can never name read and write both (W6.7, per role from v15).
+fn level_select(instance: &str, role: &str) -> String {
+    let on = if role.is_empty() {
+        escape(instance)
+    } else {
+        format!("{} on {}", escape(role), escape(instance))
+    };
     format!(
-        "<select name=\"level.{id}\" aria-label=\"Level on {id}\"><option value=\"read\">Read</option>\
+        "<select name=\"level.{id}:{role}\" aria-label=\"Level: {on}\"><option value=\"\">Not in the group</option>\
+         <option value=\"read\">Read</option>\
          <option value=\"write\">Write (includes read)</option>\
          <option value=\"admin\">Admin (configures it, no account)</option>\
          <option value=\"admin-read\">Admin and read</option>\
          <option value=\"admin-write\">Admin and write</option></select>",
-        id = escape(instance)
+        id = escape(instance),
+        role = escape(role),
     )
+}
+
+/// The roles the records know a plugin holds, none where it holds none or
+/// is not listed.
+fn known_roles(records: &AccessRecords, instance: &str) -> Vec<String> {
+    meridian_access::known_roles(records, instance)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default()
+}
+
+/// A plugin's roles as a flag on an entry that no longer matches says them.
+fn roles_said(records: &AccessRecords, instance: &str) -> String {
+    match meridian_access::known_roles(records, instance) {
+        Some([]) => format!("{instance} holds no role now"),
+        Some(roles) => format!("{instance} holds {} now", roles.join(", ")),
+        None => format!("{instance}'s roles are not known"),
+    }
 }
 
 /// Tabs, dialogs, the pickers ([`picker::SCRIPT`], between the two halves),

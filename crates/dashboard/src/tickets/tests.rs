@@ -49,6 +49,7 @@ fn access_group(id: &str, instance: &str, level: AccessLevel) -> AccessGroup {
         entries: vec![AccessEntry {
             plugin_instance_id: instance.into(),
             level: level as i32,
+            role: String::new(),
         }],
         built_in: false,
     }
@@ -209,7 +210,8 @@ fn covering(instance: &str, level: &str, groups: &[&str]) -> Covers {
     Covers {
         everything: false,
         deployment_admin: false,
-        plugins: [(instance.to_string(), level.to_string())].into(),
+        plugins: [(instance.to_string(), String::new(), level.to_string())].into(),
+        unmatched: Default::default(),
         account_groups: groups.iter().map(|g| g.to_string()).collect(),
     }
 }

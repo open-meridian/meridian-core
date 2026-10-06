@@ -65,6 +65,13 @@ pub trait DelegationStore: Send + Sync {
 
     fn refused(&self, id: &str, why: &str, now_ns: i64) -> Result<(), String>;
 
+    /// Every delegation narrowed at consent, revoked or not, by when made.
+    fn narrowed(&self) -> Result<Vec<Delegation>, String>;
+
+    /// Replace a delegation's rows with the same rows rewritten to name each
+    /// plugin's role (W6.17, contract v15); nothing else about it changes.
+    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String>;
+
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String>;
 
     /// A fresh sign-in: the person's groups on every unrevoked delegation of
@@ -330,6 +337,26 @@ impl DelegationStore for InMemory {
         Ok(())
     }
 
+    fn narrowed(&self) -> Result<Vec<Delegation>, String> {
+        let mut narrowed: Vec<Delegation> = self
+            .lock()
+            .delegations
+            .values()
+            .filter(|delegation| !delegation.covers.everything)
+            .cloned()
+            .collect();
+        narrowed.sort_by_key(|delegation| delegation.made_at_ns);
+        Ok(narrowed)
+    }
+
+    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String> {
+        if let Some(delegation) = self.lock().delegations.get_mut(id) {
+            delegation.covers.plugins = covers.plugins.clone();
+            delegation.covers.unmatched = covers.unmatched.clone();
+        }
+        Ok(())
+    }
+
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String> {
         if let Some(delegation) = self.lock().delegations.get_mut(id) {
             delegation.directory_groups = groups.to_vec();
@@ -429,11 +456,8 @@ fn delegation_of(row: &postgres::Row) -> Delegation {
         covers: Covers {
             everything: row.get(5),
             deployment_admin: row.get(6),
-            plugins: plugins
-                .iter()
-                .filter_map(|entry| entry.rsplit_once(':'))
-                .map(|(instance, level)| (instance.to_string(), level.to_string()))
-                .collect(),
+            plugins: rows_of(&plugins).0,
+            unmatched: rows_of(&plugins).1,
             account_groups: row.get::<_, Vec<String>>(8).into_iter().collect(),
         },
         made_at_ns: row.get(9),
@@ -452,12 +476,41 @@ fn delegation_of(row: &postgres::Row) -> Delegation {
     }
 }
 
+/// A delegation's rows as kept: `instance:role:level` from v15, the role
+/// empty for a plugin holding none, and an unmatched row from before as it
+/// was recorded, `instance:level`.
 fn plugins_of(covers: &Covers) -> Vec<String> {
     covers
         .plugins
         .iter()
-        .map(|(instance, level)| format!("{instance}:{level}"))
+        .map(|(instance, role, level)| format!("{instance}:{role}:{level}"))
+        .chain(
+            covers
+                .unmatched
+                .iter()
+                .map(|(instance, level)| format!("{instance}:{level}")),
+        )
         .collect()
+}
+
+/// The rows as kept, read back: three parts a row of v15, two a row recorded
+/// before, unmatched until the rewrite names its role.
+pub(crate) fn rows_of(kept: &[String]) -> (BTreeSet<(String, String, String)>, BTreeSet<(String, String)>) {
+    let mut rows = BTreeSet::new();
+    let mut unmatched = BTreeSet::new();
+    for entry in kept {
+        let parts: Vec<&str> = entry.split(':').collect();
+        match parts[..] {
+            [instance, role, level] => {
+                rows.insert((instance.to_string(), role.to_string(), level.to_string()));
+            }
+            [instance, level] => {
+                unmatched.insert((instance.to_string(), level.to_string()));
+            }
+            _ => {}
+        }
+    }
+    (rows, unmatched)
 }
 
 fn client_of(row: &postgres::Row) -> Client {
@@ -779,6 +832,34 @@ impl DelegationStore for InPostgres {
                 "UPDATE dashboard_delegation SET last_refused_at_ns = $2, last_refusal = $3
                   WHERE delegation_id = $1",
                 &[&id, &now_ns, &why],
+            )
+            .map_err(said)?;
+        Ok(())
+    }
+
+    fn narrowed(&self) -> Result<Vec<Delegation>, String> {
+        let rows = self
+            .database
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                       JOIN dashboard_oauth_client c ON c.client_id = d.client_id
+                      WHERE NOT d.covers_everything
+                      ORDER BY d.made_at_ns"
+                ),
+                &[],
+            )
+            .map_err(said)?;
+        Ok(rows.iter().map(delegation_of).collect())
+    }
+
+    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String> {
+        self.database
+            .conn()?
+            .execute(
+                "UPDATE dashboard_delegation SET covers_plugins = $2 WHERE delegation_id = $1",
+                &[&id, &plugins_of(covers)],
             )
             .map_err(said)?;
         Ok(())

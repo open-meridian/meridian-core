@@ -909,6 +909,51 @@ const SCRIPT: &str = r#"(function () {
 /// secret is sent when it differs from what the record holds, and cleared
 /// when emptied; one the form did not post is left as it is. Only settings
 /// the plugin declared, and this deployment shows, are read from the form.
+/// The first setting a change names that serves a role the person does not
+/// administer, as the refusal saying so (W6.11, contract v15): a setting is
+/// set only by one holding admin on every role it serves. None when every
+/// one is theirs to set.
+pub fn not_administered(
+    record: &PluginSettingsRecord,
+    request: &SetPluginSettingsRequest,
+    held: &meridian_access::PluginHeld,
+    plugin_roles: &[String],
+) -> Option<String> {
+    let named = request
+        .values
+        .iter()
+        .map(|value| value.name.as_str())
+        .chain(request.cleared.iter().map(String::as_str));
+    for name in named {
+        let Some(declaration) = record.declared_settings.iter().find(|d| d.name == name) else {
+            continue;
+        };
+        // A declaration naming no role -- from a sidecar before v15 -- serves
+        // every role the plugin holds, or the plugin as a whole.
+        let serves = if declaration.roles.is_empty() {
+            plugin_roles
+        } else {
+            declaration.roles.as_slice()
+        };
+        if held.administers_every(serves) {
+            continue;
+        }
+        let not: Vec<&str> = serves
+            .iter()
+            .filter(|role| !held.administers(role))
+            .map(String::as_str)
+            .collect();
+        return Some(format!(
+            "{} serves {}, and you do not administer {}: a setting serving several roles is set \
+             by an admin of every one",
+            label(declaration),
+            serves.join(" and "),
+            not.join(" or ")
+        ));
+    }
+    None
+}
+
 pub fn request(
     record: &PluginSettingsRecord,
     fields: &HashMap<String, String>,

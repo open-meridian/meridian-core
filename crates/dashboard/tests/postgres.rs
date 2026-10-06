@@ -370,7 +370,7 @@ fn a_delegation_is_made_renewed_in_place_and_narrowed_as_it_was_asked() {
     assert!(store.register(&client("mdc_a", T0), 10).unwrap());
     let narrowed = Covers {
         deployment_admin: true,
-        plugins: [("oms-1".to_string(), "read".to_string())].into(),
+        plugins: [("oms-1".to_string(), String::new(), "read".to_string())].into(),
         account_groups: ["AG-1".to_string()].into(),
         ..Covers::default()
     };

@@ -249,6 +249,10 @@ async fn the_admin_pages_are_for_deployment_admins_only() {
 fn table<'a>(body: &'a str, class: &str) -> &'a str {
     body.split(&format!("<table class=\"list {class}\""))
         .nth(1)
+        .or_else(|| {
+            body.split(&format!("<table class=\"list one-line {class}\""))
+                .nth(1)
+        })
         .and_then(|rest| rest.split_once('>').map(|(_, inside)| inside))
         .and_then(|rest| rest.split("</table>").next())
         .unwrap_or_else(|| panic!("no {class} table in the page"))
@@ -760,13 +764,12 @@ fn entries_are_plugin_and_level_one_per_line() {
         .unwrap_err()
         .contains("not read, write or admin"));
     assert!(parse_entries("oms-1").is_err());
-    // decisions/026: a plugin declares no tags, so an entry naming one is
-    // refused and says why, rather than read as something else.
-    let tagged = parse_entries("snaptrade-1 custody read").unwrap_err();
-    assert!(
-        tagged.contains("names a tag") && tagged.contains("decisions/026"),
-        "{tagged}"
-    );
+    // From contract v15 three words are a plugin, one of its roles and a
+    // level (decisions/033); a plugin still names no tags of its own.
+    let on_role = parse_entries("snaptrade-1 custody read").unwrap();
+    assert_eq!(on_role[0].role, "custody");
+    assert_eq!(on_role[0].level, AccessLevel::Read as i32);
+    assert!(parse_entries("snaptrade-1 custody read extra").is_err());
 }
 
 // ── A plugin instance's admin view and settings (W6.9, W6.10, W6.11) ───────
@@ -1597,6 +1600,7 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
             entries: vec![meridian_domain::v1::AccessEntry {
                 plugin_instance_id: "snaptrade-1".into(),
                 level: meridian_access::AccessLevel::Read as i32,
+                role: String::new(),
             }],
             built_in: false,
         });
@@ -1692,6 +1696,7 @@ fn declaring(pages: &[(&str, &str)]) -> meridian_domain::v1::PluginReport {
                     path: path.to_string(),
                     title: title.to_string(),
                     levels: vec![meridian_access::AccessLevel::Admin as i32],
+                    roles: vec![],
                 })
                 .collect(),
         }),
@@ -1763,6 +1768,7 @@ fn plugin_admin_alone() -> AccessRecords {
         entries: vec![meridian_domain::v1::AccessEntry {
             plugin_instance_id: "snaptrade-1".into(),
             level: meridian_access::AccessLevel::Admin as i32,
+            role: String::new(),
         }],
         built_in: false,
     }];
@@ -2224,6 +2230,7 @@ fn a_firm() -> AccessRecords {
                     } else {
                         AccessLevel::Read
                     } as i32,
+                    role: String::new(),
                 })
                 .collect(),
             built_in: false,
@@ -2253,7 +2260,8 @@ async fn every_option_is_in_the_page_once_however_many_records_there_are() {
     assert_eq!(body.matches("name=\"account_ids\"").count(), ACCOUNTS);
     // Admins' Ada and the 200.
     assert_eq!(body.matches("name=\"login\"").count(), PEOPLE + 1);
-    assert_eq!(body.matches("name=\"plugin\"").count(), 33);
+    // A row per plugin role in the Access editor, each with its one choice.
+    assert_eq!(body.matches("<tr data-instance=").count(), 33);
     assert_eq!(body.matches("<select name=\"level.").count(), 33);
     assert!(
         body.len() < 1 << 20,
@@ -2436,7 +2444,7 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
         ("plugin", "snaptrade-1"),
         ("level.snaptrade-1", "read"),
         ("level.unchosen-1", "write"),
-    ]))
+    ]), &meridian_domain::v1::AccessRecords::default())
     .unwrap();
     let got: Vec<(&str, i32)> = entries
         .iter()
@@ -2452,7 +2460,7 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
     );
     // The lines the form took before, still.
     assert_eq!(
-        entries_of(&pairs(&[("entries", "oms-1 read")]))
+        entries_of(&pairs(&[("entries", "oms-1 read")]), &meridian_domain::v1::AccessRecords::default())
             .unwrap()
             .len(),
         1
@@ -2471,23 +2479,23 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
             ("level.oms-1", "read"),
         ]),
     ] {
-        let refused = entries_of(&twice).unwrap_err();
+        let refused = entries_of(&twice, &meridian_domain::v1::AccessRecords::default()).unwrap_err();
         assert!(
             refused.contains("named twice") && refused.contains("write includes read"),
             "{refused}"
         );
     }
-    assert!(entries_of(&pairs(&[("plugin", "oms-1")]))
+    assert!(entries_of(&pairs(&[("plugin", "oms-1")]), &meridian_domain::v1::AccessRecords::default())
         .unwrap_err()
         .contains("no level"));
     assert!(
-        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "owner")]))
+        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "owner")]), &meridian_domain::v1::AccessRecords::default())
             .unwrap_err()
             .contains("not admin, read or write")
     );
     // Admin, alone or beside one data level (W6.7).
     let levels = |choice: &str| -> Vec<i32> {
-        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", choice)]))
+        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", choice)]), &meridian_domain::v1::AccessRecords::default())
             .unwrap()
             .into_iter()
             .map(|entry| entry.level)
@@ -2582,7 +2590,6 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
     for (dialog, picker, name) in [
         ("user-group", "user-group-people", "login"),
         ("account-group", "account-group-accounts", "account_ids"),
-        ("access-group", "access-group-plugins", "plugin"),
     ] {
         let inside = body
             .split(&format!(
@@ -2616,19 +2623,29 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
             "{dialog}: a new one chooses nothing"
         );
     }
-    // An access entry's level: one choice, admin, a data level, or admin
-    // beside one, never read and write both.
+    // The Access editor (contract v15): a row for each plugin's role, one
+    // line each, paged, its level one choice -- nothing, admin, a data
+    // level, or admin beside one, never read and write both.
+    let editor = body
+        .split("<dialog id=\"access-group\" aria-labelledby=\"access-group-title\">")
+        .nth(1)
+        .unwrap()
+        .split("</dialog>")
+        .next()
+        .unwrap();
+    assert!(editor.contains("<om-pager rows=\"6\"><table class=\"list one-line access-roles\""));
+    assert!(editor.contains("<th>Plugin</th><th>Role</th><th>Level</th>"));
     assert!(body.contains(
-        "<select name=\"level.plugin-00\" aria-label=\"Level on plugin-00\"><option value=\"read\">Read</option>\
+        "<select name=\"level.plugin-00:\" aria-label=\"Level: plugin-00\"><option value=\"\">Not in the group</option>\
+         <option value=\"read\">Read</option>\
          <option value=\"write\">Write (includes read)</option>\
          <option value=\"admin\">Admin (configures it, no account)</option>\
          <option value=\"admin-read\">Admin and read</option>\
          <option value=\"admin-write\">Admin and write</option></select>"
     ));
     let fill = fill_of(&body, "AG-00");
-    assert_eq!(fill["fields"]["level.plugin-00"], "write");
-    assert_eq!(fill["fields"]["level.plugin-01"], "read");
-    assert_eq!(fill["checked"]["plugin"].as_array().unwrap().len(), 4);
+    assert_eq!(fill["fields"]["level.plugin-00:"], "write");
+    assert_eq!(fill["fields"]["level.plugin-01:"], "read");
     // The page's script: the pickers, and a dialog filled from its Edit.
     for held in [
         "Array.prototype.forEach.call(document.querySelectorAll(\"[data-picker]\"), picker);",
@@ -2872,4 +2889,125 @@ async fn a_tables_tab_is_in_the_admin_view_and_its_save_comes_back_to_it() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(asked.lock().unwrap().len(), 3, "and nothing sent");
+}
+
+// ── The Access editor and Settings per role (contract v15) ───────────────
+
+fn known_roles_records() -> meridian_domain::v1::AccessRecords {
+    meridian_domain::v1::AccessRecords {
+        known_plugins: vec![
+            meridian_domain::v1::KnownPluginRoles {
+                plugin_instance_id: "snaptrade-1".into(),
+                roles: vec!["custody".into()],
+            },
+            meridian_domain::v1::KnownPluginRoles {
+                plugin_instance_id: "ops-1".into(),
+                roles: vec!["custody".into(), "operations".into()],
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_access_editor_sends_a_level_per_plugin_role() {
+    let records = known_roles_records();
+    let entries = entries_of(
+        &pairs(&[
+            ("level.ops-1:operations", "write"),
+            ("level.ops-1:custody", "admin-read"),
+            ("level.snaptrade-1:custody", ""),
+        ]),
+        &records,
+    )
+    .unwrap();
+    let said: Vec<(String, String, i32)> = entries
+        .iter()
+        .map(|e| (e.plugin_instance_id.clone(), e.role.clone(), e.level))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("ops-1".into(), "operations".into(), AccessLevel::Write as i32),
+            ("ops-1".into(), "custody".into(), AccessLevel::Admin as i32),
+            ("ops-1".into(), "custody".into(), AccessLevel::Read as i32),
+        ],
+        "a row left at nothing is not in the group"
+    );
+    // As the form was before v15: a plugin holding one role is granted it.
+    let older = entries_of(
+        &pairs(&[("plugin", "snaptrade-1"), ("level.snaptrade-1", "read")]),
+        &records,
+    )
+    .unwrap();
+    assert_eq!(older[0].role, "custody");
+    // One holding several is sent as named, for the conductor to refuse.
+    let several = entries_of(&pairs(&[("entries", "ops-1 read")]), &records).unwrap();
+    assert_eq!(several[0].role, "");
+    // Read and write on one role is refused; on two roles it is not both.
+    assert!(entries_of(&pairs(&[("entries", "ops-1 custody read\nops-1 custody write")]), &records)
+        .unwrap_err()
+        .contains("ops-1 custody"));
+    assert!(entries_of(
+        &pairs(&[("entries", "ops-1 custody read\nops-1 operations write")]),
+        &records
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_setting_serving_several_roles_is_set_only_by_an_admin_of_every_one() {
+    let record = PluginSettingsRecord {
+        plugin_instance_id: "ops-1".into(),
+        declared_settings: vec![
+            SettingDeclaration {
+                name: "api_key".into(),
+                label: "API key".into(),
+                roles: vec!["custody".into(), "operations".into()],
+                ..Default::default()
+            },
+            SettingDeclaration {
+                name: "poll_minutes".into(),
+                roles: vec!["custody".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut custody_admin = meridian_access::PluginHeld::default();
+    custody_admin.roles.insert(
+        "custody".into(),
+        meridian_access::Held {
+            admin: true,
+            ..Default::default()
+        },
+    );
+    let roles = vec!["custody".to_string(), "operations".to_string()];
+    let setting = |name: &str| meridian_domain::v1::SetPluginSettingsRequest {
+        plugin_instance_id: "ops-1".into(),
+        values: vec![meridian_domain::v1::PluginSettingValue {
+            name: name.into(),
+            value: "x".into(),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        settings::not_administered(&record, &setting("poll_minutes"), &custody_admin, &roles),
+        None,
+        "custody's own setting is custody's admin's"
+    );
+    let refused =
+        settings::not_administered(&record, &setting("api_key"), &custody_admin, &roles).unwrap();
+    assert!(
+        refused.contains("API key serves custody and operations")
+            && refused.contains("do not administer operations"),
+        "{refused}"
+    );
+}
+
+/// A form's fields, as the browser posts them.
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
 }

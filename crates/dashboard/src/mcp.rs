@@ -488,6 +488,29 @@ pub fn level_for(levels: &[i32], held: &meridian_access::Held) -> Option<AccessL
         .find(|level| levels.contains(&(*level as i32)) && held.holds(*level))
 }
 
+/// [`level_for`], by role (W6.20, contract v15): the highest of the tool's
+/// levels the person holds on one of the tool's `roles` through the
+/// delegation, write before read before admin. A tool naming no role -- a
+/// role-less plugin's, or one a sidecar before v15 reported -- by what they
+/// hold on the plugin as a whole.
+pub fn level_by_role(
+    levels: &[i32],
+    roles: &[String],
+    held: &meridian_access::PluginHeld,
+) -> Option<AccessLevel> {
+    if roles.is_empty() {
+        return level_for(levels, &held.union());
+    }
+    [AccessLevel::Write, AccessLevel::Read, AccessLevel::Admin]
+        .into_iter()
+        .find(|level| {
+            levels.contains(&(*level as i32))
+                && roles
+                    .iter()
+                    .any(|role| held.roles.get(role).is_some_and(|on| on.holds(*level)))
+        })
+}
+
 /// Every tool this caller may call now, core's first, then each plugin's in
 /// its instance's order and the plugin's own.
 pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> {
@@ -511,7 +534,7 @@ pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> 
         if !running(&report, now) {
             continue;
         }
-        let held = access.held(&instance);
+        let held = access.plugin(&instance);
         if !held.holds_any() {
             continue;
         }
@@ -522,7 +545,7 @@ pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> 
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| instance.clone());
         for declared in &report.declared_tools {
-            let Some(level) = level_for(&declared.levels, &held) else {
+            let Some(level) = level_by_role(&declared.levels, &declared.roles, &held) else {
                 continue;
             };
             let name = format!("{instance}__{}", declared.name);
@@ -724,6 +747,52 @@ fn not_listed(app: &App, caller: &Caller, name: &str) -> String {
             "No tool {name}: {owner} is not a plugin running in this deployment. This delegation covers: {}.",
             caller.covers.said(&names)
         );
+    }
+    // A tool the plugin offers on roles the caller does not reach: named by
+    // its roles and levels, and what the person holds on each through the
+    // delegation (W6.20, contract v15).
+    let (_, tool) = name.split_once("__").unwrap_or((name, ""));
+    let offered = app.health.view().get(owner).and_then(|report| {
+        report
+            .declared_tools
+            .iter()
+            .find(|declared| declared.name == tool)
+            .cloned()
+    });
+    if let (Some(declared), Ok(records)) =
+        (offered, app.records.current(app.clock.now_ns()))
+    {
+        if !declared.roles.is_empty() {
+            let held = caller.access(&records).plugin(owner);
+            let levels: Vec<&str> = declared
+                .levels
+                .iter()
+                .filter_map(|level| AccessLevel::try_from(*level).ok())
+                .map(level_name)
+                .collect();
+            let on: Vec<String> = declared
+                .roles
+                .iter()
+                .map(|role| match held.roles.get(role) {
+                    Some(on) if on.holds_any() => format!(
+                        "{} on {role}",
+                        on.levels()
+                            .iter()
+                            .map(|level| level_name(*level))
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    ),
+                    _ => format!("nothing on {role}"),
+                })
+                .collect();
+            return format!(
+                "No tool {name} is listed to this delegation: it serves {} at {}, and through it the person holds {}. This delegation covers: {}.",
+                declared.roles.join(" and "),
+                levels.join(" or "),
+                on.join(" and "),
+                caller.covers.said(&names)
+            );
+        }
     }
     format!(
         "No tool {name} is listed to this delegation: it is not one, or the person does not hold, or the delegation does not cover, a level it serves. This delegation covers: {}.",

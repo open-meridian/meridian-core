@@ -668,7 +668,7 @@ async fn save_settings(
     fields: &Fields,
     back: &str,
 ) -> Response {
-    let (session, records, _) = match gate_plugin(app, headers, instance, true) {
+    let (session, records, access) = match gate_plugin(app, headers, instance, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
     };
@@ -678,6 +678,7 @@ async fn save_settings(
     let Some(record) = settings_of(&records, instance) else {
         return no_such_plugin(instance);
     };
+    let held = access.plugin(instance);
     // A table's cells, each checked as the conductor checks it, an external
     // account one the plugin reported and an instrument one the deployment
     // holds; nothing is sent while one does not read (W6.11, contract v14).
@@ -701,6 +702,13 @@ async fn save_settings(
     let Some(request) = settings::request(record, fields, crate::html::is_development()) else {
         return after_to(Ok(()), &format!("{back}&saved=none"), back);
     };
+    // A setting serving several roles is set by an admin of every one
+    // (W6.11, decisions/033 point 2): the dashboard, which evaluates access,
+    // checks it before sending.
+    let plugin_roles = access.known_roles.get(instance).cloned().unwrap_or_default();
+    if let Some(refusal) = settings::not_administered(record, &request, &held, &plugin_roles) {
+        return after_to(Err(refusal), back, back);
+    }
     let outcome = command::<PluginSettingsRecord>(
         app,
         &session,
@@ -1236,73 +1244,116 @@ fn level_named(level: &str) -> Option<AccessLevel> {
     }
 }
 
-/// "plugin read|write|admin", one per line: a plugin and a level, the same
-/// three levels for every plugin (decisions/026, 027).
+/// "plugin read|write|admin", or from contract v15 "plugin role
+/// read|write|admin", one per line: a plugin, the role of it the entry is on,
+/// and a level, the same three levels for every plugin and role (decisions/026,
+/// 027, 033). A line naming no role is on the plugin's one role where it holds
+/// exactly one ([`entries_of`] fills it), or the plugin as a whole.
 pub fn parse_entries(text: &str) -> Result<Vec<AccessEntry>, String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            let [plugin, level] = parts[..] else {
-                return Err(if parts.len() == 3 {
-                    format!(
-                        "`{line}` names a tag; an entry is `plugin read|write|admin`, since a \
-                         plugin declares no tags and access to it is read, write or admin \
-                         (decisions/026)"
-                    )
-                } else {
-                    format!("`{line}` is not `plugin read|write|admin`")
-                });
+            let (plugin, role, level) = match parts[..] {
+                [plugin, level] => (plugin, "", level),
+                [plugin, role, level] => (plugin, role, level),
+                _ => return Err(format!("`{line}` is not `plugin [role] read|write|admin`")),
             };
             let level = level_named(level)
                 .ok_or_else(|| format!("`{level}` is not read, write or admin"))?;
             Ok(AccessEntry {
                 plugin_instance_id: plugin.into(),
                 level: level as i32,
+                role: role.into(),
             })
         })
         .collect()
 }
 
-/// An access group's entries as the form sends them: each plugin chosen
-/// (`plugin`, one per box) at its one choice (`level.{plugin}`): `read`,
-/// `write`, `admin`, or `admin-read` or `admin-write` for admin beside one
-/// data level; and any typed as `plugin read|write|admin` lines (`entries`,
-/// as the form was before). A plugin at both read and write, or twice at one
-/// level, is refused: write includes read (W6.7).
-pub fn entries_of(pairs: &[(String, String)]) -> Result<Vec<AccessEntry>, String> {
+/// A row of the Access editor as the form names it: `instance:role`, the
+/// role empty for a plugin holding none; or, as the form was before v15,
+/// the instance alone.
+fn row_of(named: &str) -> (&str, &str) {
+    named.split_once(':').unwrap_or((named, ""))
+}
+
+/// The levels one row's choice gives: `read`, `write`, `admin`, or
+/// `admin-read` or `admin-write` for admin beside one data level.
+fn chosen_levels(row: &str, chosen: &str) -> Result<Vec<AccessLevel>, String> {
+    Ok(match chosen {
+        "admin-read" => vec![AccessLevel::Admin, AccessLevel::Read],
+        "admin-write" => vec![AccessLevel::Admin, AccessLevel::Write],
+        "" => return Err(format!("`{row}` has no level: choose admin, read or write")),
+        other => vec![level_named(other)
+            .ok_or_else(|| format!("`{other}` is not admin, read or write"))?],
+    })
+}
+
+/// An access group's entries as the form sends them (W6.7, contract v15):
+/// the Access editor's rows, one per plugin and role, each `level.{instance}:{role}`
+/// at its one choice -- `read`, `write`, `admin`, `admin-read` or
+/// `admin-write` -- a row left at nothing not in the group; or, as the form
+/// was before, each plugin ticked (`plugin`) at `level.{plugin}`; and any typed
+/// as `plugin [role] read|write|admin` lines (`entries`). An entry naming no
+/// role on a plugin the records say holds exactly one is on that role, so a
+/// form or a client built before v15 grants what it did. A plugin and role at
+/// both read and write, or twice at one level, is refused: write includes
+/// read.
+pub fn entries_of(
+    pairs: &[(String, String)],
+    records: &AccessRecords,
+) -> Result<Vec<AccessEntry>, String> {
     let fields = once(pairs);
     let mut entries = Vec::new();
-    for plugin in every(pairs, "plugin") {
-        let chosen = field(&fields, &format!("level.{plugin}"));
-        let levels: Vec<AccessLevel> = match chosen {
-            "admin-read" => vec![AccessLevel::Admin, AccessLevel::Read],
-            "admin-write" => vec![AccessLevel::Admin, AccessLevel::Write],
-            "" => {
-                return Err(format!(
-                    "`{plugin}` has no level: choose admin, read or write"
-                ))
-            }
-            other => vec![level_named(other)
-                .ok_or_else(|| format!("`{other}` is not admin, read or write"))?],
-        };
-        entries.extend(levels.into_iter().map(|level| AccessEntry {
-            plugin_instance_id: plugin.clone(),
-            level: level as i32,
-        }));
+    let ticked = every(pairs, "plugin");
+    let rows: Vec<(String, String)> = if ticked.is_empty() {
+        pairs
+            .iter()
+            .filter_map(|(name, value)| {
+                let row = name.strip_prefix("level.")?;
+                (!value.is_empty()).then(|| (row.to_string(), value.clone()))
+            })
+            .collect()
+    } else {
+        ticked
+            .iter()
+            .map(|row| (row.clone(), field(&fields, &format!("level.{row}")).to_string()))
+            .collect()
+    };
+    for (row, chosen) in rows {
+        let (plugin, role) = row_of(&row);
+        for level in chosen_levels(&row, &chosen)? {
+            entries.push(AccessEntry {
+                plugin_instance_id: plugin.to_string(),
+                level: level as i32,
+                role: role.to_string(),
+            });
+        }
     }
     for typed in every(pairs, "entries") {
         entries.extend(parse_entries(&typed)?);
     }
+    for entry in &mut entries {
+        if entry.role.is_empty() {
+            if let Some([one]) = meridian_access::known_roles(records, &entry.plugin_instance_id) {
+                entry.role = one.clone();
+            }
+        }
+    }
     let data = |level: i32| level != AccessLevel::Admin as i32;
-    let mut seen: HashSet<(String, bool)> = HashSet::new();
+    let mut seen: HashSet<(String, String, bool)> = HashSet::new();
     for entry in &entries {
-        if !seen.insert((entry.plugin_instance_id.clone(), data(entry.level))) {
+        if !seen.insert((
+            entry.plugin_instance_id.clone(),
+            entry.role.clone(),
+            data(entry.level),
+        )) {
             return Err(format!(
                 "`{}` is named twice at a data level, or twice at admin; an access group gives \
-                 each plugin admin and at most one of read and write, and write includes read",
-                entry.plugin_instance_id
+                 each plugin's role admin and at most one of read and write, and write includes \
+                 read",
+                crate::delegation::row_named(&entry.plugin_instance_id, &entry.role)
             ));
         }
     }
@@ -1315,8 +1366,9 @@ async fn define_access_group(
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
     let fields = once(&pairs);
+    let records = app.records.current(app.clock.now_ns()).unwrap_or_default();
     admin_form!(app, headers, fields, session, {
-        match entries_of(&pairs) {
+        match entries_of(&pairs, &records) {
             Err(sentence) => Err(sentence),
             Ok(entries) => {
                 let request = DefineAccessGroupRequest {

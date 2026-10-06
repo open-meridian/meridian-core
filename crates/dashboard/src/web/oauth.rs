@@ -400,8 +400,10 @@ async fn authorize(
 /// account groups their permissions name, and whether they hold the
 /// deployment admin's capabilities.
 struct Holdable {
-    /// Each plugin instance and the levels held on it, Manage first.
-    plugins: BTreeMap<String, Vec<AccessLevel>>,
+    /// Each plugin instance and role, and the levels held on it, Manage
+    /// first: a row of consent per role from v15 (W6.17), the role empty for
+    /// a plugin holding none.
+    plugins: BTreeMap<(String, String), Vec<AccessLevel>>,
     /// Each account group, its name and how many accounts it holds.
     account_groups: BTreeMap<String, (String, usize)>,
     deployment_admin: bool,
@@ -426,17 +428,21 @@ impl Holdable {
             deployment_admin: covers.deployment_admin && self.deployment_admin,
             ..Covers::default()
         };
-        for (instance, held) in &self.plugins {
+        for ((instance, role), held) in &self.plugins {
             let top = held.iter().copied().find(|level| {
-                covers
-                    .plugins
-                    .contains(&(instance.clone(), level_name(*level).into()))
+                covers.plugins.contains(&(
+                    instance.clone(),
+                    role.clone(),
+                    level_name(*level).into(),
+                ))
             });
             if let Some(top) = top {
                 for level in with_below(held, top) {
-                    picked
-                        .plugins
-                        .insert((instance.clone(), level_name(level).to_string()));
+                    picked.plugins.insert((
+                        instance.clone(),
+                        role.clone(),
+                        level_name(level).to_string(),
+                    ));
                 }
             }
         }
@@ -482,11 +488,15 @@ async fn holdable(app: &App, person: &Person, now: i64) -> Result<Holdable, Stri
         );
         instances.extend(app.health.view().into_keys());
     }
+    // A row per role held, each at the levels held on it (W6.17, v15).
     let plugins = instances
         .into_iter()
-        .map(|instance| {
-            let levels = access.held(&instance).levels();
-            (instance, levels)
+        .flat_map(|instance| {
+            access
+                .plugin(&instance)
+                .roles
+                .into_iter()
+                .map(move |(role, held)| ((instance.clone(), role), held.levels()))
         })
         .filter(|(_, levels)| !levels.is_empty())
         .collect();
@@ -593,24 +603,33 @@ async fn consent_shown(
 }
 
 /// The tools each row of access reaches, for a client asking for `/mcp`
-/// (W6.17, W6.20, Q5): under each plugin and level, the plugin's tools that
-/// level serves, by title, reads and acts apart; under the deployment
-/// admin's capabilities, core's own.
+/// (W6.17, W6.20, Q5): under each plugin, role and level, the plugin's tools
+/// that role and level serve, by title, reads and acts apart; under the
+/// deployment admin's capabilities, core's own.
 pub(crate) struct ToolRows {
-    pub plugins: BTreeMap<(String, String), Vec<(String, bool)>>,
+    pub plugins: BTreeMap<(String, String, String), Vec<(String, bool)>>,
     pub deployment_admin: Vec<(String, bool)>,
 }
 
 pub(crate) fn tool_rows(app: &App) -> ToolRows {
-    let mut plugins: BTreeMap<(String, String), Vec<(String, bool)>> = BTreeMap::new();
+    let mut plugins: BTreeMap<(String, String, String), Vec<(String, bool)>> = BTreeMap::new();
     for (instance, report) in app.health.view() {
         for tool in &report.declared_tools {
-            for level in &tool.levels {
-                if let Ok(level) = AccessLevel::try_from(*level) {
-                    plugins
-                        .entry((instance.clone(), level_name(level).to_string()))
-                        .or_default()
-                        .push((tool.title.clone(), tool.reads));
+            // A tool naming no role is a role-less plugin's, or one reported
+            // before v15: its row is the plugin's as a whole.
+            let roles = if tool.roles.is_empty() {
+                vec![String::new()]
+            } else {
+                tool.roles.clone()
+            };
+            for role in &roles {
+                for level in &tool.levels {
+                    if let Ok(level) = AccessLevel::try_from(*level) {
+                        plugins
+                            .entry((instance.clone(), role.clone(), level_name(level).to_string()))
+                            .or_default()
+                            .push((tool.title.clone(), tool.reads));
+                    }
                 }
             }
         }
@@ -666,10 +685,15 @@ struct Consenting<'a> {
     tools: Option<&'a ToolRows>,
 }
 
-/// One plugin instance's level, a select (ruling 1): Nothing, then each
-/// level held from View up, each naming the levels it includes. Its options'
-/// values are what [`consent_of`] reads as `level`.
-fn level_select(instance: &str, held: &[AccessLevel], picked: Option<AccessLevel>) -> String {
+/// One plugin role's level, a select (ruling 1): Nothing, then each level
+/// held from View up, each naming the levels it includes. Its options'
+/// values, `instance:role:level`, are what [`consent_of`] reads as `level`.
+fn level_select(
+    instance: &str,
+    role: &str,
+    held: &[AccessLevel],
+    picked: Option<AccessLevel>,
+) -> String {
     let selected = |on: bool| if on { " selected" } else { "" };
     let mut options = format!(
         "<option value=\"\"{}>Nothing</option>",
@@ -692,8 +716,9 @@ fn level_select(instance: &str, held: &[AccessLevel], picked: Option<AccessLevel
             .iter()
             .any(|l| *l != AccessLevel::Admin);
         options.push_str(&format!(
-            "<option value=\"{instance}:{name}\" data-short=\"{short}\"{data}{on}>{words}</option>",
+            "<option value=\"{instance}:{role}:{name}\" data-short=\"{short}\"{data}{on}>{words}</option>",
             instance = escape(instance),
+            role = escape(role),
             name = level_name(level),
             short = button(level),
             data = if data { " data-accounts" } else { "" },
@@ -702,21 +727,22 @@ fn level_select(instance: &str, held: &[AccessLevel], picked: Option<AccessLevel
     }
     format!(
         "<select name=\"level\" data-instance=\"{id}\" aria-label=\"Level on {id}\">{options}</select>",
-        id = escape(instance)
+        id = escape(&crate::delegation::row_named(instance, role))
     )
 }
 
 /// What a plugin's levels reach on the MCP surface, folded away under it:
 /// each level held and its tools, reads and acts apart. Empty when no level
 /// reaches a tool. With the titles, for the search to find the plugin by.
-fn reached(instance: &str, held: &[AccessLevel], tools: &ToolRows) -> (String, String) {
+fn reached(instance: &str, role: &str, held: &[AccessLevel], tools: &ToolRows) -> (String, String) {
     let mut lines = String::new();
     let mut titles: BTreeSet<&str> = BTreeSet::new();
     for level in held {
-        let Some(reached) = tools
-            .plugins
-            .get(&(instance.to_string(), level_name(*level).to_string()))
-        else {
+        let Some(reached) = tools.plugins.get(&(
+            instance.to_string(),
+            role.to_string(),
+            level_name(*level).to_string(),
+        )) else {
             continue;
         };
         titles.extend(reached.iter().map(|(title, _)| title.as_str()));
@@ -746,7 +772,10 @@ fn may_do(picked: &Covers, names: &BTreeMap<String, String>) -> String {
     let mut clauses: Vec<String> = picked
         .by_level()
         .into_iter()
-        .map(|(level, instances)| format!("use {} on {}", button(level), listed(&instances)))
+        .map(|(level, rows)| {
+            let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+            format!("use {} on {}", button(level), listed(&rows))
+        })
         .collect();
     let mut groups: Vec<&str> = picked
         .account_groups
@@ -764,7 +793,7 @@ fn may_do(picked: &Covers, names: &BTreeMap<String, String>) -> String {
         return "Nothing is ticked, so it could reach nothing. Tick what it needs.".into();
     }
     let mut said = format!("It may {}.", clauses.join("; "));
-    if groups.is_empty() && picked.plugins.iter().any(|(_, level)| level != "admin") {
+    if groups.is_empty() && picked.plugins.iter().any(|(_, _, level)| level != "admin") {
         said.push_str(" It reaches no account: tick an account group for that.");
     }
     said.push_str(" Nothing else, and never more than you hold.");
@@ -876,23 +905,24 @@ fn consent_page(consenting: &Consenting) -> String {
         let rows: Vec<Choice> = holdable
             .plugins
             .iter()
-            .map(|(instance, held)| {
+            .map(|((instance, role), held)| {
                 let (after, also) = tools
-                    .map(|t| reached(instance, held, t))
+                    .map(|t| reached(instance, role, held, t))
                     .unwrap_or_default();
                 Choice {
-                    value: instance.clone(),
+                    value: format!("{instance}:{role}"),
                     label: instance.clone(),
+                    detail: role.clone(),
                     also,
                     after,
-                    control: level_select(instance, held, picked.level_on(instance)),
+                    control: level_select(instance, role, held, picked.level_on(instance, role)),
                     ..Default::default()
                 }
             })
             .collect();
         choices.push_str(&picker::each(
             "consent-plugins",
-            "Plugins: one level on each",
+            "Plugins: one level on each of their roles",
             "plugins",
             &rows,
         ));
@@ -1066,21 +1096,51 @@ fn consent_of(fields: &[(String, String)], holdable: &Holdable) -> Result<Consen
             // A plugin's select left at Nothing.
             "level" if value.is_empty() => {}
             "level" => {
-                let Some((instance, level)) = value.rsplit_once(':') else {
-                    return Err(format!("`{value}` is not a plugin and a level"));
+                // `instance:role:level`, or as before v15 `instance:level`
+                // on a plugin the person holds one role of (or none).
+                let parts: Vec<&str> = value.split(':').collect();
+                let (instance, role, level) = match parts[..] {
+                    [instance, role, level] => (instance, role.to_string(), level),
+                    [instance, level] => {
+                        let roles: Vec<&String> = holdable
+                            .plugins
+                            .keys()
+                            .filter(|(i, _)| i == instance)
+                            .map(|(_, role)| role)
+                            .collect();
+                        match roles[..] {
+                            [one] => (instance, one.clone(), level),
+                            _ => {
+                                return Err(format!(
+                                    "`{value}` names no role, and you hold several on {instance}: \
+                                     choose a level on each"
+                                ))
+                            }
+                        }
+                    }
+                    _ => return Err(format!("`{value}` is not a plugin, a role and a level")),
                 };
-                let Some((held, picked)) = holdable.plugins.get(instance).and_then(|held| {
-                    let picked = held.iter().copied().find(|l| level_name(*l) == level)?;
-                    Some((held, picked))
-                }) else {
-                    return Err(format!("you do not hold {level} on {instance}"));
+                let Some((held, picked)) = holdable
+                    .plugins
+                    .get(&(instance.to_string(), role.clone()))
+                    .and_then(|held| {
+                        let picked = held.iter().copied().find(|l| level_name(*l) == level)?;
+                        Some((held, picked))
+                    })
+                else {
+                    return Err(format!(
+                        "you do not hold {level} on {}",
+                        crate::delegation::row_named(instance, &role)
+                    ));
                 };
-                // One level per plugin, including those held below it
-                // (ruling 1): what holding it gives.
+                // One level per plugin and role, including those held below
+                // it (ruling 1): what holding it gives.
                 for level in with_below(held, picked) {
-                    covers
-                        .plugins
-                        .insert((instance.to_string(), level_name(level).to_string()));
+                    covers.plugins.insert((
+                        instance.to_string(),
+                        role.clone(),
+                        level_name(level).to_string(),
+                    ));
                 }
             }
             "account_group" => {

@@ -9,13 +9,16 @@
 //! through some plugin; and the filer always -- through a delegation, while
 //! it still reaches what the ticket concerns, since a delegation cuts
 //! tickets exactly as it cuts a page. `/mcp`'s caller's access is already
-//! narrowed, so the same function serves both. At access per role (v14),
-//! "any level on that plugin" becomes "any of its roles" and nothing else
-//! moves.
+//! narrowed, so the same function serves both. **Per role** (contract v15,
+//! the plan's Q7): a plugin's ticket concerns the plugin, never one of its
+//! roles, so "any level on that plugin" is any level on any of its roles,
+//! and its read set the union over their roles ([`Access::held`]); nothing
+//! else moves.
 //!
 //! **Worked by** (at the page only, never through a delegation): a plugin's
-//! ticket by a person holding write on that plugin and on every account it
-//! names, one naming none also by its admins; core's and the platform's by
+//! ticket by a person holding write on any of its roles with every account
+//! it names in the union of those roles' write accounts, one naming none
+//! also by an admin of any of its roles (ruled 2026-10-05); core's and the platform's by
 //! the deployment admin, one naming accounts only by a deployment admin who
 //! also reads every one of them (ruled 2026-10-04); and the filer may close
 //! what they filed as withdrawn. A worker is always someone who may see it.
@@ -67,7 +70,7 @@ fn reads_every_account(access: &Access, ticket: &Ticket, named: &[&str]) -> bool
             access
                 .plugins
                 .values()
-                .any(|held| held.accounts.read.contains(*account))
+                .any(|held| held.union().accounts.read.contains(*account))
         })
     }
 }
@@ -121,8 +124,8 @@ pub fn may_work(subject: &str, access: &Access, ticket: &Ticket) -> bool {
 /// may not.
 pub fn who_works(ticket: &Ticket) -> &'static str {
     if ticket.concerns.kind == "plugin" {
-        "a person holding write on what it concerns and every account it names, or, naming \
-         none, by its admins"
+        "a person holding write on any of its roles and, through those, every account it \
+         names, or, naming none, by an admin of any of its roles"
     } else {
         "a deployment admin who also reads every account it names"
     }
@@ -143,6 +146,91 @@ pub fn may_name(access: &Access, concerns_plugin: Option<&str>, account: &str) -
         None => access
             .plugins
             .values()
-            .any(|held| held.accounts.read.contains(account)),
+            .any(|held| held.union().accounts.read.contains(account)),
+    }
+}
+
+#[cfg(test)]
+mod per_role {
+    //! Tickets on a plugin holding several roles (contract v15, the plan's
+    //! Q7 and the ruling of 2026-10-05 on who works one).
+
+    use meridian_access::{Access, AccessLevel, Held, Levels, PluginHeld};
+
+    use super::*;
+    use crate::tickets::{Reference, Subject, Ticket};
+
+    fn set(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Write on operations (ACC-2), read on custody (ACC-1).
+    fn tam() -> Access {
+        let mut plugin = PluginHeld::default();
+        plugin.roles.insert(
+            "operations".into(),
+            Held {
+                admin: false,
+                data: Some(AccessLevel::Write),
+                accounts: Levels {
+                    read: set(&["ACC-2"]),
+                    write: set(&["ACC-2"]),
+                },
+            },
+        );
+        plugin.roles.insert(
+            "custody".into(),
+            Held {
+                admin: false,
+                data: Some(AccessLevel::Read),
+                accounts: Levels {
+                    read: set(&["ACC-1"]),
+                    write: Default::default(),
+                },
+            },
+        );
+        let mut access = Access::default();
+        access.plugins.insert("ops-1".into(), plugin);
+        access
+    }
+
+    fn ticket(accounts: &[&str]) -> Ticket {
+        Ticket {
+            concerns: Subject {
+                kind: "plugin".into(),
+                instance: "ops-1".into(),
+                ..Default::default()
+            },
+            references: accounts
+                .iter()
+                .map(|account| Reference {
+                    kind: "account".into(),
+                    value: account.to_string(),
+                    account_id: account.to_string(),
+                    found: true,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_plugins_ticket_is_seen_through_any_role_and_worked_by_write_on_one() {
+        let reader = Reader {
+            subject: "local|tam".into(),
+            access: tam(),
+            through_delegation: false,
+        };
+        assert!(may_see(&reader, &ticket(&[])), "any level on any role");
+        assert!(may_see(&reader, &ticket(&["ACC-1", "ACC-2"])), "the union of the read sets");
+        assert!(may_work("local|tam", &tam(), &ticket(&["ACC-2"])), "write on operations");
+        assert!(
+            !may_work("local|tam", &tam(), &ticket(&["ACC-1"])),
+            "custody's account is read only"
+        );
+        assert!(may_work("local|tam", &tam(), &ticket(&[])), "naming none, write on any role");
+        let mut reader_only = tam();
+        reader_only.plugins.get_mut("ops-1").unwrap().roles.remove("operations");
+        assert!(!may_work("local|tam", &reader_only, &ticket(&[])), "read alone works none");
     }
 }

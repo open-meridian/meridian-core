@@ -69,6 +69,7 @@ fn records(deployment_admin: bool) -> AccessRecords {
             entries: vec![AccessEntry {
                 plugin_instance_id: INSTANCE.into(),
                 level: AccessLevel::Write as i32,
+                role: String::new(),
             }],
             built_in: false,
         }],
@@ -112,6 +113,7 @@ fn tool(
         } else {
             String::new()
         },
+        roles: vec![],
     }
 }
 
@@ -337,8 +339,9 @@ fn covering(levels: &[&str], deployment_admin: bool) -> Covers {
         deployment_admin,
         plugins: levels
             .iter()
-            .map(|level| (INSTANCE.to_string(), level.to_string()))
+            .map(|level| (INSTANCE.to_string(), String::new(), level.to_string()))
             .collect(),
+        unmatched: Default::default(),
         account_groups: ["AcG-1".to_string()].into(),
     }
 }
@@ -877,4 +880,49 @@ async fn a_client_files_notes_and_reads_as_the_person_through_it_and_never_sees_
     assert!(recorded
         .iter()
         .any(|c| c.tool == "dashboard__file_ticket" && c.outcome == "made"));
+}
+
+#[test]
+fn a_tool_is_listed_and_opened_by_the_role_it_serves() {
+    // Write on operations and read on custody (contract v15, W6.20).
+    let mut held = meridian_access::PluginHeld::default();
+    held.roles.insert(
+        "operations".into(),
+        meridian_access::Held {
+            data: Some(AccessLevel::Write),
+            ..Default::default()
+        },
+    );
+    held.roles.insert(
+        "custody".into(),
+        meridian_access::Held {
+            data: Some(AccessLevel::Read),
+            ..Default::default()
+        },
+    );
+    let levels = |l: &[AccessLevel]| l.iter().map(|l| *l as i32).collect::<Vec<_>>();
+    let roles = |r: &[&str]| r.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        super::level_by_role(&levels(&[AccessLevel::Write]), &roles(&["custody"]), &held),
+        None,
+        "a custody write tool is not the operations writer's"
+    );
+    assert_eq!(
+        super::level_by_role(&levels(&[AccessLevel::Write]), &roles(&["operations"]), &held),
+        Some(AccessLevel::Write)
+    );
+    assert_eq!(
+        super::level_by_role(
+            &levels(&[AccessLevel::Write, AccessLevel::Read]),
+            &roles(&["custody"]),
+            &held
+        ),
+        Some(AccessLevel::Read),
+        "custody's read side opens at read"
+    );
+    // A tool naming no role is the plugin's as a whole: the union.
+    assert_eq!(
+        super::level_by_role(&levels(&[AccessLevel::Write]), &[], &held),
+        Some(AccessLevel::Write)
+    );
 }

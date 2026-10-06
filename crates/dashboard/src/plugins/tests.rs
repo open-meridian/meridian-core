@@ -64,6 +64,7 @@ fn records(instances: &[&str]) -> AccessRecords {
                 .map(|instance| AccessEntry {
                     plugin_instance_id: instance.to_string(),
                     level: AccessLevel::Read as i32,
+                    role: String::new(),
                 })
                 .collect(),
             built_in: false,
@@ -1565,11 +1566,13 @@ async fn each_button_shows_the_pages_at_its_level_and_no_way_to_the_portal_even_
                         path: "/admin/connections".into(),
                         title: "Connections".into(),
                         levels: vec![AccessLevel::Admin as i32],
+                        roles: vec![],
                     },
                     meridian_pb::v1::PageDeclaration {
                         path: "/statements".into(),
                         title: "Statements".into(),
                         levels: vec![AccessLevel::Write as i32, AccessLevel::Read as i32],
+                        roles: vec![],
                     },
                 ],
             }),
@@ -1669,6 +1672,7 @@ fn snaptrade_reporting(h: &Harness) {
             path: path.into(),
             title: title.into(),
             levels: levels.iter().map(|l| *l as i32).collect(),
+            roles: vec![],
         }
     }
     h.app.health.hear(
@@ -2074,12 +2078,14 @@ async fn the_dashboards_summary_and_settings_are_for_the_plugins_admins_alone() 
         held.access_groups[0].entries = vec![AccessEntry {
             plugin_instance_id: on.into(),
             level: level as i32,
+            role: String::new(),
         }];
         if on != INSTANCE {
             // Reading this one too, so only Manage is refused.
             held.access_groups[0].entries.push(AccessEntry {
                 plugin_instance_id: INSTANCE.into(),
                 level: AccessLevel::Read as i32,
+                role: String::new(),
             });
         }
         held.plugin_settings = vec![snaptrade_settings()];
@@ -2173,6 +2179,7 @@ async fn entered_with_no_page_named_it_lands_on_the_first_page_at_that_level() {
                             path: path.to_string(),
                             title: title.to_string(),
                             levels: levels.iter().map(|l| *l as i32).collect(),
+                            roles: vec![],
                         })
                         .collect(),
                 }),
@@ -2426,6 +2433,7 @@ fn where_no_frame_can_hold_a_session_the_page_opens_in_a_window_of_its_own() {
 fn the_assertion_names_the_delegation_a_person_came_through() {
     let opening = || Opening {
         access: meridian_access::Levels::default(),
+        roles: vec![],
         deployment_admin: false,
         level: AccessLevel::Write,
     };
@@ -2451,4 +2459,71 @@ fn the_assertion_names_the_delegation_a_person_came_through() {
     let browser = opening().claims(&who(None), INSTANCE, 1);
     assert_eq!(browser.delegation_id, "");
     assert_eq!(browser.client_name, "");
+}
+
+/// W6.9 (contract v15): the claims carry the person's level on each role
+/// within the button, its accounts as positions in the read set, beside the
+/// union as before.
+#[test]
+fn the_claims_carry_each_roles_level_and_accounts_as_positions() {
+    use meridian_access::{Held, Levels, PluginHeld};
+    let set = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect();
+    let mut plugin = PluginHeld::default();
+    plugin.roles.insert(
+        "operations".into(),
+        Held {
+            admin: false,
+            data: Some(AccessLevel::Write),
+            accounts: Levels {
+                read: set(&["ACC-2"]),
+                write: set(&["ACC-2"]),
+            },
+        },
+    );
+    plugin.roles.insert(
+        "custody".into(),
+        Held {
+            admin: false,
+            data: Some(AccessLevel::Read),
+            accounts: Levels {
+                read: set(&["ACC-1", "ACC-3"]),
+                write: Default::default(),
+            },
+        },
+    );
+    let mut access = meridian_access::Access::default();
+    access.plugins.insert(INSTANCE.into(), plugin);
+    let who = Who {
+        subject: ADA.into(),
+        display_name: "Ada Park".into(),
+        directory_groups: Vec::new(),
+        covers: None,
+        delegation: None,
+    };
+    let claims = opening(&access, INSTANCE, AccessLevel::Write)
+        .unwrap()
+        .claims(&who, INSTANCE, 1);
+    assert_eq!(claims.read_account_ids, ["ACC-1", "ACC-2", "ACC-3"]);
+    assert_eq!(claims.write_account_ids, ["ACC-2"]);
+    let entries: Vec<(String, i32, Vec<u32>, Vec<u32>)> = claims
+        .roles
+        .iter()
+        .map(|r| (r.role.clone(), r.level, r.read_positions.clone(), r.write_positions.clone()))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("custody".into(), AccessLevel::Read as i32, vec![0, 2], vec![]),
+            ("operations".into(), AccessLevel::Write as i32, vec![1], vec![1]),
+        ]
+    );
+    // Under View each role at read.
+    let view = opening(&access, INSTANCE, AccessLevel::Read)
+        .unwrap()
+        .claims(&who, INSTANCE, 1);
+    assert!(view
+        .roles
+        .iter()
+        .all(|r| r.level == AccessLevel::Read as i32 && r.write_positions.is_empty()));
+    assert!(opening(&access, INSTANCE, AccessLevel::Admin).is_none());
 }

@@ -272,6 +272,11 @@ impl PluginHeld {
         union
     }
 
+    /// Whether this holds any level on any role.
+    pub fn holds_any(&self) -> bool {
+        self.roles.values().any(Held::holds_any)
+    }
+
     /// Whether they administer this role.
     pub fn administers(&self, role: &str) -> bool {
         self.roles.get(role).is_some_and(|held| held.admin)

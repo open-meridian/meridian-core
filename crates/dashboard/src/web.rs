@@ -380,8 +380,9 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         for instance in listed.iter().map(|i| i.as_str()) {
             // A button per level held (W6.9), where a page can be opened.
             let openable = app.plugins.is_some() && crate::plugins::is_instance(instance);
+            let held = access.plugin(instance);
             let levels = if openable {
-                access.held(instance).levels()
+                held.union().levels()
             } else {
                 Vec::new()
             };
@@ -389,6 +390,8 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 instance,
                 name_of(instance).as_deref(),
                 &levels,
+                &held,
+                access.known_roles.get(instance).is_some_and(|roles| roles.len() > 1),
             ));
         }
         body.push_str(
@@ -426,6 +429,8 @@ fn plugin_card(
     instance: &str,
     name: Option<&str>,
     levels: &[meridian_access::AccessLevel],
+    held: &meridian_access::PluginHeld,
+    several: bool,
 ) -> String {
     // The plugin's name where the catalogue launched it; one installed
     // otherwise is known by its instance alone.
@@ -461,9 +466,10 @@ fn plugin_card(
         .iter()
         .map(|level| {
             format!(
-                "<a class=\"plugin-level\" data-level=\"{name}\" href=\"{href}\">{said}</a>",
+                "<a class=\"plugin-level\" data-level=\"{name}\" href=\"{href}\"{title}>{said}</a>",
                 name = meridian_access::level_name(*level),
                 href = escape(&crate::area::href(instance, *level, None)),
+                title = if several { roles_title(held, *level) } else { String::new() },
                 said = meridian_access::button(*level),
             )
         })
@@ -473,6 +479,26 @@ fn plugin_card(
          <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
         id = escape(instance),
         label = escape(title),
+    )
+}
+
+/// A button's title on a plugin holding several roles, naming each role it
+/// reaches at its level ("Open: operations write, custody read"; W6.9,
+/// contract v15); nothing on a plugin holding one role or none, drawn exactly
+/// as before.
+fn roles_title(held: &meridian_access::PluginHeld, level: meridian_access::AccessLevel) -> String {
+    let Some(session) = held.session(level) else {
+        return String::new();
+    };
+    let said: Vec<String> = session
+        .roles
+        .iter()
+        .map(|role| format!("{} {}", role.role, meridian_access::level_name(role.level)))
+        .collect();
+    format!(
+        " title=\"{}: {}\"",
+        meridian_access::button(level),
+        escape(&said.join(", "))
     )
 }
 

@@ -751,7 +751,24 @@ pub(crate) async fn frame(
         };
     let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
     let reports = app.health.view();
-    let tabs = crate::area::tabs(reports.get(&instance), level, &table_tabs(&app, &instance));
+    let held_roles: Vec<(String, AccessLevel)> = access
+        .plugin(&instance)
+        .session(level)
+        .map(|session| {
+            session
+                .roles
+                .into_iter()
+                .filter(|role| !role.role.is_empty())
+                .map(|role| (role.role, role.level))
+                .collect()
+        })
+        .unwrap_or_default();
+    let tabs = crate::area::tabs_by_role(
+        reports.get(&instance),
+        level,
+        &held_roles,
+        &table_tabs(&app, &instance),
+    );
     // A path asked for directly is its tab's, or one of its own under the
     // level's pages; otherwise the tab asked for, or the first: under Manage,
     // the dashboard's own Summary, drawn here rather than framed. A path
@@ -982,8 +999,13 @@ pub fn pages_possible(public_url: &str) -> Result<(), String> {
 /// opened at, and what that level reaches.
 pub(crate) struct Opening {
     /// The accounts the level reaches, cut to it: none under `admin`, the
-    /// read and write sets under `write`, the read set under `read`.
+    /// read and write sets under `write`, the read set under `read`; the
+    /// union over the plugin's roles.
     pub access: meridian_access::Levels,
+    /// Their level and accounts on each of the plugin's roles within the
+    /// button (W6.9, contract v15): one entry per role held, none for a
+    /// plugin holding no role.
+    pub roles: Vec<meridian_access::RoleSession>,
     /// Whether they are a deployment admin, which a plugin's page at `admin`
     /// asks when linking, a new account being theirs to name (W6.4).
     pub deployment_admin: bool,
@@ -1019,6 +1041,18 @@ impl Opening {
                 .unwrap_or_default(),
             // A page's request names no tool: only `/mcp` sets one (W6.20).
             tool_name: String::new(),
+            // Each role's level and accounts within the button, as
+            // positions in the read set (contract v15, the plan's Q2), so
+            // the sidecar admits a command by the role holding it whether or
+            // not the plugin reads roles. None for a role-less plugin.
+            roles: self
+                .roles
+                .iter()
+                .filter(|role| !role.role.is_empty())
+                .map(|role| {
+                    meridian_access::role_access(&role.role, role.level, &role.accounts, &self.access)
+                })
+                .collect(),
         }
     }
 }
@@ -1033,10 +1067,11 @@ pub(crate) fn opening(
     level: AccessLevel,
 ) -> Option<Opening> {
     access
-        .held(instance)
+        .plugin(instance)
         .session(level)
-        .map(|accounts| Opening {
-            access: accounts,
+        .map(|session| Opening {
+            access: session.accounts,
+            roles: session.roles,
             deployment_admin: access.deployment_admin,
             level,
         })

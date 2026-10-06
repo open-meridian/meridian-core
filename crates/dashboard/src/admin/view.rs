@@ -263,22 +263,38 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
         .iter()
         .map(|g| (g.account_group_id.as_str(), g.name.as_str()))
         .collect();
+    let roles = meridian_access::known_roles(records, instance)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
     let row = |order: u8,
                permission: &meridian_domain::v1::Permission,
                through: &str,
-               level: &str| {
+               role: &str,
+               level: &str,
+               stale: bool| {
         let accounts = if level == "admin" {
             "<span class=\"id\">no account</span>".to_string()
         } else {
             escape(&name(&permission.account_group_id, &account_groups))
         };
+        let role_cell = match (role.is_empty(), stale) {
+            (true, false) => "<span class=\"id\">no role</span>".to_string(),
+            (false, false) => escape(role),
+            (_, true) => format!(
+                "{} <span class=\"flag warn\" data-unmatched>holds nothing: {instance} holds {}</span>",
+                if role.is_empty() { "no role".to_string() } else { escape(role) },
+                if roles.is_empty() { "no role".to_string() } else { escape(&roles.join(", ")) },
+                instance = escape(instance),
+            ),
+        };
         (
             order,
             format!(
-                "<tr data-user-group=\"{ug}\" data-level=\"{level}\">\
+                "<tr data-user-group=\"{ug}\" data-role=\"{r}\" data-level=\"{level}\">\
                  <td><span class=\"name\">{user}</span><span class=\"id\">through {access}</span></td>\
-                 <td><span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
+                 <td>{role_cell}</td><td><span class=\"badge\">{level}</span></td><td>{accounts}</td></tr>",
                 ug = escape(&permission.user_group_id),
+                r = escape(role),
                 user = escape(&name(&permission.user_group_id, &user_groups)),
                 access = escape(through),
             ),
@@ -287,7 +303,11 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
     let mut rows: Vec<(u8, String)> = Vec::new();
     for permission in &records.permissions {
         if permission.access_group_id == ALL_PLUGINS_ADMIN {
-            rows.push(row(0, permission, "All plugins (admin)", "admin"));
+            // Every role of the plugin, or the plugin as a whole.
+            let every = if roles.is_empty() { vec![String::new()] } else { roles.clone() };
+            for role in &every {
+                rows.push(row(0, permission, "All plugins (admin)", role, "admin", false));
+            }
             continue;
         }
         let Some(group) = records
@@ -308,24 +328,27 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
                 Ok(AccessLevel::Read) => (2, "read"),
                 _ => continue,
             };
-            rows.push(row(order, permission, &group.name, level));
+            let stale = !meridian_access::entry_holds(records, instance, &entry.role);
+            rows.push(row(order, permission, &group.name, &entry.role, level, stale));
         }
     }
     // Admin, then write, then read, and otherwise in the order the
     // permissions are.
     rows.sort_by_key(|(order, _)| *order);
     let rows: String = rows.into_iter().map(|(_, row)| row).collect();
+    // One line a row, paged (the product owner, 2026-10-04), a role each.
     let table = if rows.is_empty() {
         "<p class=\"empty\">No user group holds access to it yet.</p>".to_string()
     } else {
         format!(
-            "<div class=\"scroll\"><table class=\"list access\"><thead><tr><th>User group</th>\
-             <th>Level</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<om-pager><table class=\"list one-line access\"><thead><tr><th>User group</th>\
+             <th>Role</th><th>Level</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></om-pager>"
         )
     };
-    let hint = "<p class=\"hint\">Admin configures the plugin and reaches no account's data; \
-                write and read reach the accounts of the account group granted. A deployment \
-                admin holds nothing on it by being one.</p>";
+    let hint = "<p class=\"hint\">Each grant is on one of the plugin's roles. Admin configures \
+                that role's side and reaches no account's data; write and read reach the accounts \
+                of the account group granted. A deployment admin holds nothing on it by being \
+                one.</p>";
     let grant = if may_grant {
         format!(
             "<p><a href=\"/admin#permissions\">Grant a user group access</a> through an \

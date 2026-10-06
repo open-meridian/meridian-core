@@ -53,6 +53,7 @@ pub(in crate::web) fn records() -> AccessRecords {
             entries: vec![AccessEntry {
                 plugin_instance_id: "oms-1".into(),
                 level: meridian_access::AccessLevel::Write as i32,
+                role: String::new(),
             }],
             ..Default::default()
         }],
@@ -503,9 +504,9 @@ async fn the_consent_page_names_the_client_where_its_codes_go_and_the_clis_defau
     );
     assert!(page.contains("value=\"90\" selected"), "{page}");
     // What she holds is what she may tick, and nothing else is offered.
-    assert!(page.contains("value=\"oms-1:write\""), "{page}");
-    assert!(page.contains("value=\"oms-1:read\""), "{page}");
-    assert!(!page.contains("value=\"oms-1:admin\""), "{page}");
+    assert!(page.contains("value=\"oms-1::write\""), "{page}");
+    assert!(page.contains("value=\"oms-1::read\""), "{page}");
+    assert!(!page.contains("value=\"oms-1::admin\""), "{page}");
     assert!(page.contains("name=\"deployment_admin\""), "{page}");
     assert!(page.contains("value=\"AG-1\""), "{page}");
 }
@@ -889,7 +890,7 @@ async fn one_level_is_picked_per_plugin_and_includes_those_held_below_it() {
     assert!(!page.contains("type=\"checkbox\" name=\"level\""), "{page}");
     assert!(
         page.contains(
-            "<option value=\"oms-1:write\" data-short=\"Open\" data-accounts>Open, with View</option>"
+            "<option value=\"oms-1::write\" data-short=\"Open\" data-accounts>Open, with View</option>"
         ),
         "{page}"
     );
@@ -908,8 +909,8 @@ async fn one_level_is_picked_per_plugin_and_includes_those_held_below_it() {
     assert_eq!(
         delegation.covers.plugins,
         BTreeSet::from([
-            ("oms-1".to_string(), "write".to_string()),
-            ("oms-1".to_string(), "read".to_string())
+            ("oms-1".to_string(), String::new(), "write".to_string()),
+            ("oms-1".to_string(), String::new(), "read".to_string())
         ])
     );
     let access = said["access_token"].as_str().unwrap();
@@ -964,7 +965,7 @@ async fn same_as_my_last_client_fills_the_choices_for_the_person_to_review() {
     assert!(page.contains("data-started=\"last\""), "{page}");
     assert!(page.contains("value=\"some\" checked"), "{page}");
     assert!(
-        page.contains("value=\"oms-1:read\" data-short=\"View\" data-accounts selected"),
+        page.contains("value=\"oms-1::read\" data-short=\"View\" data-accounts selected"),
         "{page}"
     );
     assert!(page.contains("value=\"AG-1\" checked"), "{page}");
@@ -1014,14 +1015,14 @@ async fn the_summary_before_allow_states_what_the_client_may_do() {
     // A choice with levels and no account group says it reaches none.
     let holdable = Holdable {
         plugins: BTreeMap::from([(
-            "oms-1".to_string(),
+            ("oms-1".to_string(), String::new()),
             vec![AccessLevel::Write, AccessLevel::Read],
         )]),
         account_groups: BTreeMap::new(),
         deployment_admin: true,
     };
     let picked = holdable.picked(&Covers {
-        plugins: BTreeSet::from([("oms-1".into(), "write".into())]),
+        plugins: BTreeSet::from([("oms-1".into(), String::new(), "write".into())]),
         deployment_admin: true,
         ..Covers::default()
     });
@@ -1057,6 +1058,7 @@ fn a_firm() -> AccessRecords {
             .map(|i| AccessEntry {
                 plugin_instance_id: format!("plugin-{i:02}"),
                 level: level as i32,
+                role: String::new(),
             })
             .collect()
     };
@@ -1100,11 +1102,11 @@ async fn forty_plugins_and_three_hundred_account_groups_make_one_short_page() {
     assert_eq!(page.matches("<select name=\"level\"").count(), 40);
     assert!(!page.contains("type=\"checkbox\" name=\"level\""));
     assert!(page.contains(
-        "<option value=\"plugin-00:admin\" data-short=\"Manage\" data-accounts>Manage, with Open and \
+        "<option value=\"plugin-00::admin\" data-short=\"Manage\" data-accounts>Manage, with Open and \
          View</option>"
     ), "manage includes open and view, as holding it does");
     assert!(
-        !page.contains("value=\"plugin-10:admin\""),
+        !page.contains("value=\"plugin-10::admin\""),
         "held on ten only"
     );
     // Account groups searched, with how many accounts each holds, and how

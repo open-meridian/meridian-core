@@ -409,6 +409,13 @@ fn run() -> Result<(), String> {
             Arc::clone(&records),
             clock.clone(),
         ));
+        // A delegation's rows recorded before access per role, rewritten once
+        // to name each plugin's role, after the first records read (W6.17).
+        tokio::spawn(meridian_dashboard::delegation::rewrite_once_records_are_read(
+            Arc::clone(&delegations),
+            Arc::clone(&records),
+            clock.clone(),
+        ));
 
         // What custody connectors say about their accounts and connections,
         // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything

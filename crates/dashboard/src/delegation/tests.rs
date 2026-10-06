@@ -705,10 +705,12 @@ fn records() -> AccessRecords {
                 AccessEntry {
                     plugin_instance_id: "oms-1".into(),
                     level: AccessLevel::Write as i32,
+                    role: String::new(),
                 },
                 AccessEntry {
                     plugin_instance_id: "oms-1".into(),
                     level: AccessLevel::Admin as i32,
+                    role: String::new(),
                 },
             ],
             ..Default::default()
@@ -761,7 +763,7 @@ fn everything_follows_the_person_and_a_narrowed_delegation_is_an_intersection() 
     let narrowed = narrow(
         access.clone(),
         &Covers {
-            plugins: BTreeSet::from([("oms-1".into(), "read".into())]),
+            plugins: BTreeSet::from([("oms-1".into(), String::new(), "read".into())]),
             account_groups: BTreeSet::from(["AG-1".into()]),
             ..Covers::default()
         },
@@ -784,8 +786,8 @@ fn everything_follows_the_person_and_a_narrowed_delegation_is_an_intersection() 
         &Covers {
             deployment_admin: true,
             plugins: BTreeSet::from([
-                ("oms-1".into(), "admin".into()),
-                ("new-1".into(), "admin".into()),
+                ("oms-1".into(), String::new(), "admin".into()),
+                ("new-1".into(), String::new(), "admin".into()),
             ]),
             ..Covers::default()
         },
@@ -806,7 +808,7 @@ fn a_narrowed_delegation_never_reaches_more_than_the_person_holds_now() {
     let mut records = records();
     let covers = Covers {
         deployment_admin: true,
-        plugins: BTreeSet::from([("oms-1".into(), "write".into())]),
+        plugins: BTreeSet::from([("oms-1".into(), String::new(), "write".into())]),
         account_groups: BTreeSet::from(["AG-1".into(), "AG-2".into()]),
         ..Covers::default()
     };
@@ -831,8 +833,8 @@ fn what_a_delegation_covers_is_said_in_a_line() {
     let some = Covers {
         deployment_admin: true,
         plugins: BTreeSet::from([
-            ("oms-1".into(), "write".into()),
-            ("oms-1".into(), "read".into()),
+            ("oms-1".into(), String::new(), "write".into()),
+            ("oms-1".into(), String::new(), "read".into()),
         ]),
         account_groups: BTreeSet::from(["AG-1".into()]),
         ..Covers::default()
@@ -848,17 +850,17 @@ fn what_a_delegation_covers_is_said_in_a_line() {
 fn one_level_is_said_per_plugin_and_a_long_list_is_cut_short() {
     let mut covers = Covers::default();
     for i in 0..5 {
-        covers.plugins.insert((format!("p-{i}"), "admin".into()));
-        covers.plugins.insert((format!("p-{i}"), "read".into()));
+        covers.plugins.insert((format!("p-{i}"), String::new(), "admin".into()));
+        covers.plugins.insert((format!("p-{i}"), String::new(), "read".into()));
     }
-    covers.plugins.insert(("q-1".into(), "write".into()));
-    covers.plugins.insert(("q-1".into(), "read".into()));
-    covers.plugins.insert(("r-1".into(), "read".into()));
+    covers.plugins.insert(("q-1".into(), String::new(), "write".into()));
+    covers.plugins.insert(("q-1".into(), String::new(), "read".into()));
+    covers.plugins.insert(("r-1".into(), String::new(), "read".into()));
     covers.account_groups = (0..300).map(|i| format!("AG-{i:03}")).collect();
-    assert_eq!(covers.level_on("p-0"), Some(AccessLevel::Admin));
-    assert_eq!(covers.level_on("q-1"), Some(AccessLevel::Write));
-    assert_eq!(covers.level_on("r-1"), Some(AccessLevel::Read));
-    assert_eq!(covers.level_on("s-1"), None);
+    assert_eq!(covers.level_on("p-0", ""), Some(AccessLevel::Admin));
+    assert_eq!(covers.level_on("q-1", ""), Some(AccessLevel::Write));
+    assert_eq!(covers.level_on("r-1", ""), Some(AccessLevel::Read));
+    assert_eq!(covers.level_on("s-1", ""), None);
     assert_eq!(
         covers.said(&BTreeMap::new()),
         "p-0 (Manage), p-1 (Manage), p-2 (Manage) and 4 more plugins; \
@@ -869,4 +871,138 @@ fn one_level_is_said_per_plugin_and_a_long_list_is_cut_short() {
     assert_eq!(listed(&["a", "b"]), "a and b");
     assert_eq!(listed(&["a", "b", "c"]), "a, b and c");
     assert_eq!(listed(&["a", "b", "c", "d"]), "a, b, c and 1 more");
+}
+
+// ── Rows per role (contract v15, W6.17) ───────────────────────────────────
+
+/// A plugin holding custody and operations: Ada writes operations on
+/// Desk one and reads custody on Desk two.
+fn two_role_records() -> AccessRecords {
+    let mut records = records();
+    records.known_plugins = vec![
+        meridian_domain::v1::KnownPluginRoles {
+            plugin_instance_id: "ops-1".into(),
+            roles: vec!["custody".into(), "operations".into()],
+        },
+        meridian_domain::v1::KnownPluginRoles {
+            plugin_instance_id: "oms-1".into(),
+            roles: vec!["oms".into()],
+        },
+    ];
+    records.access_groups.push(AccessGroup {
+        access_group_id: "AX-OPS".into(),
+        name: "Reconciliation".into(),
+        entries: vec![AccessEntry {
+            plugin_instance_id: "ops-1".into(),
+            level: AccessLevel::Write as i32,
+            role: "operations".into(),
+        }],
+        ..Default::default()
+    });
+    records.access_groups.push(AccessGroup {
+        access_group_id: "AX-CUS".into(),
+        name: "Custody readers".into(),
+        entries: vec![AccessEntry {
+            plugin_instance_id: "ops-1".into(),
+            level: AccessLevel::Read as i32,
+            role: "custody".into(),
+        }],
+        ..Default::default()
+    });
+    records.permissions.push(Permission {
+        permission_id: "P-5".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: "AG-1".into(),
+        access_group_id: "AX-OPS".into(),
+    });
+    records.permissions.push(Permission {
+        permission_id: "P-6".into(),
+        user_group_id: "UG-1".into(),
+        account_group_id: "AG-2".into(),
+        access_group_id: "AX-CUS".into(),
+    });
+    records
+}
+
+#[test]
+fn a_narrowed_delegation_covers_a_role_at_its_level_and_nothing_of_another() {
+    let records = two_role_records();
+    let access = meridian_access::person_access(&records, "local|ada", &[]);
+    let covers = Covers {
+        plugins: BTreeSet::from([
+            ("ops-1".into(), "operations".into(), "write".into()),
+            ("ops-1".into(), "operations".into(), "read".into()),
+        ]),
+        account_groups: BTreeSet::from(["AG-1".into(), "AG-2".into()]),
+        ..Covers::default()
+    };
+    let narrowed = narrow(access, &covers, &records);
+    let ops = narrowed.plugin("ops-1");
+    assert_eq!(ops.roles.keys().collect::<Vec<_>>(), ["operations"]);
+    assert_eq!(ops.roles["operations"].data, Some(AccessLevel::Write));
+    assert!(
+        ops.roles["operations"].accounts.write.contains("ACC-1"),
+        "operations write on Desk one"
+    );
+    assert!(
+        !narrowed.held("ops-1").accounts.read.contains("ACC-2"),
+        "custody's read is not covered"
+    );
+    // Everything follows the person per role.
+    let all = narrow(
+        meridian_access::person_access(&records, "local|ada", &[]),
+        &Covers::everything(),
+        &records,
+    );
+    assert!(all.plugin("ops-1").roles.contains_key("custody"));
+}
+
+#[test]
+fn rows_recorded_before_v15_are_rewritten_once_to_name_the_plugins_one_role() {
+    let records = two_role_records();
+    let covers = Covers {
+        unmatched: BTreeSet::from([
+            ("oms-1".into(), "write".into()),
+            ("ops-1".into(), "read".into()),
+            ("gone-1".into(), "admin".into()),
+        ]),
+        ..Covers::default()
+    };
+    let rewritten = rewrite_rows(&covers, &records).expect("one row rewritten");
+    assert_eq!(
+        rewritten.plugins,
+        BTreeSet::from([("oms-1".into(), "oms".into(), "write".into())])
+    );
+    assert_eq!(
+        rewritten.unmatched,
+        BTreeSet::from([("gone-1".into(), "admin".into()), ("ops-1".into(), "read".into())]),
+        "a plugin holding several roles, or none known: kept, covering nothing"
+    );
+    assert_eq!(rewrite_rows(&rewritten, &records), None, "idempotent");
+    // An unmatched row covers nothing.
+    let access = meridian_access::person_access(&records, "local|ada", &[]);
+    let narrowed = narrow(access, &rewritten, &records);
+    assert!(!narrowed.held("ops-1").holds_any());
+    assert_eq!(
+        rewritten.said(&BTreeMap::new()),
+        "oms-1 oms (Open)",
+        "a row names its role"
+    );
+}
+
+#[test]
+fn the_rows_as_kept_read_back_whichever_shape_they_were_written_in() {
+    let (rows, unmatched) = store::rows_of(&[
+        "ops-1:custody:read".into(),
+        "tool-1::write".into(),
+        "oms-1:admin".into(),
+    ]);
+    assert_eq!(
+        rows,
+        BTreeSet::from([
+            ("ops-1".into(), "custody".into(), "read".into()),
+            ("tool-1".into(), String::new(), "write".into())
+        ])
+    );
+    assert_eq!(unmatched, BTreeSet::from([("oms-1".into(), "admin".into())]));
 }

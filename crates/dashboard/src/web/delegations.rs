@@ -78,12 +78,32 @@ fn standing(delegation: &Delegation, now: i64) -> (&'static str, String) {
     }
 }
 
+/// Rows recorded before access per role that the rewrite could not name a
+/// role for: flagged, covering nothing, until the person consents again
+/// (W6.17; the plan's Q4).
+fn unmatched_flag(covers: &Covers) -> String {
+    if covers.unmatched.is_empty() {
+        return String::new();
+    }
+    let rows: Vec<String> = covers
+        .unmatched
+        .iter()
+        .map(|(instance, level)| format!("{instance} ({level})"))
+        .collect();
+    format!(
+        " <span class=\"flag warn\" data-unmatched>{} cover nothing: recorded before access \
+         per role, on a plugin holding several roles or none known; consent again to choose \
+         a role</span>",
+        escape(&rows.join(", "))
+    )
+}
+
 /// What a delegation covers, as the consent page chose it: a line, and when
 /// the line names only the first few, all of it folded beneath, each plugin
 /// under the one level picked on it and every account group
 /// (kernel/the-consent-page-at-scale).
 fn covers_cell(covers: &Covers, names: &BTreeMap<String, String>) -> String {
-    let line = escape(&covers.said(names));
+    let line = format!("{}{}", escape(&covers.said(names)), unmatched_flag(covers));
     let by_level = covers.by_level();
     let long = covers.account_groups.len() > NAMES_SAID
         || by_level.iter().any(|(_, at)| at.len() > NAMES_SAID);
