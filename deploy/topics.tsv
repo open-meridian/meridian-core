@@ -69,10 +69,10 @@ platform.street.command.record-activity	command	custody	street
 platform.street.command.record-holding	command	custody	street
 platform.street.command.record-statement	command	custody	street
 platform.street.event.activity-recorded	event	street	operations
-platform.street.event.custodial-position-updated	event	street	dashboard,operations
-platform.street.event.statement-recorded	event	street	dashboard,operations
+platform.street.event.custodial-position-updated	event	street	operations
+platform.street.event.statement-recorded	event	street	operations
 platform.street.event.sync-status-recorded	event	street	operations
 platform.street.query.list-activities	query	operations,dashboard	street
-platform.street.query.list-custodial-positions	query	dashboard,operations	street
+platform.street.query.list-custodial-positions	query	operations	street
 platform.street.query.list-statements	query	operations	street
 platform.street.query.list-sync-statuses	query	operations,dashboard	street

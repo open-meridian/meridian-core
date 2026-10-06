@@ -5276,6 +5276,22 @@ pub struct AccessRecords {
     /// that are not secret, and which secrets are set. Never a secret's value.
     #[prost(message, repeated, tag = "9")]
     pub plugin_settings: ::prost::alloc::vec::Vec<PluginSettingsRecord>,
+    /// Each known plugin's roles, as its sidecar last reported them (contract
+    /// v15, W6.1): every plugin a sidecar has reported, launched through the
+    /// dashboard or installed by the chart, running or stopped, so the dashboard
+    /// folds each grant per plugin and role and mints each role's entry in the
+    /// claims. Empty before any sidecar has reported.
+    #[prost(message, repeated, tag = "10")]
+    pub known_plugins: ::prost::alloc::vec::Vec<KnownPluginRoles>,
+}
+/// One known plugin and the roles it was launched with (contract v15).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KnownPluginRoles {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    /// Roles from the deployment's fixed list; empty for a plugin holding none.
+    #[prost(string, repeated, tag = "2")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// The only thing holdings are recorded against. A plugin creates one only by
 /// linking an external account to a new one, acting for a deployment admin in
@@ -5445,18 +5461,25 @@ pub struct DefineAccountGroupRequest {
     #[prost(message, optional, tag = "1")]
     pub account_group: ::core::option::Option<AccountGroup>,
 }
-/// Which plugin, at which level: `read`, `write` or `admin`. One plugin per
-/// entry, so each plugin's users can be counted on their own. The levels are
-/// the same for every plugin, and a plugin names no parts of itself for access
-/// (W6.7; decisions/026, 027). A group may name a plugin at `admin` and at one
-/// data level; naming it at both `read` and `write`, or twice at one level, is
-/// refused.
+/// Which plugin, which of its roles, at which level: `read`, `write` or
+/// `admin`. One plugin per entry, so each plugin's users can be counted on
+/// their own. The levels are the same for every plugin and role, and a plugin
+/// names no parts of itself for access: its roles are the deployment's fixed
+/// list (W6.7; decisions/026, 027, 033). A group may name a plugin and role at
+/// `admin` and at one data level; naming it at both `read` and `write`, or
+/// twice at one level, is refused.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessEntry {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
     #[prost(enumeration = "::meridian_pb::v1::AccessLevel", tag = "3")]
     pub level: i32,
+    /// The role of the plugin the entry grants a level on (contract v15,
+    /// decisions/033): one the plugin holds, as its sidecar last reported. Empty
+    /// only for a plugin holding no role. An entry naming a role the plugin no
+    /// longer holds holds nothing.
+    #[prost(string, tag = "4")]
+    pub role: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessGroup {

@@ -6,7 +6,7 @@
 //
 // The governing idea: access is three dimensions joined by a permission -- a
 // user group (who), an account group (which accounts), an access group (which
-// plugins, each at read, write or admin) -- and a person's access is the
+// plugins and roles, each at read, write or admin) -- and a person's access is the
 // union of their user groups' permissions, combined permission by permission.
 // None of it is read from a token, and none of it ever reaches the platform.
 //
@@ -67,6 +67,21 @@ message AccessRecords {
   // Each known plugin's settings form (W6.11): what it declared, its values
   // that are not secret, and which secrets are set. Never a secret's value.
   repeated PluginSettingsRecord plugin_settings = 9;
+
+  // Each known plugin's roles, as its sidecar last reported them (contract
+  // v15, W6.1): every plugin a sidecar has reported, launched through the
+  // dashboard or installed by the chart, running or stopped, so the dashboard
+  // folds each grant per plugin and role and mints each role's entry in the
+  // claims. Empty before any sidecar has reported.
+  repeated KnownPluginRoles known_plugins = 10;
+}
+
+// One known plugin and the roles it was launched with (contract v15).
+message KnownPluginRoles {
+  string plugin_instance_id = 1;
+
+  // Roles from the deployment's fixed list; empty for a plugin holding none.
+  repeated string roles = 2;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,15 +239,22 @@ message DefineAccountGroupRequest {
   AccountGroup account_group = 1;
 }
 
-// Which plugin, at which level: `read`, `write` or `admin`. One plugin per
-// entry, so each plugin's users can be counted on their own. The levels are
-// the same for every plugin, and a plugin names no parts of itself for access
-// (W6.7; decisions/026, 027). A group may name a plugin at `admin` and at one
-// data level; naming it at both `read` and `write`, or twice at one level, is
-// refused.
+// Which plugin, which of its roles, at which level: `read`, `write` or
+// `admin`. One plugin per entry, so each plugin's users can be counted on
+// their own. The levels are the same for every plugin and role, and a plugin
+// names no parts of itself for access: its roles are the deployment's fixed
+// list (W6.7; decisions/026, 027, 033). A group may name a plugin and role at
+// `admin` and at one data level; naming it at both `read` and `write`, or
+// twice at one level, is refused.
 message AccessEntry {
   string plugin_instance_id = 1;
   AccessLevel level = 3;
+
+  // The role of the plugin the entry grants a level on (contract v15,
+  // decisions/033): one the plugin holds, as its sidecar last reported. Empty
+  // only for a plugin holding no role. An entry naming a role the plugin no
+  // longer holds holds nothing.
+  string role = 4;
 
   // One of the plugin's tags, retired with them (decisions/026).
   reserved 2;
