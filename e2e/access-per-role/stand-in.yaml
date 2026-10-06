@@ -1,0 +1,12 @@
+# Core's stand-in plugin launched holding two roles, custody and operations
+# (contract v15; plans/access-is-granted-per-role, the plan's Q5), for `make
+# e2e-access-per-role`: it reports the accounts its connection reaches once
+# registered, as a connector does, and registers as a plugin built before v15,
+# its pages naming no role and so serving both.
+services:
+  both:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+    environment:
+      STAND_IN_REPORTS_AT_START: "1"

@@ -64,11 +64,14 @@ the same image with the list on stdin:
       links, as the dashboard counts them on its line (W6.4, W6.10). With
       --expect, waits until it is N.
 
-  grant --level read|write|admin
+  grant --level read|write|admin [--role ROLE]
       Grants the harness's admin that level on the plugin, on All accounts,
       as a deployment admin does in the dashboard (W6.5 to W6.8): a user group
       holding the admin, an access group giving the plugin the level, and the
-      permission joining them. A plugin that writes for a person -- an
+      permission joining them. From contract v15 a grant is on one role of the
+      plugin (decisions/033): --role names it, as the Access editor's row
+      does; without it, the plugin's one role where it holds exactly one, or
+      the plugin as a whole where it holds none. A plugin that writes for a person -- an
       operations plugin confirming an opening balance (W9.1) -- is opened at
       write by someone granted write; the admin is granted nothing on a
       plugin until this is run.
@@ -87,12 +90,13 @@ the same image with the list on stdin:
       equity, debt, fund, derivative, crypto_asset, event_contract, cash; each
       value goes with the source given, and the dashboard stamps the admin.
 
-  mcp connect [--covers deployment_admin] [--covers INSTANCE:LEVEL ...] [--client NAME]
+  mcp connect [--covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...] [--client NAME]
       Connects an MCP client as the admin, as an agent's client does (W6.17,
       W6.20): registers it (named "harness agent" unless --client says), sends
       her through the dashboard's authorisation for the `/mcp` resource with
       a PKCE challenge, signs her in afresh, consents to only what --covers
-      names -- the deployment admin's capabilities, and each plugin and level
+      names -- the deployment admin's capabilities, and each plugin and level,
+      from contract v15 each plugin, role and level (a row per role, W6.17)
       -- on All accounts, for 30 days, and exchanges the code for a token
       pair, kept for the run in the runner's state. Prints the delegation and
       how many tools it reaches.
@@ -576,6 +580,7 @@ def unlinked(args):
 
 def grant(args):
     level = option(args, "--level", None)
+    role = option(args, "--role", None)
     to = option(args, "--to", None)
     accounts = [a for a in (option(args, "--accounts", "") or "").split(",") if a]
     if level not in LEVELS:
@@ -615,9 +620,12 @@ def grant(args):
     user_group = defined("/admin/user-groups", "user_group_id",
                          "Harness admin" if to is None else f"Harness {to}",
                          [("login", login)])
+    # A row of the Access editor per role (contract v15), or as the form
+    # was before, the plugin ticked at its level.
     access_group = defined("/admin/access-groups", "access_group_id",
-                           f"Harness {level} on {INSTANCE}",
-                           [("plugin", INSTANCE), (f"level.{INSTANCE}", level)])
+                           f"Harness {level} on {INSTANCE}" + (f" {role}" if role else ""),
+                           [(f"level.{INSTANCE}:{role}", level)] if role is not None
+                           else [("plugin", INSTANCE), (f"level.{INSTANCE}", level)])
     # An admin reaches no account's data, so its permission names none.
     account_group = "" if level == "admin" else ALL_ACCOUNTS
     if accounts and level != "admin":
@@ -627,7 +635,7 @@ def grant(args):
     post("/admin/permissions", [("user_group_id", user_group),
                                 ("account_group_id", account_group),
                                 ("access_group_id", access_group)])
-    print(f"grant: {holder} holds {level} on {INSTANCE}, on "
+    print(f"grant: {holder} holds {level} on {INSTANCE}" + (f" {role}" if role else "") + ", on "
           + ("no account" if level == "admin" else ", ".join(accounts) or "All accounts"))
 
 
@@ -994,10 +1002,10 @@ def mcp_connect(args):
     for covered in covers:
         if covered == "deployment_admin":
             fields.append(("deployment_admin", "1"))
-        elif re.fullmatch(r"[a-z0-9-]+:(admin|write|read)", covered):
+        elif re.fullmatch(r"[a-z0-9-]+(:[a-z]*)?:(admin|write|read)", covered):
             fields.append(("level", covered))
         else:
-            raise Failed(f"--covers is deployment_admin or INSTANCE:LEVEL, not {covered!r}")
+            raise Failed(f"--covers is deployment_admin or INSTANCE[:ROLE]:LEVEL, not {covered!r}")
     data = urllib.parse.urlencode(fields).encode()
     decided = urllib.request.Request(DASHBOARD + "/oauth/authorize", data=data, method="POST")
     decided.add_header("Content-Type", "application/x-www-form-urlencoded")
