@@ -2636,12 +2636,12 @@ async fn each_group_dialog_is_a_picker_that_is_a_plain_list_without_script() {
     assert!(editor.contains("<om-pager rows=\"6\"><table class=\"list one-line access-roles\""));
     assert!(editor.contains("<th>Plugin</th><th>Role</th><th>Level</th>"));
     assert!(body.contains(
-        "<select name=\"level.plugin-00:\" aria-label=\"Level: plugin-00\"><option value=\"\">Not in the group</option>\
+        "<select name=\"level.plugin-00:\" aria-label=\"Level: plugin-00\"><option value=\"\">None</option>\
          <option value=\"read\">Read</option>\
-         <option value=\"write\">Write (includes read)</option>\
-         <option value=\"admin\">Admin (configures it, no account)</option>\
-         <option value=\"admin-read\">Admin and read</option>\
-         <option value=\"admin-write\">Admin and write</option></select>"
+         <option value=\"write\">Write</option>\
+         <option value=\"admin\">Admin</option>\
+         <option value=\"admin-read\">Admin, read</option>\
+         <option value=\"admin-write\">Admin, write</option></select>"
     ));
     let fill = fill_of(&body, "AG-00");
     assert_eq!(fill["fields"]["level.plugin-00:"], "write");

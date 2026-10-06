@@ -203,8 +203,10 @@ a.home-link:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}a
 .level-switch a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
 .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin:0 0 .5rem}\
 .section-head h2{margin:0 0 .15rem}.section-head .hint{margin:0}.section-head button{margin:0;flex-shrink:0}\
+.section-head>div{min-width:0;max-width:100%}.section-head .hint{white-space:normal;overflow-wrap:anywhere}\
+table.one-line .id{display:inline;margin-left:.4rem}table.one-line .flag{display:inline;padding:.1rem .45rem}\
 .scroll{overflow-x:auto}table.list td{vertical-align:middle}\
-@media (max-width:36rem){.section-head{flex-direction:column}td.actions{white-space:normal}}\
+@media (max-width:36rem){.section-head{flex-direction:column;align-items:stretch}td.actions{white-space:normal}}\
 table.list tbody tr:hover td{background:var(--line-soft)}\
 table.list .name{font-weight:550}table.list .hint{margin:.15rem 0 0}\
 table.list .note{overflow-wrap:anywhere}\

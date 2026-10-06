@@ -802,8 +802,11 @@ e2e-plugin-page: network
 # proves the kit's entry grid upgrades on a table's tab, adds rows past four
 # and posts them, takes 200 rows and refuses 201, that the plain table still
 # posts without script, and that every Settings page and tab fits one screen
-# at 1440x900 and 390x844 by the kit's own check; then again, the fit alone,
-# as a development deployment draws it. Its own network and no published
+# at 1440x900 and 390x844 by the kit's own check; and the Access editor per
+# role (contract v15): a row per plugin role, one line each, paged by the
+# kit's om-pager, an entry on a role no longer held flagged, a role's level
+# posted and held, and a two-role plugin's Access tab by role, each fitting
+# both sizes; then again, the fit alone, as a development deployment draws it. Its own network and no published
 # port. SHOTS=<dir> keeps a screenshot of each page and size.
 SETTINGS_PAGE_IMAGE := meridian-settings-page:local
 SETTINGS_BROWSER_IMAGE := meridian-e2e-settings-browser:local
@@ -843,7 +846,7 @@ e2e-settings-page:
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,

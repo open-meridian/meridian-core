@@ -636,6 +636,13 @@ pub fn render(
         .iter()
         .map(|line| (line.instance.clone(), line.name.clone().unwrap_or_default()))
         .collect();
+    // And every plugin a sidecar has reported (W6.1, contract v15), whether
+    // or not it runs now.
+    for known in &records.known_plugins {
+        if !instances.iter().any(|(id, _)| id == &known.plugin_instance_id) {
+            instances.push((known.plugin_instance_id.clone(), String::new()));
+        }
+    }
     for g in &records.access_groups {
         for e in &g.entries {
             if !instances.iter().any(|(id, _)| id == &e.plugin_instance_id) {
@@ -1117,12 +1124,12 @@ fn level_select(instance: &str, role: &str) -> String {
         format!("{} on {}", escape(role), escape(instance))
     };
     format!(
-        "<select name=\"level.{id}:{role}\" aria-label=\"Level: {on}\"><option value=\"\">Not in the group</option>\
+        "<select name=\"level.{id}:{role}\" aria-label=\"Level: {on}\"><option value=\"\">None</option>\
          <option value=\"read\">Read</option>\
-         <option value=\"write\">Write (includes read)</option>\
-         <option value=\"admin\">Admin (configures it, no account)</option>\
-         <option value=\"admin-read\">Admin and read</option>\
-         <option value=\"admin-write\">Admin and write</option></select>",
+         <option value=\"write\">Write</option>\
+         <option value=\"admin\">Admin</option>\
+         <option value=\"admin-read\">Admin, read</option>\
+         <option value=\"admin-write\">Admin, write</option></select>",
         id = escape(instance),
         role = escape(role),
     )

@@ -30,7 +30,7 @@ use meridian_domain::v1::{
     UserGroup,
 };
 use meridian_pb::v1::{
-    SettingChoice, SettingColumn, SettingColumnType, SettingCondition, SettingDeclaration,
+    AccessLevel, SettingChoice, SettingColumn, SettingColumnType, SettingCondition, SettingDeclaration,
     SettingType,
 };
 use prost::Message;
@@ -254,7 +254,94 @@ fn declared() -> Vec<SettingDeclaration> {
 /// columns offer.
 pub const ACCOUNTS: [&str; 4] = ["FID-401K-1", "FID-IRA-2", "SCHW-BRK-3", "VG-ROTH-4"];
 
+/// The plugin holding custody and operations whose Access tab and rows the
+/// browser checks (contract v15).
+pub const TWO_ROLES: &str = "ops-1";
+
+/// Access per role (contract v15): SnapTrade holding custody, a plugin
+/// holding custody and operations, a plugin holding none, and twenty more
+/// holding one role each, so the Access editor's rows page; access groups
+/// per role, one keeping an entry on a role its plugin no longer holds;
+/// thirty desks granted on the two-role plugin's roles, so its Access tab
+/// pages too.
+fn per_role(records: &mut AccessRecords) {
+    use meridian_domain::v1::{AccessEntry, AccessGroup, AccountGroup, KnownPluginRoles};
+    let known = |id: &str, roles: &[&str]| KnownPluginRoles {
+        plugin_instance_id: id.into(),
+        roles: roles.iter().map(|r| r.to_string()).collect(),
+    };
+    records.known_plugins = vec![
+        known(INSTANCE, &["custody"]),
+        known(TWO_ROLES, &["custody", "operations"]),
+        known("reference-1", &[]),
+    ];
+    for n in 0..20 {
+        records
+            .known_plugins
+            .push(known(&format!("plugin-{n:02}"), &[["custody", "operations", "dgm", "reporting"][n % 4]]));
+    }
+    let entry = |plugin: &str, role: &str, level: AccessLevel| AccessEntry {
+        plugin_instance_id: plugin.into(),
+        level: level as i32,
+        role: role.into(),
+    };
+    records.access_groups = vec![
+        AccessGroup {
+            access_group_id: "AX-RECON".into(),
+            name: "Reconciliation".into(),
+            entries: vec![
+                entry(TWO_ROLES, "operations", AccessLevel::Write),
+                entry(TWO_ROLES, "custody", AccessLevel::Read),
+            ],
+            built_in: false,
+        },
+        AccessGroup {
+            access_group_id: "AX-CUSTODY-ADMINS".into(),
+            name: "Custody admins".into(),
+            entries: vec![
+                entry(TWO_ROLES, "custody", AccessLevel::Admin),
+                entry(INSTANCE, "custody", AccessLevel::Admin),
+                // Kept as written: ops-1 was relaunched without ccm.
+                entry(TWO_ROLES, "ccm", AccessLevel::Admin),
+            ],
+            built_in: false,
+        },
+    ];
+    // Its settings record, as the conductor keeps one for every known plugin.
+    records.plugin_settings.push(PluginSettingsRecord {
+        plugin_instance_id: TWO_ROLES.into(),
+        ..Default::default()
+    });
+    records.account_groups.push(AccountGroup {
+        account_group_id: "AG-DESK".into(),
+        name: "The desk's accounts".into(),
+        account_ids: vec![],
+        built_in: false,
+    });
+    for n in 0..30 {
+        let group = format!("UG-DESK-{n:02}");
+        records.user_groups.push(UserGroup {
+            user_group_id: group.clone(),
+            name: format!("Desk {n:02}"),
+            directory_groups: vec![format!("desk-{n:02}")],
+            logins: vec![],
+        });
+        records.permissions.push(Permission {
+            permission_id: format!("P-DESK-{n:02}"),
+            user_group_id: group.clone(),
+            account_group_id: if n % 3 == 0 { String::new() } else { "AG-DESK".into() },
+            access_group_id: if n % 3 == 0 { "AX-CUSTODY-ADMINS" } else { "AX-RECON" }.into(),
+        });
+    }
+}
+
 fn records() -> AccessRecords {
+    let mut records = settings_records();
+    per_role(&mut records);
+    records
+}
+
+fn settings_records() -> AccessRecords {
     AccessRecords {
         user_groups: vec![UserGroup {
             user_group_id: "UG-1".into(),
@@ -420,6 +507,30 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 )?;
                 let record = records.plugin_settings[0].clone();
                 Ok(("".into(), record.encode_to_vec()))
+            },
+        );
+    }
+    {
+        // The stand-in conductor's access groups: kept as asked, the Access
+        // editor's rows a group's entries per role (contract v15).
+        let held = Arc::clone(&held);
+        bus.serve(
+            "platform.config.command.define-access-group",
+            move |envelope| {
+                let asked = meridian_domain::v1::DefineAccessGroupRequest::decode(
+                    &envelope.payload[..],
+                )
+                .map_err(|e| e.to_string())?;
+                let mut group = asked.access_group.unwrap_or_default();
+                if group.access_group_id.is_empty() {
+                    group.access_group_id = format!("AX-{}", group.name.to_uppercase());
+                }
+                let mut records = held.lock().unwrap();
+                records
+                    .access_groups
+                    .retain(|g| g.access_group_id != group.access_group_id);
+                records.access_groups.push(group.clone());
+                Ok(("".into(), group.encode_to_vec()))
             },
         );
     }

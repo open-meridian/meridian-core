@@ -213,6 +213,86 @@ def without_script_the_plain_table_posts(browser):
     ctx.close()
 
 
+ADMIN_PAGE = f"{BASE}/admin"
+TWO_ROLES = "ops-1"
+
+
+def inside_the_viewport(page):
+    """The open dialog's box within the viewport, as one screen."""
+    return page.evaluate("""() => {
+      const d = document.querySelector('dialog[open]');
+      if (!d) return 'no dialog open';
+      const r = d.getBoundingClientRect();
+      return (r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight + 1 && r.right <= innerWidth + 1)
+        ? '' : `the dialog reaches ${Math.round(r.right)}x${Math.round(r.bottom)}`;
+    }""")
+
+
+def the_access_editor_has_a_row_per_role(browser, prefix):
+    """Access per role (contract v15): the access group dialog's rows, one a
+    plugin role, one line each, paged by the kit; an entry on a role its
+    plugin no longer holds flagged; the per-plugin Access tab's rows by role;
+    each page and the open editor fitting one screen at both sizes."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#access-groups")
+        settled(page)
+        problems = page.evaluate(FIT)
+        check(not problems, f"the Access groups tab at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-access-groups-{size}.png"))
+        listed = page.inner_text("#access-groups")
+        check("ops-1 operations write" in listed and "ops-1 custody read" in listed,
+              f"at {size} each group lists its entries by role")
+        check("holds nothing" in listed, f"at {size} the entry on a role ops-1 no longer holds is flagged")
+
+        page.click("tr[data-id='AX-RECON'] button[data-dialog-open]")
+        page.wait_for_timeout(500)
+        editor = page.locator("dialog#access-group om-pager")
+        check(editor.count() == 1, f"at {size} the Access editor is paged by the kit's om-pager")
+        rows = page.locator("dialog#access-group table.access-roles > tbody > tr")
+        shown = page.evaluate("""() => [...document.querySelectorAll('dialog#access-group table.access-roles > tbody > tr')]
+          .filter(r => r.offsetParent !== null).length""")
+        check(rows.count() >= 24 and 0 < shown <= 6,
+              f"at {size} a row per plugin role ({rows.count()}), six a page ({shown} shown)")
+        check(page.input_value("select[name='level.ops-1:operations']") == "write"
+              and page.input_value("select[name='level.ops-1:custody']") == "read",
+              f"at {size} the Edit fills each role's level")
+        pager = page.evaluate("() => document.querySelector('dialog#access-group om-pager').shown")
+        check(pager and pager.get("total", 0) == rows.count(),
+              f"at {size} the pager counts every row: {pager}")
+        wraps = page.evaluate(FIT)
+        check(not wraps, f"the open Access editor at {size} fits one screen"
+              f"{': ' + '; '.join(wraps) if wraps else ''}")
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the Access editor stays within the viewport{': ' + boxed if boxed else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-access-editor-{size}.png"))
+        if size == "phone" and PASS != "fit":
+            page.select_option("select[name='level.ops-1:custody']", "admin-read")
+            page.click("dialog#access-group button[type=submit]")
+            settled(page)
+            listed = page.text_content("#access-groups")
+            check("ops-1 custody admin" in listed and "ops-1 custody read" in listed,
+                  f"a role's level posted from the editor is held: {listed[:200]!r}")
+
+        page.goto(f"{BASE}/admin/plugins/{TWO_ROLES}?tab=access")
+        settled(page)
+        problems = page.evaluate(FIT)
+        check(not problems, f"ops-1's Access tab at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        tab = page.text_content("main")
+        check("Role" in tab and "operations" in tab and "custody" in tab,
+              f"at {size} ops-1's Access tab lists each grant's role")
+        check("holds nothing: ops-1 holds custody, operations" in tab,
+              f"at {size} the grant on a role ops-1 no longer holds is flagged naming its roles")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-access-tab-{size}.png"))
+        check(not errors, f"the access pages at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
@@ -220,6 +300,7 @@ with sync_playwright() as playwright:
         the_grid_adds_rows_past_four_and_posts_them(browser)
         two_hundred_are_accepted_and_two_hundred_and_one_refused(browser)
         without_script_the_plain_table_posts(browser)
+    the_access_editor_has_a_row_per_role(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),
