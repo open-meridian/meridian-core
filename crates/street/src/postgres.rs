@@ -29,11 +29,12 @@ use r2d2_postgres::PostgresConnectionManager;
 use crate::amounts::{Exact, Money, Quantity};
 use crate::migrations;
 use crate::store::{
-    activity_cursor, check_activity, from_activity_cursor, from_statement_cursor,
-    from_sync_status_cursor, statement_cursor, sync_status_cursor, ActivitiesRead, Activity,
-    ActivityPage, Amended, Amendment, Cause, Chain, Change, Collateral, Completed, Completion,
-    Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures, Holding, Identifier, Kept,
-    Key, Lot, Opened, Page, Pending, Provenance, RawRecord, Read, Result, Scope, Settled, Side,
+    activity_cursor, activity_named, already_resolved, check_activity, check_re_resolution,
+    from_activity_cursor, from_statement_cursor, from_sync_status_cursor, sequence_cursor,
+    statement_cursor, sync_status_cursor, ActivitiesRead, Activity, ActivityPage, Amended,
+    Amendment, Cause, Chain, Change, Collateral, Completed, Completion, Cost, Counts,
+    CustodialPosition, Direction, Encumbrance, Figures, Holding, Identifier, Kept, Key, Lot,
+    Opened, Page, Pending, Provenance, RawRecord, ReResolution, Read, Result, Scope, Settled, Side,
     Statement, StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage,
     SyncStatusesRead, PARTITION, SYNC_STATUS_NOT_KNOWN_BEFORE,
 };
@@ -124,6 +125,13 @@ const ACTIVITY_COLUMNS: &str = "activity_id, account_id, external_account_id, so
         external_activity_id, trade_date, kind, instrument_id, units::text, record,
         recorded_at_ns, sequence, previous_sequence, cause_instance_id,
         cause_acting_for_subject, cause_correlation_id, cause_causation_id";
+
+/// A re-resolution's columns, in the order [`re_resolution_of`] reads them,
+/// joined to its activity as `a` for the names it was recorded under.
+const RE_RESOLUTION_COLUMNS: &str = "r.activity_id, r.account_id, a.source,
+        a.external_activity_id, r.instrument_id, r.provenance, r.resolved_at_ns,
+        r.recorded_at_ns, r.sequence, r.previous_sequence, r.cause_instance_id,
+        r.cause_acting_for_subject, r.cause_correlation_id, r.cause_causation_id";
 
 /// A sync status's columns, in the order [`sync_status_of`] reads them.
 const SYNC_STATUS_COLUMNS: &str = "account_id, external_account_id, source, state, history_from,
@@ -1056,11 +1064,94 @@ impl Store for PostgresStore {
         }
         .map_err(unavailable)?;
         let mut activities: Vec<Activity> = rows.iter().map(activity_of).collect::<Result<_>>()?;
-        let more = activities.len() > read.limit;
-        activities.truncate(read.limit);
-        let next_cursor = match activities.last() {
-            Some(last) if more => activity_cursor(last),
-            _ => String::new(),
+        let (re_resolutions, next_cursor) = match since {
+            // Since a watermark: the re-resolutions recorded after it, merged
+            // with the activities in the order recorded, the read's limit of
+            // the two together.
+            Some(since) => {
+                let mut re_resolutions: Vec<ReResolution> = tx
+                    .query(
+                        &format!(
+                            "SELECT {RE_RESOLUTION_COLUMNS}
+                               FROM activity_re_resolution r
+                               JOIN activity a USING (activity_id)
+                              WHERE ($1 = '' OR r.account_id = $1)
+                                AND ($2::text[] IS NULL OR r.account_id = ANY($2))
+                                AND ($3 = '' OR a.trade_date >= $3)
+                                AND ($4 = '' OR a.trade_date <= $4)
+                                AND r.sequence > $5 AND r.sequence > $6
+                              ORDER BY r.sequence
+                              LIMIT $7"
+                        ),
+                        &[
+                            &read.account_id,
+                            &within(&read.scope),
+                            &read.trade_date_from,
+                            &read.trade_date_to,
+                            &since,
+                            &after_sequence,
+                            &wanted,
+                        ],
+                    )
+                    .map_err(unavailable)?
+                    .iter()
+                    .map(re_resolution_of)
+                    .collect();
+                let mut merged: Vec<u64> = activities
+                    .iter()
+                    .map(|activity| activity.recorded.change.sequence)
+                    .chain(re_resolutions.iter().map(|re| re.recorded.change.sequence))
+                    .collect();
+                merged.sort_unstable();
+                let more = merged.len() > read.limit;
+                let last = if more {
+                    merged[read.limit - 1]
+                } else {
+                    u64::MAX
+                };
+                activities.retain(|activity| activity.recorded.change.sequence <= last);
+                re_resolutions.retain(|re| re.recorded.change.sequence <= last);
+                (
+                    re_resolutions,
+                    if more {
+                        sequence_cursor(last)
+                    } else {
+                        String::new()
+                    },
+                )
+            }
+            // By trade date: every re-resolution of the activities answered.
+            None => {
+                let more = activities.len() > read.limit;
+                activities.truncate(read.limit);
+                let next_cursor = match activities.last() {
+                    Some(last) if more => activity_cursor(last),
+                    _ => String::new(),
+                };
+                let answered: Vec<&str> = activities
+                    .iter()
+                    .map(|activity| activity.activity_id.as_str())
+                    .collect();
+                let re_resolutions = if answered.is_empty() {
+                    Vec::new()
+                } else {
+                    tx.query(
+                        &format!(
+                            "SELECT {RE_RESOLUTION_COLUMNS}
+                               FROM activity_re_resolution r
+                               JOIN activity a USING (activity_id)
+                              WHERE r.activity_id = ANY($1)
+                              ORDER BY r.sequence"
+                        ),
+                        &[&answered],
+                    )
+                    .map_err(unavailable)?
+                    .iter()
+                    .map(re_resolution_of)
+                    .collect()
+                };
+                (re_resolutions, next_cursor)
+            }
         };
         let history_from = if read.account_id.is_empty() {
             String::new()
@@ -1077,10 +1168,88 @@ impl Store for PostgresStore {
         tx.commit().map_err(unavailable)?;
         Ok(ActivityPage {
             activities,
+            re_resolutions,
             next_cursor,
             as_of,
             history_from,
         })
+    }
+
+    fn re_resolve(&self, mut re: ReResolution, cause: &Cause) -> Result<(ReResolution, Kept)> {
+        check_re_resolution(&re)?;
+        let mut conn = self.conn()?;
+        let named = Activity {
+            activity_id: String::new(),
+            account_id: re.account_id.clone(),
+            external_account_id: String::new(),
+            source: re.source.clone(),
+            external_activity_id: re.external_activity_id.clone(),
+            trade_date: String::new(),
+            kind: 0,
+            instrument_id: String::new(),
+            units: None,
+            record: Vec::new(),
+            recorded: Completed::default(),
+        };
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let Some(activity) = held_activity(&mut tx, &named)? else {
+            tx.rollback().map_err(unavailable)?;
+            return Err(StoreError::NoSuchActivity(activity_named(&re)));
+        };
+        re.activity_id = activity.activity_id.clone();
+
+        // Numbered first, which takes the partition head's row lock and so
+        // orders this against every other change: the latest resolution is
+        // read under it, so two re-resolutions naming the same cannot both be
+        // recorded. One already recorded rolls back, its number with it.
+        let change = next_change(&mut tx, Chain::ReResolution, &re.account_id)?;
+        let latest = tx
+            .query_opt(
+                &format!(
+                    "SELECT {RE_RESOLUTION_COLUMNS}
+                       FROM activity_re_resolution r
+                       JOIN activity a USING (activity_id)
+                      WHERE r.activity_id = $1
+                      ORDER BY r.sequence DESC
+                      LIMIT 1"
+                ),
+                &[&re.activity_id],
+            )
+            .map_err(unavailable)?
+            .as_ref()
+            .map(re_resolution_of);
+        if already_resolved(&activity, latest.as_ref(), &re) {
+            tx.rollback().map_err(unavailable)?;
+            return Ok((re, Kept::AlreadyRecorded));
+        }
+        tx.execute(
+            "INSERT INTO activity_re_resolution
+                    (sequence, previous_sequence, activity_id, account_id, instrument_id,
+                     provenance, resolved_at_ns, recorded_at_ns, cause_instance_id,
+                     cause_acting_for_subject, cause_correlation_id, cause_causation_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            &[
+                &(change.sequence as i64),
+                &(change.previous as i64),
+                &re.activity_id,
+                &re.account_id,
+                &re.instrument_id,
+                &re.provenance,
+                &re.resolved_at_ns,
+                &cause.committed_at_ns,
+                &cause.instance_id,
+                &cause.acting_for_subject,
+                &cause.correlation_id,
+                &cause.causation_id,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        re.recorded = Completed {
+            change,
+            cause: cause.clone(),
+        };
+        Ok((re, Kept::Recorded))
     }
 
     fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus> {
@@ -1272,6 +1441,31 @@ fn activity_of(row: &Row) -> Result<Activity> {
             },
         },
     })
+}
+
+fn re_resolution_of(row: &Row) -> ReResolution {
+    ReResolution {
+        activity_id: row.get(0),
+        account_id: row.get(1),
+        source: row.get(2),
+        external_activity_id: row.get(3),
+        instrument_id: row.get(4),
+        provenance: row.get(5),
+        resolved_at_ns: row.get(6),
+        recorded: Completed {
+            change: Change {
+                sequence: row.get::<_, i64>(8).max(0) as u64,
+                previous: row.get::<_, i64>(9).max(0) as u64,
+            },
+            cause: Cause {
+                instance_id: row.get(10),
+                acting_for_subject: row.get(11),
+                correlation_id: row.get(12),
+                causation_id: row.get(13),
+                committed_at_ns: row.get(7),
+            },
+        },
+    }
 }
 
 fn sync_status_of(row: &Row) -> Result<SyncStatus> {

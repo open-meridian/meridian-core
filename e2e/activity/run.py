@@ -20,6 +20,12 @@ step drives a plugin's page as a person does, or reads `store activity`,
    under income reinvested, as itself; the book moves nothing.
 5. Only when the person confirms does the book move: the lot the reinvestment
    bought, the break resolved.
+6. Re-resolved (contract v15; W2.15, W2.16): the stand-in custody reports a
+   reinvestment under a plan's own code, which resolves to nothing, then
+   re-resolves it to the fund as a person's plan-code link would, answered
+   as already recorded when sent again. The activity stays as first
+   recorded; its re-resolution is kept beside it, heard by operations'
+   stand-in with its cause and read beside the activity.
 
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
@@ -176,6 +182,41 @@ def run():
     must([line for line in store("activity") if line.startswith("activity|")] == activity,
          "step 5: the activity changed")
 
+    # 6. An activity under a plan's own code, re-resolved when the code is
+    # linked; the first record stands, the re-resolution beside it.
+    listening = post("operations", "/listen")
+    must(listening.get("listening"), f"step 6, listening: {listening}")
+    time.sleep(1)  # the stream open and the sidecar subscribed
+    plan = post("custody", "/plan-activity", level="admin")
+    must(plan.get("ok") and not plan["already_recorded"], f"step 6, the plan's activity: {plan}")
+    re_resolved = post("custody", "/re-resolve", level="admin")
+    must(re_resolved.get("ok") and re_resolved["activity_id"] == plan["activity_id"]
+         and not re_resolved["already_recorded"], f"step 6, re-resolved: {re_resolved}")
+    again = post("custody", "/re-resolve", level="admin")
+    must(again.get("ok") and again["already_recorded"], f"step 6, sent again: {again}")
+    lines = store("activity")
+    must(f"activity|{ACCOUNT}|stand-in|e2e-oqkr-2026-09-30|3||2026-09-30|1.50" in lines,
+         f"step 6, the activity as first recorded, unresolved: {lines}")
+    must([line for line in lines if line.startswith("re-resolution|")]
+         == [f"re-resolution|{ACCOUNT}|stand-in|e2e-oqkr-2026-09-30|1|{FUND}"],
+         f"step 6, the re-resolution kept once beside it: {lines}")
+    fund = read["activities"][0]["instrument_id"]
+    heard = until("operations' stand-in did not hear the re-resolution",
+                  lambda: (lambda said: said if said.get("re_resolutions") else None)(
+                      get("operations", "/heard")))
+    must(len(heard["re_resolutions"]) == 1, f"step 6, heard once: {heard}")
+    one = heard["re_resolutions"][0]
+    must(one["activity_id"] == plan["activity_id"] and one["account_id"] == account
+         and one["instrument_id"] == fund and "plan-code links" in one["person"]
+         and one["sequence"] > 0 and one["cause"] not in ("", "operations"),
+         f"step 6, what operations heard: {one}")
+    read = get("operations", f"/activity?account={account}")
+    kept = [a for a in read["activities"] if a["external_activity_id"] == "e2e-oqkr-2026-09-30"]
+    must(len(kept) == 1 and kept[0]["instrument_id"] == "", f"step 6, read as first recorded: {read}")
+    must(read["re_resolutions"] == [{"activity_id": plan["activity_id"], "account_id": account,
+                                     "instrument_id": fund, "person": one["person"]}],
+         f"step 6, the re-resolution read beside it: {read}")
+
     took = int(time.time() - started)
     print(f"e2e-activity OK in {took}s: on the plugin harness, the stand-in custody reports a "
           "statement holding a money market fund, a sync status needing a person to sign in "
@@ -183,7 +224,9 @@ def run():
           "once however often it is sent; operations' stand-in reads the activity with its "
           "history_from and the sync status within its scope, records a break on the fund's "
           "units with the reinvestment as its cause under income reinvested, and the book "
-          "moves nothing until the person confirms the lot it bought")
+          "moves nothing until the person confirms the lot it bought; an activity under a "
+          "plan's own code is re-resolved to the fund once, kept beside the activity as first "
+          "recorded, heard by operations and read with it")
 
 
 def main():

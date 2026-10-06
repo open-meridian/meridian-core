@@ -95,7 +95,10 @@ pub mod store;
 
 mod memory;
 
-pub use activity::{list_activities, list_sync_statuses, record_activity, record_sync_status};
+pub use activity::{
+    list_activities, list_sync_statuses, re_resolve_activity, record_activity, record_sync_status,
+    ReResolved,
+};
 pub use amounts::{Money, Quantity};
 pub use memory::MemoryStore;
 pub use positions::{list_positions, list_statements};
@@ -104,7 +107,7 @@ pub use record::{move_positions, open_statement, record_holding, Recorded};
 pub use store::{
     ActivitiesRead, Activity, ActivityPage, Amended, Amendment, Cause, Chain, Change, Collateral,
     Completed, Completion, Cost, Counts, CustodialPosition, Direction, Encumbrance, Figures,
-    Holding, Kept, Key, Lot, Opened, Pending, Provenance, RawRecord, Scope, Settled, Side,
-    Statement, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead, PARTITION,
+    Holding, Kept, Key, Lot, Opened, Pending, Provenance, RawRecord, ReResolution, Scope, Settled,
+    Side, Statement, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead, PARTITION,
     SYNC_STATUS_NOT_KNOWN_BEFORE,
 };

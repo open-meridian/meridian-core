@@ -33,6 +33,8 @@
 //! as a tombstone so that read sees the removal.
 
 use std::collections::BTreeSet;
+
+use prost::Message;
 use std::fmt;
 
 use crate::amounts::{Money, Quantity, Refused};
@@ -106,6 +108,13 @@ pub enum StoreError {
     #[error("the statement has no row for {0}; a backfill amends a row already recorded")]
     NoSuchRow(String),
 
+    /// A re-resolution naming no activity recorded (W2.15, contract v15): a
+    /// re-resolution resolves no activity into existence.
+    #[error(
+        "no activity is recorded as {0}; a re-resolution re-resolves an activity already recorded"
+    )]
+    NoSuchActivity(String),
+
     /// A quantity or an amount outside what the wire carries, named.
     #[error(transparent)]
     OutOfRange(#[from] Refused),
@@ -149,6 +158,9 @@ pub enum Chain {
     Activity,
     /// Each sync status the street heard (W2.13, contract v14).
     SyncStatus,
+    /// Each re-resolution of an activity (W2.16, contract v15), apart from
+    /// the activities, so a reader hearing only those sees no gap.
+    ReResolution,
 }
 
 impl Chain {
@@ -158,6 +170,7 @@ impl Chain {
             Chain::Statement => "statement",
             Chain::Activity => "activity",
             Chain::SyncStatus => "sync_status",
+            Chain::ReResolution => "re_resolution",
         }
     }
 }
@@ -929,7 +942,28 @@ pub struct Activity {
     pub recorded: Completed,
 }
 
-/// What recording an activity did.
+/// One re-resolution of an activity (W2.15, W2.16; contract v15): the
+/// instrument the activity now resolves to and how, kept beside the activity
+/// as first recorded, which it never changes (decisions/031).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReResolution {
+    /// The activity it sits beside: filled by the store from the three
+    /// below, which name it as it was recorded.
+    pub activity_id: String,
+    pub account_id: String,
+    pub source: String,
+    pub external_activity_id: String,
+    /// Empty where the link it had been resolved by was removed.
+    pub instrument_id: String,
+    /// The Provenance, encoded as it arrived.
+    pub provenance: Vec<u8>,
+    /// When what resolves it was made, as the plugin sent it.
+    pub resolved_at_ns: i64,
+    /// Its change and who caused it, the cause's time when it was recorded.
+    pub recorded: Completed,
+}
+
+/// What recording an activity, or a re-resolution of one, did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kept {
     /// New, numbered and recorded now: announced (W2.12).
@@ -988,9 +1022,15 @@ pub struct ActivitiesRead {
 
 /// A page of activity, the number it was read at, and the named account's
 /// `history_from` as its latest sync status said it.
+///
+/// Its re-resolutions (W2.11, contract v15): by trade date, every one of the
+/// activities answered; since a watermark, those recorded after it, merged
+/// with the activities in the order recorded, a page holding at most the
+/// read's limit of the two together, so each is answered once across pages.
 #[derive(Debug, Clone, Default)]
 pub struct ActivityPage {
     pub activities: Vec<Activity>,
+    pub re_resolutions: Vec<ReResolution>,
     pub next_cursor: String,
     pub as_of: u64,
     pub history_from: String,
@@ -1027,6 +1067,13 @@ pub fn activity_cursor(activity: &Activity) -> String {
         activity.trade_date,
         activity.recorded.change.sequence
     )
+}
+
+/// A page's cursor when read since a watermark, whose last item may be a
+/// re-resolution: its number alone, the date part empty, which a read since a
+/// watermark never compares.
+pub fn sequence_cursor(sequence: u64) -> String {
+    format!("0:{sequence}")
 }
 
 /// An activity cursor read back, or refused.
@@ -1186,6 +1233,15 @@ pub trait Store: Send + Sync {
     /// named account's `history_from` from its latest sync status.
     fn activities(&self, read: &ActivitiesRead) -> Result<ActivityPage>;
 
+    /// Re-resolve a recorded activity (W2.15, W2.16): the activity named by
+    /// its source, account and the custodian's identifier, refused when none
+    /// is; numbered in the partition and chained to the account's last
+    /// re-resolution, apart from the activities, and recorded with `cause`;
+    /// or, naming the instrument and provenance its latest resolution names,
+    /// that answered as already recorded, changing nothing and taking no
+    /// number.
+    fn re_resolve(&self, re: ReResolution, cause: &Cause) -> Result<(ReResolution, Kept)>;
+
     /// Record a sync status (W2.13): every one heard is a record, numbered
     /// and chained to the last of its account's, '' for an unlinked one.
     fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus>;
@@ -1215,4 +1271,82 @@ pub fn check_activity(activity: &Activity) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a re-resolution that names no account, source or identifier, says
+/// not how it was resolved or when (W2.15): the sidecar refuses an unlinked
+/// one first and the wire requires the rest, so this is the second line.
+pub fn check_re_resolution(re: &ReResolution) -> Result<()> {
+    if re.account_id.is_empty() {
+        return Err(StoreError::Edge(
+            "a re-resolution names no account: its external account is not linked".into(),
+        ));
+    }
+    if re.source.is_empty() {
+        return Err(StoreError::Edge("source names no source".into()));
+    }
+    if re.external_activity_id.is_empty() {
+        return Err(StoreError::Edge(
+            "external_activity_id is empty; a re-resolution names the activity it re-resolves"
+                .into(),
+        ));
+    }
+    let provenance = meridian_pb::v1::Provenance::decode(&re.provenance[..]).unwrap_or_default();
+    let kind = meridian_pb::v1::ProvenanceKind::try_from(provenance.kind).ok();
+    if !matches!(
+        kind,
+        Some(meridian_pb::v1::ProvenanceKind::Supplied | meridian_pb::v1::ProvenanceKind::Derived)
+    ) {
+        return Err(StoreError::Edge(
+            "provenance.kind is neither supplied nor derived; a re-resolution is a person's link \
+             or a named rule, never the custodian's word"
+                .into(),
+        ));
+    }
+    if re.resolved_at_ns == 0 {
+        return Err(StoreError::Edge(
+            "resolved_at_ns is 0; a re-resolution says when what resolves it was made".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// How a re-resolution names its activity in a refusal.
+pub fn activity_named(re: &ReResolution) -> String {
+    format!(
+        "{} from {} on {}",
+        re.external_activity_id, re.source, re.account_id
+    )
+}
+
+/// What an activity's latest resolution names, its instrument and its
+/// provenance encoded: its latest re-resolution's, or, with none, the
+/// activity's own as first recorded -- its instrument and the provenance it
+/// carried for it, none where the custodian's code resolved it.
+pub fn latest_resolution(activity: &Activity, latest: Option<&ReResolution>) -> (String, Vec<u8>) {
+    if let Some(latest) = latest {
+        return (latest.instrument_id.clone(), latest.provenance.clone());
+    }
+    let own = meridian_domain::v1::CustodialActivity::decode(&activity.record[..])
+        .ok()
+        .and_then(|first| {
+            first
+                .provenance
+                .into_iter()
+                .find(|provenance| provenance.field == "instrument_id")
+        })
+        .map(|provenance| provenance.encode_to_vec())
+        .unwrap_or_default();
+    (activity.instrument_id.clone(), own)
+}
+
+/// Whether a re-resolution names what the activity's latest resolution
+/// already names, so nothing is recorded.
+pub fn already_resolved(
+    activity: &Activity,
+    latest: Option<&ReResolution>,
+    re: &ReResolution,
+) -> bool {
+    let (instrument_id, provenance) = latest_resolution(activity, latest);
+    instrument_id == re.instrument_id && provenance == re.provenance
 }

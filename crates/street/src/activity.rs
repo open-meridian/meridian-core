@@ -11,6 +11,12 @@
 //! that is merely old; and a read of an account's activity answers how far
 //! back its history reaches from the latest it keeps (W2.11).
 //!
+//! From contract v15 an activity whose instrument resolves later is
+//! re-resolved (W2.15): the street keeps each re-resolution as a record of
+//! its own beside the activity as first recorded, which never changes,
+//! chained per account apart from the activities, announces it whole
+//! (W2.16), and answers it beside the activity on a read.
+//!
 //! # Nothing is derived
 //!
 //! Activity is evidence, never a source (the spec's requirement 8): nothing
@@ -19,8 +25,9 @@
 //! the store takes out only what a read selects and orders by.
 
 use meridian_domain::v1::{
-    ActivityRecordedEvent, CustodialActivity, ListActivitiesReply, ListActivitiesRequest,
-    ListSyncStatusesReply, ListSyncStatusesRequest, RecordActivityReply, RecordActivityRequest,
+    ActivityReResolution, ActivityReResolvedEvent, ActivityRecordedEvent, CustodialActivity,
+    ListActivitiesReply, ListActivitiesRequest, ListSyncStatusesReply, ListSyncStatusesRequest,
+    ReResolveActivityReply, ReResolveActivityRequest, RecordActivityReply, RecordActivityRequest,
     SyncStatusEvent, SyncStatusRecordedEvent,
 };
 use meridian_pb::bounds::{
@@ -33,8 +40,8 @@ use crate::ids;
 use crate::positions::{as_of, limit, since};
 use crate::record::{to_wire_cause, to_wire_journal};
 use crate::store::{
-    ActivitiesRead, Activity, Cause, Completed, Kept, Result, Scope, Store, StoreError, SyncStatus,
-    SyncStatusesRead,
+    ActivitiesRead, Activity, Cause, Completed, Kept, ReResolution, Result, Scope, Store,
+    StoreError, SyncStatus, SyncStatusesRead,
 };
 
 /// What recording an activity did: the reply, and the event to announce when
@@ -87,6 +94,54 @@ pub fn record_activity(
     })
 }
 
+/// What re-resolving an activity did: the reply, and the event to announce
+/// when a re-resolution was recorded now. One answered as already recorded
+/// announces nothing.
+#[derive(Debug)]
+pub struct ReResolved {
+    pub reply: ReResolveActivityReply,
+    pub event: Option<ActivityReResolvedEvent>,
+}
+
+/// W2.15, then W2.16: the activity named by its source, the account the
+/// sidecar stamped and the custodian's identifier re-resolved, its
+/// re-resolution kept beside it; or, naming what its latest resolution
+/// names, answered as already recorded. Refused naming the activity when
+/// none is recorded under that identity.
+pub fn re_resolve_activity(
+    store: &dyn Store,
+    request: &ReResolveActivityRequest,
+    cause: &Cause,
+) -> Result<ReResolved> {
+    let (held, kept) = store.re_resolve(
+        ReResolution {
+            activity_id: String::new(),
+            account_id: request.account_id.clone(),
+            source: request.source.clone(),
+            external_activity_id: request.external_activity_id.clone(),
+            instrument_id: request.instrument_id.clone(),
+            provenance: request
+                .provenance
+                .as_ref()
+                .map(Message::encode_to_vec)
+                .unwrap_or_default(),
+            resolved_at_ns: request.resolved_at_ns,
+            recorded: Completed::default(),
+        },
+        cause,
+    )?;
+    Ok(ReResolved {
+        reply: ReResolveActivityReply {
+            activity_id: held.activity_id.clone(),
+            already_recorded: kept == Kept::AlreadyRecorded,
+        },
+        event: match kept {
+            Kept::Recorded => Some(activity_re_resolved(&held)?),
+            Kept::AlreadyRecorded => None,
+        },
+    })
+}
+
 /// W2.11: activity within the reader's scope, each as it was announced, with
 /// the named account's `history_from`.
 pub fn list_activities(
@@ -112,8 +167,11 @@ pub fn list_activities(
         next_cursor: page.next_cursor,
         as_of: Some(as_of(page.as_of)),
         history_from: page.history_from,
-        // The street keeps no re-resolution until W2.16 is built.
-        re_resolutions: Vec::new(),
+        re_resolutions: page
+            .re_resolutions
+            .iter()
+            .map(activity_re_resolution)
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -183,6 +241,32 @@ fn activity_recorded(activity: &Activity) -> Result<ActivityRecordedEvent> {
         recorded_at_ns: activity.recorded.cause.committed_at_ns,
         journal: Some(to_wire_journal(activity.recorded.change)),
         cause: Some(to_wire_cause(&activity.recorded.cause)),
+    })
+}
+
+/// A re-resolution as the street keeps it, announced (W2.16) and read
+/// (W2.11).
+fn activity_re_resolution(re: &ReResolution) -> Result<ActivityReResolution> {
+    Ok(ActivityReResolution {
+        activity_id: re.activity_id.clone(),
+        account_id: re.account_id.clone(),
+        instrument_id: re.instrument_id.clone(),
+        provenance: Some(decoded(&re.provenance, "a re-resolution's provenance")?),
+        resolved_at_ns: re.resolved_at_ns,
+        recorded_at_ns: re.recorded.cause.committed_at_ns,
+        journal: Some(to_wire_journal(re.recorded.change)),
+    })
+}
+
+/// A re-resolution announced (W2.16): its record whole, its account, who
+/// caused it and its number at the top, as every delivered record carries
+/// them.
+fn activity_re_resolved(re: &ReResolution) -> Result<ActivityReResolvedEvent> {
+    Ok(ActivityReResolvedEvent {
+        account_id: re.account_id.clone(),
+        re_resolution: Some(activity_re_resolution(re)?),
+        cause: Some(to_wire_cause(&re.recorded.cause)),
+        journal: Some(to_wire_journal(re.recorded.change)),
     })
 }
 
@@ -764,5 +848,304 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.instruments_held().unwrap().is_empty());
+    }
+
+    // ── An activity re-resolved (contract v15: W2.15, W2.16) ──
+
+    /// A 401(k)'s reinvestment, its plan code OQKR not yet linked.
+    fn unresolved(account: &str, id: &str) -> RecordActivityRequest {
+        let mut request = reinvestment(account, id, "2026-09-30");
+        let activity = request.activity.as_mut().unwrap();
+        activity.instrument_id = String::new();
+        activity.instrument_as_reported = Some(meridian_pb::v1::AsReported {
+            scheme: "snaptrade:plan-code".into(),
+            code: "OQKR".into(),
+            text: "OQKR".into(),
+        });
+        request
+    }
+
+    fn linked(person: &str) -> meridian_pb::v1::Provenance {
+        meridian_pb::v1::Provenance {
+            field: "instrument_id".into(),
+            kind: meridian_pb::v1::ProvenanceKind::Supplied as i32,
+            person: person.into(),
+            ..Default::default()
+        }
+    }
+
+    fn re_resolution(account: &str, id: &str, instrument: &str) -> ReResolveActivityRequest {
+        ReResolveActivityRequest {
+            account_id: account.into(),
+            external_account_id: format!("SNAP-{account}"),
+            source: "snaptrade".into(),
+            external_activity_id: id.into(),
+            instrument_id: instrument.into(),
+            provenance: Some(linked("Ada Park, in the plan-code links")),
+            resolved_at_ns: NOW - 60,
+        }
+    }
+
+    #[test]
+    fn a_re_resolution_is_kept_beside_the_activity_which_never_changes() {
+        let store = MemoryStore::new();
+        let first = record_activity(&store, &unresolved("ACC-1", "oqkr-1"), &by("c", NOW))
+            .unwrap()
+            .event
+            .unwrap();
+        let done = re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "oqkr-1", "INS-VIGIX"),
+            &by("custody-1", NOW + 5),
+        )
+        .unwrap();
+        assert_eq!(done.reply.activity_id, first.activity_id);
+        assert!(!done.reply.already_recorded);
+        let event = done
+            .event
+            .expect("a re-resolution recorded now is announced");
+        assert_eq!(event.account_id, "ACC-1");
+        let re = event.re_resolution.clone().unwrap();
+        assert_eq!(
+            (re.activity_id.as_str(), re.account_id.as_str()),
+            (first.activity_id.as_str(), "ACC-1")
+        );
+        assert_eq!(re.instrument_id, "INS-VIGIX");
+        assert_eq!(
+            re.provenance,
+            Some(linked("Ada Park, in the plan-code links"))
+        );
+        assert_eq!((re.resolved_at_ns, re.recorded_at_ns), (NOW - 60, NOW + 5));
+        // Its own number, at the top as in the record, chained apart.
+        assert_eq!(event.journal, re.journal);
+        let journal = re.journal.unwrap();
+        assert_eq!((journal.sequence, journal.previous_sequence), (2, 0));
+        assert_eq!(event.cause.unwrap().instance_id, "custody-1");
+
+        let read = list_activities(
+            &store,
+            &ListActivitiesRequest::default(),
+            &Scope::Everything,
+        )
+        .unwrap();
+        assert_eq!(
+            read.activities,
+            vec![first],
+            "the activity as first recorded"
+        );
+        assert_eq!(read.re_resolutions, vec![event.re_resolution.unwrap()]);
+    }
+
+    #[test]
+    fn a_re_resolution_naming_the_latest_is_already_recorded_and_takes_no_number() {
+        let store = MemoryStore::new();
+        record_activity(&store, &unresolved("ACC-1", "oqkr-1"), &by("c", NOW)).unwrap();
+        let request = re_resolution("ACC-1", "oqkr-1", "INS-VIGIX");
+        re_resolve_activity(&store, &request, &by("c", NOW + 1)).unwrap();
+        let again = re_resolve_activity(&store, &request, &by("c", NOW + 2)).unwrap();
+        assert!(again.reply.already_recorded && again.event.is_none());
+        assert!(!again.reply.activity_id.is_empty());
+
+        // Changed, then removed: each its own record, chained per account.
+        let changed = re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "oqkr-1", "INS-VFIAX"),
+            &by("c", NOW + 3),
+        )
+        .unwrap()
+        .event
+        .unwrap();
+        let journal = changed.journal.unwrap();
+        assert_eq!((journal.sequence, journal.previous_sequence), (3, 2));
+        let removed = re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "oqkr-1", ""),
+            &by("c", NOW + 4),
+        )
+        .unwrap()
+        .event
+        .expect("unresolved again is a re-resolution");
+        assert_eq!(removed.re_resolution.unwrap().instrument_id, "");
+        let read = list_activities(
+            &store,
+            &ListActivitiesRequest::default(),
+            &Scope::Everything,
+        )
+        .unwrap();
+        let instruments: Vec<_> = read
+            .re_resolutions
+            .iter()
+            .map(|re| re.instrument_id.as_str())
+            .collect();
+        assert_eq!(instruments, ["INS-VIGIX", "INS-VFIAX", ""]);
+    }
+
+    #[test]
+    fn a_re_resolution_naming_what_the_activity_first_named_is_already_recorded() {
+        let store = MemoryStore::new();
+        let mut request = reinvestment("ACC-1", "linked-1", "2026-09-30");
+        request
+            .activity
+            .as_mut()
+            .unwrap()
+            .provenance
+            .push(linked("Ada Park, in the plan-code links"));
+        record_activity(&store, &request, &by("c", NOW)).unwrap();
+        let same = re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "linked-1", "INS-SPAXX"),
+            &by("c", NOW + 1),
+        )
+        .unwrap();
+        assert!(same.reply.already_recorded && same.event.is_none());
+    }
+
+    #[test]
+    fn re_resolutions_are_chained_apart_from_the_activities() {
+        let store = MemoryStore::new();
+        record_activity(&store, &unresolved("ACC-1", "1"), &by("c", NOW)).unwrap();
+        re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "1", "INS-VIGIX"),
+            &by("c", NOW),
+        )
+        .unwrap();
+        let second = record_activity(&store, &unresolved("ACC-1", "2"), &by("c", NOW))
+            .unwrap()
+            .event
+            .unwrap()
+            .journal
+            .unwrap();
+        assert_eq!(
+            (second.sequence, second.previous_sequence),
+            (3, 1),
+            "the activities' chain sees no gap from a re-resolution"
+        );
+    }
+
+    #[test]
+    fn a_re_resolution_naming_no_recorded_activity_or_saying_not_how_is_refused() {
+        let store = MemoryStore::new();
+        record_activity(&store, &unresolved("ACC-1", "1"), &by("c", NOW)).unwrap();
+        let none = re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "never-sent", "INS-VIGIX"),
+            &by("c", NOW),
+        )
+        .unwrap_err();
+        assert!(matches!(none, StoreError::NoSuchActivity(_)));
+        assert!(none
+            .to_string()
+            .contains("never-sent from snaptrade on ACC-1"));
+        let elsewhere = re_resolution("ACC-2", "1", "INS-VIGIX");
+        assert!(matches!(
+            re_resolve_activity(&store, &elsewhere, &by("c", NOW)),
+            Err(StoreError::NoSuchActivity(_))
+        ));
+
+        let mut unsaid = re_resolution("ACC-1", "1", "INS-VIGIX");
+        unsaid.provenance = None;
+        let mut reported = re_resolution("ACC-1", "1", "INS-VIGIX");
+        reported.provenance.as_mut().unwrap().kind =
+            meridian_pb::v1::ProvenanceKind::Reported as i32;
+        let mut undated = re_resolution("ACC-1", "1", "INS-VIGIX");
+        undated.resolved_at_ns = 0;
+        let unlinked = re_resolution("", "1", "INS-VIGIX");
+        for refused in [unsaid, reported, undated, unlinked] {
+            assert!(matches!(
+                re_resolve_activity(&store, &refused, &by("c", NOW)),
+                Err(StoreError::Edge(_))
+            ));
+        }
+        let read = list_activities(
+            &store,
+            &ListActivitiesRequest::default(),
+            &Scope::Everything,
+        )
+        .unwrap();
+        assert!(read.re_resolutions.is_empty(), "nothing refused is kept");
+    }
+
+    #[test]
+    fn since_a_watermark_re_resolutions_are_read_with_the_activities_once_each() {
+        let store = MemoryStore::new();
+        // 1 activity, 2 re-resolution, 3 activity, 4 re-resolution of the
+        // first, on another account a 5 activity and a 6 re-resolution.
+        record_activity(&store, &unresolved("ACC-1", "1"), &by("c", NOW)).unwrap();
+        re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "1", "INS-VIGIX"),
+            &by("c", NOW),
+        )
+        .unwrap();
+        record_activity(&store, &unresolved("ACC-1", "2"), &by("c", NOW)).unwrap();
+        re_resolve_activity(
+            &store,
+            &re_resolution("ACC-1", "1", "INS-VFIAX"),
+            &by("c", NOW),
+        )
+        .unwrap();
+        record_activity(&store, &unresolved("ACC-9", "9"), &by("c", NOW)).unwrap();
+        re_resolve_activity(
+            &store,
+            &re_resolution("ACC-9", "9", "INS-VIGIX"),
+            &by("c", NOW),
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let page = list_activities(
+                &store,
+                &ListActivitiesRequest {
+                    since: Some(watermark(1)),
+                    page_size: 2,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                },
+                &within(&["ACC-1"]),
+            )
+            .unwrap();
+            assert!(page.activities.len() + page.re_resolutions.len() <= 2);
+            seen.extend(
+                page.activities
+                    .iter()
+                    .map(|a| a.journal.as_ref().unwrap().sequence),
+            );
+            seen.extend(
+                page.re_resolutions
+                    .iter()
+                    .map(|re| re.journal.as_ref().unwrap().sequence),
+            );
+            if page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            [2, 3, 4],
+            "each once, within the scope, after the watermark"
+        );
+
+        // By trade date: every re-resolution of the activities answered.
+        let dated = list_activities(
+            &store,
+            &ListActivitiesRequest {
+                account_id: "ACC-1".into(),
+                page_size: 1,
+                ..Default::default()
+            },
+            &Scope::Everything,
+        )
+        .unwrap();
+        assert_eq!(dated.activities.len(), 1);
+        assert_eq!(dated.re_resolutions.len(), 2);
+        assert!(dated
+            .re_resolutions
+            .iter()
+            .all(|re| re.activity_id == dated.activities[0].activity_id));
     }
 }

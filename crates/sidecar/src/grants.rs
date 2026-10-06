@@ -310,6 +310,30 @@ platform.config.query.plugin-configuration\tquery\tsidecar\tconductor
     }
 
     #[test]
+    fn the_compiled_in_contract_admits_a_re_resolution_from_custody_heard_by_operations() {
+        // Contract v15 (W2.15, W2.16): custody re-resolves a recorded
+        // activity, the street keeps it, and operations hears it; a plugin
+        // holding both is admitted it by custody alone.
+        let contract = Contract::embedded();
+        let custody = contract.grants_for(&roles(&["custody"])).unwrap();
+        let operations = contract.grants_for(&roles(&["operations"])).unwrap();
+        assert!(custody.may_publish("platform.street.command.re-resolve-activity"));
+        assert!(!operations.may_publish("platform.street.command.re-resolve-activity"));
+        assert!(operations.may_subscribe("platform.street.event.activity-re-resolved"));
+        assert!(!custody.may_subscribe("platform.street.event.activity-re-resolved"));
+        assert_eq!(
+            contract.roles_granting(
+                &roles(&["custody", "operations"]),
+                "platform.street.command.re-resolve-activity"
+            ),
+            ["custody"]
+        );
+        let street = contract.component("street");
+        assert!(street.may_subscribe("platform.street.command.re-resolve-activity"));
+        assert!(street.may_publish("platform.street.event.activity-re-resolved"));
+    }
+
+    #[test]
     fn the_roles_granting_a_topic_are_each_role_holding_it() {
         const TWO: &str = "\
 topic\tkind\tpublisher\tsubscriber

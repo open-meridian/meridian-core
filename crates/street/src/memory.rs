@@ -9,10 +9,11 @@ use std::sync::RwLock;
 
 use crate::amounts::Quantity;
 use crate::store::{
-    activity_cursor, check_activity, connection, from_activity_cursor, from_statement_cursor,
-    from_sync_status_cursor, statement_cursor, sync_status_cursor, ActivitiesRead, Activity,
-    ActivityPage, Amended, Amendment, Cause, Chain, Change, Completed, Completion, Counts,
-    CustodialPosition, Holding, Kept, Key, Opened, Page, Read, Result, Settled, Side, Statement,
+    activity_cursor, activity_named, already_resolved, check_activity, check_re_resolution,
+    connection, from_activity_cursor, from_statement_cursor, from_sync_status_cursor,
+    sequence_cursor, statement_cursor, sync_status_cursor, ActivitiesRead, Activity, ActivityPage,
+    Amended, Amendment, Cause, Chain, Change, Completed, Completion, Counts, CustodialPosition,
+    Holding, Kept, Key, Opened, Page, ReResolution, Read, Result, Settled, Side, Statement,
     StatementPage, StatementsRead, Store, StoreError, SyncStatus, SyncStatusPage, SyncStatusesRead,
     SYNC_STATUS_NOT_KNOWN_BEFORE,
 };
@@ -119,6 +120,10 @@ impl Store for MemoryStore {
         self.read()?.activities_page(read)
     }
 
+    fn re_resolve(&self, re: ReResolution, cause: &Cause) -> Result<(ReResolution, Kept)> {
+        self.write()?.re_resolve(re, cause)
+    }
+
     fn record_sync_status(&self, status: SyncStatus, cause: &Cause) -> Result<SyncStatus> {
         Ok(self.write()?.record_sync_status(status, cause))
     }
@@ -163,6 +168,10 @@ pub(crate) struct Held {
 
     /// Each sync status heard, in the order recorded (W2.13).
     pub(crate) sync_statuses: Vec<SyncStatus>,
+
+    /// Each re-resolution of an activity, in the order recorded (W2.16,
+    /// contract v15). The activity in `activities` stays as first recorded.
+    pub(crate) re_resolutions: Vec<ReResolution>,
 }
 
 impl Held {
@@ -662,6 +671,39 @@ impl Held {
         Ok((activity, Kept::Recorded))
     }
 
+    pub(crate) fn re_resolve(
+        &mut self,
+        mut re: ReResolution,
+        cause: &Cause,
+    ) -> Result<(ReResolution, Kept)> {
+        check_re_resolution(&re)?;
+        let key = (
+            re.source.clone(),
+            re.account_id.clone(),
+            re.external_activity_id.clone(),
+        );
+        let activity = match self.activity_by_external.get(&key) {
+            Some(&at) => &self.activities[at],
+            None => return Err(StoreError::NoSuchActivity(activity_named(&re))),
+        };
+        re.activity_id = activity.activity_id.clone();
+        let latest = self
+            .re_resolutions
+            .iter()
+            .rev()
+            .find(|held| held.activity_id == re.activity_id);
+        if already_resolved(activity, latest, &re) {
+            return Ok((re, Kept::AlreadyRecorded));
+        }
+        let change = self.next(Chain::ReResolution, &re.account_id);
+        re.recorded = Completed {
+            change,
+            cause: cause.clone(),
+        };
+        self.re_resolutions.push(re.clone());
+        Ok((re, Kept::Recorded))
+    }
+
     pub(crate) fn activities_page(&self, read: &ActivitiesRead) -> Result<ActivityPage> {
         read.scope.admit(&read.account_id)?;
         let after = if read.cursor.is_empty() {
@@ -710,18 +752,85 @@ impl Held {
             })
             .take(read.limit + 1)
             .collect();
+        if let Some(since) = read.since {
+            // Since a watermark: the activities and the re-resolutions
+            // recorded after it, merged in the order recorded, the read's
+            // limit of the two together.
+            let above = after.as_ref().map_or(since, |(_, at)| since.max(*at));
+            let mut re_resolutions: Vec<&ReResolution> = self
+                .re_resolutions
+                .iter()
+                .filter(|re| re.recorded.change.sequence > above)
+                .filter(|re| self.answers_re_resolution(read, re))
+                .take(read.limit + 1)
+                .collect();
+            let mut merged: Vec<u64> = page
+                .iter()
+                .map(|activity| activity.recorded.change.sequence)
+                .chain(re_resolutions.iter().map(|re| re.recorded.change.sequence))
+                .collect();
+            merged.sort_unstable();
+            let more = merged.len() > read.limit;
+            let last = if more {
+                merged[read.limit - 1]
+            } else {
+                u64::MAX
+            };
+            page.retain(|activity| activity.recorded.change.sequence <= last);
+            re_resolutions.retain(|re| re.recorded.change.sequence <= last);
+            return Ok(ActivityPage {
+                activities: page.into_iter().cloned().collect(),
+                re_resolutions: re_resolutions.into_iter().cloned().collect(),
+                next_cursor: if more {
+                    sequence_cursor(last)
+                } else {
+                    String::new()
+                },
+                as_of: self.head,
+                history_from: self.history_from(&read.account_id),
+            });
+        }
         let more = page.len() > read.limit;
         page.truncate(read.limit);
         let next_cursor = match page.last() {
             Some(last) if more => activity_cursor(last),
             _ => String::new(),
         };
+        // By trade date: every re-resolution of the activities answered.
+        let answered: std::collections::HashSet<&str> = page
+            .iter()
+            .map(|activity| activity.activity_id.as_str())
+            .collect();
+        let re_resolutions = self
+            .re_resolutions
+            .iter()
+            .filter(|re| answered.contains(re.activity_id.as_str()))
+            .cloned()
+            .collect();
         Ok(ActivityPage {
             activities: page.into_iter().cloned().collect(),
+            re_resolutions,
             next_cursor,
             as_of: self.head,
             history_from: self.history_from(&read.account_id),
         })
+    }
+
+    /// Whether a re-resolution is answered to a read since a watermark: its
+    /// account within the read's scope and naming, its activity within the
+    /// read's trade dates.
+    fn answers_re_resolution(&self, read: &ActivitiesRead, re: &ReResolution) -> bool {
+        if !read.scope.answers(&read.account_id, &re.account_id) {
+            return false;
+        }
+        let trade_date = self
+            .activities
+            .iter()
+            .find(|activity| activity.activity_id == re.activity_id)
+            .map(|activity| activity.trade_date.as_str())
+            .unwrap_or_default();
+        (read.trade_date_from.is_empty() || trade_date >= read.trade_date_from.as_str())
+            && (read.trade_date_to.is_empty() || trade_date <= read.trade_date_to.as_str())
     }
 
     /// The named account's `history_from`, as its latest sync status said

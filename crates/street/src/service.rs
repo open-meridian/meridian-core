@@ -2,7 +2,8 @@
 //!
 //! Three commands in, four queries in, two events heard, one query asked,
 //! four events out; from contract v14 the custodian's activity (W2.10 to
-//! W2.12) and each sync status heard (W2.13, W2.14), below the first. W2.2 and W2.3 arrive as commands from a connector, W2.7 and
+//! W2.12) and each sync status heard (W2.13, W2.14), below the first; from
+//! contract v15 an activity re-resolved (W2.15, W2.16). W2.2 and W2.3 arrive as commands from a connector, W2.7 and
 //! W2.9 as queries from the dashboard or an `operations` plugin, a
 //! placeholder's replacement (W3.8) as an event from the instrument store,
 //! W3.6 is asked of the instrument store by the sweep below, W2.5 leaves when
@@ -50,13 +51,15 @@ use std::time::Duration;
 use meridian_bus::{Bus, Delivery, Envelope};
 use meridian_domain::v1::{
     InstrumentReplacedEvent, ListActivitiesRequest, ListCustodialPositionsRequest,
-    ListStatementsRequest, ListSyncStatusesRequest, RecordActivityRequest, RecordHoldingRequest,
-    RecordHoldingsStatementRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
-    SyncStatusEvent,
+    ListStatementsRequest, ListSyncStatusesRequest, ReResolveActivityRequest,
+    RecordActivityRequest, RecordHoldingRequest, RecordHoldingsStatementRequest,
+    ResolveInstrumentReply, ResolveInstrumentRequest, SyncStatusEvent,
 };
 use prost::Message;
 
-use crate::activity::{list_activities, list_sync_statuses, record_activity, record_sync_status};
+use crate::activity::{
+    list_activities, list_sync_statuses, re_resolve_activity, record_activity, record_sync_status,
+};
 use crate::positions::{list_positions, list_statements};
 use crate::record::{move_positions, open_statement, record_holding};
 use crate::store::{Cause, Scope, Store};
@@ -88,6 +91,12 @@ pub const ACTIVITY_RECORDED: &str = "platform.street.event.activity-recorded";
 /// W2.11. An `operations` plugin, or the dashboard, reading an account's
 /// activity.
 pub const LIST_ACTIVITIES: &str = "platform.street.query.list-activities";
+
+/// W2.15. A custody plugin re-resolving a recorded activity (contract v15).
+pub const RE_RESOLVE_ACTIVITY: &str = "platform.street.command.re-resolve-activity";
+
+/// W2.16. An activity was re-resolved.
+pub const ACTIVITY_RE_RESOLVED: &str = "platform.street.event.activity-re-resolved";
 
 /// W2.1, heard (contract v14): every custody plugin's sync status, the
 /// instance the topic's.
@@ -270,7 +279,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     // W2.10, and W2.12 when it was recorded now: a redelivery is answered as
     // already recorded and announces nothing.
     let activities = store.clone();
-    let activity_clock = clock;
+    let activity_clock = clock.clone();
     let activity_bus = bus.clone();
     bus.serve(RECORD_ACTIVITY, move |envelope| {
         expect(&envelope.payload_type, "meridian.v1.RecordActivityRequest")?;
@@ -298,6 +307,45 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         Ok((
             "meridian.v1.RecordActivityReply".to_string(),
             recorded.reply.encode_to_vec(),
+        ))
+    });
+
+    // W2.15, and W2.16 when a re-resolution was recorded now: one naming
+    // what the activity's latest resolution names is answered as already
+    // recorded and announces nothing; one naming no activity is refused,
+    // naming it.
+    let re_resolving = store.clone();
+    let re_resolving_clock = clock;
+    let re_resolving_bus = bus.clone();
+    bus.serve(RE_RESOLVE_ACTIVITY, move |envelope| {
+        expect(
+            &envelope.payload_type,
+            "meridian.v1.ReResolveActivityRequest",
+        )?;
+
+        let request = ReResolveActivityRequest::decode(&envelope.payload[..])
+            .map_err(|failed| format!("undecodable re-resolution: {failed}"))?;
+
+        let cause = cause_of(&envelope, re_resolving_clock.now_ns());
+        let re_resolved = re_resolve_activity(re_resolving.as_ref(), &request, &cause)
+            .map_err(|failed| failed.to_string())?;
+
+        if let Some(event) = re_resolved.event {
+            let meta = envelope.meta.as_ref();
+            re_resolving_bus
+                .publish(
+                    ACTIVITY_RE_RESOLVED,
+                    "meridian.v1.ActivityReResolvedEvent",
+                    event.encode_to_vec(),
+                    meta.map(|meta| meta.correlation_id.as_str()),
+                    meta.map(|meta| meta.message_id.as_str()),
+                )
+                .map_err(|failed| failed.to_string())?;
+        }
+
+        Ok((
+            "meridian.v1.ReResolveActivityReply".to_string(),
+            re_resolved.reply.encode_to_vec(),
         ))
     });
 
@@ -604,9 +652,9 @@ mod tests {
 
     use meridian_bus::{MemoryBackend, Subscription};
     use meridian_domain::v1::{
-        ActivityRecordedEvent, CustodialPositionUpdatedEvent, HoldingSide,
+        ActivityReResolvedEvent, ActivityRecordedEvent, CustodialPositionUpdatedEvent, HoldingSide,
         Identifier as PbIdentifier, ListActivitiesReply, ListCustodialPositionsReply,
-        ListSyncStatusesReply, RecordActivityReply, RecordHoldingReply,
+        ListSyncStatusesReply, ReResolveActivityReply, RecordActivityReply, RecordHoldingReply,
         RecordHoldingsStatementReply, StatementRecordedEvent, SyncStatusRecordedEvent,
     };
 
@@ -1347,6 +1395,100 @@ mod tests {
                 .unwrap()
                 .history_from,
             "2024-10-04"
+        );
+    }
+
+    // ── An activity re-resolved (contract v15) ──
+
+    async fn re_resolve_over(
+        bus: &Bus,
+        request: &ReResolveActivityRequest,
+    ) -> Result<ReResolveActivityReply, meridian_bus::BusError> {
+        let (payload_type, payload) = bus
+            .call(
+                RE_RESOLVE_ACTIVITY,
+                "meridian.v1.ReResolveActivityRequest",
+                request.encode_to_vec(),
+                None,
+                None,
+            )
+            .await?;
+        assert_eq!(payload_type, "meridian.v1.ReResolveActivityReply");
+        Ok(ReResolveActivityReply::decode(&payload[..]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_re_resolution_arrives_over_the_bus_and_is_announced_once() {
+        let (bus, _) = wired();
+        let mut announced = bus.subscribe(ACTIVITY_RE_RESOLVED);
+        let recorded = record_activity_over(&bus, &reinvestment("oqkr-1")).await;
+        let request = ReResolveActivityRequest {
+            account_id: "ACC-1".into(),
+            external_account_id: "SNAP-ACC-1".into(),
+            source: "snaptrade".into(),
+            external_activity_id: "oqkr-1".into(),
+            instrument_id: "INS-VIGIX".into(),
+            provenance: Some(meridian_pb::v1::Provenance {
+                field: "instrument_id".into(),
+                kind: meridian_pb::v1::ProvenanceKind::Supplied as i32,
+                person: "Ada Park".into(),
+                ..Default::default()
+            }),
+            resolved_at_ns: NOW - 1,
+        };
+
+        let first = re_resolve_over(&bus, &request).await.unwrap();
+        assert_eq!(first.activity_id, recorded.activity_id);
+        assert!(!first.already_recorded);
+        let event =
+            ActivityReResolvedEvent::decode(&next(&mut announced).await.envelope.payload[..])
+                .unwrap();
+        let re = event.re_resolution.clone().unwrap();
+        assert_eq!(
+            (re.activity_id.as_str(), re.instrument_id.as_str()),
+            (recorded.activity_id.as_str(), "INS-VIGIX")
+        );
+        assert_eq!(event.journal, re.journal);
+
+        let again = re_resolve_over(&bus, &request).await.unwrap();
+        assert!(again.already_recorded);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), announced.recv())
+                .await
+                .is_err(),
+            "a re-resolution already recorded was announced again"
+        );
+
+        let (_, payload) = bus
+            .call(
+                LIST_ACTIVITIES,
+                "meridian.v1.ListActivitiesRequest",
+                ListActivitiesRequest {
+                    account_id: "ACC-1".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let read = ListActivitiesReply::decode(&payload[..]).unwrap();
+        assert_eq!(read.re_resolutions, vec![re]);
+        assert_eq!(
+            read.activities[0].activity.as_ref().unwrap().instrument_id,
+            "INS-SPAXX",
+            "the activity as first recorded"
+        );
+
+        let mut nothing = request.clone();
+        nothing.external_activity_id = "never-sent".into();
+        let refused = re_resolve_over(&bus, &nothing).await.unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("no activity is recorded as never-sent"),
+            "{refused}"
         );
     }
 }

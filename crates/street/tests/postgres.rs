@@ -15,7 +15,7 @@ use std::sync::Arc;
 use meridian_street::amounts::{Exact, Money, Quantity};
 use meridian_street::store::{
     Cause, Collateral, Completion, Counts, Direction, Figures, Holding, Identifier, Opened, Read,
-    Scope, Settled, Side, Statement, Store,
+    Scope, Settled, Side, Statement, Store, StoreError,
 };
 use meridian_street::PostgresStore;
 
@@ -2147,4 +2147,140 @@ fn sync_statuses_kept_before_the_gap_was_recorded_have_their_first_marked() {
         .unwrap()
         .get(0);
     assert_eq!(again, 2);
+}
+
+// ── An activity re-resolved (contract v15: W2.15, W2.16) ──
+
+fn re_resolution(
+    account: &str,
+    id: &str,
+    instrument: &str,
+) -> meridian_domain::v1::ReResolveActivityRequest {
+    meridian_domain::v1::ReResolveActivityRequest {
+        account_id: account.into(),
+        external_account_id: format!("SNAP-{account}"),
+        source: "snaptrade".into(),
+        external_activity_id: id.into(),
+        instrument_id: instrument.into(),
+        provenance: Some(meridian_pb::v1::Provenance {
+            field: "instrument_id".into(),
+            kind: meridian_pb::v1::ProvenanceKind::Supplied as i32,
+            person: "Ada Park, in the plan-code links".into(),
+            ..Default::default()
+        }),
+        resolved_at_ns: NOW - 60,
+    }
+}
+
+#[test]
+fn a_re_resolution_is_kept_beside_the_activity_chained_apart_and_read_with_it() {
+    let store = store();
+    let account = unique("ACC");
+    let activity = meridian_street::record_activity(
+        &store,
+        &reinvestment(&account, "oqkr-1", "2026-09-30"),
+        &at(NOW),
+    )
+    .unwrap()
+    .event
+    .unwrap();
+
+    let first = meridian_street::re_resolve_activity(
+        &store,
+        &re_resolution(&account, "oqkr-1", "INS-VIGIX"),
+        &at(NOW + 1),
+    )
+    .unwrap();
+    assert_eq!(first.reply.activity_id, activity.activity_id);
+    let event = first.event.expect("announced");
+    let re = event.re_resolution.clone().unwrap();
+    assert_eq!(re.account_id, account);
+    assert_eq!(re.recorded_at_ns, NOW + 1);
+    assert_eq!(re.resolved_at_ns, NOW - 60);
+    assert_eq!(event.journal, re.journal);
+    let journal = re.journal.clone().unwrap();
+    assert!(journal.sequence > activity.journal.as_ref().unwrap().sequence);
+    assert_eq!(
+        journal.previous_sequence, 0,
+        "chained apart from the activities"
+    );
+
+    // Sent again: nothing recorded, nothing numbered.
+    let again = meridian_street::re_resolve_activity(
+        &store,
+        &re_resolution(&account, "oqkr-1", "INS-VIGIX"),
+        &at(NOW + 2),
+    )
+    .unwrap();
+    assert!(again.reply.already_recorded && again.event.is_none());
+    let changed = meridian_street::re_resolve_activity(
+        &store,
+        &re_resolution(&account, "oqkr-1", ""),
+        &at(NOW + 3),
+    )
+    .unwrap()
+    .event
+    .unwrap();
+    assert_eq!(
+        changed
+            .re_resolution
+            .as_ref()
+            .unwrap()
+            .journal
+            .as_ref()
+            .unwrap()
+            .previous_sequence,
+        journal.sequence
+    );
+
+    let read =
+        meridian_street::list_activities(&store, &named(&account), &Scope::Everything).unwrap();
+    assert_eq!(read.activities, vec![activity.clone()], "as first recorded");
+    assert_eq!(
+        read.re_resolutions,
+        vec![re.clone(), changed.re_resolution.clone().unwrap()]
+    );
+
+    // Since the activity: the two re-resolutions, a page each.
+    let mut since = named(&account);
+    since.since = Some(meridian_domain::v1::Watermark {
+        partitions: vec![meridian_domain::v1::PartitionSequence {
+            partition: "street".into(),
+            sequence: activity.journal.as_ref().unwrap().sequence,
+        }],
+    });
+    since.page_size = 1;
+    let one = meridian_street::list_activities(&store, &since, &Scope::Everything).unwrap();
+    assert_eq!(
+        (one.activities.len(), one.re_resolutions.clone()),
+        (0, vec![re])
+    );
+    since.cursor = one.next_cursor;
+    let two = meridian_street::list_activities(&store, &since, &Scope::Everything).unwrap();
+    assert_eq!(two.re_resolutions, vec![changed.re_resolution.unwrap()]);
+    assert!(two.next_cursor.is_empty());
+
+    // Another account's scope reads none of it.
+    let elsewhere = Scope::Within([unique("ACC")].into_iter().collect());
+    let none = meridian_street::list_activities(
+        &store,
+        &meridian_domain::v1::ListActivitiesRequest {
+            since: since.since.clone(),
+            ..Default::default()
+        },
+        &elsewhere,
+    )
+    .unwrap();
+    assert!(none.re_resolutions.is_empty());
+
+    let refused = meridian_street::re_resolve_activity(
+        &store,
+        &re_resolution(&account, "never-sent", "INS-VIGIX"),
+        &at(NOW + 4),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(refused, StoreError::NoSuchActivity(_)),
+        "{refused}"
+    );
 }
