@@ -113,6 +113,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-out", post(sign_out))
         .route("/mode", get(mode))
         .route("/.meridian/ui/{*file}", get(kit))
+        .route("/favicon.ico", get(icon))
+        .route("/favicon.svg", get(icon))
+        .route("/favicon-32.png", get(icon))
+        .route("/apple-touch-icon.png", get(icon))
         .merge(oauth::routes())
         .merge(crate::mcp::routes())
         .merge(crate::tickets::pages::routes())
@@ -149,6 +153,11 @@ async fn framed_only_here(mut response: Response) -> Response {
         .entry(axum::http::header::CONTENT_SECURITY_POLICY)
         .or_insert(HeaderValue::from_static("frame-ancestors 'self'"));
     response
+}
+
+/// The Open Meridian icon, on the dashboard's own host ([`crate::brand`]).
+async fn icon(request: axum::extract::Request) -> Response {
+    crate::brand::serve(request.method(), request.uri().path())
 }
 
 /// The kit, on the dashboard's own host, for the dashboard's own pages.

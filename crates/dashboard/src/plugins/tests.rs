@@ -2340,6 +2340,42 @@ async fn a_page_in_a_window_of_its_own_goes_back_to_the_frame_and_one_in_the_fra
 }
 
 #[tokio::test]
+async fn the_icon_is_served_on_the_plugins_host_and_the_dashboards_to_anybody_and_linked() {
+    let h = harness(&[INSTANCE]).await;
+    // No session: the icon is the same files for everybody, on either host.
+    for host in [PLUGIN_HOST, DASHBOARD] {
+        let svg = get(&h.app, host, "/favicon.svg", &[]).await;
+        assert_eq!(svg.status, StatusCode::OK, "{host}: {}", svg.body);
+        assert_eq!(svg.headers["content-type"], "image/svg+xml");
+        assert!(svg.body.starts_with("<svg"), "{host}");
+        for (path, kind) in [
+            ("/favicon.ico", "image/x-icon"),
+            ("/favicon-32.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+        ] {
+            let file = get(&h.app, host, path, &[]).await;
+            assert_eq!(file.status, StatusCode::OK, "{host}{path}");
+            assert_eq!(file.headers["content-type"], kind, "{host}{path}");
+        }
+    }
+    assert!(
+        h.reached.lock().unwrap().is_empty(),
+        "the plugin never saw it"
+    );
+    // A page the dashboard draws on the plugin's host links it: here, the
+    // one telling somebody posting with no session to open the plugin from
+    // the dashboard again.
+    let drawn = send(&h.app, PLUGIN_HOST, Method::POST, "/", &[]).await;
+    assert_eq!(drawn.status, StatusCode::UNAUTHORIZED);
+    assert!(
+        drawn.body.contains(crate::brand::LINKS),
+        "{}: {}",
+        drawn.status,
+        drawn.body
+    );
+}
+
+#[tokio::test]
 async fn the_kit_is_served_on_the_plugins_host_to_anybody_and_its_page_framed_by_the_dashboard_alone(
 ) {
     let h = harness(&[INSTANCE]).await;

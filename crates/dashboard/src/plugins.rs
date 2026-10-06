@@ -1473,6 +1473,11 @@ pub(crate) async fn on_plugin_host(
 }
 
 async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -> Response {
+    // The icon the dashboard's pages here link, before anything about who
+    // asks, as the kit is.
+    if crate::brand::is_icon(request.uri().path()) {
+        return crate::brand::serve(request.method(), request.uri().path());
+    }
     // The kit, on the plugin's own origin, before anything about who asks.
     if request.uri().path().starts_with(crate::kit::PATH) {
         return match &app.kit {

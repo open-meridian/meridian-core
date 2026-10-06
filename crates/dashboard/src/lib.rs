@@ -20,6 +20,7 @@
 pub mod accounts;
 pub mod admin;
 pub mod area;
+pub mod brand;
 pub mod catalogue;
 pub mod clock;
 pub mod custody;

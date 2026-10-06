@@ -14,7 +14,11 @@ needed?" So, in headless Chromium:
 - without script the plain table still posts, the rows held and a few blank;
 - every page -- Settings and each of its groups' tabs, and each table's tab,
   in the plugin's area and in the admin portal -- fits one screen at 1440x900
-  and 390x844 by the kit's own overflow check (lib/fit.js, fitProblems).
+  and 390x844 by the kit's own overflow check (lib/fit.js, fitProblems), and
+  nothing in the open Access editor reaches past its dialog;
+- the Open Meridian icon: each page's head links the PNG, then the SVG, then
+  the touch icon, each answered with its type, the SVG drawn light and dark,
+  and /favicon.ico answered unprompted.
 
 PASS=fit checks the fit alone (the development deployment's run, whose
 Developer group and banner the ordinary run has not). Prints one line per
@@ -228,6 +232,36 @@ def inside_the_viewport(page):
     }""")
 
 
+# The kit's overflow check, turned on the open dialog: the kit's own
+# fitProblems reads the document, and a modal dialog sits in the top layer,
+# fixed to the viewport, which it does not count. So the same rule, held to
+# the dialog's box: nothing in it, that nothing scrolls or clips, reaches past
+# its edges, and it scrolls no wider than it is. Its one-line rows are the
+# kit's check's already, which counts every table.one-line row drawn.
+INSIDE = """() => {
+  const d = document.querySelector('dialog[open]');
+  if (!d) return ['no dialog open'];
+  const box = d.getBoundingClientRect();
+  const name = (el) => el.localName + (el.id ? '#' + el.id : '')
+    + [...el.classList].slice(0, 2).map((c) => '.' + c).join('');
+  const out = [];
+  if (d.scrollWidth > d.clientWidth + 1)
+    out.push(`the dialog is ${d.scrollWidth - d.clientWidth}px too wide inside`);
+  (function walk(el, clipped) {
+    for (const child of [...el.children, ...(el.shadowRoot ? el.shadowRoot.children : [])]) {
+      const st = getComputedStyle(child);
+      if (st.display === 'none') continue;
+      const r = child.getBoundingClientRect();
+      if (!clipped && (r.width || r.height)
+          && (r.right > box.right + 0.5 || r.left < box.left - 0.5))
+        out.push(`${name(child)} reaches ${Math.round(r.left)} to ${Math.round(r.right)}px, past the dialog's ${Math.round(box.left)} to ${Math.round(box.right)}px`);
+      walk(child, clipped || st.overflowX !== 'visible' || st.overflowY !== 'visible');
+    }
+  })(d, false);
+  return out;
+}"""
+
+
 def the_access_editor_has_a_row_per_role(browser, prefix):
     """Access per role (contract v15): the access group dialog's rows, one a
     plugin role, one line each, paged by the kit; an entry on a role its
@@ -269,6 +303,9 @@ def the_access_editor_has_a_row_per_role(browser, prefix):
               f"{': ' + '; '.join(wraps) if wraps else ''}")
         boxed = inside_the_viewport(page)
         check(not boxed, f"at {size} the Access editor stays within the viewport{': ' + boxed if boxed else ''}")
+        spilled = page.evaluate(INSIDE)
+        check(not spilled, f"at {size} nothing in the Access editor reaches past the dialog"
+              f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
         page.screenshot(path=os.path.join(OUT, f"{prefix}-access-editor-{size}.png"))
         if size == "phone" and PASS != "fit":
             page.select_option("select[name='level.ops-1:custody']", "admin-read")
@@ -293,10 +330,44 @@ def the_access_editor_has_a_row_per_role(browser, prefix):
         ctx.close()
 
 
+def the_icon_is_linked_and_served(browser):
+    """The product owner, 2026-10-06: the Open Meridian icon on the
+    deployment too."""
+    ctx = context(browser)
+    page = ctx.new_page()
+    page.goto(ADMIN_PAGE)
+    settled(page)
+    links = page.evaluate("""async () => Promise.all(
+      [...document.head.querySelectorAll('link[rel~=icon], link[rel=apple-touch-icon]')].map(
+        async (l) => { const r = await fetch(l.href);
+          return [l.rel, new URL(l.href).pathname, r.status, r.headers.get('content-type')]; }))""")
+    check([path for _, path, _, _ in links] == ["/favicon-32.png", "/favicon.svg", "/apple-touch-icon.png"],
+          f"the head links the PNG, then the SVG, then the touch icon: {links}")
+    check(all(status == 200 for _, _, status, _ in links)
+          and [kind for _, _, _, kind in links] == ["image/png", "image/svg+xml", "image/png"],
+          f"each is answered with its type: {links}")
+    ico = page.request.get(f"{BASE}/favicon.ico")
+    check(ico.status == 200 and ico.headers.get("content-type") == "image/x-icon",
+          f"/favicon.ico is answered unprompted: {ico.status} {ico.headers.get('content-type')}")
+    ctx.close()
+    for scheme in ("light", "dark"):
+        shown = browser.new_context(viewport={"width": 160, "height": 160}, color_scheme=scheme)
+        icon = shown.new_page()
+        icon.set_content(f'<body style="margin:0;display:grid;place-items:center;height:100vh;'
+                         f'background:{"#fff" if scheme == "light" else "#14161f"}">'
+                         f'<img src="{BASE}/favicon.svg" width="128" height="128"></body>')
+        icon.wait_for_timeout(300)
+        drawn = icon.evaluate("() => document.querySelector('img').naturalWidth > 0")
+        check(drawn, f"the SVG icon is drawn in a {scheme} browser")
+        icon.screenshot(path=os.path.join(OUT, f"favicon-{scheme}.png"))
+        shown.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
     if PASS != "fit":
+        the_icon_is_linked_and_served(browser)
         the_grid_adds_rows_past_four_and_posts_them(browser)
         two_hundred_are_accepted_and_two_hundred_and_one_refused(browser)
         without_script_the_plain_table_posts(browser)

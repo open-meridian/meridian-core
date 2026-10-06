@@ -279,6 +279,13 @@ dialog::backdrop{background:var(--backdrop)}\
 fieldset.checks{border:1px solid var(--line);border-radius:var(--radius);padding:.5rem .75rem;margin:0 0 .9rem;\
 max-height:14rem;overflow:auto}fieldset.checks legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\
 fieldset.checks label{margin:.25rem 0}\
+fieldset.access-editor{border:1px solid var(--line);border-radius:var(--radius);padding:.4rem .6rem;margin:0 0 .9rem;\
+min-width:0}fieldset.access-editor legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\
+table.access-roles{width:100%;table-layout:fixed}table.access-roles :is(th,td){padding-left:.4rem;padding-right:.4rem}\
+table.access-roles th:last-child,table.access-roles td:last-child{width:6.5rem}\
+table.access-roles td{overflow:hidden;text-overflow:ellipsis}table.access-roles select{width:100%;min-width:0}\
+fieldset.access-editor om-pager{display:block;max-width:100%}fieldset.access-editor .pager{gap:.5rem}\
+fieldset.access-editor .pager .button{padding-left:.6rem;padding-right:.6rem}\
 .view-switch{display:inline-flex;border:1px solid var(--line-strong);border-radius:var(--radius);overflow:hidden}\
 .view-switch button{margin:0;border:0;border-radius:0;padding:.35rem .8rem;font-size:.86rem;background:var(--card);color:var(--ink-soft)}\
 .view-switch button+button{border-left:1px solid var(--line-strong)}\
@@ -1079,11 +1086,12 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Open Meridian</title><script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}</style></head><body>\n\
+         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}</style></head><body>\n\
          {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,
+        icon = crate::brand::LINKS,
         inbox = if chrome.viewer.is_some() {
             format!("<script>{INBOX_SCRIPT}</script>")
         } else {
@@ -1095,6 +1103,13 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_page_links_the_icon_in_its_head() {
+        let drawn = page("Accounts", "<p>a page</p>");
+        let head = drawn.split("</head>").next().unwrap();
+        assert!(head.contains(crate::brand::LINKS), "{head}");
+    }
 
     #[test]
     fn every_character_that_could_open_markup_is_escaped() {
