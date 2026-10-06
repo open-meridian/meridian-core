@@ -112,6 +112,8 @@ pub fn list_activities(
         next_cursor: page.next_cursor,
         as_of: Some(as_of(page.as_of)),
         history_from: page.history_from,
+        // The street keeps no re-resolution until W2.16 is built.
+        re_resolutions: Vec::new(),
     })
 }
 
