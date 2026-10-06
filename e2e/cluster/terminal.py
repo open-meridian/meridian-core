@@ -337,7 +337,10 @@ def admin_page(browser):
 def held_by(page):
     """Each person Connected clients lists, by their row's id, and how many
     delegations each holds."""
+    # Read afresh: a goto naming the address the page is on, fragment and
+    # all, navigates within it and reads nothing again.
     page.goto(f"{DASHBOARD}/admin#connected-clients")
+    page.reload()
     if "Nobody has delegated to a client" in page.content():
         return {}
     # By the count's own attribute, not its column.
