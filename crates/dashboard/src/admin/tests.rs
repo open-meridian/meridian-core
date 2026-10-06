@@ -3031,3 +3031,41 @@ fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect()
 }
+
+#[test]
+fn a_setting_serving_a_role_not_administered_is_shown_read_only() {
+    let record = PluginSettingsRecord {
+        plugin_instance_id: "ops-1".into(),
+        declared_settings: vec![
+            SettingDeclaration {
+                name: "api_key".into(),
+                label: "API key".into(),
+                r#type: SettingType::String as i32,
+                roles: vec!["custody".into(), "operations".into()],
+                ..Default::default()
+            },
+            SettingDeclaration {
+                name: "poll_minutes".into(),
+                label: "Read every".into(),
+                r#type: SettingType::Integer as i32,
+                roles: vec!["custody".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut custody_admin = meridian_access::PluginHeld::default();
+    custody_admin.roles.insert(
+        "custody".into(),
+        meridian_access::Held {
+            admin: true,
+            ..Default::default()
+        },
+    );
+    let roles = vec!["custody".to_string(), "operations".to_string()];
+    let form = settings::form_with(&record, "", false, "/x", Some((&custody_admin, &roles)));
+    assert_eq!(form.matches("data-read-only").count(), 1, "{form}");
+    assert!(form.contains("Serves custody and operations: set by an admin of every one"));
+    let all = settings::form_with(&record, "", false, "/x", None);
+    assert!(!all.contains("data-read-only"));
+}

@@ -672,6 +672,7 @@ pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> St
         token,
         development,
         &path(&record.plugin_instance_id),
+        None,
     )
 }
 
@@ -688,6 +689,7 @@ pub fn form_with(
     token: &str,
     development: bool,
     action: &str,
+    held: Option<(&meridian_access::PluginHeld, &[String])>,
 ) -> String {
     let declared = &record.declared_settings;
     let tables: Vec<&str> = tables(record, development)
@@ -746,7 +748,19 @@ pub fn form_with(
             let fields: String = group
                 .settings
                 .iter()
-                .map(|declaration| field(declaration, record, declared))
+                .map(|declaration| {
+                    let shown = field(declaration, record, declared);
+                    // Shown to an admin of any role it serves, set only by one
+                    // of every role (W6.11, contract v15): read-only, so
+                    // nothing of it is posted, else.
+                    match held.and_then(|(held, roles)| read_only(declaration, held, roles)) {
+                        None => shown,
+                        Some(why) => format!(
+                            "<fieldset class=\"read-only\" disabled title=\"{why}\" data-read-only>{shown}</fieldset>",
+                            why = escape(&why),
+                        ),
+                    }
+                })
                 .collect();
             format!(
                 "<section class=\"setting-group\" id=\"{id}\" aria-label=\"{title}\">\
@@ -909,6 +923,28 @@ const SCRIPT: &str = r#"(function () {
 /// secret is sent when it differs from what the record holds, and cleared
 /// when emptied; one the form did not post is left as it is. Only settings
 /// the plugin declared, and this deployment shows, are read from the form.
+/// Why a setting is shown read-only to this person, or None when they may set
+/// it: it serves a role they do not administer (W6.11, contract v15). A
+/// declaration naming no role serves every role the plugin holds.
+fn read_only(
+    declaration: &SettingDeclaration,
+    held: &meridian_access::PluginHeld,
+    plugin_roles: &[String],
+) -> Option<String> {
+    let serves = if declaration.roles.is_empty() {
+        plugin_roles
+    } else {
+        declaration.roles.as_slice()
+    };
+    if held.administers_every(serves) {
+        return None;
+    }
+    Some(format!(
+        "Serves {}: set by an admin of every one",
+        serves.join(" and ")
+    ))
+}
+
 /// The first setting a change names that serves a role the person does not
 /// administer, as the refusal saying so (W6.11, contract v15): a setting is
 /// set only by one holding admin on every role it serves. None when every

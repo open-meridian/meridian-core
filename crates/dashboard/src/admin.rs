@@ -503,6 +503,7 @@ async fn plugin_view(
         current,
         area: administers.then(|| view::area_at_admin(&instance)),
         may_grant: access.deployment_admin,
+        held: &access.plugin(&instance),
     });
     // The way back is the breadcrumb: for a deployment admin the settings
     // home, its plugins, then this one by its name, its instance ID on
@@ -775,6 +776,12 @@ fn tools_section(report: Option<&meridian_domain::v1::PluginReport>) -> String {
 /// Nothing of the deployment's and no account's data: a plugin admin's, of
 /// this plugin alone.
 pub(crate) fn settings_tab(manage: &Manage) -> String {
+    let held = person_access(
+        manage.records,
+        &manage.session.subject,
+        &manage.session.directory_groups,
+    )
+    .plugin(manage.instance);
     settings_section(
         manage.records,
         settings_of(manage.records, manage.instance),
@@ -782,6 +789,7 @@ pub(crate) fn settings_tab(manage: &Manage) -> String {
         crate::html::is_development(),
         &crate::area::settings_path(manage.instance),
         manage.notice,
+        Some(&held),
     )
 }
 
@@ -842,16 +850,26 @@ pub(crate) fn settings_section(
     development: bool,
     action: &str,
     notice: &str,
+    held: Option<&meridian_access::PluginHeld>,
 ) -> String {
     let Some(record) = record else {
         return not_known_yet(notice);
     };
+    let plugin_roles = meridian_access::known_roles(records, &record.plugin_instance_id)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
     format!(
         "{notice}<section class=\"panel padded settings-page\" id=\"settings\"><div class=\"settings-head\">\
          <h2>Settings</h2>{changed}</div>{form}</section>",
         notice = notice_line(notice),
         changed = last_changed(records, record),
-        form = settings::form_with(record, token, development, action),
+        form = settings::form_with(
+            record,
+            token,
+            development,
+            action,
+            held.map(|held| (held, plugin_roles.as_slice())),
+        ),
     )
 }
 

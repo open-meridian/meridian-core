@@ -509,6 +509,9 @@ pub struct View<'a> {
     pub area: Option<String>,
     /// Whether the viewer is a deployment admin, who grants.
     pub may_grant: bool,
+    /// What the viewer holds on each of the plugin's roles: which settings
+    /// they may set, and which they see read-only (W6.11, contract v15).
+    pub held: &'a meridian_access::PluginHeld,
 }
 
 fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
@@ -549,6 +552,7 @@ pub fn render(view: &View) -> String {
             view.development,
             &settings::path(&line.instance),
             view.notice,
+            Some(view.held),
         ),
         (key, Some((record, table))) => super::table_section(
             view.records,
