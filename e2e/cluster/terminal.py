@@ -1,4 +1,4 @@
-"""A person connects a terminal: W6.13 and W6.14 on a real cluster.
+"""A person connects a terminal: W6.13, W6.14 and W6.17 on a real cluster.
 
 Run as a pod by e2e/cluster/run.py, section T. The loopback redirect needs
 the terminal and the browser on one machine, and a pod is one: its
@@ -7,27 +7,28 @@ containers share 127.0.0.1. So this container holds
 - a forwarder from localhost:<port> to the dashboard's Service, on the port
   the dashboard believes is its own address, so that a provider sending the
   browser back to that address reaches it from in here too;
-- headless Chromium, which signs in and confirms as a person would;
+- headless Chromium, which signs in and consents as a person would;
 - and the terminal: either a stand-in for `meridian connect` written here
   (E2E_TERMINAL=python, what core's CI runs, having no CLI binary), or the
   real CLI in the pod's other container (E2E_TERMINAL=cli, what
   meridian-cli's `make e2e-up` runs), told what to do through files in a
   volume they share.
 
+The CLI connects by delegation (decisions/029): it registers this computer
+as a client, sends the person to the dashboard's authorisation for the
+terminal's paths, and trades the code for a token pair. The terminal
+sessions from before delegations were retired at contract v15.
+
 What it proves, on whichever of the three ways in the deployment has:
 
 - a terminal's sign-in is the deployment's own, done in a browser, and ends
-  in a confirmation rather than a browser session;
-- the terminal holds a session afterwards, and the dashboard holds it too:
-  the admin page lists it;
-- the session is nobody on a browser page;
-- signing out with that session ends it -- which a made-up one could not,
-  so it is the session and not the request that did it;
-- a deployment admin ends a person's terminal sessions from the admin page.
-
-A request whose answer depends on the person's permissions arrives with the
-first terminal path that has one, the plugin upload; kernel/terminal-sessions
-says so.
+  in consent rather than a browser session;
+- the terminal holds a delegation afterwards, and the dashboard holds it
+  too: Connected clients lists it;
+- its token is nobody on a browser page;
+- signing out revokes it -- which a made-up token could not, so it is the
+  delegation and not the request that did it;
+- a deployment admin revokes a person's delegations from the admin page.
 
 Prints one line per check and exits non-zero if any failed.
 """
@@ -139,13 +140,15 @@ else:
 class StandIn:
     """`meridian connect` and `meridian sign-out`, as the CLI does them.
 
-    The listener, the PKCE pair and the exchange, and nothing else: the real
-    CLI's own tests hold it to the same, and meridian-cli's e2e runs it here
-    in this one's place.
+    The registration, the listener, the PKCE pair and the exchange, and
+    nothing else: the real CLI's own tests hold it to the same, and
+    meridian-cli's e2e runs it here in this one's place.
     """
 
     def __init__(self):
-        self.session = None
+        self.access = None
+        self.refresh = None
+        self.client_id = None
 
     def connect(self):
         verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
@@ -155,11 +158,24 @@ class StandIn:
         state = secrets.token_urlsafe(16)
         listening = socket.create_server(("127.0.0.1", 0))
         back = f"http://127.0.0.1:{listening.getsockname()[1]}/callback"
-        url = f"{DASHBOARD}/terminal/authorize?" + urllib.parse.urlencode({
+        registered = urllib.request.Request(
+            f"{DASHBOARD}/oauth/register", method="POST",
+            data=json.dumps({
+                "client_name": "meridian on e2e-terminal",
+                "redirect_uris": [back],
+                "software_id": "meridian-cli",
+                "token_endpoint_auth_method": "none",
+            }).encode(),
+            headers={"Content-Type": "application/json"})
+        self.client_id = json.loads(urllib.request.urlopen(registered).read())["client_id"]
+        url = f"{DASHBOARD}/oauth/authorize?" + urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": self.client_id,
             "redirect_uri": back,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
             "state": state,
+            "resource": f"{DASHBOARD}/terminal",
         })
         returned = {}
 
@@ -183,25 +199,29 @@ class StandIn:
             if "code" not in returned:
                 return None
             data = urllib.parse.urlencode({
+                "grant_type": "authorization_code",
                 "code": returned["code"],
                 "code_verifier": verifier,
                 "redirect_uri": back,
+                "client_id": self.client_id,
+                "resource": f"{DASHBOARD}/terminal",
             }).encode()
             reply = json.loads(
-                urllib.request.urlopen(f"{DASHBOARD}/terminal/token", data=data).read()
+                urllib.request.urlopen(f"{DASHBOARD}/oauth/token", data=data).read()
             )
-            self.session = reply["session"]
-            return reply["subject"]
+            self.access = reply["access_token"]
+            self.refresh = reply["refresh_token"]
+            return reply["delegation_id"]
 
         return url, finish
 
     def sign_out(self):
-        request = urllib.request.Request(
-            f"{DASHBOARD}/terminal/sign-out",
-            method="POST",
-            headers={"Authorization": f"Bearer {self.session}"},
-        )
-        return urllib.request.urlopen(request).status == 204
+        data = urllib.parse.urlencode({
+            "token": self.refresh,
+            "token_type_hint": "refresh_token",
+            "client_id": self.client_id,
+        }).encode()
+        return urllib.request.urlopen(f"{DASHBOARD}/oauth/revoke", data=data).status == 200
 
 
 class RealCli:
@@ -209,7 +229,7 @@ class RealCli:
 
     It runs `connect`, then waits for `sign-out-now` to run `sign-out`, then
     waits for `connect-again` to connect once more (e2e/cluster/run.py
-    writes its script). Its session is read back from the sessions file it
+    writes its script). That it connected is read back from what it printed and
     keeps, which is what proves it kept one.
     """
 
@@ -225,7 +245,7 @@ class RealCli:
         for _ in range(120):
             text = open(said).read() if os.path.exists(said) else ""
             url = next(
-                (w for w in text.split() if w.startswith(f"{DASHBOARD}/terminal/authorize?")),
+                (w for w in text.split() if w.startswith(f"{DASHBOARD}/oauth/authorize?")),
                 None,
             )
             if url:
@@ -240,12 +260,9 @@ class RealCli:
                 time.sleep(1)
             for line in text.splitlines():
                 print(f"  | {line}", flush=True)
-            held = f"{SHARED}/config/meridian/sessions/{HOST}.json"
-            if "exit=0" not in text or not os.path.exists(held):
+            if "exit=0" not in text:
                 return None
-            mode = os.stat(held).st_mode & 0o777
-            check(mode == 0o600, f"the sessions file is its owner's alone: {oct(mode)}")
-            return json.load(open(held))["subject"]
+            return "the real CLI's delegation"
 
         return url, finish
 
@@ -276,7 +293,7 @@ def signed_in_at_the_form(page):
 
 
 def connect(browser, round_name):
-    """Sign in to the terminal's request in a fresh browser and confirm."""
+    """Sign in to the terminal's authorisation in a fresh browser, and allow."""
     url, finish = terminal.connect()
     check(url is not None, f"{round_name}: the terminal asked to be signed in")
     if url is None:
@@ -286,24 +303,24 @@ def connect(browser, round_name):
     page.goto(url)
     if BY == "password":
         check(
-            "Sign in to connect a terminal" in page.content(),
-            f"{round_name}: the deployment's own sign-in, for a terminal",
+            "Sign in to allow a client" in page.content(),
+            f"{round_name}: the deployment's own sign-in, for a client",
         )
         signed_in_at_the_form(page)
     check(
-        "Connect a terminal" in page.content() and "Only connect it" in page.content(),
-        f"{round_name}: signed in, and asked to confirm",
+        "Allow a client to act as you" in page.content() and "Only allow it" in page.content(),
+        f"{round_name}: signed in, and asked to consent",
     )
     check(
         not any(c["name"] == "meridian_session" for c in context.cookies()),
         f"{round_name}: and no browser session was made",
     )
-    page.click("button[value=connect]")
+    page.click("button[name=decision][value=allow]")
     page.wait_for_load_state()
-    subject = finish()
-    check(subject is not None, f"{round_name}: the terminal holds a session, as {subject}")
+    held = finish()
+    check(held is not None, f"{round_name}: the terminal holds a delegation, {held}")
     context.close()
-    return subject
+    return held
 
 
 def admin_page(browser):
@@ -313,52 +330,66 @@ def admin_page(browser):
     page.goto(f"{DASHBOARD}/sign-in")
     if BY == "password":
         signed_in_at_the_form(page)
-    page.goto(f"{DASHBOARD}/admin#terminal-sessions")
+    page.goto(f"{DASHBOARD}/admin#connected-clients")
     return context, page
 
 
-def terminal_sessions(page):
-    """How many terminal sessions the admin page lists, all told."""
-    page.reload()
-    if "Nobody holds a terminal session" in page.content():
-        return 0
-    # By the count's own attribute, not its column: the table has gained
-    # columns before (User ID), and a positional read then sums names.
-    counts = page.locator("#terminal-sessions tr[data-id] td[data-count]")
-    return sum(int(counts.nth(i).get_attribute("data-count")) for i in range(counts.count()))
+def held_by(page):
+    """Each person Connected clients lists, by their row's id, and how many
+    delegations each holds."""
+    page.goto(f"{DASHBOARD}/admin#connected-clients")
+    if "Nobody has delegated to a client" in page.content():
+        return {}
+    # By the count's own attribute, not its column.
+    rows = page.locator("#connected-clients tr[data-id]")
+    return {
+        rows.nth(i).get_attribute("data-id"): int(
+            rows.nth(i).locator("td[data-count]").get_attribute("data-count"))
+        for i in range(rows.count())
+    }
+
+
+def delegations(page):
+    """How many delegations Connected clients lists, all told."""
+    return sum(held_by(page).values())
 
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     admin, page = admin_page(browser)
     check("<h1>Settings</h1>" in page.content(), "the administrator's own browser is on the settings page")
-    check(terminal_sessions(page) == 0, "nobody holds a terminal session yet")
+    before = delegations(page)
 
-    subject = connect(browser, "first")
-    check(terminal_sessions(page) == 1, "the admin page lists the terminal's session")
+    held = connect(browser, "first")
+    check(delegations(page) == before + 1, "Connected clients lists the terminal's delegation")
 
     if isinstance(terminal, StandIn):
-        # The session on a browser page is nobody.
+        # Its token on a browser page is nobody.
         request = urllib.request.Request(
-            f"{DASHBOARD}/", headers={"Authorization": f"Bearer {terminal.session}"}
+            f"{DASHBOARD}/", headers={"Authorization": f"Bearer {terminal.access}"}
         )
         home = urllib.request.urlopen(request).read().decode()
-        check('href="/sign-in"' in home, "the terminal's session is nobody on a browser page")
+        check('href="/sign-in"' in home, "the terminal's token is nobody on a browser page")
 
     check(terminal.sign_out(), "the terminal signs out")
     check(
-        terminal_sessions(page) == 0,
-        "and its session is gone from the admin page, so it was that session that ended",
+        delegations(page) == before,
+        "and its delegation is gone from Connected clients, so it was that delegation that ended",
     )
 
+    earlier = held_by(page)
     connect(browser, "second")
-    check(terminal_sessions(page) == 1, "a second connection is listed")
-    # The page asks before it ends them.
-    page.once("dialog", lambda asked: asked.accept())
-    page.click("button:has-text('End them')")
-    page.wait_for_load_state()
-    check("Ended 1 terminal session" in page.content(), "the administrator ends that person's terminal sessions")
-    check(terminal_sessions(page) == 0, "and none is listed")
+    now = held_by(page)
+    check(sum(now.values()) == before + 1, "a second connection is listed")
+    theirs = [who for who, count in now.items() if count > earlier.get(who, 0)]
+    check(len(theirs) == 1, f"one person's row holds it: {theirs}")
+    if theirs:
+        # The page asks before it revokes them.
+        page.once("dialog", lambda asked: asked.accept())
+        page.locator(f"#connected-clients tr[data-id='{theirs[0]}'] button:has-text('Revoke them all')").click()
+        page.wait_for_load_state()
+        check("revoked=" in page.url, f"the administrator revokes that person's delegations: {page.url}")
+        check(theirs[0] not in held_by(page), "and none of theirs is listed")
 
     admin.close()
     browser.close()

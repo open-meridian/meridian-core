@@ -174,7 +174,15 @@ pub fn described_group(group: &AccessGroup) -> String {
             }
         })
         .collect();
-    format!("{:?}: {}", group.name, if entries.is_empty() { "no entries".to_string() } else { entries.join(", ") })
+    format!(
+        "{:?}: {}",
+        group.name,
+        if entries.is_empty() {
+            "no entries".to_string()
+        } else {
+            entries.join(", ")
+        }
+    )
 }
 
 /// A permission as a change record says it: the user group, and the account
@@ -264,7 +272,10 @@ pub const REWRITTEN_TO_NAME_ITS_ROLE: &str = "the one-time rewrite at the upgrad
 /// plugin's, where it holds exactly one as its sidecar last reported, or --
 /// where no sidecar has reported -- as its latest launch said. None where it
 /// holds none or several, or nothing is known of it: the entry is left.
-pub fn the_one_role<'a>(reported: Option<&'a [String]>, launched: Option<&'a [String]>) -> Option<&'a str> {
+pub fn the_one_role<'a>(
+    reported: Option<&'a [String]>,
+    launched: Option<&'a [String]>,
+) -> Option<&'a str> {
     match reported.or(launched) {
         Some([one]) => Some(one.as_str()),
         _ => None,

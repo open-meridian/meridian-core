@@ -59,14 +59,24 @@ mod tests {
 
     #[test]
     fn one_role_fills_a_declaration_naming_none() {
-        assert_eq!(served(&[], &roles(&["custody"]), 15), Ok(roles(&["custody"])));
-        assert_eq!(served(&[], &[], 15), Ok(vec![]), "a role-less plugin names none");
+        assert_eq!(
+            served(&[], &roles(&["custody"]), 15),
+            Ok(roles(&["custody"]))
+        );
+        assert_eq!(
+            served(&[], &[], 15),
+            Ok(vec![]),
+            "a role-less plugin names none"
+        );
     }
 
     #[test]
     fn a_role_the_plugin_was_not_launched_with_is_refused_naming_its_roles() {
         let refused = served(&roles(&["oms"]), &roles(&["custody", "operations"]), 15).unwrap_err();
-        assert!(refused.contains("oms") && refused.contains("custody and operations"), "{refused}");
+        assert!(
+            refused.contains("oms") && refused.contains("custody and operations"),
+            "{refused}"
+        );
         let on_none = served(&roles(&["custody"]), &[], 15).unwrap_err();
         assert!(on_none.contains("no role"), "{on_none}");
     }
@@ -74,8 +84,14 @@ mod tests {
     #[test]
     fn several_roles_need_naming_from_v15_and_serve_all_from_before() {
         let both = roles(&["custody", "operations"]);
-        assert!(served(&[], &both, 15).unwrap_err().contains("names no role"));
-        assert_eq!(served(&[], &both, 14), Ok(both.clone()), "built at v14: every role");
+        assert!(served(&[], &both, 15)
+            .unwrap_err()
+            .contains("names no role"));
+        assert_eq!(
+            served(&[], &both, 14),
+            Ok(both.clone()),
+            "built at v14: every role"
+        );
         assert_eq!(
             served(&roles(&["operations", "operations"]), &both, 15),
             Ok(roles(&["operations"]))

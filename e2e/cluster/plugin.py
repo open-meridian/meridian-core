@@ -280,12 +280,13 @@ def signed_in_at_the_form(page):
 
 
 def confirm_the_connection(browser):
-    """The CLI printed where to sign in; do so, and confirm."""
+    """The CLI printed where to sign in; do so, and allow it (it connects by
+    delegation, decisions/029)."""
     url = None
     for _ in range(300):
         text = open(f"{SHARED}/connect.out").read() if os.path.exists(f"{SHARED}/connect.out") else ""
         url = next(
-            (w for w in text.split() if w.startswith(f"{DASHBOARD}/terminal/authorize?")),
+            (w for w in text.split() if w.startswith(f"{DASHBOARD}/oauth/authorize?")),
             None,
         )
         if url:
@@ -299,7 +300,7 @@ def confirm_the_connection(browser):
     page.goto(url)
     if BY == "password":
         signed_in_at_the_form(page)
-    page.click("button[value=connect]")
+    page.click("button[name=decision][value=allow]")
     page.wait_for_load_state()
     context.close()
     check("exit=0" in said_by("connect.out", 120), "and it connected")

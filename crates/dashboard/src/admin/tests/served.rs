@@ -30,8 +30,8 @@ use meridian_domain::v1::{
     UserGroup,
 };
 use meridian_pb::v1::{
-    AccessLevel, SettingChoice, SettingColumn, SettingColumnType, SettingCondition, SettingDeclaration,
-    SettingType,
+    AccessLevel, SettingChoice, SettingColumn, SettingColumnType, SettingCondition,
+    SettingDeclaration, SettingType,
 };
 use prost::Message;
 
@@ -276,9 +276,10 @@ fn per_role(records: &mut AccessRecords) {
         known("reference-1", &[]),
     ];
     for n in 0..20 {
-        records
-            .known_plugins
-            .push(known(&format!("plugin-{n:02}"), &[["custody", "operations", "dgm", "reporting"][n % 4]]));
+        records.known_plugins.push(known(
+            &format!("plugin-{n:02}"),
+            &[["custody", "operations", "dgm", "reporting"][n % 4]],
+        ));
     }
     let entry = |plugin: &str, role: &str, level: AccessLevel| AccessEntry {
         plugin_instance_id: plugin.into(),
@@ -329,8 +330,17 @@ fn per_role(records: &mut AccessRecords) {
         records.permissions.push(Permission {
             permission_id: format!("P-DESK-{n:02}"),
             user_group_id: group.clone(),
-            account_group_id: if n % 3 == 0 { String::new() } else { "AG-DESK".into() },
-            access_group_id: if n % 3 == 0 { "AX-CUSTODY-ADMINS" } else { "AX-RECON" }.into(),
+            account_group_id: if n % 3 == 0 {
+                String::new()
+            } else {
+                "AG-DESK".into()
+            },
+            access_group_id: if n % 3 == 0 {
+                "AX-CUSTODY-ADMINS"
+            } else {
+                "AX-RECON"
+            }
+            .into(),
         });
     }
 }
@@ -517,10 +527,9 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         bus.serve(
             "platform.config.command.define-access-group",
             move |envelope| {
-                let asked = meridian_domain::v1::DefineAccessGroupRequest::decode(
-                    &envelope.payload[..],
-                )
-                .map_err(|e| e.to_string())?;
+                let asked =
+                    meridian_domain::v1::DefineAccessGroupRequest::decode(&envelope.payload[..])
+                        .map_err(|e| e.to_string())?;
                 let mut group = asked.access_group.unwrap_or_default();
                 if group.access_group_id.is_empty() {
                     group.access_group_id = format!("AX-{}", group.name.to_uppercase());
@@ -603,7 +612,6 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: Arc::clone(&cache),
         sessions,
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(clock),

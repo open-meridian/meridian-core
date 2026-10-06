@@ -158,7 +158,6 @@ fn app_with(
         wizard: Arc::new(WizardSession::default()),
         records,
         sessions: Arc::new(Sessions::default()),
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(At(T0)),

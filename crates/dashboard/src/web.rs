@@ -32,7 +32,6 @@ use crate::html::{escape, page, page_with, Chrome, Viewer};
 use crate::oidc::Oidc;
 use crate::records::{refresh, RecordsCache};
 use crate::session::{Session, Sessions, ABSOLUTE_NS};
-use crate::terminal::Terminals;
 
 mod delegations;
 pub(crate) mod oauth;
@@ -55,9 +54,6 @@ pub struct App {
     pub wizard: Arc<crate::first_run::WizardSession>,
     pub records: Arc<RecordsCache>,
     pub sessions: Arc<Sessions>,
-    /// Terminals' requests, codes and sessions (W6.13, W6.14). Apart from
-    /// `sessions` because a terminal's session is never a browser's.
-    pub terminals: Arc<Terminals>,
     /// Clients, the delegations people make to them, and the authorisations
     /// in flight (W6.14, W6.17, W6.18; decisions/029).
     pub delegations: Arc<Delegations>,
@@ -117,7 +113,6 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-out", post(sign_out))
         .route("/mode", get(mode))
         .route("/.meridian/ui/{*file}", get(kit))
-        .merge(terminal::routes())
         .merge(oauth::routes())
         .merge(crate::mcp::routes())
         .merge(crate::tickets::pages::routes())
@@ -391,7 +386,10 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 name_of(instance).as_deref(),
                 &levels,
                 &held,
-                access.known_roles.get(instance).is_some_and(|roles| roles.len() > 1),
+                access
+                    .known_roles
+                    .get(instance)
+                    .is_some_and(|roles| roles.len() > 1),
             ));
         }
         body.push_str(
@@ -462,18 +460,19 @@ fn plugin_card(
             id = escape(instance)
         );
     }
-    let buttons: String = levels
-        .iter()
-        .map(|level| {
-            format!(
+    let buttons: String =
+        levels
+            .iter()
+            .map(|level| {
+                format!(
                 "<a class=\"plugin-level\" data-level=\"{name}\" href=\"{href}\"{title}>{said}</a>",
                 name = meridian_access::level_name(*level),
                 href = escape(&crate::area::href(instance, *level, None)),
                 title = if several { roles_title(held, *level) } else { String::new() },
                 said = meridian_access::button(*level),
             )
-        })
-        .collect();
+            })
+            .collect();
     format!(
         "<li data-instance=\"{id}\"><div class=\"plugin-card\"><span class=\"plugin-main\">{text}</span>\
          <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
@@ -572,9 +571,8 @@ async fn sign_in(
 /// the name is unknown or the password is wrong. Telling them apart would let
 /// anybody who can reach this page enumerate a firm's staff.
 ///
-/// The same form signs somebody in for a terminal (W6.13), carrying the
-/// terminal's request so the sign-in ends in a confirmation rather than a
-/// browser session.
+/// The same form signs somebody in for a client's authorisation (W6.17),
+/// carrying it so the sign-in ends in consent rather than a browser session.
 pub(crate) fn password_page(app: &App, refusal: &str, purpose: For<'_>, notice: &str) -> String {
     let told = if refusal.is_empty() {
         String::new()
@@ -595,13 +593,6 @@ pub(crate) fn password_page(app: &App, refusal: &str, purpose: For<'_>, notice: 
         ""
     };
     let (heading, carried) = match purpose {
-        For::Terminal(id) => (
-            "Sign in to connect a terminal",
-            format!(
-                "<input type=\"hidden\" name=\"terminal\" value=\"{}\">",
-                escape(id)
-            ),
-        ),
         For::Client(id) => (
             "Sign in to allow a client",
             format!(
@@ -626,12 +617,11 @@ pub(crate) fn password_page(app: &App, refusal: &str, purpose: For<'_>, notice: 
     )
 }
 
-/// What a sign-in is for: a browser's session, a terminal's request (W6.13),
-/// or a client's authorisation (W6.17). Only the first makes a session.
+/// What a sign-in is for: a browser's session, or a client's authorisation
+/// (W6.17). Only the first makes a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum For<'a> {
     Browser,
-    Terminal(&'a str),
     Client(&'a str),
 }
 
@@ -639,9 +629,6 @@ pub(crate) enum For<'a> {
 pub struct Credentials {
     name: String,
     password: String,
-    /// A terminal's request, when this sign-in is for one.
-    #[serde(default)]
-    terminal: String,
     /// A client's authorisation, when this sign-in is for one.
     #[serde(default)]
     authorize: String,
@@ -649,10 +636,9 @@ pub struct Credentials {
 
 impl Credentials {
     fn purpose(&self) -> For<'_> {
-        match (self.terminal.as_str(), self.authorize.as_str()) {
-            ("", "") => For::Browser,
-            (id, "") => For::Terminal(id),
-            (_, id) => For::Client(id),
+        match self.authorize.as_str() {
+            "" => For::Browser,
+            id => For::Client(id),
         }
     }
 }
@@ -668,7 +654,6 @@ async fn signed_in_for(
 ) -> Response {
     match purpose {
         For::Browser => began(app, subject, display_name, groups, now).await,
-        For::Terminal(id) => terminal::signed_in(app, id, subject, display_name, groups, now).await,
         For::Client(id) => oauth::signed_in(app, id, subject, display_name, groups, now).await,
     }
 }
@@ -879,19 +864,16 @@ async fn callback(
         return bad_request("this sign-in was started in another browser; start again here");
     }
 
-    // Whether this sign-in was a terminal's or a client's, asked before it
-    // is finished so a state is matched to at most one request, whatever
-    // happens next.
-    let terminal = app.terminals.for_provider_state(state);
+    // Whether this sign-in was a client's, asked before it is finished so a
+    // state is matched to at most one request, whatever happens next.
     let client = app.delegations.for_provider_state(state);
     let identity = match oidc.finish(state, code, now).await {
         Ok(identity) => identity,
         Err(failed) => return bad_request(&failed),
     };
-    let purpose = match (&terminal, &client) {
-        (Some(id), _) => For::Terminal(id),
-        (None, Some(id)) => For::Client(id),
-        (None, None) => For::Browser,
+    let purpose = match &client {
+        Some(id) => For::Client(id),
+        None => For::Browser,
     };
     let mut response = signed_in_for(
         &app,

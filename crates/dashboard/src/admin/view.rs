@@ -304,9 +304,20 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
     for permission in &records.permissions {
         if permission.access_group_id == ALL_PLUGINS_ADMIN {
             // Every role of the plugin, or the plugin as a whole.
-            let every = if roles.is_empty() { vec![String::new()] } else { roles.clone() };
+            let every = if roles.is_empty() {
+                vec![String::new()]
+            } else {
+                roles.clone()
+            };
             for role in &every {
-                rows.push(row(0, permission, "All plugins (admin)", role, "admin", false));
+                rows.push(row(
+                    0,
+                    permission,
+                    "All plugins (admin)",
+                    role,
+                    "admin",
+                    false,
+                ));
             }
             continue;
         }
@@ -329,7 +340,14 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
                 _ => continue,
             };
             let stale = !meridian_access::entry_holds(records, instance, &entry.role);
-            rows.push(row(order, permission, &group.name, &entry.role, level, stale));
+            rows.push(row(
+                order,
+                permission,
+                &group.name,
+                &entry.role,
+                level,
+                stale,
+            ));
         }
     }
     // Admin, then write, then read, and otherwise in the order the

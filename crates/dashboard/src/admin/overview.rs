@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 9] = [
+const TABS: [(&str, &str); 8] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -38,7 +38,6 @@ const TABS: [(&str, &str); 9] = [
     ("accounts", "Accounts"),
     ("books", "Books"),
     ("connected-clients", "Connected clients"),
-    ("terminal-sessions", "Terminal sessions"),
 ];
 
 fn level_name(level: i32) -> &'static str {
@@ -186,7 +185,6 @@ fn by_name<'a>(name: &'a str, id: &'a str) -> (String, &'a str) {
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     records: &AccessRecords,
-    holders: &[(String, String, usize)],
     delegating: &[(String, String, usize)],
     plugins: &[Line],
     people: &[Person],
@@ -639,7 +637,10 @@ pub fn render(
     // And every plugin a sidecar has reported (W6.1, contract v15), whether
     // or not it runs now.
     for known in &records.known_plugins {
-        if !instances.iter().any(|(id, _)| id == &known.plugin_instance_id) {
+        if !instances
+            .iter()
+            .any(|(id, _)| id == &known.plugin_instance_id)
+        {
             instances.push((known.plugin_instance_id.clone(), String::new()));
         }
     }
@@ -668,7 +669,11 @@ pub fn render(
     let mut editor_rows: Vec<(String, String, String, bool)> = Vec::new();
     for (id, name) in &instances {
         let roles = known_roles(records, id);
-        let shown = if name.is_empty() { id.clone() } else { name.clone() };
+        let shown = if name.is_empty() {
+            id.clone()
+        } else {
+            name.clone()
+        };
         if roles.is_empty() {
             editor_rows.push((id.clone(), shown.clone(), String::new(), false));
         }
@@ -749,11 +754,12 @@ pub fn render(
                 .entries
                 .iter()
                 .map(|e| {
-                    let stale = if meridian_access::entry_holds(records, &e.plugin_instance_id, &e.role) {
-                        ""
-                    } else {
-                        " (holds nothing: not a role it holds now)"
-                    };
+                    let stale =
+                        if meridian_access::entry_holds(records, &e.plugin_instance_id, &e.role) {
+                            ""
+                        } else {
+                            " (holds nothing: not a role it holds now)"
+                        };
                     let role = if e.role.is_empty() {
                         String::new()
                     } else {
@@ -1024,73 +1030,6 @@ pub fn render(
         "Who has delegated to a client -- the <code>meridian</code> command on a computer, or \
          an agent -- and the way to revoke one or all of a person's delegations. Their browser \
          sessions are untouched.",
-        "",
-        body,
-    ));
-
-    // ── Terminal sessions ───────────────────────────────────────────────────
-    // W6.14. Per person: what is being ended is their access from a terminal,
-    // so there is no choosing among their sessions to offer. By user ID, then
-    // login ID.
-    let body = if holders.is_empty() {
-        "<p class=\"empty\">Nobody holds a terminal session.</p>".to_string()
-    } else {
-        let mut held: Vec<(Person, usize)> = holders
-            .iter()
-            .map(|(login, name, count)| {
-                (
-                    Person {
-                        user_id: super::people::user_id(login),
-                        login: login.clone(),
-                        name: name.clone(),
-                    },
-                    *count,
-                )
-            })
-            .collect();
-        held.sort_by(|(a, _), (b, _)| {
-            a.user_id
-                .to_lowercase()
-                .cmp(&b.user_id.to_lowercase())
-                .then_with(|| a.login.cmp(&b.login))
-        });
-        let rows: String = held
-            .iter()
-            .map(|(person, count)| {
-                let called = if person.name.is_empty() {
-                    &person.user_id
-                } else {
-                    &person.name
-                };
-                format!(
-                    "<tr data-id=\"{login}\" data-name=\"{name}\"><td><span class=\"name\">{user}</span></td>\
-                     <td>{named}</td><td data-count=\"{count}\">{count}</td><td class=\"actions\">\
-                     <form method=\"post\" action=\"/admin/end-terminal-sessions#terminal-sessions\" \
-                     data-confirm=\"End {called}'s terminal sessions? Their CLI signs in again.\">{token}\
-                     <input type=\"hidden\" name=\"login\" value=\"{login}\">\
-                     <button type=\"submit\">End them</button></form></td></tr>",
-                    login = escape(&person.login),
-                    name = escape(&person.name),
-                    user = escape(&person.user_id),
-                    named = named(&person.name, &person.login),
-                    called = escape(called),
-                )
-            })
-            .collect();
-        listing(
-            "terminal-sessions-table",
-            "",
-            "people",
-            "Search by user ID, name or login",
-            "<th>User ID</th><th>Person</th><th>Sessions</th><th></th>",
-            &rows,
-        )
-    };
-    sections.push(section(
-        "terminal-sessions",
-        "Terminal sessions",
-        "Who is signed in from a terminal by a CLI from before delegations, honoured until \
-         each session lapses.",
         "",
         body,
     ));

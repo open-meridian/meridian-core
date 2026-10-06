@@ -850,12 +850,22 @@ fn what_a_delegation_covers_is_said_in_a_line() {
 fn one_level_is_said_per_plugin_and_a_long_list_is_cut_short() {
     let mut covers = Covers::default();
     for i in 0..5 {
-        covers.plugins.insert((format!("p-{i}"), String::new(), "admin".into()));
-        covers.plugins.insert((format!("p-{i}"), String::new(), "read".into()));
+        covers
+            .plugins
+            .insert((format!("p-{i}"), String::new(), "admin".into()));
+        covers
+            .plugins
+            .insert((format!("p-{i}"), String::new(), "read".into()));
     }
-    covers.plugins.insert(("q-1".into(), String::new(), "write".into()));
-    covers.plugins.insert(("q-1".into(), String::new(), "read".into()));
-    covers.plugins.insert(("r-1".into(), String::new(), "read".into()));
+    covers
+        .plugins
+        .insert(("q-1".into(), String::new(), "write".into()));
+    covers
+        .plugins
+        .insert(("q-1".into(), String::new(), "read".into()));
+    covers
+        .plugins
+        .insert(("r-1".into(), String::new(), "read".into()));
     covers.account_groups = (0..300).map(|i| format!("AG-{i:03}")).collect();
     assert_eq!(covers.level_on("p-0", ""), Some(AccessLevel::Admin));
     assert_eq!(covers.level_on("q-1", ""), Some(AccessLevel::Write));
@@ -975,7 +985,10 @@ fn rows_recorded_before_v15_are_rewritten_once_to_name_the_plugins_one_role() {
     );
     assert_eq!(
         rewritten.unmatched,
-        BTreeSet::from([("gone-1".into(), "admin".into()), ("ops-1".into(), "read".into())]),
+        BTreeSet::from([
+            ("gone-1".into(), "admin".into()),
+            ("ops-1".into(), "read".into())
+        ]),
         "a plugin holding several roles, or none known: kept, covering nothing"
     );
     assert_eq!(rewrite_rows(&rewritten, &records), None, "idempotent");
@@ -1004,5 +1017,8 @@ fn the_rows_as_kept_read_back_whichever_shape_they_were_written_in() {
             ("tool-1".into(), String::new(), "write".into())
         ])
     );
-    assert_eq!(unmatched, BTreeSet::from([("oms-1".into(), "admin".into())]));
+    assert_eq!(
+        unmatched,
+        BTreeSet::from([("oms-1".into(), "admin".into())])
+    );
 }

@@ -202,7 +202,6 @@ fn dashboard(
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions,
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(clock),
@@ -715,7 +714,7 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     );
 
     plugins
-        .sweep(&h.app.sessions, &h.app.terminals, &h.app.delegations, now)
+        .sweep(&h.app.sessions, &h.app.delegations, now)
         .await;
     assert_eq!(
         plugins.entered.lock().unwrap().len(),
@@ -726,12 +725,7 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
 
     h.app.sessions.end(&h.session);
     plugins
-        .sweep(
-            &h.app.sessions,
-            &h.app.terminals,
-            &h.app.delegations,
-            now + CODE_NS + 1,
-        )
+        .sweep(&h.app.sessions, &h.app.delegations, now + CODE_NS + 1)
         .await;
     assert!(plugins.entered.lock().unwrap().is_empty());
     assert!(plugins.codes.lock().unwrap().is_empty());
@@ -1113,31 +1107,10 @@ async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
     assert!(!home.body.contains("snaptrade-1"), "{}", home.body);
 }
 
-/// A terminal session for Ada, as `meridian connect` gets one.
+/// What `meridian connect` holds for Ada: a delegation to the CLI covering
+/// everything she holds, its access token (W6.13, W6.17).
 async fn terminal(app: &Arc<App>) -> String {
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-    const BACK: &str = "http://127.0.0.1:53682/callback";
-    let now = app.clock.now_ns();
-    let terminals = &app.terminals;
-    let id = terminals.open(
-        crate::terminal::check(BACK, CHALLENGE, "S256", "st").unwrap(),
-        now,
-    );
-    let person = crate::terminal::Person {
-        subject: ADA.into(),
-        display_name: "Ada".into(),
-        directory_groups: vec![],
-        signed_in_at_ns: now,
-    };
-    let confirm = terminals.signed_in(&id, person, now).unwrap();
-    let (_, code) = terminals.decide(&id, &confirm, true, now).unwrap();
-    terminals
-        .exchange(&code.unwrap(), VERIFIER, BACK, now)
-        .await
-        .expect("the store answers")
-        .unwrap()
-        .session
+    crate::delegation::connected_for_tests(&app.delegations, ADA, app.clock.now_ns()).await
 }
 
 async fn develop(app: &Arc<App>, method: Method, path: &str, bearer: &str, body: &str) -> Answer {
@@ -1295,8 +1268,24 @@ async fn a_terminal_link_enters_the_plugins_host_once_and_ends_with_the_terminal
     let home = get(&h.app, DASHBOARD, "/", std::slice::from_ref(&cookie)).await;
     assert!(!home.body.contains("Ada"), "{}", home.body);
 
-    // The terminal session ends, and the host's with it.
-    h.app.terminals.end(&session).await.unwrap();
+    // The delegation is revoked, and the host's session with it.
+    let delegation = h
+        .app
+        .delegations
+        .check(
+            &session,
+            crate::delegation::Resource::Terminal,
+            None,
+            h.app.clock.now_ns(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    h.app
+        .delegations
+        .revoke(&delegation.id, ADA, "signed out", h.app.clock.now_ns())
+        .await
+        .unwrap();
     let after = get(&h.app, PLUGIN_HOST, "/", &[cookie]).await;
     assert_eq!(
         after.status,
@@ -2508,13 +2497,30 @@ fn the_claims_carry_each_roles_level_and_accounts_as_positions() {
     let entries: Vec<(String, i32, Vec<u32>, Vec<u32>)> = claims
         .roles
         .iter()
-        .map(|r| (r.role.clone(), r.level, r.read_positions.clone(), r.write_positions.clone()))
+        .map(|r| {
+            (
+                r.role.clone(),
+                r.level,
+                r.read_positions.clone(),
+                r.write_positions.clone(),
+            )
+        })
         .collect();
     assert_eq!(
         entries,
         [
-            ("custody".into(), AccessLevel::Read as i32, vec![0, 2], vec![]),
-            ("operations".into(), AccessLevel::Write as i32, vec![1], vec![1]),
+            (
+                "custody".into(),
+                AccessLevel::Read as i32,
+                vec![0, 2],
+                vec![]
+            ),
+            (
+                "operations".into(),
+                AccessLevel::Write as i32,
+                vec![1],
+                vec![1]
+            ),
         ]
     );
     // Under View each role at read.

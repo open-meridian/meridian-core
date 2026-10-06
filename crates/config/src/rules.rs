@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 use meridian_access::{is_built_in_access_group, AccessLevel, ALL_ACCOUNTS};
 use meridian_domain::setting_table;
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
-    LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
+    AccessEntry, AccessGroup, AccountGroup, AccountState, DefineAccountRequest,
+    GrantPermissionRequest, LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
 };
 use meridian_pb::bounds::{
     ACCOUNT_RECORD_ACCOUNT_TYPE_LENGTH, ACCOUNT_RECORD_CUSTODIAN_LENGTH,

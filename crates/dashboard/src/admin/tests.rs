@@ -161,7 +161,6 @@ fn harness_holding(
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions,
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(At(T0)),
@@ -2438,13 +2437,16 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect()
     };
-    let entries = entries_of(&pairs(&[
-        ("plugin", "oms-1"),
-        ("level.oms-1", "write"),
-        ("plugin", "snaptrade-1"),
-        ("level.snaptrade-1", "read"),
-        ("level.unchosen-1", "write"),
-    ]), &meridian_domain::v1::AccessRecords::default())
+    let entries = entries_of(
+        &pairs(&[
+            ("plugin", "oms-1"),
+            ("level.oms-1", "write"),
+            ("plugin", "snaptrade-1"),
+            ("level.snaptrade-1", "read"),
+            ("level.unchosen-1", "write"),
+        ]),
+        &meridian_domain::v1::AccessRecords::default(),
+    )
     .unwrap();
     let got: Vec<(&str, i32)> = entries
         .iter()
@@ -2460,9 +2462,12 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
     );
     // The lines the form took before, still.
     assert_eq!(
-        entries_of(&pairs(&[("entries", "oms-1 read")]), &meridian_domain::v1::AccessRecords::default())
-            .unwrap()
-            .len(),
+        entries_of(
+            &pairs(&[("entries", "oms-1 read")]),
+            &meridian_domain::v1::AccessRecords::default()
+        )
+        .unwrap()
+        .len(),
         1
     );
     // One level each: never twice, however it is sent.
@@ -2479,27 +2484,35 @@ fn an_access_group_gives_each_plugin_chosen_exactly_one_level() {
             ("level.oms-1", "read"),
         ]),
     ] {
-        let refused = entries_of(&twice, &meridian_domain::v1::AccessRecords::default()).unwrap_err();
+        let refused =
+            entries_of(&twice, &meridian_domain::v1::AccessRecords::default()).unwrap_err();
         assert!(
             refused.contains("named twice") && refused.contains("write includes read"),
             "{refused}"
         );
     }
-    assert!(entries_of(&pairs(&[("plugin", "oms-1")]), &meridian_domain::v1::AccessRecords::default())
-        .unwrap_err()
-        .contains("no level"));
-    assert!(
-        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", "owner")]), &meridian_domain::v1::AccessRecords::default())
-            .unwrap_err()
-            .contains("not admin, read or write")
-    );
+    assert!(entries_of(
+        &pairs(&[("plugin", "oms-1")]),
+        &meridian_domain::v1::AccessRecords::default()
+    )
+    .unwrap_err()
+    .contains("no level"));
+    assert!(entries_of(
+        &pairs(&[("plugin", "oms-1"), ("level.oms-1", "owner")]),
+        &meridian_domain::v1::AccessRecords::default()
+    )
+    .unwrap_err()
+    .contains("not admin, read or write"));
     // Admin, alone or beside one data level (W6.7).
     let levels = |choice: &str| -> Vec<i32> {
-        entries_of(&pairs(&[("plugin", "oms-1"), ("level.oms-1", choice)]), &meridian_domain::v1::AccessRecords::default())
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.level)
-            .collect()
+        entries_of(
+            &pairs(&[("plugin", "oms-1"), ("level.oms-1", choice)]),
+            &meridian_domain::v1::AccessRecords::default(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.level)
+        .collect()
     };
     assert_eq!(levels("admin"), [AccessLevel::Admin as i32]);
     assert_eq!(
@@ -2928,7 +2941,11 @@ fn the_access_editor_sends_a_level_per_plugin_role() {
     assert_eq!(
         said,
         [
-            ("ops-1".into(), "operations".into(), AccessLevel::Write as i32),
+            (
+                "ops-1".into(),
+                "operations".into(),
+                AccessLevel::Write as i32
+            ),
             ("ops-1".into(), "custody".into(), AccessLevel::Admin as i32),
             ("ops-1".into(), "custody".into(), AccessLevel::Read as i32),
         ],
@@ -2945,9 +2962,12 @@ fn the_access_editor_sends_a_level_per_plugin_role() {
     let several = entries_of(&pairs(&[("entries", "ops-1 read")]), &records).unwrap();
     assert_eq!(several[0].role, "");
     // Read and write on one role is refused; on two roles it is not both.
-    assert!(entries_of(&pairs(&[("entries", "ops-1 custody read\nops-1 custody write")]), &records)
-        .unwrap_err()
-        .contains("ops-1 custody"));
+    assert!(entries_of(
+        &pairs(&[("entries", "ops-1 custody read\nops-1 custody write")]),
+        &records
+    )
+    .unwrap_err()
+    .contains("ops-1 custody"));
     assert!(entries_of(
         &pairs(&[("entries", "ops-1 custody read\nops-1 operations write")]),
         &records

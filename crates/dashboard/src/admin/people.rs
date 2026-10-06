@@ -19,7 +19,7 @@
 //! dashboard keeps none.
 //!
 //! Nobody is listed who has not been named somewhere this dashboard can see:
-//! in a user group, holding a terminal session, or a local account. A person
+//! in a user group, holding a delegation, or a local account. A person
 //! from a directory who has never signed in is named by typing their login,
 //! which the form still takes (design/naming-a-person-before-they-sign-in
 //! owns how a directory's people are named before then).

@@ -3,13 +3,10 @@
 //! Prefixed `dashboard_`, beside the conductor's `config_` ones: two
 //! components keeping their own tables in one database is the arrangement
 //! this deployment already runs, and two components sharing a table is not
-//! supported. Two things are kept here:
+//! supported. Kept here:
 //!
 //! - the accounts this deployment holds itself ([`crate::accounts`]), used
 //!   only where the firm has no directory of its own;
-//! - terminal sessions ([`crate::terminal`]), by hash, in every deployment
-//!   that signs people in, so a restart or an upgrade leaves them standing
-//!   (W6.13, ruled 2026-09-30);
 //! - clients, the delegations people make to them, and their tokens by
 //!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
 //! - tickets, their references and notes, notices and each reader's place
@@ -66,6 +63,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "ticket",
         sql: include_str!("../migrations/0005_ticket.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "terminal_sessions_retired",
+        sql: include_str!("../migrations/0006_terminal_sessions_retired.sql"),
     },
 ];
 

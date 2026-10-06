@@ -26,8 +26,8 @@ use crate::migrations;
 use crate::store::{
     group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
     AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
-    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
-    StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError, StoredSetting,
+    Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -594,7 +594,10 @@ impl Store for PostgresStore {
             &[&permission_id],
         )
         .map_err(unavailable)?;
-        insert_access_change(&mut tx, &permission_change(&withdrawn, false, author, at_ns))?;
+        insert_access_change(
+            &mut tx,
+            &permission_change(&withdrawn, false, author, at_ns),
+        )?;
         tx.commit().map_err(unavailable)?;
         Ok(Withdrawal::Withdrawn)
     }

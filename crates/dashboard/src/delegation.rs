@@ -205,9 +205,9 @@ impl Covers {
     /// v15): the highest it covers there. Manage includes Open and View, as
     /// holding it does.
     pub fn level_on(&self, instance: &str, role: &str) -> Option<AccessLevel> {
-        LEVELS_DOWN.into_iter().find(|level| {
-            self.covers(instance, role, meridian_access::level_name(*level))
-        })
+        LEVELS_DOWN
+            .into_iter()
+            .find(|level| self.covers(instance, role, meridian_access::level_name(*level)))
     }
 
     /// The plugin instances and roles it names, in order.
@@ -319,7 +319,9 @@ pub fn rewrite_rows(covers: &Covers, records: &AccessRecords) -> Option<Covers> 
                     .insert((instance.clone(), String::new(), level.clone()));
             }
             _ => {
-                rewritten.unmatched.insert((instance.clone(), level.clone()));
+                rewritten
+                    .unmatched
+                    .insert((instance.clone(), level.clone()));
             }
         }
     }
@@ -453,14 +455,18 @@ pub fn narrow(
             }
         }
         if admin || data.is_some() {
-            plugins.entry(instance.to_string()).or_default().roles.insert(
-                role.to_string(),
-                Held {
-                    admin,
-                    data,
-                    accounts: reached,
-                },
-            );
+            plugins
+                .entry(instance.to_string())
+                .or_default()
+                .roles
+                .insert(
+                    role.to_string(),
+                    Held {
+                        admin,
+                        data,
+                        accounts: reached,
+                    },
+                );
         }
     }
     meridian_access::Access {
@@ -1418,6 +1424,82 @@ impl Delegations {
         }
         self.stored(move |store| store.sweep(now_ns)).await
     }
+}
+
+/// A delegation covering everything a person holds, to the CLI on a computer,
+/// for the terminal's paths, as `meridian connect` makes one: its access
+/// token. For other modules' tests of what a terminal path does.
+#[cfg(test)]
+pub(crate) async fn connected_for_tests(
+    delegations: &Delegations,
+    subject: &str,
+    now_ns: i64,
+) -> String {
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const BACK: &str = "http://127.0.0.1:53682/callback";
+    let client = delegations
+        .register(
+            Registration {
+                name: format!("meridian for {subject}"),
+                redirect_uris: vec![BACK.into()],
+                software_id: CLI_SOFTWARE_ID.into(),
+            },
+            now_ns,
+        )
+        .await
+        .expect("kept")
+        .expect("registered");
+    let asked = check_asked(
+        client.clone(),
+        BACK,
+        "code",
+        CHALLENGE,
+        "S256",
+        "st",
+        Resource::Terminal,
+    )
+    .expect("asked");
+    let id = delegations.open(asked, now_ns);
+    let person = Person {
+        subject: subject.into(),
+        display_name: subject.into(),
+        directory_groups: vec![],
+        signed_in_at_ns: now_ns,
+    };
+    let (_, confirm) = delegations
+        .signed_in(&id, person, now_ns)
+        .expect("signed in");
+    let (_, code) = delegations
+        .decide(
+            &id,
+            &confirm,
+            Some(Consent {
+                covers: Covers::everything(),
+                days: 30,
+            }),
+            now_ns,
+        )
+        .await
+        .expect("kept")
+        .expect("decided");
+    let (delegation, resource) = delegations
+        .redeem(
+            &code.expect("a code"),
+            VERIFIER,
+            BACK,
+            &client.client_id,
+            None,
+            now_ns,
+        )
+        .await
+        .expect("kept")
+        .expect("redeemed");
+    delegations
+        .issue(delegation, resource, now_ns)
+        .await
+        .expect("issued")
+        .access_token
 }
 
 #[cfg(test)]

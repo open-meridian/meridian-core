@@ -57,7 +57,6 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/access-groups", post(define_access_group))
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
-        .route("/admin/end-terminal-sessions", post(end_terminal_sessions))
         .route("/admin/instruments", get(instruments_page))
         .route("/admin/instruments/complete", post(complete_instruments))
         .route("/admin/instruments/accept", post(accept_offers))
@@ -253,41 +252,6 @@ fn after_to(outcome: Result<(), String>, done: &str, back: &str) -> Response {
     }
 }
 
-/// W6.14: every terminal session a person holds, ended. Nothing goes to the
-/// conductor: the sessions are this dashboard's, and so is ending them.
-async fn end_terminal_sessions(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Form(fields): Form<Fields>,
-) -> Response {
-    let (session, _) = match gate(&app, &headers, true) {
-        Ok(gated) => gated,
-        Err(response) => return *response,
-    };
-    if let Err(response) = form_token_matches(&session, &fields) {
-        return *response;
-    }
-    let login = field(&fields, "login");
-    let ended = match app.terminals.end_person(login).await {
-        Ok(ended) => ended,
-        Err(unavailable) => {
-            tracing::error!(login, %unavailable, "terminal sessions could not be ended");
-            return crate::web::refused(&format!(
-                "{login}'s terminal sessions were not ended: {unavailable}"
-            ));
-        }
-    };
-    tracing::info!(login, ended, by = %session.subject, "terminal sessions ended");
-    (
-        StatusCode::SEE_OTHER,
-        [(
-            axum::http::header::LOCATION,
-            format!("/admin?terminal_sessions_ended={ended}"),
-        )],
-    )
-        .into_response()
-}
-
 // ── The first deployment admin ──────────────────────────────────────────────
 
 async fn claim_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -389,7 +353,7 @@ pub mod people;
 pub(crate) mod picker;
 
 /// Everybody this dashboard can name for a user group (people.rs): those the
-/// groups name, those holding a terminal session, and the accounts this
+/// groups name, those holding a delegation, and the accounts this
 /// deployment holds itself. The local accounts are read off the async
 /// threads, as a sign-in reads them; if they cannot be read, the page still
 /// lists the rest and says so in the log.
@@ -437,29 +401,10 @@ async fn people_known(
     )
 }
 
-async fn admin_page(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Query(query): Query<Fields>,
-) -> Response {
+async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let (session, records) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
-    };
-    // What the last form did, where it has something to say.
-    let notice = match field(&query, "terminal_sessions_ended").parse::<usize>() {
-        Ok(ended) => format!(
-            "Ended {ended} terminal session{}.",
-            if ended == 1 { "" } else { "s" }
-        ),
-        Err(_) => String::new(),
-    };
-    let holders = match app.terminals.holders(app.clock.now_ns()).await {
-        Ok(holders) => holders,
-        Err(unavailable) => {
-            tracing::error!(%unavailable, "terminal sessions could not be listed");
-            return crate::web::refused(&unavailable.to_string());
-        }
     };
     let delegating = match app.delegations.holders(app.clock.now_ns()).await {
         Ok(delegating) => delegating,
@@ -470,17 +415,16 @@ async fn admin_page(
     };
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
-    let people = people_known(&app, &records, &holders).await;
+    let people = people_known(&app, &records, &delegating).await;
     let books = books::read(&app.bus).await;
     let body = overview::render(
         &records,
-        &holders,
         &delegating,
         &lines,
         &people,
         &books,
         &token_input(&session),
-        &notice,
+        "",
     );
     Html(page_with("Settings", &body, &admin_chrome(&session))).into_response()
 }
@@ -705,7 +649,11 @@ async fn save_settings(
     // A setting serving several roles is set by an admin of every one
     // (W6.11, decisions/033 point 2): the dashboard, which evaluates access,
     // checks it before sending.
-    let plugin_roles = access.known_roles.get(instance).cloned().unwrap_or_default();
+    let plugin_roles = access
+        .known_roles
+        .get(instance)
+        .cloned()
+        .unwrap_or_default();
     if let Some(refusal) = settings::not_administered(record, &request, &held, &plugin_roles) {
         return after_to(Err(refusal), back, back);
     }
@@ -1285,8 +1233,10 @@ fn chosen_levels(row: &str, chosen: &str) -> Result<Vec<AccessLevel>, String> {
         "admin-read" => vec![AccessLevel::Admin, AccessLevel::Read],
         "admin-write" => vec![AccessLevel::Admin, AccessLevel::Write],
         "" => return Err(format!("`{row}` has no level: choose admin, read or write")),
-        other => vec![level_named(other)
-            .ok_or_else(|| format!("`{other}` is not admin, read or write"))?],
+        other => {
+            vec![level_named(other)
+                .ok_or_else(|| format!("`{other}` is not admin, read or write"))?]
+        }
     })
 }
 
@@ -1318,7 +1268,12 @@ pub fn entries_of(
     } else {
         ticked
             .iter()
-            .map(|row| (row.clone(), field(&fields, &format!("level.{row}")).to_string()))
+            .map(|row| {
+                (
+                    row.clone(),
+                    field(&fields, &format!("level.{row}")).to_string(),
+                )
+            })
             .collect()
     };
     for (row, chosen) in rows {

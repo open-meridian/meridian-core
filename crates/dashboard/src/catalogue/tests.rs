@@ -16,7 +16,6 @@ use tower::ServiceExt;
 use super::*;
 use crate::records::RecordsCache;
 use crate::session::Sessions;
-use crate::terminal::{check, Terminals};
 use crate::web::router;
 use crate::Clock;
 
@@ -186,28 +185,6 @@ struct Harness {
     browser: String,
 }
 
-/// A terminal session, by the steps a CLI takes.
-async fn terminal_session(terminals: &Terminals, subject: &str) -> String {
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-    const BACK: &str = "http://127.0.0.1:53682/callback";
-    let id = terminals.open(check(BACK, CHALLENGE, "S256", "st").unwrap(), T0);
-    let person = Person {
-        subject: subject.into(),
-        display_name: subject.into(),
-        directory_groups: vec![],
-        signed_in_at_ns: T0,
-    };
-    let confirm = terminals.signed_in(&id, person, T0).unwrap();
-    let (_, code) = terminals.decide(&id, &confirm, true, T0).unwrap();
-    terminals
-        .exchange(&code.unwrap(), VERIFIER, BACK, T0)
-        .await
-        .expect("the store answers")
-        .unwrap()
-        .session
-}
-
 async fn harness() -> Harness {
     let (base, reached) = registry().await;
     let bus = Arc::new(Bus::single(
@@ -218,18 +195,18 @@ async fn harness() -> Harness {
     conductor(&bus);
     let cache = Arc::new(RecordsCache::default());
     cache.store(records(), T0);
-    let terminals = Arc::new(Terminals::default());
+    let delegations = Arc::new(crate::delegation::Delegations::default());
     let sessions = Arc::new(Sessions::default());
-    let ada = terminal_session(&terminals, "local|ada").await;
-    let bob = terminal_session(&terminals, "local|bob").await;
+    // What `meridian connect` holds: a delegation to the CLI (W6.13, W6.17).
+    let ada = crate::delegation::connected_for_tests(&delegations, "local|ada", T0).await;
+    let bob = crate::delegation::connected_for_tests(&delegations, "local|bob", T0).await;
     let browser = sessions.start("local|ada", "Ada", vec![], T0);
     let app = Arc::new(App {
         first_run: false,
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions,
-        terminals,
-        delegations: Arc::new(crate::delegation::Delegations::default()),
+        delegations,
         public_url: String::new(),
         clock: Arc::new(At(T0)),
         bus,

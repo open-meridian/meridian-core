@@ -344,7 +344,10 @@ impl SidecarService for Sidecar {
                     Err(why) => {
                         return Ok(Response::new(RegisterReply {
                             admitted: false,
-                            refusal_reason: format!("the page {} ({}) {why}", page.path, page.title),
+                            refusal_reason: format!(
+                                "the page {} ({}) {why}",
+                                page.path, page.title
+                            ),
                             ..Default::default()
                         }));
                     }

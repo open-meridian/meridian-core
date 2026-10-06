@@ -575,8 +575,10 @@ fn a_session_carries_each_roles_level_within_its_button() {
         ]
     );
     let view = ops.session(AccessLevel::Read).unwrap();
-    assert!(view.roles.iter().all(|role| role.level == AccessLevel::Read
-        && role.accounts.write.is_empty()));
+    assert!(view
+        .roles
+        .iter()
+        .all(|role| role.level == AccessLevel::Read && role.accounts.write.is_empty()));
     assert_eq!(ops.session(AccessLevel::Admin), None, "Manage is not held");
 }
 
@@ -585,7 +587,10 @@ fn an_entry_naming_a_role_the_plugin_no_longer_holds_holds_nothing() {
     let mut records = two_roles();
     records.known_plugins[0].roles = vec!["operations".into()];
     let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
-    assert!(!ops.roles.contains_key("custody"), "custody's entry holds nothing");
+    assert!(
+        !ops.roles.contains_key("custody"),
+        "custody's entry holds nothing"
+    );
     assert!(ops.roles.contains_key("operations"));
     assert!(!entry_holds(&records, OPS, "custody"));
     // A role-less entry on a plugin that now holds roles holds nothing either,
@@ -711,5 +716,7 @@ fn the_access_table_breaks_the_union_down_by_role_as_positions() {
     // A role-less plugin's table carries no entry.
     let mut whole = self::records();
     known(&mut whole, OMS, &[]);
-    assert!(plugin_access_table(&whole, OMS).user_groups[0].roles.is_empty());
+    assert!(plugin_access_table(&whole, OMS).user_groups[0]
+        .roles
+        .is_empty());
 }

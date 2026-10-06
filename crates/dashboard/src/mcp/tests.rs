@@ -254,7 +254,6 @@ async fn harness(deployment_admin: bool) -> Harness {
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions: Arc::new(Sessions::default()),
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(SystemClock),
@@ -908,7 +907,11 @@ fn a_tool_is_listed_and_opened_by_the_role_it_serves() {
         "a custody write tool is not the operations writer's"
     );
     assert_eq!(
-        super::level_by_role(&levels(&[AccessLevel::Write]), &roles(&["operations"]), &held),
+        super::level_by_role(
+            &levels(&[AccessLevel::Write]),
+            &roles(&["operations"]),
+            &held
+        ),
         Some(AccessLevel::Write)
     );
     assert_eq!(

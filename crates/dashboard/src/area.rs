@@ -463,21 +463,37 @@ mod tests {
         // A plugin holding custody and operations (contract v15): a page
         // naming a role shows when the person's level on it within the
         // button is one of the page's levels.
-        let page = |path: &str, title: &str, levels: &[AccessLevel], roles: &[&str]| PageDeclaration {
-            path: path.into(),
-            title: title.into(),
-            levels: levels.iter().map(|l| *l as i32).collect(),
-            roles: roles.iter().map(|r| r.to_string()).collect(),
-        };
+        let page =
+            |path: &str, title: &str, levels: &[AccessLevel], roles: &[&str]| PageDeclaration {
+                path: path.into(),
+                title: title.into(),
+                levels: levels.iter().map(|l| *l as i32).collect(),
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+            };
         let report = PluginReport {
             declared_interface: Some(InterfaceDeclaration {
                 loopback_port: 8000,
                 title: "Ops".into(),
                 pages: vec![
-                    page("/balances", "Balances", &[AccessLevel::Write, AccessLevel::Read], &["operations"]),
-                    page("/statements", "Statements", &[AccessLevel::Write], &["custody"]),
+                    page(
+                        "/balances",
+                        "Balances",
+                        &[AccessLevel::Write, AccessLevel::Read],
+                        &["operations"],
+                    ),
+                    page(
+                        "/statements",
+                        "Statements",
+                        &[AccessLevel::Write],
+                        &["custody"],
+                    ),
                     page("/holdings", "Holdings", &[AccessLevel::Read], &["custody"]),
-                    page("/links", "Account links", &[AccessLevel::Admin], &["custody"]),
+                    page(
+                        "/links",
+                        "Account links",
+                        &[AccessLevel::Admin],
+                        &["custody"],
+                    ),
                 ],
             }),
             ..Default::default()
@@ -486,7 +502,10 @@ mod tests {
         let open = tabs_by_role(
             Some(&report),
             AccessLevel::Write,
-            &[("custody".into(), AccessLevel::Read), ("operations".into(), AccessLevel::Write)],
+            &[
+                ("custody".into(), AccessLevel::Read),
+                ("operations".into(), AccessLevel::Write),
+            ],
             &[],
         );
         assert_eq!(titles(open), ["Balances", "Holdings"]);
@@ -503,7 +522,10 @@ mod tests {
             &[("custody".into(), AccessLevel::Admin)],
             &[],
         );
-        assert_eq!(titles(custody_admin), ["Summary", "Settings", "Account links"]);
+        assert_eq!(
+            titles(custody_admin),
+            ["Summary", "Settings", "Account links"]
+        );
     }
 
     #[test]

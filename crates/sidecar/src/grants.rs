@@ -317,7 +317,8 @@ platform.street.command.record-holding\tcommand\tcustody\tstreet
 platform.book.command.record-break\tcommand\toperations\tbook
 platform.config.command.file-ticket\tcommand\tcustody,operations\tdashboard
 ";
-        let contract = Contract::parse(TWO, "name\tkind\ncustody\trole\noperations\trole\n").unwrap();
+        let contract =
+            Contract::parse(TWO, "name\tkind\ncustody\trole\noperations\trole\n").unwrap();
         let both = roles(&["custody", "operations"]);
         assert_eq!(
             contract.roles_granting(&both, "platform.street.command.record-holding"),

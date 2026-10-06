@@ -1,161 +1,26 @@
-//! Sessions for a terminal: W6.13 and W6.14.
+//! What a client's credentials and the dashboard's own share: the person a
+//! credential names, the store being away, PKCE's check and a token's hash.
 //!
-//! `meridian connect` listens on a loopback port and opens the dashboard's
-//! terminal sign-in with a PKCE challenge (RFC 7636) and a state. The person
-//! signs in afresh -- never on a browser session they already hold -- and
-//! confirms; the browser is sent back to the loopback address with a one-time
-//! code; the CLI exchanges the code, with its verifier, for a session of its
-//! own (RFC 8252). This module is that exchange's state, and nothing about
-//! HTTP.
-//!
-//! Three things are held, each bounded so that nobody can fill this process
-//! by asking:
-//!
-//! - **Requests** a terminal opened and nobody has finished: 10 minutes, and
-//!   at most [`MAX_REQUESTS`], the oldest dropped first. Opening one needs no
-//!   sign-in, which is why the cap exists.
-//! - **Codes**: 60 seconds, spent by their first use. A code presented twice
-//!   ends the session its first use made, because the only way to present it
-//!   twice is for somebody else to have it too.
-//! - **Sessions**: decisions/015's bounds, counted from the sign-in. Kept by
-//!   the SHA-256 of the token and never the token, so a dump signs nobody in;
-//!   and kept in the dashboard's own table in the deployment's database
-//!   ([`TerminalSessions`]), so a restart or an upgrade leaves them standing
-//!   and ending one ends it on every replica (W6.13, ruled 2026-09-30). What
-//!   ended a session is kept beside it until it would have lapsed anyway, so
-//!   the CLI can say which.
-//!
-//! Requests and codes stay in memory: minutes long, so a restart during one
-//! costs a retry rather than a session.
-//!
-//! A session names a person and nothing they may do. Access is evaluated per
-//! request from the records, exactly as a browser's is.
-
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+//! The terminal sessions from before delegations (W6.13's own sign-in, code
+//! and session) are retired: the CLI connects by delegation since 0.1.25
+//! (decisions/029; spec/clients-act-on-a-persons-delegation, requirement 22),
+//! and from contract v15 the dashboard serves no older CLI
+//! ([`crate::web::terminal::OLDEST_CLI`]) and keeps no terminal session
+//! (dashboard migration 6). What remains here is what a delegation uses.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use crate::clock::{MINUTE_NS, SECOND_NS};
-use crate::session::{token, ABSOLUTE_NS};
+use crate::clock::SECOND_NS;
 
-mod sessions;
-pub use sessions::{InMemory, InPostgres, TerminalSessions};
-
-/// How long a terminal's request waits for somebody to sign in and confirm.
-pub const REQUEST_NS: i64 = 10 * MINUTE_NS;
-/// How long a code waits to be exchanged. The CLI is listening when it
-/// arrives, so this only has to cover a slow machine.
-pub const CODE_NS: i64 = 60 * SECOND_NS;
-/// Requests held at once. Far above any firm's staff connecting at the same
-/// moment, and far below what would matter to this process's memory.
-pub const MAX_REQUESTS: usize = 1_000;
-
-/// What a terminal asked for, checked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-    pub redirect_uri: String,
-    pub challenge: String,
-    pub state: String,
-}
-
-/// Who signed in to a terminal's request.
+/// Who a credential names: the person who signed in to grant it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Person {
     pub subject: String,
     pub display_name: String,
     pub directory_groups: Vec<String>,
     pub signed_in_at_ns: i64,
-}
-
-/// What an exchange hands the CLI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Issued {
-    /// The only copy there will be.
-    pub session: String,
-    pub subject: String,
-    pub expires_at_ns: i64,
-}
-
-/// Why a session was not honoured. Said to the CLI, which says it to the
-/// person: a lapsed session and an ended one ask different things of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// Past one of its bounds.
-    Lapsed,
-    /// Signed out, or ended by a deployment admin.
-    Ended,
-    /// Never issued here, or gone long enough that why no longer matters.
-    Unknown,
-}
-
-impl Refusal {
-    pub fn reason(self) -> &'static str {
-        match self {
-            Refusal::Lapsed => "lapsed",
-            Refusal::Ended => "ended",
-            Refusal::Unknown => "unknown",
-        }
-    }
-}
-
-/// Check what a terminal asked for, before anybody is asked to sign in.
-///
-/// The redirect is to the loopback interface and nowhere else: `http`, the
-/// literal `127.0.0.1` or `[::1]`, any port, and the path `/callback`. Not
-/// `localhost`, which a hosts file can send elsewhere, and never a host a
-/// link could name. The state comes back in a URL unescaped, so it is held to
-/// the characters that need no escaping.
-pub fn check(
-    redirect_uri: &str,
-    challenge: &str,
-    method: &str,
-    state: &str,
-) -> Result<Request, String> {
-    if !loopback(redirect_uri) {
-        return Err(
-            "the terminal's address must be http://127.0.0.1:<port>/callback or \
-             http://[::1]:<port>/callback"
-                .into(),
-        );
-    }
-    if method != "S256" {
-        return Err("the code challenge method must be S256".into());
-    }
-    // A SHA-256 in unpadded base64url is 43 characters, always.
-    if challenge.len() != 43 || !challenge.bytes().all(url_safe) {
-        return Err("the code challenge is not a SHA-256 in base64url".into());
-    }
-    if state.is_empty() || state.len() > 256 || !state.bytes().all(unreserved) {
-        return Err("the state must be 1 to 256 unreserved characters".into());
-    }
-    Ok(Request {
-        redirect_uri: redirect_uri.to_string(),
-        challenge: challenge.to_string(),
-        state: state.to_string(),
-    })
-}
-
-fn loopback(uri: &str) -> bool {
-    let Some(rest) = uri.strip_prefix("http://") else {
-        return false;
-    };
-    let Some((authority, path)) = rest.split_once('/') else {
-        return false;
-    };
-    if path != "callback" {
-        return false;
-    }
-    let port = if let Some(port) = authority.strip_prefix("127.0.0.1:") {
-        port
-    } else if let Some(port) = authority.strip_prefix("[::1]:") {
-        port
-    } else {
-        return false;
-    };
-    matches!(port.parse::<u16>(), Ok(port) if port > 0) && !port.starts_with('0')
 }
 
 pub(crate) fn url_safe(byte: u8) -> bool {
@@ -166,8 +31,8 @@ pub(crate) fn unreserved(byte: u8) -> bool {
     url_safe(byte) || byte == b'.' || byte == b'~'
 }
 
-/// RFC 7636's S256: the challenge is the verifier's SHA-256, base64url.
-/// Shared with delegations' authorisation codes ([`crate::delegation`]).
+/// RFC 7636's S256: the challenge is the verifier's SHA-256, base64url, as
+/// delegations' authorisation codes check it ([`crate::delegation`]).
 pub(crate) fn verifies(verifier: &str, challenge: &str) -> bool {
     if !(43..=128).contains(&verifier.len()) || !verifier.bytes().all(unreserved) {
         return false;
@@ -181,334 +46,21 @@ pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// A terminal session's key where it is kept.
+/// A token's key where it is kept: never the token itself.
 pub fn hashed(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
-struct Waiting {
-    request: Request,
-    opened_at_ns: i64,
-    /// Set once somebody has signed in to it, with the token their
-    /// confirmation form carries.
-    signed_in: Option<(Person, String)>,
-}
-
-struct Code {
-    request: Request,
-    person: Person,
-    issued_at_ns: i64,
-    /// The session its first use made, by hash.
-    redeemed: Option<String>,
-}
-
-/// What is held only in this process: minutes long at most, so a restart
-/// during one costs a retry, not a session.
-#[derive(Default)]
-struct Inner {
-    waiting: HashMap<String, Waiting>,
-    /// A provider's sign-in state, to the request it is signing somebody in
-    /// to. A provider sends the browser back to one address for every
-    /// sign-in, and this is how that address tells a terminal's from a
-    /// browser's.
-    by_provider_state: HashMap<String, String>,
-    codes: HashMap<String, Code>,
-}
-
 /// The store could not be asked. Said as a 503, never as a refusal of the
-/// session: a CLI told its session is unknown tells its person to sign in
-/// again, which a database that is briefly away does not call for.
+/// credential: a CLI told its credential is unknown tells its person to sign
+/// in again, which a database that is briefly away does not call for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unavailable(pub String);
 
 impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "terminal sessions could not be read: {}", self.0)
+        write!(f, "the dashboard's store could not be read: {}", self.0)
     }
-}
-
-pub struct Terminals {
-    inner: Mutex<Inner>,
-    sessions: Arc<dyn TerminalSessions>,
-}
-
-impl Default for Terminals {
-    /// Sessions in memory: for tests, and a dashboard given no database.
-    fn default() -> Self {
-        Self::keeping(Arc::new(InMemory::default()))
-    }
-}
-
-impl Terminals {
-    /// Sessions kept in `sessions`; everything else in memory.
-    pub fn keeping(sessions: Arc<dyn TerminalSessions>) -> Self {
-        Self {
-            inner: Mutex::default(),
-            sessions,
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().expect("terminal lock poisoned")
-    }
-
-    /// Ask the session store, off the async runtime: the store may be the
-    /// blocking Postgres client, which panics when used on it.
-    async fn stored<T: Send + 'static>(
-        &self,
-        ask: impl FnOnce(&dyn TerminalSessions) -> Result<T, String> + Send + 'static,
-    ) -> Result<T, Unavailable> {
-        let sessions = Arc::clone(&self.sessions);
-        tokio::task::spawn_blocking(move || ask(sessions.as_ref()))
-            .await
-            .map_err(|failed| Unavailable(failed.to_string()))?
-            .map_err(Unavailable)
-    }
-
-    /// Hold a checked request, and return the id the sign-in carries.
-    pub fn open(&self, request: Request, now_ns: i64) -> String {
-        let mut inner = self.lock();
-        inner
-            .waiting
-            .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
-        while inner.waiting.len() >= MAX_REQUESTS {
-            let oldest = inner
-                .waiting
-                .iter()
-                .min_by_key(|(_, w)| w.opened_at_ns)
-                .map(|(id, _)| id.clone())
-                .expect("a full map has an oldest");
-            inner.waiting.remove(&oldest);
-        }
-        let id = token();
-        inner.waiting.insert(
-            id.clone(),
-            Waiting {
-                request,
-                opened_at_ns: now_ns,
-                signed_in: None,
-            },
-        );
-        id
-    }
-
-    /// Note that a provider sign-in with this state is for this request.
-    pub fn through_provider(&self, provider_state: &str, id: &str) {
-        self.lock()
-            .by_provider_state
-            .insert(provider_state.to_string(), id.to_string());
-    }
-
-    /// The request a provider sign-in was for, if it was for one. Taken, so
-    /// a state is matched once.
-    pub fn for_provider_state(&self, provider_state: &str) -> Option<String> {
-        self.lock().by_provider_state.remove(provider_state)
-    }
-
-    /// Somebody signed in to this request. Returns the token their
-    /// confirmation must carry, or nothing when the request has gone -- too
-    /// old, or already signed in to.
-    pub fn signed_in(&self, id: &str, person: Person, now_ns: i64) -> Option<String> {
-        let mut inner = self.lock();
-        let waiting = inner.waiting.get_mut(id)?;
-        if now_ns - waiting.opened_at_ns > REQUEST_NS || waiting.signed_in.is_some() {
-            return None;
-        }
-        let confirm = token();
-        waiting.signed_in = Some((person, confirm.clone()));
-        Some(confirm)
-    }
-
-    /// The person confirmed: a code, and where to send it. Or declined:
-    /// where to say so. Either way the request is spent.
-    pub fn decide(
-        &self,
-        id: &str,
-        confirm: &str,
-        allow: bool,
-        now_ns: i64,
-    ) -> Result<(Request, Option<String>), &'static str> {
-        let mut inner = self.lock();
-        let Some(waiting) = inner.waiting.get(id) else {
-            return Err("this terminal sign-in has expired or was already used");
-        };
-        let Some((_, expected)) = &waiting.signed_in else {
-            return Err("nobody has signed in to this terminal sign-in");
-        };
-        if !same(expected.as_bytes(), confirm.as_bytes()) {
-            return Err("this confirmation did not come from this sign-in");
-        }
-        let waiting = inner.waiting.remove(id).expect("found above");
-        if now_ns - waiting.opened_at_ns > REQUEST_NS {
-            return Err("this terminal sign-in has expired or was already used");
-        }
-        if !allow {
-            return Ok((waiting.request, None));
-        }
-        let (person, _) = waiting.signed_in.expect("checked above");
-        let code = token();
-        inner.codes.insert(
-            code.clone(),
-            Code {
-                request: waiting.request.clone(),
-                person,
-                issued_at_ns: now_ns,
-                redeemed: None,
-            },
-        );
-        Ok((waiting.request, Some(code)))
-    }
-
-    /// Trade a code for a session. Every refusal is the same refusal, as
-    /// RFC 6749 has it; which check failed is for the log.
-    pub async fn exchange(
-        &self,
-        code: &str,
-        verifier: &str,
-        redirect_uri: &str,
-        now_ns: i64,
-    ) -> Result<Result<Issued, &'static str>, Unavailable> {
-        let decided = self.redeem(code, verifier, redirect_uri, now_ns);
-        match decided {
-            Redeemed::Refused(why) => Ok(Err(why)),
-            Redeemed::Twice(first) => {
-                // Presented twice. Somebody else has it, so what it bought
-                // is theirs too, and ends.
-                self.stored(move |sessions| sessions.end(&first)).await?;
-                Ok(Err("code used twice; the session it made is ended"))
-            }
-            Redeemed::Issued {
-                key,
-                person,
-                issued,
-            } => {
-                self.stored(move |sessions| sessions.keep(&key, &person, now_ns))
-                    .await?;
-                Ok(Ok(issued))
-            }
-        }
-    }
-
-    /// The part of an exchange held in memory, decided under the lock and
-    /// before anything is asked of the store.
-    fn redeem(&self, code: &str, verifier: &str, redirect_uri: &str, now_ns: i64) -> Redeemed {
-        let mut inner = self.lock();
-        let Some(held) = inner.codes.get(code) else {
-            return Redeemed::Refused("unknown code");
-        };
-        if let Some(first) = held.redeemed.clone() {
-            return Redeemed::Twice(first);
-        }
-        let held = inner.codes.remove(code).expect("found above");
-        if now_ns - held.issued_at_ns > CODE_NS {
-            return Redeemed::Refused("code expired");
-        }
-        if held.request.redirect_uri != redirect_uri {
-            return Redeemed::Refused("redirect_uri differs from the one the code was issued to");
-        }
-        if !verifies(verifier, &held.request.challenge) {
-            return Redeemed::Refused("verifier does not match the challenge");
-        }
-        let session = token();
-        let key = hashed(&session);
-        let person = held.person.clone();
-        let issued = Issued {
-            session,
-            subject: person.subject.clone(),
-            expires_at_ns: person.signed_in_at_ns + ABSOLUTE_NS,
-        };
-        inner.codes.insert(
-            code.to_string(),
-            Code {
-                redeemed: Some(key.clone()),
-                ..held
-            },
-        );
-        Redeemed::Issued {
-            key,
-            person,
-            issued,
-        }
-    }
-
-    /// The person behind a session, touched; or why not.
-    pub async fn find(
-        &self,
-        session: &str,
-        now_ns: i64,
-    ) -> Result<Result<Person, Refusal>, Unavailable> {
-        self.find_hashed(&hashed(session), now_ns).await
-    }
-
-    /// Whether a session is live, by its hash, without touching it: for a
-    /// sweep, which is not somebody using it.
-    pub async fn is_live_hashed(&self, key: &str, now_ns: i64) -> Result<bool, Unavailable> {
-        let key = key.to_string();
-        self.stored(move |sessions| sessions.is_live(&key, now_ns))
-            .await
-    }
-
-    /// As `find`, by the hash sessions are kept by: what a plugin host's
-    /// session opened from a terminal holds of it (W6.15), so the token
-    /// itself is still kept nowhere.
-    pub async fn find_hashed(
-        &self,
-        key: &str,
-        now_ns: i64,
-    ) -> Result<Result<Person, Refusal>, Unavailable> {
-        let key = key.to_string();
-        self.stored(move |sessions| sessions.find(&key, now_ns))
-            .await
-    }
-
-    /// `meridian sign-out`. Ending a session that has already gone is not
-    /// an error: the CLI forgets it either way.
-    pub async fn end(&self, session: &str) -> Result<(), Unavailable> {
-        let key = hashed(session);
-        self.stored(move |sessions| sessions.end(&key)).await
-    }
-
-    /// End every terminal session a person holds, and say how many.
-    pub async fn end_person(&self, subject: &str) -> Result<usize, Unavailable> {
-        let subject = subject.to_string();
-        self.stored(move |sessions| sessions.end_person(&subject))
-            .await
-    }
-
-    /// Who holds a live terminal session, how many, by name -- for the admin
-    /// page. Nothing about the sessions themselves.
-    pub async fn holders(&self, now_ns: i64) -> Result<Vec<(String, String, usize)>, Unavailable> {
-        self.stored(move |sessions| sessions.holders(now_ns)).await
-    }
-
-    /// Forget everything past its bound.
-    pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
-        {
-            let mut inner = self.lock();
-            inner
-                .waiting
-                .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
-            let waiting: std::collections::HashSet<String> =
-                inner.waiting.keys().cloned().collect();
-            inner.by_provider_state.retain(|_, id| waiting.contains(id));
-            inner
-                .codes
-                .retain(|_, c| now_ns - c.issued_at_ns <= CODE_NS);
-        }
-        self.stored(move |sessions| sessions.sweep(now_ns)).await
-    }
-}
-
-/// What the in-memory half of an exchange decided.
-enum Redeemed {
-    Refused(&'static str),
-    /// Presented before: the session its first use made, by hash.
-    Twice(String),
-    Issued {
-        key: String,
-        person: Person,
-        issued: Issued,
-    },
 }
 
 /// A moment as RFC 3339 in UTC, to the second. Here rather than a date

@@ -11,16 +11,16 @@ caught because nothing signed anybody in on this route. This does.
 
 Phases:
   main      -- the account first run made exists, and somebody uses it
-  connect   -- a terminal connects as them (W6.13), as a released CLI does
+  retired   -- the terminal sessions from before delegations are served no
+               more, and one held from before names nobody (contract v15)
   delegate  -- the CLI connects by delegation (W6.17), as `meridian connect`
-               now does: registered, consented to after a fresh sign-in, a
+               does: registered, consented to after a fresh sign-in, a
                code traded for a pair, and a refresh nobody asked for
-  restarted -- after the dashboard is recreated, that terminal's session still
-               pushes and uploads a plugin, and signing out ends it
-               (kernel/terminal-sessions-survive-a-restart); the delegation
-               stands and refreshes, a refresh token presented twice revokes
-               it, the admin revokes one client's and the other's works on,
-               and the client revokes its own (W6.14, W6.18)
+  restarted -- after the dashboard is recreated, the delegation stands,
+               pushes and uploads a plugin and refreshes, a refresh token
+               presented twice revokes it, the admin revokes one client's
+               and the other's works on, and the client revokes its own
+               (W6.14, W6.18)
   tickets   -- the admin reports a problem on a page, her agent files one
                through /mcp, and she works hers at its page: assigned,
                resolved citing a note, closed; and nothing of either reaches
@@ -135,41 +135,19 @@ def hidden(page, name):
     return found.group(1) if found else ""
 
 
-def connect_phase():
-    say("E: a terminal connects as them, as `meridian connect` does")
-    verifier = b64url(os.urandom(32))
-    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
-    browser = Browser()
-    asked = browser.get(dash("/terminal/authorize?" + urllib.parse.urlencode({
-        "redirect_uri": BACK,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": "e2e-restart",
-    })))
-    request = hidden(asked, "terminal")
-    check(asked.status == 200 and request, f"the terminal's sign-in is the form: {asked.status}")
-
-    confirming = browser.post(dash("/sign-in"),
-                              {"name": NAME, "password": PASSWORD, "terminal": request})
-    check(confirming.status == 200 and "Connect a terminal" in confirming.body,
-          f"signed in afresh, and asked to confirm: {confirming.status}")
-    decided = browser.post(dash("/terminal/authorize"), {
-        "request": hidden(confirming, "request"),
-        "confirm": hidden(confirming, "confirm"),
-        "decision": "connect",
-    })
-    back = urllib.parse.urlparse(decided.location or "")
-    code = urllib.parse.parse_qs(back.query).get("code", [""])[0]
-    check(decided.status == 302 and code, f"the loopback address gets a code: {decided.status}")
-
-    exchanged = Browser().post(dash("/terminal/token"), {
-        "code": code, "code_verifier": verifier, "redirect_uri": BACK,
-    })
-    session = json.loads(exchanged.body).get("session", "") if exchanged.status == 200 else ""
-    check(session, f"and the CLI trades it for a session: {exchanged.status}")
-    status, body, _ = terminal("GET", "/terminal/plugins", session)
-    check(status == 200, f"which lists the catalogue: {status} {body[:200]}")
-    remember("terminal_session", session)
+def retired_phase():
+    say("E: the terminal sessions from before delegations are gone (contract v15)")
+    for method, path in [("GET", "/terminal/authorize?redirect_uri=x"),
+                         ("POST", "/terminal/token"), ("POST", "/terminal/sign-out"),
+                         ("POST", "/admin/end-terminal-sessions")]:
+        if method == "GET":
+            answer = Browser().get(dash(path))
+        else:
+            answer = Browser().post(dash(path), {"code": "x"})
+        check(answer.status in (404, 405), f"{method} {path} is served no more: {answer.status}")
+    status, body, _ = terminal("GET", "/terminal/plugins", "a-terminal-session-from-before")
+    check(status == 401 and '"reason":"unknown"' in body.replace(" ", ""),
+          f"and a terminal session from before names nobody: {status} {body[:200]}")
 
 
 def push_and_upload(session):
@@ -209,27 +187,6 @@ def push_and_upload(session):
         "sdk_version": "0.1.0", "image_digest": digest,
     }).encode(), "application/json")
     return status, body
-
-
-def restarted_phase():
-    say("F: the dashboard restarted, and the terminal's session stands")
-    session = recall("terminal_session")
-    check(bool(session), "a session was kept from before the restart")
-    if not session:
-        return
-    status, body, _ = terminal("GET", "/terminal/plugins", session)
-    check(status == 200,
-          f"the session made before the restart is honoured after it: {status} {body[:200]}")
-    status, body = push_and_upload(session)
-    check(status == 201 and f'"name":"{PLUGIN}"' in body.replace(" ", ""),
-          f"and a plugin is pushed and uploaded on it: {status} {body[:200]}")
-
-    say("G: signing out ends it, and the refusal says why")
-    status, _, _ = terminal("POST", "/terminal/sign-out", session)
-    check(status == 204, f"signed out: {status}")
-    status, body, _ = terminal("GET", "/terminal/plugins", session)
-    check(status == 401 and '"reason":"ended"' in body.replace(" ", ""),
-          f"refused as ended, not as unknown: {status} {body[:200]}")
 
 
 def token_endpoint(fields):
@@ -323,6 +280,9 @@ def delegation_restarted_phase():
     client_id, access, refresh = recall("client_id"), recall("access"), recall("refresh")
     status, body, _ = terminal("GET", "/terminal/plugins", access)
     check(status == 200, f"the access token from before the restart acts after it: {status} {body[:200]}")
+    status, body = push_and_upload(access)
+    check(status == 201 and f'"name":"{PLUGIN}"' in body.replace(" ", ""),
+          f"and a plugin is pushed and uploaded on it: {status} {body[:200]}")
     status, third = refreshed(client_id, refresh)
     check(status == 200, f"and refreshes: {status} {third}")
 
@@ -453,12 +413,11 @@ def main():
     wait_dashboard()
     if phase == "main":
         main_phase()
-    elif phase == "connect":
-        connect_phase()
+    elif phase == "retired":
+        retired_phase()
     elif phase == "delegate":
         delegate_phase()
     elif phase == "restarted":
-        restarted_phase()
         delegation_restarted_phase()
     elif phase == "tickets":
         tickets_phase()

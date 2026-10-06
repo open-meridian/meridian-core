@@ -759,9 +759,7 @@ fn not_listed(app: &App, caller: &Caller, name: &str) -> String {
             .find(|declared| declared.name == tool)
             .cloned()
     });
-    if let (Some(declared), Ok(records)) =
-        (offered, app.records.current(app.clock.now_ns()))
-    {
+    if let (Some(declared), Ok(records)) = (offered, app.records.current(app.clock.now_ns())) {
         if !declared.roles.is_empty() {
             let held = caller.access(&records).plugin(owner);
             let levels: Vec<&str> = declared

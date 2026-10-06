@@ -231,8 +231,12 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
-            let (claims, roles) =
-                self.vouched_for_configuration(&topic, payload_type, acting_for.as_ref(), self.clock.now_ns())?;
+            let (claims, roles) = self.vouched_for_configuration(
+                &topic,
+                payload_type,
+                acting_for.as_ref(),
+                self.clock.now_ns(),
+            )?;
             tracing::info!(
                 instance = self.instance_id(),
                 topic,
@@ -337,13 +341,8 @@ impl Sidecar {
         let claims = match acting_for {
             None => CallerClaims::default(),
             Some(assertion) => {
-                let (claims, roles) = self.vouched_writer(
-                    &topic,
-                    payload_type,
-                    &assertion,
-                    account.as_deref(),
-                    now,
-                )?;
+                let (claims, roles) =
+                    self.vouched_writer(&topic, payload_type, &assertion, account.as_deref(), now)?;
                 tracing::info!(
                     instance = self.instance_id(),
                     topic,
@@ -423,8 +422,7 @@ impl Sidecar {
     /// Which of this plugin's roles hold `topic` among their generated
     /// grants (decisions/033, point 3): what a person's act is admitted by.
     fn roles_granting(&self, topic: &str) -> Vec<String> {
-        self.contract
-            .roles_granting(&self.identity.roles, topic)
+        self.contract.roles_granting(&self.identity.roles, topic)
     }
 
     /// Claims carrying no per-role entry -- from a dashboard older than this
@@ -773,12 +771,12 @@ fn held_on(claims: &CallerClaims, roles: &[String]) -> String {
     }
     roles
         .iter()
-        .map(|role| {
-            match claims.roles.iter().find(|held| &held.role == role) {
+        .map(
+            |role| match claims.roles.iter().find(|held| &held.role == role) {
                 Some(held) => format!("{} on {role}", level_named(held.level)),
                 None => format!("nothing on {role}"),
-            }
-        })
+            },
+        )
         .collect::<Vec<_>>()
         .join(" and ")
 }

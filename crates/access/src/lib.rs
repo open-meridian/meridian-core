@@ -348,7 +348,10 @@ impl PluginHeld {
 /// The roles the records know a plugin holds, as its sidecar last reported
 /// them (W6.1, contract v15); None for a plugin they do not list, which only
 /// a conductor before v15 answers.
-pub fn known_roles<'a>(records: &'a AccessRecords, plugin_instance_id: &str) -> Option<&'a [String]> {
+pub fn known_roles<'a>(
+    records: &'a AccessRecords,
+    plugin_instance_id: &str,
+) -> Option<&'a [String]> {
     records
         .known_plugins
         .iter()
@@ -666,7 +669,11 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
         .iter()
         .filter_map(|group| {
             let held = access_of_groups(records, &BTreeSet::from([group.user_group_id.clone()]));
-            let plugin = held.plugins.get(plugin_instance_id).cloned().unwrap_or_default();
+            let plugin = held
+                .plugins
+                .get(plugin_instance_id)
+                .cloned()
+                .unwrap_or_default();
             let access = plugin.union().accounts;
             (!access.is_empty()).then(|| UserGroupAccess {
                 user_group_id: group.user_group_id.clone(),
@@ -683,7 +690,11 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
         .iter()
         .filter_map(|person| {
             let held = person_access(records, &person.subject, &person.directory_groups);
-            let plugin = held.plugins.get(plugin_instance_id).cloned().unwrap_or_default();
+            let plugin = held
+                .plugins
+                .get(plugin_instance_id)
+                .cloned()
+                .unwrap_or_default();
             let access = plugin.union().accounts;
             (!access.is_empty()).then(|| PersonAccess {
                 subject: person.subject.clone(),
@@ -721,7 +732,12 @@ fn table_roles(plugin: &PluginHeld, union: &Levels) -> Vec<RoleAccess> {
 /// One role's level and accounts, its accounts as positions in `union`'s
 /// read accounts, sorted as the wire lists them (contract v15, the plan's
 /// Q2): never repeated, so a role costs a few bytes an account.
-pub fn role_access(role: &str, level: AccessLevel, accounts: &Levels, union: &Levels) -> RoleAccess {
+pub fn role_access(
+    role: &str,
+    level: AccessLevel,
+    accounts: &Levels,
+    union: &Levels,
+) -> RoleAccess {
     let positions = |of: &BTreeSet<String>| -> Vec<u32> {
         union
             .read

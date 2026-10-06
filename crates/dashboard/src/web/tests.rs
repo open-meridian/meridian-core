@@ -27,7 +27,6 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         wizard: Arc::new(crate::first_run::WizardSession::default()),
         records: cache,
         sessions: Arc::new(Sessions::default()),
-        terminals: Arc::new(crate::terminal::Terminals::default()),
         delegations: Arc::new(crate::delegation::Delegations::default()),
         public_url: String::new(),
         clock: Arc::new(At(now)),

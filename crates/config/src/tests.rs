@@ -1314,7 +1314,12 @@ fn an_administrator_who_arrived_another_way_is_left_alone() {
         access_group_id: DEPLOYMENT_ADMIN.into(),
     };
     store
-        .install_first_admin(&group, std::slice::from_ref(&permission), &crate::Author::default(), 0)
+        .install_first_admin(
+            &group,
+            std::slice::from_ref(&permission),
+            &crate::Author::default(),
+            0,
+        )
         .unwrap();
 
     assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
@@ -2716,9 +2721,11 @@ async fn an_access_entry_names_one_role_its_plugin_holds() {
         .await
         .unwrap_err();
     assert!(on_none.contains("granted as a whole"), "{on_none}");
-    assert!(access_group(&h, vec![on_role("tool-1", "", AccessLevel::Read)])
-        .await
-        .is_ok());
+    assert!(
+        access_group(&h, vec![on_role("tool-1", "", AccessLevel::Read)])
+            .await
+            .is_ok()
+    );
     let both = access_group(
         &h,
         vec![
@@ -2771,7 +2778,10 @@ async fn an_entry_that_no_longer_matches_is_kept_as_written_never_refused_for_be
     )
     .await
     .unwrap();
-    assert_eq!(saved.entries[0].role, "custody", "kept as the admin wrote it");
+    assert_eq!(
+        saved.entries[0].role, "custody",
+        "kept as the admin wrote it"
+    );
     // A new entry naming the dropped role is refused.
     let mut again = saved.clone();
     again

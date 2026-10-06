@@ -506,11 +506,12 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     // moved. That is the street store's to say.
     assert!(!custody.may_publish(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
 
-    // The dashboard is a component, and reads; nothing it does writes to the
-    // street store.
+    // The dashboard is a component that reaches no account's data (ruling
+    // 21): from contract v15 it neither reads nor hears the street's
+    // positions, and nothing it does writes to the street store.
     let dashboard = contract.component("dashboard");
-    assert!(dashboard.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
-    assert!(dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
+    assert!(!dashboard.may_publish(meridian_street::service::LIST_CUSTODIAL_POSITIONS));
+    assert!(!dashboard.may_subscribe(meridian_street::service::CUSTODIAL_POSITION_UPDATED));
     assert!(!dashboard.may_publish(meridian_street::service::RECORD_HOLDING));
 
     // The book (W9, contract v8): operations writes it; portfolio, reporting,

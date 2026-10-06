@@ -493,9 +493,16 @@ fn plugins_of(covers: &Covers) -> Vec<String> {
         .collect()
 }
 
+/// A delegation's rows as read back: plugin, role and level from v15, and
+/// those recorded before, plugin and level, unmatched until the rewrite.
+pub(crate) type Rows = (
+    BTreeSet<(String, String, String)>,
+    BTreeSet<(String, String)>,
+);
+
 /// The rows as kept, read back: three parts a row of v15, two a row recorded
 /// before, unmatched until the rewrite names its role.
-pub(crate) fn rows_of(kept: &[String]) -> (BTreeSet<(String, String, String)>, BTreeSet<(String, String)>) {
+pub(crate) fn rows_of(kept: &[String]) -> Rows {
     let mut rows = BTreeSet::new();
     let mut unmatched = BTreeSet::new();
     for entry in kept {

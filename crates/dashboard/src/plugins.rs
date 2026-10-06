@@ -80,7 +80,7 @@ use crate::delegation::Delegations;
 use crate::html::{escape, page};
 use crate::session::{token, Sessions, ABSOLUTE_NS};
 use crate::signing::Signer;
-use crate::terminal::{Terminals, Unavailable};
+use crate::terminal::Unavailable;
 use crate::web::{cookie, redirect, refused, set_cookie, App, SESSION_COOKIE};
 
 /// The plugin host's own session.
@@ -99,13 +99,11 @@ const CODE_NS: i64 = 60 * SECOND_NS;
 const ASSERTION_NS: i64 = 60 * SECOND_NS;
 
 /// The session a plugin host's session came from, which it ends with: a
-/// browser's on the dashboard, a terminal's (W6.15), held by the hash its
-/// own store keys it by, or a delegation's, by its id -- so no terminal's
-/// token and no client's is kept anywhere.
+/// browser's on the dashboard, or a delegation's, by its id -- so no
+/// client's token is kept anywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Came {
     Browser(String),
-    Terminal(String),
     Delegation(String),
 }
 
@@ -154,18 +152,6 @@ impl Came {
                 covers: None,
                 delegation: None,
             }),
-            Came::Terminal(hash) => app
-                .terminals
-                .find_hashed(hash, now_ns)
-                .await?
-                .ok()
-                .map(|p| Who {
-                    subject: p.subject,
-                    display_name: p.display_name,
-                    directory_groups: p.directory_groups,
-                    covers: None,
-                    delegation: None,
-                }),
             Came::Delegation(id) => app
                 .delegations
                 .delegation(id)
@@ -190,13 +176,11 @@ impl Came {
     async fn is_live(
         &self,
         sessions: &Sessions,
-        terminals: &Terminals,
         delegations: &Delegations,
         now_ns: i64,
     ) -> Result<bool, Unavailable> {
         match self {
             Came::Browser(key) => Ok(sessions.is_live(key, now_ns)),
-            Came::Terminal(hash) => terminals.is_live_hashed(hash, now_ns).await,
             Came::Delegation(id) => Ok(delegations
                 .delegation(id)
                 .await?
@@ -510,17 +494,11 @@ impl Plugins {
             .remove(key);
     }
 
-    /// Forget codes past their minute and plugin sessions whose dashboard or
-    /// terminal session has ended. One whose terminal session could not be
+    /// Forget codes past their minute and plugin sessions whose dashboard
+    /// session or delegation has ended. One whose delegation could not be
     /// asked about is kept for the next sweep: a database briefly away has
     /// ended nobody's session.
-    pub async fn sweep(
-        &self,
-        sessions: &Sessions,
-        terminals: &Terminals,
-        delegations: &Delegations,
-        now_ns: i64,
-    ) {
+    pub async fn sweep(&self, sessions: &Sessions, delegations: &Delegations, now_ns: i64) {
         self.codes
             .lock()
             .expect("code lock poisoned")
@@ -534,7 +512,7 @@ impl Plugins {
             .collect();
         let mut ended = Vec::new();
         for (key, came) in held {
-            match came.is_live(sessions, terminals, delegations, now_ns).await {
+            match came.is_live(sessions, delegations, now_ns).await {
                 Ok(true) => {}
                 Ok(false) => ended.push(key),
                 Err(unavailable) => {
@@ -1050,7 +1028,12 @@ impl Opening {
                 .iter()
                 .filter(|role| !role.role.is_empty())
                 .map(|role| {
-                    meridian_access::role_access(&role.role, role.level, &role.accounts, &self.access)
+                    meridian_access::role_access(
+                        &role.role,
+                        role.level,
+                        &role.accounts,
+                        &self.access,
+                    )
                 })
                 .collect(),
         }
@@ -1263,7 +1246,6 @@ async fn from_terminal(
         )));
     };
     let (came, covers, delegation) = match caller.through {
-        crate::web::Through::Session(hash) => (Came::Terminal(hash), None, None),
         crate::web::Through::Delegation {
             id,
             client_name,
@@ -1303,8 +1285,8 @@ async fn running<'a>(app: &'a App, instance: &str) -> Result<&'a Plugins, Box<Re
 
 /// `POST /terminal/plugins/{instance}/open?level=`: OpenPluginFromTerminal.
 /// The code `/plugins/{instance}` would mint at the level named, bound to the
-/// terminal session: whichever browser opens the link first enters that
-/// plugin's host alone, at that level, until the terminal session ends,
+/// delegation: whichever browser opens the link first enters that plugin's
+/// host alone, at that level, until the delegation ends,
 /// landing where the area would at that level ([`first_page`]).
 pub(crate) async fn open_from_terminal(
     State(app): State<Arc<App>>,
@@ -1515,8 +1497,8 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
         return enter(app, plugins, instance, &uri, now).await;
     }
 
-    // Whose request this is: the plugin host's session, and the dashboard or
-    // terminal session it came from, still live.
+    // Whose request this is: the plugin host's session, and the dashboard
+    // session or delegation it came from, still live.
     let key = cookie(app, request.headers(), PLUGIN_COOKIE);
     let came = key
         .as_deref()
@@ -1625,10 +1607,7 @@ async fn enter(
         .unwrap_or_default();
     let code = asked.get("code").map(String::as_str).unwrap_or_default();
     let came = match plugins.redeem(code, instance, now) {
-        Some((came, level)) => match came
-            .is_live(&app.sessions, &app.terminals, &app.delegations, now)
-            .await
-        {
+        Some((came, level)) => match came.is_live(&app.sessions, &app.delegations, now).await {
             Ok(true) => Some((came, level)),
             Ok(false) => None,
             Err(unavailable) => return refused(&unavailable.to_string()),

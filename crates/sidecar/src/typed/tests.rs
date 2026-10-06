@@ -2008,7 +2008,12 @@ async fn a_command_the_book_could_not_check_is_unavailable_to_try_again() {
 async fn holding_roles(
     roles: &[&str],
     version: &str,
-) -> (Sidecar, SigningKey, Arc<Mutex<Vec<RecordHoldingRequest>>>, Heard) {
+) -> (
+    Sidecar,
+    SigningKey,
+    Arc<Mutex<Vec<RecordHoldingRequest>>>,
+    Heard,
+) {
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
     let verifier = Arc::new(Verifier::holding(
         "snaptrade-1",
@@ -2076,7 +2081,12 @@ fn by_role(
     }
 }
 
-fn role(name: &str, level: AccessLevel, read: &[u32], write: &[u32]) -> meridian_pb::v1::RoleAccess {
+fn role(
+    name: &str,
+    level: AccessLevel,
+    read: &[u32],
+    write: &[u32],
+) -> meridian_pb::v1::RoleAccess {
     meridian_pb::v1::RoleAccess {
         role: name.into(),
         level: level as i32,
@@ -2108,7 +2118,10 @@ async fn a_command_is_admitted_by_write_on_the_role_whose_grants_hold_it() {
         refused.message(),
         "RecordHolding is custody's, and Ada holds read on custody"
     );
-    assert!(recorded.lock().unwrap().is_empty(), "nothing reached the street");
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "nothing reached the street"
+    );
 
     // Write on custody: admitted.
     let custody_writer = by_role(
@@ -2140,7 +2153,9 @@ async fn a_command_is_admitted_by_write_on_the_role_whose_grants_hold_it() {
         .await
         .unwrap_err();
     assert!(
-        refused.message().contains("write on custody without account ACC-1"),
+        refused
+            .message()
+            .contains("write on custody without account ACC-1"),
         "{}",
         refused.message()
     );
@@ -2167,14 +2182,20 @@ async fn a_command_is_admitted_by_write_on_the_role_whose_grants_hold_it() {
 async fn claims_with_no_per_role_entry_are_today_s_on_one_role_and_refused_on_two() {
     // A dashboard older than the sidecar signs no roles.
     let (one, key, recorded, _) = holding_roles(&["custody"], "v14").await;
-    one.record_holding(Request::new(for_person("ext-1", assertion(&key, writing(&["ACC-1"])))))
-        .await
-        .expect("one role: the claims' sets are that role's");
+    one.record_holding(Request::new(for_person(
+        "ext-1",
+        assertion(&key, writing(&["ACC-1"])),
+    )))
+    .await
+    .expect("one role: the claims' sets are that role's");
     assert_eq!(recorded.lock().unwrap().len(), 1);
 
     let (two, key, recorded, _) = holding_roles(&["custody", "operations"], "v14").await;
     let refused = two
-        .record_holding(Request::new(for_person("ext-1", assertion(&key, writing(&["ACC-1"])))))
+        .record_holding(Request::new(for_person(
+            "ext-1",
+            assertion(&key, writing(&["ACC-1"])),
+        )))
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::PermissionDenied);
@@ -2197,7 +2218,12 @@ async fn the_link_is_admitted_by_admin_on_the_role_holding_it_and_refused_naming
         vec![role("operations", AccessLevel::Admin, &[], &[])],
     );
     let refused = sidecar
-        .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(operations_admin))))
+        .link_external_account(Request::new(link(
+            "ext-new",
+            "ACC-1",
+            "",
+            Some(operations_admin),
+        )))
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::PermissionDenied);
@@ -2215,7 +2241,12 @@ async fn the_link_is_admitted_by_admin_on_the_role_holding_it_and_refused_naming
         vec![role("custody", AccessLevel::Admin, &[], &[])],
     );
     sidecar
-        .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(custody_admin))))
+        .link_external_account(Request::new(link(
+            "ext-new",
+            "ACC-1",
+            "",
+            Some(custody_admin),
+        )))
         .await
         .expect("an admin of custody links");
     assert_eq!(heard.lock().unwrap().len(), 1);
@@ -2259,10 +2290,14 @@ async fn a_role_less_page_on_two_roles_is_refused_from_v15_and_serves_both_from_
         .await
     }
     let at_v15 = sidecar("v15");
-    let reply = register(&at_v15, "v15", page(vec![])).await.unwrap().into_inner();
+    let reply = register(&at_v15, "v15", page(vec![]))
+        .await
+        .unwrap()
+        .into_inner();
     assert!(!reply.admitted);
     assert!(
-        reply.refusal_reason.contains("/balances") && reply.refusal_reason.contains("names no role"),
+        reply.refusal_reason.contains("/balances")
+            && reply.refusal_reason.contains("names no role"),
         "{}",
         reply.refusal_reason
     );
@@ -2272,10 +2307,17 @@ async fn a_role_less_page_on_two_roles_is_refused_from_v15_and_serves_both_from_
         .unwrap()
         .into_inner();
     assert!(!reply.admitted);
-    assert!(reply.refusal_reason.contains("oms"), "{}", reply.refusal_reason);
+    assert!(
+        reply.refusal_reason.contains("oms"),
+        "{}",
+        reply.refusal_reason
+    );
 
     let at_v14 = sidecar("v14");
-    let reply = register(&at_v14, "v14", page(vec![])).await.unwrap().into_inner();
+    let reply = register(&at_v14, "v14", page(vec![]))
+        .await
+        .unwrap()
+        .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
     assert_eq!(
         at_v14.registration().unwrap().interface.unwrap().pages[0].roles,

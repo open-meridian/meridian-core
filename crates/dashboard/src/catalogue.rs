@@ -3,8 +3,7 @@
 //!
 //! Every route here admits a deployment admin acting from a terminal -- an
 //! access token on a delegation covering the deployment admin's
-//! capabilities (W6.18), or a terminal session from before delegations --
-//! and nothing else: not a browser's cookie, which is refused as if absent. The image
+//! capabilities (W6.18) -- and nothing else: not a browser's cookie, which is refused as if absent. The image
 //! goes layer by layer in the registry's own protocol, streamed and never
 //! held, under `plugins/{name}` alone: the registry is reachable from
 //! outside the cluster only this way, and only to write and to ask whether a
@@ -92,8 +91,7 @@ fn refused(status: StatusCode, reason: impl Into<String>) -> Response {
 }
 
 /// A deployment admin acting from a terminal -- on a delegation covering the
-/// deployment admin's capabilities, or a terminal session from before
-/// delegations -- or the refusal.
+/// deployment admin's capabilities -- or the refusal.
 async fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
     let caller = caller_of(app, headers).await?;
     let records = app

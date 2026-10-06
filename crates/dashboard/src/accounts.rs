@@ -14,7 +14,7 @@
 //!
 //! Used only on this branch: a deployment signing people in through a
 //! provider or through LDAP keeps no account here. Its dashboard still uses
-//! the same database, for terminal sessions ([`crate::database`]).
+//! the same database, for delegations ([`crate::database`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -222,15 +222,32 @@ mod per_role {
             through_delegation: false,
         };
         assert!(may_see(&reader, &ticket(&[])), "any level on any role");
-        assert!(may_see(&reader, &ticket(&["ACC-1", "ACC-2"])), "the union of the read sets");
-        assert!(may_work("local|tam", &tam(), &ticket(&["ACC-2"])), "write on operations");
+        assert!(
+            may_see(&reader, &ticket(&["ACC-1", "ACC-2"])),
+            "the union of the read sets"
+        );
+        assert!(
+            may_work("local|tam", &tam(), &ticket(&["ACC-2"])),
+            "write on operations"
+        );
         assert!(
             !may_work("local|tam", &tam(), &ticket(&["ACC-1"])),
             "custody's account is read only"
         );
-        assert!(may_work("local|tam", &tam(), &ticket(&[])), "naming none, write on any role");
+        assert!(
+            may_work("local|tam", &tam(), &ticket(&[])),
+            "naming none, write on any role"
+        );
         let mut reader_only = tam();
-        reader_only.plugins.get_mut("ops-1").unwrap().roles.remove("operations");
-        assert!(!may_work("local|tam", &reader_only, &ticket(&[])), "read alone works none");
+        reader_only
+            .plugins
+            .get_mut("ops-1")
+            .unwrap()
+            .roles
+            .remove("operations");
+        assert!(
+            !may_work("local|tam", &reader_only, &ticket(&[])),
+            "read alone works none"
+        );
     }
 }

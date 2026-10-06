@@ -4,9 +4,9 @@
 //! reach. It holds no deployment key: it reads the access records from the
 //! conductor's configuration store over the bus, as the instance its launch
 //! configuration names, with the `admin` role's grants. A browser's session
-//! lives in memory, so a restart signs every browser out; a terminal's is
-//! kept in the dashboard's own tables, and so are the accounts of a
-//! deployment that holds its own (decisions/018).
+//! lives in memory, so a restart signs every browser out; a client's
+//! delegation is kept in the dashboard's own tables, and so are the accounts
+//! of a deployment that holds its own (decisions/018).
 //!
 //! `meridian-dashboard migrate` applies those tables, once per release.
 //!
@@ -25,7 +25,6 @@ use meridian_dashboard::directory::Directory;
 use meridian_dashboard::oidc::{Oidc, OidcConfig};
 use meridian_dashboard::plugins::Plugins;
 use meridian_dashboard::signing::Signer;
-use meridian_dashboard::terminal::{self, TerminalSessions, Terminals};
 use meridian_dashboard::{
     refresh, refresh_forever, router, App, RecordsCache, Sessions, WizardSession,
 };
@@ -53,8 +52,8 @@ fn main() {
 fn run() -> Result<(), String> {
     // The dashboard's tables, once per release, as the migrating role: the
     // migrate Job's container, beside every other store's. Made in every
-    // deployment whichever way it signs people in: terminal sessions are
-    // kept on every branch, and the Job cannot know which the wizard chose.
+    // deployment whichever way it signs people in: delegations are kept on
+    // every branch, and the Job cannot know which the wizard chose.
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         let url = required("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL")?;
         meridian_runtime::migrate_once_it_answers(
@@ -297,8 +296,8 @@ fn run() -> Result<(), String> {
     // failing at the first sign-in. The chart's startup probe gives the
     // dashboard as long as that takes before its liveness counts.
     //
-    // Wherever somebody can sign in: terminal sessions are kept there on
-    // every branch (W6.13), and accounts on the branch that holds them. Not
+    // Wherever somebody can sign in: delegations are kept there on every
+    // branch (W6.17), and accounts on the branch that holds them. Not
     // during first run, which signs nobody in and may be the very thing
     // making the database.
     let signs_people_in = provider.is_some() || directory.is_some() || accounts_url.is_some();
@@ -318,18 +317,6 @@ fn run() -> Result<(), String> {
             },
         )?),
         _ => None,
-    };
-    let terminal_sessions: Arc<dyn TerminalSessions> = match &database {
-        Some(database) => Arc::new(terminal::InPostgres::on(database.clone())),
-        None => {
-            if signs_people_in {
-                tracing::warn!(
-                    "no database is given for this dashboard, so terminal sessions are held \
-                     in memory and end when it restarts"
-                );
-            }
-            Arc::new(terminal::InMemory::default())
-        }
     };
     // Delegations beside them, in the same tables' database, so a client's
     // delegation outlives a restart (decisions/029); in memory without one.
@@ -391,7 +378,6 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
         let records = Arc::new(RecordsCache::default());
         let sessions = Arc::new(Sessions::default());
-        let terminals = Arc::new(Terminals::keeping(terminal_sessions.clone()));
         let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
         let tickets = Arc::new(meridian_dashboard::tickets::Tickets::keeping(
             ticket_store.clone(),
@@ -411,11 +397,13 @@ fn run() -> Result<(), String> {
         ));
         // A delegation's rows recorded before access per role, rewritten once
         // to name each plugin's role, after the first records read (W6.17).
-        tokio::spawn(meridian_dashboard::delegation::rewrite_once_records_are_read(
-            Arc::clone(&delegations),
-            Arc::clone(&records),
-            clock.clone(),
-        ));
+        tokio::spawn(
+            meridian_dashboard::delegation::rewrite_once_records_are_read(
+                Arc::clone(&delegations),
+                Arc::clone(&records),
+                clock.clone(),
+            ),
+        );
 
         // What custody connectors say about their accounts and connections,
         // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything
@@ -427,7 +415,6 @@ fn run() -> Result<(), String> {
         meridian_dashboard::health::listen(&bus, Arc::clone(&health));
 
         let sweeping = Arc::clone(&sessions);
-        let sweeping_terminals = Arc::clone(&terminals);
         let sweeping_delegations = Arc::clone(&delegations);
         let sweeping_tickets = Arc::clone(&tickets);
         let sweeping_plugins = plugins.clone();
@@ -436,9 +423,6 @@ fn run() -> Result<(), String> {
             loop {
                 every.tick().await;
                 sweeping.sweep(now_ns());
-                if let Err(unavailable) = sweeping_terminals.sweep(now_ns()).await {
-                    tracing::warn!(%unavailable, "terminal sessions were not swept");
-                }
                 if let Err(unavailable) = sweeping_delegations.sweep(now_ns()).await {
                     tracing::warn!(%unavailable, "delegations were not swept");
                 }
@@ -448,12 +432,7 @@ fn run() -> Result<(), String> {
                 }
                 if let Some(plugins) = &sweeping_plugins {
                     plugins
-                        .sweep(
-                            &sweeping,
-                            &sweeping_terminals,
-                            &sweeping_delegations,
-                            now_ns(),
-                        )
+                        .sweep(&sweeping, &sweeping_delegations, now_ns())
                         .await;
                 }
             }
@@ -506,7 +485,6 @@ fn run() -> Result<(), String> {
             )),
             records,
             sessions,
-            terminals,
             delegations,
             public_url: public_url.clone(),
             clock,

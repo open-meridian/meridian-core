@@ -247,19 +247,7 @@ async fn reset(
 
     let browsers = app.sessions.end_person(&subject);
     // The password is set by now, and what it opened is ended as far as it
-    // can be; a terminal session that could not be ended is logged loudly
-    // rather than undoing a reset the platform's code has already paid for.
-    let terminals = match app.terminals.end_person(&subject).await {
-        Ok(ended) => ended,
-        Err(unavailable) => {
-            tracing::error!(
-                login,
-                %unavailable,
-                "a password was reset and its terminal sessions could not be ended"
-            );
-            0
-        }
-    };
+    // can be: every browser session above, and every delegation below.
     // And every delegation the old password made (requirement 7 of
     // spec/clients-act-on-a-persons-delegation): a reset is a way back in
     // for somebody who lost their password, or for somebody who took it.
@@ -287,7 +275,6 @@ async fn reset(
     tracing::info!(
         login,
         browsers,
-        terminals,
         delegations,
         "a local administrator's password was reset with a code from the platform"
     );

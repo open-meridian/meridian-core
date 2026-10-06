@@ -152,14 +152,18 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         ],
         built_in: false,
     };
-    store.put_access_group(&access, &meridian_config::Author::default(), 0).unwrap();
+    store
+        .put_access_group(&access, &meridian_config::Author::default(), 0)
+        .unwrap();
     let permission = Permission {
         permission_id: "PRM-1".into(),
         user_group_id: "UG-1".into(),
         account_group_id: "AG-1".into(),
         access_group_id: "AX-1".into(),
     };
-    store.add_permission(&permission, &meridian_config::Author::default(), 0).unwrap();
+    store
+        .add_permission(&permission, &meridian_config::Author::default(), 0)
+        .unwrap();
     let link = ExternalAccountLink {
         plugin_instance_id: "oms-1".into(),
         external_account_id: "st-1".into(),
@@ -258,7 +262,9 @@ fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
         ..admin_permission("PRM-1", "UG-1")
     };
     assert!(
-        store.add_permission(&with_accounts, &meridian_config::Author::default(), 0).is_err(),
+        store
+            .add_permission(&with_accounts, &meridian_config::Author::default(), 0)
+            .is_err(),
         "deployment admin names no account group"
     );
 }
@@ -290,7 +296,9 @@ fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
                 store
                     .install_first_admin(
                         &group,
-                        &[admin_permission(&format!("PRM-{n}"), &group.user_group_id)], &meridian_config::Author::default(), 0,
+                        &[admin_permission(&format!("PRM-{n}"), &group.user_group_id)],
+                        &meridian_config::Author::default(),
+                        0,
                     )
                     .unwrap()
             })
@@ -312,13 +320,25 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
         store.put_user_group(&group).unwrap();
         store
-            .add_permission(&admin_permission(&format!("PRM-{n}"), &group.user_group_id), &meridian_config::Author::default(), 0)
+            .add_permission(
+                &admin_permission(&format!("PRM-{n}"), &group.user_group_id),
+                &meridian_config::Author::default(),
+                0,
+            )
             .unwrap();
     }
     let threads: Vec<_> = (0..2)
         .map(|n| {
             let store = Arc::clone(&store);
-            std::thread::spawn(move || store.withdraw_permission(&format!("PRM-{n}"), &meridian_config::Author::default(), 0).unwrap())
+            std::thread::spawn(move || {
+                store
+                    .withdraw_permission(
+                        &format!("PRM-{n}"),
+                        &meridian_config::Author::default(),
+                        0,
+                    )
+                    .unwrap()
+            })
         })
         .collect();
     let outcomes: Vec<Withdrawal> = threads.into_iter().map(|t| t.join().unwrap()).collect();
@@ -326,7 +346,9 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
     assert!(outcomes.contains(&Withdrawal::LastAdmin), "{outcomes:?}");
     assert_eq!(store.snapshot().unwrap().records.permissions.len(), 1);
     assert_eq!(
-        store.withdraw_permission("PRM-missing", &meridian_config::Author::default(), 0).unwrap(),
+        store
+            .withdraw_permission("PRM-missing", &meridian_config::Author::default(), 0)
+            .unwrap(),
         Withdrawal::Unknown
     );
 }
@@ -1079,18 +1101,24 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
         account_group_id: "AG-1".into(),
         access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
     };
-    assert!(store.add_permission(&naming, &meridian_config::Author::default(), 0).is_err());
+    assert!(store
+        .add_permission(&naming, &meridian_config::Author::default(), 0)
+        .is_err());
     store
-        .put_access_group(&AccessGroup {
-            access_group_id: "AX-ADMIN".into(),
-            name: "Admins of oms".into(),
-            entries: vec![AccessEntry {
-                plugin_instance_id: "oms-1".into(),
-                level: AccessLevel::Admin as i32,
-                role: String::new(),
-            }],
-            built_in: false,
-        }, &meridian_config::Author::default(), 0)
+        .put_access_group(
+            &AccessGroup {
+                access_group_id: "AX-ADMIN".into(),
+                name: "Admins of oms".into(),
+                entries: vec![AccessEntry {
+                    plugin_instance_id: "oms-1".into(),
+                    level: AccessLevel::Admin as i32,
+                    role: String::new(),
+                }],
+                built_in: false,
+            },
+            &meridian_config::Author::default(),
+            0,
+        )
         .expect("an admin entry is kept");
     let held = store.snapshot().unwrap().records.access_groups;
     assert!(held.iter().any(
@@ -1594,9 +1622,13 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
     let kinds: Vec<_> = trading_changes.iter().map(|change| change.kind).collect();
     use meridian_config::AccessChangeKind::{NotKnownBefore, Rewritten};
     assert_eq!(kinds, [NotKnownBefore, Rewritten]);
-    assert!(trading_changes.iter().all(|change| change.at_ns == 5_000 && change.by.is_empty()));
+    assert!(trading_changes
+        .iter()
+        .all(|change| change.at_ns == 5_000 && change.by.is_empty()));
     assert!(trading_changes[1].was.contains("snaptrade-1 read"));
-    assert!(trading_changes[1].became.contains("snaptrade-1 custody read"));
+    assert!(trading_changes[1]
+        .became
+        .contains("snaptrade-1 custody read"));
     assert!(trading_changes[1].note.contains("contract v15"));
     assert_eq!(
         store
@@ -1634,12 +1666,18 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
             meridian_access::plugin_access_table(&snapshot.records, plugin)
                 .people
                 .iter()
-                .map(|person| (person.read_account_ids.clone(), person.write_account_ids.clone()))
+                .map(|person| (
+                    person.read_account_ids.clone(),
+                    person.write_account_ids.clone()
+                ))
                 .collect::<Vec<_>>(),
             meridian_access::plugin_access_table(&as_v14, plugin)
                 .people
                 .iter()
-                .map(|person| (person.read_account_ids.clone(), person.write_account_ids.clone()))
+                .map(|person| (
+                    person.read_account_ids.clone(),
+                    person.write_account_ids.clone()
+                ))
                 .collect::<Vec<_>>(),
             "{plugin}'s table"
         );
@@ -1649,5 +1687,9 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
     }
     // Only the two-role plugin's entry, which the rewrite could not name,
     // holds nothing now, and is flagged.
-    assert!(!meridian_access::entry_holds(&snapshot.records, "multi-1", ""));
+    assert!(!meridian_access::entry_holds(
+        &snapshot.records,
+        "multi-1",
+        ""
+    ));
 }

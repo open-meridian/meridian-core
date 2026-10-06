@@ -144,7 +144,10 @@ pub fn rewrite_entries_to_name_their_role(
 ) -> Result<Vec<String>> {
     let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
     let reported: std::collections::BTreeMap<String, Vec<String>> = tx
-        .query("SELECT plugin_instance_id, roles FROM config_known_plugin", &[])
+        .query(
+            "SELECT plugin_instance_id, roles FROM config_known_plugin",
+            &[],
+        )
         .map_err(unavailable)?
         .iter()
         .map(|row| (row.get(0), row.get(1)))
@@ -193,11 +196,13 @@ pub fn rewrite_entries_to_name_their_role(
             name: name.clone(),
             entries: entries
                 .iter()
-                .map(|(_, plugin, level, role)| meridian_domain::v1::AccessEntry {
-                    plugin_instance_id: plugin.clone(),
-                    level: i32::from(*level),
-                    role: role.clone(),
-                })
+                .map(
+                    |(_, plugin, level, role)| meridian_domain::v1::AccessEntry {
+                        plugin_instance_id: plugin.clone(),
+                        level: i32::from(*level),
+                        role: role.clone(),
+                    },
+                )
                 .collect(),
             built_in: false,
         };

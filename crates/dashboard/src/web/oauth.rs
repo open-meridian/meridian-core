@@ -626,7 +626,11 @@ pub(crate) fn tool_rows(app: &App) -> ToolRows {
                 for level in &tool.levels {
                     if let Ok(level) = AccessLevel::try_from(*level) {
                         plugins
-                            .entry((instance.clone(), role.clone(), level_name(level).to_string()))
+                            .entry((
+                                instance.clone(),
+                                role.clone(),
+                                level_name(level).to_string(),
+                            ))
                             .or_default()
                             .push((tool.title.clone(), tool.reads));
                     }

@@ -12,9 +12,9 @@ use meridian_domain::v1::{
 use meridian_pb::v1::SettingDeclaration;
 
 use crate::store::{
-    group_change, known_plugins, permission_change, redaction_note, redeclared,
-    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
-    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
+    group_change, known_plugins, permission_change, redaction_note, redeclared, AccessChangeRecord,
+    Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result, SettingChange,
+    SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
     REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
