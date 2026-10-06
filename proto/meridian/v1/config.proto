@@ -24,6 +24,9 @@ package meridian.v1;
 // this repository pins.
 import "meridian/v1/sidecar.proto";
 
+// An instance's archive (W8.7, contract v16), which the moves' read carries.
+import "meridian/v1/plugins.proto";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // W6.1 — who has signed in
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +77,11 @@ message AccessRecords {
   // folds each grant per plugin and role and mints each role's entry in the
   // claims. Empty before any sidecar has reported.
   repeated KnownPluginRoles known_plugins = 10;
+
+  // The holds on raw records a deployment admin set (W6.25, contract v16),
+  // one per edge role or one for every one, for the deployment's Settings
+  // and each edge plugin's Summary. Empty while none is set.
+  repeated Hold holds = 11;
 }
 
 // One known plugin and the roles it was launched with (contract v15).
@@ -353,6 +361,82 @@ message PluginSettingsRecord {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// W6.25 — the hold on raw records, contract v16
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Sets or clears a hold, for a deployment admin, from the deployment's
+// Settings (spec/an-edge-plugins-older-records-move-to-the-archive,
+// requirement 8). Sent by the dashboard alone, for the admin signed in.
+message SetHoldRequest {
+  // An edge role (decisions/028), or empty for every one. Another role is
+  // refused, naming it.
+  string role = 1;
+
+  // The least number of days a record is kept anywhere, storage or
+  // archive, from when it was received. 0 clears the hold; at most 36,500.
+  uint32 days = 2;
+
+  // Whether the hold needs records that cannot be altered: met only by an
+  // archive with object lock, for the hold's length, and refused where the
+  // deployment's archive cannot lock (kernel/edge-plugins-own-storage-for-
+  // raw-records, ruling 3).
+  bool write_once = 3;
+}
+
+// A hold as the conductor records it.
+message Hold {
+  string role = 1;
+  uint32 days = 2;
+  bool write_once = 3;
+
+  // Who set it, the deployment-local subject the dashboard stamped, and
+  // when. Each change is its own record (decisions/031).
+  string updated_by = 4;
+  int64 updated_at_ns = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.9, W4.13 — the moves of an edge plugin's raw records, contract v16
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The dashboard reads an edge plugin's moves for its Summary, newest first.
+message ReadMovesRequest {
+  string plugin_instance_id = 1;
+
+  // Empty for the newest page; the reply's `next_cursor` for the next.
+  string cursor = 2;
+}
+
+message ReadMovesReply {
+  // A page of the instance's moves, newest first, each as recorded.
+  repeated MoveRecord moves = 1;
+
+  // Empty when there is no older page.
+  string next_cursor = 2;
+
+  // Per kind, what the archive holds: the units archived and not deleted,
+  // summed from the moves.
+  repeated StoredSpan archived = 3;
+
+  // Whether a deployment admin allowed the instance an archive, and its
+  // bound (W8.7); unset when never allowed.
+  PluginArchive archive = 4;
+}
+
+// One move as the conductor recorded it (W4.13): the move the sidecar
+// reported, and who and when.
+message MoveRecord {
+  RecordMoveRequest move = 1;
+
+  // The deployment-local subject of the person it was done for, from the
+  // envelope; empty for a window's move, whose rule the move names.
+  string person = 2;
+
+  // When the conductor recorded it, in nanoseconds since the epoch.
+  int64 at_ns = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W4.7, W4.11 — what a sidecar is told about its own plugin
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -379,6 +463,14 @@ message PluginConfiguration {
   // beside its scope (W4.11). A rename or a close of one is a change to the
   // plugin's configuration, announced as any other.
   repeated AccountRecord linked_accounts = 6;
+
+  // The hold over the instance (W6.25, contract v16): the longest of its
+  // edge roles' and the one for every role, in days; 0 when none. The
+  // sidecar refuses a deletion inside it (W4.13).
+  uint32 hold_days = 7;
+
+  // Whether that hold needs records that cannot be altered.
+  bool hold_write_once = 8;
 }
 
 // Something in a plugin's configuration changed; its sidecar asks again.

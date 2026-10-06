@@ -372,6 +372,9 @@ impl Plugins {
             // Approved with the roles: storage of its own where it asks for
             // it, and none where it asks for none (W8.3, contract v11).
             declaration: metadata.declaration.clone(),
+            // An archive a deployment admin allowed (W8.3, W8.7, contract
+            // v16): none until the conductor records the allowing.
+            archive: None,
         };
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,

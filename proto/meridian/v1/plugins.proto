@@ -161,6 +161,13 @@ message CreatePluginRequest {
   // holding an edge role, as before v11.
   PluginDeclaration declaration = 7;
 
+  // The archive a deployment admin allowed the instance (W8.3, W8.7,
+  // contract v16): the launcher gives it beside its storage, mounted at
+  // MERIDIAN_ARCHIVE_DIR or, in a cloud, a bucket named in
+  // MERIDIAN_ARCHIVE_BUCKET with a credential scoped to it. Unset or not
+  // allowed, none.
+  PluginArchive archive = 8;
+
   // Tags, retired with them (decisions/026).
   reserved 4;
   reserved "tags";
@@ -169,6 +176,42 @@ message CreatePluginRequest {
 message CreatePluginReply {
   // The workload the launcher made, which it alone may later remove.
   string workload = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.7 — an instance's archive, contract v16
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A deployment admin allows an edge instance an archive, or changes its
+// bound, from its Manage page; the conductor records it and restarts the
+// instance through CreatePlugin carrying it.
+message AllowArchiveRequest {
+  string instance_id = 1;
+
+  // The most bytes it may hold; 0 for no bound.
+  uint64 most_bytes = 2;
+}
+
+// A deployment admin withdraws it: the instance is restarted without it,
+// and what it holds is kept until an admin removes it.
+message WithdrawArchiveRequest {
+  string instance_id = 1;
+}
+
+// An instance's archive, as the conductor records it.
+message PluginArchive {
+  string instance_id = 1;
+
+  // Allowed now; false once withdrawn.
+  bool allowed = 2;
+
+  // The most bytes it may hold; 0 for no bound.
+  uint64 most_bytes = 3;
+
+  // Who last allowed, changed or withdrew it, the deployment-local subject
+  // the dashboard stamped, and when. Each is its own record (decisions/031).
+  string updated_by = 4;
+  int64 updated_at_ns = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -445,6 +445,7 @@ mod tests {
             }],
             storage: Some(StorageDeclaration {
                 retention_days: 2555,
+                ..Default::default()
             }),
         };
         assert_eq!(declaration_refused(&declaration, &settings, &custody), None);

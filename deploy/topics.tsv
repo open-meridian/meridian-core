@@ -19,6 +19,7 @@ platform.book.query.list-account-attributes	query	portfolio,reporting,compliance
 platform.book.query.list-account-figures	query	operations,portfolio,compliance,reporting	bor
 platform.book.query.list-breaks	query	operations,oms,compliance,portfolio,reporting	bor
 platform.book.query.list-positions	query	portfolio,reporting,compliance,oms,operations	bor
+platform.config.command.allow-archive	command	dashboard	conductor
 platform.config.command.apply-first-run-configuration	command	dashboard	first-run
 platform.config.command.close-account	command	dashboard	conductor
 platform.config.command.define-access-group	command	dashboard	conductor
@@ -30,11 +31,14 @@ platform.config.command.file-ticket	command	sidecar	dashboard
 platform.config.command.grant-permission	command	dashboard	conductor
 platform.config.command.launch-plugin	command	dashboard	conductor
 platform.config.command.link-external-account	command	custody	conductor
+platform.config.command.record-move	command	sidecar	conductor
 platform.config.command.record-plugin-upload	command	dashboard	conductor
 platform.config.command.redeem-claim-code	command	dashboard	conductor
 platform.config.command.send-diagnostic-bundle	command	dashboard	conductor
+platform.config.command.set-hold	command	dashboard	conductor
 platform.config.command.set-plugin-settings	command	dashboard	conductor
 platform.config.command.stop-plugin	command	dashboard	conductor
+platform.config.command.withdraw-archive	command	dashboard	conductor
 platform.config.command.withdraw-permission	command	dashboard	conductor
 platform.config.event.person-signed-in	event	dashboard	conductor
 platform.config.event.plugin-configuration-changed	event	conductor	sidecar
@@ -45,6 +49,7 @@ platform.config.query.check-first-run-answer	query	dashboard	first-run
 platform.config.query.enrolment	query	dashboard	conductor
 platform.config.query.filed-tickets	query	sidecar	dashboard
 platform.config.query.first-run-sealing-key	query	dashboard	first-run
+platform.config.query.moves	query	dashboard	conductor
 platform.config.query.plugin-access	query	sidecar	conductor
 platform.config.query.plugin-catalogue	query	dashboard	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor

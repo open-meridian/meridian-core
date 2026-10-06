@@ -677,6 +677,11 @@ message PluginReport {
   repeated ToolDeclaration declared_tools = 18;
   repeated string tool_refusals = 19;
 
+  // What the plugin's storage holds of each kind of raw record, as its last
+  // accepted heartbeat said (W4.5, W4.8, contract v16); empty while it is not
+  // registered, and from a plugin declaring no kinds.
+  repeated StoredSpan stored = 20;
+
   // A single role, before a plugin could hold several.
   reserved 2;
   reserved "role";

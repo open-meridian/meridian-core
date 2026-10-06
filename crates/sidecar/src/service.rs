@@ -14,8 +14,8 @@ use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
     AccountScopeDelivery, FileTicketReply, FileTicketRequest, HeartbeatReply, HeartbeatRequest,
     LeaveReply, LeaveRequest, PluginAccessReply, PluginAccessRequest, ReadFiledTicketsReply,
-    ReadFiledTicketsRequest, RegisterReply, RegisterRequest, SettingsDelivery,
-    WatchAccountScopeRequest, WatchSettingsRequest,
+    ReadFiledTicketsRequest, RecordMoveReply, RecordMoveRequest, RegisterReply, RegisterRequest,
+    SettingsDelivery, WatchAccountScopeRequest, WatchSettingsRequest,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -592,6 +592,18 @@ impl SidecarService for Sidecar {
         request: Request<ReadFiledTicketsRequest>,
     ) -> Result<Response<ReadFiledTicketsReply>, Status> {
         self.filed_tickets_for_person(request).await
+    }
+
+    /// W4.13, contract v16. Answered unimplemented until this sidecar serves
+    /// v16 (its CONTRACT_CURRENT), as W4.1 says an older sidecar answers:
+    /// a plugin built at v16 is refused at registration first.
+    async fn record_move(
+        &self,
+        _request: Request<RecordMoveRequest>,
+    ) -> Result<Response<RecordMoveReply>, Status> {
+        Err(Status::unimplemented(
+            "this sidecar does not record a move of raw records yet (W4.13, contract v16)",
+        ))
     }
 }
 

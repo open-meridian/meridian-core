@@ -92,6 +92,7 @@ fn records() -> AccessRecords {
         links: vec![],
         plugin_settings: vec![],
         known_plugins: vec![],
+        holds: vec![],
     }
 }
 

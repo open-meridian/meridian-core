@@ -74,6 +74,9 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
         not_carried,
         storage: declared.storage.as_ref().map(|storage| StorageDeclaration {
             retention_days: storage.retention_days,
+            // The kinds of raw record (W8.1, contract v16): read from the
+            // metadata once the dashboard serves v16.
+            record_kinds: Vec::new(),
         }),
     })
 }
@@ -204,7 +207,10 @@ mod tests {
                 name: "open_pnl".into(),
                 reason: NotCarriedReason::NoContractMeaning as i32,
             }],
-            storage: Some(StorageDeclaration { retention_days: 30 }),
+            storage: Some(StorageDeclaration {
+                retention_days: 30,
+                ..Default::default()
+            }),
         };
         let seen = [NotCarriedSeen {
             scheme: "snaptrade:position".into(),

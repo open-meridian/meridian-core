@@ -1996,6 +1996,11 @@ pub struct PluginReport {
     pub declared_tools: ::prost::alloc::vec::Vec<::meridian_pb::v1::ToolDeclaration>,
     #[prost(string, repeated, tag = "19")]
     pub tool_refusals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// What the plugin's storage holds of each kind of raw record, as its last
+    /// accepted heartbeat said (W4.5, W4.8, contract v16); empty while it is not
+    /// registered, and from a plugin declaring no kinds.
+    #[prost(message, repeated, tag = "20")]
+    pub stored: ::prost::alloc::vec::Vec<::meridian_pb::v1::StoredSpan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -5328,6 +5333,250 @@ pub struct Envelope {
     #[prost(bytes = "vec", tag = "3")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
 }
+/// What a plugin says about itself, from `\[tool.meridian\]` in its
+/// pyproject.toml. Declarations for an administrator to approve, not grants.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginMetadata {
+    /// Lowercase letters, digits and single hyphens, starting with a letter:
+    /// the name `meridian plugin new` gave it, and its repository in the
+    /// deployment's registry, plugins/<name>.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// As its pyproject.toml has it. An uploaded version is never replaced.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// A set, from matrix/roles.tsv, and never a component's name -- the
+    /// dashboard's among them (decisions/020). Empty is a plugin admitted with
+    /// no topics, as the reference plugin is.
+    #[prost(string, repeated, tag = "3")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether it serves a page through its sidecar (decisions/014).
+    #[prost(bool, tag = "5")]
+    pub interface: bool,
+    /// The open-meridian version its base image carries, so an administrator
+    /// can see which plugins stand on a base that needs a fix.
+    #[prost(string, tag = "6")]
+    pub sdk_version: ::prost::alloc::string::String,
+    /// What the version declares beside its roles (W8.1, contract v11): its
+    /// secret settings' names, what it does not carry, and the storage it asks
+    /// for. Read by the CLI from the built image, as the SDK builds it from the
+    /// plugin's code; shown in the catalogue and approved at launch. Unset for
+    /// a version built before v11. A declaration asking for storage on a
+    /// version holding no edge role is refused.
+    #[prost(message, optional, tag = "7")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+}
+/// The dashboard records a version once its image is in the registry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordPluginUploadRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<PluginMetadata>,
+    /// The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
+    /// runs exactly this, never a tag that could move.
+    #[prost(string, tag = "2")]
+    pub image_digest: ::prost::alloc::string::String,
+}
+/// A version in the catalogue.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginVersion {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<PluginMetadata>,
+    #[prost(string, tag = "2")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// The deployment-local login of the administrator who uploaded it.
+    #[prost(string, tag = "3")]
+    pub uploaded_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub uploaded_at_ns: i64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PluginCatalogueRequest {}
+/// Every version uploaded and every launch, live or stopped.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginCatalogue {
+    #[prost(message, repeated, tag = "1")]
+    pub versions: ::prost::alloc::vec::Vec<PluginVersion>,
+    #[prost(message, repeated, tag = "2")]
+    pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
+}
+/// A deployment admin launches a version. The roles are the ones they were
+/// shown and approved, and the launch is refused unless they are exactly the
+/// version's metadata: an approval of something other than what runs is no
+/// approval.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LaunchPluginRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// What it runs as, and what its sidecar's credential and grants are for.
+    /// Unique among the deployment's live plugins.
+    #[prost(string, tag = "3")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// In the live shape, on a development deployment alone: the plugin runs
+    /// the files sent to it since, and the launcher refuses this anywhere else
+    /// (W8.3, spec/live-plugin-development).
+    #[prost(bool, tag = "6")]
+    pub live: bool,
+}
+/// A launch, as the conductor records it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginLaunch {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub image_digest: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "7")]
+    pub launched_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub launched_at_ns: i64,
+    #[prost(enumeration = "PluginLaunchState", tag = "9")]
+    pub state: i32,
+    #[prost(string, tag = "10")]
+    pub stopped_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "11")]
+    pub stopped_at_ns: i64,
+    #[prost(string, tag = "12")]
+    pub failure: ::prost::alloc::string::String,
+    /// Launched in the live shape (W8.3).
+    #[prost(bool, tag = "13")]
+    pub live: bool,
+}
+/// The conductor to the launcher: create this plugin, in the chart's plugin
+/// shape and no other.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreatePluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Always the deployment's own registry, by digest:
+    /// `localhost:<port>/plugins/<name>@sha256:<hex>`.
+    #[prost(string, tag = "2")]
+    pub image: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub interface: bool,
+    /// The chart's live shape rather than its plugin shape; refused by a
+    /// launcher on a deployment not installed for development.
+    #[prost(bool, tag = "6")]
+    pub live: bool,
+    /// The version's declaration, as approved at launch (W8.3, contract v11):
+    /// the launcher gives the instance storage of its own where it asks for
+    /// it. Unset for a version uploaded with none, which gets storage by
+    /// holding an edge role, as before v11.
+    #[prost(message, optional, tag = "7")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+    /// The archive a deployment admin allowed the instance (W8.3, W8.7,
+    /// contract v16): the launcher gives it beside its storage, mounted at
+    /// MERIDIAN_ARCHIVE_DIR or, in a cloud, a bucket named in
+    /// MERIDIAN_ARCHIVE_BUCKET with a credential scoped to it. Unset or not
+    /// allowed, none.
+    #[prost(message, optional, tag = "8")]
+    pub archive: ::core::option::Option<PluginArchive>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreatePluginReply {
+    /// The workload the launcher made, which it alone may later remove.
+    #[prost(string, tag = "1")]
+    pub workload: ::prost::alloc::string::String,
+}
+/// A deployment admin allows an edge instance an archive, or changes its
+/// bound, from its Manage page; the conductor records it and restarts the
+/// instance through CreatePlugin carrying it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllowArchiveRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// The most bytes it may hold; 0 for no bound.
+    #[prost(uint64, tag = "2")]
+    pub most_bytes: u64,
+}
+/// A deployment admin withdraws it: the instance is restarted without it,
+/// and what it holds is kept until an admin removes it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawArchiveRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+/// An instance's archive, as the conductor records it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginArchive {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Allowed now; false once withdrawn.
+    #[prost(bool, tag = "2")]
+    pub allowed: bool,
+    /// The most bytes it may hold; 0 for no bound.
+    #[prost(uint64, tag = "3")]
+    pub most_bytes: u64,
+    /// Who last allowed, changed or withdrew it, the deployment-local subject
+    /// the dashboard stamped, and when. Each is its own record (decisions/031).
+    #[prost(string, tag = "4")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub updated_at_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopPluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+/// The conductor to the launcher: remove what it made for this instance.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemovePluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemovePluginReply {
+    /// False when there was nothing to remove, which is not an error: stopping
+    /// is asked for an outcome, and the outcome holds.
+    #[prost(bool, tag = "1")]
+    pub removed: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PluginLaunchState {
+    Unspecified = 0,
+    /// Recorded, and the launcher asked.
+    Launched = 1,
+    /// Stopped by an administrator; its instance may be launched again.
+    Stopped = 2,
+    /// The launcher refused or failed, with the reason in `failure`.
+    Failed = 3,
+}
+impl PluginLaunchState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLUGIN_LAUNCH_STATE_UNSPECIFIED",
+            Self::Launched => "PLUGIN_LAUNCH_STATE_LAUNCHED",
+            Self::Stopped => "PLUGIN_LAUNCH_STATE_STOPPED",
+            Self::Failed => "PLUGIN_LAUNCH_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLUGIN_LAUNCH_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLUGIN_LAUNCH_STATE_LAUNCHED" => Some(Self::Launched),
+            "PLUGIN_LAUNCH_STATE_STOPPED" => Some(Self::Stopped),
+            "PLUGIN_LAUNCH_STATE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
 /// Published by the dashboard at each sign-in and kept by the conductor, for
 /// the access table (W4.10) and the per-plugin count. Only people who have
 /// signed in are in it, and it never leaves the deployment.
@@ -5382,6 +5631,11 @@ pub struct AccessRecords {
     /// claims. Empty before any sidecar has reported.
     #[prost(message, repeated, tag = "10")]
     pub known_plugins: ::prost::alloc::vec::Vec<KnownPluginRoles>,
+    /// The holds on raw records a deployment admin set (W6.25, contract v16),
+    /// one per edge role or one for every one, for the deployment's Settings
+    /// and each edge plugin's Summary. Empty while none is set.
+    #[prost(message, repeated, tag = "11")]
+    pub holds: ::prost::alloc::vec::Vec<Hold>,
 }
 /// One known plugin and the roles it was launched with (contract v15).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5690,6 +5944,82 @@ pub struct PluginSettingsRecord {
     #[prost(string, tag = "6")]
     pub updated_by: ::prost::alloc::string::String,
 }
+/// Sets or clears a hold, for a deployment admin, from the deployment's
+/// Settings (spec/an-edge-plugins-older-records-move-to-the-archive,
+/// requirement 8). Sent by the dashboard alone, for the admin signed in.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetHoldRequest {
+    /// An edge role (decisions/028), or empty for every one. Another role is
+    /// refused, naming it.
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    /// The least number of days a record is kept anywhere, storage or
+    /// archive, from when it was received. 0 clears the hold; at most 36,500.
+    #[prost(uint32, tag = "2")]
+    pub days: u32,
+    /// Whether the hold needs records that cannot be altered: met only by an
+    /// archive with object lock, for the hold's length, and refused where the
+    /// deployment's archive cannot lock (kernel/edge-plugins-own-storage-for-
+    /// raw-records, ruling 3).
+    #[prost(bool, tag = "3")]
+    pub write_once: bool,
+}
+/// A hold as the conductor records it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Hold {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub days: u32,
+    #[prost(bool, tag = "3")]
+    pub write_once: bool,
+    /// Who set it, the deployment-local subject the dashboard stamped, and
+    /// when. Each change is its own record (decisions/031).
+    #[prost(string, tag = "4")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub updated_at_ns: i64,
+}
+/// The dashboard reads an edge plugin's moves for its Summary, newest first.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadMovesRequest {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    /// Empty for the newest page; the reply's `next_cursor` for the next.
+    #[prost(string, tag = "2")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadMovesReply {
+    /// A page of the instance's moves, newest first, each as recorded.
+    #[prost(message, repeated, tag = "1")]
+    pub moves: ::prost::alloc::vec::Vec<MoveRecord>,
+    /// Empty when there is no older page.
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// Per kind, what the archive holds: the units archived and not deleted,
+    /// summed from the moves.
+    #[prost(message, repeated, tag = "3")]
+    pub archived: ::prost::alloc::vec::Vec<::meridian_pb::v1::StoredSpan>,
+    /// Whether a deployment admin allowed the instance an archive, and its
+    /// bound (W8.7); unset when never allowed.
+    #[prost(message, optional, tag = "4")]
+    pub archive: ::core::option::Option<PluginArchive>,
+}
+/// One move as the conductor recorded it (W4.13): the move the sidecar
+/// reported, and who and when.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MoveRecord {
+    #[prost(message, optional, tag = "1")]
+    pub r#move: ::core::option::Option<::meridian_pb::v1::RecordMoveRequest>,
+    /// The deployment-local subject of the person it was done for, from the
+    /// envelope; empty for a window's move, whose rule the move names.
+    #[prost(string, tag = "2")]
+    pub person: ::prost::alloc::string::String,
+    /// When the conductor recorded it, in nanoseconds since the epoch.
+    #[prost(int64, tag = "3")]
+    pub at_ns: i64,
+}
 /// Answered for the instance the envelope names, and no other. Secrets travel
 /// only on this reply, never on a broadcast, because the broker narrows
 /// publishing to an instance and not subscribing.
@@ -5716,6 +6046,14 @@ pub struct PluginConfiguration {
     /// plugin's configuration, announced as any other.
     #[prost(message, repeated, tag = "6")]
     pub linked_accounts: ::prost::alloc::vec::Vec<AccountRecord>,
+    /// The hold over the instance (W6.25, contract v16): the longest of its
+    /// edge roles' and the one for every role, in days; 0 when none. The
+    /// sidecar refuses a deletion inside it (W4.13).
+    #[prost(uint32, tag = "7")]
+    pub hold_days: u32,
+    /// Whether that hold needs records that cannot be altered.
+    #[prost(bool, tag = "8")]
+    pub hold_write_once: bool,
 }
 /// Something in a plugin's configuration changed; its sidecar asks again.
 /// Carries no setting, so every sidecar may hear it.
@@ -6092,205 +6430,4 @@ pub struct FirstRunApplied {
     /// succeeded; until then the dashboard shows that the rights are still held.
     #[prost(bool, tag = "4")]
     pub rights_released: bool,
-}
-/// What a plugin says about itself, from `\[tool.meridian\]` in its
-/// pyproject.toml. Declarations for an administrator to approve, not grants.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginMetadata {
-    /// Lowercase letters, digits and single hyphens, starting with a letter:
-    /// the name `meridian plugin new` gave it, and its repository in the
-    /// deployment's registry, plugins/<name>.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// As its pyproject.toml has it. An uploaded version is never replaced.
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    /// A set, from matrix/roles.tsv, and never a component's name -- the
-    /// dashboard's among them (decisions/020). Empty is a plugin admitted with
-    /// no topics, as the reference plugin is.
-    #[prost(string, repeated, tag = "3")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Whether it serves a page through its sidecar (decisions/014).
-    #[prost(bool, tag = "5")]
-    pub interface: bool,
-    /// The open-meridian version its base image carries, so an administrator
-    /// can see which plugins stand on a base that needs a fix.
-    #[prost(string, tag = "6")]
-    pub sdk_version: ::prost::alloc::string::String,
-    /// What the version declares beside its roles (W8.1, contract v11): its
-    /// secret settings' names, what it does not carry, and the storage it asks
-    /// for. Read by the CLI from the built image, as the SDK builds it from the
-    /// plugin's code; shown in the catalogue and approved at launch. Unset for
-    /// a version built before v11. A declaration asking for storage on a
-    /// version holding no edge role is refused.
-    #[prost(message, optional, tag = "7")]
-    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-}
-/// The dashboard records a version once its image is in the registry.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordPluginUploadRequest {
-    #[prost(message, optional, tag = "1")]
-    pub metadata: ::core::option::Option<PluginMetadata>,
-    /// The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
-    /// runs exactly this, never a tag that could move.
-    #[prost(string, tag = "2")]
-    pub image_digest: ::prost::alloc::string::String,
-}
-/// A version in the catalogue.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginVersion {
-    #[prost(message, optional, tag = "1")]
-    pub metadata: ::core::option::Option<PluginMetadata>,
-    #[prost(string, tag = "2")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// The deployment-local login of the administrator who uploaded it.
-    #[prost(string, tag = "3")]
-    pub uploaded_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub uploaded_at_ns: i64,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct PluginCatalogueRequest {}
-/// Every version uploaded and every launch, live or stopped.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginCatalogue {
-    #[prost(message, repeated, tag = "1")]
-    pub versions: ::prost::alloc::vec::Vec<PluginVersion>,
-    #[prost(message, repeated, tag = "2")]
-    pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
-}
-/// A deployment admin launches a version. The roles are the ones they were
-/// shown and approved, and the launch is refused unless they are exactly the
-/// version's metadata: an approval of something other than what runs is no
-/// approval.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LaunchPluginRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    /// What it runs as, and what its sidecar's credential and grants are for.
-    /// Unique among the deployment's live plugins.
-    #[prost(string, tag = "3")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "4")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// In the live shape, on a development deployment alone: the plugin runs
-    /// the files sent to it since, and the launcher refuses this anywhere else
-    /// (W8.3, spec/live-plugin-development).
-    #[prost(bool, tag = "6")]
-    pub live: bool,
-}
-/// A launch, as the conductor records it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginLaunch {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub image_digest: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "5")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "7")]
-    pub launched_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "8")]
-    pub launched_at_ns: i64,
-    #[prost(enumeration = "PluginLaunchState", tag = "9")]
-    pub state: i32,
-    #[prost(string, tag = "10")]
-    pub stopped_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "11")]
-    pub stopped_at_ns: i64,
-    #[prost(string, tag = "12")]
-    pub failure: ::prost::alloc::string::String,
-    /// Launched in the live shape (W8.3).
-    #[prost(bool, tag = "13")]
-    pub live: bool,
-}
-/// The conductor to the launcher: create this plugin, in the chart's plugin
-/// shape and no other.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreatePluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// Always the deployment's own registry, by digest:
-    /// `localhost:<port>/plugins/<name>@sha256:<hex>`.
-    #[prost(string, tag = "2")]
-    pub image: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "3")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag = "5")]
-    pub interface: bool,
-    /// The chart's live shape rather than its plugin shape; refused by a
-    /// launcher on a deployment not installed for development.
-    #[prost(bool, tag = "6")]
-    pub live: bool,
-    /// The version's declaration, as approved at launch (W8.3, contract v11):
-    /// the launcher gives the instance storage of its own where it asks for
-    /// it. Unset for a version uploaded with none, which gets storage by
-    /// holding an edge role, as before v11.
-    #[prost(message, optional, tag = "7")]
-    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreatePluginReply {
-    /// The workload the launcher made, which it alone may later remove.
-    #[prost(string, tag = "1")]
-    pub workload: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StopPluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-}
-/// The conductor to the launcher: remove what it made for this instance.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RemovePluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RemovePluginReply {
-    /// False when there was nothing to remove, which is not an error: stopping
-    /// is asked for an outcome, and the outcome holds.
-    #[prost(bool, tag = "1")]
-    pub removed: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PluginLaunchState {
-    Unspecified = 0,
-    /// Recorded, and the launcher asked.
-    Launched = 1,
-    /// Stopped by an administrator; its instance may be launched again.
-    Stopped = 2,
-    /// The launcher refused or failed, with the reason in `failure`.
-    Failed = 3,
-}
-impl PluginLaunchState {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PLUGIN_LAUNCH_STATE_UNSPECIFIED",
-            Self::Launched => "PLUGIN_LAUNCH_STATE_LAUNCHED",
-            Self::Stopped => "PLUGIN_LAUNCH_STATE_STOPPED",
-            Self::Failed => "PLUGIN_LAUNCH_STATE_FAILED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PLUGIN_LAUNCH_STATE_UNSPECIFIED" => Some(Self::Unspecified),
-            "PLUGIN_LAUNCH_STATE_LAUNCHED" => Some(Self::Launched),
-            "PLUGIN_LAUNCH_STATE_STOPPED" => Some(Self::Stopped),
-            "PLUGIN_LAUNCH_STATE_FAILED" => Some(Self::Failed),
-            _ => None,
-        }
-    }
 }

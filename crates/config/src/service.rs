@@ -269,6 +269,10 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         read_account_ids: scope.read.into_iter().collect(),
         write_account_ids: scope.write.into_iter().collect(),
         linked_accounts,
+        // The hold over the instance (W6.25, contract v16): none until the
+        // conductor records holds.
+        hold_days: 0,
+        hold_write_once: false,
     }
 }
 

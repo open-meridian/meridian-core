@@ -369,6 +369,7 @@ fn version(name: &str, version: &str) -> PluginVersion {
                 not_carried: vec![],
                 storage: Some(meridian_pb::v1::StorageDeclaration {
                     retention_days: 2555,
+                    ..Default::default()
                 }),
             }),
         }),
