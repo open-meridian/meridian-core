@@ -382,7 +382,7 @@ impl Sidecar {
         self.admitted()?;
         let now = self.clock.now_ns();
         let assertion = carried(request.metadata())?;
-        let claims = self.vouched_for_configuration(FILE_TICKET, assertion.as_ref(), now)?;
+        let (claims, _) = self.vouched_for_configuration(FILE_TICKET, "", assertion.as_ref(), now)?;
         let filing = self.checked(request.into_inner(), &claims, now).await?;
         let key = filing.idempotency_key.clone();
         let counted = self.counted(&key, now)?;
@@ -430,7 +430,7 @@ impl Sidecar {
         self.admitted()?;
         let now = self.clock.now_ns();
         let assertion = carried(request.metadata())?;
-        let claims = self.vouched_for_configuration(FILED_TICKETS, assertion.as_ref(), now)?;
+        let (claims, _) = self.vouched_for_configuration(FILED_TICKETS, "", assertion.as_ref(), now)?;
         let asked = request.into_inner();
         for (n, id) in asked.ticket_ids.iter().enumerate() {
             self.plain(&format!("ticket_ids[{n}]"), id, None)?;

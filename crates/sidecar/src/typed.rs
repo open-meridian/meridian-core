@@ -21,8 +21,19 @@
 //! Under `write` (Open), a command on an account in the write set; under
 //! `admin` (Manage), the accounts read and the link, and nothing else, since
 //! `admin` reaches no account's data; under `read` (View), nothing. An
-//! assertion naming no level holds nothing. Each act admitted for a person is
-//! logged with the level it was done under.
+//! assertion naming no level holds nothing.
+//!
+//! **By the role holding the act** (contract v15, decisions/033): the plugin
+//! names no role on what it sends; the sidecar asks which of the plugin's
+//! roles hold the topic among their generated grants, and admits the command
+//! for `write` -- or the `config` act for `admin` -- on one of those roles in
+//! the claims' per-role entries, the account among that role's write
+//! accounts. Refused otherwise, naming each role that grants it and what the
+//! person holds on it ("RecordHoldingsStatement is custody's, and Ada holds
+//! read on custody"). Claims with no per-role entry are read as the one
+//! role's on a plugin holding one, and refused on a plugin holding several.
+//! Each act admitted for a person is logged with its level and the roles it
+//! was admitted under.
 //!
 //! **A read is within the plugin's read scope** (W4.4, W4.11). Every query is
 //! stamped with the scope, marked as applying, so the store answers an empty
@@ -220,13 +231,14 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
-            let claims =
-                self.vouched_for_configuration(&topic, acting_for.as_ref(), self.clock.now_ns())?;
+            let (claims, roles) =
+                self.vouched_for_configuration(&topic, payload_type, acting_for.as_ref(), self.clock.now_ns())?;
             tracing::info!(
                 instance = self.instance_id(),
                 topic,
                 by = claims.subject,
                 at_level = level_named(claims.level),
+                roles = roles.join(","),
                 "read for a person"
             );
             (claims.subject, claims.delegation_id, claims.client_name)
@@ -291,7 +303,8 @@ impl Sidecar {
             // An admin's act on the deployment's configuration, not a write
             // to an account: a link names an account nothing may write through
             // this plugin yet, since the link is what grants it (W4.11).
-            let claims = self.vouched_for_configuration(&topic, acting_for.as_ref(), now)?;
+            let (claims, roles) =
+                self.vouched_for_configuration(&topic, payload_type, acting_for.as_ref(), now)?;
             if topic == LINK_EXTERNAL_ACCOUNT {
                 self.reported_by_this_plugin(&message.encode_to_vec(), now)
                     .await?;
@@ -305,6 +318,7 @@ impl Sidecar {
                 topic,
                 by = claims.subject,
                 at_level = level_named(claims.level),
+                roles = roles.join(","),
                 "sent for a person"
             );
             return self.ask_for(&topic, payload_type, message, &claims).await;
@@ -323,12 +337,19 @@ impl Sidecar {
         let claims = match acting_for {
             None => CallerClaims::default(),
             Some(assertion) => {
-                let claims = self.vouched_writer(&assertion, account.as_deref(), now)?;
+                let (claims, roles) = self.vouched_writer(
+                    &topic,
+                    payload_type,
+                    &assertion,
+                    account.as_deref(),
+                    now,
+                )?;
                 tracing::info!(
                     instance = self.instance_id(),
                     topic,
                     by = claims.subject,
                     at_level = "write",
+                    roles = roles.join(","),
                     "sent for a person"
                 );
                 claims
@@ -382,17 +403,48 @@ impl Sidecar {
     /// any level for the two named exceptions, an admin of this plugin in a
     /// session opened by Manage for every other, and never the plugin as
     /// itself (W4.9's notes, W4.12).
+    /// With the roles it was admitted under, for the log: none for the two
+    /// named exceptions, admitted at any level on any role.
     pub(crate) fn vouched_for_configuration(
         &self,
         topic: &str,
+        payload_type: &str,
         acting_for: Option<&CallerAssertion>,
         now_ns: i64,
-    ) -> Result<CallerClaims, Status> {
+    ) -> Result<(CallerClaims, Vec<String>), Status> {
         if FOR_A_PERSON_AT_ANY_LEVEL.contains(&topic) {
             self.vouched_person(topic, acting_for, now_ns)
+                .map(|claims| (claims, Vec::new()))
         } else {
-            self.vouched_admin(topic, acting_for, now_ns)
+            self.vouched_admin(topic, payload_type, acting_for, now_ns)
         }
+    }
+
+    /// Which of this plugin's roles hold `topic` among their generated
+    /// grants (decisions/033, point 3): what a person's act is admitted by.
+    fn roles_granting(&self, topic: &str) -> Vec<String> {
+        self.contract
+            .roles_granting(&self.identity.roles, topic)
+    }
+
+    /// Claims carrying no per-role entry -- from a dashboard older than this
+    /// sidecar, during an upgrade's roll -- are read as the one role's on a
+    /// plugin holding one, exactly the check before v15; on a plugin holding
+    /// several, nothing is sent for the person until they carry roles. Fail
+    /// closed (W4.9).
+    fn without_roles(&self, claims: &CallerClaims) -> Result<(), Status> {
+        if !claims.roles.is_empty() || self.identity.roles.len() <= 1 {
+            return Ok(());
+        }
+        let refusal = format!(
+            "{}'s claims carry no level per role, and {} holds {}: nothing is sent for a person \
+             on a plugin holding several roles until the claims say their level on each",
+            who(claims),
+            self.instance_id(),
+            self.identity.roles.join(" and ")
+        );
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
     }
 
     /// The claims of a person an assertion vouches for, at any level: what a
@@ -442,9 +494,10 @@ impl Sidecar {
     fn vouched_admin(
         &self,
         topic: &str,
+        payload_type: &str,
         acting_for: Option<&CallerAssertion>,
         now_ns: i64,
-    ) -> Result<CallerClaims, Status> {
+    ) -> Result<(CallerClaims, Vec<String>), Status> {
         let refuse = |refusal: String| {
             self.note_refusal(&refusal);
             Err(Status::permission_denied(refusal))
@@ -471,7 +524,34 @@ impl Sidecar {
                 session_named(claims.level)
             ));
         }
-        Ok(claims)
+        // By `admin` on a role whose grants include it (W4.9, decisions/033
+        // point 2): the link is custody's, and an admin of the plugin's other
+        // roles alone is refused it, naming custody.
+        let granting = self.roles_granting(topic);
+        self.without_roles(&claims)?;
+        if claims.roles.is_empty() {
+            return Ok((claims, granting));
+        }
+        let admitted: Vec<String> = granting
+            .iter()
+            .filter(|role| {
+                claims
+                    .roles
+                    .iter()
+                    .any(|held| &held.role == *role && held.level == AccessLevel::Admin as i32)
+            })
+            .cloned()
+            .collect();
+        if admitted.is_empty() {
+            return refuse(format!(
+                "{} is {}, and {} holds {}",
+                act_named(topic, payload_type),
+                owned_by(&granting),
+                who(&claims),
+                held_on(&claims, &granting)
+            ));
+        }
+        Ok((claims, admitted))
     }
 
     /// A link naming a new account, rather than an existing one, is a
@@ -531,14 +611,24 @@ impl Sidecar {
 
     /// The person an assertion vouches for, if they may write `account`
     /// through this plugin -- or, for a command naming none, anything at all
-    /// through it. Their access is what the dashboard signed, under a minute
-    /// ago; a person narrows what a plugin may do and never widens it.
+    /// through it -- with the roles it is admitted under. Their access is
+    /// what the dashboard signed, under a minute ago; a person narrows what a
+    /// plugin may do and never widens it.
+    ///
+    /// **By the role holding the act** (contract v15, decisions/033 point 3,
+    /// W4.9): the person holds `write` on one of the plugin's roles whose
+    /// generated grants include the command's topic, with the account among
+    /// that role's write accounts; a row several roles hold is admitted for
+    /// `write` on any of them. Otherwise refused, naming each role that
+    /// grants it and what the person holds on it.
     fn vouched_writer(
         &self,
+        topic: &str,
+        payload_type: &str,
         assertion: &CallerAssertion,
         account: Option<&str>,
         now_ns: i64,
-    ) -> Result<CallerClaims, Status> {
+    ) -> Result<(CallerClaims, Vec<String>), Status> {
         let verifier = self.verifier.as_ref().ok_or_else(|| {
             Status::unauthenticated(
                 "this sidecar holds none of the dashboard's keys, so it can vouch for nobody",
@@ -547,35 +637,150 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        let refuse = |refusal: String| {
+            self.note_refusal(&refusal);
+            Err(Status::permission_denied(refusal))
+        };
         // A command only in a session opened by Open: one under Manage
         // reaches no account's data, and one under View acts on nothing
         // (W6.9).
         if claims.level != AccessLevel::Write as i32 {
-            let refusal = format!(
+            return refuse(format!(
                 "{} sent this in a {} session, and a command is sent for a person only in \
                  a session at write, opened by Open",
                 claims.subject,
                 session_named(claims.level)
-            );
-            self.note_refusal(&refusal);
-            return Err(Status::permission_denied(refusal));
+            ));
         }
-        // The accounts the person may write through this plugin, whole: a
-        // person's access to a plugin is read, write or admin, with nothing
-        // finer (decisions/026, 027).
-        let may_write = &claims.write_account_ids;
-        match account {
-            Some(account) if !may_write.iter().any(|held| held == account) => {
-                Err(Status::permission_denied(format!(
-                    "the person may not write account {account} through this plugin"
-                )))
+        let granting = self.roles_granting(topic);
+        self.without_roles(&claims)?;
+        if claims.roles.is_empty() {
+            // One role, or none: the claims' write set is that role's, the
+            // check before v15.
+            let may_write = &claims.write_account_ids;
+            return match account {
+                Some(account) if !may_write.iter().any(|held| held == account) => {
+                    Err(Status::permission_denied(format!(
+                        "the person may not write account {account} through this plugin"
+                    )))
+                }
+                None if may_write.is_empty() => Err(Status::permission_denied(
+                    "the person may write nothing through this plugin",
+                )),
+                _ => Ok((claims, granting)),
+            };
+        }
+        let mut admitted = Vec::new();
+        let mut outside = Vec::new();
+        for role in &granting {
+            let Some(held) = claims
+                .roles
+                .iter()
+                .find(|held| &held.role == role && held.level == AccessLevel::Write as i32)
+            else {
+                continue;
+            };
+            let writes: Vec<&str> = held
+                .write_positions
+                .iter()
+                .filter_map(|at| claims.read_account_ids.get(*at as usize))
+                .map(String::as_str)
+                .collect();
+            let reaches = match account {
+                Some(account) => writes.contains(&account),
+                None => !writes.is_empty(),
+            };
+            if reaches {
+                admitted.push(role.clone());
+            } else {
+                outside.push(role.clone());
             }
-            None if may_write.is_empty() => Err(Status::permission_denied(
-                "the person may write nothing through this plugin",
-            )),
-            _ => Ok(claims),
         }
+        if !admitted.is_empty() {
+            return Ok((claims, admitted));
+        }
+        let act = act_named(topic, payload_type);
+        if !outside.is_empty() {
+            return refuse(match account {
+                Some(account) => format!(
+                    "{act} is {}, and {} holds write on {} without account {account}",
+                    owned_by(&granting),
+                    who(&claims),
+                    outside.join(" and ")
+                ),
+                None => format!(
+                    "{act} is {}, and {} may write no account on {}",
+                    owned_by(&granting),
+                    who(&claims),
+                    outside.join(" and ")
+                ),
+            });
+        }
+        refuse(format!(
+            "{act} is {}, and {} holds {}",
+            owned_by(&granting),
+            who(&claims),
+            held_on(&claims, &granting)
+        ))
     }
+}
+
+/// Who the claims name, for a refusal: their name where the dashboard gave
+/// one, else their subject.
+fn who(claims: &CallerClaims) -> &str {
+    if claims.display_name.is_empty() {
+        &claims.subject
+    } else {
+        &claims.display_name
+    }
+}
+
+/// The act a topic carries, as the matrix names its operation: the request's
+/// type less its package and `Request` (`RecordHoldingsStatement`), or the
+/// topic where no type is given.
+fn act_named<'a>(topic: &'a str, payload_type: &'a str) -> &'a str {
+    payload_type
+        .rsplit('.')
+        .next()
+        .and_then(|name| name.strip_suffix("Request"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or(topic)
+}
+
+/// "custody's", "custody's and operations'", or no role's.
+fn owned_by(roles: &[String]) -> String {
+    if roles.is_empty() {
+        return "no role's this plugin holds".into();
+    }
+    roles
+        .iter()
+        .map(|role| {
+            if role.ends_with('s') {
+                format!("{role}'")
+            } else {
+                format!("{role}'s")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// What the claims hold on each of `roles`: "read on custody", "nothing on
+/// operations".
+fn held_on(claims: &CallerClaims, roles: &[String]) -> String {
+    if roles.is_empty() {
+        return "no role that grants it".into();
+    }
+    roles
+        .iter()
+        .map(|role| {
+            match claims.roles.iter().find(|held| &held.role == role) {
+                Some(held) => format!("{} on {role}", level_named(held.level)),
+                None => format!("nothing on {role}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// A session's level as a log names it.

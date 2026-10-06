@@ -12,7 +12,8 @@ use meridian_domain::v1::{
 use meridian_pb::v1::SettingDeclaration;
 
 use crate::store::{
-    redaction_note, redeclared, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
+    group_change, known_plugins, permission_change, redaction_note, redeclared,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
     SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
     REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
@@ -23,6 +24,8 @@ pub struct MemoryStore {
     /// Each settings change's own record (W6.11), as the Postgres store keeps
     /// them, so the rule is tested on both.
     changes: Mutex<Vec<SettingChangeRecord>>,
+    /// Each grant change's own record (W6.7, W6.8), likewise.
+    access_changes: Mutex<Vec<AccessChangeRecord>>,
 }
 
 impl MemoryStore {
@@ -41,6 +44,7 @@ impl MemoryStore {
         Self {
             state: Mutex::new(snapshot),
             changes: Mutex::new(Vec::new()),
+            access_changes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -114,6 +118,7 @@ fn redact(
 impl Store for MemoryStore {
     fn snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = self.state.lock().expect("store lock poisoned").clone();
+        snapshot.records.known_plugins = known_plugins(&snapshot.plugins);
         for change in self.changes.lock().expect("store lock poisoned").iter() {
             if matches!(change.kind, ChangeKind::Set | ChangeKind::Cleared) {
                 snapshot.settings_changed.insert(
@@ -152,11 +157,23 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn put_access_group(&self, group: &AccessGroup) -> Result<()> {
+    fn put_access_group(&self, group: &AccessGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
+        let before = state
+            .records
+            .access_groups
+            .iter()
+            .find(|g| g.access_group_id == group.access_group_id)
+            .cloned();
         upsert(&mut state.records.access_groups, group, |g| {
             g.access_group_id == group.access_group_id
         });
+        if let Some(record) = group_change(before.as_ref(), group, author, at_ns) {
+            self.access_changes
+                .lock()
+                .expect("store lock poisoned")
+                .push(record);
+        }
         Ok(())
     }
 
@@ -189,13 +206,22 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn add_permission(&self, permission: &Permission) -> Result<()> {
+    fn add_permission(&self, permission: &Permission, author: &Author, at_ns: i64) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
         state.records.permissions.push(permission.clone());
+        self.access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .push(permission_change(permission, true, author, at_ns));
         Ok(())
     }
 
-    fn withdraw_permission(&self, permission_id: &str) -> Result<Withdrawal> {
+    fn withdraw_permission(
+        &self,
+        permission_id: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Withdrawal> {
         let mut state = self.state.lock().expect("store lock poisoned");
         let permissions = &mut state.records.permissions;
         let Some(at) = permissions
@@ -211,11 +237,21 @@ impl Store for MemoryStore {
         if permissions[at].access_group_id == DEPLOYMENT_ADMIN && admins == 1 {
             return Ok(Withdrawal::LastAdmin);
         }
-        permissions.remove(at);
+        let withdrawn = permissions.remove(at);
+        self.access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .push(permission_change(&withdrawn, false, author, at_ns));
         Ok(Withdrawal::Withdrawn)
     }
 
-    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool> {
+    fn install_first_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool> {
         let mut state = self.state.lock().expect("store lock poisoned");
         if state
             .records
@@ -230,7 +266,26 @@ impl Store for MemoryStore {
             .records
             .permissions
             .extend(permissions.iter().cloned());
+        self.access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(
+                permissions
+                    .iter()
+                    .map(|permission| permission_change(permission, true, author, at_ns)),
+            );
         Ok(true)
+    }
+
+    fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
+        Ok(self
+            .access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.access_group_id == access_group_id)
+            .cloned()
+            .collect())
     }
 
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()> {

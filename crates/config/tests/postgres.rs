@@ -142,22 +142,24 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
             AccessEntry {
                 plugin_instance_id: "oms-1".into(),
                 level: AccessLevel::Write as i32,
+                role: String::new(),
             },
             AccessEntry {
                 plugin_instance_id: "reporting-1".into(),
                 level: AccessLevel::Read as i32,
+                role: String::new(),
             },
         ],
         built_in: false,
     };
-    store.put_access_group(&access).unwrap();
+    store.put_access_group(&access, &meridian_config::Author::default(), 0).unwrap();
     let permission = Permission {
         permission_id: "PRM-1".into(),
         user_group_id: "UG-1".into(),
         account_group_id: "AG-1".into(),
         access_group_id: "AX-1".into(),
     };
-    store.add_permission(&permission).unwrap();
+    store.add_permission(&permission, &meridian_config::Author::default(), 0).unwrap();
     let link = ExternalAccountLink {
         plugin_instance_id: "oms-1".into(),
         external_account_id: "st-1".into(),
@@ -256,7 +258,7 @@ fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
         ..admin_permission("PRM-1", "UG-1")
     };
     assert!(
-        store.add_permission(&with_accounts).is_err(),
+        store.add_permission(&with_accounts, &meridian_config::Author::default(), 0).is_err(),
         "deployment admin names no account group"
     );
 }
@@ -288,7 +290,7 @@ fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
                 store
                     .install_first_admin(
                         &group,
-                        &[admin_permission(&format!("PRM-{n}"), &group.user_group_id)],
+                        &[admin_permission(&format!("PRM-{n}"), &group.user_group_id)], &meridian_config::Author::default(), 0,
                     )
                     .unwrap()
             })
@@ -310,13 +312,13 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
         store.put_user_group(&group).unwrap();
         store
-            .add_permission(&admin_permission(&format!("PRM-{n}"), &group.user_group_id))
+            .add_permission(&admin_permission(&format!("PRM-{n}"), &group.user_group_id), &meridian_config::Author::default(), 0)
             .unwrap();
     }
     let threads: Vec<_> = (0..2)
         .map(|n| {
             let store = Arc::clone(&store);
-            std::thread::spawn(move || store.withdraw_permission(&format!("PRM-{n}")).unwrap())
+            std::thread::spawn(move || store.withdraw_permission(&format!("PRM-{n}"), &meridian_config::Author::default(), 0).unwrap())
         })
         .collect();
     let outcomes: Vec<Withdrawal> = threads.into_iter().map(|t| t.join().unwrap()).collect();
@@ -324,7 +326,7 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
     assert!(outcomes.contains(&Withdrawal::LastAdmin), "{outcomes:?}");
     assert_eq!(store.snapshot().unwrap().records.permissions.len(), 1);
     assert_eq!(
-        store.withdraw_permission("PRM-missing").unwrap(),
+        store.withdraw_permission("PRM-missing", &meridian_config::Author::default(), 0).unwrap(),
         Withdrawal::Unknown
     );
 }
@@ -844,21 +846,25 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
             .entries
             .clone()
     };
-    let entry = |plugin: &str, level: AccessLevel| AccessEntry {
+    // And, migrated on to contract v15, each entry names its plugin's one
+    // role where the deployment knows it: SnapTrade reported custody, and
+    // nothing is known of oms-1, which is left naming none.
+    let entry = |plugin: &str, role: &str, level: AccessLevel| AccessEntry {
         plugin_instance_id: plugin.into(),
         level: level as i32,
+        role: role.into(),
     };
     assert_eq!(
         entries("AX-TRADING"),
         [
-            entry("snaptrade-1", AccessLevel::Write),
-            entry("oms-1", AccessLevel::Read)
+            entry("snaptrade-1", "custody", AccessLevel::Write),
+            entry("oms-1", "", AccessLevel::Read)
         ],
         "read on holdings and write on custody is write on the plugin"
     );
     assert_eq!(
         entries("AX-VIEWING"),
-        [entry("snaptrade-1", AccessLevel::Read)],
+        [entry("snaptrade-1", "custody", AccessLevel::Read)],
         "read on both tags stays read"
     );
     assert_eq!(snapshot.plugins[0].roles, ["custody"]);
@@ -1073,7 +1079,7 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
         account_group_id: "AG-1".into(),
         access_group_id: meridian_access::ALL_PLUGINS_ADMIN.into(),
     };
-    assert!(store.add_permission(&naming).is_err());
+    assert!(store.add_permission(&naming, &meridian_config::Author::default(), 0).is_err());
     store
         .put_access_group(&AccessGroup {
             access_group_id: "AX-ADMIN".into(),
@@ -1081,9 +1087,10 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
             entries: vec![AccessEntry {
                 plugin_instance_id: "oms-1".into(),
                 level: AccessLevel::Admin as i32,
+                role: String::new(),
             }],
             built_in: false,
-        })
+        }, &meridian_config::Author::default(), 0)
         .expect("an admin entry is kept");
     let held = store.snapshot().unwrap().records.access_groups;
     assert!(held.iter().any(
@@ -1492,4 +1499,155 @@ fn migration_12_redacts_what_a_secret_settings_records_hold() {
         .unwrap()
         .get(0);
     assert!(!text.contains("plain-before"), "redacted: {text}");
+}
+
+#[test]
+fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records_it() {
+    // A store at migration 12, as a deployment at contract v14 has it: entries
+    // naming plugins and levels alone, on a custody plugin, an operations
+    // plugin, a plugin holding no role, a plugin holding two, and one no
+    // sidecar has reported but a launch names.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_per_role_{seq}_{}", std::process::id());
+    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .unwrap();
+    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 12)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    db.batch_execute(
+        "INSERT INTO config_known_plugin (plugin_instance_id, roles, last_reported_at_ns)
+         VALUES ('snaptrade-1', '{custody}', 1), ('ops-1', '{operations}', 1),
+                ('tool-1', '{}', 1), ('multi-1', '{custody,operations}', 1);
+         INSERT INTO config_plugin_version (name, version, roles, interface, sdk_version,
+                image_digest, uploaded_by, uploaded_at_ns)
+         VALUES ('later', '1.0.0', '{oms}', false, '0.19.0', 'sha256:00', 'local|ada', 1);
+         INSERT INTO config_plugin_launch (instance_id, name, version, image_digest, roles,
+                launched_by, launched_at_ns, state)
+         VALUES ('later-1', 'later', '1.0.0', 'sha256:00', '{oms}', 'local|ada', 1, 1);
+         INSERT INTO config_account (account_id, name, state, created_at_ns)
+         VALUES ('ACC-1', 'Growth', 1, 1), ('ACC-2', 'Income', 1, 1);
+         INSERT INTO config_user_group (user_group_id, name, logins)
+         VALUES ('UG-1', 'Traders', '{local|tam}');
+         INSERT INTO config_account_group (account_group_id, name, account_ids)
+         VALUES ('AG-1', 'Growth', '{ACC-1}');
+         INSERT INTO config_access_group (access_group_id, name) VALUES ('AX-1', 'Trading'),
+                ('AX-2', 'Nothing to rewrite');
+         INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
+         VALUES ('AX-1', 0, 'snaptrade-1', 1), ('AX-1', 1, 'snaptrade-1', 3),
+                ('AX-1', 2, 'ops-1', 2), ('AX-1', 3, 'tool-1', 2),
+                ('AX-1', 4, 'multi-1', 1), ('AX-1', 5, 'later-1', 2),
+                ('AX-2', 0, 'tool-1', 1);
+         INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
+         VALUES ('P-1', 'UG-1', 'AG-1', 'AX-1');
+         INSERT INTO config_sign_in (subject, display_name, signed_in_at_ns)
+         VALUES ('local|tam', 'Tam', 1);",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(5_000)).unwrap();
+    store
+        .migrate(&At(6_000))
+        .expect("migrating twice is a no-op");
+
+    let snapshot = store.snapshot().unwrap();
+    let trading = snapshot
+        .records
+        .access_groups
+        .iter()
+        .find(|group| group.access_group_id == "AX-1")
+        .unwrap();
+    let named: Vec<(&str, &str)> = trading
+        .entries
+        .iter()
+        .map(|entry| (entry.plugin_instance_id.as_str(), entry.role.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("snaptrade-1", "custody"),
+            ("snaptrade-1", "custody"),
+            ("ops-1", "operations"),
+            ("tool-1", ""),
+            ("multi-1", ""),
+            ("later-1", "oms"),
+        ],
+        "each plugin's one role; none for a role-less plugin; a two-role plugin's left"
+    );
+
+    // Each group has its gap; the one rewritten its record, by no person.
+    let trading_changes = store.access_changes("AX-1").unwrap();
+    let kinds: Vec<_> = trading_changes.iter().map(|change| change.kind).collect();
+    use meridian_config::AccessChangeKind::{NotKnownBefore, Rewritten};
+    assert_eq!(kinds, [NotKnownBefore, Rewritten]);
+    assert!(trading_changes.iter().all(|change| change.at_ns == 5_000 && change.by.is_empty()));
+    assert!(trading_changes[1].was.contains("snaptrade-1 read"));
+    assert!(trading_changes[1].became.contains("snaptrade-1 custody read"));
+    assert!(trading_changes[1].note.contains("contract v15"));
+    assert_eq!(
+        store
+            .access_changes("AX-2")
+            .unwrap()
+            .iter()
+            .map(|change| change.kind)
+            .collect::<Vec<_>>(),
+        [NotKnownBefore],
+        "nothing to rewrite, so only its gap"
+    );
+    for built_in in [DEPLOYMENT_ADMIN, meridian_access::ALL_PLUGINS_ADMIN] {
+        assert_eq!(store.access_changes(built_in).unwrap().len(), 1);
+    }
+
+    // Run again, it changes nothing.
+    let mut tx = db.transaction().unwrap();
+    let again =
+        meridian_config::migrations::rewrite_entries_to_name_their_role(&mut tx, 7_000).unwrap();
+    tx.commit().unwrap();
+    assert!(again.is_empty(), "idempotent: {again:?}");
+    assert_eq!(store.access_changes("AX-1").unwrap().len(), 2);
+
+    // Nobody's access moved: the access table and every person's level and
+    // accounts are what reading the entries per plugin, as v14 did, gives.
+    let mut as_v14 = snapshot.records.clone();
+    as_v14.known_plugins.clear();
+    for group in &mut as_v14.access_groups {
+        for entry in &mut group.entries {
+            entry.role.clear();
+        }
+    }
+    for plugin in ["snaptrade-1", "ops-1", "tool-1", "later-1"] {
+        assert_eq!(
+            meridian_access::plugin_access_table(&snapshot.records, plugin)
+                .people
+                .iter()
+                .map(|person| (person.read_account_ids.clone(), person.write_account_ids.clone()))
+                .collect::<Vec<_>>(),
+            meridian_access::plugin_access_table(&as_v14, plugin)
+                .people
+                .iter()
+                .map(|person| (person.read_account_ids.clone(), person.write_account_ids.clone()))
+                .collect::<Vec<_>>(),
+            "{plugin}'s table"
+        );
+        let now = meridian_access::person_access(&snapshot.records, "local|tam", &[]).held(plugin);
+        let then = meridian_access::person_access(&as_v14, "local|tam", &[]).held(plugin);
+        assert_eq!(now, then, "Tam on {plugin}");
+    }
+    // Only the two-role plugin's entry, which the rewrite could not name,
+    // holds nothing now, and is flagged.
+    assert!(!meridian_access::entry_holds(&snapshot.records, "multi-1", ""));
 }

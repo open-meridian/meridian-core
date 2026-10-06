@@ -14,8 +14,9 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::{
-    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Permission,
-    PluginCatalogue, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
+    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, KnownPluginRoles,
+    Permission, PluginCatalogue, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord,
+    UserGroup,
 };
 use meridian_pb::v1::SettingDeclaration;
 
@@ -83,13 +84,191 @@ pub struct SettingChange {
     pub held: Option<Held>,
 }
 
-/// Who made a settings change: the person the dashboard stamped, and the
-/// delegation they acted through when they acted through a client (empty
-/// otherwise). A plugin sets none of its settings (W6.11, option A).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingsAuthor {
+/// Who made a change: the person the dashboard stamped, and the delegation
+/// they acted through when they acted through a client (empty otherwise).
+/// Empty `by` for a change no person made: a migration's, or a plugin's
+/// re-declaration. A plugin sets none of its settings (W6.11, option A).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Author {
     pub by: String,
     pub delegation: String,
+}
+
+/// Who made a settings change (W6.11).
+pub type SettingsAuthor = Author;
+
+/// What one change to an access group, or to a permission to one, left as its
+/// own record (W6.7, W6.8, decisions/031; the plan's R1, contract v15): what
+/// it was, what it became, who, through which delegation, and when. A gap
+/// record says the group's history is not known before its time, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessChangeRecord {
+    pub access_group_id: String,
+    pub kind: AccessChangeKind,
+    /// The group or the permission as it was; empty for one defined anew,
+    /// granted, or a gap.
+    pub was: String,
+    /// As it became; empty for one withdrawn, or a gap.
+    pub became: String,
+    /// The permission granted or withdrawn; empty otherwise.
+    pub permission_id: String,
+    pub by: String,
+    pub delegation: String,
+    pub at_ns: i64,
+    pub note: String,
+}
+
+/// An access group defined anew, or changed; its entries rewritten once at
+/// the upgrade to contract v15; a permission to it granted or withdrawn; or a
+/// gap, nothing known before the record's time (decisions/031, point 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessChangeKind {
+    Defined,
+    Changed,
+    Rewritten,
+    Granted,
+    Withdrawn,
+    NotKnownBefore,
+}
+
+impl AccessChangeKind {
+    /// The `kind` column's number.
+    pub fn code(self) -> i16 {
+        match self {
+            AccessChangeKind::Defined => 1,
+            AccessChangeKind::Changed => 2,
+            AccessChangeKind::Rewritten => 3,
+            AccessChangeKind::Granted => 4,
+            AccessChangeKind::Withdrawn => 5,
+            AccessChangeKind::NotKnownBefore => 6,
+        }
+    }
+
+    pub fn from_code(code: i16) -> Option<Self> {
+        match code {
+            1 => Some(AccessChangeKind::Defined),
+            2 => Some(AccessChangeKind::Changed),
+            3 => Some(AccessChangeKind::Rewritten),
+            4 => Some(AccessChangeKind::Granted),
+            5 => Some(AccessChangeKind::Withdrawn),
+            6 => Some(AccessChangeKind::NotKnownBefore),
+            _ => None,
+        }
+    }
+}
+
+/// An access group as a change record says what it was and what it became:
+/// its name, and each entry's plugin, role and level, in its order.
+pub fn described_group(group: &AccessGroup) -> String {
+    let entries: Vec<String> = group
+        .entries
+        .iter()
+        .map(|entry| {
+            let level = meridian_access::AccessLevel::try_from(entry.level)
+                .map(meridian_access::level_name)
+                .unwrap_or("no level");
+            if entry.role.is_empty() {
+                format!("{} {level}", entry.plugin_instance_id)
+            } else {
+                format!("{} {} {level}", entry.plugin_instance_id, entry.role)
+            }
+        })
+        .collect();
+    format!("{:?}: {}", group.name, if entries.is_empty() { "no entries".to_string() } else { entries.join(", ") })
+}
+
+/// A permission as a change record says it: the user group, and the account
+/// group where it names one.
+pub fn described_permission(permission: &Permission) -> String {
+    if permission.account_group_id.is_empty() {
+        format!("user group {}, no account group", permission.user_group_id)
+    } else {
+        format!(
+            "user group {}, account group {}",
+            permission.user_group_id, permission.account_group_id
+        )
+    }
+}
+
+/// The record of a change to an access group: defined when there was none
+/// before, changed otherwise; None when nothing changed.
+pub fn group_change(
+    before: Option<&AccessGroup>,
+    after: &AccessGroup,
+    author: &Author,
+    at_ns: i64,
+) -> Option<AccessChangeRecord> {
+    if before == Some(after) {
+        return None;
+    }
+    Some(AccessChangeRecord {
+        access_group_id: after.access_group_id.clone(),
+        kind: if before.is_some() {
+            AccessChangeKind::Changed
+        } else {
+            AccessChangeKind::Defined
+        },
+        was: before.map(described_group).unwrap_or_default(),
+        became: described_group(after),
+        permission_id: String::new(),
+        by: author.by.clone(),
+        delegation: author.delegation.clone(),
+        at_ns,
+        note: String::new(),
+    })
+}
+
+/// The record of a permission granted or withdrawn.
+pub fn permission_change(
+    permission: &Permission,
+    granted: bool,
+    author: &Author,
+    at_ns: i64,
+) -> AccessChangeRecord {
+    AccessChangeRecord {
+        access_group_id: permission.access_group_id.clone(),
+        kind: if granted {
+            AccessChangeKind::Granted
+        } else {
+            AccessChangeKind::Withdrawn
+        },
+        was: if granted {
+            String::new()
+        } else {
+            described_permission(permission)
+        },
+        became: if granted {
+            described_permission(permission)
+        } else {
+            String::new()
+        },
+        permission_id: permission.permission_id.clone(),
+        by: author.by.clone(),
+        delegation: author.delegation.clone(),
+        at_ns,
+        note: String::new(),
+    }
+}
+
+/// Why each access group's history before contract v15 is a gap.
+pub const ACCESS_NOT_KNOWN_BEFORE: &str = "not known before: until contract v15 the store kept \
+     each access group as it stood and when it was made, never a change to its entries or to \
+     the permissions to it; each change since is its own record";
+
+/// What the one-time rewrite's record says (W6.7; the spec's requirement 27).
+pub const REWRITTEN_TO_NAME_ITS_ROLE: &str = "the one-time rewrite at the upgrade to contract \
+     v15, no person: each entry naming no role on a plugin holding exactly one now names it, \
+     as its sidecar last reported or its latest launch said; nobody's access moved";
+
+/// The one role an entry naming none is rewritten to name (W6.7): the
+/// plugin's, where it holds exactly one as its sidecar last reported, or --
+/// where no sidecar has reported -- as its latest launch said. None where it
+/// holds none or several, or nothing is known of it: the entry is left.
+pub fn the_one_role<'a>(reported: Option<&'a [String]>, launched: Option<&'a [String]>) -> Option<&'a str> {
+    match reported.or(launched) {
+        Some([one]) => Some(one.as_str()),
+        _ => None,
+    }
 }
 
 /// What a change to one setting left as its own record (W6.11,
@@ -165,6 +344,17 @@ pub struct Snapshot {
     /// the change records: who the settings record says last changed them,
     /// and when. Empty `by` for a clear the plugin's re-declaration made.
     pub settings_changed: BTreeMap<String, LastChange>,
+}
+
+/// Each known plugin's roles as the records carry them (W6.1, contract v15).
+pub fn known_plugins(plugins: &[KnownPlugin]) -> Vec<KnownPluginRoles> {
+    plugins
+        .iter()
+        .map(|plugin| KnownPluginRoles {
+            plugin_instance_id: plugin.plugin_instance_id.clone(),
+            roles: plugin.roles.clone(),
+        })
+        .collect()
 }
 
 /// Who made a plugin's latest settings change, and when.
@@ -270,7 +460,11 @@ pub trait Store: Send + Sync {
     fn put_account(&self, account: &AccountRecord) -> Result<()>;
     fn put_user_group(&self, group: &UserGroup) -> Result<()>;
     fn put_account_group(&self, group: &AccountGroup) -> Result<()>;
-    fn put_access_group(&self, group: &AccessGroup) -> Result<()>;
+    /// Insert or replace an access group, and record the change as its own
+    /// record, in one step (W6.7, decisions/031): defined or changed, what it
+    /// was and what it became, by `author` at `at_ns`. Nothing is recorded
+    /// when nothing changed.
+    fn put_access_group(&self, group: &AccessGroup, author: &Author, at_ns: i64) -> Result<()>;
 
     /// Insert or replace one link; an empty `account_id` removes it.
     fn put_link(&self, link: &ExternalAccountLink) -> Result<()>;
@@ -283,15 +477,34 @@ pub trait Store: Send + Sync {
         link: &ExternalAccountLink,
     ) -> Result<()>;
 
-    fn add_permission(&self, permission: &Permission) -> Result<()>;
+    /// A permission granted, recorded as its own record in the same step
+    /// (W6.8).
+    fn add_permission(&self, permission: &Permission, author: &Author, at_ns: i64) -> Result<()>;
 
-    /// Atomic: refuses the last permission to deployment admin.
-    fn withdraw_permission(&self, permission_id: &str) -> Result<Withdrawal>;
+    /// Atomic: refuses the last permission to deployment admin. A
+    /// withdrawal is recorded as its own record in the same step (W6.8).
+    fn withdraw_permission(
+        &self,
+        permission_id: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Withdrawal>;
 
     /// Atomic: writes the group and its permissions -- to deployment admin
     /// and to All plugins (admin) -- only if no permission to deployment
-    /// admin exists, and says whether it did.
-    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool>;
+    /// admin exists, and says whether it did; each permission recorded as
+    /// granted by `author`.
+    fn install_first_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool>;
+
+    /// Every change recorded for one access group and the permissions to it,
+    /// gap and rewrite records included, in the order recorded.
+    fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>>;
 
     /// The latest sign-in stands; groups are never merged across sign-ins.
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;

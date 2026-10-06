@@ -26,6 +26,7 @@ pub mod edge;
 mod older;
 mod receive;
 pub mod report;
+pub mod roles;
 mod service;
 mod streams;
 mod tickets;

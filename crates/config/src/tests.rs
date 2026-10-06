@@ -201,6 +201,7 @@ fn entry(level: AccessLevel) -> AccessEntry {
     AccessEntry {
         plugin_instance_id: "oms-1".into(),
         level: level as i32,
+        role: "oms".into(),
     }
 }
 
@@ -1313,7 +1314,7 @@ fn an_administrator_who_arrived_another_way_is_left_alone() {
         access_group_id: DEPLOYMENT_ADMIN.into(),
     };
     store
-        .install_first_admin(&group, std::slice::from_ref(&permission))
+        .install_first_admin(&group, std::slice::from_ref(&permission), &crate::Author::default(), 0)
         .unwrap();
 
     assert!(!install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
@@ -2650,4 +2651,223 @@ fn accounts_linked_twice_before_the_rule_are_reported_and_kept() {
             ]
         )]
     );
+}
+
+// ── Access per role (contract v15, decisions/033) ─────────────────────────
+
+fn on_role(plugin: &str, role: &str, level: AccessLevel) -> AccessEntry {
+    AccessEntry {
+        plugin_instance_id: plugin.into(),
+        level: level as i32,
+        role: role.into(),
+    }
+}
+
+/// A plugin holding custody and operations, and one holding none.
+fn two_roles_and_none(h: &Harness) {
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "ops-1".into(),
+            roles: vec!["custody".into(), "operations".into()],
+            last_reported_at_ns: 0,
+        })
+        .unwrap();
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "tool-1".into(),
+            roles: vec![],
+            last_reported_at_ns: 0,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_access_entry_names_one_role_its_plugin_holds() {
+    let h = harness("dashboard-1");
+    two_roles_and_none(&h);
+    let per_role = access_group(
+        &h,
+        vec![
+            on_role("ops-1", "operations", AccessLevel::Write),
+            on_role("ops-1", "custody", AccessLevel::Read),
+            on_role("ops-1", "custody", AccessLevel::Admin),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(per_role.entries[0].role, "operations");
+
+    let stranger = access_group(&h, vec![on_role("ops-1", "oms", AccessLevel::Write)])
+        .await
+        .unwrap_err();
+    assert!(
+        stranger.contains("not launched with") && stranger.contains("custody, operations"),
+        "{stranger}"
+    );
+    let component = access_group(&h, vec![on_role("ops-1", "street", AccessLevel::Read)])
+        .await
+        .unwrap_err();
+    assert!(component.contains("custody, operations"), "{component}");
+    let role_less = access_group(&h, vec![on_role("ops-1", "", AccessLevel::Read)])
+        .await
+        .unwrap_err();
+    assert!(role_less.contains("names no role"), "{role_less}");
+    let on_none = access_group(&h, vec![on_role("tool-1", "custody", AccessLevel::Read)])
+        .await
+        .unwrap_err();
+    assert!(on_none.contains("granted as a whole"), "{on_none}");
+    assert!(access_group(&h, vec![on_role("tool-1", "", AccessLevel::Read)])
+        .await
+        .is_ok());
+    let both = access_group(
+        &h,
+        vec![
+            on_role("ops-1", "custody", AccessLevel::Read),
+            on_role("ops-1", "custody", AccessLevel::Write),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(both.contains("custody on ops-1 is named at both"), "{both}");
+    // Read on one role and write on another is not both.
+    assert!(access_group(
+        &h,
+        vec![
+            on_role("ops-1", "custody", AccessLevel::Read),
+            on_role("ops-1", "operations", AccessLevel::Write),
+        ],
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn an_entry_that_no_longer_matches_is_kept_as_written_never_refused_for_being_there() {
+    let h = harness("dashboard-1");
+    two_roles_and_none(&h);
+    let group = access_group(&h, vec![on_role("ops-1", "custody", AccessLevel::Read)])
+        .await
+        .unwrap();
+    // Relaunched without custody.
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "ops-1".into(),
+            roles: vec!["operations".into()],
+            last_reported_at_ns: 1,
+        })
+        .unwrap();
+    let mut edited = group.clone();
+    edited.name = "Trading desk".into();
+    edited
+        .entries
+        .push(on_role("ops-1", "operations", AccessLevel::Write));
+    let saved: AccessGroup = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(edited),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.entries[0].role, "custody", "kept as the admin wrote it");
+    // A new entry naming the dropped role is refused.
+    let mut again = saved.clone();
+    again
+        .entries
+        .push(on_role("ops-1", "custody", AccessLevel::Admin));
+    let refused: Result<AccessGroup, String> = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(again),
+        },
+    )
+    .await;
+    assert!(refused.unwrap_err().contains("not launched with"));
+}
+
+#[tokio::test]
+async fn the_records_carry_each_known_plugins_roles() {
+    let h = harness("dashboard-1");
+    two_roles_and_none(&h);
+    let known = records(&h).await.known_plugins;
+    let named: Vec<(String, Vec<String>)> = known
+        .into_iter()
+        .map(|plugin| (plugin.plugin_instance_id, plugin.roles))
+        .collect();
+    assert!(named.contains(&("ops-1".into(), vec!["custody".into(), "operations".into()])));
+    assert!(named.contains(&("tool-1".into(), vec![])));
+    assert!(named.contains(&("oms-1".into(), vec!["oms".into()])));
+}
+
+#[tokio::test]
+async fn every_grant_change_is_its_own_record_naming_who_and_when() {
+    let h = harness("dashboard-1");
+    two_roles_and_none(&h);
+    let group = access_group(&h, vec![on_role("ops-1", "custody", AccessLevel::Read)])
+        .await
+        .unwrap();
+    let mut changed = group.clone();
+    changed.entries[0].level = AccessLevel::Write as i32;
+    let _: AccessGroup = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(changed.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    // Saved again unchanged: nothing to record.
+    let _: AccessGroup = ask(
+        &h,
+        DEFINE_ACCESS_GROUP,
+        "meridian.v1.DefineAccessGroupRequest",
+        DefineAccessGroupRequest {
+            access_group: Some(changed),
+        },
+    )
+    .await
+    .unwrap();
+    let people = user_group(&h).await;
+    let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
+    let permission = grant(
+        &h,
+        &people.user_group_id,
+        &growth.account_group_id,
+        &group.access_group_id,
+    )
+    .await
+    .unwrap();
+    let withdrawn: WithdrawPermissionReply = ask(
+        &h,
+        WITHDRAW_PERMISSION,
+        "meridian.v1.WithdrawPermissionRequest",
+        WithdrawPermissionRequest {
+            permission_id: permission.permission_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(withdrawn.withdrawn);
+
+    let records = h.store.access_changes(&group.access_group_id).unwrap();
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    use crate::AccessChangeKind::*;
+    assert_eq!(kinds, [Defined, Changed, Granted, Withdrawn]);
+    assert!(records.iter().all(|record| record.by == ADA));
+    assert!(records
+        .iter()
+        .all(|record| record.at_ns == 1_790_380_800_000_000_000));
+    assert_eq!(records[0].was, "");
+    assert_eq!(records[0].became, "\"Trading\": ops-1 custody read");
+    assert_eq!(records[1].was, "\"Trading\": ops-1 custody read");
+    assert_eq!(records[1].became, "\"Trading\": ops-1 custody write");
+    assert_eq!(records[2].permission_id, permission.permission_id);
+    assert!(records[2].became.contains(&growth.account_group_id));
+    assert!(records[3].was.contains(&people.user_group_id) && records[3].became.is_empty());
 }

@@ -479,7 +479,7 @@ async fn only_the_two_ticket_topics_are_sent_for_a_person_below_admin() {
                 || topic.starts_with("platform.config.query.")
         })
     {
-        let vouched = sidecar.vouched_for_configuration(topic, Some(&viewing), now());
+        let vouched = sidecar.vouched_for_configuration(topic, "", Some(&viewing), now());
         if topic == FILE_TICKET || topic == FILED_TICKETS {
             assert!(vouched.is_ok(), "{topic}");
         } else {
@@ -492,7 +492,7 @@ async fn only_the_two_ticket_topics_are_sent_for_a_person_below_admin() {
         }
         assert_eq!(
             sidecar
-                .vouched_for_configuration(topic, None, now())
+                .vouched_for_configuration(topic, "", None, now())
                 .unwrap_err()
                 .code(),
             Code::PermissionDenied,

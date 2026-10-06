@@ -13,8 +13,9 @@
 //! could forget to mount or edit to disagree.
 //!
 //! People are not here. What a person may do through a plugin is their access
-//! groups', at read or write (W6.7, decisions/026), and grants nothing on the
-//! bus.
+//! groups', at a level on each of its roles (W6.7, decisions/026, 033), and
+//! grants nothing on the bus: the sidecar admits a person's command by the
+//! role whose grants hold its topic ([`Contract::roles_granting`]).
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -206,6 +207,18 @@ impl Contract {
     pub fn component(&self, name: &str) -> Grants {
         self.named(&[name])
     }
+
+    /// Which of a plugin's `roles` hold `topic` to publish among their
+    /// generated grants (decisions/033, point 3; W4.9): the roles a command
+    /// sent for a person is admitted by, as the plugin names none. A row
+    /// several roles hold returns each of them, in the plugin's order.
+    pub fn roles_granting(&self, roles: &[String], topic: &str) -> Vec<String> {
+        roles
+            .iter()
+            .filter(|role| self.named(&[role.as_str()]).may_publish(topic))
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +307,34 @@ platform.config.query.plugin-configuration\tquery\tsidecar\tconductor
             !Contract::embedded().is_role("admin"),
             "decisions/020: admin is no role"
         );
+    }
+
+    #[test]
+    fn the_roles_granting_a_topic_are_each_role_holding_it() {
+        const TWO: &str = "\
+topic\tkind\tpublisher\tsubscriber
+platform.street.command.record-holding\tcommand\tcustody\tstreet
+platform.book.command.record-break\tcommand\toperations\tbook
+platform.config.command.file-ticket\tcommand\tcustody,operations\tdashboard
+";
+        let contract = Contract::parse(TWO, "name\tkind\ncustody\trole\noperations\trole\n").unwrap();
+        let both = roles(&["custody", "operations"]);
+        assert_eq!(
+            contract.roles_granting(&both, "platform.street.command.record-holding"),
+            ["custody"]
+        );
+        assert_eq!(
+            contract.roles_granting(&both, "platform.book.command.record-break"),
+            ["operations"]
+        );
+        assert_eq!(
+            contract.roles_granting(&both, "platform.config.command.file-ticket"),
+            ["custody", "operations"],
+            "a row two roles hold returns both"
+        );
+        assert!(contract
+            .roles_granting(&roles(&["custody"]), "platform.book.command.record-break")
+            .is_empty());
     }
 
     #[test]

@@ -119,8 +119,16 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// status and the read; each sync status the street keeps, heard and read
 /// by an operations plugin; and the book's cause for income the custodian
 /// reinvested, and a cause's link to the activity that explains it. A plugin
-/// built before reports and reads no activity.
-pub const CONTRACT_CURRENT: u32 = 14;
+/// built before reports and reads no activity. v15 is a person's access
+/// granted per role of a plugin (spec/access-is-granted-per-role-within-a-
+/// plugin, decisions/033; sdk-contract/access-is-granted-per-role): each
+/// role's level and accounts in the claims, the roles a page, tool and
+/// setting serves at registration and in the report ([`crate::roles`]), the
+/// access table per role, and a person's command admitted by the role whose
+/// grants hold it. A plugin built before names no role on its declarations,
+/// which on a plugin holding several serve every role, and reads the claims'
+/// level and account sets, the union over the roles.
+pub const CONTRACT_CURRENT: u32 = 15;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -368,7 +376,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v14); rebuild it against v2 or later"
+                 (v2 through v15); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -377,11 +385,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v15"),
+            admit("v16"),
             Err(
-                "the plugin was built against contract v15, newer than this sidecar \
-                 (v2 through v14); upgrade the runtime, or rebuild the plugin against \
-                 v14 or earlier"
+                "the plugin was built against contract v16, newer than this sidecar \
+                 (v2 through v15); upgrade the runtime, or rebuild the plugin against \
+                 v15 or earlier"
                     .into()
             )
         );
@@ -392,7 +400,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v14"
+                "the plugin declared no contract version; this sidecar accepts v2 through v15"
                     .into()
             )
         );

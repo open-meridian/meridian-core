@@ -97,7 +97,157 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0012_a_secret_settings_earlier_values_redacted.sql"),
         then: Some(secret_settings_redacted),
     },
+    Migration {
+        version: 13,
+        name: "access_is_granted_per_role",
+        sql: include_str!("../migrations/0013_access_is_granted_per_role.sql"),
+        then: Some(access_per_role),
+    },
 ];
+
+/// Migration 13 (contract v15): each access group's gap record, then the
+/// one-time rewrite of the entries naming no role, each group it rewrote its
+/// own record, all at `at_ns`, the moment it ran.
+fn access_per_role(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    access_not_known_before(tx, at_ns)?;
+    rewrite_entries_to_name_their_role(tx, at_ns)?;
+    Ok(())
+}
+
+/// One gap record per access group (decisions/031, point 4): its history --
+/// its entries, and the permissions to it -- is not known before `at_ns`. A
+/// group given one already is left as it is.
+fn access_not_known_before(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO config_access_change (access_group_id, kind, changed_at_ns, note)
+         SELECT access_group_id, 6, $1::bigint, $2::text
+           FROM config_access_group grp
+          WHERE NOT EXISTS (SELECT 1 FROM config_access_change gap
+                             WHERE gap.access_group_id = grp.access_group_id AND gap.kind = 6)
+          ORDER BY access_group_id",
+        &[&at_ns, &crate::store::ACCESS_NOT_KNOWN_BEFORE],
+    )
+    .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+    Ok(())
+}
+
+/// The one-time rewrite (W6.7; the spec's requirement 27, the plan's Q3):
+/// every entry naming no role whose plugin holds exactly one -- as its
+/// sidecar last reported, or where none has, as its latest launch said --
+/// is rewritten to name it, and each access group rewritten is recorded,
+/// what it was and what it became, by no person. Only entries naming no role
+/// are read, so it is idempotent: run again, it changes nothing. Returns the
+/// groups it rewrote.
+pub fn rewrite_entries_to_name_their_role(
+    tx: &mut Transaction<'_>,
+    at_ns: i64,
+) -> Result<Vec<String>> {
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    let reported: std::collections::BTreeMap<String, Vec<String>> = tx
+        .query("SELECT plugin_instance_id, roles FROM config_known_plugin", &[])
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let launched: std::collections::BTreeMap<String, Vec<String>> = tx
+        .query(
+            "SELECT DISTINCT ON (instance_id) instance_id, roles FROM config_plugin_launch
+              ORDER BY instance_id, launch_id DESC",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let groups: Vec<String> = tx
+        .query(
+            "SELECT DISTINCT access_group_id FROM config_access_entry WHERE role = ''
+              ORDER BY access_group_id",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut rewritten = Vec::new();
+    for group in groups {
+        let entries: Vec<(i32, String, i16, String)> = tx
+            .query(
+                "SELECT position, plugin_instance_id, level, role FROM config_access_entry
+                  WHERE access_group_id = $1 ORDER BY position",
+                &[&group],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let name: String = tx
+            .query_one(
+                "SELECT name FROM config_access_group WHERE access_group_id = $1",
+                &[&group],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        let as_group = |entries: &[(i32, String, i16, String)]| meridian_domain::v1::AccessGroup {
+            access_group_id: group.clone(),
+            name: name.clone(),
+            entries: entries
+                .iter()
+                .map(|(_, plugin, level, role)| meridian_domain::v1::AccessEntry {
+                    plugin_instance_id: plugin.clone(),
+                    level: i32::from(*level),
+                    role: role.clone(),
+                })
+                .collect(),
+            built_in: false,
+        };
+        let was = as_group(&entries);
+        let mut became = entries.clone();
+        let mut changed = false;
+        for (position, plugin, _, role) in &mut became {
+            if !role.is_empty() {
+                continue;
+            }
+            let Some(one) = crate::store::the_one_role(
+                reported.get(plugin.as_str()).map(Vec::as_slice),
+                launched.get(plugin.as_str()).map(Vec::as_slice),
+            ) else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE config_access_entry SET role = $3
+                  WHERE access_group_id = $1 AND position = $2 AND role = ''",
+                &[&group, &*position, &one],
+            )
+            .map_err(unavailable)?;
+            *role = one.to_string();
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        let record = crate::store::AccessChangeRecord {
+            access_group_id: group.clone(),
+            kind: crate::store::AccessChangeKind::Rewritten,
+            was: crate::store::described_group(&was),
+            became: crate::store::described_group(&as_group(&became)),
+            permission_id: String::new(),
+            by: String::new(),
+            delegation: String::new(),
+            at_ns,
+            note: crate::store::REWRITTEN_TO_NAME_ITS_ROLE.to_string(),
+        };
+        crate::postgres::insert_access_change(tx, &record)?;
+        tracing::info!(
+            access_group = group,
+            was = record.was,
+            became = record.became,
+            "access group rewritten to name each entry's role (contract v15)"
+        );
+        rewritten.push(group);
+    }
+    Ok(rewritten)
+}
 
 /// Migration 12's redactions: each setting declared secret now, or held
 /// sealed, whose earlier change records still hold a value.

@@ -227,6 +227,7 @@ mod tests {
                 path: path.to_string(),
                 title: title.to_string(),
                 levels: vec![],
+                roles: vec![],
             };
             wire::put(&mut interface, ADMIN_PAGES, &page.encode_to_vec());
         }

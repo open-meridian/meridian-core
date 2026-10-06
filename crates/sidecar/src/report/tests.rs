@@ -143,7 +143,17 @@ async fn what_the_plugin_declared_is_reported_and_nothing_once_it_leaves() {
         .unwrap()
         .into_inner();
     assert!(reply.admitted, "{}", reply.refusal_reason);
-    assert_eq!(sidecar.report(2).declared_settings, declared);
+    // Each as declared, with the role it serves filled on a plugin holding
+    // one (contract v15).
+    let served: Vec<SettingDeclaration> = declared
+        .iter()
+        .cloned()
+        .map(|setting| SettingDeclaration {
+            roles: sidecar.registration().unwrap().roles,
+            ..setting
+        })
+        .collect();
+    assert_eq!(sidecar.report(2).declared_settings, served);
 
     sidecar
         .leave(Request::new(LeaveRequest {

@@ -1395,11 +1395,13 @@ async fn the_report_carries_the_interface_the_plugin_declared() {
                 path: "/admin/connections".into(),
                 title: "Connections".into(),
                 levels: vec![AccessLevel::Admin as i32],
+                roles: vec![],
             },
             PageDeclaration {
                 path: "/statements".into(),
                 title: "Statements".into(),
                 levels: vec![AccessLevel::Write as i32, AccessLevel::Read as i32],
+                roles: vec![],
             },
         ],
     };
@@ -1411,7 +1413,12 @@ async fn the_report_carries_the_interface_the_plugin_declared() {
         }))
         .await
         .unwrap();
-    assert_eq!(sidecar.report(0).declared_interface, Some(declared));
+    // Each page with the role it serves filled, on a plugin holding one.
+    let mut served = declared.clone();
+    for page in &mut served.pages {
+        page.roles = vec!["custody".into()];
+    }
+    assert_eq!(sidecar.report(0).declared_interface, Some(served));
     sidecar
         .leave(Request::new(meridian_pb::v1::LeaveRequest::default()))
         .await
@@ -1511,6 +1518,7 @@ async fn a_page_serving_no_level_is_refused_at_registration_naming_it() {
                         path: "/statements".into(),
                         title: "Statements".into(),
                         levels,
+                        roles: vec![],
                     }],
                 }),
                 ..Default::default()
@@ -1990,5 +1998,288 @@ async fn a_command_the_book_could_not_check_is_unavailable_to_try_again() {
     assert_eq!(
         refused.message(),
         "the instrument store did not answer; try again"
+    );
+}
+
+// ── By the role holding the act (contract v15, decisions/033; W4.9) ───────
+
+/// A sidecar for a plugin holding `roles`, the dashboard's key in hand, its
+/// street store keeping what it records, and its conductor taking a link.
+async fn holding_roles(
+    roles: &[&str],
+    version: &str,
+) -> (Sidecar, SigningKey, Arc<Mutex<Vec<RecordHoldingRequest>>>, Heard) {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier = Arc::new(Verifier::holding(
+        "snaptrade-1",
+        KEY_ID,
+        key.verifying_key(),
+    ));
+    let (sidecar, bus, recorded) = registered_at(roles, Some(verifier), version).await;
+    let heard: Heard = Arc::default();
+    let keeping = Arc::clone(&heard);
+    bus.serve(LINK, move |envelope| {
+        let request = LinkExternalAccountRequest::decode(&envelope.payload[..]).unwrap();
+        let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+        keeping.lock().unwrap().push((request.clone(), by));
+        Ok((
+            "meridian.v1.ExternalAccountLink".into(),
+            ExternalAccountLink {
+                plugin_instance_id: request.plugin_instance_id,
+                external_account_id: request.external_account_id,
+                account_id: request.account_id,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    sidecar
+        .report_external_accounts(Request::new(ReportExternalAccountsParams {
+            accounts: vec![ExternalAccount {
+                external_account_id: "ext-new".into(),
+                ..Default::default()
+            }],
+        }))
+        .await
+        .expect("reported");
+    (sidecar, key, recorded, heard)
+}
+
+/// What the dashboard signs from v15: the session's level and account sets,
+/// the union, and each role's level and accounts as positions in the read
+/// set.
+fn by_role(
+    key: &SigningKey,
+    level: AccessLevel,
+    read: &[&str],
+    write: &[&str],
+    roles: Vec<meridian_pb::v1::RoleAccess>,
+) -> CallerAssertion {
+    let issued = now();
+    let claims = CallerClaims {
+        subject: "local|ada".into(),
+        display_name: "Ada".into(),
+        audience_instance_id: "snaptrade-1".into(),
+        read_account_ids: read.iter().map(|a| a.to_string()).collect(),
+        write_account_ids: write.iter().map(|a| a.to_string()).collect(),
+        issued_at_ns: issued,
+        expires_at_ns: issued + 60_000_000_000,
+        assertion_id: "a-roles".into(),
+        level: level as i32,
+        roles,
+        ..CallerClaims::default()
+    }
+    .encode_to_vec();
+    CallerAssertion {
+        signature: key.sign(&claims).to_bytes().to_vec(),
+        claims,
+        key_id: KEY_ID.into(),
+    }
+}
+
+fn role(name: &str, level: AccessLevel, read: &[u32], write: &[u32]) -> meridian_pb::v1::RoleAccess {
+    meridian_pb::v1::RoleAccess {
+        role: name.into(),
+        level: level as i32,
+        read_positions: read.to_vec(),
+        write_positions: write.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn a_command_is_admitted_by_write_on_the_role_whose_grants_hold_it() {
+    let (sidecar, key, recorded, _) = holding_roles(&["custody", "operations"], "v15").await;
+    // Write on operations, read on custody: the holding is custody's.
+    let operations_writer = by_role(
+        &key,
+        AccessLevel::Write,
+        &["ACC-1"],
+        &["ACC-1"],
+        vec![
+            role("custody", AccessLevel::Read, &[0], &[]),
+            role("operations", AccessLevel::Write, &[0], &[0]),
+        ],
+    );
+    let refused = sidecar
+        .record_holding(Request::new(for_person("ext-1", operations_writer)))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert_eq!(
+        refused.message(),
+        "RecordHolding is custody's, and Ada holds read on custody"
+    );
+    assert!(recorded.lock().unwrap().is_empty(), "nothing reached the street");
+
+    // Write on custody: admitted.
+    let custody_writer = by_role(
+        &key,
+        AccessLevel::Write,
+        &["ACC-1"],
+        &["ACC-1"],
+        vec![
+            role("custody", AccessLevel::Write, &[0], &[0]),
+            role("operations", AccessLevel::Read, &[0], &[]),
+        ],
+    );
+    sidecar
+        .record_holding(Request::new(for_person("ext-1", custody_writer)))
+        .await
+        .expect("admitted on custody");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    // Write on custody, but not on the account the row is for.
+    let elsewhere = by_role(
+        &key,
+        AccessLevel::Write,
+        &["ACC-1", "ACC-3"],
+        &["ACC-1", "ACC-3"],
+        vec![role("custody", AccessLevel::Write, &[1], &[1])],
+    );
+    let refused = sidecar
+        .record_holding(Request::new(for_person("ext-1", elsewhere)))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.message().contains("write on custody without account ACC-1"),
+        "{}",
+        refused.message()
+    );
+
+    // Nothing on custody at all.
+    let none = by_role(
+        &key,
+        AccessLevel::Write,
+        &["ACC-1"],
+        &["ACC-1"],
+        vec![role("operations", AccessLevel::Write, &[0], &[0])],
+    );
+    let refused = sidecar
+        .record_holding(Request::new(for_person("ext-1", none)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "RecordHolding is custody's, and Ada holds nothing on custody"
+    );
+}
+
+#[tokio::test]
+async fn claims_with_no_per_role_entry_are_today_s_on_one_role_and_refused_on_two() {
+    // A dashboard older than the sidecar signs no roles.
+    let (one, key, recorded, _) = holding_roles(&["custody"], "v14").await;
+    one.record_holding(Request::new(for_person("ext-1", assertion(&key, writing(&["ACC-1"])))))
+        .await
+        .expect("one role: the claims' sets are that role's");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    let (two, key, recorded, _) = holding_roles(&["custody", "operations"], "v14").await;
+    let refused = two
+        .record_holding(Request::new(for_person("ext-1", assertion(&key, writing(&["ACC-1"])))))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("carry no level per role"),
+        "{}",
+        refused.message()
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_link_is_admitted_by_admin_on_the_role_holding_it_and_refused_naming_it() {
+    let (sidecar, key, _, heard) = holding_roles(&["custody", "operations"], "v15").await;
+    let operations_admin = by_role(
+        &key,
+        AccessLevel::Admin,
+        &[],
+        &[],
+        vec![role("operations", AccessLevel::Admin, &[], &[])],
+    );
+    let refused = sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(operations_admin))))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert_eq!(
+        refused.message(),
+        "LinkExternalAccount is custody's, and Ada holds nothing on custody"
+    );
+    assert!(heard.lock().unwrap().is_empty());
+
+    let custody_admin = by_role(
+        &key,
+        AccessLevel::Admin,
+        &[],
+        &[],
+        vec![role("custody", AccessLevel::Admin, &[], &[])],
+    );
+    sidecar
+        .link_external_account(Request::new(link("ext-new", "ACC-1", "", Some(custody_admin))))
+        .await
+        .expect("an admin of custody links");
+    assert_eq!(heard.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_role_less_page_on_two_roles_is_refused_from_v15_and_serves_both_from_before() {
+    let page = |roles: Vec<String>| InterfaceDeclaration {
+        loopback_port: 8000,
+        title: "Ops".into(),
+        pages: vec![PageDeclaration {
+            path: "/balances".into(),
+            title: "Balances".into(),
+            levels: vec![AccessLevel::Write as i32],
+            roles,
+        }],
+    };
+    let sidecar = |version: &str| {
+        let _ = version;
+        Sidecar::under(
+            &contract(),
+            Arc::new(Bus::single(
+                "ops-1",
+                Arc::new(MemoryBackend::new()),
+                Arc::new(meridian_clock::SystemClock),
+            )),
+            "DEP-test",
+            Identity::new("ops-1", vec!["custody".into(), "operations".into()]),
+        )
+    };
+    async fn register(
+        sc: &Sidecar,
+        version: &str,
+        interface: InterfaceDeclaration,
+    ) -> Result<tonic::Response<meridian_pb::v1::RegisterReply>, tonic::Status> {
+        sc.register(Request::new(RegisterRequest {
+            schema_version: version.into(),
+            interface: Some(interface),
+            ..Default::default()
+        }))
+        .await
+    }
+    let at_v15 = sidecar("v15");
+    let reply = register(&at_v15, "v15", page(vec![])).await.unwrap().into_inner();
+    assert!(!reply.admitted);
+    assert!(
+        reply.refusal_reason.contains("/balances") && reply.refusal_reason.contains("names no role"),
+        "{}",
+        reply.refusal_reason
+    );
+    let stranger = sidecar("v15");
+    let reply = register(&stranger, "v15", page(vec!["oms".into()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reply.admitted);
+    assert!(reply.refusal_reason.contains("oms"), "{}", reply.refusal_reason);
+
+    let at_v14 = sidecar("v14");
+    let reply = register(&at_v14, "v14", page(vec![])).await.unwrap().into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    assert_eq!(
+        at_v14.registration().unwrap().interface.unwrap().pages[0].roles,
+        ["custody", "operations"],
+        "built before v15, it serves every role"
     );
 }

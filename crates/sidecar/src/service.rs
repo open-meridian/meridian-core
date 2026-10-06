@@ -112,6 +112,11 @@ pub struct Sidecar {
     /// so there is no moment when a plugin could register unenforced.
     grants: Result<Grants, String>,
 
+    /// The contract the grants came from, kept to ask which of the plugin's
+    /// roles hold a topic: what a command sent for a person is admitted by
+    /// (W4.9, contract v15).
+    pub(crate) contract: Contract,
+
     state: Arc<RwLock<Option<Registration>>>,
 
     /// The plugin's configuration -- settings, links and account scope -- as
@@ -193,6 +198,7 @@ impl Sidecar {
             deployment_id: deployment_id.into(),
             identity,
             grants,
+            contract: contract.clone(),
             state: Arc::new(RwLock::new(None)),
             configuration,
             refusals: Arc::default(),
@@ -324,6 +330,41 @@ impl SidecarService for Sidecar {
             }));
         }
 
+        // And the roles each page and setting serves (contract v15,
+        // [`crate::roles`]): one the plugin was not launched with refuses the
+        // registration naming it, as a page naming no level does; filled
+        // where it names none and may, so the report carries them.
+        let built_at = crate::contract::declared(&req.schema_version);
+        let launched = &self.identity.roles;
+        let mut interface = req.interface.clone();
+        if let Some(declared) = interface.as_mut() {
+            for page in &mut declared.pages {
+                match crate::roles::served(&page.roles, launched, built_at) {
+                    Ok(roles) => page.roles = roles,
+                    Err(why) => {
+                        return Ok(Response::new(RegisterReply {
+                            admitted: false,
+                            refusal_reason: format!("the page {} ({}) {why}", page.path, page.title),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+        }
+        let mut settings = req.settings.clone();
+        for setting in &mut settings {
+            match crate::roles::served(&setting.roles, launched, built_at) {
+                Ok(roles) => setting.roles = roles,
+                Err(why) => {
+                    return Ok(Response::new(RegisterReply {
+                        admitted: false,
+                        refusal_reason: format!("the setting {} {why}", setting.name),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+
         // A table setting's columns (contract v14, W4.8): at least one, each
         // named once and never as a stamp the conductor adds, a choice with
         // its options, and the table never secret. Refused naming it.
@@ -358,7 +399,12 @@ impl SidecarService for Sidecar {
         // Its tools (contract v12), each checked and refused alone: a tool
         // that fails names itself in the report and never stops the plugin
         // registering (W4.1).
-        let (tools, tool_refusals) = crate::tools::checked(&req.tools, &self.identity.instance_id);
+        let (tools, tool_refusals) = crate::tools::checked(
+            &req.tools,
+            &self.identity.instance_id,
+            &self.identity.roles,
+            built_at,
+        );
         for refusal in &tool_refusals {
             tracing::warn!(instance = self.identity.instance_id, "{refusal}");
         }
@@ -385,8 +431,8 @@ impl SidecarService for Sidecar {
             interface_port,
             health_detail: String::new(),
             contract_version: req.schema_version.clone(),
-            settings: req.settings.clone(),
-            interface: req.interface.clone(),
+            settings,
+            interface,
             figures: Vec::new(),
             declaration: req.declaration.clone(),
             not_carried_seen: Vec::new(),
@@ -721,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v15"] {
+        for declared in ["v1", "v16"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -730,7 +776,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v14"));
+            assert!(reply.refusal_reason.contains("v2 through v15"));
             assert!(sc.registration().is_none());
         }
     }

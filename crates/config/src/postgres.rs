@@ -24,9 +24,10 @@ use prost::Message;
 
 use crate::migrations;
 use crate::store::{
-    redeclared, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result, SettingChange,
-    SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
-    REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
+    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
+    StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -151,7 +152,7 @@ impl Store for PostgresStore {
 
         let entries = tx
             .query(
-                "SELECT access_group_id, plugin_instance_id, level FROM config_access_entry
+                "SELECT access_group_id, plugin_instance_id, level, role FROM config_access_entry
                   ORDER BY access_group_id, position",
                 &[],
             )
@@ -171,6 +172,7 @@ impl Store for PostgresStore {
                 .map(|entry| AccessEntry {
                     plugin_instance_id: entry.get(1),
                     level: i32::from(entry.get::<_, i16>(2)),
+                    role: entry.get(3),
                 })
                 .collect();
             records.access_groups.push(AccessGroup {
@@ -243,6 +245,9 @@ impl Store for PostgresStore {
                 last_reported_at_ns: row.get(2),
             });
         }
+        // Each known plugin's roles on the records, so access is folded per
+        // plugin and role wherever it is evaluated (W6.1, contract v15).
+        snapshot.records.known_plugins = known_plugins(&snapshot.plugins);
 
         for row in tx
             .query(
@@ -429,9 +434,12 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn put_access_group(&self, group: &AccessGroup) -> Result<()> {
+    fn put_access_group(&self, group: &AccessGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // The group as it stood, read in the transaction that replaces it, so
+        // its record says what it was.
+        let before = read_access_group(&mut tx, &group.access_group_id)?;
         tx.execute(
             "INSERT INTO config_access_group (access_group_id, name, built_in)
              VALUES ($1, $2, $3)
@@ -447,16 +455,20 @@ impl Store for PostgresStore {
         for (position, entry) in group.entries.iter().enumerate() {
             tx.execute(
                 "INSERT INTO config_access_entry
-                        (access_group_id, position, plugin_instance_id, level)
-                 VALUES ($1, $2, $3, $4)",
+                        (access_group_id, position, plugin_instance_id, level, role)
+                 VALUES ($1, $2, $3, $4, $5)",
                 &[
                     &group.access_group_id,
                     &(position as i32),
                     &entry.plugin_instance_id,
                     &(entry.level as i16),
+                    &entry.role,
                 ],
             )
             .map_err(unavailable)?;
+        }
+        if let Some(record) = group_change(before.as_ref(), group, author, at_ns) {
+            insert_access_change(&mut tx, &record)?;
         }
         tx.commit().map_err(unavailable)
     }
@@ -529,12 +541,20 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn add_permission(&self, permission: &Permission) -> Result<()> {
+    fn add_permission(&self, permission: &Permission, author: &Author, at_ns: i64) -> Result<()> {
         let mut conn = self.conn()?;
-        insert_permission(&mut *conn, permission)
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        insert_permission(&mut tx, permission)?;
+        insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
+        tx.commit().map_err(unavailable)
     }
 
-    fn withdraw_permission(&self, permission_id: &str) -> Result<Withdrawal> {
+    fn withdraw_permission(
+        &self,
+        permission_id: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Withdrawal> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute("LOCK TABLE config_permission IN SHARE ROW EXCLUSIVE MODE")
@@ -542,7 +562,8 @@ impl Store for PostgresStore {
 
         let Some(row) = tx
             .query_opt(
-                "SELECT access_group_id FROM config_permission WHERE permission_id = $1",
+                "SELECT access_group_id, user_group_id, account_group_id FROM config_permission
+                  WHERE permission_id = $1",
                 &[&permission_id],
             )
             .map_err(unavailable)?
@@ -550,6 +571,12 @@ impl Store for PostgresStore {
             return Ok(Withdrawal::Unknown);
         };
         let access_group: String = row.get(0);
+        let withdrawn = Permission {
+            permission_id: permission_id.to_string(),
+            user_group_id: row.get(1),
+            account_group_id: row.get::<_, Option<String>>(2).unwrap_or_default(),
+            access_group_id: access_group.clone(),
+        };
         if access_group == DEPLOYMENT_ADMIN {
             let admins: i64 = tx
                 .query_one(
@@ -567,11 +594,18 @@ impl Store for PostgresStore {
             &[&permission_id],
         )
         .map_err(unavailable)?;
+        insert_access_change(&mut tx, &permission_change(&withdrawn, false, author, at_ns))?;
         tx.commit().map_err(unavailable)?;
         Ok(Withdrawal::Withdrawn)
     }
 
-    fn install_first_admin(&self, group: &UserGroup, permissions: &[Permission]) -> Result<bool> {
+    fn install_first_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute("LOCK TABLE config_permission IN SHARE ROW EXCLUSIVE MODE")
@@ -599,9 +633,42 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         for permission in permissions {
             insert_permission(&mut tx, permission)?;
+            insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
         }
         tx.commit().map_err(unavailable)?;
         Ok(true)
+    }
+
+    fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT access_group_id, kind, was, became, permission_id, changed_by,
+                        through_delegation, changed_at_ns, note
+                   FROM config_access_change
+                  WHERE access_group_id = $1
+                  ORDER BY change_id",
+                &[&access_group_id],
+            )
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let code: i16 = row.get(1);
+                Ok(AccessChangeRecord {
+                    access_group_id: row.get(0),
+                    kind: AccessChangeKind::from_code(code).ok_or_else(|| {
+                        StoreError::Unavailable(format!("an access change of kind {code}"))
+                    })?,
+                    was: row.get(2),
+                    became: row.get(3),
+                    permission_id: row.get(4),
+                    by: row.get(5),
+                    delegation: row.get(6),
+                    at_ns: row.get(7),
+                    note: row.get(8),
+                })
+            })
+            .collect()
     }
 
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()> {
@@ -950,6 +1017,70 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         failure: row.get(10),
         live: row.get(11),
     }
+}
+
+/// One access group as it stands, its entries in order; None when there is
+/// none by that identifier.
+fn read_access_group(
+    client: &mut impl postgres::GenericClient,
+    access_group_id: &str,
+) -> Result<Option<AccessGroup>> {
+    let Some(group) = client
+        .query_opt(
+            "SELECT name, built_in FROM config_access_group WHERE access_group_id = $1",
+            &[&access_group_id],
+        )
+        .map_err(unavailable)?
+    else {
+        return Ok(None);
+    };
+    let entries = client
+        .query(
+            "SELECT plugin_instance_id, level, role FROM config_access_entry
+              WHERE access_group_id = $1 ORDER BY position",
+            &[&access_group_id],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|entry| AccessEntry {
+            plugin_instance_id: entry.get(0),
+            level: i32::from(entry.get::<_, i16>(1)),
+            role: entry.get(2),
+        })
+        .collect();
+    Ok(Some(AccessGroup {
+        access_group_id: access_group_id.to_string(),
+        name: group.get(0),
+        entries,
+        built_in: group.get(1),
+    }))
+}
+
+/// One access change's own record (decisions/031).
+pub(crate) fn insert_access_change(
+    client: &mut impl postgres::GenericClient,
+    record: &AccessChangeRecord,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO config_access_change
+                    (access_group_id, kind, was, became, permission_id, changed_by,
+                     through_delegation, changed_at_ns, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &record.access_group_id,
+                &record.kind.code(),
+                &record.was,
+                &record.became,
+                &record.permission_id,
+                &record.by,
+                &record.delegation,
+                &record.at_ns,
+                &record.note,
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
 }
 
 fn insert_permission(

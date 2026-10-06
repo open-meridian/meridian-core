@@ -4,8 +4,9 @@
 //! it is a deployment admin at a form, and "invalid request" tells them
 //! nothing. Refusals are the spec's: deployment admin, All plugins (admin)
 //! and All accounts are built in; an access entry names a plugin that has
-//! reported and a level, `read`, `write` or `admin`, and no tag (decisions/026,
-//! 027), and a group names a plugin at `admin` and at one data level at most;
+//! reported, one role it holds (none on a plugin holding none) and a level,
+//! `read`, `write` or `admin`, and no tag (decisions/026, 027, 033), and a
+//! group names a plugin and role at `admin` and at one data level at most;
 //! a permission to a built-in access group, or to one granting only `admin`,
 //! names no account group, and every other names one (W6.8); a setting is one
 //! its plugin declared, in a form its declared type reads.
@@ -15,7 +16,7 @@ use std::collections::BTreeSet;
 use meridian_access::{is_built_in_access_group, AccessLevel, ALL_ACCOUNTS};
 use meridian_domain::setting_table;
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
+    AccessEntry, AccessGroup, AccountGroup, AccountState, DefineAccountRequest, GrantPermissionRequest,
     LinkExternalAccountRequest, SetPluginSettingsRequest, UserGroup,
 };
 use meridian_pb::bounds::{
@@ -277,17 +278,28 @@ pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
             "access group",
         )?;
     }
+    // What the group holds now: an entry kept exactly as it was written is
+    // kept, even where it no longer matches its plugin's roles -- it holds
+    // nothing and is flagged on the Access tab, never refused for being
+    // there (W6.7; the plan's Q4).
+    let standing: Vec<&AccessEntry> = snapshot
+        .records
+        .access_groups
+        .iter()
+        .filter(|g| g.access_group_id == group.access_group_id && !group.access_group_id.is_empty())
+        .flat_map(|g| g.entries.iter())
+        .collect();
     for entry in &group.entries {
-        if !snapshot
+        let Some(plugin) = snapshot
             .plugins
             .iter()
-            .any(|p| p.plugin_instance_id == entry.plugin_instance_id)
-        {
+            .find(|p| p.plugin_instance_id == entry.plugin_instance_id)
+        else {
             return Err(format!(
                 "no plugin {} has reported, so the deployment does not know it",
                 entry.plugin_instance_id
             ));
-        }
+        };
         let known = [
             AccessLevel::Read as i32,
             AccessLevel::Write as i32,
@@ -299,25 +311,26 @@ pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
                 entry.plugin_instance_id
             ));
         }
+        if !standing.contains(&entry) {
+            entry_names_a_role_it_holds(entry, &plugin.roles)?;
+        }
     }
-    // A plugin at `admin` and at one data level at most: write already
-    // includes read, and one level twice says nothing more (W6.7).
+    // A plugin and role at `admin` and at one data level at most: write
+    // already includes read, and one level twice says nothing more (W6.7).
     for (at, entry) in group.entries.iter().enumerate() {
         for earlier in &group.entries[..at] {
-            if earlier.plugin_instance_id != entry.plugin_instance_id {
+            if earlier.plugin_instance_id != entry.plugin_instance_id || earlier.role != entry.role
+            {
                 continue;
             }
+            let named = named_on(entry);
             if earlier.level == entry.level {
-                return Err(format!(
-                    "{} is named twice at one level",
-                    entry.plugin_instance_id
-                ));
+                return Err(format!("{named} is named twice at one level"));
             }
             let data = |level: i32| level != AccessLevel::Admin as i32;
             if data(earlier.level) && data(entry.level) {
                 return Err(format!(
-                    "{} is named at both read and write; write already includes read",
-                    entry.plugin_instance_id
+                    "{named} is named at both read and write; write already includes read"
                 ));
             }
         }
@@ -338,6 +351,48 @@ pub fn access_group(snapshot: &Snapshot, group: &AccessGroup) -> Verdict {
         }
     }
     Ok(())
+}
+
+/// A plugin, and the role an entry names on it where it names one, as a
+/// refusal says it.
+fn named_on(entry: &AccessEntry) -> String {
+    if entry.role.is_empty() {
+        entry.plugin_instance_id.clone()
+    } else {
+        format!("{} on {}", entry.role, entry.plugin_instance_id)
+    }
+}
+
+/// An entry names one role its plugin holds, as its sidecar last reported,
+/// or none on a plugin holding none (W6.7; decisions/033, point 1): refused
+/// naming the plugin's roles otherwise -- a role it was not launched with or
+/// a component's name, no role on a plugin holding one, a role on a plugin
+/// holding none.
+fn entry_names_a_role_it_holds(entry: &AccessEntry, roles: &[String]) -> Verdict {
+    let plugin = &entry.plugin_instance_id;
+    let holds = if roles.is_empty() {
+        "it holds no role".to_string()
+    } else {
+        format!("it holds {}", roles.join(", "))
+    };
+    match (entry.role.is_empty(), roles.is_empty()) {
+        (true, true) => Ok(()),
+        (false, true) => Err(format!(
+            "an access entry for {plugin} names the role {}, and {holds}: a plugin holding no \
+             role is granted as a whole, its entries naming none",
+            entry.role
+        )),
+        (true, false) => Err(format!(
+            "an access entry for {plugin} names no role, and {holds}: an entry names one of \
+             its roles"
+        )),
+        (false, false) if roles.contains(&entry.role) => Ok(()),
+        (false, false) => Err(format!(
+            "an access entry for {plugin} names {}, which {plugin} was not launched with: \
+             {holds}",
+            entry.role
+        )),
+    }
 }
 
 /// Whether an access group has a `read` or `write` entry, which a permission
@@ -381,7 +436,7 @@ pub fn names_no_tag(define_access_group: &[u8]) -> Verdict {
     match (read, named) {
         (None, _) => Err("an access group that does not decode".into()),
         (Some(()), true) => Err(
-            "an access entry names a plugin and a level, `read`, `write` or `admin`, and no \
+            "an access entry names a plugin, one of its roles and a level, `read`, `write` or `admin`, and no \
              tag: a plugin declares no tags (decisions/026)"
                 .into(),
         ),

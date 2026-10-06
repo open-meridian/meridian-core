@@ -45,8 +45,9 @@ pub use service::{
     serve, Clock, Upstream,
 };
 pub use store::{
-    ChangeKind, Ending, Held, KnownPlugin, LastChange, SettingChange, SettingChangeRecord,
-    SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
+    AccessChangeKind, AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin,
+    LastChange, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
+    StoredSetting, Withdrawal,
 };
 
 #[cfg(test)]

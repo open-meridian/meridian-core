@@ -135,10 +135,15 @@ fn refused(tool: &ToolDeclaration, instance: &str) -> Option<String> {
 }
 
 /// The tools a plugin declared, split into those admitted and a sentence
-/// for each refused, in its order.
+/// for each refused, in its order. Each admitted tool's roles are those it
+/// serves, filled where it names none and may (contract v15,
+/// [`crate::roles`]); one naming a role the plugin was not launched with, or
+/// none on a plugin holding several from v15, is refused by name.
 pub fn checked(
     declared: &[ToolDeclaration],
     instance: &str,
+    launched: &[String],
+    built_at: u32,
 ) -> (Vec<ToolDeclaration>, Vec<String>) {
     let mut admitted: Vec<ToolDeclaration> = Vec::new();
     let mut refusals = Vec::new();
@@ -154,6 +159,13 @@ pub fn checked(
             refusals.push(why);
             continue;
         }
+        let roles = match crate::roles::served(&tool.roles, launched, built_at) {
+            Ok(roles) => roles,
+            Err(why) => {
+                refusals.push(format!("the tool {} is refused: it {why}", tool.name));
+                continue;
+            }
+        };
         if admitted.iter().any(|held| held.name == tool.name) {
             refusals.push(format!(
                 "the tool {} is refused: it is declared twice",
@@ -171,7 +183,10 @@ pub fn checked(
             ));
             continue;
         }
-        admitted.push(tool.clone());
+        admitted.push(ToolDeclaration {
+            roles,
+            ..tool.clone()
+        });
     }
     (admitted, refusals)
 }
@@ -212,6 +227,7 @@ mod tests {
             reads: false,
             input_schema: r#"{"type":"object"}"#.into(),
             output_schema: String::new(),
+            roles: vec![],
         }
     }
 
@@ -236,7 +252,7 @@ mod tests {
                 ..tool("wordy", "POST", "/w")
             },
         ];
-        let (admitted, refused) = checked(&declared, "operations-1");
+        let (admitted, refused) = checked(&declared, "operations-1", &[], 14);
         assert_eq!(
             admitted.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             ["confirm_opening_balance"]
@@ -250,13 +266,38 @@ mod tests {
     #[test]
     fn a_name_too_long_for_its_instance_is_refused_and_past_200_too() {
         let long = "a".repeat(60);
-        let (_, refused) = checked(&[tool(&long, "POST", "/a")], "operations-sample-1");
+        let (_, refused) = checked(&[tool(&long, "POST", "/a")], "operations-sample-1", &[], 14);
         assert!(refused[0].contains("at most 64"), "{refused:?}");
         let many: Vec<_> = (0..201)
             .map(|n| tool(&format!("t{n}"), "POST", &format!("/t{n}")))
             .collect();
-        let (admitted, refused) = checked(&many, "ops");
+        let (admitted, refused) = checked(&many, "ops", &[], 14);
         assert_eq!((admitted.len(), refused.len()), (200, 1));
+    }
+
+    #[test]
+    fn a_tools_roles_are_filled_or_it_is_refused_by_name() {
+        let both = vec!["custody".to_string(), "operations".to_string()];
+        let declared = vec![
+            ToolDeclaration {
+                roles: vec!["custody".into()],
+                ..tool("record_statement", "POST", "/statement")
+            },
+            tool("role_less", "POST", "/opening"),
+            ToolDeclaration {
+                roles: vec!["oms".into()],
+                ..tool("stranger", "POST", "/order")
+            },
+        ];
+        let (admitted, refused) = checked(&declared, "ops-1", &both, 15);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].roles, ["custody"]);
+        assert!(refused[0].contains("role_less") && refused[0].contains("names no role"));
+        assert!(refused[1].contains("stranger") && refused[1].contains("oms"));
+        let (older, _) = checked(&declared[1..2], "ops-1", &both, 14);
+        assert_eq!(older[0].roles, both, "built before v15: every role");
+        let (one, _) = checked(&declared[1..2], "ops-1", &both[..1], 15);
+        assert_eq!(one[0].roles, ["custody"], "one role fills it");
     }
 
     #[test]

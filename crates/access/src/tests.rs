@@ -36,6 +36,7 @@ fn access_group(id: &str, level: AccessLevel) -> AccessGroup {
         entries: vec![AccessEntry {
             plugin_instance_id: OMS.into(),
             level: level as i32,
+            role: String::new(),
         }],
         built_in: false,
     }
@@ -90,6 +91,7 @@ fn records() -> AccessRecords {
         read_at_ns: 0,
         links: vec![],
         plugin_settings: vec![],
+        known_plugins: vec![],
     }
 }
 
@@ -103,7 +105,7 @@ fn trader() -> Access {
 
 #[test]
 fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
-    let levels = &trader().plugins[OMS].accounts;
+    let levels = &trader().plugins[OMS].union().accounts;
     assert_eq!(levels.write, set(&["ACC-GROWTH"]));
     assert_eq!(levels.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
     assert!(
@@ -114,7 +116,7 @@ fn access_is_combined_permission_by_permission_not_dimension_by_dimension() {
 
 #[test]
 fn write_includes_read() {
-    let levels = &trader().plugins[OMS].accounts;
+    let levels = &trader().plugins[OMS].union().accounts;
     assert!(levels.write.is_subset(&levels.read));
 }
 
@@ -138,7 +140,7 @@ fn a_closed_account_stays_readable_and_is_never_writable() {
     let mut records = records();
     records.accounts[0].state = AccountState::Closed as i32;
     let access = person_access(&records, "someone", &["trading-desk".into()]);
-    let levels = &access.plugins[OMS].accounts;
+    let levels = &access.plugins[OMS].union().accounts;
     assert!(levels.read.contains("ACC-GROWTH"));
     assert!(!levels.write.contains("ACC-GROWTH"));
 }
@@ -298,10 +300,12 @@ fn two_entries_for_one_plugin_come_to_the_higher_level() {
             AccessEntry {
                 plugin_instance_id: OMS.into(),
                 level: AccessLevel::Read as i32,
+                role: String::new(),
             },
             AccessEntry {
                 plugin_instance_id: OMS.into(),
                 level: AccessLevel::Write as i32,
+                role: String::new(),
             },
         ],
         built_in: false,
@@ -326,6 +330,7 @@ fn entry(plugin: &str, level: AccessLevel) -> AccessEntry {
     AccessEntry {
         plugin_instance_id: plugin.into(),
         level: level as i32,
+        role: String::new(),
     }
 }
 
@@ -472,4 +477,239 @@ fn a_level_is_named_by_its_button_or_its_name() {
     }
     assert_eq!(parse_level("owner"), None);
     assert_eq!(parse_level(""), None);
+}
+
+// ── Per role of a plugin (contract v15, decisions/033) ───────────────────
+
+const OPS: &str = "ops-1";
+
+fn role_entry(plugin: &str, role: &str, level: AccessLevel) -> AccessEntry {
+    AccessEntry {
+        plugin_instance_id: plugin.into(),
+        level: level as i32,
+        role: role.into(),
+    }
+}
+
+fn known(records: &mut AccessRecords, plugin: &str, roles: &[&str]) {
+    records
+        .known_plugins
+        .push(meridian_domain::v1::KnownPluginRoles {
+            plugin_instance_id: plugin.into(),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+        });
+}
+
+/// A plugin holding custody and operations; the traders hold write on
+/// Growth for operations and read on Income for custody.
+fn two_roles() -> AccessRecords {
+    let mut records = records();
+    known(&mut records, OPS, &["custody", "operations"]);
+    known(&mut records, OMS, &["oms"]);
+    with_group(
+        &mut records,
+        "AX-OPS-WRITE",
+        vec![role_entry(OPS, "operations", AccessLevel::Write)],
+    );
+    with_group(
+        &mut records,
+        "AX-CUSTODY-READ",
+        vec![role_entry(OPS, "custody", AccessLevel::Read)],
+    );
+    records.permissions = vec![
+        permission("P-1", "UG-TRADERS", "AG-GROWTH", "AX-OPS-WRITE"),
+        permission("P-2", "UG-TRADERS", "AG-INCOME", "AX-CUSTODY-READ"),
+        permission("P-3", "UG-ADMINS", "", DEPLOYMENT_ADMIN),
+    ];
+    records
+}
+
+#[test]
+fn write_on_one_role_and_read_on_another_is_exactly_that() {
+    let records = two_roles();
+    let tam = person_access(&records, "someone", &["trading-desk".into()]);
+    let ops = tam.plugin(OPS);
+    let operations = &ops.roles["operations"];
+    assert_eq!(operations.data, Some(AccessLevel::Write));
+    assert_eq!(operations.accounts.write, set(&["ACC-GROWTH"]));
+    assert_eq!(operations.accounts.read, set(&["ACC-GROWTH"]));
+    let custody = &ops.roles["custody"];
+    assert_eq!(custody.data, Some(AccessLevel::Read));
+    assert_eq!(custody.accounts.read, set(&["ACC-INCOME"]));
+    assert!(
+        custody.accounts.write.is_empty(),
+        "never write on custody, nor on Income"
+    );
+    // The union is what the home and a plugin reading no role see.
+    let union = tam.held(OPS);
+    assert_eq!(union.levels(), [AccessLevel::Write, AccessLevel::Read]);
+    assert_eq!(union.accounts.write, set(&["ACC-GROWTH"]));
+    assert_eq!(union.accounts.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
+}
+
+#[test]
+fn a_session_carries_each_roles_level_within_its_button() {
+    let records = two_roles();
+    let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    let open = ops.session(AccessLevel::Write).unwrap();
+    assert_eq!(open.accounts.write, set(&["ACC-GROWTH"]));
+    assert_eq!(
+        open.roles,
+        vec![
+            RoleSession {
+                role: "custody".into(),
+                level: AccessLevel::Read,
+                accounts: Levels {
+                    read: set(&["ACC-INCOME"]),
+                    write: BTreeSet::new(),
+                },
+            },
+            RoleSession {
+                role: "operations".into(),
+                level: AccessLevel::Write,
+                accounts: Levels {
+                    read: set(&["ACC-GROWTH"]),
+                    write: set(&["ACC-GROWTH"]),
+                },
+            },
+        ]
+    );
+    let view = ops.session(AccessLevel::Read).unwrap();
+    assert!(view.roles.iter().all(|role| role.level == AccessLevel::Read
+        && role.accounts.write.is_empty()));
+    assert_eq!(ops.session(AccessLevel::Admin), None, "Manage is not held");
+}
+
+#[test]
+fn an_entry_naming_a_role_the_plugin_no_longer_holds_holds_nothing() {
+    let mut records = two_roles();
+    records.known_plugins[0].roles = vec!["operations".into()];
+    let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    assert!(!ops.roles.contains_key("custody"), "custody's entry holds nothing");
+    assert!(ops.roles.contains_key("operations"));
+    assert!(!entry_holds(&records, OPS, "custody"));
+    // A role-less entry on a plugin that now holds roles holds nothing either,
+    // never read as every role.
+    with_group(
+        &mut records,
+        "AX-WHOLE",
+        vec![role_entry(OPS, "", AccessLevel::Write)],
+    );
+    records
+        .permissions
+        .push(permission("P-4", "UG-TRADERS", "AG-INCOME", "AX-WHOLE"));
+    let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    assert!(!ops.roles.contains_key(""));
+    assert!(!ops.union().accounts.write.contains("ACC-INCOME"));
+    // And a role restored at a later launch makes it hold again.
+    records.known_plugins[0].roles = vec!["custody".into(), "operations".into()];
+    let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    assert!(ops.roles.contains_key("custody"));
+}
+
+#[test]
+fn a_role_less_plugin_is_granted_as_a_whole() {
+    let mut records = records();
+    known(&mut records, OMS, &[]);
+    let tam = person_access(&records, "someone", &["trading-desk".into()]);
+    assert_eq!(tam.plugin(OMS).roles.keys().collect::<Vec<_>>(), [""]);
+    assert!(entry_holds(&records, OMS, ""));
+    assert!(!entry_holds(&records, OMS, "custody"));
+}
+
+#[test]
+fn all_plugins_admin_holds_every_role_those_gained_later_included() {
+    let mut records = two_roles();
+    records
+        .permissions
+        .push(permission("P-9", "UG-ADMINS", "", ALL_PLUGINS_ADMIN));
+    let ada = person_access(&records, ADA, &[]).plugin(OPS);
+    assert!(ada.administers("custody") && ada.administers("operations"));
+    assert!(ada.administers_every(&["custody".into(), "operations".into()]));
+    records.known_plugins[0].roles.push("ccm".into());
+    let ada = person_access(&records, ADA, &[]).plugin(OPS);
+    assert!(ada.administers("ccm"), "a role gained later");
+    // Nobody else holds a role the plugin gains (W8.3).
+    let tam = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    assert!(!tam.roles.contains_key("ccm"));
+}
+
+#[test]
+fn admin_on_one_role_is_not_admin_on_the_plugin_as_a_whole() {
+    let mut records = two_roles();
+    with_group(
+        &mut records,
+        "AX-CUSTODY-ADMIN",
+        vec![role_entry(OPS, "custody", AccessLevel::Admin)],
+    );
+    records.permissions = vec![permission("P-5", "UG-TRADERS", "", "AX-CUSTODY-ADMIN")];
+    let ops = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
+    assert!(ops.administers("custody"));
+    assert!(!ops.administers("operations"));
+    assert!(!ops.administers_every(&["custody".into(), "operations".into()]));
+    assert!(ops.administers_any_of(&["custody".into(), "operations".into()]));
+    let manage = ops.session(AccessLevel::Admin).unwrap();
+    assert_eq!(manage.roles.len(), 1);
+    assert_eq!(manage.roles[0].role, "custody");
+    assert!(manage.accounts.is_empty());
+}
+
+#[test]
+fn the_scope_is_the_union_over_the_roles() {
+    let scope = plugin_scope(&two_roles(), &[], OPS);
+    assert_eq!(scope.read, set(&["ACC-GROWTH", "ACC-INCOME"]));
+    assert_eq!(scope.write, set(&["ACC-GROWTH"]));
+}
+
+#[test]
+fn the_access_table_breaks_the_union_down_by_role_as_positions() {
+    let mut records = two_roles();
+    records.people = vec![SignInRecord {
+        subject: "trader-1".into(),
+        display_name: "Tam".into(),
+        directory_groups: vec!["trading-desk".into()],
+        signed_in_at_ns: 7,
+    }];
+    let table = plugin_access_table(&records, OPS);
+    let tam = &table.people[0];
+    assert_eq!(tam.read_account_ids, ["ACC-GROWTH", "ACC-INCOME"]);
+    assert_eq!(tam.write_account_ids, ["ACC-GROWTH"]);
+    assert_eq!(
+        tam.roles,
+        vec![
+            RoleAccess {
+                role: "custody".into(),
+                level: AccessLevel::Read as i32,
+                read_positions: vec![1],
+                write_positions: vec![],
+            },
+            RoleAccess {
+                role: "operations".into(),
+                level: AccessLevel::Write as i32,
+                read_positions: vec![0],
+                write_positions: vec![0],
+            },
+        ]
+    );
+    assert_eq!(table.user_groups[0].roles, tam.roles);
+    // A plugin holding one role reads one entry equal to the whole.
+    let oms_records = {
+        let mut records = self::records();
+        known(&mut records, OMS, &["oms"]);
+        for group in &mut records.access_groups {
+            for entry in &mut group.entries {
+                entry.role = "oms".into();
+            }
+        }
+        records
+    };
+    let table = plugin_access_table(&oms_records, OMS);
+    let traders = &table.user_groups[0];
+    assert_eq!(traders.roles.len(), 1);
+    assert_eq!(traders.roles[0].read_positions, vec![0, 1]);
+    assert_eq!(traders.roles[0].write_positions, vec![0]);
+    // A role-less plugin's table carries no entry.
+    let mut whole = self::records();
+    known(&mut whole, OMS, &[]);
+    assert!(plugin_access_table(&whole, OMS).user_groups[0].roles.is_empty());
 }

@@ -81,7 +81,8 @@ use crate::ids;
 use crate::rules;
 use crate::sealing::SettingsKey;
 use crate::store::{
-    Held, KnownPlugin, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
+    Author, Held, KnownPlugin, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting,
+    Withdrawal,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -577,9 +578,23 @@ pub fn install_named_administrator(
     };
     let permissions = administrators(&group.user_group_id, now);
 
+    // Granted by the first run that named them, no person signed in.
+    let author = Author {
+        by: String::new(),
+        delegation: String::new(),
+    };
     store
-        .install_first_admin(&group, &permissions)
+        .install_first_admin(&group, &permissions, &author, now)
         .map_err(|failed| failed.to_string())
+}
+
+/// Who made a change the envelope carries: the person the dashboard stamped,
+/// and the delegation they acted through where they used one.
+fn author(envelope: &Envelope) -> Author {
+    Author {
+        by: subject(envelope),
+        delegation: delegation(envelope),
+    }
 }
 
 pub(crate) fn subject(envelope: &Envelope) -> String {
@@ -1060,7 +1075,7 @@ pub fn serve(
                 group.access_group_id = ids::access_group(cx.clock.now_ns());
             }
             cx.store
-                .put_access_group(&group)
+                .put_access_group(&group, &author(envelope), cx.clock.now_ns())
                 .map_err(|f| f.to_string())?;
             tracing::info!(
                 access_group = group.access_group_id,
@@ -1089,7 +1104,7 @@ pub fn serve(
                 access_group_id: request.access_group_id,
             };
             cx.store
-                .add_permission(&permission)
+                .add_permission(&permission, &author(envelope), cx.clock.now_ns())
                 .map_err(|f| f.to_string())?;
             tracing::info!(
                 permission = permission.permission_id,
@@ -1112,7 +1127,7 @@ pub fn serve(
             let before = cx.snapshot()?;
             let outcome = cx
                 .store
-                .withdraw_permission(&request.permission_id)
+                .withdraw_permission(&request.permission_id, &author(envelope), cx.clock.now_ns())
                 .map_err(|f| f.to_string())?;
             let reply = match outcome {
                 Withdrawal::Withdrawn => {
@@ -1202,7 +1217,7 @@ pub fn serve(
             let permissions = administrators(&group.user_group_id, now);
             let installed = cx
                 .store
-                .install_first_admin(&group, &permissions)
+                .install_first_admin(&group, &permissions, &author(envelope), now)
                 .map_err(|f| f.to_string())?;
             if !installed {
                 // Another redemption won between the check and now. The code

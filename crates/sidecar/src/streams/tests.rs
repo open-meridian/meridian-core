@@ -220,6 +220,7 @@ async fn registered_declaring(
                     name: "Operations".into(),
                     read_account_ids: vec![],
                     write_account_ids: vec![],
+                    roles: vec![],
                 }],
                 ..Default::default()
             }

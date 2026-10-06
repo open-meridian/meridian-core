@@ -16,9 +16,16 @@
 //! make impossible: each permission contributes only its own accounts, at its
 //! own level, to the plugin its entry names.
 //!
-//! Per plugin, and nothing finer: a person's access to a plugin is `read`,
-//! `write` or `admin`, the same for every plugin, and a plugin names no parts
-//! of itself for access (decisions/026, 027).
+//! **Per role of a plugin** (contract v15, decisions/033): an access entry
+//! names a plugin, one role it holds and a level, `read`, `write` or `admin`,
+//! the same for every plugin and role. The roles are the deployment's fixed
+//! list, so a plugin still names no parts of itself for access (decisions/026,
+//! 027). A plugin holding no role is granted as a whole, its entries naming
+//! none. An entry that does not match the plugin's roles as the records know
+//! them -- a role the plugin no longer holds, a role-less entry on a plugin
+//! that now holds roles -- holds nothing, and is never read as every role
+//! ([`entry_holds`]). Write on one role and read on another is exactly that:
+//! a role's grant reaches nothing of another.
 //!
 //! **Levels** (W6.7, the product owner's rulings of 2026-09-30). A person may
 //! hold `admin` on a plugin and, independently, one data level, the higher
@@ -28,18 +35,20 @@
 //! bound what each reaches. `admin` configures the plugin and reaches no
 //! account.
 //!
-//! **A session carries one level** (W6.9): Manage at `admin` with no account,
+//! **A session carries one button** (W6.9): Manage at `admin` with no account,
 //! Open at `write` with the read set and the write set, View at `read` with
-//! the read set alone. [`Access::session`] cuts the accounts to the level
-//! chosen, and holds nothing for a level the person does not hold.
+//! the read set alone, each set the union over the plugin's roles; and from
+//! v15 the person's level on each role within that button
+//! ([`PluginHeld::session`]). Nothing is held for a button the person does not
+//! hold.
 //!
 //! A closed account stays readable and is never writable. Its history remains,
 //! and nothing may change it.
 //!
 //! **Built in** are deployment admin, which holds the dashboard's own
 //! capabilities and no plugin and no account; All plugins (admin), which
-//! grants `admin` on every plugin, those launched later included, and no
-//! account; and All accounts, an account group holding every account the
+//! grants `admin` on every role of every plugin, those launched later and
+//! roles gained later included, and no account; and All accounts, an account group holding every account the
 //! records hold, those opened later included. An account no group lists is
 //! reached only by a permission naming All accounts, or by a plugin's link;
 //! nobody reaches it by being an admin.
@@ -52,7 +61,7 @@ use meridian_domain::v1::{
     AccessRecords, AccountRecord, AccountState, ExternalAccountLink, Permission, UserGroup,
 };
 pub use meridian_pb::v1::AccessLevel;
-use meridian_pb::v1::{PersonAccess, PluginAccessReply, UserGroupAccess};
+use meridian_pb::v1::{PersonAccess, PluginAccessReply, RoleAccess, UserGroupAccess};
 
 /// The built-in access group of the dashboard's own capabilities. Reaches no
 /// plugin and no account; cannot be edited, deleted, or left without a
@@ -112,8 +121,10 @@ impl Levels {
     }
 }
 
-/// What a person holds on one plugin: whether they administer it, their data
-/// level, and the accounts that level reaches.
+/// What a person holds on one role of a plugin, or on a plugin holding none
+/// as a whole: whether they administer it, their data level, and the accounts
+/// that level reaches. [`Access::held`] answers the same for a plugin, the
+/// union over its roles.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Held {
     /// `admin`: configures the plugin, reaching no account.
@@ -217,8 +228,151 @@ pub fn parse_level(named: &str) -> Option<AccessLevel> {
     }
 }
 
-/// Plugin instance, then what is held on it.
-pub type PluginLevels = BTreeMap<String, Held>;
+/// Plugin instance, then what is held on each of its roles.
+pub type PluginLevels = BTreeMap<String, PluginHeld>;
+
+/// What a person holds on one plugin, role by role (contract v15): keyed by
+/// role, the empty role for a plugin holding none -- or one whose roles the
+/// records do not know, from a conductor before v15, whose entries are read
+/// as written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginHeld {
+    pub roles: BTreeMap<String, Held>,
+}
+
+/// A person's level and accounts on one role within a session's button
+/// (W6.9): what the claims' per-role entry carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSession {
+    pub role: String,
+    pub level: AccessLevel,
+    pub accounts: Levels,
+}
+
+/// A session at one button: the accounts it reaches, the union over the
+/// roles, and each role's level and accounts within it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Session {
+    pub accounts: Levels,
+    pub roles: Vec<RoleSession>,
+}
+
+impl PluginHeld {
+    fn add(&mut self, role: &str, held: &Held) {
+        self.roles.entry(role.to_string()).or_default().add(held);
+    }
+
+    /// The union over the roles: what the home's buttons are offered by, and
+    /// what a plugin reading no role is served (W6.9).
+    pub fn union(&self) -> Held {
+        let mut union = Held::default();
+        for held in self.roles.values() {
+            union.add(held);
+        }
+        union
+    }
+
+    /// Whether they administer this role.
+    pub fn administers(&self, role: &str) -> bool {
+        self.roles.get(role).is_some_and(|held| held.admin)
+    }
+
+    /// Whether they administer every one of `roles`: what a setting serving
+    /// several roles, and every act on the plugin as a whole, needs
+    /// (decisions/033, point 2). For no role, the plugin as a whole.
+    pub fn administers_every(&self, roles: &[String]) -> bool {
+        if roles.is_empty() {
+            return self.administers("");
+        }
+        roles.iter().all(|role| self.administers(role))
+    }
+
+    /// Whether they administer any of `roles` (any role at all for none).
+    pub fn administers_any_of(&self, roles: &[String]) -> bool {
+        if roles.is_empty() {
+            return self.roles.values().any(|held| held.admin);
+        }
+        roles.iter().any(|role| self.administers(role))
+    }
+
+    /// The session at `level`'s button, or None when it is not held: the
+    /// union of the accounts cut to it, and one entry per role held within
+    /// it -- under Manage each role administered at `admin` with no account,
+    /// under Open each role with a data level at that level, under View each
+    /// at `read` with its read accounts (W6.9). A role-less plugin's entry
+    /// is the empty role's, which the claims do not carry.
+    pub fn session(&self, level: AccessLevel) -> Option<Session> {
+        let accounts = self.union().session(level)?;
+        let roles = self
+            .roles
+            .iter()
+            .filter_map(|(role, held)| {
+                let (at, accounts) = match level {
+                    AccessLevel::Admin if held.admin => (AccessLevel::Admin, Levels::default()),
+                    AccessLevel::Write => match held.data {
+                        Some(AccessLevel::Write) => (AccessLevel::Write, held.accounts.clone()),
+                        Some(_) => (
+                            AccessLevel::Read,
+                            Levels {
+                                read: held.accounts.read.clone(),
+                                write: BTreeSet::new(),
+                            },
+                        ),
+                        None => return None,
+                    },
+                    AccessLevel::Read if held.data.is_some() => (
+                        AccessLevel::Read,
+                        Levels {
+                            read: held.accounts.read.clone(),
+                            write: BTreeSet::new(),
+                        },
+                    ),
+                    _ => return None,
+                };
+                Some(RoleSession {
+                    role: role.clone(),
+                    level: at,
+                    accounts,
+                })
+            })
+            .collect();
+        Some(Session { accounts, roles })
+    }
+}
+
+/// The roles the records know a plugin holds, as its sidecar last reported
+/// them (W6.1, contract v15); None for a plugin they do not list, which only
+/// a conductor before v15 answers.
+pub fn known_roles<'a>(records: &'a AccessRecords, plugin_instance_id: &str) -> Option<&'a [String]> {
+    records
+        .known_plugins
+        .iter()
+        .find(|known| known.plugin_instance_id == plugin_instance_id)
+        .map(|known| known.roles.as_slice())
+}
+
+/// Whether an entry naming `role` on a plugin holds anything (W6.7; the
+/// plan's Q4): a role the plugin holds, or no role on a plugin holding none.
+/// An entry naming a role the plugin no longer holds, or none on a plugin
+/// that now holds roles, holds nothing and is flagged, never read as every
+/// role. A plugin the records do not list -- a conductor before v15 -- is
+/// read as written.
+pub fn entry_holds(records: &AccessRecords, plugin_instance_id: &str, role: &str) -> bool {
+    match known_roles(records, plugin_instance_id) {
+        None => true,
+        Some([]) => role.is_empty(),
+        Some(roles) => !role.is_empty() && roles.iter().any(|held| held == role),
+    }
+}
+
+/// The roles a grant on a plugin is held on: those the records know, the
+/// empty role for a plugin holding none or one they do not list.
+fn roles_of(known: &BTreeMap<String, Vec<String>>, plugin_instance_id: &str) -> Vec<String> {
+    match known.get(plugin_instance_id) {
+        Some(roles) if !roles.is_empty() => roles.clone(),
+        _ => vec![String::new()],
+    }
+}
 
 /// One person's access, as the dashboard evaluates it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -227,25 +381,42 @@ pub struct Access {
     /// capabilities, and nothing on any plugin by that.
     pub deployment_admin: bool,
 
-    /// Holds a permission to [`ALL_PLUGINS_ADMIN`]: `admin` on every plugin,
-    /// those launched later included.
+    /// Holds a permission to [`ALL_PLUGINS_ADMIN`]: `admin` on every role of
+    /// every plugin, those launched later and roles gained later included.
     pub all_plugins_admin: bool,
 
     pub user_group_ids: BTreeSet<String>,
 
-    /// What is held on each plugin an access entry names.
+    /// What is held on each role of each plugin an access entry names.
     pub plugins: PluginLevels,
+
+    /// Each known plugin's roles, as the records carried them (contract
+    /// v15): what All plugins (admin) is held on, role by role.
+    pub known_roles: BTreeMap<String, Vec<String>>,
 }
 
 impl Access {
-    /// What this person holds on one plugin, All plugins (admin) included.
+    /// What this person holds on one plugin, the union over its roles, All
+    /// plugins (admin) included: the home's buttons, and what a plugin
+    /// reading no role is served.
     pub fn held(&self, plugin_instance_id: &str) -> Held {
+        self.plugin(plugin_instance_id).union()
+    }
+
+    /// What this person holds on each role of one plugin, All plugins
+    /// (admin) marking admin on every role it holds, or on the plugin as a
+    /// whole where it holds none.
+    pub fn plugin(&self, plugin_instance_id: &str) -> PluginHeld {
         let mut held = self
             .plugins
             .get(plugin_instance_id)
             .cloned()
             .unwrap_or_default();
-        held.admin |= self.all_plugins_admin;
+        if self.all_plugins_admin {
+            for role in roles_of(&self.known_roles, plugin_instance_id) {
+                held.roles.entry(role).or_default().admin = true;
+            }
+        }
         held
     }
 
@@ -263,7 +434,11 @@ impl Access {
     /// Whether they administer any plugin: every plugin through All plugins
     /// (admin), or one an entry names.
     pub fn administers_any(&self) -> bool {
-        self.all_plugins_admin || self.plugins.values().any(|held| held.admin)
+        self.all_plugins_admin
+            || self
+                .plugins
+                .values()
+                .any(|plugin| plugin.roles.values().any(|held| held.admin))
     }
 }
 
@@ -305,6 +480,11 @@ pub fn person_access(
 fn access_of_groups(records: &AccessRecords, user_group_ids: &BTreeSet<String>) -> Access {
     let mut access = Access {
         user_group_ids: user_group_ids.clone(),
+        known_roles: records
+            .known_plugins
+            .iter()
+            .map(|known| (known.plugin_instance_id.clone(), known.roles.clone()))
+            .collect(),
         ..Access::default()
     };
     for permission in records
@@ -322,10 +502,12 @@ fn access_of_groups(records: &AccessRecords, user_group_ids: &BTreeSet<String>) 
 }
 
 /// One permission's contribution: its own accounts, at its own level, to the
-/// plugin each entry names. Nothing crosses from one permission to another,
-/// and two entries naming one plugin come to the higher of their levels,
-/// which is what the union of them is. An `admin` entry marks the plugin
-/// administered and adds no account.
+/// plugin and role each entry names. Nothing crosses from one permission to
+/// another, nor from one role to another, and two entries naming one plugin
+/// and role come to the higher of their levels, which is what the union of
+/// them is. An `admin` entry marks the role administered and adds no
+/// account. An entry that does not match the plugin's roles holds nothing
+/// ([`entry_holds`]).
 fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevels) {
     let Some(access_group) = records
         .access_groups
@@ -354,9 +536,12 @@ fn fold(records: &AccessRecords, permission: &Permission, into: &mut PluginLevel
             // An entry naming no level holds nothing.
             _ => continue,
         }
+        if !entry_holds(records, &entry.plugin_instance_id, &entry.role) {
+            continue;
+        }
         into.entry(entry.plugin_instance_id.clone())
             .or_default()
-            .add(&held);
+            .add(&entry.role, &held);
     }
 }
 
@@ -419,8 +604,9 @@ pub fn account_groups_named(records: &AccessRecords, access: &Access) -> BTreeSe
 }
 
 /// A plugin's account scope: every account anybody may read through it, and
-/// every account anybody may write through it; and every account one of its
-/// external accounts is linked to. `admin` adds none.
+/// every account anybody may write through it, on any of its roles; and
+/// every account one of its external accounts is linked to. `admin` adds
+/// none.
 ///
 /// Derived from every permission, not from people: the deployment knows no
 /// directory, so it cannot ask who is in a group, only what the groups hold.
@@ -437,9 +623,11 @@ pub fn plugin_scope(
             fold(records, permission, &mut all);
         }
     }
+    // One scope per plugin, whatever its roles: the union over them (W4.11,
+    // decisions/033 point 5).
     let mut scope = all
         .remove(plugin_instance_id)
-        .map(|held| held.accounts)
+        .map(|held| held.union().accounts)
         .unwrap_or_default();
     for link in links
         .iter()
@@ -462,19 +650,25 @@ pub fn plugin_scope(
 
 /// Who may use a plugin, for shaping its interface (W4.10): each user group
 /// holding access to it, and each person who has signed in with access to it
-/// through the groups they were in at their last sign-in.
+/// through the groups they were in at their last sign-in. Each carries its
+/// read and write accounts, the union over the plugin's roles, and from v15
+/// one entry per role of this plugin it holds a data level on, its accounts
+/// as positions in its read accounts; none for `admin`, which the table does
+/// not list, and none on a plugin holding no role.
 pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) -> PluginAccessReply {
     let user_groups = records
         .user_groups
         .iter()
         .filter_map(|group| {
             let held = access_of_groups(records, &BTreeSet::from([group.user_group_id.clone()]));
-            let access = held.on_plugin(plugin_instance_id);
+            let plugin = held.plugins.get(plugin_instance_id).cloned().unwrap_or_default();
+            let access = plugin.union().accounts;
             (!access.is_empty()).then(|| UserGroupAccess {
                 user_group_id: group.user_group_id.clone(),
                 name: group.name.clone(),
                 read_account_ids: access.read_account_ids(),
                 write_account_ids: access.write_account_ids(),
+                roles: table_roles(&plugin, &access),
             })
         })
         .collect();
@@ -484,7 +678,8 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
         .iter()
         .filter_map(|person| {
             let held = person_access(records, &person.subject, &person.directory_groups);
-            let access = held.on_plugin(plugin_instance_id);
+            let plugin = held.plugins.get(plugin_instance_id).cloned().unwrap_or_default();
+            let access = plugin.union().accounts;
             (!access.is_empty()).then(|| PersonAccess {
                 subject: person.subject.clone(),
                 display_name: person.display_name.clone(),
@@ -492,6 +687,7 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
                 last_signed_in_at_ns: person.signed_in_at_ns,
                 read_account_ids: access.read_account_ids(),
                 write_account_ids: access.write_account_ids(),
+                roles: table_roles(&plugin, &access),
             })
         })
         .collect();
@@ -499,6 +695,42 @@ pub fn plugin_access_table(records: &AccessRecords, plugin_instance_id: &str) ->
     PluginAccessReply {
         user_groups,
         people,
+    }
+}
+
+/// Each role's data level in the access table, its accounts as positions in
+/// the union's read accounts (W4.10): only named roles, never the empty one
+/// of a plugin holding none, and none for admin alone.
+fn table_roles(plugin: &PluginHeld, union: &Levels) -> Vec<RoleAccess> {
+    plugin
+        .roles
+        .iter()
+        .filter(|(role, _)| !role.is_empty())
+        .filter_map(|(role, held)| {
+            let level = held.data?;
+            Some(role_access(role, level, &held.accounts, union))
+        })
+        .collect()
+}
+
+/// One role's level and accounts, its accounts as positions in `union`'s
+/// read accounts, sorted as the wire lists them (contract v15, the plan's
+/// Q2): never repeated, so a role costs a few bytes an account.
+pub fn role_access(role: &str, level: AccessLevel, accounts: &Levels, union: &Levels) -> RoleAccess {
+    let positions = |of: &BTreeSet<String>| -> Vec<u32> {
+        union
+            .read
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| of.contains(*account))
+            .map(|(at, _)| at as u32)
+            .collect()
+    };
+    RoleAccess {
+        role: role.to_string(),
+        level: level as i32,
+        read_positions: positions(&accounts.read),
+        write_positions: positions(&accounts.write),
     }
 }
 
