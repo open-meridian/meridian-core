@@ -27,11 +27,11 @@ ON CONFLICT DO NOTHING;
 INSERT INTO config_access_group (access_group_id, name)
 VALUES ('grp-book', 'Book writers'), ('grp-book-reading', 'Book readers')
 ON CONFLICT DO NOTHING;
--- AccessLevel 2: write; 1: read.
-INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
-VALUES ('grp-book', 0, 'custody-test-1', 2),
-       ('grp-book', 1, 'operations-test-1', 2),
-       ('grp-book-reading', 0, 'reporting-test-1', 1)
+-- AccessLevel 2: write; 1: read; each on the role its plugin holds (v15).
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level, role)
+VALUES ('grp-book', 0, 'custody-test-1', 2, 'custody'),
+       ('grp-book', 1, 'operations-test-1', 2, 'operations'),
+       ('grp-book-reading', 0, 'reporting-test-1', 1, 'reporting')
 ON CONFLICT DO NOTHING;
 INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
 VALUES ('perm-book', 'ug-book', 'ag-book', 'grp-book'),

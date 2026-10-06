@@ -23,15 +23,15 @@ VALUES ('ag-interop', 'Interop', '{ACC-INTEROP}')
 ON CONFLICT DO NOTHING;
 INSERT INTO config_access_group (access_group_id, name) VALUES ('grp-interop', 'Interop')
 ON CONFLICT DO NOTHING;
--- AccessLevel 2: write.
-INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
-VALUES ('grp-interop', 0, 'custody-test-1', 2)
+-- AccessLevel 2: write, on the role each plugin holds (contract v15).
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level, role)
+VALUES ('grp-interop', 0, 'custody-test-1', 2, 'custody')
 ON CONFLICT DO NOTHING;
 -- AccessLevel 1: read. The interop account in operations-test-1's read
 -- scope, so it reads and hears what the street records of it (contract v7);
 -- operations-test-2 is named by no entry, and its scope is empty.
-INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level)
-VALUES ('grp-interop', 1, 'operations-test-1', 1)
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level, role)
+VALUES ('grp-interop', 1, 'operations-test-1', 1, 'operations')
 ON CONFLICT DO NOTHING;
 INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
 VALUES ('perm-interop', 'ug-interop', 'ag-interop', 'grp-interop')
