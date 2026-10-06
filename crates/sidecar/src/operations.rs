@@ -164,6 +164,22 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.street.query.list-activities", "meridian.v1.ListActivitiesRequest", message, account, None).await
     }
 
+    /// W2.15: `platform.street.command.re-resolve-activity` (preview).
+    async fn re_resolve_activity(
+        &self,
+        request: Request<plugin::ReResolveActivityParams>,
+    ) -> Result<Response<plugin::ReResolveActivityResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ReResolveActivityRequest = self.as_domain(params)?;
+        if let Some(held0) = message.provenance.as_ref() {
+            self.known("provenance.kind", held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+        }
+        message.account_id = self.linked_account("meridian.v1.ReResolveActivityRequest", &message.external_account_id).await?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.street.command.re-resolve-activity", "meridian.v1.ReResolveActivityRequest", message, account, acting_for).await
+    }
+
     /// W2.14: `platform.street.query.list-sync-statuses` (preview).
     async fn list_sync_statuses(
         &self,
@@ -534,6 +550,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.SyncStatusRecordedEvent",
         read: sync_status_recorded,
     },
+    crate::receive::Row {
+        name: "ActivityReResolved",
+        step: "W2.16",
+        topic: "platform.street.event.activity-re-resolved",
+        payload_type: "meridian.v1.ActivityReResolvedEvent",
+        read: activity_re_resolved,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -621,5 +644,16 @@ fn sync_status_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::D
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::SyncStatusRecorded(message),
+    })
+}
+
+/// W2.16: a ActivityReResolvedEvent, its account at `re_resolution.account_id`.
+fn activity_re_resolved(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::ActivityReResolvedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.re_resolution.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::ActivityReResolved(message),
     })
 }

@@ -976,6 +976,100 @@ message ListActivitiesReply {
   // has no activity to explain it. Empty where the request names no account
   // or the source has not said.
   string history_from = 4;
+
+  // The re-resolutions of the activities answered (W2.16, contract v15),
+  // each naming its activity and account, in the order recorded; on a read
+  // since a watermark, every re-resolution recorded after it, whether or not
+  // its activity was. The activities above stay as first recorded: an
+  // activity's instrument is its latest re-resolution's, or its own where
+  // there is none. Empty where none was re-resolved, and before v15.
+  repeated ActivityReResolution re_resolutions = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2.15, W2.16 — an activity re-resolved (contract v15)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Re-resolve a recorded activity (W2.15): its instrument resolved later, or
+// otherwise -- a plan's own code linked after the activity was reported. The
+// activity is named as it was recorded (W2.10), by its source, the external
+// account and the custodian's identifier; only its instrument is
+// re-resolved, and the activity as first recorded never changes
+// (decisions/031).
+message ReResolveActivityRequest {
+  // The account the external account is linked to (W6.4), set by the
+  // sidecar; refused when there is no link.
+  string account_id = 1;
+
+  // The account as the rail knows it, which the sidecar translates.
+  string external_account_id = 2;
+
+  // The source and the custodian's identifier the activity was recorded
+  // under: with the account, the key that names it. No activity under it is
+  // a refusal, naming it.
+  string source = 3;
+  string external_activity_id = 4;
+
+  // The instrument it now resolves to, the deployment's record; empty where
+  // the link it had been resolved by was removed, and then it is unresolved
+  // again, its code as first reported.
+  string instrument_id = 5;
+
+  // How it was resolved this time: supplied by the named person who set the
+  // link, or derived by a named rule. Never the custodian's word.
+  Provenance provenance = 6;
+
+  // When what resolves it was made: the link set, a table setting row's
+  // changed_at, the rule run. The street stamps its own record time.
+  int64 resolved_at_ns = 7;
+}
+
+message ReResolveActivityReply {
+  // The activity re-resolved, by the street's identifier for it.
+  string activity_id = 1;
+
+  // True when the activity's latest resolution already named this
+  // instrument and provenance, and nothing was recorded.
+  bool already_recorded = 2;
+}
+
+// One re-resolution as the street keeps it, beside the activity it names
+// (W2.16): its own record, chained per account with the re-resolutions
+// before it and apart from the activities, so activity-recorded keeps what
+// it said at v14.
+message ActivityReResolution {
+  // The activity it sits beside, and the account it is recorded against.
+  string activity_id = 1;
+  string account_id = 7;
+
+  // The instrument the activity now resolves to, empty where unresolved
+  // again, and how.
+  string instrument_id = 2;
+  Provenance provenance = 3;
+
+  // When what resolves it was made, as the plugin sent it; when the street
+  // recorded it, never back-dated.
+  int64 resolved_at_ns = 4;
+  int64 recorded_at_ns = 5;
+
+  // Its own number in the street's partition, chained per account with the
+  // re-resolutions before it.
+  JournalRef journal = 6;
+}
+
+// An activity was re-resolved (W2.16): the re-resolution whole, so a
+// reconciliation whose break waited on an unresolved code re-runs its
+// candidate causes without a second read.
+message ActivityReResolvedEvent {
+  // The account it is on, as its re-resolution names it.
+  string account_id = 1;
+
+  ActivityReResolution re_resolution = 2;
+
+  // Who caused it, and its number: the re-resolution's journal, at the top
+  // as every delivered record carries it (W4.3).
+  ChangeCause cause = 3;
+  JournalRef journal = 4;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

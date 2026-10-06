@@ -3395,6 +3395,105 @@ pub struct ListActivitiesReply {
     /// or the source has not said.
     #[prost(string, tag = "4")]
     pub history_from: ::prost::alloc::string::String,
+    /// The re-resolutions of the activities answered (W2.16, contract v15),
+    /// each naming its activity and account, in the order recorded; on a read
+    /// since a watermark, every re-resolution recorded after it, whether or not
+    /// its activity was. The activities above stay as first recorded: an
+    /// activity's instrument is its latest re-resolution's, or its own where
+    /// there is none. Empty where none was re-resolved, and before v15.
+    #[prost(message, repeated, tag = "5")]
+    pub re_resolutions: ::prost::alloc::vec::Vec<ActivityReResolution>,
+}
+/// Re-resolve a recorded activity (W2.15): its instrument resolved later, or
+/// otherwise -- a plan's own code linked after the activity was reported. The
+/// activity is named as it was recorded (W2.10), by its source, the external
+/// account and the custodian's identifier; only its instrument is
+/// re-resolved, and the activity as first recorded never changes
+/// (decisions/031).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReResolveActivityRequest {
+    /// The account the external account is linked to (W6.4), set by the
+    /// sidecar; refused when there is no link.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The account as the rail knows it, which the sidecar translates.
+    #[prost(string, tag = "2")]
+    pub external_account_id: ::prost::alloc::string::String,
+    /// The source and the custodian's identifier the activity was recorded
+    /// under: with the account, the key that names it. No activity under it is
+    /// a refusal, naming it.
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub external_activity_id: ::prost::alloc::string::String,
+    /// The instrument it now resolves to, the deployment's record; empty where
+    /// the link it had been resolved by was removed, and then it is unresolved
+    /// again, its code as first reported.
+    #[prost(string, tag = "5")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// How it was resolved this time: supplied by the named person who set the
+    /// link, or derived by a named rule. Never the custodian's word.
+    #[prost(message, optional, tag = "6")]
+    pub provenance: ::core::option::Option<::meridian_pb::v1::Provenance>,
+    /// When what resolves it was made: the link set, a table setting row's
+    /// changed_at, the rule run. The street stamps its own record time.
+    #[prost(int64, tag = "7")]
+    pub resolved_at_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReResolveActivityReply {
+    /// The activity re-resolved, by the street's identifier for it.
+    #[prost(string, tag = "1")]
+    pub activity_id: ::prost::alloc::string::String,
+    /// True when the activity's latest resolution already named this
+    /// instrument and provenance, and nothing was recorded.
+    #[prost(bool, tag = "2")]
+    pub already_recorded: bool,
+}
+/// One re-resolution as the street keeps it, beside the activity it names
+/// (W2.16): its own record, chained per account with the re-resolutions
+/// before it and apart from the activities, so activity-recorded keeps what
+/// it said at v14.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActivityReResolution {
+    /// The activity it sits beside, and the account it is recorded against.
+    #[prost(string, tag = "1")]
+    pub activity_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The instrument the activity now resolves to, empty where unresolved
+    /// again, and how.
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub provenance: ::core::option::Option<::meridian_pb::v1::Provenance>,
+    /// When what resolves it was made, as the plugin sent it; when the street
+    /// recorded it, never back-dated.
+    #[prost(int64, tag = "4")]
+    pub resolved_at_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub recorded_at_ns: i64,
+    /// Its own number in the street's partition, chained per account with the
+    /// re-resolutions before it.
+    #[prost(message, optional, tag = "6")]
+    pub journal: ::core::option::Option<JournalRef>,
+}
+/// An activity was re-resolved (W2.16): the re-resolution whole, so a
+/// reconciliation whose break waited on an unresolved code re-runs its
+/// candidate causes without a second read.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActivityReResolvedEvent {
+    /// The account it is on, as its re-resolution names it.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub re_resolution: ::core::option::Option<ActivityReResolution>,
+    /// Who caused it, and its number: the re-resolution's journal, at the top
+    /// as every delivered record carries it (W4.3).
+    #[prost(message, optional, tag = "3")]
+    pub cause: ::core::option::Option<ChangeCause>,
+    #[prost(message, optional, tag = "4")]
+    pub journal: ::core::option::Option<JournalRef>,
 }
 /// A sync status was recorded (W2.13): the street heard a custody plugin's
 /// sync status (W2.1) and kept it, so operations tells a connection that needs
