@@ -86,6 +86,26 @@ the plugin itself, and a POST to /confirm resolves it for the person with the
 lot the reinvestment bought. These use the SDK image's bindings, which carry
 v14 when core's e2e builds the image from the SDK beside it.
 
+From contract v15 it re-resolves one (W2.15): as `custody`, a POST to
+/plan-activity records a 401(k)'s reinvestment under the plan's own code
+OQKR, unresolved, and a POST to /re-resolve re-resolves it to the money
+market fund's record, as a person's plan-code link would, supplied by the
+harness's admin; as `operations`, a POST to /listen opens the plugin's
+delivery stream for the re-resolutions it hears (W2.16), a GET of /heard
+says what arrived, and /activity answers the re-resolutions read beside the
+activities.
+
+With STAND_IN_TOOLS set it is a plugin built at contract v15 holding custody
+and operations (`make e2e-access-per-role`, steps 5 and 6): it registers
+declaring v15, its pages naming both roles and no setting, and three MCP
+tools (W6.20), each naming its role: open_balance, operations' at write,
+the fund's opening balance on an account for the person, its instrument as
+the reinvestment on another account names it; record_statement, custody's
+at write, a holdings statement for the person; and
+statement_from_operations, operations' at write, whose route sends that
+custody statement, which the sidecar refuses by role. Each answers typed,
+with an outcome.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -209,13 +229,53 @@ def heartbeat(nine=False):
     return {"ok": True}
 
 
+# ── Contract v15: built at v15, its tools by role (STAND_IN_TOOLS) ──
+TOOLS = bool(os.environ.get("STAND_IN_TOOLS"))
+BOTH = ["custody", "operations"]
+TOOL_ROUTES = {
+    "/tool/open": ("open_balance", "Record the fund's opening balance", ["operations"]),
+    "/tool/statement": ("record_statement", "Record a holdings statement", ["custody"]),
+    "/tool/statement-from-operations": (
+        "statement_from_operations", "Record a holdings statement from operations' page",
+        ["operations"]),
+}
+
+
+def v15_registration():
+    """What a plugin built at v15 holding two roles sends: every page and
+    tool naming the roles it serves, and no setting, which on two roles would
+    have to name its own."""
+    write, read, admin = sidecar_pb2.ACCESS_LEVEL_WRITE, sidecar_pb2.ACCESS_LEVEL_READ, sidecar_pb2.ACCESS_LEVEL_ADMIN
+    pages = [sidecar_pb2.PageDeclaration(path="/", title="Plugin page", levels=[write, read], roles=BOTH)]
+    pages += [sidecar_pb2.PageDeclaration(path=path, title=title, levels=[admin], roles=BOTH)
+              for path, title in ADMIN_PAGES]
+    schema = json.dumps({"type": "object", "properties": {
+        "account": {"type": "string"}, "instrument_from": {"type": "string"}}})
+    tools = [sidecar_pb2.ToolDeclaration(
+        name=name, title=title, description=f"{title}, for the person the call is made for.",
+        method="POST", path=path, levels=[write], input_schema=schema, roles=roles)
+        for path, (name, title, roles) in TOOL_ROUTES.items()]
+    return sidecar_pb2.RegisterRequest(
+        schema_version="v15",
+        interface=sidecar_pb2.InterfaceDeclaration(loopback_port=PORT, title="Plugin page", pages=pages),
+        tools=tools).SerializeToString()
+
+
+def typed(done):
+    """A route's answer as a tool's: an outcome, and why where refused."""
+    if done.get("ok"):
+        return {"outcome": "made", **{k: v for k, v in done.items() if k != "ok"}}
+    return {"outcome": "refused", "reason": (done.get("code") or "refused").lower(),
+            "fields": [], "detail": done.get("detail", "")}
+
+
 def register():
     register_call = grpc.insecure_channel(SIDECAR).unary_unary(
         "/meridian.v1.SidecarService/Register",
         request_serializer=lambda raw: raw,
         response_deserializer=sidecar_pb2.RegisterReply.FromString,
     )
-    request = older_registration()
+    request = v15_registration() if TOOLS else older_registration()
     for _ in range(60):
         try:
             reply = register_call(request, timeout=2)
@@ -273,6 +333,8 @@ def write_for(header):
             operations_pb2.RecordHoldingsStatementParams(
                 source="e2e", external_statement_id=str(uuid.uuid4()),
                 as_of_date="2026-09-26", read_at_ns=time.time_ns(), expected_rows=1,
+                # Built at v15, a statement names its external account (v7).
+                external_account_id=EXTERNAL_ACCOUNT if TOOLS else "",
                 acting_for=person),
             timeout=10)
         held = ops.RecordHolding(
@@ -531,6 +593,81 @@ def report_activity():
             "already_recorded": recorded.already_recorded}
 
 
+# ── Contract v15: an activity re-resolved (make e2e-activity) ──
+PLAN_ACTIVITY_ID = "e2e-oqkr-2026-09-30"
+LINKED_BY = "the harness's admin, in the stand-in's plan-code links"
+HEARD = {"listening": False, "re_resolutions": []}
+
+
+def report_plan_activity():
+    """A reinvestment under the plan's own code, which resolves to nothing
+    yet: recorded with the code as reported."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        recorded = ops.RecordActivity(
+            operations_pb2.RecordActivityParams(
+                external_account_id=EXTERNAL_ACCOUNT, source=SOURCE,
+                activity=operations_pb2.CustodialActivity(
+                    external_activity_id=PLAN_ACTIVITY_ID,
+                    kind=operations_pb2.ACTIVITY_KIND_REINVESTMENT,
+                    instrument_as_reported=operations_pb2.AsReported(
+                        scheme="stand-in:plan-code", code="OQKR", text="OQKR"),
+                    trade_date=REINVESTED_ON, units=decimal("1.50"),
+                    amount=money("-1.50"), description="REINVESTMENT OQKR")),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "activity_id": recorded.activity_id,
+            "already_recorded": recorded.already_recorded}
+
+
+def re_resolve():
+    """The plan code linked to the fund: the activity re-resolved, as the
+    plugin itself, answered as already recorded when sent again."""
+    ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+    try:
+        done = ops.ReResolveActivity(
+            operations_pb2.ReResolveActivityParams(
+                external_account_id=EXTERNAL_ACCOUNT, source=SOURCE,
+                external_activity_id=PLAN_ACTIVITY_ID, instrument_id=mmf(),
+                provenance=operations_pb2.Provenance(
+                    field="instrument_id", kind=operations_pb2.PROVENANCE_KIND_SUPPLIED,
+                    person=LINKED_BY),
+                resolved_at_ns=time.time_ns()),
+            timeout=10)
+    except grpc.RpcError as refused:
+        return refused_as(refused)
+    return {"ok": True, "activity_id": done.activity_id,
+            "already_recorded": done.already_recorded}
+
+
+def listen():
+    """Hear the re-resolutions this plugin's roles hear, for as long as the
+    process runs."""
+    if HEARD["listening"]:
+        return {"ok": True, "listening": True}
+    HEARD["listening"] = True
+
+    def hearing():
+        ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
+        try:
+            for delivery in ops.Receive(operations_pb2.ReceiveRequest(rows=["ActivityReResolved"])):
+                if delivery.WhichOneof("item") != "activity_re_resolved":
+                    continue
+                re = delivery.activity_re_resolved.re_resolution
+                HEARD["re_resolutions"].append({
+                    "activity_id": re.activity_id, "account_id": re.account_id,
+                    "instrument_id": re.instrument_id, "person": re.provenance.person,
+                    "sequence": delivery.meta.journal.sequence,
+                    "cause": delivery.meta.cause.instance_id})
+        except grpc.RpcError as ended:
+            print(f"the delivery stream ended: {ended.code().name}", flush=True)
+        HEARD["listening"] = False
+
+    threading.Thread(target=hearing, daemon=True).start()
+    return {"ok": True, "listening": True}
+
+
 def read_activity(account_id):
     """The account's activity as an operations plugin reads it."""
     ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
@@ -545,7 +682,11 @@ def read_activity(account_id):
          "kind": operations_pb2.ActivityKind.Name(a.activity.kind),
          "instrument_id": a.activity.instrument_id, "trade_date": a.activity.trade_date,
          "sequence": a.journal.sequence, "previous": a.journal.previous_sequence}
-        for a in read.activities]}
+        for a in read.activities],
+        "re_resolutions": [
+            {"activity_id": re.activity_id, "account_id": re.account_id,
+             "instrument_id": re.instrument_id, "person": re.provenance.person}
+            for re in getattr(read, "re_resolutions", [])]}
 
 
 def read_sync():
@@ -562,11 +703,12 @@ def read_sync():
         for s in read.statuses]}
 
 
-def open_book(header, account_id):
+def open_book(header, account_id, instrument_from=""):
     """The fund's opening balance, for the person the header names: its
     units and the one lot the custodian lists. The fund as the activity it
-    read names it, since an operations plugin resolves no identifier."""
-    activity = the_reinvestment(account_id)
+    read names it, since an operations plugin resolves no identifier: the
+    activity on `instrument_from` where it names another account."""
+    activity = the_reinvestment(instrument_from or account_id)
     if activity is None:
         return {"ok": False, "detail": "no reinvestment read"}
     ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
@@ -804,6 +946,9 @@ def decoded(header):
         "assertion_id": claims.assertion_id,
         "deployment_admin": claims.deployment_admin,
         "access": {"read": list(claims.read_account_ids), "write": list(claims.write_account_ids)},
+        # Contract v15: the session's entry per role, the role and its level.
+        "roles": {entry.role: sidecar_pb2.AccessLevel.Name(entry.level)
+                  for entry in getattr(claims, "roles", [])},
     }
 
 
@@ -811,9 +956,14 @@ class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         callers = self.headers.get_all("Meridian-Caller") or []
         path, _, query = self.path.partition("?")
-        if path in ("/activity", "/sync"):
+        if path in ("/activity", "/sync", "/heard"):
             asked = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
-            said = read_activity(asked.get("account", "")) if path == "/activity" else read_sync()
+            if path == "/heard":
+                said = {"ok": True, **HEARD}
+            elif path == "/activity":
+                said = read_activity(asked.get("account", ""))
+            else:
+                said = read_sync()
             body = json.dumps(said).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -879,6 +1029,18 @@ class Page(http.server.BaseHTTPRequestHandler):
         elif self.path == "/ticket":
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             done = file_ticket(callers, form)
+        elif self.path in TOOL_ROUTES:
+            asked = json.loads(sent or b"{}")
+            if not callers:
+                done = {"ok": False, "detail": "nobody"}
+            elif self.path == "/tool/open":
+                done = open_book(callers[0], asked.get("account", ""), asked.get("instrument_from", ""))
+            else:
+                done = write_for(callers[0])
+            done = typed(done)
+        elif self.path in ("/plan-activity", "/re-resolve", "/listen"):
+            done = {"/plan-activity": report_plan_activity, "/re-resolve": re_resolve,
+                    "/listen": listen}[self.path]()
         elif self.path in ("/activity", "/open", "/break", "/confirm"):
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             if self.path == "/activity":

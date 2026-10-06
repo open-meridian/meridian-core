@@ -1,0 +1,9 @@
+# Step 4 of `make e2e-access-per-role`: `both` launched again holding a third
+# role, oms, every topic of which operations holds too, so the broker's
+# credential for it needs nothing more (decisions/020). Nobody but All plugins
+# (admin) holds the role until a deployment admin grants it (W8.3, contract
+# v15).
+services:
+  sidecar-both:
+    environment:
+      MERIDIAN_PLUGIN_ROLES: "custody,operations,oms"

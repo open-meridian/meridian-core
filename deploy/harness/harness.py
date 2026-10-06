@@ -90,14 +90,16 @@ the same image with the list on stdin:
       equity, debt, fund, derivative, crypto_asset, event_contract, cash; each
       value goes with the source given, and the dashboard stamps the admin.
 
-  mcp connect [--covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...] [--client NAME]
+  mcp connect [--covers everything | --covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...]
+              [--client NAME]
       Connects an MCP client as the admin, as an agent's client does (W6.17,
       W6.20): registers it (named "harness agent" unless --client says), sends
       her through the dashboard's authorisation for the `/mcp` resource with
       a PKCE challenge, signs her in afresh, consents to only what --covers
       names -- the deployment admin's capabilities, and each plugin and level,
       from contract v15 each plugin, role and level (a row per role, W6.17)
-      -- on All accounts, for 30 days, and exchanges the code for a token
+      -- on All accounts, for 30 days; or with `--covers everything`, all she
+      holds now and is granted later (W6.17's "Everything"); and exchanges the code for a token
       pair, kept for the run in the runner's state. Prints the delegation and
       how many tools it reaches.
 
@@ -994,12 +996,15 @@ def mcp_connect(args):
     confirm = re.search(r'name="confirm" value="([^"]+)"', consent.body)
     if consent.status != 200 or not request or not confirm:
         raise Failed(f"she was not shown the consent page: {consent.status} {sentence(consent)}")
+    everything = "everything" in covers
+    if everything and len(covers) > 1:
+        raise Failed("--covers everything is the whole of what she holds, alone")
     fields = [("request", request.group(1)), ("confirm", confirm.group(1)), ("decision", "allow"),
-              ("covers", "some"), ("days", "30")]
+              ("covers", "everything" if everything else "some"), ("days", "30")]
     # Every account she may tick: All accounts once she holds a grant on it.
     for offered in re.findall(r'name="account_group" value="([^"]+)"', consent.body):
         fields.append(("account_group", html.unescape(offered)))
-    for covered in covers:
+    for covered in [] if everything else covers:
         if covered == "deployment_admin":
             fields.append(("deployment_admin", "1"))
         elif re.fullmatch(r"[a-z0-9-]+(:[a-z]*)?:(admin|write|read)", covered):

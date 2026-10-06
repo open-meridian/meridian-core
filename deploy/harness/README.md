@@ -140,7 +140,7 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `unlinked [--expect N] [--seconds N]` | Prints how many external accounts the plugin reported that nothing links, as the dashboard counts them; with `--expect`, waits for `N`. |
 | `instruments [--expect N] [--seconds N]` | Prints each record the dashboard's Instruments page lists as one the book cannot use, its ID and identifiers; with `--expect`, waits until it lists `N`. |
 | `instrument ID\|--identifier TEXT asset_class=CLASS currency=CODE source=TEXT [description=TEXT] [instrument_type=money_market_fund fund_category=government\|prime\|tax_exempt fund_investors=retail\|institutional fund_nav=stable\|floating fund_liquidity_fee=mandatory\|discretionary] [note=TEXT]` | Completes a record at the Instruments page as the deployment admin does, each value with its source: its asset class and currency, and its description; and from contract v11 its instrument type and, for a money market fund, its four attributes, stated together. |
-| `mcp connect [--covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...] [--client NAME]` | From contract v12: connects an MCP client as the admin, as an agent's client does: registers it, takes her through the authorisation for the `/mcp` resource with a PKCE challenge, signs her in afresh, consents to only what `--covers` names on All accounts -- from contract v15 a row per plugin role, and keeps the token pair in the runner's state for the run. |
+| `mcp connect [--covers everything \| --covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...] [--client NAME]` | From contract v12: connects an MCP client as the admin, as an agent's client does: registers it, takes her through the authorisation for the `/mcp` resource with a PKCE challenge, signs her in afresh, consents to only what `--covers` names on All accounts -- from contract v15 a row per plugin role -- or with `--covers everything` to all she holds now and is granted later, and keeps the token pair in the runner's state for the run. |
 | `mcp list [--expect NAME ...]` | Prints the tools the delegation reaches, one per line. |
 | `mcp call NAME [JSON] [--from SAVED[.PATH]] [--set PATH=VALUE ...] [--save SAVED] [--expect-outcome OUTCOME] [--expect TEXT]` | Calls a tool and prints its typed answer as JSON; `--from` starts from what an earlier call saved, and each `--set` changes one field by the dictionary's path grammar, `[key=value]` picking a row by a field of its own. Refreshes the pair when the access token has lapsed. |
 | `mcp complete --identifier TEXT asset_class=CLASS currency=CODE source=TEXT note=TEXT [instrument_type=... fund_...=...]` | Completes the record listed with that identifier through core's tools, against the version listed. |
@@ -230,6 +230,7 @@ recorded and each connection's latest sync status, ordered bytewise:
 
     activity|<account>|<source>|<external activity id>|<kind>|<instrument>|<trade date>|<units>
     sync|<account>|<source>|<external account>|<state>|<history from>
+    re-resolution|<account>|<source>|<external activity id>|<n>|<instrument>
 
 - `<account>` and `<instrument>` as the street store prints them; a sync
   status of an external account nothing links has an empty `<account>`, and
@@ -241,6 +242,10 @@ recorded and each connection's latest sync status, ordered bytewise:
   the latest the street heard for that connection, and `<history from>` the
   first date the source said it can read history from, empty where it said
   none.
+- A `re-resolution` line (contract v15) is one of an activity's later
+  resolutions, kept beside it while its `activity` line stays as first
+  recorded: `<n>` its place among the activity's re-resolutions, 1 the
+  first, and `<instrument>` empty where it is unresolved again.
 
 Its own store rather than lines of `store street`, so a plugin's expected
 street file is not changed by a revision it has not taken up.

@@ -1,3 +1,4 @@
 [
-  {"instance": "both", "image": "meridian-python-interop", "roles": ["custody", "operations"]}
+  {"instance": "both", "image": "meridian-python-interop", "roles": ["custody", "operations"]},
+  {"instance": "tools", "image": "meridian-python-interop", "roles": ["custody", "operations"]}
 ]
