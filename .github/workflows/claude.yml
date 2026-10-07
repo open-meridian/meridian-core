@@ -5,8 +5,8 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
-  issues:
-    types: [opened, assigned]
+  # Not on a new issue: each one started a run that was skipped. Mention
+  # @claude in a comment on the issue instead (the product owner, 2026-10-07).
   pull_request_review:
     types: [submitted]
 
@@ -15,8 +15,7 @@ jobs:
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,4 +46,18 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr *)'
+
+          # Its reply is public and posted at once, so it answers only from
+          # what it can see here (the product owner, 2026-10-07).
+          claude_args: >-
+            --append-system-prompt "You are replying in public on an Open
+            Meridian repository, and your reply is posted as soon as you
+            finish. Answer only from this repository's code and docs. The
+            design repository, its specs and its rulings are private and you
+            cannot see them: when a question turns on why something is
+            designed as it is, or on what is planned, say so plainly and
+            point to https://open-meridian.dev rather than guessing. Never
+            promise a feature, a date or a priority. Never say or imply that
+            Open Meridian meets a regulation or is ready for regulated use.
+            Keep replies short and factual." 
 
