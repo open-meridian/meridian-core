@@ -132,6 +132,11 @@ for _ in range(120):
 else:
     print("FAILED: the dashboard never answered through the forwarder", flush=True)
     sys.exit(1)
+# The CLI beside this container reaches the dashboard through this forwarder,
+# so it starts once the forwarder answers (e2e/cluster/run.py's script): a
+# container's start order is the kubelet's, and a `connect` before then is
+# refused on loopback and never asks anybody to sign in.
+open(f"{SHARED}/forwarding", "w").close()
 
 
 # ── The terminal ──────────────────────────────────────────────────────────

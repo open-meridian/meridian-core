@@ -7,7 +7,8 @@ uploads it -- built by the node's own docker daemon, which the pod is given,
 as a person's machine gives it theirs -- and launches it with no role. This
 container is the person's browser: it confirms the CLI's
 connection, and once the run says the plugin is up, signs in to the
-dashboard as its administrator and opens the plugin's page from home.
+dashboard as its administrator and opens the plugin from home by Manage,
+which serves its Setup page: what it is, and no account's data.
 
 The page is on the plugin's own host, `{instance}.plugins.localhost`, which
 a browser sends to loopback by itself, and the forwarder here takes loopback
@@ -17,9 +18,11 @@ to be granted, and an administrator opens any plugin's page.
 
 Then acting-for, on a copy of the plugin declaring `custody`, which holds
 the step its button takes (recording a statement): the administrator grants
-herself read on an account through it and the button is refused, since she
-may write nothing through it; the grant becomes write, and the same button
-records the statement. What decides is her access, not the plugin's role.
+herself read on an account through it, and View shows her that account and
+offers no button, the plugin refusing the step's route under View; the grant
+becomes write, and Open's button records the statement. Granted write on the
+reference plugin too, the same button there is refused by its sidecar, since
+that plugin holds no role.
 
 Last, the upload's path as the first terminal path with a permission behind
 it (kernel/terminal-sessions left this to it): the terminal's session is
@@ -145,6 +148,11 @@ for _ in range(120):
 else:
     print("FAILED: the dashboard never answered through the forwarder", flush=True)
     sys.exit(1)
+# The CLI beside this container reaches the dashboard through this forwarder,
+# so it starts once the forwarder answers (e2e/cluster/run.py's script): a
+# container's start order is the kubelet's, and a `connect` before then is
+# refused on loopback and never asks anybody to sign in.
+open(f"{SHARED}/forwarding", "w").close()
 
 
 # ── The administrator's forms ─────────────────────────────────────────────
@@ -182,17 +190,34 @@ def administer(context, action, fields, patience=0):
     return context.request.get(f"{DASHBOARD}/admin").text()
 
 
-def statement(page, instance):
-    """Press the page's one button: what the plugin says came of it."""
-    page.goto(f"http://{instance}.plugins.{HOST}/")
+# The template's one action, offered on its Accounts page under Open alone.
+BUTTON = "button:has-text('Open an empty statement for me')"
+
+
+def statement(page, instance, level="write"):
+    """Open the plugin at `level` and press the page's one button: what the
+    plugin says came of it, in its notice."""
+    page.goto(f"{DASHBOARD}/plugins/{instance}/enter?level={level}")
     page.wait_for_load_state()
-    button = page.locator("button:has-text('Open an empty statement for me')")
+    button = page.locator(BUTTON)
     if not button.count():
-        return f"no statement button: {sentence(page.inner_text('body'))}"
+        return f"no statement button at {page.url}: {sentence(page.content())}"
     button.click()
     page.wait_for_load_state()
-    notice = page.locator("p > strong")
+    notice = page.locator(".notice[role=status]")
     return notice.last.inner_text() if notice.count() else page.content()[:300]
+
+
+def pressed(page, instance, until, seconds):
+    """`statement`, again until what it says starts with `until`: a grant
+    reaches the dashboard and the plugin's sidecar after the admin page says
+    it was made, not with it."""
+    deadline = time.monotonic() + seconds
+    said = statement(page, instance)
+    while not said.startswith(until) and time.monotonic() < deadline:
+        time.sleep(3)
+        said = statement(page, instance)
+    return said
 
 
 # ── The terminal: the real CLI, in the pod's other container ────────────
@@ -380,9 +405,10 @@ with sync_playwright() as playwright:
                 break
             time.sleep(3)
         at = page.url
+        # Manage serves the page the template declares at `admin`, Setup.
         check(
-            at.startswith(f"http://{INSTANCE}.plugins.{HOST}/"),
-            f"the page is on the plugin's own host: {at}",
+            at.startswith(f"http://{INSTANCE}.plugins.{HOST}/setup"),
+            f"the page is on the plugin's own host, its Setup under Manage: {at}",
         )
         content = page.content()
         check("<h1>Reference plugin</h1>" in content, "and it is the reference plugin's page")
@@ -390,12 +416,13 @@ with sync_playwright() as playwright:
             "Signed in as <strong>" in content and "<strong></strong>" not in content,
             "which the plugin was told the person asking by the dashboard, through its sidecar",
         )
-        page.click("button:has-text('Open an empty statement for me')")
-        page.wait_for_load_state()
-        refused = page.locator("p > strong").last.inner_text()
         check(
-            refused.startswith("Refused") and "holds no role" in refused,
-            f"it may not record a statement, whoever asks, holding no role: {refused}",
+            f"<dd><code>{INSTANCE}</code></dd>" in content and "<dt>Roles</dt><dd>none</dd>" in content,
+            f"Setup says what the deployment launched: {INSTANCE}, holding no role",
+        )
+        check(
+            page.locator("om-grid").count() == 0 and page.locator(BUTTON).count() == 0,
+            "and, under Manage, shows no account's data and offers no action",
         )
 
     # Acting-for, on the copy that holds the step: her access decides.
@@ -408,7 +435,8 @@ with sync_playwright() as playwright:
     account_group = row_id(admin, "Account", "Custody copy accounts")
     admin = administer(
         context, "/admin/access-groups",
-        {"access_group_id": "", "name": "Custody copy users", "entries": f"{CUSTODY} read"},
+        {"access_group_id": "", "name": "Custody copy users",
+         "entries": f"{CUSTODY} read\n{INSTANCE} write"},
         patience=90,
     )
     access_group = row_id(admin, "Access", "Custody copy users")
@@ -429,40 +457,57 @@ with sync_playwright() as playwright:
 
     # The permission reaches the plugin's sidecar after the dashboard says it
     # was granted, not with it: looked for again until it has.
-    # Opened by View, the level she now holds on it besides Manage (W6.9).
+    # Opened by View, the level she now holds on it besides Manage (W6.9):
+    # the Accounts page, with the account she may read through it: a row of
+    # its grid, as the kit draws it.
+    def shown_read():
+        row = page.locator("om-grid tr", has_text=account or "no account")
+        return row.count() == 1 and row.first.inner_text().split()[-1:] == ["read"]
+
     deadline = time.monotonic() + 60
     while True:
         page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter?level=read")
         page.wait_for_load_state()
-        shown = "<td>custody</td>" in page.content()
+        shown = shown_read()
         if shown or time.monotonic() > deadline:
             break
         time.sleep(2)
     check(
         page.url.startswith(f"http://{CUSTODY}.plugins.{HOST}/") and shown,
-        f"{CUSTODY}'s page shows what she may see through it: {page.url}"
-        + ("" if shown else f" {sentence(page.inner_text('body'))}"),
+        f"{CUSTODY}'s page shows the account she may read through it: {page.url}"
+        + ("" if shown else f" {page.locator('om-grid').first.inner_text() if page.locator('om-grid').count() else sentence(page.content())}"),
     )
-    said = statement(page, CUSTODY)
+    # Under View the step is not offered, and its route, declared at write,
+    # is refused by the plugin before its view runs.
+    check(page.locator(BUTTON).count() == 0, "while she only reads, View offers no statement")
+    # Asked from the page itself, as its own form would: the plugin's host
+    # resolves to loopback in the browser alone.
+    status, text = page.evaluate(
+        "async () => { const r = await fetch('/statement', {method: 'POST'});"
+        " return [r.status, await r.text()]; }"
+    )
     check(
-        said.startswith("Refused") and "View (read)" in said,
-        f"while she only reads, the sidecar refuses the statement she asked for under View: {said}",
+        status == 403 and "View" in text,
+        f"and the statement asked for under View is refused: {status} {text}",
+    )
+
+    # Write on the reference plugin, through the same permission: Open offers
+    # its button, and its sidecar refuses the step whoever asks, since the
+    # plugin holds no role.
+    said = pressed(page, INSTANCE, "Refused", 60)
+    check(
+        said.startswith("Refused") and "holds no role" in said,
+        f"the reference plugin may not record a statement, whoever asks, holding no role: {said}",
     )
 
     administer(
         context, "/admin/access-groups",
         {"access_group_id": access_group or "", "name": "Custody copy users",
-         "entries": f"{CUSTODY} write"},
+         "entries": f"{CUSTODY} write\n{INSTANCE} write"},
     )
     # Opened by Open now she writes; the sidecar reads the plugin's write
     # scope again within 30 seconds.
-    page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter?level=write")
-    page.wait_for_load_state()
-    deadline = time.monotonic() + 90
-    said = statement(page, CUSTODY)
-    while not said.startswith("Opened statement") and time.monotonic() < deadline:
-        time.sleep(5)
-        said = statement(page, CUSTODY)
+    said = pressed(page, CUSTODY, "Opened statement", 90)
     check(said.startswith("Opened statement"), f"once she writes, it is recorded for her: {said}")
 
     # The live loop (spec/live-plugin-development, requirements 10 to 14),
@@ -502,9 +547,10 @@ with sync_playwright() as playwright:
     print(f"  save to ready: {took:.2f}s", flush=True)
     at = revision
 
-    printed = cli(f"meridian plugin open --instance {LIVE} --print /")
+    # At the first level she holds on it, Manage, whose page is Setup.
+    printed = cli(f"meridian plugin open --instance {LIVE} --print /setup")
     check("exit=0" in printed and "<h1>Reference plugin, changed live</h1>" in printed,
-          f"`plugin open --print /` shows the changed page as she is served it: {sentence(printed)}")
+          f"`plugin open --print /setup` shows the changed page as she is served it: {sentence(printed)}")
 
     linked = said_json(cli(f"meridian plugin open --instance {LIVE} --json"))
     url = linked.get("url", "")
@@ -528,10 +574,15 @@ with sync_playwright() as playwright:
     mended = saved(f"{scaffold}/__main__.py", main_py)
     check(bool(waited(lambda: first(dev_events("dev.out"), "ready", mended), 60)),
           "and mended by the next save, without anybody restarting anything")
-    page.goto(f"{DASHBOARD}/plugins/{LIVE}/enter")
-    page.wait_for_load_state()
-    page.click("button:has-text('Open an empty statement for me')")
-    page.wait_for_load_state()
+    # Write on the live instance, so Open offers its button, which its
+    # sidecar refuses: it holds no role.
+    administer(
+        context, "/admin/access-groups",
+        {"access_group_id": access_group or "", "name": "Custody copy users",
+         "entries": f"{CUSTODY} write\n{INSTANCE} write\n{LIVE} write"},
+        patience=90,
+    )
+    pressed(page, LIVE, "Refused", 60)
     refused = waited(lambda: [e for e in said_json(cli(
         f"meridian plugin events --instance {LIVE} --since {mended - 1} --json")).get("events", [])
         if e.get("event") == "refused"], 30)
@@ -556,7 +607,7 @@ with sync_playwright() as playwright:
     listed = cli("meridian plugin list")
     check(re.search(rf"{LIVE}\s+reference-plugin 0\.1\.1\s+launched", listed) is not None,
           "the catalogue holds 0.1.1, launched in the live instance's place")
-    served = waited(lambda: "changed live" in cli(f"meridian plugin open --instance {LIVE} --print /"), 180)
+    served = waited(lambda: "changed live" in cli(f"meridian plugin open --instance {LIVE} --print /setup"), 180)
     check(bool(served), "and the released version serves what was live")
 
     # Live again, for the run's last check: stopped, and developed again from

@@ -166,8 +166,33 @@ UPGRADE_VERSION = os.environ.get("E2E_UPGRADE_VERSION", "")
 # never did: it is what found a RoleBinding the chart's own Job deletes.
 HELM = os.environ.get("E2E_HELM", "helm")
 
-# The registry's node proxy port, as the chart's registry.hostPort.
-REGISTRY_PORT = int(os.environ.get("E2E_REGISTRY_PORT", "5000"))
+def free_registry_port():
+    """The chart's registry.hostPort for this run: the first from 5000 that no
+    pod in the cluster holds as a host port.
+
+    A host port is the node's, not the namespace's, so a deployment already
+    on this cluster -- somebody's own, at the chart's default 5000 -- keeps
+    this run's node proxy from scheduling, and the node then pulls this run's
+    images from that deployment's registry instead, which has none of them.
+    The scheduler decides by the host ports pods declare, so those are what
+    is asked. E2E_REGISTRY_PORT names one instead.
+    """
+    if os.environ.get("E2E_REGISTRY_PORT"):
+        return int(os.environ["E2E_REGISTRY_PORT"])
+    held = subprocess.run(
+        ["kubectl", "get", "pods", "--all-namespaces", "-o",
+         "jsonpath={.items[*].spec.containers[*].ports[*].hostPort}"],
+        capture_output=True, text=True,
+    )
+    if held.returncode != 0:
+        raise SystemExit(f"the cluster's host ports could not be read\n{held.stderr}")
+    taken = {int(port) for port in held.stdout.split()}
+    return next(port for port in range(5000, 6000) if port not in taken)
+
+
+# The registry's node proxy port, as the chart's registry.hostPort, which
+# both drivers install with.
+REGISTRY_PORT = free_registry_port()
 
 # Headless Chromium, built beside the runtime image (e2e/cluster/browser.py).
 BROWSER_IMAGE = os.environ.get("E2E_BROWSER_IMAGE", "meridian-e2e-browser:local")
@@ -451,6 +476,12 @@ def by_cli(s, deployment_id, enrolment_code):
     params.write("".join(f"{k}: {json.dumps(v)}\n" for k, v in plain.items()))
     params.close()
     os.chmod(params.name, 0o644)
+    # The registry's port, in a values file as a person gives the chart
+    # anything `meridian up` does not ask: `-f`.
+    registry = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    registry.write(f"registry:\n  hostPort: {REGISTRY_PORT}\n")
+    registry.close()
+    os.chmod(registry.name, 0o644)
 
     kubeconfig = os.environ.get("KUBECONFIG") or os.path.expanduser("~/.kube/config")
     environment = {
@@ -467,12 +498,14 @@ def by_cli(s, deployment_id, enrolment_code):
         "-v", f"{kubeconfig}:/kube/config:ro", "-e", "KUBECONFIG=/kube/config",
         "-v", f"{os.path.abspath(CHART)}:/chart:ro",
         "-v", f"{params.name}:/params.yaml:ro",
+        "-v", f"{registry.name}:/registry.yaml:ro",
         *[flag for name in environment for flag in ("-e", name)],
         CLI_IMAGE, "up",
         "--namespace", NAMESPACE, "--release", RELEASE, "--chart", "/chart",
         "--id", deployment_id, "--platform", PLATFORM_FROM_POD,
         *(["--image", IMAGE] if IMAGE else []),
-        "--params", "/params.yaml", "--host", HOST, "--development", "--no-doctor",
+        "--params", "/params.yaml", "-f", "/registry.yaml",
+        "--host", HOST, "--development", "--no-doctor",
         # Plain HTTP and no certificate, as the runner's own install: for testing.
         "--plain-http",
     ]
@@ -480,6 +513,7 @@ def by_cli(s, deployment_id, enrolment_code):
         command, capture_output=True, text=True, env={**os.environ, **environment}
     )
     os.unlink(params.name)
+    os.unlink(registry.name)
     for line in (done.stdout + done.stderr).splitlines():
         print(f"    | {line}", flush=True)
     s.check(done.returncode == 0, f"meridian up finished: exit {done.returncode}")
@@ -580,6 +614,7 @@ def main():
             # testing: this run reaches Traefik on :80 (task kernel/a-
             # development-deployment-serves-https, ruling 3).
             "--set", "ingress.plainHttp=true",
+            "--set", f"registry.hostPort={REGISTRY_PORT}",
         ]
         run(HELM, "upgrade", "--install", RELEASE, *chart, "--namespace", NAMESPACE, *values)
 
@@ -823,6 +858,7 @@ def main():
         - sh
         - -c
         - |
+          i=0; until [ -f /shared/forwarding ] || [ $i -ge 600 ]; do sleep 0.2; i=$((i+1)); done
           meridian connect {DASHBOARD_URL} > /shared/connect-1.out 2>&1; echo "exit=$?" >> /shared/connect-1.out
           until [ -f /shared/sign-out-now ]; do sleep 1; done
           meridian sign-out > /shared/sign-out.out 2>&1; echo "exit=$?" >> /shared/sign-out.out
@@ -950,6 +986,46 @@ spec:
 
     edge_storage(s)
 
+    if SIGN_IN == "local":
+        # W6.16. The only administrator's password is lost, and a code from
+        # the platform is the way back: nothing is learned from the cluster
+        # and no namespace is deleted. After every stage that signs in with
+        # the password the wizard was given, and before P, which ends by
+        # withdrawing her deployment admin (a reset is for a login holding
+        # it) and upgrading the deployment, which recreates the dashboard:
+        # P signs in with the new password instead.
+        print("Z: a lost password, and a code from the platform the way back", flush=True)
+        name, password = WAY_IN["administrator"]
+        status, before = signed_in(name, password)
+        s.check(status == 303 and bool(before), f"{name} holds a session before the reset: {status}")
+        reset_code = platform(
+            "issue_claim_code", "--deployment", deployment_id, "--purpose", "reset-local-admin"
+        ).splitlines()[-1]
+        renewed = "Renewed-e2e-password"
+        status, _ = post(
+            "/sign-in/reset",
+            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
+            {},
+        )
+        s.check(status == 303, f"the code is redeemed and the password set: {status}")
+        status, _ = post("/sign-in", {"name": name, "password": password}, {})
+        s.check(status == 401, f"the lost password is refused now: {status}")
+        status, after = signed_in(name, renewed)
+        s.check(status == 303 and bool(after), f"the new one signs {name} in: {status}")
+        if status == 303:
+            WAY_IN["administrator"] = (name, renewed)
+        s.check(ADMIN_HOME in get("/", after), "still a deployment admin")
+        s.check(
+            ADMIN_HOME not in get("/", before),
+            "and the session held before the reset has ended",
+        )
+        status, _ = post(
+            "/sign-in/reset",
+            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
+            {},
+        )
+        s.check(status != 303, f"and the code, once spent, is refused: {status}")
+
     print("P: a person makes a plugin, launches it, and opens its page", flush=True)
     # Results 2 and 3 of plans/a-person-reaches-a-plugin, by the real CLI:
     # `meridian plugin new`, `connect`, `upload`, `launch` and `list`, then
@@ -967,6 +1043,8 @@ spec:
             f"          {command} > /shared/{said}.out 2>&1; echo \"exit=$?\" >> /shared/{said}.out"
         )
         script = "\n".join([
+            # Once the browser's forwarder answers, which `connect` goes through.
+            "          i=0; until [ -f /shared/forwarding ] || [ $i -ge 600 ]; do sleep 0.2; i=$((i+1)); done",
             step("new", "meridian plugin new reference-plugin --into /shared/reference-plugin"),
             step("connect", f"meridian connect {DASHBOARD_URL}"),
             step("upload", "meridian plugin upload --dir /shared/reference-plugin"),
@@ -1120,41 +1198,6 @@ spec:
                     said = str(failed)
                 for line in said.splitlines():
                     print(f"      {line}", flush=True)
-
-    if SIGN_IN == "local":
-        # W6.16, last, because every stage above signs in with the password
-        # the wizard was given. The only administrator's password is lost,
-        # and a code from the platform is the way back: nothing is learned
-        # from the cluster and no namespace is deleted.
-        print("Z: a lost password, and a code from the platform the way back", flush=True)
-        name, password = WAY_IN["administrator"]
-        status, before = signed_in(name, password)
-        s.check(status == 303 and bool(before), f"{name} holds a session before the reset: {status}")
-        reset_code = platform(
-            "issue_claim_code", "--deployment", deployment_id, "--purpose", "reset-local-admin"
-        ).splitlines()[-1]
-        renewed = "Renewed-e2e-password"
-        status, _ = post(
-            "/sign-in/reset",
-            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
-            {},
-        )
-        s.check(status == 303, f"the code is redeemed and the password set: {status}")
-        status, _ = post("/sign-in", {"name": name, "password": password}, {})
-        s.check(status == 401, f"the lost password is refused now: {status}")
-        status, after = signed_in(name, renewed)
-        s.check(status == 303 and bool(after), f"the new one signs {name} in: {status}")
-        s.check(ADMIN_HOME in get("/", after), "still a deployment admin")
-        s.check(
-            ADMIN_HOME not in get("/", before),
-            "and the session held before the reset has ended",
-        )
-        status, _ = post(
-            "/sign-in/reset",
-            {"code": reset_code, "login": name, "password": renewed, "password_again": renewed},
-            {},
-        )
-        s.check(status != 303, f"and the code, once spent, is refused: {status}")
 
     return verdict(s)
 
