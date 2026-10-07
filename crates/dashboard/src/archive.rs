@@ -8,12 +8,17 @@
 //! version's default -- and whether the hold over the instance overrides it,
 //! how many records its storage holds and from when to when, as the plugin's
 //! heartbeat last said (W4.5), and how many the archive holds and from when
-//! to when, summed by the conductor from the moves (ReadMoves). Then its
-//! moves, newest first, one line each, paged by the kit's om-pager: when,
-//! what became of the unit, the kind, the unit, its count and span, and the
-//! rule or the person. Where no archive is allowed it says so, and that
-//! records past their window are kept; where one is, its bound. Nothing of a
-//! record's content is ever here: counts, times, the plugin's own keys.
+//! to when, summed by the conductor from the moves (ReadMoves), and the
+//! bytes it uses of the archive, as the plugin's heartbeat said
+//! (`StoredSpan.bytes`, named 2026-10-07), with the bytes of every kind
+//! together in the table's foot. Then its moves, newest first, one line
+//! each, paged by the kit's om-pager: when, what became of the unit, the
+//! kind, the unit, its count and span, and the rule or the person. Where no
+//! archive is allowed it says so, and that records past their window are
+//! kept; where one was and is withdrawn, that, and what it still holds;
+//! where one is, its bound and how much of it is used, or that it is full.
+//! Nothing of a record's content is ever here: counts, times, sizes, the
+//! plugin's own keys.
 //!
 //! **Allowing an archive** is a deployment admin's (W8.7: it grants
 //! resources, possibly unbounded): a dialog on the panel with the bound, or
@@ -143,6 +148,62 @@ fn when_cell(at_ns: i64) -> String {
     }
 }
 
+/// A size as a person reads it: whole bytes below a KiB, else to a tenth of
+/// the largest binary unit it reaches, rounded down so a size never reads
+/// as more than it is; integers throughout.
+pub fn bytes_said(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return if bytes == 1 {
+            "1 byte".into()
+        } else {
+            format!("{} bytes", thousands(bytes))
+        };
+    }
+    let mut unit = 1024u64;
+    let mut named = 0;
+    while named + 1 < UNITS.len() && bytes / unit >= 1024 {
+        unit *= 1024;
+        named += 1;
+    }
+    let tenths = u128::from(bytes) * 10 / u128::from(unit);
+    let (whole, tenth) = (tenths / 10, tenths % 10);
+    if tenth == 0 {
+        format!("{} {}", thousands(whole as u64), UNITS[named])
+    } else {
+        format!("{}.{tenth} {}", thousands(whole as u64), UNITS[named])
+    }
+}
+
+/// What a kind uses of the archive, in a cell: its size, or none.
+fn used_said(bytes: u64) -> String {
+    if bytes == 0 {
+        "none".into()
+    } else {
+        bytes_said(bytes)
+    }
+}
+
+/// How much of a bound is used, as the state line says it: "1.2 GiB of at
+/// most 50 GiB used", or that it is full; with no bound, the size alone.
+pub fn used_of(used: u64, most_bytes: u64) -> String {
+    if most_bytes == 0 {
+        format!("no bound, {} used", bytes_said(used))
+    } else if used >= most_bytes {
+        format!(
+            "full: {} of at most {} used",
+            bytes_said(used),
+            bytes_said(most_bytes)
+        )
+    } else {
+        format!(
+            "{} of at most {} used",
+            bytes_said(used),
+            bytes_said(most_bytes)
+        )
+    }
+}
+
 /// A bound as a person reads it.
 pub fn bound_said(most_bytes: u64) -> String {
     if most_bytes == 0 {
@@ -224,14 +285,43 @@ pub fn sections(panel: &Panel) -> (String, String) {
         Err(why) => (&[][..], None, &[][..], "", Some(why.as_str())),
     };
     let allowed = archive.filter(|archive| archive.allowed);
+    // What each kind uses of the archive, as the plugin last said.
+    let used = |kind: &str| {
+        report
+            .stored
+            .iter()
+            .find(|s| s.record_kind == kind)
+            .map_or(0, |s| s.bytes)
+    };
+    let used_in_all: u64 = report.stored.iter().map(|s| s.bytes).sum();
+    // An archive withdrawn: one recorded as no longer allowed, or records
+    // the archive still holds with none allowed now.
+    let withdrawn = allowed.is_none()
+        && (archive.is_some_and(|archive| !archive.allowed)
+            || archived.iter().any(|span| span.record_count > 0)
+            || used_in_all > 0);
     let state = match (allowed, unread) {
         (_, Some(_)) => "<span class=\"archive-state\" data-archive=\"unread\">The archive could not be read just now.</span>".to_string(),
         (Some(archive), None) => format!(
-            "<span class=\"archive-state\" data-archive=\"allowed\" title=\"Allowed by {by}, {at}\">\
-             Archive allowed, {bound}.</span>",
-            bound = escape(&bound_said(archive.most_bytes)),
+            "<span class=\"archive-state\" data-archive=\"{full}\" title=\"Allowed by {by}, {at}\">\
+             Archive allowed: {used}.</span>",
+            full = if archive.most_bytes > 0 && used_in_all >= archive.most_bytes {
+                "full"
+            } else {
+                "allowed"
+            },
+            used = escape(&used_of(used_in_all, archive.most_bytes)),
             by = escape(&crate::tickets::display_name(panel.records, &archive.updated_by)),
             at = escape(&utc(archive.updated_at_ns)),
+        ),
+        (None, None) if withdrawn => format!(
+            "<span class=\"archive-state\" data-archive=\"withdrawn\">Archive withdrawn: what it \
+             holds is kept{held}, and records past their window are kept in storage.</span>",
+            held = if used_in_all > 0 {
+                format!(", {}", escape(&bytes_said(used_in_all)))
+            } else {
+                String::new()
+            },
         ),
         (None, None) => "<span class=\"archive-state\" data-archive=\"none\">No archive allowed: \
              records past their window are kept.</span>"
@@ -246,7 +336,7 @@ pub fn sections(panel: &Panel) -> (String, String) {
     let mut overridden = Vec::new();
     let lines: String = if kinds.is_empty() {
         format!(
-            "<tr data-kind=\"\"><td>Its raw records</td><td class=\"wide\">{} days</td><td>as it keeps them</td><td>{}</td></tr>",
+            "<tr data-kind=\"\"><td>Its raw records</td><td class=\"wide\">{} days</td><td>as it keeps them</td><td>{}</td><td class=\"num\">none</td></tr>",
             report
                 .declaration
                 .as_ref()
@@ -272,11 +362,13 @@ pub fn sections(panel: &Panel) -> (String, String) {
                 );
                 let stored = report.stored.iter().find(|s| s.record_kind == kind.name);
                 let archived = archived.iter().find(|s| s.record_kind == kind.name);
+                let bytes = used(&kind.name);
                 format!(
                     "<tr data-kind=\"{name}\"><td title=\"{name}\">{label}</td>\
                      <td class=\"wide\" title=\"{window}\">{window}</td>\
                      <td data-stored title=\"{stored_said}\">{stored}</td>\
-                     <td data-archived title=\"{archived_said}\">{archived}</td></tr>",
+                     <td data-archived title=\"{archived_said}\">{archived}</td>\
+                     <td class=\"num\" data-used=\"{bytes}\" title=\"{bytes_exact} bytes\">{used}</td></tr>",
                     name = escape(&kind.name),
                     label = escape(&kind.label),
                     window = escape(&window),
@@ -284,6 +376,8 @@ pub fn sections(panel: &Panel) -> (String, String) {
                     stored = span_cell(stored),
                     archived_said = escape(&span_said(archived)),
                     archived = span_cell(archived),
+                    bytes_exact = thousands(bytes),
+                    used = escape(&used_said(bytes)),
                 )
             })
             .collect()
@@ -301,6 +395,23 @@ pub fn sections(panel: &Panel) -> (String, String) {
              younger is deleted.</p>",
             thousands(u64::from(hold)),
             escape(&overridden.join(", "))
+        )
+    };
+    // Every kind together, against the bound where there is one; nothing
+    // to add up where no archive is allowed and none holds anything.
+    let total = if allowed.is_none() && used_in_all == 0 {
+        String::new()
+    } else {
+        let against = allowed
+            .filter(|archive| archive.most_bytes > 0)
+            .map(|archive| format!(" of {}", bytes_said(archive.most_bytes)))
+            .unwrap_or_default();
+        format!(
+            "<tfoot><tr data-used-in-all=\"{used_in_all}\"><td>In all</td><td class=\"wide\"></td>\
+             <td></td><td></td><td class=\"num\" title=\"{exact} bytes\">{said}{against}</td></tr></tfoot>",
+            exact = thousands(used_in_all),
+            said = escape(&used_said(used_in_all)),
+            against = escape(&against),
         )
     };
     let rows: String = moves
@@ -326,6 +437,7 @@ pub fn sections(panel: &Panel) -> (String, String) {
                     record_count: moved.record_count,
                     first_received_ns: moved.first_received_ns,
                     last_received_ns: moved.last_received_ns,
+                    bytes: 0,
                 }))),
                 who = escape(&who),
             )
@@ -362,7 +474,9 @@ pub fn sections(panel: &Panel) -> (String, String) {
             "<section class=\"panel padded\" id=\"records\"><div class=\"row records-head\"><h2>Raw records</h2>\
              {state}{actions}</div>\
              <table class=\"list one-line kinds\"><thead><tr><th>Kind</th><th class=\"wide\">Window</th>\
-             <th>In storage</th><th>In the archive</th></tr></thead><tbody>{lines}</tbody></table>{held}</section>"
+             <th title=\"What its storage holds\">Stored</th><th title=\"What the archive holds\">Archived</th>\
+             <th class=\"num\" title=\"The bytes it uses of the archive, which the bound is counted against\">Size</th></tr></thead>\
+             <tbody>{lines}</tbody>{total}</table>{held}</section>"
         ),
         format!(
             "<section class=\"panel padded\" id=\"moves\"><div class=\"row moves-head\"><h2>Moves</h2>\

@@ -436,12 +436,15 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
                 record_count: 48_210,
                 first_received_ns: 1_554_076_800_000_000_000,
                 last_received_ns: now - 600_000_000_000,
+                // What its archived months use of the archive.
+                bytes: 3_435_973_837,
             },
             StoredSpan {
                 record_kind: "responses".into(),
                 record_count: 1_260,
                 first_received_ns: now - 30 * 86_400_000_000_000,
                 last_received_ns: now - 600_000_000_000,
+                bytes: 0,
             },
         ],
         ..Default::default()
@@ -736,6 +739,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                     record_count: (0..60).map(|n| 180 + n).sum(),
                     first_received_ns: 1_388_534_400_000_000_000,
                     last_received_ns: 1_388_534_400_000_000_000 + 60 * 30 * 86_400_000_000_000 - 1,
+                    bytes: 0,
                 }],
                 archive: archive.lock().unwrap().clone(),
             };

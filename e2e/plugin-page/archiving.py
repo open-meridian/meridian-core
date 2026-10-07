@@ -151,13 +151,28 @@ def seed():
         keep(held)
 
 
+def archived_bytes(held, name):
+    """The bytes a kind's units use of the archive (StoredSpan.bytes), as
+    the SDK sums them from its index: each archived unit's file."""
+    total = 0
+    for unit, entry in held.items():
+        if entry["kind"] == name and entry["where"] == "archive" and ARCHIVE:
+            try:
+                total += os.path.getsize(file_of(ARCHIVE, unit))
+            except OSError:
+                pass
+    return total
+
+
 def stored():
-    """What storage holds of each declared kind, for the heartbeat."""
+    """What storage holds of each declared kind, and what each uses of the
+    archive, for the heartbeat."""
     held = index()
     spans = []
     for name, _, _, _ in KINDS:
         units = [u for u in held.values() if u["kind"] == name and u["where"] == "storage"]
-        span = sidecar_pb2.StoredSpan(record_kind=name, record_count=sum(u["count"] for u in units))
+        span = sidecar_pb2.StoredSpan(record_kind=name, record_count=sum(u["count"] for u in units),
+                                      bytes=archived_bytes(held, name))
         if units:
             span.first_received_ns = min(u["first"] for u in units)
             span.last_received_ns = max(u["last"] for u in units)

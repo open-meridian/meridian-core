@@ -338,6 +338,15 @@ def the_access_editor_has_a_row_per_role(browser, prefix):
 
 SUMMARY = AREA + "summary"
 
+# The cells of a one-line table whose text the ellipsis cuts: each drawn
+# cell's content wider than its box. A phone's narrower cells leave their
+# dates and times to the cell's title, so nothing drawn is cut either, but a
+# kind's label, which its title holds whole.
+CUT = """(table) => [...document.querySelectorAll(table + ' :is(th, td)')]
+  .filter((c) => innerWidth > 640 || !c.closest('table.kinds') || c.cellIndex > 0)
+  .filter((c) => c.offsetParent !== null && c.scrollWidth > c.clientWidth + 1)
+  .map((c) => c.textContent.trim())"""
+
 
 def the_raw_records_and_the_holds(browser, prefix):
     """Contract v16: the Summary's raw records panel, Allow archive on it,
@@ -369,6 +378,17 @@ def the_raw_records_and_the_holds(browser, prefix):
         archived = page.get_attribute("#records tr[data-kind=activity] td[data-archived]", "title")
         check(stored.startswith("48,210, 2019-04-01 to "), f"at {size} what storage holds: {stored}")
         check(archived.startswith("12,570, 2014-01-01 to "), f"at {size} what the archive holds: {archived}")
+        used = page.inner_text("#records tr[data-kind=activity] td[data-used]")
+        none = page.inner_text("#records tr[data-kind=responses] td[data-used]")
+        check(used == "3.2 GiB" and none == "none", f"at {size} the bytes each kind uses of the archive: {used}, {none}")
+        foot = page.locator("#records tfoot tr[data-used-in-all]")
+        check(foot.count() == 1 and foot.is_visible() and "3.2 GiB" in foot.inner_text(),
+              f"at {size} every kind's bytes together, in the table's foot")
+        cut = page.evaluate(CUT, "#records table.kinds")
+        check(not cut, f"at {size} no cell of the raw records is cut off: {cut}")
+        state = page.inner_text("#records .archive-state")
+        check("Archive withdrawn" in state and "3.2 GiB" in state and "No archive allowed" not in state,
+              f"at {size} records in an archive no longer allowed: withdrawn, what it holds kept: {state}")
         held = page.inner_text("#records [data-hold]")
         check("2,190 days" in held and "responses_window_days" in held,
               f"at {size} the hold it is under, and the window it overrides: {held}")
@@ -386,7 +406,7 @@ def the_raw_records_and_the_holds(browser, prefix):
         page.screenshot(path=os.path.join(OUT, f"{prefix}-summary-moves-paged-{size}.png"))
         page.evaluate("h => { location.hash = h; }", "#part-records")
         page.wait_for_timeout(300)
-        if page.locator("#records [data-archive=none]").count():
+        if page.locator("#records [data-archive=withdrawn]").count():
             page.click("#records [data-allow-archive]")
             page.wait_for_timeout(300)
             boxed = inside_the_viewport(page)
@@ -401,8 +421,10 @@ def the_raw_records_and_the_holds(browser, prefix):
                 settled(page)
                 said = page.inner_text("#records .archive-state")
                 check("saved=1" in page.url and page.locator("#records").is_visible()
-                      and "Archive allowed, at most 50 GiB." in said,
-                      f"an archive allowed with a bound, back on the Summary: {said} ({page.url})")
+                      and "Archive allowed: 3.2 GiB of at most 50 GiB used." in said,
+                      f"an archive allowed with a bound, back on the Summary, its use against it: {said} ({page.url})")
+                foot = page.inner_text("#records tfoot tr[data-used-in-all]")
+                check("3.2 GiB of 50 GiB" in foot, f"every kind together against the bound: {foot}")
                 problems = page.evaluate(FIT)
                 check(not problems, f"the Summary with its archive allowed fits one screen"
                       f"{': ' + '; '.join(problems) if problems else ''}")
@@ -410,12 +432,14 @@ def the_raw_records_and_the_holds(browser, prefix):
                 page.click("#records [data-withdraw-archive]")
                 settled(page)
                 said = page.inner_text("#records .archive-state")
-                check("No archive allowed" in said, f"withdrawn, it says so again: {said}")
+                check("Archive withdrawn" in said, f"withdrawn, it says so again: {said}")
 
         page.goto(ADMIN_PAGE + "#holds")
         settled(page)
         rows = page.eval_on_selector_all("#holds table.holds tbody tr", "rows => rows.map(r => r.dataset.id)")
         check(set(rows) >= {"", "custody"}, f"at {size} the Holds tab lists each hold, one line each: {rows}")
+        cut = page.evaluate(CUT, "#holds table.holds")
+        check(not cut, f"at {size} no cell of the holds is cut off, when each was set among them: {cut}")
         problems = page.evaluate(FIT)
         check(not problems, f"the Holds tab at {size} fits one screen"
               f"{': ' + '; '.join(problems) if problems else ''}")

@@ -24,7 +24,9 @@
 //! MERIDIAN_ARCHIVE_DIR, or a bucket's prefix of its own in
 //! MERIDIAN_ARCHIVE_BUCKET and the account whose workload identity is scoped
 //! to it -- merged into the plugin's container, only when the conductor's
-//! CreatePlugin carries one allowed. Refused where the chart gives none.
+//! CreatePlugin carries one allowed, with its bound in bytes as
+//! MERIDIAN_ARCHIVE_MOST_BYTES where it has one. Refused where the chart
+//! gives none.
 
 use meridian_domain::v1::CreatePluginRequest;
 
@@ -266,6 +268,10 @@ pub fn manifest(
     Ok(manifest)
 }
 
+/// The archive's bound as the plugin is told it, beside where the archive
+/// is (W8.3): `PluginArchive.most_bytes`, set only where it is not none.
+pub const ARCHIVE_MOST_BYTES: &str = "MERIDIAN_ARCHIVE_MOST_BYTES";
+
 /// Whether a request carries an archive a deployment admin allowed.
 pub fn archive_allowed(request: &CreatePluginRequest) -> bool {
     request
@@ -322,6 +328,21 @@ pub fn with_archive(
                 Some(held) => held.extend(added.iter().cloned()),
                 None => container[field] = serde_json::Value::Array(added.clone()),
             }
+        }
+    }
+    // Its bound beside it, in bytes (named 2026-10-07); unset for none.
+    let most_bytes = request
+        .archive
+        .as_ref()
+        .map_or(0, |archive| archive.most_bytes);
+    if most_bytes > 0 {
+        let bound = serde_json::json!({
+            "name": ARCHIVE_MOST_BYTES,
+            "value": most_bytes.to_string(),
+        });
+        match container["env"].as_array_mut() {
+            Some(held) => held.push(bound),
+            None => container["env"] = serde_json::Value::Array(vec![bound]),
         }
     }
     if let Some(added) = shape["volumes"].as_array() {

@@ -22,7 +22,8 @@ helper does what an SDK's does:
    cannot lock.
 4. A unit past its window archived by the plugin as itself: in storage no
    more, in the archive, its move recorded naming the window, and the
-   Summary drawing the archive's span; a row's raw record resolves to
+   Summary drawing the archive's span and the bytes the unit uses of it
+   against the bound (StoredSpan.bytes); a row's raw record resolves to
    "archived, restorable".
 5. A restore asked for by a person with write, through the plugin's own
    route: read back from the restore area, recorded for that person; then
@@ -44,6 +45,7 @@ copies the harness out first; standard library only.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -131,7 +133,8 @@ def run():
 
     # 2. An archive allowed with a bound; archived then a choice.
     allowed = runner("archive", "allow", "--bound-gib", "50")
-    must("Archive allowed, at most 50 GiB." in allowed, f"step 2, the archive allowed: {allowed}")
+    must("Archive allowed: 0 bytes of at most 50 GiB used." in allowed,
+         f"step 2, the archive allowed, none of its bound used: {allowed}")
     runner("settings", "activity_past_window=archived")
 
     # 3. The hold; a window below it refused; write-once refused here.
@@ -150,6 +153,9 @@ def run():
          "step 4, the Summary draws the move, naming the window that made it")
     until("step 4, storage's count no longer holding the unit",
           lambda: "160, 2010-01-01 to " in summary("Raw records"))
+    until("step 4, the bytes the unit uses of the archive, against the bound",
+          lambda: re.search(r'data-used="[1-9][0-9]*"', summary("Raw records"))
+          and "KiB of at most 50 GiB used." in summary("Raw records"))
     resolved = get(f"/record?key={ARCHIVED}%237", level="read")
     must(resolved["resolves"] == "archived, restorable",
          f"step 4, a row's raw record resolves to archived, restorable: {resolved}")
@@ -204,7 +210,7 @@ def run():
           "per kind what its storage holds on its Summary; a deployment admin allows it an archive "
           "with a bound and sets a hold, a window below the hold is refused naming the setting and "
           "a write-once hold refused on a local archive; a unit past its window is archived by the "
-          "plugin, in storage no more, its move recorded naming the window and the archive's span "
+          "plugin, in storage no more, its move recorded naming the window, the archive's span and the bytes it uses against the bound "
           "drawn, and a row's record resolves to archived, restorable; a person with write restores "
           "it and reads it back, the restore recorded for them, and its return recorded; a deletion "
           "inside the hold is refused with its code and a window's deletion of an archived unit "

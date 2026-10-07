@@ -45,6 +45,7 @@ fn report() -> PluginReport {
             record_count: 48_210,
             first_received_ns: 1_554_076_800_000_000_000,
             last_received_ns: 1_790_380_500_000_000_000,
+            bytes: 1_288_490_189,
         }],
         ..Default::default()
     }
@@ -82,6 +83,7 @@ fn reply(allowed: bool) -> ReadMovesReply {
             record_count: 214,
             first_received_ns: 1_551_398_400_000_000_000,
             last_received_ns: 1_554_076_799_000_000_000,
+            bytes: 0,
         }],
         archive: allowed.then(|| PluginArchive {
             instance_id: INSTANCE.into(),
@@ -125,7 +127,23 @@ fn each_kind_is_one_line_of_storage_and_archive_and_each_move_one_line() {
         "{page}"
     );
     assert!(page.contains("data-kind=\"responses\""));
-    assert!(page.contains("Archive allowed, at most 50 GiB."));
+    assert!(
+        page.contains("Archive allowed: 1.2 GiB of at most 50 GiB used."),
+        "{page}"
+    );
+    assert!(
+        page.contains("data-used=\"1288490189\" title=\"1,288,490,189 bytes\">1.2 GiB</td>"),
+        "each kind's bytes in the archive: {page}"
+    );
+    assert!(
+        page.contains("data-used=\"0\" title=\"0 bytes\">none</td>"),
+        "a kind with nothing archived: {page}"
+    );
+    assert!(
+        page.contains("data-used-in-all=\"1288490189\"")
+            && page.contains(">1.2 GiB of 50 GiB</td>"),
+        "every kind together against the bound: {page}"
+    );
     assert!(page.contains("<om-pager><table class=\"list one-line moves\" data-moves=\"2\">"));
     assert!(page.contains("data-move=\"Restored\""));
     assert!(page.contains("activity_window_days 2555"));
@@ -137,10 +155,102 @@ fn each_kind_is_one_line_of_storage_and_archive_and_each_move_one_line() {
 }
 
 #[test]
+fn a_full_archive_says_so() {
+    let mut full = reply(true);
+    full.archive.as_mut().unwrap().most_bytes = 1_073_741_824;
+    let page = drawn(&AccessRecords::default(), &Ok(full), true);
+    assert!(
+        page.contains("data-archive=\"full\"")
+            && page.contains("Archive allowed: full: 1.2 GiB of at most 1 GiB used."),
+        "{page}"
+    );
+    let mut unbounded = reply(true);
+    unbounded.archive.as_mut().unwrap().most_bytes = 0;
+    let page = drawn(&AccessRecords::default(), &Ok(unbounded), true);
+    assert!(
+        page.contains("Archive allowed: no bound, 1.2 GiB used."),
+        "{page}"
+    );
+    assert!(
+        page.contains(">1.2 GiB</td></tr></tfoot>"),
+        "no bound to count against: {page}"
+    );
+}
+
+#[test]
+fn an_archive_withdrawn_with_records_in_it_says_withdrawn() {
+    // Recorded as withdrawn: what it holds is kept, and said.
+    let mut withdrawn = reply(true);
+    withdrawn.archive.as_mut().unwrap().allowed = false;
+    let page = drawn(&AccessRecords::default(), &Ok(withdrawn), true);
+    assert!(
+        page.contains("data-archive=\"withdrawn\"")
+            && page.contains("Archive withdrawn: what it holds is kept, 1.2 GiB, and records past their window are kept in storage."),
+        "{page}"
+    );
+    assert!(!page.contains("No archive allowed"), "{page}");
+    assert!(page.contains("Allow archive") && !page.contains("data-withdraw-archive"));
+    // Records archived and no archive record at all: withdrawn too.
+    let mut gone = reply(false);
+    gone.archived[0].record_count = 214;
+    let mut report = report();
+    report.stored[0].bytes = 0;
+    let (records, _) = sections(&Panel {
+        instance: INSTANCE,
+        report: Some(&report),
+        records: &AccessRecords::default(),
+        moves: &Ok(gone),
+        deployment_admin: false,
+        token: "",
+        cursor: "",
+    });
+    assert!(
+        records.contains("Archive withdrawn: what it holds is kept, and records past"),
+        "{records}"
+    );
+}
+
+#[test]
+fn a_size_reads_in_binary_units_rounded_down() {
+    assert_eq!(bytes_said(0), "0 bytes");
+    assert_eq!(bytes_said(1), "1 byte");
+    assert_eq!(bytes_said(1023), "1,023 bytes");
+    assert_eq!(bytes_said(1024), "1 KiB");
+    assert_eq!(bytes_said(1_210_000), "1.1 MiB");
+    assert_eq!(bytes_said(1_073_741_823), "1,023.9 MiB");
+    assert_eq!(bytes_said(53_687_091_200), "50 GiB");
+    assert_eq!(
+        bytes_said(u64::MAX),
+        "16,383.9 PiB",
+        "rounded down, never more than it is"
+    );
+    assert_eq!(used_of(0, 53_687_091_200), "0 bytes of at most 50 GiB used");
+}
+
+#[test]
 fn no_archive_says_records_past_their_window_are_kept_and_a_plugin_admin_sees_no_button() {
-    let page = drawn(&AccessRecords::default(), &Ok(reply(false)), false);
-    assert!(page.contains("No archive allowed: records past their window are kept."));
+    let mut report = report();
+    report.stored[0].bytes = 0;
+    let mut never = reply(false);
+    never.archived.clear();
+    let (page, _) = sections(&Panel {
+        instance: INSTANCE,
+        report: Some(&report),
+        records: &AccessRecords::default(),
+        moves: &Ok(never.clone()),
+        deployment_admin: false,
+        token: "",
+        cursor: "",
+    });
+    assert!(
+        page.contains("No archive allowed: records past their window are kept."),
+        "{page}"
+    );
     assert!(!page.contains("data-allow-archive"));
+    assert!(
+        !page.contains("<tfoot>"),
+        "no archive and nothing in one: no foot to add up: {page}"
+    );
     let admin = drawn(&AccessRecords::default(), &Ok(reply(false)), true);
     assert!(admin.contains("Allow archive") && !admin.contains("data-withdraw-archive"));
     let unread = drawn(&AccessRecords::default(), &Err("timed out".into()), true);

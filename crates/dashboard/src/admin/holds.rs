@@ -5,7 +5,10 @@
 //!
 //! One line a hold: the edge role it covers, or every one; the least days a
 //! record is kept anywhere, storage or archive; whether it needs records that
-//! cannot be altered; who set it and when. Set or changed in a dialog, and
+//! cannot be altered; who set it, and when, in full -- a phone keeps what it
+//! covers, the days and the day it was set, leaves who, write-once and the
+//! time to the cells' titles, and opens the dialog from what it covers, where
+//! 0 days clears it. Set or changed in a dialog, and
 //! cleared from its row, each a command to the conductor, which records it
 //! as its own record, refuses a write-once hold where the deployment's
 //! archive cannot lock, and tells each sidecar it covers.
@@ -33,12 +36,18 @@ pub fn section(records: &AccessRecords, token: &str) -> (String, String) {
                 "fields": {"role": hold.role, "days": hold.days.to_string()},
                 "checked": if hold.write_once { vec!["write_once"] } else { vec![] },
             });
+            let at = crate::custody::utc(hold.updated_at_ns);
+            let (day, time) = at.split_once(' ').unwrap_or((at.as_str(), ""));
             format!(
-                "<tr data-id=\"{role}\" data-name=\"{said}\"><td>{said}</td><td>{days} days</td>\
-                 <td>{once}</td><td title=\"{when}\">{by}, {when}</td><td class=\"actions\">\
+                "<tr data-id=\"{role}\" data-name=\"{said}\"><td title=\"{said}\">\
+                 <button type=\"button\" class=\"link\" data-dialog-open=\"hold\" data-title=\"Change the hold\" \
+                 data-fill=\"{fill}\">{said}</button></td><td>{days} days</td>\
+                 <td class=\"wide\">{once}</td><td class=\"wide\" title=\"{by}\">{by}</td>\
+                 <td title=\"{when} by {by}\" data-set>{day}<span class=\"dates\"> {time}</span></td>\
+                 <td class=\"actions\">\
                  <button type=\"button\" data-dialog-open=\"hold\" data-title=\"Change the hold\" \
                  data-fill=\"{fill}\">Edit</button>\
-                 <form method=\"post\" action=\"/admin/holds#holds\" class=\"inline\" \
+                 <form method=\"post\" action=\"/admin/holds#holds\" class=\"inline wide\" \
                  data-confirm=\"Clear this hold? A window may then be set shorter, and deletion comes sooner.\">{token}\
                  <input type=\"hidden\" name=\"role\" value=\"{role}\"><input type=\"hidden\" name=\"days\" value=\"0\">\
                  <button type=\"submit\">Clear</button></form></td></tr>",
@@ -47,7 +56,9 @@ pub fn section(records: &AccessRecords, token: &str) -> (String, String) {
                 days = thousands(u64::from(hold.days)),
                 once = if hold.write_once { "write-once" } else { "no" },
                 by = escape(&crate::tickets::display_name(records, &hold.updated_by)),
-                when = escape(&crate::custody::utc(hold.updated_at_ns)),
+                when = escape(&at),
+                day = escape(day),
+                time = escape(time),
                 fill = escape(&fill.to_string()),
             )
         })
@@ -59,7 +70,8 @@ pub fn section(records: &AccessRecords, token: &str) -> (String, String) {
     } else {
         format!(
             "<div class=\"scroll\"><table class=\"list one-line holds\" data-holds=\"{n}\"><thead><tr>\
-             <th>Covers</th><th>Kept at least</th><th>Write-once</th><th>Set</th><th></th></tr></thead>\
+             <th>Covers</th><th>Kept<span class=\"dates\"> at least</span></th><th class=\"wide\">Write-once</th>\
+             <th class=\"wide\">Set by</th><th>Set</th><th class=\"actions\"></th></tr></thead>\
              <tbody>{rows}</tbody></table></div>",
             n = records.holds.len()
         )
@@ -112,7 +124,28 @@ mod tests {
         ];
         let (body, _) = section(&records, "<t>");
         assert!(body.contains("data-holds=\"2\""));
-        assert!(body.contains("<td>Every edge role</td><td>400 days</td>"));
-        assert!(body.contains("<td>custody</td><td>2,190 days</td><td>write-once</td>"));
+        assert!(
+            body.contains(">Every edge role</button></td><td>400 days</td>"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                ">custody</button></td><td>2,190 days</td><td class=\"wide\">write-once</td>"
+            ),
+            "{body}"
+        );
+        // When it was set, in full: the day, then the time a phone leaves
+        // to the cell's title, never cut off mid-time.
+        assert!(
+            body.contains(
+                "<td title=\"2026-10-08 00:00 UTC by ada@example.com\" data-set>2026-10-08\
+                 <span class=\"dates\"> 00:00 UTC</span></td>"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("class=\"inline wide\""),
+            "Clear leaves a phone's row: {body}"
+        );
     }
 }

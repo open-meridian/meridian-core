@@ -182,7 +182,13 @@ font-size:.86rem;font-weight:600;line-height:1.4;white-space:nowrap}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
 @media (max-width:640px){.figures{grid-template-columns:repeat(2,minmax(0,1fr))}}\
 div.records-head,div.moves-head{flex-wrap:wrap;gap:.5rem 1rem}\
-@media (max-width:640px){table.kinds .wide,table.moves .wide,table.kinds .dates,table.moves .dates{display:none}}\
+table.kinds th:first-child{width:15%}table.kinds th.wide{width:21%}table.kinds th.num{width:14%}\
+table.holds th.actions{width:8.5rem}table.holds td.actions{text-align:right}\
+table.holds td button.link{border:0;background:none;box-shadow:none;padding:0;min-height:0;color:var(--accent);\
+font:inherit;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+@media (max-width:640px){table.kinds .wide,table.moves .wide,table.kinds .dates,table.moves .dates,\
+table.holds .wide,table.holds .dates{display:none}table.kinds th:first-child{width:30%}table.kinds th.num{width:22%}\
+table.holds .actions{display:none}table.holds th:first-child{width:38%}table.holds th:nth-child(2){width:30%}}\
 .figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\
 box-shadow:var(--shadow)}.figure-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}\
 .figure-label{min-width:0;color:var(--ink-soft);font-size:.86rem;font-weight:550;overflow-wrap:anywhere}\

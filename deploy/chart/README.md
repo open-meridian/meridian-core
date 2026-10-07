@@ -152,7 +152,10 @@ each, with a bound or none, on the plugin's Manage page, and the launcher
 restarts the instance with its archive beside its storage: its own directory of
 the local archive, named for the instance, at the path `MERIDIAN_ARCHIVE_DIR`
 names, or its own prefix of the bucket in `MERIDIAN_ARCHIVE_BUCKET`, the pod
-running as the bucket's account, never holding a key. Where the cluster has
+running as the bucket's account, never holding a key; and its bound, in bytes,
+in `MERIDIAN_ARCHIVE_MOST_BYTES`, unset where there is none, which the SDK
+refuses to archive past. The plugin's Summary shows how much of the archive
+each kind uses against the bound. Where the cluster has
 ValidatingAdmissionPolicy, a plugin's pod mounting the archive as anything but
 its own instance's directory is refused. Withdrawing it restarts the instance
 without it, and what it holds is kept; like storage, nothing in the deployment

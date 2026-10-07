@@ -402,7 +402,8 @@ pluginStorage:
 # sets), made into a volume of its own, `<release>-meridian-runtime-archive`;
 # or a claim already made on such storage (`existingClaim`). Each allowed
 # instance mounts its own directory of it, named for the instance, at the path
-# MERIDIAN_ARCHIVE_DIR names, in the plugin's container alone; an admission
+# MERIDIAN_ARCHIVE_DIR names, in the plugin's container alone, its bound in
+# MERIDIAN_ARCHIVE_MOST_BYTES where the deployment admin gave one; an admission
 # policy holds every pod to its own directory where the cluster can. Kept on
 # uninstall, never deleted by the deployment, and a local archive cannot lock:
 # a hold needing records that cannot be altered is refused, not claimed.

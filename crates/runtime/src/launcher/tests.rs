@@ -331,6 +331,54 @@ fn an_allowed_archive_is_the_instances_own_directory_in_the_plugins_container_al
 }
 
 #[test]
+fn the_archives_bound_is_given_beside_it_and_none_leaves_it_unset() {
+    let bound = |most_bytes: u64| CreatePluginRequest {
+        archive: Some(meridian_domain::v1::PluginArchive {
+            instance_id: "snaptrade-1".into(),
+            allowed: true,
+            most_bytes,
+            ..Default::default()
+        }),
+        ..request()
+    };
+    for shape in [LOCAL_ARCHIVE, BUCKET_ARCHIVE] {
+        let made = with_archive(pod(), Some(shape), &bound(53_687_091_200), &edge()).unwrap();
+        let env = made["spec"]["template"]["spec"]["containers"][1]["env"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let given: Vec<_> = env
+            .iter()
+            .filter(|e| e["name"] == ARCHIVE_MOST_BYTES)
+            .collect();
+        assert_eq!(given.len(), 1, "{env:?}");
+        assert_eq!(
+            given[0]["value"], "53687091200",
+            "a string, as every env value is"
+        );
+
+        let unbounded = with_archive(pod(), Some(shape), &bound(0), &edge()).unwrap();
+        let env = &unbounded["spec"]["template"]["spec"]["containers"][1]["env"];
+        assert!(
+            !env.as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == ARCHIVE_MOST_BYTES),
+            "0 is no bound, and the plugin is told none: {env}"
+        );
+    }
+    // The sidecar is told nothing of it.
+    let made = with_archive(pod(), Some(LOCAL_ARCHIVE), &bound(1), &edge()).unwrap();
+    assert_eq!(
+        made["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn no_archive_unless_one_is_allowed_and_the_chart_keeps_one() {
     // None carried, or one withdrawn: as before.
     assert_eq!(

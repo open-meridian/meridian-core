@@ -756,10 +756,24 @@ mod tests {
             } else {
                 0
             },
+            bytes: 0,
         };
         assert_eq!(
             stored_refused(
                 &[span("activity", 48_210), span("responses", 0)],
+                Some(&declaration)
+            ),
+            None
+        );
+        // What each kind uses of the archive (named 2026-10-07): any size,
+        // with records in storage or none left there.
+        let archived = |kind: &str, count: u64| StoredSpan {
+            bytes: 1_210_000,
+            ..span(kind, count)
+        };
+        assert_eq!(
+            stored_refused(
+                &[archived("activity", 48_210), archived("responses", 0)],
                 Some(&declaration)
             ),
             None
