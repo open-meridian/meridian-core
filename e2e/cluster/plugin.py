@@ -16,13 +16,15 @@ to the dashboard. That the page can be opened at all is ruling 19 of
 spec/deployment-dashboard-and-access: the reference plugin declares nothing
 to be granted, and an administrator opens any plugin's page.
 
-Then acting-for, on a copy of the plugin declaring `custody`, which holds
-the step its button takes (recording a statement): the administrator grants
-herself read on an account through it, and View shows her that account and
-offers no button, the plugin refusing the step's route under View; the grant
-becomes write, and Open's button records the statement. Granted write on the
-reference plugin too, the same button there is refused by its sidecar, since
-that plugin holds no role.
+Then link, then record, on a copy of the plugin declaring `custody`, which
+holds the step its button takes (recording a statement): it reported the
+external account it reaches, and the administrator links it to an account on
+the copy's Setup. She grants herself read on that account through it, and
+View shows her the account and offers no button, the plugin refusing the
+step's route under View; the grant becomes write, and Open's button records
+the statement for the linked external account. Granted write on the
+reference plugin too, which holds no role and so reported nothing to link,
+Open there offers no statement and says to link an account first.
 
 Last, the upload's path as the first terminal path with a permission behind
 it (kernel/terminal-sessions left this to it): the terminal's session is
@@ -191,7 +193,9 @@ def administer(context, action, fields, patience=0):
 
 
 # The template's one action, offered on its Accounts page under Open alone.
-BUTTON = "button:has-text('Open an empty statement for me')"
+BUTTON = "button:has-text('Open a statement')"
+# What the page says, in its place, while the plugin has linked nothing.
+LINK_FIRST = "Link an account first"
 
 
 def statement(page, instance, level="write"):
@@ -424,10 +428,34 @@ with sync_playwright() as playwright:
             page.locator("om-grid").count() == 0 and page.locator(BUTTON).count() == 0,
             "and, under Manage, shows no account's data and offers no action",
         )
+        check(
+            "holds no role that reports external accounts" in content,
+            "and says it has no external account to link, holding no role that reports one",
+        )
 
     # Acting-for, on the copy that holds the step: her access decides.
     admin = administer(context, "/admin/accounts", {"account_id": "", "name": "Custody copy account"})
     account = row_id(admin, "Accounts", "Custody copy account")
+
+    # Link, then record: the custody copy reported the external account its
+    # connection reaches when it started, and its admin links it to that
+    # account on its Setup page, under Manage, as the page's own form posts.
+    page.goto(f"{DASHBOARD}/plugins/{CUSTODY}/enter?level=admin")
+    page.wait_for_load_state()
+    unlinked = page.locator("om-account-map").count() == 1 and "Not linked" in page.inner_text("body")
+    check(unlinked, f"{CUSTODY}'s Setup lists the external account it reported, not linked: {page.url}")
+    status, text = page.evaluate(
+        "async ([account]) => { const map = document.querySelector('om-account-map');"
+        " const form = new URLSearchParams({csrf: map ? map.getAttribute('token') : '',"
+        " external_account_id: 'reference-1', account_id: account, intent: 'link'});"
+        " const r = await fetch('/link', {method: 'POST', body: form});"
+        " return [r.status, await r.text()]; }",
+        [account or ""],
+    )
+    check(
+        status == 200 and "Linked reference-1." in text and "Custody copy account" in text,
+        f"and links it to Custody copy account: {status} {sentence(text)}",
+    )
     admin = administer(
         context, "/admin/account-groups",
         {"account_group_id": "", "name": "Custody copy accounts", "account_ids": account or ""},
@@ -491,13 +519,21 @@ with sync_playwright() as playwright:
         f"and the statement asked for under View is refused: {status} {text}",
     )
 
-    # Write on the reference plugin, through the same permission: Open offers
-    # its button, and its sidecar refuses the step whoever asks, since the
-    # plugin holds no role.
-    said = pressed(page, INSTANCE, "Refused", 60)
+    # Write on the reference plugin, through the same permission: holding no
+    # role, it reported no external account, so nothing is linked, and Open
+    # offers no statement, saying to link an account first.
+    deadline = time.monotonic() + 60
+    while True:
+        page.goto(f"{DASHBOARD}/plugins/{INSTANCE}/enter?level=write")
+        page.wait_for_load_state()
+        body = page.inner_text("body")
+        if LINK_FIRST in body or time.monotonic() > deadline:
+            break
+        time.sleep(3)
     check(
-        said.startswith("Refused") and "holds no role" in said,
-        f"the reference plugin may not record a statement, whoever asks, holding no role: {said}",
+        LINK_FIRST in body and page.locator(BUTTON).count() == 0,
+        f"the reference plugin, having linked nothing, offers no statement and says to link first: "
+        f"{page.url} {sentence(page.content())}",
     )
 
     administer(
@@ -571,18 +607,18 @@ with sync_playwright() as playwright:
           "a save that fails to start is reported as crashed, with its traceback")
     at = revision
 
-    mended = saved(f"{scaffold}/__main__.py", main_py)
+    # Mended, and asking for what its roles do not grant -- reporting
+    # external accounts, holding no role -- which the sidecar refuses, and
+    # says so where the person developing it looks.
+    started = "        await plugin.report(healthy=True"
+    asking = main_py.replace(started, "        try:\n"
+                             "            await plugin.report_external_accounts(accounts=REACHES)\n"
+                             "        except meridian.MeridianError:\n"
+                             "            pass\n" + started, 1)
+    check(asking != main_py, "the scaffold's start is there to add to")
+    mended = saved(f"{scaffold}/__main__.py", asking)
     check(bool(waited(lambda: first(dev_events("dev.out"), "ready", mended), 60)),
           "and mended by the next save, without anybody restarting anything")
-    # Write on the live instance, so Open offers its button, which its
-    # sidecar refuses: it holds no role.
-    administer(
-        context, "/admin/access-groups",
-        {"access_group_id": access_group or "", "name": "Custody copy users",
-         "entries": f"{CUSTODY} write\n{INSTANCE} write\n{LIVE} write"},
-        patience=90,
-    )
-    pressed(page, LIVE, "Refused", 60)
     refused = waited(lambda: [e for e in said_json(cli(
         f"meridian plugin events --instance {LIVE} --since {mended - 1} --json")).get("events", [])
         if e.get("event") == "refused"], 30)
