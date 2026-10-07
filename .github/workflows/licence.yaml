@@ -1,0 +1,34 @@
+# Anyone outside the team who writes on an issue is asked, once, to agree to
+# the suggestion licence in CONTRIBUTING.md. The issue forms require the box,
+# but GitHub enforces a form only in the browser: an issue opened through the
+# API or the CLI skips it, an edit can untick it, and a comment never had it.
+#
+# The check is the shared action in meridian-core; this file is the same in
+# every public repository. Its decisions are tested by `make
+# licence-check-test`; this job is allowlisted in ci-mirror-check because it
+# acts on GitHub's issue events, which a laptop does not have.
+
+name: licence
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+
+# One run per issue at a time, so the bot never asks twice. A run looks at
+# the whole issue, so one that is replaced in the queue loses nothing.
+concurrency:
+  group: licence-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  licence:
+    if: ${{ !github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: open-meridian/meridian-core/.github/actions/licence-check@main

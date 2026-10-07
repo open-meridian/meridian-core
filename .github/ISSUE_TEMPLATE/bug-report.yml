@@ -22,7 +22,7 @@ body:
   - type: checkboxes
     id: licence
     attributes:
-      label: Your suggestion
+      label: Your report
       options:
         - label: I give Societal Lab Inc. a perpetual, irrevocable, worldwide, royalty-free licence to use what I've written here for any purpose, as CONTRIBUTING.md says.
           required: true

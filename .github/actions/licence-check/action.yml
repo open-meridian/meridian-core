@@ -1,0 +1,23 @@
+# The one copy of the suggestion-licence check, called by a small workflow in
+# each public repository (.github/workflows/licence.yaml). The logic, and why,
+# is in licence_check.py; `make licence-check-test` runs its tests.
+#
+# An action rather than a reusable workflow because an action finds its own
+# files at the ref it was called with ($GITHUB_ACTION_PATH), so the script
+# always matches the caller's pin; a reusable workflow would have to check out
+# meridian-core again, at a ref it cannot see.
+
+name: Suggestion licence
+description: Asks anyone outside the team who writes on an issue to agree, once, to the licence in CONTRIBUTING.md.
+
+runs:
+  using: composite
+  steps:
+    - name: Check the suggestion licence
+      shell: bash
+      env:
+        # The caller grants issues: write and nothing else.
+        GITHUB_TOKEN: ${{ github.token }}
+      # The script reads the event from GITHUB_EVENT_PATH as JSON; nothing an
+      # issue says is interpolated here.
+      run: python3 "$GITHUB_ACTION_PATH/licence_check.py"
