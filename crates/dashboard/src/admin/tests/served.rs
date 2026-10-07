@@ -14,6 +14,12 @@
 //! the browser proves is therefore the page and the dashboard's handling of
 //! what it posts, end to end, with only the store's persistence left out.
 //!
+//! And, from contract v16, the instance's raw records on its Summary --
+//! two kinds, what storage and the archive hold of each, sixty moves paged
+//! -- with Allow archive and Withdraw, and the holds on the deployment's
+//! Settings, behind a stand-in conductor answering ReadMoves, AllowArchive,
+//! WithdrawArchive and SetHold as the real one records them.
+//!
 //! Ignored in the ordinary run: it serves until it is stopped. The person
 //! signed in is a deployment admin, administering every plugin, and the
 //! session it starts is printed for the browser to present.
@@ -348,7 +354,130 @@ fn per_role(records: &mut AccessRecords) {
 fn records() -> AccessRecords {
     let mut records = settings_records();
     per_role(&mut records);
+    // The holds a deployment admin set (contract v16, W6.25).
+    records.holds = vec![
+        meridian_domain::v1::Hold {
+            role: String::new(),
+            days: 400,
+            write_once: false,
+            updated_by: ADMIN.into(),
+            updated_at_ns: 1_791_331_200_000_000_000,
+        },
+        meridian_domain::v1::Hold {
+            role: "custody".into(),
+            days: 2190,
+            write_once: false,
+            updated_by: ADMIN.into(),
+            updated_at_ns: 1_791_417_600_000_000_000,
+        },
+    ];
     records
+}
+
+/// SnapTrade's report as a v16 sidecar sends it: its figures, its
+/// declaration with two kinds of raw record, and what its storage holds of
+/// each (contract v16, W4.5, W4.8).
+fn report(now: i64) -> meridian_domain::v1::PluginReport {
+    use meridian_pb::v1::{
+        plugin_figure, NotCarried, NotCarriedReason, PluginDeclaration, PluginFigure,
+        RawRecordKind, StorageDeclaration, StoredSpan,
+    };
+    let figure = |label: &str, value: plugin_figure::Value| PluginFigure {
+        label: label.into(),
+        value: Some(value),
+        ..Default::default()
+    };
+    meridian_domain::v1::PluginReport {
+        plugin_instance_id: INSTANCE.into(),
+        roles: vec!["custody".into()],
+        registered: true,
+        healthy: true,
+        last_heartbeat_at_ns: now,
+        contract_version: "v16".into(),
+        reported_at_ns: now,
+        declared_settings: declared(),
+        figures: vec![
+            figure("Connections", plugin_figure::Value::Count(3)),
+            figure("Accounts reached", plugin_figure::Value::Count(7)),
+            figure(
+                "Last read",
+                plugin_figure::Value::AtNs(now - 300_000_000_000),
+            ),
+        ],
+        declaration: Some(PluginDeclaration {
+            secret_settings: vec!["client_id".into(), "consumer_key".into()],
+            not_carried: vec![NotCarried {
+                role: "custody".into(),
+                scheme: "snaptrade:position".into(),
+                name: "open_pnl".into(),
+                reason: NotCarriedReason::NoContractMeaning as i32,
+            }],
+            storage: Some(StorageDeclaration {
+                retention_days: 2555,
+                record_kinds: vec![
+                    RawRecordKind {
+                        name: "activity".into(),
+                        label: "Reported activity".into(),
+                        window_days: 2555,
+                        archivable: true,
+                    },
+                    RawRecordKind {
+                        name: "responses".into(),
+                        label: "Raw responses".into(),
+                        window_days: 30,
+                        archivable: true,
+                    },
+                ],
+            }),
+        }),
+        stored: vec![
+            StoredSpan {
+                record_kind: "activity".into(),
+                record_count: 48_210,
+                first_received_ns: 1_554_076_800_000_000_000,
+                last_received_ns: now - 600_000_000_000,
+            },
+            StoredSpan {
+                record_kind: "responses".into(),
+                record_count: 1_260,
+                first_received_ns: now - 30 * 86_400_000_000_000,
+                last_received_ns: now - 600_000_000_000,
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// Sixty months of an account's activity archived by its window, the
+/// latest restored for Ada: what the moves' pager pages (W4.13, W6.9).
+fn moves() -> Vec<meridian_domain::v1::MoveRecord> {
+    use meridian_pb::v1::{MoveOutcome, RecordMoveRequest};
+    let month = 30 * 86_400_000_000_000_i64;
+    let mut moves: Vec<_> = (0..60_i64)
+        .map(|n| meridian_domain::v1::MoveRecord {
+            r#move: Some(RecordMoveRequest {
+                record_kind: "activity".into(),
+                unit: format!("activity/FID-401K-1/{:04}-{:02}", 2014 + n / 12, n % 12 + 1),
+                record_count: 180 + n as u64,
+                first_received_ns: 1_388_534_400_000_000_000 + n * month,
+                last_received_ns: 1_388_534_400_000_000_000 + (n + 1) * month - 1,
+                outcome: MoveOutcome::Archived as i32,
+                rule: "activity_window_days 2555".into(),
+            }),
+            person: String::new(),
+            at_ns: 1_791_504_000_000_000_000 + n * 1_000_000_000,
+        })
+        .collect();
+    moves.reverse();
+    let mut restored = moves[0].clone();
+    if let Some(moved) = restored.r#move.as_mut() {
+        moved.outcome = MoveOutcome::Restored as i32;
+        moved.rule.clear();
+    }
+    restored.person = ADMIN.into();
+    restored.at_ns += 60_000_000_000;
+    moves.insert(0, restored);
+    moves
 }
 
 fn settings_records() -> AccessRecords {
@@ -578,6 +707,91 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         },
     );
 
+    // The stand-in conductor's archive and moves (contract v16): ReadMoves
+    // answered from the moves above, an archive allowed or withdrawn as
+    // asked, each hold kept as set.
+    let archive: Arc<Mutex<Option<meridian_domain::v1::PluginArchive>>> = Arc::default();
+    {
+        let archive = Arc::clone(&archive);
+        bus.serve(crate::archive::READ_MOVES, move |envelope| {
+            let asked = meridian_domain::v1::ReadMovesRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let all = moves();
+            let from = asked
+                .cursor
+                .strip_prefix("before-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            let page: Vec<_> = all.iter().skip(from).take(50).cloned().collect();
+            let next = if from + 50 < all.len() {
+                format!("before-{}", from + 50)
+            } else {
+                String::new()
+            };
+            let reply = meridian_domain::v1::ReadMovesReply {
+                moves: page,
+                next_cursor: next,
+                archived: vec![meridian_pb::v1::StoredSpan {
+                    record_kind: "activity".into(),
+                    record_count: (0..60).map(|n| 180 + n).sum(),
+                    first_received_ns: 1_388_534_400_000_000_000,
+                    last_received_ns: 1_388_534_400_000_000_000 + 60 * 30 * 86_400_000_000_000 - 1,
+                }],
+                archive: archive.lock().unwrap().clone(),
+            };
+            Ok(("".into(), reply.encode_to_vec()))
+        });
+    }
+    {
+        let archive = Arc::clone(&archive);
+        bus.serve(crate::archive::ALLOW_ARCHIVE, move |envelope| {
+            let asked = meridian_domain::v1::AllowArchiveRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let by = envelope.meta.clone().unwrap_or_default().acting_for_subject;
+            let allowed = meridian_domain::v1::PluginArchive {
+                instance_id: asked.instance_id,
+                allowed: true,
+                most_bytes: asked.most_bytes,
+                updated_by: by,
+                updated_at_ns: meridian_clock::SystemClock.now_ns(),
+            };
+            *archive.lock().unwrap() = Some(allowed.clone());
+            Ok(("".into(), allowed.encode_to_vec()))
+        });
+    }
+    {
+        let archive = Arc::clone(&archive);
+        bus.serve(crate::archive::WITHDRAW_ARCHIVE, move |_| {
+            let mut held = archive.lock().unwrap();
+            let withdrawn = meridian_domain::v1::PluginArchive {
+                allowed: false,
+                ..held.clone().unwrap_or_default()
+            };
+            *held = Some(withdrawn.clone());
+            Ok(("".into(), withdrawn.encode_to_vec()))
+        });
+    }
+    {
+        let held = Arc::clone(&held);
+        bus.serve("platform.config.command.set-hold", move |envelope| {
+            let asked = meridian_domain::v1::SetHoldRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let hold = meridian_domain::v1::Hold {
+                role: asked.role,
+                days: asked.days,
+                write_once: asked.write_once,
+                updated_by: envelope.meta.clone().unwrap_or_default().acting_for_subject,
+                updated_at_ns: meridian_clock::SystemClock.now_ns(),
+            };
+            let mut records = held.lock().unwrap();
+            records.holds.retain(|h| h.role != hold.role);
+            if hold.days > 0 {
+                records.holds.push(hold.clone());
+            }
+            Ok(("".into(), hold.encode_to_vec()))
+        });
+    }
+
     let kit = crate::kit::Kit::at(
         std::env::var("MERIDIAN_UI_DIR").unwrap_or_else(|_| crate::kit::IN_IMAGE.into()),
     )
@@ -607,6 +821,19 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     cache.store(held.lock().unwrap().clone(), clock.now_ns());
     let sessions = Arc::new(Sessions::default());
     let session = sessions.start(ADMIN, "Ada Admin", vec![], clock.now_ns());
+    // SnapTrade's report, heard afresh every half minute as its sidecar
+    // sends it, so its Summary is never stale.
+    let health: Arc<crate::health::Health> = Arc::default();
+    health.hear(INSTANCE, report(clock.now_ns()));
+    {
+        let health = Arc::clone(&health);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                health.hear(INSTANCE, report(meridian_clock::SystemClock.now_ns()));
+            }
+        });
+    }
     let app = Arc::new(App {
         first_run: false,
         wizard: Arc::new(crate::first_run::WizardSession::default()),
@@ -624,7 +851,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         plugins: Some(Arc::new(plugins)),
         registry: None,
         custody: Arc::default(),
-        health: Arc::default(),
+        health,
         kit: Some(Arc::new(kit)),
         bounds: Arc::default(),
         tickets: Arc::default(),

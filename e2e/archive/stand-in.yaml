@@ -1,0 +1,19 @@
+# Core's stand-in as two plugins at the edge built at contract v16, for `make
+# e2e-archive` (plans/an-edge-plugins-older-records-move-to-the-archive):
+# `custody`, given the harness's archive as a deployment admin allows one,
+# and `keeper`, given none, whose records past their window are kept. Each
+# keeps two kinds of raw record in its storage (e2e/plugin-page/archiving.py).
+x-stand-in: &stand-in
+  entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+  volumes:
+    - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+
+services:
+  custody:
+    <<: *stand-in
+    environment:
+      STAND_IN_ARCHIVE: "1"
+  keeper:
+    <<: *stand-in
+    environment:
+      STAND_IN_ARCHIVE: "1"

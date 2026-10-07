@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -26,6 +26,7 @@ help:
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make e2e-settings-page  a plugin's Settings pages in a real browser: the entry grid, its most, one screen"
 	@echo "  make harness-check  the plugin harness image runs three plugins, end to end"
+	@echo "  make e2e-archive    an edge plugin's records archived, restored and returned, a hold refusing on the harness"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
@@ -35,7 +36,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -846,7 +847,7 @@ e2e-settings-page:
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, every part and dialog fitting both sizes"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,
@@ -874,7 +875,7 @@ e2e-settings-page:
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty.
 HARNESS_IMAGE := meridian-harness:local
-HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py street.sql tickets.sql
+HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py moves.sql street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
@@ -1038,6 +1039,27 @@ e2e-access-per-role:
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/access-per-role/plugins.json >.harness/plugins.yaml
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/access-per-role/run.py
+
+# An edge plugin's older records move to the archive (contract v16), end to
+# end on the plugin harness: core's stand-in as two custody plugins built at
+# v16, one given the harness's archive and one none, a deployment admin
+# allowing the archive and setting a hold, the plugin archiving a unit past
+# its window, a person restoring it and reading it back, its return, and the
+# deletions and the window the hold refuses (e2e/archive/run.py says each
+# step). Its own compose project.
+e2e-archive:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "e2e-archive FAILED: the harness image did not build" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-archive FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/archive/plugins.json >.harness/plugins.yaml
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/archive/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1208,6 +1230,36 @@ chart-check:
 		&& echo "$$held" | grep -q '(ccm|custody|dgm|match|reporting|servicing|settlement)' \
 		&& echo "$$held" | grep -q 'meridian.dev/component: sidecar' \
 		|| { echo "chart-check FAILED: the admission policy on plugin pods does not render with their claim, the edge roles and its selector" >&2; exit 1; }
+	@# An archive for edge plugins' older records (contract v16): none by
+	@# default; a local one a volume and claim of their own, kept, the
+	@# conductor told, the launcher given its shape -- the instance's own
+	@# directory at MERIDIAN_ARCHIVE_DIR -- and the admission policy holding
+	@# every mount of it to that directory; a bucket the conductor told whether
+	@# it locks; and the values that cannot stand together refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	none="$$($(HELM) template check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$none" | grep -q 'MERIDIAN_ARCHIVE\|archive.json\|plugin-archive' \
+		&& { echo "chart-check FAILED: with no pluginArchive, an archive still renders" >&2; exit 1; }; \
+	local="$$($(HELM) template check deploy/chart $$base --set pluginArchive.path=/srv/archive \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null)"; \
+	echo "$$local" | awk '/^---/{c=0} /^kind: PersistentVolumeClaim$$/{c=1} c&&/^  name: check-meridian-runtime-archive$$/{n=1} c&&/helm.sh\/resource-policy: keep/{k=1} END{exit !(n&&k)}' \
+		|| { echo "chart-check FAILED: a local archive is not a claim of its own, kept on uninstall" >&2; exit 1; }; \
+	echo "$$local" | grep -A1 'name: MERIDIAN_ARCHIVE$$' | grep -q 'value: "path"' \
+		|| { echo "chart-check FAILED: the conductor is not told the deployment keeps a local archive" >&2; exit 1; }; \
+	echo "$$local" | grep '^  archive.json: ' | grep -q 'MERIDIAN_ARCHIVE_DIR.*subPath.*__INSTANCE__.*check-meridian-runtime-archive' \
+		|| { echo "chart-check FAILED: the launcher's archive shape is not the instance's own directory at MERIDIAN_ARCHIVE_DIR" >&2; exit 1; }; \
+	echo "$$local" | grep -q 'm.subPath == object.metadata.labels' \
+		|| { echo "chart-check FAILED: the admission policy does not hold an archive's mount to its instance's directory" >&2; exit 1; }; \
+	bucket="$$($(HELM) template check deploy/chart $$base --set pluginArchive.bucket=s3://firm/meridian \
+		--set pluginArchive.serviceAccount=archive-writer --set pluginArchive.objectLock=true 2>/dev/null)"; \
+	echo "$$bucket" | grep -A1 'name: MERIDIAN_ARCHIVE_LOCKS$$' | grep -q 'value: "true"' \
+		&& echo "$$bucket" | grep '^  archive.json: ' | grep -q 'MERIDIAN_ARCHIVE_BUCKET.*s3://firm/meridian/__INSTANCE__.*archive-writer' \
+		|| { echo "chart-check FAILED: a bucket archive does not render its prefix, its account and whether it locks" >&2; exit 1; }; \
+	for refused in "pluginArchive.bucket=s3://x" "pluginArchive.objectLock=true" \
+		"pluginArchive.path=/a,pluginArchive.existingClaim=c" "pluginArchive.path=/a,pluginArchive.bucket=s3://x,pluginArchive.serviceAccount=s"; do \
+		$(HELM) template check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: pluginArchive $$refused rendered, and cannot stand" >&2; exit 1; }; \
+	done; true
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }

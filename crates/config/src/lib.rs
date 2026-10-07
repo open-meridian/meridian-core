@@ -24,6 +24,7 @@
 //! [`meridian_access`], which the dashboard links too; this crate's store it
 //! does not, and `make check-crate-boundaries` keeps it that way.
 
+pub mod archive;
 pub mod ids;
 pub mod migrations;
 pub mod plugins;
@@ -35,19 +36,21 @@ pub mod store;
 
 mod memory;
 
+pub use archive::{ArchiveGrant, ArchiveKind};
 pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use plugins::serve_plugins;
+pub use plugins::serve_plugins_with;
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{
     all_accounts, all_plugins_admin, configuration, deployment_admin, install_named_administrator,
-    serve, Clock, Upstream,
+    serve, serve_with, Clock, Upstream,
 };
 pub use store::{
     AccessChangeKind, AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin,
-    LastChange, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
-    StoredSetting, Withdrawal,
+    LastChange, RecordedMove, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store,
+    StoreError, StoredSetting, Withdrawal,
 };
 
 #[cfg(test)]

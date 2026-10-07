@@ -189,9 +189,17 @@ fn run() -> Result<(), String> {
             key_path.clone(),
         );
 
+        // Where the deployment keeps archives, as the chart's pluginArchive
+        // says (W7.1, W8.7, contract v16): none, a local path, or a bucket
+        // per instance in a cloud's cold class, locking or not.
+        let archive = meridian_config::ArchiveGrant::named(
+            &var("MERIDIAN_ARCHIVE").unwrap_or_default(),
+            &var("MERIDIAN_ARCHIVE_LOCKS").unwrap_or_default(),
+        )?;
+
         // The config domain: registered and subscribed before the loop
         // starts, so nothing the dashboard or a sidecar asks is missed.
-        meridian_config::serve(
+        meridian_config::serve_with(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
@@ -201,16 +209,18 @@ fn run() -> Result<(), String> {
             Arc::new(meridian_config::SettingsKey::at(
                 var("MERIDIAN_SETTINGS_KEY_DIR").unwrap_or_else(|| SETTINGS_KEY.into()),
             )),
+            archive,
         );
 
         // W8: the plugin catalogue, and launching from it. Every launch
         // runs an image from the deployment's own registry as each node
         // reaches it, by digest (spec/the-local-plugin-registry).
-        meridian_config::serve_plugins(
+        meridian_config::serve_plugins_with(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
+            archive,
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing

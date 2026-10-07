@@ -37,6 +37,32 @@ pub const EDGE_ROLES: [&str; 7] = [
     "settlement",
 ];
 
+/// A count as a sentence says it, "2,190": a hold's days and a span's
+/// records (contract v16), which the sidecar's refusal, the conductor's and
+/// the dashboard's pages each name, and must name alike.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_count_is_grouped_by_thousands() {
+        assert_eq!(super::thousands(0), "0");
+        assert_eq!(super::thousands(999), "999");
+        assert_eq!(super::thousands(2190), "2,190");
+        assert_eq!(super::thousands(1_000_000_000), "1,000,000,000");
+    }
+}
+
 #[allow(clippy::all)]
 pub mod v1 {
     include!("v1.rs");

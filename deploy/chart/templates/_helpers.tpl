@@ -197,6 +197,64 @@ ccm,custody,dgm,match,reporting,servicing,settlement
   plugin's name, a placeholder in the launcher's copy) for the claim the
   launcher makes, which it alone may mount again, for the same plugin.
 */}}
+{{/*
+  The deployment's archive (contract v16; values.yaml's pluginArchive): `path`
+  for a volume made from a directory on the node or a claim already made,
+  `bucket` for a cloud's, or nothing. The one place the rule is said, so the
+  conductor, the launcher and the admission policy cannot disagree.
+*/}}
+{{- define "meridian-runtime.archiveKind" -}}
+{{- $a := .Values.pluginArchive | default dict -}}
+{{- if and (or $a.path $a.existingClaim) $a.bucket -}}
+{{- fail "pluginArchive names a local archive (path or existingClaim) and a bucket; a deployment keeps its archives in one place" -}}
+{{- end -}}
+{{- if and $a.path $a.existingClaim -}}
+{{- fail "pluginArchive names a path and an existing claim; name one" -}}
+{{- end -}}
+{{- if and $a.objectLock (not $a.bucket) -}}
+{{- fail "pluginArchive.objectLock is set without a bucket; only a cloud bucket made with object lock can hold records that cannot be altered" -}}
+{{- end -}}
+{{- if and $a.bucket (not $a.serviceAccount) -}}
+{{- fail "pluginArchive.bucket is set without a serviceAccount; an allowed instance reaches its bucket through a workload identity scoped to it, never a key" -}}
+{{- end -}}
+{{- if or $a.path $a.existingClaim -}}path{{- else if $a.bucket -}}bucket{{- end -}}
+{{- end -}}
+
+{{/* The claim a local archive is, by name. */}}
+{{- define "meridian-runtime.archiveClaim" -}}
+{{- $a := .Values.pluginArchive | default dict -}}
+{{- if $a.existingClaim -}}{{ $a.existingClaim }}{{- else if $a.path -}}{{ include "meridian-runtime.fullname" . }}-archive{{- end -}}
+{{- end -}}
+
+{{/*
+  What an allowed instance is given beside its storage, as the launcher
+  merges it into the plugin's container (W8.3, W8.7): a local archive's
+  directory of its own, mounted at MERIDIAN_ARCHIVE_DIR, or a bucket's prefix
+  of its own in MERIDIAN_ARCHIVE_BUCKET and the account scoped to it. The
+  instance a placeholder the launcher fills in once it has checked it.
+*/}}
+{{- define "meridian-runtime.archiveShape" -}}
+{{- $kind := include "meridian-runtime.archiveKind" . -}}
+{{- if eq $kind "path" }}
+env:
+  - name: MERIDIAN_ARCHIVE_DIR
+    value: /var/lib/meridian/archive
+volumeMounts:
+  - name: archive
+    mountPath: /var/lib/meridian/archive
+    subPath: __INSTANCE__
+volumes:
+  - name: archive
+    persistentVolumeClaim:
+      claimName: {{ include "meridian-runtime.archiveClaim" . }}
+{{- else if eq $kind "bucket" }}
+env:
+  - name: MERIDIAN_ARCHIVE_BUCKET
+    value: {{ printf "%s/__INSTANCE__" (trimSuffix "/" .Values.pluginArchive.bucket) | quote }}
+serviceAccountName: {{ .Values.pluginArchive.serviceAccount | quote }}
+{{- end }}
+{{- end -}}
+
 {{- define "meridian-runtime.pluginStorage" -}}
 {{- $top := .top -}}
 apiVersion: v1

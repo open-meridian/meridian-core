@@ -95,6 +95,11 @@ delivery stream for the re-resolutions it hears (W2.16), a GET of /heard
 says what arrived, and /activity answers the re-resolutions read beside the
 activities.
 
+With STAND_IN_ARCHIVE set it is a plugin at the edge built at contract v16,
+keeping two kinds of raw record in its storage and moving them to its
+archive, back for a person and away (`make e2e-archive`): archiving.py beside
+this says how.
+
 With STAND_IN_TOOLS set it is a plugin built at contract v15 holding custody
 and operations (`make e2e-access-per-role`, steps 5 and 6): it registers
 declaring v15, its pages naming both roles and no setting, and three MCP
@@ -231,6 +236,10 @@ def heartbeat(nine=False):
 
 # ── Contract v15: built at v15, its tools by role (STAND_IN_TOOLS) ──
 TOOLS = bool(os.environ.get("STAND_IN_TOOLS"))
+# ── Contract v16: at the edge, its raw records archived (STAND_IN_ARCHIVE) ──
+ARCHIVING = bool(os.environ.get("STAND_IN_ARCHIVE"))
+if ARCHIVING:
+    import archiving
 BOTH = ["custody", "operations"]
 TOOL_ROUTES = {
     "/tool/open": ("open_balance", "Record the fund's opening balance", ["operations"]),
@@ -275,7 +284,10 @@ def register():
         request_serializer=lambda raw: raw,
         response_deserializer=sidecar_pb2.RegisterReply.FromString,
     )
-    request = v15_registration() if TOOLS else older_registration()
+    if ARCHIVING:
+        request = archiving.registration(PORT)
+    else:
+        request = v15_registration() if TOOLS else older_registration()
     for _ in range(60):
         try:
             reply = register_call(request, timeout=2)
@@ -953,9 +965,22 @@ def decoded(header):
 
 
 class Page(http.server.BaseHTTPRequestHandler):
+    def answer_json(self, said):
+        body = json.dumps(said).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         callers = self.headers.get_all("Meridian-Caller") or []
         path, _, query = self.path.partition("?")
+        if ARCHIVING:
+            said = archiving.get(path, {k: v[0] for k, v in urllib.parse.parse_qs(query).items()})
+            if said is not None:
+                self.answer_json(said)
+                return
         if path in ("/activity", "/sync", "/heard"):
             asked = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
             if path == "/heard":
@@ -1017,6 +1042,12 @@ class Page(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         callers = self.headers.get_all("Meridian-Caller") or []
         sent = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if ARCHIVING:
+            form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
+            said = archiving.post(self.path, form, callers[0] if callers else None)
+            if said is not None:
+                self.answer_json(said)
+                return
         if self.path == "/report":
             done = report()
         elif self.path == "/figures":
@@ -1103,7 +1134,10 @@ if __name__ == "__main__":
         print("stand-in: failing on its first start, as told", flush=True)
         raise SystemExit(1)
     register()
-    threading.Thread(target=watch_settings, daemon=True).start()
+    if ARCHIVING:
+        archiving.start()
+    else:
+        threading.Thread(target=watch_settings, daemon=True).start()
     if os.environ.get("STAND_IN_REPORTS_AT_START"):
         threading.Thread(target=report_at_start, daemon=True).start()
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Page).serve_forever()

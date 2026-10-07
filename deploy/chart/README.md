@@ -124,3 +124,40 @@ place for it. Encryption at rest, snapshots and backups are the storage
 class's and the cluster's, as they are for the database; the claims carry
 `meridian.dev/component: plugin-storage` for a backup policy to select.
 `pluginStorage.enabled: false` gives no plugin storage.
+
+## An archive for older records
+
+Past each kind of raw record's window, a plugin at the edge may move its
+older records to an archive rather than delete them, at its admin's choice
+(contract v16; spec/an-edge-plugins-older-records-move-to-the-archive).
+`pluginArchive` says where the deployment keeps archives, and none is the
+default: nothing is archived, and records past their window are kept in
+storage.
+
+- **A local or on-premises deployment**: `pluginArchive.path`, a directory on
+  the node -- a NAS export or a second disk mounted there; what `meridian up
+  --archive <path>` sets -- made into a volume and a claim of their own,
+  `<release>-meridian-runtime-archive`, `pluginArchive.size`; or
+  `pluginArchive.existingClaim`, a claim already made on shared storage, for a
+  cluster of more than one node.
+- **A cloud**: `pluginArchive.bucket`, a bucket in the provider's cold class
+  (`s3://...`, `gs://...` or an Azure container URL), and
+  `pluginArchive.serviceAccount`, the account whose workload identity is
+  scoped to it; `pluginArchive.objectLock: true` where the bucket was made
+  with object lock in compliance mode. The chart and the launcher make no
+  bucket: name one made for the deployment.
+
+Setting one allows no instance an archive by itself. A deployment admin allows
+each, with a bound or none, on the plugin's Manage page, and the launcher
+restarts the instance with its archive beside its storage: its own directory of
+the local archive, named for the instance, at the path `MERIDIAN_ARCHIVE_DIR`
+names, or its own prefix of the bucket in `MERIDIAN_ARCHIVE_BUCKET`, the pod
+running as the bucket's account, never holding a key. Where the cluster has
+ValidatingAdmissionPolicy, a plugin's pod mounting the archive as anything but
+its own instance's directory is refused. Withdrawing it restarts the instance
+without it, and what it holds is kept; like storage, nothing in the deployment
+deletes an archive or a volume made for one, uninstalling included.
+
+A hold that needs records that cannot be altered is accepted only where
+`pluginArchive.objectLock` says the bucket enforces it; on a local archive it
+is refused rather than claimed.

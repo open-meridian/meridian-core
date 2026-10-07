@@ -61,6 +61,10 @@ pub struct Registration {
     /// claim to; and a sentence for each it refused ([`crate::tools`]).
     pub tools: Vec<meridian_pb::v1::ToolDeclaration>,
     pub tool_refusals: Vec<String>,
+    /// What each kind of raw record holds in its storage, as its last
+    /// accepted heartbeat said (W4.5, contract v16), which its report
+    /// carries; none after a heartbeat that was refused.
+    pub stored: Vec<meridian_pb::v1::StoredSpan>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -441,6 +445,7 @@ impl SidecarService for Sidecar {
             not_carried_seen: Vec::new(),
             tools,
             tool_refusals,
+            stored: Vec::new(),
         });
         self.changed.notify_one();
 
@@ -470,26 +475,45 @@ impl SidecarService for Sidecar {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        self.admitted()?;
+        let registration = self.admitted()?;
         let req = request.into_inner();
 
         // Its figures past a bound refuse the heartbeat whole, never cut
         // (W4.5). It still says the plugin is alive: reported not healthy,
         // the refusal as the reason, and no figures rather than stale ones,
         // so a malformed figure is seen on the Summary and never taken for
-        // silence.
-        let refused = crate::figures::check(&req.figures)
+        // silence. What each kind holds in storage likewise (contract v16),
+        // refused naming the field by its path.
+        let refused: Option<(String, Vec<String>)> = crate::figures::check(&req.figures)
             .err()
-            .or_else(|| crate::edge::seen_refused(&req.not_carried_seen));
-        let (healthy, detail, figures, seen) = match &refused {
-            Some(refusal) => (
+            .or_else(|| crate::edge::seen_refused(&req.not_carried_seen))
+            .map(|refusal| (refusal, Vec::new()))
+            .or_else(|| {
+                crate::edge::stored_refused(&req.stored, registration.declaration.as_ref())
+                    .map(|(path, words)| (words, vec![path]))
+            });
+        let (healthy, detail, figures, seen, stored) = match &refused {
+            Some((refusal, _)) => (
                 false,
                 format!("the plugin's heartbeat was refused: {refusal}"),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ),
-            None if req.healthy => (true, String::new(), req.figures, req.not_carried_seen),
-            None => (false, req.detail.clone(), req.figures, req.not_carried_seen),
+            None if req.healthy => (
+                true,
+                String::new(),
+                req.figures,
+                req.not_carried_seen,
+                req.stored,
+            ),
+            None => (
+                false,
+                req.detail.clone(),
+                req.figures,
+                req.not_carried_seen,
+                req.stored,
+            ),
         };
 
         let mut changed = false;
@@ -497,12 +521,14 @@ impl SidecarService for Sidecar {
             changed = state.healthy != healthy
                 || state.health_detail != detail
                 || state.figures != figures
-                || state.not_carried_seen != seen;
+                || state.not_carried_seen != seen
+                || state.stored != stored;
             state.healthy = healthy;
             state.last_heartbeat_ns = self.clock.now_ns();
             state.health_detail = detail;
             state.figures = figures;
             state.not_carried_seen = seen;
+            state.stored = stored;
         }
         // What the report says moved, so it goes out now rather than at the
         // next interval; a heartbeat repeating the last says nothing new.
@@ -510,12 +536,17 @@ impl SidecarService for Sidecar {
             self.changed.notify_one();
         }
 
-        if let Some(refusal) = refused {
+        if let Some((refusal, fields)) = refused {
             tracing::warn!(refusal, "the plugin's heartbeat was refused");
             if let Some(live) = self.live.get() {
                 live.refused(&format!("its heartbeat: {refusal}"));
             }
-            return Err(Status::invalid_argument(refusal));
+            return Err(crate::typed::refused_naming(
+                tonic::Code::InvalidArgument,
+                refusal,
+                meridian_pb::v1::RefusalReason::Unspecified,
+                fields,
+            ));
         }
         if !req.healthy {
             tracing::warn!(detail = req.detail, "plugin reports itself unhealthy");
@@ -594,16 +625,14 @@ impl SidecarService for Sidecar {
         self.filed_tickets_for_person(request).await
     }
 
-    /// W4.13, contract v16. Answered unimplemented until this sidecar serves
-    /// v16 (its CONTRACT_CURRENT), as W4.1 says an older sidecar answers:
-    /// a plugin built at v16 is refused at registration first.
+    /// W4.13, contract v16: one unit of a kind of raw record moved, as the
+    /// plugin itself for a window's move or acting for a person
+    /// ([`crate::moves`]).
     async fn record_move(
         &self,
-        _request: Request<RecordMoveRequest>,
+        request: Request<RecordMoveRequest>,
     ) -> Result<Response<RecordMoveReply>, Status> {
-        Err(Status::unimplemented(
-            "this sidecar does not record a move of raw records yet (W4.13, contract v16)",
-        ))
+        self.record_move_reported(request).await
     }
 }
 
@@ -782,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v16"] {
+        for declared in ["v1", "v17"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -791,7 +820,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v15"));
+            assert!(reply.refusal_reason.contains("v2 through v16"));
             assert!(sc.registration().is_none());
         }
     }

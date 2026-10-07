@@ -127,8 +127,19 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// access table per role, and a person's command admitted by the role whose
 /// grants hold it. A plugin built before names no role on its declarations,
 /// which on a plugin holding several serve every role, and reads the claims'
-/// level and account sets, the union over the roles.
-pub const CONTRACT_CURRENT: u32 = 15;
+/// level and account sets, the union over the roles. v16 is an edge
+/// plugin's older records moving to the archive (spec/an-edge-plugins-older-
+/// records-move-to-the-archive; sdk-contract/an-edge-plugins-older-records-
+/// move-to-the-archive): the kinds of raw record in the declaration, each
+/// kind's window settings' names reserved ([`crate::edge`]), what each kind
+/// holds in storage on the heartbeat, carried in the report, and
+/// `SidecarService.RecordMove`, by which a plugin at the edge reports a unit
+/// archived, restored, returned or deleted, refused inside the hold over its
+/// instance with `REFUSAL_REASON_WITHIN_HOLD` ([`crate::moves`]). A plugin
+/// built on it would meet `UNIMPLEMENTED` at its first move on an older
+/// sidecar, rather than a refusal at registration naming both versions. A
+/// plugin built before declares no kinds and moves nothing.
+pub const CONTRACT_CURRENT: u32 = 16;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -376,7 +387,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v15); rebuild it against v2 or later"
+                 (v2 through v16); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -385,11 +396,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v16"),
+            admit("v17"),
             Err(
-                "the plugin was built against contract v16, newer than this sidecar \
-                 (v2 through v15); upgrade the runtime, or rebuild the plugin against \
-                 v15 or earlier"
+                "the plugin was built against contract v17, newer than this sidecar \
+                 (v2 through v16); upgrade the runtime, or rebuild the plugin against \
+                 v16 or earlier"
                     .into()
             )
         );
@@ -400,7 +411,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v15"
+                "the plugin declared no contract version; this sidecar accepts v2 through v16"
                     .into()
             )
         );

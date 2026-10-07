@@ -14,11 +14,11 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::{
-    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, KnownPluginRoles,
-    Permission, PluginCatalogue, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord,
-    UserGroup,
+    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
+    KnownPluginRoles, MoveRecord, Permission, PluginArchive, PluginCatalogue, PluginLaunch,
+    PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
-use meridian_pb::v1::SettingDeclaration;
+use meridian_pb::v1::{MoveOutcome, SettingDeclaration, StoredSpan};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -355,6 +355,62 @@ pub struct Snapshot {
     /// the change records: who the settings record says last changed them,
     /// and when. Empty `by` for a clear the plugin's re-declaration made.
     pub settings_changed: BTreeMap<String, LastChange>,
+    /// The holds on raw records standing now (W6.25, contract v16), one per
+    /// edge role or one for every role (an empty role), each as its latest
+    /// record says it; a hold cleared (0 days) is not among them.
+    pub holds: Vec<Hold>,
+    /// Each instance's archive as its latest record says it (W8.7, contract
+    /// v16), allowed or withdrawn; an instance never allowed one has none.
+    pub archives: Vec<PluginArchive>,
+}
+
+/// One move of raw records as the store keeps it (W4.13, contract v16): its
+/// number, which the moves' pages count back from, the instance, the move as
+/// recorded, and the delegation the person acted through where they used
+/// one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedMove {
+    pub move_id: i64,
+    pub instance_id: String,
+    pub record: MoveRecord,
+    pub delegation: String,
+}
+
+/// Whether the archive holds a unit whose latest move this is: archived,
+/// restored from it, or returned to it; not once deleted.
+pub fn in_the_archive(outcome: i32) -> bool {
+    [
+        MoveOutcome::Archived as i32,
+        MoveOutcome::Restored as i32,
+        MoveOutcome::Returned as i32,
+    ]
+    .contains(&outcome)
+}
+
+/// What the archive holds of each kind (W6.9): the units whose latest move
+/// leaves them in it, summed per kind, from the first record received to
+/// the last. Given each unit's latest move, in any order.
+pub fn archived_spans<'a>(
+    latest: impl IntoIterator<Item = &'a meridian_pb::v1::RecordMoveRequest>,
+) -> Vec<StoredSpan> {
+    let mut kinds: BTreeMap<String, StoredSpan> = BTreeMap::new();
+    for held in latest {
+        if !in_the_archive(held.outcome) {
+            continue;
+        }
+        let span = kinds
+            .entry(held.record_kind.clone())
+            .or_insert_with(|| StoredSpan {
+                record_kind: held.record_kind.clone(),
+                ..Default::default()
+            });
+        span.record_count += held.record_count;
+        if span.first_received_ns == 0 || held.first_received_ns < span.first_received_ns {
+            span.first_received_ns = held.first_received_ns;
+        }
+        span.last_received_ns = span.last_received_ns.max(held.last_received_ns);
+    }
+    kinds.into_values().collect()
 }
 
 /// Each known plugin's roles as the records carry them (W6.1, contract v15).
@@ -568,4 +624,37 @@ pub trait Store: Send + Sync {
     /// End an instance's live launch, returning it as ended, or None when
     /// none was live.
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>>;
+
+    /// A hold set, changed or cleared (0 days), as its own record (W6.25,
+    /// decisions/031): the role, the days and write-once as set, who
+    /// (`hold.updated_by`), through which delegation, and when
+    /// (`hold.updated_at_ns`). The snapshot's holds are each role's latest.
+    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()>;
+
+    /// An instance's archive allowed, its bound changed, or withdrawn, as its
+    /// own record (W8.7, decisions/031): who and when are the archive's own
+    /// `updated_by` and `updated_at_ns`.
+    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()>;
+
+    /// A move of raw records, as its own record (W4.13, decisions/031);
+    /// false, and nothing recorded, when the unit's latest move is the same
+    /// outcome -- a retry, answered as recorded.
+    fn record_move(&self, instance_id: &str, record: &MoveRecord, delegation: &str)
+        -> Result<bool>;
+
+    /// The latest move of one unit of a kind, if it ever moved.
+    fn latest_move(
+        &self,
+        instance_id: &str,
+        record_kind: &str,
+        unit: &str,
+    ) -> Result<Option<MoveRecord>>;
+
+    /// One instance's moves, newest first: at most `limit`, those numbered
+    /// below `before` where it is not 0.
+    fn moves(&self, instance_id: &str, before: i64, limit: usize) -> Result<Vec<RecordedMove>>;
+
+    /// What the archive holds of each of an instance's kinds
+    /// ([`archived_spans`]).
+    fn archived(&self, instance_id: &str) -> Result<Vec<StoredSpan>>;
 }

@@ -108,7 +108,7 @@ fn at_path(code: Code, path: &str, words: String) -> Status {
 /// The assertion the call carries, if it carries one; a malformed one is
 /// not the dashboard's.
 #[allow(clippy::result_large_err)]
-fn carried(metadata: &MetadataMap) -> Result<Option<CallerAssertion>, Status> {
+pub(crate) fn carried(metadata: &MetadataMap) -> Result<Option<CallerAssertion>, Status> {
     let Some(value) = metadata.get(HEADER) else {
         return Ok(None);
     };

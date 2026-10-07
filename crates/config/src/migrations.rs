@@ -103,6 +103,14 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0013_access_is_granted_per_role.sql"),
         then: Some(access_per_role),
     },
+    Migration {
+        version: 14,
+        name: "an_edge_plugins_older_records_move_to_the_archive",
+        sql: include_str!(
+            "../migrations/0014_an_edge_plugins_older_records_move_to_the_archive.sql"
+        ),
+        then: None,
+    },
 ];
 
 /// Migration 13 (contract v15): each access group's gap record, then the

@@ -19,6 +19,7 @@
 
 pub mod accounts;
 pub mod admin;
+pub mod archive;
 pub mod area;
 pub mod brand;
 pub mod catalogue;

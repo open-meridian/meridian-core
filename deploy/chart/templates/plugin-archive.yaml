@@ -1,0 +1,52 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.pluginArchive.path }}
+{{- $kind := include "meridian-runtime.archiveKind" . }}
+{{- $claim := include "meridian-runtime.archiveClaim" . }}
+{{/*
+  A local archive from a directory on the node (contract v16; values.yaml's
+  pluginArchive.path): a volume of its own and the one claim bound to it,
+  which each allowed edge instance mounts a directory of, named for it.
+  Kept on uninstall and never deleted by the deployment, as storage is: what
+  it holds is removed only by an administrator's act (decisions/028). A
+  directory on one node: on a cluster of several, name a claim on shared
+  storage instead (existingClaim).
+*/}}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ printf "%s-%s" .Release.Namespace $claim }}
+  labels:
+    meridian.dev/component: plugin-archive
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity:
+    storage: {{ .Values.pluginArchive.size | quote }}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ $claim }}
+  hostPath:
+    path: {{ .Values.pluginArchive.path | quote }}
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $claim }}
+  labels:
+    meridian.dev/component: plugin-archive
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: {{ printf "%s-%s" .Release.Namespace $claim }}
+  resources:
+    requests:
+      storage: {{ .Values.pluginArchive.size | quote }}
+{{- end }}

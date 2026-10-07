@@ -54,6 +54,12 @@
       "launched" true
       "plugin" "__PLUGIN__") }}
 {{- end }}
+{{/*
+  What an allowed instance is given beside its storage (contract v16,
+  W8.7): its archive, merged by the launcher into the plugin's container
+  when the conductor's CreatePlugin carries one allowed.
+*/}}
+{{- $archive := include "meridian-runtime.archiveShape" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -65,6 +71,9 @@ data:
   {{- if .Values.pluginStorage.enabled }}
   plugin-storage.json: {{ $storage | fromYaml | toJson | quote }}
   claim.json: {{ $claim | fromYaml | toJson | quote }}
+  {{- end }}
+  {{- if $archive }}
+  archive.json: {{ $archive | fromYaml | toJson | quote }}
   {{- end }}
   {{- if .Values.development }}
   {{- /*
@@ -168,7 +177,7 @@ spec:
         meridian.dev/component: launcher
       annotations:
         # A new template is a new launcher, so it never fills in an old one.
-        checksum/template: {{ printf "%s%s%s" $shape $storage $claim | sha256sum }}
+        checksum/template: {{ printf "%s%s%s%s" $shape $storage $claim $archive | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- with .Values.podSecurityContext }}
@@ -212,6 +221,12 @@ spec:
             - name: MERIDIAN_LAUNCHER_LIVE_STORAGE_TEMPLATE
               value: /etc/meridian/launcher/plugin-live-storage.json
             {{- end }}
+            {{- end }}
+            {{- if $archive }}
+            # What an instance a deployment admin allowed an archive is given
+            # beside its storage (W8.7, contract v16).
+            - name: MERIDIAN_LAUNCHER_ARCHIVE_TEMPLATE
+              value: /etc/meridian/launcher/archive.json
             {{- end }}
             # The only registry a launched plugin's image may come from.
             - name: MERIDIAN_REGISTRY_ADDRESS

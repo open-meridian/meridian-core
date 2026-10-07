@@ -2,6 +2,7 @@
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-plugin-storage" $full }}
+{{- $archive := include "meridian-runtime.archiveClaim" . }}
 {{/*
   Defence in depth for decisions/028, where the cluster can say so itself
   (Kubernetes 1.30 and later): a plugin's pod mounts no storage but its own
@@ -16,6 +17,11 @@
   add -- or the claim `<fullname>-storage-<its instance>`. A claim of any
   other name, a host path, an ephemeral claim or any other volume source is
   refused, and so is its own claim on a pod whose sidecar holds no edge role.
+
+  And, where the deployment keeps a local archive (contract v16), its claim,
+  on an edge plugin's pod alone and only as a directory named for its own
+  instance: every mount of it carries that subPath, so no pod reaches
+  another instance's archive.
 */}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -36,6 +42,14 @@ spec:
       expression: >-
         '{{ $full }}-storage-' +
         object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: archive
+      expression: >-
+        {{ $archive | squote }}
+    - name: archiveVolumes
+      expression: >-
+        !has(object.spec.volumes) ? [] : object.spec.volumes.filter(v,
+          has(v.persistentVolumeClaim) && variables.archive != "" &&
+          v.persistentVolumeClaim.claimName == variables.archive).map(v, v.name)
     - name: edge
       expression: >-
         object.spec.containers.exists(c, c.name == "sidecar" && has(c.env) &&
@@ -46,10 +60,20 @@ spec:
         !has(object.spec.volumes) || object.spec.volumes.all(v,
           has(v.emptyDir) || has(v.configMap) || has(v.secret) ||
           has(v.projected) || has(v.downwardAPI) ||
-          (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == variables.claim))
+          (has(v.persistentVolumeClaim) && (v.persistentVolumeClaim.claimName == variables.claim ||
+            (variables.archive != "" && v.persistentVolumeClaim.claimName == variables.archive))))
       message: >-
         a plugin's pod mounts no storage but its own instance's claim
-        (decisions/028)
+        (decisions/028), and the deployment's archive
+    - expression: >-
+        object.spec.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m,
+          !(m.name in variables.archiveVolumes) ||
+          (has(m.subPath) && m.subPath == object.metadata.labels[?"meridian.dev/instance"].orValue("-")))) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(c, !has(c.volumeMounts) ||
+          c.volumeMounts.all(m, !(m.name in variables.archiveVolumes))))
+      message: >-
+        a plugin's pod mounts the archive only as its own instance's directory
+        (contract v16)
     - expression: >-
         variables.edge || !has(object.spec.volumes) ||
         !object.spec.volumes.exists(v, has(v.persistentVolumeClaim))

@@ -17,6 +17,14 @@
 //! never the claim, so launching the same plugin as the same instance again
 //! finds what it kept; the launcher has no right to delete a claim at all,
 //! and refuses to hand one plugin's storage to another.
+//!
+//! And an edge plugin a deployment admin allowed an archive is given it
+//! beside its storage (W8.3, W8.7, contract v16): the chart's archive shape
+//! -- a directory of the deployment's archive named for the instance, at
+//! MERIDIAN_ARCHIVE_DIR, or a bucket's prefix of its own in
+//! MERIDIAN_ARCHIVE_BUCKET and the account whose workload identity is scoped
+//! to it -- merged into the plugin's container, only when the conductor's
+//! CreatePlugin carries one allowed. Refused where the chart gives none.
 
 use meridian_domain::v1::CreatePluginRequest;
 
@@ -78,6 +86,9 @@ pub struct Shapes {
     pub plain: String,
     pub live: Option<String>,
     pub storage: Option<StorageShapes>,
+    /// What an allowed instance is given beside its storage, where the
+    /// chart keeps archives (contract v16).
+    pub archive: Option<String>,
 }
 
 /// An edge plugin's shapes (decisions/028), and which roles are the edge's.
@@ -251,6 +262,76 @@ pub fn manifest(
         .map_err(|failed| format!("the template is not JSON: {failed}"))?;
     if manifest["metadata"]["labels"]["meridian.dev/launched"] != "true" {
         return Err("the template does not mark what it makes as the launcher's".into());
+    }
+    Ok(manifest)
+}
+
+/// Whether a request carries an archive a deployment admin allowed.
+pub fn archive_allowed(request: &CreatePluginRequest) -> bool {
+    request
+        .archive
+        .as_ref()
+        .is_some_and(|archive| archive.allowed)
+}
+
+/// The Deployment with its instance's archive merged into the plugin's
+/// container (W8.3, W8.7, contract v16): the chart's archive shape filled in
+/// for the checked request -- its env and mounts on the container named
+/// `plugin`, its volumes on the pod, and the account it runs as, where the
+/// shape names one. Unchanged for a request carrying none allowed; refused
+/// for one at no edge role, and where the chart keeps no archive.
+pub fn with_archive(
+    mut manifest: serde_json::Value,
+    template: Option<&str>,
+    request: &CreatePluginRequest,
+    edge_roles: &[String],
+) -> Result<serde_json::Value, String> {
+    if !archive_allowed(request) {
+        return Ok(manifest);
+    }
+    if !at_the_edge(&request.roles, edge_roles) {
+        return Err(format!(
+            "{} was allowed an archive and holds no edge role; only a plugin at the edge \
+             keeps raw records (decisions/028)",
+            request.instance_id
+        ));
+    }
+    let template = template.ok_or_else(|| {
+        format!(
+            "{} was allowed an archive, and this deployment's chart keeps none \
+             (pluginArchive)",
+            request.instance_id
+        )
+    })?;
+    let filled = template.replace("__INSTANCE__", &request.instance_id);
+    if let Some(left) = placeholder(&filled) {
+        return Err(format!(
+            "the archive template has a placeholder this does not fill: {left}"
+        ));
+    }
+    let shape: serde_json::Value = serde_json::from_str(&filled)
+        .map_err(|failed| format!("the archive template is not JSON: {failed}"))?;
+    let pod = &mut manifest["spec"]["template"]["spec"];
+    let container = pod["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "plugin"))
+        .ok_or("the template has no container named plugin to give the archive to")?;
+    for (field, from) in [("env", "env"), ("volumeMounts", "volumeMounts")] {
+        if let Some(added) = shape[from].as_array() {
+            match container[field].as_array_mut() {
+                Some(held) => held.extend(added.iter().cloned()),
+                None => container[field] = serde_json::Value::Array(added.clone()),
+            }
+        }
+    }
+    if let Some(added) = shape["volumes"].as_array() {
+        match pod["volumes"].as_array_mut() {
+            Some(held) => held.extend(added.iter().cloned()),
+            None => pod["volumes"] = serde_json::Value::Array(added.clone()),
+        }
+    }
+    if let Some(account) = shape["serviceAccountName"].as_str() {
+        pod["serviceAccountName"] = serde_json::Value::String(account.to_string());
     }
     Ok(manifest)
 }

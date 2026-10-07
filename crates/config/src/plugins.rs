@@ -19,15 +19,20 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
-    CreatePluginReply, CreatePluginRequest, LaunchPluginRequest, PluginCatalogue,
-    PluginCatalogueRequest, PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion,
-    RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, StopPluginRequest,
+    AllowArchiveRequest, CreatePluginReply, CreatePluginRequest, LaunchPluginRequest,
+    PluginArchive, PluginCatalogue, PluginCatalogueRequest, PluginLaunch, PluginLaunchState,
+    PluginMetadata, PluginVersion, RecordPluginUploadRequest, RemovePluginReply,
+    RemovePluginRequest, StopPluginRequest, WithdrawArchiveRequest,
 };
 use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
 use prost::Message;
 
-use crate::service::{answer_on, subject, Clock};
+use crate::archive::{
+    archive_allowed, edge_roles, roles_of, ArchiveGrant, ArchiveKind, ALLOW_ARCHIVE,
+    WITHDRAW_ARCHIVE,
+};
+use crate::service::{answer_on, delegation, subject, Clock};
 use crate::store::{Ending, Snapshot, Store};
 
 pub const RECORD_PLUGIN_UPLOAD: &str = "platform.config.command.record-plugin-upload";
@@ -48,6 +53,9 @@ struct Plugins {
     /// The deployment's own registry, as each node reaches it:
     /// `localhost:<port>`. Every launch runs an image from here, by digest.
     registry: String,
+    /// Where the deployment keeps archives, as its install named it (W7.1,
+    /// W8.7, contract v16).
+    archive: ArchiveGrant,
 }
 
 // ── The rules ───────────────────────────────────────────────────────────────
@@ -207,6 +215,12 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
                 STORAGE_DECLARATION_RETENTION_DAYS_RANGE.most
             ));
         }
+        // Its kinds of raw record (contract v16): each named once and of its
+        // form, labelled, its window within bounds, as `meridian plugin
+        // check` says first and the sidecar again at registration.
+        if let Some(refused) = meridian_sidecar::edge::kinds_refused(&storage.record_kinds, &[]) {
+            return Err(refused);
+        }
     }
     Ok(())
 }
@@ -358,24 +372,12 @@ impl Plugins {
                 request.instance_id
             ));
         }
-        let create = CreatePluginRequest {
-            instance_id: request.instance_id.clone(),
-            image: format!(
-                "{}/plugins/{}@{}",
-                self.registry, metadata.name, version.image_digest
-            ),
-            roles: metadata.roles.clone(),
-            interface: metadata.interface,
-            // Whether the deployment is for development is the launcher's to
-            // know and to refuse on (spec/live-plugin-development, ruling 2).
-            live: request.live,
-            // Approved with the roles: storage of its own where it asks for
-            // it, and none where it asks for none (W8.3, contract v11).
-            declaration: metadata.declaration.clone(),
-            // An archive a deployment admin allowed (W8.3, W8.7, contract
-            // v16): none until the conductor records the allowing.
-            archive: None,
-        };
+        let create = self.create_request(
+            &request.instance_id,
+            version,
+            request.live,
+            archive_allowed(&snapshot, &request.instance_id).cloned(),
+        );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",
@@ -406,6 +408,228 @@ impl Plugins {
                 Err(format!(
                     "the launcher did not create {}: {failed}",
                     request.instance_id
+                ))
+            }
+        }
+    }
+
+    /// What the launcher is asked to make for an instance of a recorded
+    /// version.
+    fn create_request(
+        &self,
+        instance_id: &str,
+        version: &PluginVersion,
+        live: bool,
+        archive: Option<PluginArchive>,
+    ) -> CreatePluginRequest {
+        let metadata = version.metadata.clone().unwrap_or_default();
+        CreatePluginRequest {
+            instance_id: instance_id.to_string(),
+            image: format!(
+                "{}/plugins/{}@{}",
+                self.registry, metadata.name, version.image_digest
+            ),
+            roles: metadata.roles.clone(),
+            interface: metadata.interface,
+            // Whether the deployment is for development is the launcher's to
+            // know and to refuse on (spec/live-plugin-development, ruling 2).
+            live,
+            // Approved with the roles: storage of its own where it asks for
+            // it, and none where it asks for none (W8.3, contract v11).
+            declaration: metadata.declaration,
+            // The archive a deployment admin allowed it, beside its storage
+            // (W8.3, W8.7, contract v16); none otherwise.
+            archive,
+        }
+    }
+
+    /// W8.7: a deployment admin allows an instance at the edge an archive,
+    /// or changes its bound; recorded, and the instance, where the catalogue
+    /// launched it, restarted through CreatePlugin carrying it (the names'
+    /// choice e).
+    fn allow_archive(
+        &self,
+        request: AllowArchiveRequest,
+        envelope: &Envelope,
+    ) -> Result<PluginArchive, String> {
+        let by = subject(envelope);
+        if by.is_empty() {
+            return Err(
+                "an archive is a deployment admin's to allow, and this is sent for nobody".into(),
+            );
+        }
+        if self.archive.kind == ArchiveKind::None {
+            return Err(format!(
+                "this deployment was installed with no archive, so {} cannot be allowed one; \
+                 its records past their window are kept (W7.1)",
+                request.instance_id
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        let Some(roles) = roles_of(&snapshot, &request.instance_id) else {
+            return Err(format!(
+                "{} is no plugin this deployment has launched or heard from",
+                request.instance_id
+            ));
+        };
+        if edge_roles(roles).is_empty() {
+            return Err(format!(
+                "{} holds {}, no edge role; only a plugin at the edge keeps raw records, and so \
+                 an archive (decisions/028)",
+                request.instance_id,
+                if roles.is_empty() {
+                    "no role".to_string()
+                } else {
+                    roles.join(", ")
+                }
+            ));
+        }
+        if i64::try_from(request.most_bytes).is_err() {
+            return Err(format!(
+                "a bound of {} bytes is past what is kept",
+                request.most_bytes
+            ));
+        }
+        let archive = PluginArchive {
+            instance_id: request.instance_id.clone(),
+            allowed: true,
+            most_bytes: request.most_bytes,
+            updated_by: by,
+            updated_at_ns: self.clock.now_ns(),
+        };
+        self.store
+            .put_archive(&archive, &delegation(envelope))
+            .map_err(|f| f.to_string())?;
+        tracing::info!(
+            instance = archive.instance_id,
+            most_bytes = archive.most_bytes,
+            by = archive.updated_by,
+            "an archive allowed"
+        );
+        self.restart(&archive.instance_id, Some(archive.clone()))?;
+        Ok(archive)
+    }
+
+    /// W8.7: a deployment admin withdraws an instance's archive; recorded,
+    /// and the instance restarted without it. What the archive holds is
+    /// kept. An instance never allowed one is answered as it stands, and
+    /// nothing recorded.
+    fn withdraw_archive(
+        &self,
+        request: WithdrawArchiveRequest,
+        envelope: &Envelope,
+    ) -> Result<PluginArchive, String> {
+        let by = subject(envelope);
+        if by.is_empty() {
+            return Err(
+                "an archive is a deployment admin's to withdraw, and this is sent for nobody"
+                    .into(),
+            );
+        }
+        let snapshot = self.snapshot()?;
+        let standing = snapshot
+            .archives
+            .iter()
+            .find(|archive| archive.instance_id == request.instance_id)
+            .cloned();
+        let Some(standing) = standing.filter(|archive| archive.allowed) else {
+            return Ok(PluginArchive {
+                instance_id: request.instance_id,
+                ..Default::default()
+            });
+        };
+        let archive = PluginArchive {
+            allowed: false,
+            updated_by: by,
+            updated_at_ns: self.clock.now_ns(),
+            ..standing
+        };
+        self.store
+            .put_archive(&archive, &delegation(envelope))
+            .map_err(|f| f.to_string())?;
+        tracing::info!(
+            instance = archive.instance_id,
+            by = archive.updated_by,
+            "an archive withdrawn; what it holds is kept"
+        );
+        self.restart(&archive.instance_id, None)?;
+        Ok(archive)
+    }
+
+    /// The instance's live launch, made again by the launcher with or
+    /// without its archive: removed, then created, since a mount cannot be
+    /// added to a running pod (W8.7, the names' choice e). An instance the
+    /// catalogue did not launch -- one the chart or a harness runs -- is
+    /// given it at its next start, and nothing is restarted here.
+    fn restart(&self, instance: &str, archive: Option<PluginArchive>) -> Result<(), String> {
+        let snapshot = self.snapshot()?;
+        let Some(launch) = snapshot
+            .catalogue
+            .launches
+            .iter()
+            .find(|held| {
+                held.instance_id == instance && held.state == PluginLaunchState::Launched as i32
+            })
+            .cloned()
+        else {
+            tracing::info!(
+                instance,
+                "not launched from the catalogue: given its archive, or none, at its next start"
+            );
+            return Ok(());
+        };
+        let version = snapshot
+            .catalogue
+            .versions
+            .iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "recorded; {} {} is not in the catalogue, so {instance} was not restarted",
+                    launch.name, launch.version
+                )
+            })?;
+        let _: RemovePluginReply = self
+            .ask_launcher(
+                REMOVE_PLUGIN,
+                "meridian.v1.RemovePluginRequest",
+                RemovePluginRequest {
+                    instance_id: instance.to_string(),
+                },
+            )
+            .map_err(|failed| {
+                format!("recorded; the launcher did not stop {instance} to restart it: {failed}")
+            })?;
+        let create = self.create_request(instance, version, launch.live, archive);
+        match self.ask_launcher::<_, CreatePluginReply>(
+            CREATE_PLUGIN,
+            "meridian.v1.CreatePluginRequest",
+            create,
+        ) {
+            Ok(made) => {
+                tracing::info!(
+                    instance,
+                    workload = made.workload,
+                    "a plugin restarted with its archive as allowed"
+                );
+                Ok(())
+            }
+            Err(failed) => {
+                let ending = Ending {
+                    state: PluginLaunchState::Failed,
+                    by: String::new(),
+                    at_ns: self.clock.now_ns(),
+                    failure: failed.clone(),
+                };
+                self.store
+                    .end_launch(instance, &ending)
+                    .map_err(|f| f.to_string())?;
+                Err(format!(
+                    "recorded; the launcher did not create {instance} again: {failed}"
                 ))
             }
         }
@@ -455,19 +679,55 @@ impl Plugins {
 }
 
 /// Serve W8's commands and query. `registry` is where a node reaches the
-/// deployment's own registry, `localhost:<port>`.
+/// deployment's own registry, `localhost:<port>`. A deployment with no
+/// archive ([`serve_plugins_with`] names one).
 pub fn serve_plugins(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     registry: String,
 ) {
+    serve_plugins_with(bus, store, clock, registry, ArchiveGrant::default())
+}
+
+/// [`serve_plugins`], for a deployment whose install named where archives
+/// are kept (W7.1), so an archive may be allowed (W8.7, contract v16).
+pub fn serve_plugins_with(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
         store,
         clock,
         registry,
+        archive,
     });
+    answer_on(
+        &bus,
+        &plugins,
+        ALLOW_ARCHIVE,
+        (
+            "meridian.v1.AllowArchiveRequest",
+            "meridian.v1.PluginArchive",
+        ),
+        |plugins, request: AllowArchiveRequest, envelope| plugins.allow_archive(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        WITHDRAW_ARCHIVE,
+        (
+            "meridian.v1.WithdrawArchiveRequest",
+            "meridian.v1.PluginArchive",
+        ),
+        |plugins, request: WithdrawArchiveRequest, envelope| {
+            plugins.withdraw_archive(request, envelope)
+        },
+    );
     answer_on(
         &bus,
         &plugins,

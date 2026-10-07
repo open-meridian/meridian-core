@@ -23,6 +23,15 @@ use meridian_pb::v1::{
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A suffix no earlier run used: a process's id repeats in a fresh
+/// container, and the test database keeps every schema a run made.
+fn unique() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
 fn base_url() -> String {
     std::env::var("MERIDIAN_TEST_DATABASE_URL").expect(
         "MERIDIAN_TEST_DATABASE_URL is not set. These tests need a real Postgres; \
@@ -1146,7 +1155,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
     // A store at migration 10, as a deployment before contract v14 has it:
     // two changes to poll_minutes and a secret set, recorded without values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let name = format!("config_backfill_{seq}_{}", std::process::id());
+    let name = format!("config_backfill_{seq}_{}", unique());
     let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
     admin
         .batch_execute(&format!("CREATE SCHEMA {name}"))
@@ -1442,7 +1451,7 @@ fn migration_12_redacts_what_a_secret_settings_records_hold() {
     // A store at migration 11 whose api_key became secret before redaction
     // was ruled: its records, a backfilled one among them, hold its values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let name = format!("config_redact_{seq}_{}", std::process::id());
+    let name = format!("config_redact_{seq}_{}", unique());
     let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
     admin
         .batch_execute(&format!("CREATE SCHEMA {name}"))
@@ -1537,7 +1546,7 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
     // plugin, a plugin holding no role, a plugin holding two, and one no
     // sidecar has reported but a launch names.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let name = format!("config_per_role_{seq}_{}", std::process::id());
+    let name = format!("config_per_role_{seq}_{}", unique());
     let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
     admin
         .batch_execute(&format!("CREATE SCHEMA {name}"))
@@ -1693,4 +1702,140 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
         "multi-1",
         ""
     ));
+}
+
+/// Contract v16 (W6.25, W8.7, W4.13): each hold, archive and move its own
+/// record, what stands each one's latest, a retry recorded once, and the
+/// archive's spans each unit's latest move, as the in-memory store has them.
+#[test]
+fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
+    use meridian_domain::v1::{Hold, MoveRecord, PluginArchive};
+    use meridian_pb::v1::{MoveOutcome, RecordMoveRequest};
+
+    let (store, url) = store_at("archive");
+    let hold = |role: &str, days: u32, at: i64| Hold {
+        role: role.into(),
+        days,
+        write_once: false,
+        updated_by: "ada@example.com".into(),
+        updated_at_ns: at,
+    };
+    store.set_hold(&hold("custody", 2190, 1), "").unwrap();
+    store.set_hold(&hold("", 400, 2), "DLG-1").unwrap();
+    store.set_hold(&hold("custody", 3650, 3), "").unwrap();
+    store.set_hold(&hold("", 0, 4), "").unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.holds, vec![hold("custody", 3650, 3)]);
+
+    let archive = PluginArchive {
+        instance_id: "snaptrade-1".into(),
+        allowed: true,
+        most_bytes: 53_687_091_200,
+        updated_by: "ada@example.com".into(),
+        updated_at_ns: 5,
+    };
+    store.put_archive(&archive, "").unwrap();
+    let withdrawn = PluginArchive {
+        allowed: false,
+        updated_at_ns: 6,
+        ..archive.clone()
+    };
+    store.put_archive(&withdrawn, "").unwrap();
+    assert_eq!(store.snapshot().unwrap().archives, vec![withdrawn]);
+
+    let moved = |unit: &str, outcome: MoveOutcome, person: &str, at: i64| MoveRecord {
+        r#move: Some(RecordMoveRequest {
+            record_kind: "activity".into(),
+            unit: unit.into(),
+            record_count: 214,
+            first_received_ns: 1_551_398_400_000_000_000,
+            last_received_ns: 1_554_076_799_000_000_000,
+            outcome: outcome as i32,
+            rule: if person.is_empty() {
+                "activity_window_days 2555".into()
+            } else {
+                String::new()
+            },
+        }),
+        person: person.into(),
+        at_ns: at,
+    };
+    assert!(store
+        .record_move(
+            "snaptrade-1",
+            &moved("u1", MoveOutcome::Archived, "", 10),
+            ""
+        )
+        .unwrap());
+    assert!(
+        !store
+            .record_move(
+                "snaptrade-1",
+                &moved("u1", MoveOutcome::Archived, "", 11),
+                ""
+            )
+            .unwrap(),
+        "a retry is recorded once"
+    );
+    assert!(store
+        .record_move(
+            "snaptrade-1",
+            &moved("u1", MoveOutcome::Restored, "ben@example.com", 12),
+            "DLG-2"
+        )
+        .unwrap());
+    assert!(store
+        .record_move(
+            "snaptrade-1",
+            &moved("u2", MoveOutcome::Archived, "", 13),
+            ""
+        )
+        .unwrap());
+    assert!(store
+        .record_move(
+            "snaptrade-1",
+            &moved("u2", MoveOutcome::Deleted, "ada@example.com", 14),
+            ""
+        )
+        .unwrap());
+    assert!(store
+        .record_move("other-1", &moved("u9", MoveOutcome::Archived, "", 15), "")
+        .unwrap());
+
+    let latest = store
+        .latest_move("snaptrade-1", "activity", "u1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest,
+        moved("u1", MoveOutcome::Restored, "ben@example.com", 12)
+    );
+    let page = store.moves("snaptrade-1", 0, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].record.at_ns, 14);
+    assert_eq!(page[1].record.at_ns, 13);
+    let older = store.moves("snaptrade-1", page[1].move_id, 10).unwrap();
+    assert_eq!(
+        older.iter().map(|m| m.record.at_ns).collect::<Vec<_>>(),
+        [12, 10]
+    );
+    assert_eq!(older[0].delegation, "DLG-2");
+    let archived = store.archived("snaptrade-1").unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        archived[0].record_count, 214,
+        "u2 was deleted; u1 is in the archive"
+    );
+
+    // Nothing is ever updated: four hold records, two archive records.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut count = |table: &str| -> i64 {
+        client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(count("config_hold_change"), 4);
+    assert_eq!(count("config_archive_change"), 2);
+    assert_eq!(count("config_record_move"), 5);
 }

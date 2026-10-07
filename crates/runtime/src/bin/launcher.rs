@@ -17,8 +17,8 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    checked, claim, manifest, reusable, template_for, Shapes, StorageShapes, CREATE_PLUGIN,
-    REMOVE_PLUGIN,
+    checked, claim, manifest, reusable, template_for, with_archive, Shapes, StorageShapes,
+    CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -73,7 +73,20 @@ impl Launcher {
             ));
         }
         let chosen = template_for(&request, self.development, &self.shapes)?;
-        let made = manifest(chosen.workload, &request)?;
+        // Its archive beside its storage, where a deployment admin allowed
+        // it one (W8.7, contract v16).
+        let edge = self
+            .shapes
+            .storage
+            .as_ref()
+            .map(|storage| storage.edge_roles.clone())
+            .unwrap_or_default();
+        let made = with_archive(
+            manifest(chosen.workload, &request)?,
+            self.shapes.archive.as_deref(),
+            &request,
+            &edge,
+        )?;
         if let Some(template) = chosen.claim {
             self.storage(template, &request)?;
         }
@@ -85,6 +98,7 @@ impl Launcher {
             workload,
             image = request.image,
             live = request.live,
+            archive = meridian_runtime::launcher::archive_allowed(&request),
             "a plugin created"
         );
         Ok(CreatePluginReply { workload })
@@ -175,6 +189,9 @@ fn run() -> Result<(), String> {
             plain,
             live,
             storage,
+            // What an allowed instance is given beside its storage, where
+            // the chart keeps archives (pluginArchive, contract v16).
+            archive: optional("MERIDIAN_LAUNCHER_ARCHIVE_TEMPLATE")?,
         },
         development,
         registry,

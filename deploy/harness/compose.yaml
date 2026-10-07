@@ -242,6 +242,10 @@ services:
       MERIDIAN_INSTANCE_ID: conductor-1
       MERIDIAN_ADMINISTRATOR_LOGIN: local|harness
       MERIDIAN_SETTINGS_KEY_DIR: /keys/settings
+      # The harness keeps a local archive (contract v16): a plugin listed
+      # with "archive": true is given a volume of its own as it, and a
+      # deployment admin may allow it one. A local archive cannot lock.
+      MERIDIAN_ARCHIVE: path
     volumes:
       - keys:/keys:ro
       - secrets:/secrets:ro
@@ -329,8 +333,8 @@ services:
     networks: [harness]
 
   # A store, printed by name as stable, sorted lines: `run --rm -T store
-  # street`, `store book`, `store tickets` or `store activity` (README.md has
-  # their formats). Whoever reads a
+  # street`, `store book`, `store tickets`, `store activity` or `store moves`
+  # (README.md has their formats). Whoever reads a
   # store here needs no database user, file or query of their own.
   store:
     profiles: [runner]
@@ -341,8 +345,8 @@ services:
       - |
         set -e
         case "$${1:-}" in
-          street|book|tickets|activity) ;;
-          *) echo "store takes the name of a store: street, book, tickets or activity" >&2; exit 2 ;;
+          street|book|tickets|activity|moves) ;;
+          *) echo "store takes the name of a store: street, book, tickets, activity or moves" >&2; exit 2 ;;
         esac
         PGPASSWORD=$$(cat /secrets/postgres)
         export PGPASSWORD
@@ -353,6 +357,7 @@ services:
       - ./book.sql:/harness/book.sql:ro
       - ./tickets.sql:/harness/tickets.sql:ro
       - ./activity.sql:/harness/activity.sql:ro
+      - ./moves.sql:/harness/moves.sql:ro
       - secrets:/secrets:ro
     networks: [harness]
 

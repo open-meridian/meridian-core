@@ -15,19 +15,20 @@ use postgres::{IsolationLevel, NoTls};
 use r2d2_postgres::PostgresConnectionManager;
 
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Permission,
-    PluginLaunch, PluginMetadata, PluginVersion, SignInRecord, UserGroup,
+    AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord,
+    Permission, PluginArchive, PluginLaunch, PluginMetadata, PluginVersion, SignInRecord,
+    UserGroup,
 };
 
-use meridian_pb::v1::{PluginDeclaration, SettingDeclaration};
+use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
 use prost::Message;
 
 use crate::migrations;
 use crate::store::{
-    group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
-    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result,
-    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError, StoredSetting,
-    Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    archived_spans, group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, RecordedMove,
+    Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
+    StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -370,6 +371,44 @@ impl Store for PostgresStore {
             .map_err(unavailable)?
         {
             snapshot.catalogue.launches.push(launch_from(&row));
+        }
+
+        // Each role's latest hold, a cleared one left out, and each
+        // instance's latest archive (W6.25, W8.7, contract v16).
+        for row in tx
+            .query(
+                "SELECT role, days, write_once, changed_by, changed_at_ns FROM (
+                     SELECT DISTINCT ON (role) role, days, write_once, changed_by, changed_at_ns
+                       FROM config_hold_change ORDER BY role, change_id DESC) latest
+                  WHERE days > 0 ORDER BY role",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.holds.push(Hold {
+                role: row.get(0),
+                days: u32::try_from(row.get::<_, i32>(1)).unwrap_or_default(),
+                write_once: row.get(2),
+                updated_by: row.get(3),
+                updated_at_ns: row.get(4),
+            });
+        }
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (instance_id) instance_id, allowed, most_bytes, changed_by,
+                        changed_at_ns
+                   FROM config_archive_change ORDER BY instance_id, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.archives.push(PluginArchive {
+                instance_id: row.get(0),
+                allowed: row.get(1),
+                most_bytes: u64::try_from(row.get::<_, i64>(2)).unwrap_or_default(),
+                updated_by: row.get(3),
+                updated_at_ns: row.get(4),
+            });
         }
 
         tx.commit().map_err(unavailable)?;
@@ -994,6 +1033,166 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         Ok(ended.as_ref().map(launch_from))
     }
+
+    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()> {
+        let days = i32::try_from(hold.days).map_err(|_| {
+            StoreError::Unavailable(format!("a hold of {} days does not fit", hold.days))
+        })?;
+        self.conn()?
+            .execute(
+                "INSERT INTO config_hold_change
+                        (role, days, write_once, changed_by, through_delegation, changed_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &hold.role,
+                    &days,
+                    &hold.write_once,
+                    &hold.updated_by,
+                    &delegation,
+                    &hold.updated_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()> {
+        let most = i64::try_from(archive.most_bytes).map_err(|_| {
+            StoreError::Unavailable(format!(
+                "a bound of {} bytes does not fit",
+                archive.most_bytes
+            ))
+        })?;
+        self.conn()?
+            .execute(
+                "INSERT INTO config_archive_change
+                        (instance_id, allowed, most_bytes, changed_by, through_delegation,
+                         changed_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &archive.instance_id,
+                    &archive.allowed,
+                    &most,
+                    &archive.updated_by,
+                    &delegation,
+                    &archive.updated_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn record_move(
+        &self,
+        instance_id: &str,
+        record: &MoveRecord,
+        delegation: &str,
+    ) -> Result<bool> {
+        let moved = record.r#move.clone().unwrap_or_default();
+        let count = i64::try_from(moved.record_count).map_err(|_| {
+            StoreError::Unavailable(format!("a count of {} does not fit", moved.record_count))
+        })?;
+        let outcome = i16::try_from(moved.outcome).unwrap_or_default();
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // One unit's moves in turn, so a retry and its original never both
+        // pass the check.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1::text || '/' || $2::text || '/' || $3::text))",
+            &[&instance_id, &moved.record_kind, &moved.unit],
+        )
+        .map_err(unavailable)?;
+        let latest = tx
+            .query_opt(
+                "SELECT outcome FROM config_record_move
+                  WHERE instance_id = $1 AND record_kind = $2 AND unit = $3
+                  ORDER BY move_id DESC LIMIT 1",
+                &[&instance_id, &moved.record_kind, &moved.unit],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get::<_, i16>(0));
+        if latest == Some(outcome) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO config_record_move
+                    (instance_id, record_kind, unit, record_count, first_received_ns,
+                     last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &instance_id,
+                &moved.record_kind,
+                &moved.unit,
+                &count,
+                &moved.first_received_ns,
+                &moved.last_received_ns,
+                &outcome,
+                &moved.rule,
+                &record.person,
+                &delegation,
+                &record.at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
+
+    fn latest_move(
+        &self,
+        instance_id: &str,
+        record_kind: &str,
+        unit: &str,
+    ) -> Result<Option<MoveRecord>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                &format!(
+                    "SELECT {MOVE_COLUMNS} FROM config_record_move
+                      WHERE instance_id = $1 AND record_kind = $2 AND unit = $3
+                      ORDER BY move_id DESC LIMIT 1"
+                ),
+                &[&instance_id, &record_kind, &unit],
+            )
+            .map_err(unavailable)?
+            .map(|row| move_of(&row).record))
+    }
+
+    fn moves(&self, instance_id: &str, before: i64, limit: usize) -> Result<Vec<RecordedMove>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(self
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {MOVE_COLUMNS} FROM config_record_move
+                      WHERE instance_id = $1 AND ($2::bigint = 0 OR move_id < $2::bigint)
+                      ORDER BY move_id DESC LIMIT $3::bigint"
+                ),
+                &[&instance_id, &before, &limit],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(move_of)
+            .collect())
+    }
+
+    fn archived(&self, instance_id: &str) -> Result<Vec<StoredSpan>> {
+        let latest: Vec<RecordMoveRequest> = self
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT DISTINCT ON (record_kind, unit) {MOVE_COLUMNS}
+                       FROM config_record_move WHERE instance_id = $1
+                      ORDER BY record_kind, unit, move_id DESC"
+                ),
+                &[&instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .filter_map(|row| move_of(row).record.r#move)
+            .collect();
+        Ok(archived_spans(&latest))
+    }
 }
 
 /// An account's optional text as its column holds it: NULL for none, so an
@@ -1106,6 +1305,31 @@ fn insert_permission(
         )
         .map_err(unavailable)?;
     Ok(())
+}
+
+/// A move's columns, in the order [`move_of`] reads them.
+const MOVE_COLUMNS: &str = "move_id, instance_id, record_kind, unit, record_count, \
+     first_received_ns, last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns";
+
+fn move_of(row: &postgres::Row) -> RecordedMove {
+    RecordedMove {
+        move_id: row.get(0),
+        instance_id: row.get(1),
+        record: MoveRecord {
+            r#move: Some(RecordMoveRequest {
+                record_kind: row.get(2),
+                unit: row.get(3),
+                record_count: u64::try_from(row.get::<_, i64>(4)).unwrap_or_default(),
+                first_received_ns: row.get(5),
+                last_received_ns: row.get(6),
+                outcome: i32::from(row.get::<_, i16>(7)),
+                rule: row.get(8),
+            }),
+            person: row.get(9),
+            at_ns: row.get(11),
+        },
+        delegation: row.get(10),
+    }
 }
 
 fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {

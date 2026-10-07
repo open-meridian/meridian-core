@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 8] = [
+const TABS: [(&str, &str); 9] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -37,6 +37,7 @@ const TABS: [(&str, &str); 8] = [
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
     ("books", "Books"),
+    ("holds", "Holds"),
     ("connected-clients", "Connected clients"),
 ];
 
@@ -961,6 +962,20 @@ pub fn render(
         "Each account's base currency and the lots a sale relieves when it names none, in          the book of record, and the date its opening balance stands for. Each change is          journalled with its reason.",
         "",
         format!("{books_body}{books_dialog}"),
+    ));
+
+    // ── Holds ───────────────────────────────────────────────────────────────
+    // W6.25 (contract v16): the least time an edge plugin's raw records are
+    // kept, per edge role or for every one, a deployment admin's.
+    let (holds_body, holds_dialog) = super::holds::section(records, token);
+    sections.push(section(
+        "holds",
+        "Holds",
+        "The least time an edge plugin's raw records are kept anywhere, storage or archive, \
+         as a firm's recordkeeping rule asks. No window goes below it, and nothing inside it \
+         is deleted.",
+        &add_button("hold", "a hold"),
+        format!("{holds_body}{holds_dialog}"),
     ));
 
     // ── Connected clients ───────────────────────────────────────────────────

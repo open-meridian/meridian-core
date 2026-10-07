@@ -126,6 +126,16 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::admin::routes())
         .merge(crate::first_run::routes())
         .route("/plugins/{instance}", get(crate::plugins::frame))
+        // Its archive, a deployment admin's to allow and withdraw from its
+        // Manage page (W8.7, contract v16).
+        .route(
+            "/plugins/{instance}/archive",
+            axum::routing::post(crate::archive::allow),
+        )
+        .route(
+            "/plugins/{instance}/archive/withdraw",
+            axum::routing::post(crate::archive::withdraw),
+        )
         .route("/plugins/{instance}/enter", get(crate::plugins::open))
         .with_state(Arc::clone(&app))
         // The dashboard's pages are framed by nobody but itself: a plugin's

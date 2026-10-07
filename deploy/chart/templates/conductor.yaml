@@ -134,6 +134,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.conductorKey) }}
+            {{- with include "meridian-runtime.archiveKind" . }}
+            # Where edge plugins' older records are archived (contract v16,
+            # pluginArchive): what allowing an instance one needs, and what a
+            # write-once hold is refused against (W6.25, W8.7).
+            - name: MERIDIAN_ARCHIVE
+              value: {{ . | quote }}
+            - name: MERIDIAN_ARCHIVE_LOCKS
+              value: {{ and (eq . "bucket") $.Values.pluginArchive.objectLock | ternary "true" "" | quote }}
+            {{- end }}
             # The key secret plugin settings are sealed with (settings-key.yaml).
             - name: MERIDIAN_SETTINGS_KEY_DIR
               value: /run/meridian/settings-key

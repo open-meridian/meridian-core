@@ -9,7 +9,8 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    NotCarried, NotCarriedReason, NotCarriedSeen, PluginDeclaration, StorageDeclaration,
+    NotCarried, NotCarriedReason, NotCarriedSeen, PluginDeclaration, RawRecordKind,
+    StorageDeclaration,
 };
 
 use crate::html::escape;
@@ -37,6 +38,21 @@ pub struct DeclaredNotCarried {
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
 pub struct DeclaredStorage {
     pub retention_days: u32,
+    /// The kinds of raw record it keeps (W8.1, contract v16), each with its
+    /// default window and whether it can be archived; none from a version
+    /// built before.
+    #[serde(default)]
+    pub record_kinds: Vec<DeclaredKind>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredKind {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    pub window_days: u32,
+    #[serde(default)]
+    pub archivable: bool,
 }
 
 /// A reason as the wire numbers it, or none for one it does not define.
@@ -74,9 +90,19 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
         not_carried,
         storage: declared.storage.as_ref().map(|storage| StorageDeclaration {
             retention_days: storage.retention_days,
-            // The kinds of raw record (W8.1, contract v16): read from the
-            // metadata once the dashboard serves v16.
-            record_kinds: Vec::new(),
+            // The kinds of raw record (W8.1, contract v16), which the
+            // conductor holds to the dictionary's bounds when it records the
+            // version.
+            record_kinds: storage
+                .record_kinds
+                .iter()
+                .map(|kind| RawRecordKind {
+                    name: kind.name.clone(),
+                    label: kind.label.clone(),
+                    window_days: kind.window_days,
+                    archivable: kind.archivable,
+                })
+                .collect(),
         }),
     })
 }
@@ -93,6 +119,12 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "storage": declaration.storage.as_ref().map(|storage| serde_json::json!({
             "retention_days": storage.retention_days,
+            "record_kinds": storage.record_kinds.iter().map(|kind| serde_json::json!({
+                "name": kind.name,
+                "label": kind.label,
+                "window_days": kind.window_days,
+                "archivable": kind.archivable,
+            })).collect::<Vec<_>>(),
         })),
     })
 }
@@ -124,9 +156,15 @@ pub fn summary(declaration: Option<&PluginDeclaration>, seen: &[NotCarriedSeen])
     };
     let storage = match &declaration.storage {
         None => "none".to_string(),
-        Some(storage) => format!(
+        Some(storage) if storage.record_kinds.is_empty() => format!(
             "its own, for its raw records, kept {} days",
             storage.retention_days
+        ),
+        // Each kind's window and what is kept of it are drawn in the
+        // records panel (contract v16).
+        Some(storage) => format!(
+            "its own, for {} kinds of raw record, each kept for its window",
+            storage.record_kinds.len()
         ),
     };
     let rows: String = declaration
@@ -155,7 +193,7 @@ pub fn summary(declaration: Option<&PluginDeclaration>, seen: &[NotCarriedSeen])
         "<p class=\"hint\">It declares nothing it receives and does not carry.</p>".to_string()
     } else {
         format!(
-            "<table class=\"list\"><thead><tr><th>Role</th><th>Scheme</th><th>Name</th>\
+            "<table class=\"list one-line\"><thead><tr><th>Role</th><th>Scheme</th><th>Name</th>\
              <th>Why</th><th>Seen</th></tr></thead><tbody>{rows}</tbody></table>"
         )
     };

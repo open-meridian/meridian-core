@@ -5,17 +5,17 @@
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Permission, PluginLaunch,
-    PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
+    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord, Permission,
+    PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
 };
 
-use meridian_pb::v1::SettingDeclaration;
+use meridian_pb::v1::{SettingDeclaration, StoredSpan};
 
 use crate::store::{
-    group_change, known_plugins, permission_change, redaction_note, redeclared, AccessChangeRecord,
-    Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, Result, SettingChange,
-    SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal,
-    REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    archived_spans, group_change, known_plugins, permission_change, redaction_note, redeclared,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, RecordedMove,
+    Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting,
+    Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -26,6 +26,12 @@ pub struct MemoryStore {
     changes: Mutex<Vec<SettingChangeRecord>>,
     /// Each grant change's own record (W6.7, W6.8), likewise.
     access_changes: Mutex<Vec<AccessChangeRecord>>,
+    /// Each hold's and each archive's change, its own record, in order, with
+    /// the delegation it was made through (W6.25, W8.7).
+    holds: Mutex<Vec<(Hold, String)>>,
+    archives: Mutex<Vec<(PluginArchive, String)>>,
+    /// Each move of raw records (W4.13), numbered from 1 in order.
+    moves: Mutex<Vec<RecordedMove>>,
 }
 
 impl MemoryStore {
@@ -45,8 +51,39 @@ impl MemoryStore {
             state: Mutex::new(snapshot),
             changes: Mutex::new(Vec::new()),
             access_changes: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+            archives: Mutex::new(Vec::new()),
+            moves: Mutex::new(Vec::new()),
         }
     }
+
+    /// Each unit's latest move, for one instance.
+    fn latest_moves(&self, instance_id: &str) -> Vec<RecordedMove> {
+        let moves = self.moves.lock().expect("store lock poisoned");
+        let mut latest: Vec<RecordedMove> = Vec::new();
+        for held in moves.iter().rev() {
+            if held.instance_id != instance_id {
+                continue;
+            }
+            let (kind, unit) = unit_of(&held.record);
+            if !latest
+                .iter()
+                .any(|seen| unit_of(&seen.record) == (kind, unit))
+            {
+                latest.push(held.clone());
+            }
+        }
+        latest
+    }
+}
+
+/// A move's kind and unit.
+fn unit_of(record: &MoveRecord) -> (&str, &str) {
+    record
+        .r#move
+        .as_ref()
+        .map(|m| (m.record_kind.as_str(), m.unit.as_str()))
+        .unwrap_or_default()
 }
 
 impl Default for MemoryStore {
@@ -119,6 +156,24 @@ impl Store for MemoryStore {
     fn snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = self.state.lock().expect("store lock poisoned").clone();
         snapshot.records.known_plugins = known_plugins(&snapshot.plugins);
+        // Each role's latest hold, a cleared one left out; each instance's
+        // latest archive.
+        for (hold, _) in self.holds.lock().expect("store lock poisoned").iter() {
+            snapshot.holds.retain(|held| held.role != hold.role);
+            if hold.days > 0 {
+                snapshot.holds.push(hold.clone());
+            }
+        }
+        snapshot.holds.sort_by(|a, b| a.role.cmp(&b.role));
+        for (archive, _) in self.archives.lock().expect("store lock poisoned").iter() {
+            snapshot
+                .archives
+                .retain(|held| held.instance_id != archive.instance_id);
+            snapshot.archives.push(archive.clone());
+        }
+        snapshot
+            .archives
+            .sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
         for change in self.changes.lock().expect("store lock poisoned").iter() {
             if matches!(change.kind, ChangeKind::Set | ChangeKind::Cleared) {
                 snapshot.settings_changed.insert(
@@ -451,5 +506,87 @@ impl Store for MemoryStore {
             *launch = ending.applied_to(launch);
             launch.clone()
         }))
+    }
+
+    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()> {
+        self.holds
+            .lock()
+            .expect("store lock poisoned")
+            .push((hold.clone(), delegation.to_string()));
+        Ok(())
+    }
+
+    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()> {
+        self.archives
+            .lock()
+            .expect("store lock poisoned")
+            .push((archive.clone(), delegation.to_string()));
+        Ok(())
+    }
+
+    fn record_move(
+        &self,
+        instance_id: &str,
+        record: &MoveRecord,
+        delegation: &str,
+    ) -> Result<bool> {
+        let (kind, unit) = unit_of(record);
+        let again = self
+            .latest_move(instance_id, kind, unit)?
+            .and_then(|latest| latest.r#move)
+            .zip(record.r#move.as_ref())
+            .is_some_and(|(latest, now)| latest.outcome == now.outcome);
+        if again {
+            return Ok(false);
+        }
+        let mut moves = self.moves.lock().expect("store lock poisoned");
+        let move_id = moves.len() as i64 + 1;
+        moves.push(RecordedMove {
+            move_id,
+            instance_id: instance_id.to_string(),
+            record: record.clone(),
+            delegation: delegation.to_string(),
+        });
+        Ok(true)
+    }
+
+    fn latest_move(
+        &self,
+        instance_id: &str,
+        record_kind: &str,
+        unit: &str,
+    ) -> Result<Option<MoveRecord>> {
+        Ok(self
+            .moves
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .find(|held| {
+                held.instance_id == instance_id && unit_of(&held.record) == (record_kind, unit)
+            })
+            .map(|held| held.record.clone()))
+    }
+
+    fn moves(&self, instance_id: &str, before: i64, limit: usize) -> Result<Vec<RecordedMove>> {
+        Ok(self
+            .moves
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .filter(|held| {
+                held.instance_id == instance_id && (before == 0 || held.move_id < before)
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn archived(&self, instance_id: &str) -> Result<Vec<StoredSpan>> {
+        let latest = self.latest_moves(instance_id);
+        Ok(archived_spans(
+            latest.iter().filter_map(|held| held.record.r#move.as_ref()),
+        ))
     }
 }

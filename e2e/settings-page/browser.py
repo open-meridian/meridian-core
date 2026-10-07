@@ -18,7 +18,13 @@ needed?" So, in headless Chromium:
   nothing in the open Access editor reaches past its dialog;
 - the Open Meridian icon: each page's head links the PNG, then the SVG, then
   the touch icon, each answered with its type, the SVG drawn light and dark,
-  and /favicon.ico answered unprompted.
+  and /favicon.ico answered unprompted;
+- an edge plugin's raw records (contract v16): its Summary's panel, one line
+  a kind of what storage and the archive hold, its moves paged by the kit's
+  om-pager, which upgrades; Allow archive's dialog within the viewport;
+  allowing with a bound and withdrawing, each back on the Summary saying so;
+  and the deployment's Holds tab and its dialog, a hold set from it held --
+  each page and open dialog fitting one screen at both sizes.
 
 PASS=fit checks the fit alone (the development deployment's run, whose
 Developer group and banner the ordinary run has not). Prints one line per
@@ -330,6 +336,109 @@ def the_access_editor_has_a_row_per_role(browser, prefix):
         ctx.close()
 
 
+SUMMARY = AREA + "summary"
+
+
+def the_raw_records_and_the_holds(browser, prefix):
+    """Contract v16: the Summary's raw records panel, Allow archive on it,
+    and the holds on the deployment's Settings, at both sizes."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(SUMMARY)
+        settled(page)
+        parts = page.eval_on_selector_all("nav.summary-parts a", "links => links.map(a => a.getAttribute('href'))")
+        check(parts[:3] == ["#part-status", "#part-records", "#part-moves"],
+              f"at {size} the Summary's parts: its status, then the raw records and their moves: {parts}")
+        for part in parts:
+            page.evaluate("h => { location.hash = h; }", part)
+            page.wait_for_timeout(300)
+            problems = page.evaluate(FIT)
+            check(not problems, f"the Summary's {part} at {size} fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-summary-{part[6:]}-{size}.png"))
+        page.evaluate("h => { location.hash = h; }", "#part-records")
+        page.wait_for_timeout(300)
+        panel = page.locator("#records")
+        check(panel.count() == 1 and panel.is_visible(), f"at {size} the Summary draws the raw records panel")
+        kinds = page.eval_on_selector_all("#records table.kinds tbody tr", "rows => rows.map(r => r.dataset.kind)")
+        check(kinds == ["activity", "responses"], f"at {size} one line a kind: {kinds}")
+        stored = page.get_attribute("#records tr[data-kind=activity] td[data-stored]", "title")
+        archived = page.get_attribute("#records tr[data-kind=activity] td[data-archived]", "title")
+        check(stored.startswith("48,210, 2019-04-01 to "), f"at {size} what storage holds: {stored}")
+        check(archived.startswith("12,570, 2014-01-01 to "), f"at {size} what the archive holds: {archived}")
+        held = page.inner_text("#records [data-hold]")
+        check("2,190 days" in held and "responses_window_days" in held,
+              f"at {size} the hold it is under, and the window it overrides: {held}")
+        page.evaluate("h => { location.hash = h; }", "#part-moves")
+        page.wait_for_timeout(500)
+        upgraded = page.evaluate("() => !!customElements.get('om-pager') && !!document.querySelector('#moves om-pager nav')")
+        shown = page.evaluate("""() => [...document.querySelectorAll('#moves table.moves tbody tr')]
+          .filter(r => r.offsetParent !== null).length""")
+        total = page.locator("#moves table.moves tbody tr").count()
+        check(upgraded and 3 <= shown < total,
+              f"at {size} the moves are paged by the kit's om-pager, a screen's worth a page: {shown} of {total} shown")
+        pager = page.evaluate("() => document.querySelector('#moves om-pager').shown")
+        check(bool(pager) and pager.get("total", 0) == total, f"at {size} the pager counts every move: {pager}")
+        check(page.locator("#moves a.older").count() == 1, f"at {size} the conductor's older moves a link away")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-summary-moves-paged-{size}.png"))
+        page.evaluate("h => { location.hash = h; }", "#part-records")
+        page.wait_for_timeout(300)
+        if page.locator("#records [data-archive=none]").count():
+            page.click("#records [data-allow-archive]")
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} Allow archive's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in Allow archive's dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-allow-archive-{size}.png"))
+            if size == "desktop" and PASS != "fit":
+                page.fill("dialog#allow-archive input[name=most_gib]", "50")
+                page.click("dialog#allow-archive button[type=submit]")
+                settled(page)
+                said = page.inner_text("#records .archive-state")
+                check("saved=1" in page.url and page.locator("#records").is_visible()
+                      and "Archive allowed, at most 50 GiB." in said,
+                      f"an archive allowed with a bound, back on the Summary: {said} ({page.url})")
+                problems = page.evaluate(FIT)
+                check(not problems, f"the Summary with its archive allowed fits one screen"
+                      f"{': ' + '; '.join(problems) if problems else ''}")
+                page.screenshot(path=os.path.join(OUT, f"{prefix}-summary-archive-allowed-{size}.png"))
+                page.click("#records [data-withdraw-archive]")
+                settled(page)
+                said = page.inner_text("#records .archive-state")
+                check("No archive allowed" in said, f"withdrawn, it says so again: {said}")
+
+        page.goto(ADMIN_PAGE + "#holds")
+        settled(page)
+        rows = page.eval_on_selector_all("#holds table.holds tbody tr", "rows => rows.map(r => r.dataset.id)")
+        check(set(rows) >= {"", "custody"}, f"at {size} the Holds tab lists each hold, one line each: {rows}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"the Holds tab at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-holds-{size}.png"))
+        page.click("#holds button[data-dialog-open=hold]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the hold's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        spilled = page.evaluate(INSIDE)
+        check(not spilled, f"at {size} nothing in the hold's dialog reaches past it"
+              f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-hold-dialog-{size}.png"))
+        if size == "desktop" and PASS != "fit":
+            page.select_option("dialog#hold select[name=role]", "settlement")
+            page.fill("dialog#hold input[name=days]", "3650")
+            page.click("dialog#hold button[type=submit]")
+            settled(page)
+            listed = page.text_content("#holds")
+            check("settlement" in listed and "3,650 days" in listed, f"a hold set from the dialog is held: {listed[:200]!r}")
+        check(not errors, f"the raw records and holds at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def the_icon_is_linked_and_served(browser):
     """The product owner, 2026-10-06: the Open Meridian icon on the
     deployment too."""
@@ -372,6 +481,7 @@ with sync_playwright() as playwright:
         two_hundred_are_accepted_and_two_hundred_and_one_refused(browser)
         without_script_the_plain_table_posts(browser)
     the_access_editor_has_a_row_per_role(browser, prefix)
+    the_raw_records_and_the_holds(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),

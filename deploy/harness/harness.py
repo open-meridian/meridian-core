@@ -22,8 +22,12 @@ the same image with the list on stdin:
       it fails, as a pod's container is; the broker configured for them all,
       and a password drawn for each. A plugin holding an edge role is also
       given its storage (decisions/028): a volume of its own, kept while the
-      run's volumes are, at the path MERIDIAN_STORAGE_DIR names. The first is
-      the runner's plugin.
+      run's volumes are, at the path MERIDIAN_STORAGE_DIR names. One listed
+      with `"archive": true` -- an edge plugin a deployment admin allows an
+      archive, as `archive allow` then records -- is given the harness's
+      archive beside it (contract v16): a volume of its own at the path
+      MERIDIAN_ARCHIVE_DIR names, as the launcher gives an allowed instance
+      its directory of a local archive. The first is the runner's plugin.
 
   ready [--seconds N]
       Until the plugin has registered with its sidecar and the dashboard lists
@@ -35,7 +39,26 @@ the same image with the list on stdin:
       field; a developer's setting is accepted because the harness's dashboard
       is a development one. A table setting's cell is NAME[ROW].COLUMN=VALUE,
       the rows given its whole (contract v14). --expect reads the Settings
-      tab after and fails unless it says TEXT.
+      tab after and fails unless it says TEXT. --expect-refused TEXT fails
+      unless the dashboard refuses the settings saying TEXT -- a window below
+      the hold, naming the setting (contract v16).
+
+  hold DAYS [--role ROLE] [--write-once] [--expect-refused TEXT]
+      Sets the hold on raw records on the deployment's Settings, as a
+      deployment admin does (W6.25, contract v16): for ROLE, an edge role, or
+      every one without it; 0 days clears it. --expect-refused TEXT fails
+      unless it is refused saying TEXT.
+
+  archive allow [--bound-gib N] | archive withdraw
+      Allows the plugin an archive, with a bound in GiB or none, or withdraws
+      it, on its Manage page's Summary, as a deployment admin does (W8.7,
+      contract v16). The harness has no launcher: the plugin listed with
+      `"archive": true` already holds its archive's volume, and this records
+      what a deployment admin allowed.
+
+  summary [--until TEXT] [--seconds N]
+      Prints the plugin's Summary under Manage, where its raw records are
+      drawn (W6.9): with --until, again until it says TEXT.
 
   account NAME [--seconds N]
       Defines an account (W6.3) and prints its ID, for a plugin whose page
@@ -373,6 +396,7 @@ def ready(args):
 def settings(args):
     seconds = number(args, "--seconds", 60)
     wanted = option(args, "--expect", None)
+    refusal = option(args, "--expect-refused", None)
     asked = pairs(args)
     if args or not asked:
         raise Failed("settings takes NAME=VALUE, at least one")
@@ -411,6 +435,13 @@ def settings(args):
         secret = f'name="secret.{name}"' in form.body
         fields[("secret." if secret else "value.") + name] = value
     saved = admin.post(f"{VIEW}/settings", fields)
+    if refusal is not None:
+        if saved.status == 303:
+            raise Failed(f"the settings were saved, and were to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(saved)):
+            raise Failed(f"the settings were refused, not saying {refusal!r}: {sentence(saved)}")
+        print(f"settings: refused: {html.unescape(sentence(saved))}")
+        return
     if saved.status != 303:
         raise Failed(f"the settings were not saved: {saved.status} {sentence(saved)}")
     print(f"settings: saved {', '.join(sorted({base(name) for name, _ in asked}))}")
@@ -420,6 +451,76 @@ def settings(args):
             raise Failed(f"the settings page does not say {wanted!r}")
         said = re.search(r"data-last-changed>([^<]*)<", shown.body)
         print(f"settings: {said.group(1) if said else wanted}")
+
+
+def hold(args):
+    role = option(args, "--role", "")
+    write_once = "--write-once" in args
+    if write_once:
+        args.remove("--write-once")
+    refusal = option(args, "--expect-refused", None)
+    if len(args) != 1 or not args[0].isdigit():
+        raise Failed("hold takes a number of days, 0 to clear")
+    admin = signed_in()
+    page = admin.get("/admin")
+    fields = {"form_token": form_token(page), "role": role, "days": args[0]}
+    if write_once:
+        fields["write_once"] = "1"
+    done = admin.post("/admin/holds", fields)
+    covers = role or "every edge role"
+    if refusal is not None:
+        if done.status == 303:
+            raise Failed(f"the hold was set, and was to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(done)):
+            raise Failed(f"the hold was refused, not saying {refusal!r}: {sentence(done)}")
+        print(f"hold: refused: {html.unescape(sentence(done))}")
+        return
+    if done.status != 303:
+        raise Failed(f"the hold was not set: {done.status} {sentence(done)}")
+    print(f"hold: {args[0]} days over {covers}")
+
+
+def archive(args):
+    if not args or args[0] not in ("allow", "withdraw"):
+        raise Failed("archive takes allow or withdraw")
+    verb = args.pop(0)
+    bound = option(args, "--bound-gib", "")
+    if args:
+        raise Failed(f"archive {verb} takes no {args[0]!r}")
+    admin = signed_in()
+    summary_at = f"/plugins/{INSTANCE}?level=admin&tab=summary"
+    page = admin.get(summary_at)
+    if page.status != 200:
+        raise Failed(f"its Summary: {page.status} {sentence(page)}")
+    fields = {"form_token": form_token(page)}
+    path = f"/plugins/{INSTANCE}/archive"
+    if verb == "allow":
+        fields["most_gib"] = bound
+    else:
+        path += "/withdraw"
+    done = admin.post(path, fields)
+    if done.status != 303:
+        raise Failed(f"the archive was not {verb}ed: {done.status} {sentence(done)}")
+    shown = admin.get(summary_at)
+    said = re.search(r'class="archive-state"[^>]*>([^<]*)<', shown.body)
+    print(f"archive {verb}: {html.unescape(said.group(1)) if said else 'done'}")
+
+
+def summary(args):
+    seconds = number(args, "--seconds", 60)
+    wanted = option(args, "--until", None)
+    admin = signed_in()
+
+    def answered():
+        page = admin.get(f"/plugins/{INSTANCE}?level=admin&tab=summary")
+        if page.status != 200:
+            raise Failed(f"its Summary: {page.status} {sentence(page)}")
+        if wanted is not None and wanted not in html.unescape(page.body):
+            raise Failed(f"its Summary does not say {wanted!r} yet")
+        return page
+
+    page = until(seconds, answered, f"{INSTANCE}'s Summary")
+    print(page.body)
 
 
 def account(args):
@@ -787,6 +888,9 @@ RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the run
 # claim of its own, at the same path.
 EDGE_ROLES = ("ccm", "custody", "dgm", "match", "reporting", "servicing", "settlement")
 STORAGE_DIR = "/var/lib/meridian/storage"
+# Where an edge plugin allowed an archive finds it (contract v16), as the
+# chart's archive shape mounts an allowed instance's directory.
+ARCHIVE_DIR = "/var/lib/meridian/archive"
 
 
 def plugins_listed(text):
@@ -801,8 +905,12 @@ def plugins_listed(text):
     seen = set()
     for at, plugin in enumerate(listed):
         where = f"plugin {at + 1}"
-        if not isinstance(plugin, dict) or set(plugin) != {"instance", "image", "roles"}:
-            raise Failed(f"{where} is an object of instance, image and roles, and nothing else")
+        if not isinstance(plugin, dict) or not {"instance", "image", "roles"} <= set(plugin) \
+                or set(plugin) - {"instance", "image", "roles", "archive"}:
+            raise Failed(f"{where} is an object of instance, image and roles, and archive where it "
+                         "is allowed one, and nothing else")
+        if "archive" in plugin and plugin["archive"] is not True:
+            raise Failed(f"{where}'s archive is true where it is allowed one, and absent otherwise")
         name, image, roles = plugin["instance"], plugin["image"], plugin["roles"]
         if not isinstance(name, str) or not INSTANCE_NAME.fullmatch(name):
             raise Failed(f"{where}'s instance {name!r} is not lower case letters, digits and inner hyphens, "
@@ -816,6 +924,9 @@ def plugins_listed(text):
             raise Failed(f"{where}'s image {image!r} is not an image reference")
         if not isinstance(roles, list) or not all(isinstance(r, str) and ROLE_NAME.fullmatch(r) for r in roles):
             raise Failed(f"{where}'s roles are a list of role names, empty for a plugin holding none")
+        if plugin.get("archive") and not any(role in EDGE_ROLES for role in roles):
+            raise Failed(f"{where} is allowed an archive and holds no edge role; only a plugin at the "
+                         "edge keeps raw records (decisions/028)")
     return listed
 
 
@@ -830,6 +941,7 @@ def compose(args):
     instances.append({"instance_id": "dashboard-1", "component": "dashboard"})
     stored = [plugin["instance"] for plugin in listed
               if any(role in EDGE_ROLES for role in plugin["roles"])]
+    archived = [plugin["instance"] for plugin in listed if plugin.get("archive")]
     services = {
         "keys": {"environment": {"MERIDIAN_HARNESS_BROKER_USERS": " ".join(names)}},
         "broker-config": {"environment": {
@@ -844,7 +956,8 @@ def compose(args):
             "image": "alpine/openssl:3.3.2",
             "entrypoint": ["sh", "-c"],
             "command": ["chmod 0777 /storage/*"],
-            "volumes": [f"storage-{name}:/storage/{name}" for name in stored],
+            "volumes": [f"storage-{name}:/storage/{name}" for name in stored]
+                       + [f"archive-{name}:/storage/archive-{name}" for name in archived],
             "networks": ["harness"],
         }
     for plugin in listed:
@@ -895,6 +1008,11 @@ def compose(args):
             services[name]["depends_on"]["storage"] = {"condition": "service_completed_successfully"}
             services[name]["environment"]["MERIDIAN_STORAGE_DIR"] = STORAGE_DIR
             services[name]["volumes"] = [f"storage-{name}:{STORAGE_DIR}"]
+        # Its archive, where it is allowed one (contract v16): a volume of
+        # its own beside its storage, which `down -v` removes.
+        if name in archived:
+            services[name]["environment"]["MERIDIAN_ARCHIVE_DIR"] = ARCHIVE_DIR
+            services[name]["volumes"].append(f"archive-{name}:{ARCHIVE_DIR}")
     written = {
         "x-harness": "written by harness.py compose for " + ", ".join(names)
                      + "; written again, never edited, for another list",
@@ -902,6 +1020,7 @@ def compose(args):
     }
     if stored:
         written["volumes"] = {f"storage-{name}": {} for name in stored}
+        written["volumes"].update({f"archive-{name}": {} for name in archived})
     print(json.dumps(written, indent=2))
 
 
@@ -1398,7 +1517,8 @@ def mcp(args):
     verbs[args.pop(0)](args)
 
 
-COMMANDS = {"ready": ready, "settings": settings, "account": account, "page": page,
+COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
+            "summary": summary, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
             "instruments": instruments, "instrument": instrument, "mcp": mcp,
             "ticket": ticket, "inbox": inbox}

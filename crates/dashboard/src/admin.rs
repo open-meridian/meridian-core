@@ -57,6 +57,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/access-groups", post(define_access_group))
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
+        .route("/admin/holds", post(set_hold))
         .route("/admin/instruments", get(instruments_page))
         .route("/admin/instruments/complete", post(complete_instruments))
         .route("/admin/instruments/accept", post(accept_offers))
@@ -225,6 +226,12 @@ fn after(outcome: Result<(), String>) -> Response {
     after_to(outcome, "/admin", "/admin")
 }
 
+/// The page saying a change was not done, in the store's sentence, with a
+/// way back to `back`.
+pub(crate) fn not_done(sentence: &str, back: &str) -> Response {
+    after_to(Err(sentence.to_string()), back, back)
+}
+
 /// To `done` when it was, and otherwise the store's sentence, with a way
 /// back to `back`.
 fn after_to(outcome: Result<(), String>, done: &str, back: &str) -> Response {
@@ -347,6 +354,7 @@ pub(crate) fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod books;
+pub mod holds;
 pub mod instruments;
 mod overview;
 pub mod people;
@@ -682,6 +690,10 @@ pub(crate) struct Manage<'a> {
     pub session: &'a Session,
     pub notice: &'a str,
     pub now: i64,
+    /// Its moves and archive as the conductor answers them, for a plugin
+    /// keeping raw records (W6.9, contract v16); and the page of moves asked.
+    pub moves: Option<&'a Result<meridian_domain::v1::ReadMovesReply, String>>,
+    pub moves_cursor: &'a str,
 }
 
 /// The dashboard's Summary tab in a plugin's area under Manage, where Manage
@@ -719,15 +731,98 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
             .map(|report| report.not_carried_seen.as_slice())
             .unwrap_or_default(),
     );
-    format!(
+    // Its raw records, storage's and the archive's, and its moves (W6.9,
+    // contract v16), for a plugin at the edge keeping them.
+    let (records, moves) = match manage.moves {
+        Some(moves) => crate::archive::sections(&crate::archive::Panel {
+            instance: manage.instance,
+            report: manage.report,
+            records: manage.records,
+            moves,
+            deployment_admin: person_access(
+                manage.records,
+                &manage.session.subject,
+                &manage.session.directory_groups,
+            )
+            .deployment_admin,
+            token: &token_input(manage.session),
+            cursor: manage.moves_cursor,
+        }),
+        None => (String::new(), String::new()),
+    };
+    let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
          <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
-         holding it at one will be here. They are not built yet.</p></section>{figures}{declared}{tools}",
-        tools = tools_section(manage.report),
+         holding it at one will be here. They are not built yet.</p></section>{figures}"
+    );
+    format!(
+        "{notice}{parts}",
+        notice = notice_line(manage.notice),
+        parts = summary_parts(&[
+            ("status", "Status", status),
+            ("records", "Raw records", records),
+            ("moves", "Moves", moves),
+            ("declared", "What it declares", declared),
+            ("tools", "Tools for agents", tools_section(manage.report)),
+        ]),
     )
 }
+
+/// The Summary's parts -- its status and figures, an edge plugin's raw
+/// records and their moves (contract v16), what it declares, its tools -- as
+/// tabs of their own where there are two or more, so the Summary fits one
+/// screen (the product owner, 2026-10-04): one shown at a time, the one the
+/// address names or else the first, its status. Without script every part
+/// shows, under its own heading.
+fn summary_parts(parts: &[(&str, &str, String)]) -> String {
+    let shown: Vec<&(&str, &str, String)> = parts
+        .iter()
+        .filter(|(_, _, html)| !html.is_empty())
+        .collect();
+    if shown.len() < 2 {
+        return shown.iter().map(|(_, _, html)| html.as_str()).collect();
+    }
+    let links: String = shown
+        .iter()
+        .map(|(id, title, _)| format!("<a href=\"#part-{id}\">{title}</a>"))
+        .collect();
+    let sections: String = shown
+        .iter()
+        .map(|(id, _, html)| format!("<div class=\"summary-part\" id=\"part-{id}\">{html}</div>"))
+        .collect();
+    format!(
+        "<nav class=\"tabs summary-parts\" data-summary-parts aria-label=\"The Summary's parts\">{links}</nav>\
+         {sections}<script>{SUMMARY_PARTS}</script>"
+    )
+}
+
+/// One part of the Summary at a time, as Settings shows one group; the kit's
+/// om-pager in a part shown is told to measure again, as on a resize.
+const SUMMARY_PARTS: &str = r#"(function () {
+  var nav = document.querySelector("nav[data-summary-parts]");
+  if (!nav) return;
+  var tabs = [].slice.call(nav.querySelectorAll("a[href^='#']"));
+  var ids = tabs.map(function (a) { return a.getAttribute("href").slice(1); });
+  function show() {
+    var asked = decodeURIComponent(location.hash.slice(1));
+    var want = ids.indexOf(asked) >= 0 ? asked : ids[0];
+    tabs.forEach(function (a) {
+      var on = a.getAttribute("href").slice(1) === want;
+      a.classList.toggle("on", on);
+      if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+    });
+    ids.forEach(function (id) {
+      var part = document.getElementById(id);
+      if (part) part.hidden = id !== want;
+    });
+    // A pager in the part now shown measures the space it is given again.
+    window.dispatchEvent(new Event("resize"));
+  }
+  window.addEventListener("hashchange", show);
+  show();
+})();"#;
 
 /// The plugin's tools on the deployment's MCP surface (W4.8, W6.20, contract
 /// v12): those its sidecar admitted, reads and acts apart, and each refused
@@ -1769,3 +1864,33 @@ pub(crate) fn query_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// W6.25: a deployment admin sets, changes or clears (0 days) a hold on raw
+/// records, from the deployment's Settings.
+async fn set_hold(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    admin_form!(app, headers, fields, session, {
+        match field(&fields, "days").parse::<u32>() {
+            Err(_) => Err(format!(
+                "{:?} is not a number of days",
+                field(&fields, "days")
+            )),
+            Ok(days) => command::<meridian_domain::v1::Hold>(
+                &app,
+                &session,
+                "platform.config.command.set-hold",
+                "meridian.v1.SetHoldRequest",
+                meridian_domain::v1::SetHoldRequest {
+                    role: field(&fields, "role").to_string(),
+                    days,
+                    write_once: !field(&fields, "write_once").is_empty(),
+                },
+            )
+            .await
+            .map(|_| ()),
+        }
+    })
+}

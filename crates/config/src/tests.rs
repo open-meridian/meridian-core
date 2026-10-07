@@ -2881,3 +2881,112 @@ async fn every_grant_change_is_its_own_record_naming_who_and_when() {
     assert!(records[2].became.contains(&growth.account_group_id));
     assert!(records[3].was.contains(&people.user_group_id) && records[3].became.is_empty());
 }
+
+/// Contract v16 (W6.25, W4.7, W6.11): a hold a deployment admin sets reaches
+/// the sidecar of each instance it covers on its configuration, the records
+/// carry it, and a window setting below it is refused naming the setting.
+#[tokio::test]
+async fn a_hold_reaches_the_sidecars_it_covers_and_holds_a_window_back() {
+    let h = harness("dashboard-1");
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "custody-1".into(),
+            roles: vec!["custody".into()],
+            last_reported_at_ns: 0,
+        })
+        .unwrap();
+    h.store
+        .record_declared_settings(
+            "custody-1",
+            &[
+                SettingDeclaration {
+                    name: "activity_window_days".into(),
+                    r#type: SettingType::Integer as i32,
+                    ..Default::default()
+                },
+                SettingDeclaration {
+                    name: "activity_past_window".into(),
+                    r#type: SettingType::Choice as i32,
+                    choices: ["archived", "kept", "deleted"]
+                        .iter()
+                        .map(|value| SettingChoice {
+                            value: value.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        )
+        .unwrap();
+    let mut changed = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let set: meridian_domain::v1::Hold = ask(
+        &h,
+        crate::archive::SET_HOLD,
+        "meridian.v1.SetHoldRequest",
+        meridian_domain::v1::SetHoldRequest {
+            role: "custody".into(),
+            days: 2190,
+            write_once: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(set.updated_by, ADA);
+    let told = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let delivery = changed.recv().await.expect("announced");
+            let event =
+                PluginConfigurationChangedEvent::decode(&delivery.envelope.payload[..]).unwrap();
+            if event.plugin_instance_id == "custody-1" {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("the custody instance was told its configuration changed");
+    assert_eq!(told.plugin_instance_id, "custody-1");
+    // What its sidecar is told on its configuration.
+    let configured = configuration(
+        &h.store.snapshot().unwrap(),
+        "custody-1",
+        &SettingsKey::holding(&[7u8; 32]),
+    );
+    assert_eq!(configured.hold_days, 2190);
+    assert_eq!(records(&h).await.holds, vec![set]);
+
+    let refused = ask::<_, PluginSettingsRecord>(
+        &h,
+        SET_PLUGIN_SETTINGS,
+        "meridian.v1.SetPluginSettingsRequest",
+        SetPluginSettingsRequest {
+            plugin_instance_id: "custody-1".into(),
+            values: vec![PluginSettingValue {
+                name: "activity_window_days".into(),
+                value: "30".into(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("activity_window_days: 30 is below the hold of 2,190 days"),
+        "{refused}"
+    );
+    // A role that is no edge role is refused, naming it.
+    let oms = ask::<_, meridian_domain::v1::Hold>(
+        &h,
+        crate::archive::SET_HOLD,
+        "meridian.v1.SetHoldRequest",
+        meridian_domain::v1::SetHoldRequest {
+            role: "oms".into(),
+            days: 30,
+            write_once: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(oms.contains("oms is not an edge role"), "{oms}");
+}

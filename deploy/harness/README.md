@@ -27,11 +27,12 @@ same tag. The runtime image carries none of it.
 | File | What it is |
 |---|---|
 | `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles; the stores migrated; street, the book (`bor`), instrument, conductor and a development dashboard; the `runner`; and `store` |
-| `harness.py` | The runner, standard library only: `ready`, `settings`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`; and `compose`, which writes the plugins' half of the deployment |
+| `harness.py` | The runner, standard library only: `ready`, `settings`, `hold`, `archive`, `summary`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
 | `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
 | `activity.sql` | The custodian's activity and each connection's latest sync status, as the street keeps them, as stable, sorted lines (contract v14), which `store activity` prints |
+| `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), which `store moves` prints; never a record's content |
 
 ## Taking it out of the image
 
@@ -80,11 +81,25 @@ container made again (`up -d --force-recreate <instance>`), which is how a
 plugin's e2e proves it rebuilds from what it kept, and goes with `down -v`.
 No other plugin mounts it, and a plugin holding no edge role has none.
 
+From contract v16, an edge plugin listed with `"archive": true` is also given
+the harness's archive (spec/an-edge-plugins-older-records-move-to-the-archive),
+as the launcher gives an instance a deployment admin allowed one: a volume of
+its own, `archive-<instance>`, at the path `MERIDIAN_ARCHIVE_DIR` names
+(`/var/lib/meridian/archive`), beside its storage and going with `down -v`. The
+harness has no launcher, so the volume is there from the start; `archive
+allow` then records on the plugin's Manage page what a deployment admin
+allowed, which past-the-window `archived` needs. The harness's archive is a
+local one, which cannot lock: a write-once hold is refused here, as on any
+local deployment.
+
+    [{"instance": "snaptrade", "image": "...", "roles": ["custody"], "archive": true}]
+
 - `instance` is lower case letters, digits and inner hyphens, at most 32,
   starting with a letter, and none of the names the harness already holds
   (its services, `storage` among them, `runtime`, `first-run`, `dashboard-1`,
   or `sidecar-...`).
 - `roles` is a list, empty for a plugin holding none.
+- `archive`, where given, is `true`, and only for a plugin holding an edge role.
 - The first plugin listed is the runner's, when a command names no
   `--instance`.
 
@@ -134,6 +149,9 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 |---|---|
 | `ready [--seconds N]` | Waits until the plugin has registered and the dashboard lists it, healthy or not. The first command of a run. |
 | `settings NAME=VALUE ... [--seconds N] [--expect TEXT]` | Sets the plugin's settings in its settings form, once it has declared each; a secret in its secret field. A developer setting is accepted here. A table setting's cell is `NAME[ROW].COLUMN=VALUE`, and the rows given are its whole (contract v14). `--expect` reads the Settings tab after saving and fails unless it says TEXT, printing who last changed them |
+| `hold DAYS [--role ROLE] [--write-once] [--expect-refused TEXT]` | From contract v16: sets the hold on raw records on the deployment's Settings, as a deployment admin does, for one edge role or every one; 0 days clears it. With `--expect-refused`, fails unless it is refused saying `TEXT`. `settings ... --expect-refused TEXT` likewise expects a window below the hold refused, naming the setting. |
+| `archive allow [--bound-gib N]` / `archive withdraw` | From contract v16: allows the plugin an archive, with a bound in GiB or none, or withdraws it, on its Manage page, and prints what its Summary then says. |
+| `summary [--until TEXT] [--seconds N]` | Prints the plugin's Summary under Manage, where from contract v16 its raw records are drawn: per kind what its storage and its archive hold, and its moves; with `--until`, again until it says `TEXT`. |
 | `account NAME [--seconds N]` | Defines an account and prints its ID, for a page that links only to an account that exists. |
 | `page --level admin\|write\|read PATH [--until TEXT] [--seconds N]` | Opens a session on the plugin's own host at that level (Manage, Open, View), GETs `PATH`, prints the status and then the body; with `--until`, again until the body says `TEXT`. |
 | `form --level L --page PATH --post PATH [--csrf-field NAME] [--from-page NAME ...] [--expect TEXT] FIELD=VALUE ...` | In such a session, reads `--page`, takes its CSRF field (`csrf`, the SDK's name) and each field `--from-page` names (repeated, or comma separated) with the value the page gives it -- a proposal's digest, say -- and posts them with the fields you give, urlencoded, to `--post`; prints the status and the body. A field you give wins over one taken from the page; a field the page does not have fails. With `--expect`, fails unless the body says `TEXT`. A 4xx or 5xx fails. |
@@ -166,6 +184,15 @@ proof that the page links.
     $H run --rm -T store book
     $H run --rm -T store tickets
     $H run --rm -T store activity
+    $H run --rm -T store moves
+
+`store moves` (contract v16) prints each move of raw records the conductor
+recorded, and each hold and archive change, one line each, sorted, never a
+record's content:
+
+    move|<instance>|<kind>|<unit>|<archived|restored|returned|deleted>|<records>|<first received ns>|<last received ns>|<rule>|<person>
+    hold|<role, empty for every one>|<days>|<write-once>|<set by>
+    archive|<instance>|<allowed>|<most bytes>|<set by>
 
 `store tickets` (contract v13) prints the dashboard's tickets, one line each,
 and the records each names and its notes, sorted, and never a text:

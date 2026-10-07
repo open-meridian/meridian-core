@@ -33,16 +33,21 @@ struct Launcher {
 }
 
 fn harness() -> (Arc<Bus>, Arc<Launcher>) {
+    harness_with(ArchiveGrant::default())
+}
+
+fn harness_with(archive: ArchiveGrant) -> (Arc<Bus>, Arc<Launcher>) {
     let bus = Arc::new(Bus::single(
         "conductor-1",
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    serve_plugins(
+    serve_plugins_with(
         Arc::clone(&bus),
         Arc::new(MemoryStore::new()),
         Arc::new(At(1_790_380_800_000_000_000)),
         "localhost:5000".into(),
+        archive,
     );
     let launcher = Arc::new(Launcher::default());
     let creating = Arc::clone(&launcher);
@@ -381,4 +386,138 @@ async fn a_live_launch_is_recorded_as_live_and_asked_of_the_launcher_as_live() {
     request.version = "0.2.0".into();
     assert!(!launch(&bus, request).await.unwrap().live);
     assert!(!launcher.created.lock().unwrap()[1].live);
+}
+
+/// W8.7, contract v16: a deployment admin allows a launched edge instance an
+/// archive; it is recorded, and the instance restarted through CreatePlugin
+/// carrying it; withdrawn, restarted without it; a later launch carries what
+/// stands. Refused with no archive installed, and for an instance at no edge
+/// role.
+#[tokio::test(flavor = "multi_thread")]
+async fn allowing_an_archive_restarts_the_instance_carrying_it() {
+    use meridian_domain::v1::{AllowArchiveRequest, PluginArchive, WithdrawArchiveRequest};
+    let local = ArchiveGrant {
+        kind: ArchiveKind::Path,
+        locks: false,
+    };
+    let (bus, launcher) = harness_with(local);
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    launch(&bus, launching("snaptrade-1", &["custody"]))
+        .await
+        .unwrap();
+    assert_eq!(launcher.created.lock().unwrap()[0].archive, None);
+
+    let allowed: PluginArchive = ask(
+        &bus,
+        ALLOW_ARCHIVE,
+        "meridian.v1.AllowArchiveRequest",
+        AllowArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+            most_bytes: 53_687_091_200,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(allowed.allowed);
+    assert_eq!(allowed.updated_by, ADA);
+    assert_eq!(*launcher.removed.lock().unwrap(), ["snaptrade-1"]);
+    let made = launcher.created.lock().unwrap()[1].clone();
+    assert_eq!(made.archive, Some(allowed.clone()));
+    assert_eq!(made.instance_id, "snaptrade-1");
+
+    let withdrawn: PluginArchive = ask(
+        &bus,
+        WITHDRAW_ARCHIVE,
+        "meridian.v1.WithdrawArchiveRequest",
+        WithdrawArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!withdrawn.allowed);
+    assert_eq!(
+        withdrawn.most_bytes, 53_687_091_200,
+        "its bound is kept with it"
+    );
+    let again = launcher.created.lock().unwrap()[2].clone();
+    assert!(again
+        .archive
+        .as_ref()
+        .is_none_or(|archive| !archive.allowed));
+
+    // Withdrawn again: answered as it stands, nothing recorded or restarted.
+    let _: PluginArchive = ask(
+        &bus,
+        WITHDRAW_ARCHIVE,
+        "meridian.v1.WithdrawArchiveRequest",
+        WithdrawArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(launcher.created.lock().unwrap().len(), 3);
+
+    // An instance nobody launched or heard from is refused.
+    let unknown = ask::<_, PluginArchive>(
+        &bus,
+        ALLOW_ARCHIVE,
+        "meridian.v1.AllowArchiveRequest",
+        AllowArchiveRequest {
+            instance_id: "nobody-1".into(),
+            most_bytes: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(unknown.contains("no plugin this deployment"), "{unknown}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_is_refused_with_none_installed_and_at_no_edge_role() {
+    use meridian_domain::v1::{AllowArchiveRequest, PluginArchive};
+    let (bus, _) = harness();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    launch(&bus, launching("snaptrade-1", &["custody"]))
+        .await
+        .unwrap();
+    let none = ask::<_, PluginArchive>(
+        &bus,
+        ALLOW_ARCHIVE,
+        "meridian.v1.AllowArchiveRequest",
+        AllowArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+            most_bytes: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(none.contains("installed with no archive"), "{none}");
+
+    let (bus, _) = harness_with(ArchiveGrant {
+        kind: ArchiveKind::Path,
+        locks: false,
+    });
+    let mut inner = snaptrade("0.1.0");
+    inner.metadata.as_mut().unwrap().roles = vec!["operations".into()];
+    upload(&bus, inner).await.unwrap();
+    launch(&bus, launching("ops-1", &["operations"]))
+        .await
+        .unwrap();
+    let refused = ask::<_, PluginArchive>(
+        &bus,
+        ALLOW_ARCHIVE,
+        "meridian.v1.AllowArchiveRequest",
+        AllowArchiveRequest {
+            instance_id: "ops-1".into(),
+            most_bytes: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("holds operations, no edge role"),
+        "{refused}"
+    );
 }

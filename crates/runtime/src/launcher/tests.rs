@@ -133,6 +133,7 @@ fn shapes(storage: bool) -> Shapes {
             .map(String::from)
             .to_vec(),
         }),
+        archive: None,
     }
 }
 
@@ -271,4 +272,97 @@ fn kept_storage_is_mounted_again_by_the_same_plugin_and_never_by_another() {
         refused.contains("was not made by the launcher"),
         "{refused}"
     );
+}
+
+const LOCAL_ARCHIVE: &str = r#"{"env":[{"name":"MERIDIAN_ARCHIVE_DIR","value":"/var/lib/meridian/archive"}],"volumeMounts":[{"mountPath":"/var/lib/meridian/archive","name":"archive","subPath":"__INSTANCE__"}],"volumes":[{"name":"archive","persistentVolumeClaim":{"claimName":"check-meridian-runtime-archive"}}]}"#;
+const BUCKET_ARCHIVE: &str = r#"{"env":[{"name":"MERIDIAN_ARCHIVE_BUCKET","value":"s3://firm/meridian/__INSTANCE__"}],"serviceAccountName":"archive-writer"}"#;
+
+fn edge() -> Vec<String> {
+    vec!["custody".to_string()]
+}
+
+fn pod() -> serde_json::Value {
+    serde_json::json!({"spec": {"template": {"spec": {
+        "containers": [
+            {"name": "sidecar", "env": [{"name": "MERIDIAN_PLUGIN_ROLES", "value": "custody"}]},
+            {"name": "plugin", "env": [{"name": "MERIDIAN_STORAGE_DIR", "value": "/var/lib/meridian/storage"}],
+             "volumeMounts": [{"name": "storage", "mountPath": "/var/lib/meridian/storage"}]}
+        ],
+        "volumes": [{"name": "storage", "persistentVolumeClaim": {"claimName": "s"}}]
+    }}}})
+}
+
+fn allowed() -> CreatePluginRequest {
+    CreatePluginRequest {
+        archive: Some(meridian_domain::v1::PluginArchive {
+            instance_id: "snaptrade-1".into(),
+            allowed: true,
+            ..Default::default()
+        }),
+        ..request()
+    }
+}
+
+#[test]
+fn an_allowed_archive_is_the_instances_own_directory_in_the_plugins_container_alone() {
+    let made = with_archive(pod(), Some(LOCAL_ARCHIVE), &allowed(), &edge()).unwrap();
+    let spec = &made["spec"]["template"]["spec"];
+    let plugin = &spec["containers"][1];
+    assert_eq!(plugin["env"][1]["name"], "MERIDIAN_ARCHIVE_DIR");
+    assert_eq!(plugin["volumeMounts"][1]["subPath"], "snaptrade-1");
+    assert_eq!(
+        spec["volumes"][1]["persistentVolumeClaim"]["claimName"],
+        "check-meridian-runtime-archive"
+    );
+    assert_eq!(
+        spec["containers"][0]["env"].as_array().unwrap().len(),
+        1,
+        "the sidecar is given nothing"
+    );
+    assert!(spec["serviceAccountName"].is_null());
+
+    let bucket = with_archive(pod(), Some(BUCKET_ARCHIVE), &allowed(), &edge()).unwrap();
+    let spec = &bucket["spec"]["template"]["spec"];
+    assert_eq!(
+        spec["containers"][1]["env"][1]["value"],
+        "s3://firm/meridian/snaptrade-1"
+    );
+    assert_eq!(spec["serviceAccountName"], "archive-writer");
+}
+
+#[test]
+fn no_archive_unless_one_is_allowed_and_the_chart_keeps_one() {
+    // None carried, or one withdrawn: as before.
+    assert_eq!(
+        with_archive(pod(), Some(LOCAL_ARCHIVE), &request(), &edge()).unwrap(),
+        pod()
+    );
+    let withdrawn = CreatePluginRequest {
+        archive: Some(meridian_domain::v1::PluginArchive {
+            allowed: false,
+            ..Default::default()
+        }),
+        ..request()
+    };
+    assert_eq!(
+        with_archive(pod(), Some(LOCAL_ARCHIVE), &withdrawn, &edge()).unwrap(),
+        pod()
+    );
+    assert!(with_archive(pod(), None, &allowed(), &edge())
+        .unwrap_err()
+        .contains("keeps none"));
+    let inner = CreatePluginRequest {
+        roles: vec!["operations".into()],
+        ..allowed()
+    };
+    assert!(with_archive(pod(), Some(LOCAL_ARCHIVE), &inner, &edge())
+        .unwrap_err()
+        .contains("no edge role"));
+    assert!(with_archive(
+        pod(),
+        Some(r#"{"env":[{"name":"X","value":"__WHO__"}]}"#),
+        &allowed(),
+        &edge()
+    )
+    .is_err());
 }

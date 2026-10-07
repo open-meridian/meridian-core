@@ -810,6 +810,18 @@ pub(crate) async fn frame(
                 Some(record) => crate::admin::choices(&app, &instance, record, &records).await,
                 None => crate::admin::settings::Choices::default(),
             };
+            // Its raw records and moves, on its Summary alone, for a plugin
+            // keeping them (W6.9, contract v16).
+            let on_summary = matches!(
+                current.map(|tab| tab.key.as_str()),
+                Some(crate::area::SUMMARY) | None
+            );
+            let moves_cursor = asked.get("moves").map(String::as_str).unwrap_or_default();
+            let moves = if on_summary && crate::archive::keeps_records(reports.get(&instance)) {
+                Some(crate::archive::read(&app, &instance, moves_cursor).await)
+            } else {
+                None
+            };
             let manage = crate::admin::Manage {
                 instance: &instance,
                 choices: &choices,
@@ -819,6 +831,8 @@ pub(crate) async fn frame(
                 session: &session,
                 notice,
                 now,
+                moves: moves.as_ref(),
+                moves_cursor,
             };
             crate::area::Shown::Drawn(match current.map(|tab| tab.key.as_str()) {
                 Some(crate::area::SETTINGS) => crate::admin::settings_tab(&manage),

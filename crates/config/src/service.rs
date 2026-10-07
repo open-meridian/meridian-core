@@ -2,7 +2,11 @@
 //!
 //! Eleven commands and queries from the dashboard, two queries from sidecars,
 //! a command and a query from a plugin acting for its admin, three events
-//! heard, a query asked of the instrument store, one announced. Every change
+//! heard, a query asked of the instrument store, one announced. And from
+//! contract v16 an edge plugin's raw records ([`crate::archive`]): a hold set
+//! and the moves read, from the dashboard, and a move reported by a sidecar as
+//! itself; the hold over an instance is told to its sidecar on its
+//! configuration, and a window setting below it refused. Every change
 //! is written the same way:
 //! read a snapshot, check the rule, write, read again, and announce a change
 //! to each plugin whose configuration differs between the two. A sidecar asks
@@ -262,6 +266,7 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         })
         .cloned()
         .collect();
+    let (hold_days, hold_write_once) = crate::archive::hold_over(snapshot, plugin_instance_id);
     PluginConfiguration {
         plugin_instance_id: plugin_instance_id.to_string(),
         settings: Vec::new(),
@@ -269,10 +274,11 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         read_account_ids: scope.read.into_iter().collect(),
         write_account_ids: scope.write.into_iter().collect(),
         linked_accounts,
-        // The hold over the instance (W6.25, contract v16): none until the
-        // conductor records holds.
-        hold_days: 0,
-        hold_write_once: false,
+        // The hold over the instance (W6.25, contract v16): the longest of
+        // its edge roles' and the one for every role. Its sidecar refuses a
+        // deletion inside it (W4.13); the plugin is never told it.
+        hold_days,
+        hold_write_once,
     }
 }
 
@@ -397,6 +403,10 @@ struct Context {
     /// as heard since this started: in memory, since a connector reports its
     /// whole list on each read, as the dashboard keeps it.
     reported: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// The deployment's archive, as its install named it (W7.1, W8.7).
+    grant: crate::archive::ArchiveGrant,
+    /// The kinds of raw record each plugin last declared (W4.1, W4.8).
+    kinds: crate::archive::Kinds,
 }
 
 impl Context {
@@ -625,7 +635,7 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
 
 /// The delegation the person acted through, when they acted through a
 /// client (decisions/029); empty otherwise.
-fn delegation(envelope: &Envelope) -> String {
+pub(crate) fn delegation(envelope: &Envelope) -> String {
     envelope
         .meta
         .as_ref()
@@ -689,13 +699,34 @@ pub(crate) fn answer_on<C, Req, Rep, F>(
 /// for the two events it keeps. Call inside a runtime.
 ///
 /// `key` seals a secret setting before it is written and opens it for its
-/// plugin's sidecar; nothing else here holds it.
+/// plugin's sidecar; nothing else here holds it. A deployment with no
+/// archive ([`serve_with`] names one).
 pub fn serve(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     upstream: Arc<dyn Upstream>,
     key: Arc<SettingsKey>,
+) {
+    serve_with(
+        bus,
+        store,
+        clock,
+        upstream,
+        key,
+        crate::archive::ArchiveGrant::default(),
+    )
+}
+
+/// [`serve`], for a deployment whose install named where archives are kept
+/// (W7.1, W8.7, contract v16): what a write-once hold is refused against.
+pub fn serve_with(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    upstream: Arc<dyn Upstream>,
+    key: Arc<SettingsKey>,
+    grant: crate::archive::ArchiveGrant,
 ) {
     let context = Arc::new(Context {
         bus: Arc::clone(&bus),
@@ -704,6 +735,8 @@ pub fn serve(
         upstream,
         key,
         reported: Mutex::new(BTreeMap::new()),
+        grant,
+        kinds: Mutex::new(BTreeMap::new()),
     });
 
     // Links made before an account held one external account at most are
@@ -746,7 +779,59 @@ pub fn serve(
             // a connector reports have none (W2.8, W6.4). Only the dashboard
             // asks this, and it may already see every account.
             records.links = snapshot.links;
+            // The holds standing, for the deployment's Settings and each
+            // edge plugin's Summary (W6.25, contract v16).
+            records.holds = snapshot.holds;
             Ok(records)
+        },
+    );
+
+    answer(
+        &context,
+        crate::archive::SET_HOLD,
+        ("meridian.v1.SetHoldRequest", "meridian.v1.Hold"),
+        |cx, request: meridian_domain::v1::SetHoldRequest, envelope| {
+            let before = cx.snapshot()?;
+            let hold = crate::archive::set_hold(
+                cx.store.as_ref(),
+                cx.grant,
+                &request,
+                &subject(envelope),
+                &delegation(envelope),
+                cx.clock.now_ns(),
+            )?;
+            // Each sidecar the hold covers reads hold_days afresh.
+            cx.announce(&before)?;
+            Ok(hold)
+        },
+    );
+
+    answer(
+        &context,
+        crate::archive::RECORD_MOVE,
+        (
+            "meridian.v1.RecordMoveRequest",
+            "meridian.v1.RecordMoveReply",
+        ),
+        |cx, request: meridian_pb::v1::RecordMoveRequest, envelope| {
+            crate::archive::record_move(
+                cx.store.as_ref(),
+                &cx.snapshot()?,
+                &publisher(envelope),
+                request,
+                &subject(envelope),
+                &delegation(envelope),
+                cx.clock.now_ns(),
+            )
+        },
+    );
+
+    answer(
+        &context,
+        crate::archive::READ_MOVES,
+        ("meridian.v1.ReadMovesRequest", "meridian.v1.ReadMovesReply"),
+        |cx, request: meridian_domain::v1::ReadMovesRequest, _| {
+            crate::archive::read_moves(cx.store.as_ref(), &cx.snapshot()?, &request)
         },
     );
 
@@ -780,6 +865,19 @@ pub fn serve(
             // is written: a refusal part-way through changes nothing.
             let checked = rules::plugin_settings(&before, &request)?;
             cx.references_refused(&before, &request)?;
+            // A window never below the hold, and archived only where an
+            // archive is allowed and the kind archivable (W6.11, contract
+            // v16), naming the setting.
+            let kinds = cx
+                .kinds
+                .lock()
+                .ok()
+                .and_then(|kinds| kinds.get(plugin).cloned());
+            if let Some(refusal) =
+                crate::archive::windows_refused(&before, &request, kinds.as_deref())
+            {
+                return Err(refusal);
+            }
             let mut changes = Vec::new();
             for (declaration, value) in checked {
                 let name = declaration.name.clone();
@@ -1369,6 +1467,19 @@ pub fn serve(
             // plugin's instance: which settings are secret is not something
             // another component may say about a plugin.
             let own = publisher(&delivery.envelope) == plugin.plugin_instance_id;
+            // The kinds of raw record it declared (contract v16), which a
+            // past-the-window setting is checked against.
+            if report.registered && own {
+                let kinds = report
+                    .declaration
+                    .as_ref()
+                    .and_then(|declaration| declaration.storage.as_ref())
+                    .map(|storage| storage.record_kinds.clone())
+                    .unwrap_or_default();
+                if let Ok(mut held) = noting.kinds.lock() {
+                    held.insert(plugin.plugin_instance_id.clone(), kinds);
+                }
+            }
             let declared = (report.registered && own).then_some(report.declared_settings);
             let store = Arc::clone(&noting.store);
             let instance = plugin.plugin_instance_id.clone();

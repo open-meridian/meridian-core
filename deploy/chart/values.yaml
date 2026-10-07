@@ -388,6 +388,41 @@ pluginStorage:
   # OpenShift does; podSecurityContext.fsGroup, when set, wins.
   fsGroup: 65532
 
+# An archive for an edge plugin's older records (contract v16;
+# spec/an-edge-plugins-older-records-move-to-the-archive): past a kind's
+# window, a plugin moves its raw records here rather than deleting them, at
+# its admin's choice. Setting one of these allows no instance an archive by
+# itself: a deployment admin allows each, with a bound or none, on the
+# plugin's Manage page (W8.7), and the launcher restarts the instance with it.
+# None set, the default: nothing is archived, and records past their window
+# are kept in storage.
+#
+# On a local or on-premises deployment, a directory on the node (`path`, a NAS
+# export or a second disk mounted there; what `meridian up --archive <path>`
+# sets), made into a volume of its own, `<release>-meridian-runtime-archive`;
+# or a claim already made on such storage (`existingClaim`). Each allowed
+# instance mounts its own directory of it, named for the instance, at the path
+# MERIDIAN_ARCHIVE_DIR names, in the plugin's container alone; an admission
+# policy holds every pod to its own directory where the cluster can. Kept on
+# uninstall, never deleted by the deployment, and a local archive cannot lock:
+# a hold needing records that cannot be altered is refused, not claimed.
+#
+# In a cloud, `bucket`: the URL of a bucket in the provider's cold class
+# (s3://, gs://, or an Azure container URL), each allowed instance its own
+# prefix, named in MERIDIAN_ARCHIVE_BUCKET; `serviceAccount` is the account
+# whose workload identity is scoped to that bucket, which an allowed
+# instance's pod runs as, so no key is ever handed to a plugin. `objectLock`
+# says the bucket was made with object lock in compliance mode, which alone
+# lets a hold need records that cannot be altered.
+pluginArchive:
+  path: ""
+  existingClaim: ""
+  # The volume made from `path`, requested once.
+  size: 100Gi
+  bucket: ""
+  serviceAccount: ""
+  objectLock: false
+
 
 resources:
   requests:

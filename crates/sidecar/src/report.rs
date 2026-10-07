@@ -131,9 +131,13 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.not_carried_seen.clone())
                 .unwrap_or_default(),
-            // What each kind of raw record holds in storage (W4.5, W4.8,
-            // contract v16): none until this sidecar serves v16.
-            stored: Vec::new(),
+            // What each kind of raw record holds in storage, as its last
+            // accepted heartbeat said (W4.5, W4.8, contract v16): a count
+            // and a span per kind, never a record.
+            stored: registration
+                .as_ref()
+                .map(|r| r.stored.clone())
+                .unwrap_or_default(),
             // The tools it declared and this sidecar admitted, and a sentence
             // for each refused (W4.1, W4.8, contract v12): the dashboard's
             // catalogue for /mcp, and the Summary's.
