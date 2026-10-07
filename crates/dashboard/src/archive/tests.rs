@@ -140,6 +140,10 @@ fn each_kind_is_one_line_of_storage_and_archive_and_each_move_one_line() {
         "a kind with nothing archived: {page}"
     );
     assert!(
+        page.contains(">Archive size</th>"),
+        "the bytes are the archive's, and the heading says so: {page}"
+    );
+    assert!(
         page.contains("data-used-in-all=\"1288490189\"")
             && page.contains(">1.2 GiB of 50 GiB</td>"),
         "every kind together against the bound: {page}"

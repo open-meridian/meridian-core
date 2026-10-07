@@ -336,7 +336,7 @@ pub fn sections(panel: &Panel) -> (String, String) {
     let mut overridden = Vec::new();
     let lines: String = if kinds.is_empty() {
         format!(
-            "<tr data-kind=\"\"><td>Its raw records</td><td class=\"wide\">{} days</td><td>as it keeps them</td><td>{}</td><td class=\"num\">none</td></tr>",
+            "<tr data-kind=\"\"><td>Its raw records</td><td class=\"wide\">{} days</td><td>as it keeps them</td><td data-archived>{}</td><td class=\"num\">none</td></tr>",
             report
                 .declaration
                 .as_ref()
@@ -408,7 +408,7 @@ pub fn sections(panel: &Panel) -> (String, String) {
             .unwrap_or_default();
         format!(
             "<tfoot><tr data-used-in-all=\"{used_in_all}\"><td>In all</td><td class=\"wide\"></td>\
-             <td></td><td></td><td class=\"num\" title=\"{exact} bytes\">{said}{against}</td></tr></tfoot>",
+             <td></td><td data-archived></td><td class=\"num\" title=\"{exact} bytes\">{said}{against}</td></tr></tfoot>",
             exact = thousands(used_in_all),
             said = escape(&used_said(used_in_all)),
             against = escape(&against),
@@ -474,8 +474,8 @@ pub fn sections(panel: &Panel) -> (String, String) {
             "<section class=\"panel padded\" id=\"records\"><div class=\"row records-head\"><h2>Raw records</h2>\
              {state}{actions}</div>\
              <table class=\"list one-line kinds\"><thead><tr><th>Kind</th><th class=\"wide\">Window</th>\
-             <th title=\"What its storage holds\">Stored</th><th title=\"What the archive holds\">Archived</th>\
-             <th class=\"num\" title=\"The bytes it uses of the archive, which the bound is counted against\">Size</th></tr></thead>\
+             <th title=\"What its storage holds\">Stored</th><th data-archived title=\"What the archive holds\">Archived</th>\
+             <th class=\"num\" title=\"The bytes it uses of the archive, which the bound is counted against\">Archive size</th></tr></thead>\
              <tbody>{lines}</tbody>{total}</table>{held}</section>"
         ),
         format!(
