@@ -294,6 +294,7 @@ async fn an_instance_runs_once_and_is_free_again_when_stopped() {
         "meridian.v1.StopPluginRequest",
         StopPluginRequest {
             instance_id: "snaptrade-1".into(),
+            ..Default::default()
         },
     )
     .await
@@ -307,6 +308,7 @@ async fn an_instance_runs_once_and_is_free_again_when_stopped() {
         "meridian.v1.StopPluginRequest",
         StopPluginRequest {
             instance_id: "snaptrade-1".into(),
+            ..Default::default()
         },
     )
     .await;
@@ -414,6 +416,7 @@ async fn allowing_an_archive_restarts_the_instance_carrying_it() {
         AllowArchiveRequest {
             instance_id: "snaptrade-1".into(),
             most_bytes: 53_687_091_200,
+            ..Default::default()
         },
     )
     .await
@@ -431,6 +434,7 @@ async fn allowing_an_archive_restarts_the_instance_carrying_it() {
         "meridian.v1.WithdrawArchiveRequest",
         WithdrawArchiveRequest {
             instance_id: "snaptrade-1".into(),
+            ..Default::default()
         },
     )
     .await
@@ -453,6 +457,7 @@ async fn allowing_an_archive_restarts_the_instance_carrying_it() {
         "meridian.v1.WithdrawArchiveRequest",
         WithdrawArchiveRequest {
             instance_id: "snaptrade-1".into(),
+            ..Default::default()
         },
     )
     .await
@@ -467,6 +472,7 @@ async fn allowing_an_archive_restarts_the_instance_carrying_it() {
         AllowArchiveRequest {
             instance_id: "nobody-1".into(),
             most_bytes: 0,
+            ..Default::default()
         },
     )
     .await
@@ -489,6 +495,7 @@ async fn an_archive_is_refused_with_none_installed_and_at_no_edge_role() {
         AllowArchiveRequest {
             instance_id: "snaptrade-1".into(),
             most_bytes: 0,
+            ..Default::default()
         },
     )
     .await
@@ -512,6 +519,7 @@ async fn an_archive_is_refused_with_none_installed_and_at_no_edge_role() {
         AllowArchiveRequest {
             instance_id: "ops-1".into(),
             most_bytes: 0,
+            ..Default::default()
         },
     )
     .await
@@ -520,4 +528,109 @@ async fn an_archive_is_refused_with_none_installed_and_at_no_edge_role() {
         refused.contains("holds operations, no edge role"),
         "{refused}"
     );
+}
+
+/// One request, stamped as the dashboard sends it for a person through a
+/// delegation and its client (W4.9): the terminal's and core's tools'.
+async fn ask_through<Q: Message, A: Message + Default>(
+    bus: &Bus,
+    topic: &str,
+    kind: &str,
+    request: Q,
+) -> Result<A, String> {
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: ADA.into(),
+        acting_through_delegation: "DLG-1".into(),
+        acting_through_client: "meridian on ada-laptop".into(),
+        account_scope: None,
+    };
+    let (_, bytes) = bus
+        .call_stamped(topic, kind, request.encode_to_vec(), None, None, &stamp)
+        .await
+        .map_err(|failed| failed.to_string())?;
+    Ok(A::decode(&bytes[..]).unwrap())
+}
+
+#[tokio::test]
+async fn a_launch_and_a_stop_through_a_delegation_record_it_and_the_client() {
+    let (bus, _) = harness();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    let launched: PluginLaunch = ask_through(
+        &bus,
+        LAUNCH_PLUGIN,
+        "meridian.v1.LaunchPluginRequest",
+        LaunchPluginRequest {
+            note: "Bringing SnapTrade in for the Growth accounts.".into(),
+            ..launching("snaptrade-1", &["custody"])
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(launched.launched_by, ADA);
+    assert_eq!(launched.acting_through_delegation, "DLG-1");
+    assert_eq!(launched.client_name, "meridian on ada-laptop");
+    let stopped: PluginLaunch = ask_through(
+        &bus,
+        STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "snaptrade-1".into(),
+            note: "Retired.".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped.stopped_by, ADA);
+    assert_eq!(stopped.stopped_through_delegation, "DLG-1");
+    assert_eq!(stopped.stopped_client_name, "meridian on ada-laptop");
+    assert_eq!(catalogue(&bus).await.launches[0], stopped);
+    // A browser's call names neither.
+    launch(&bus, launching("snaptrade-2", &["custody"]))
+        .await
+        .map(|launched| {
+            assert!(
+                launched.acting_through_delegation.is_empty() && launched.client_name.is_empty()
+            )
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_archive_allowed_through_a_delegation_records_it_and_the_client() {
+    use meridian_domain::v1::{AllowArchiveRequest, PluginArchive, WithdrawArchiveRequest};
+    let (bus, _) = harness_with(ArchiveGrant {
+        kind: ArchiveKind::Path,
+        locks: false,
+    });
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    launch(&bus, launching("snaptrade-1", &["custody"]))
+        .await
+        .unwrap();
+    let allowed: PluginArchive = ask_through(
+        &bus,
+        ALLOW_ARCHIVE,
+        "meridian.v1.AllowArchiveRequest",
+        AllowArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+            most_bytes: 0,
+            note: "Keep seven years.".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(allowed.acting_through_delegation, "DLG-1");
+    assert_eq!(allowed.client_name, "meridian on ada-laptop");
+    let withdrawn: PluginArchive = ask_through(
+        &bus,
+        WITHDRAW_ARCHIVE,
+        "meridian.v1.WithdrawArchiveRequest",
+        WithdrawArchiveRequest {
+            instance_id: "snaptrade-1".into(),
+            note: "Not needed.".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!withdrawn.allowed);
+    assert_eq!(withdrawn.client_name, "meridian on ada-laptop");
 }

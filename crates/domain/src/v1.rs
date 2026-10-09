@@ -5420,6 +5420,10 @@ pub struct LaunchPluginRequest {
     /// (W8.3, spec/live-plugin-development).
     #[prost(bool, tag = "6")]
     pub live: bool,
+    /// Why, kept with the launch's record (decisions/031; contract v17).
+    /// Through /mcp every launch carries one (W6.20).
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
 }
 /// A launch, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5449,6 +5453,19 @@ pub struct PluginLaunch {
     /// Launched in the live shape (W8.3).
     #[prost(bool, tag = "13")]
     pub live: bool,
+    /// The delegation the person who launched it acted through and its
+    /// client's name, and the same for the stop, as the dashboard stamped them
+    /// (contract v17). A launch or stop before v17 was made through the
+    /// terminal on a delegation that was not recorded: these are empty, and
+    /// the store keeps a gap record saying so (decisions/031).
+    #[prost(string, tag = "14")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub client_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "16")]
+    pub stopped_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "17")]
+    pub stopped_client_name: ::prost::alloc::string::String,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -5498,6 +5515,10 @@ pub struct AllowArchiveRequest {
     /// The most bytes it may hold; 0 for no bound.
     #[prost(uint64, tag = "2")]
     pub most_bytes: u64,
+    /// Why, kept with the change's record (decisions/031; contract v17).
+    /// Through /mcp every change carries one (W6.20).
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
 }
 /// A deployment admin withdraws it: the instance is restarted without it,
 /// and what it holds is kept until an admin removes it.
@@ -5505,6 +5526,10 @@ pub struct AllowArchiveRequest {
 pub struct WithdrawArchiveRequest {
     #[prost(string, tag = "1")]
     pub instance_id: ::prost::alloc::string::String,
+    /// Why, kept with the change's record (decisions/031; contract v17).
+    /// Through /mcp every change carries one (W6.20).
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
 }
 /// An instance's archive, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5523,11 +5548,22 @@ pub struct PluginArchive {
     pub updated_by: ::prost::alloc::string::String,
     #[prost(int64, tag = "5")]
     pub updated_at_ns: i64,
+    /// The delegation the person acted through and its client's name, as the
+    /// dashboard stamped them (contract v17): empty for a change made in a
+    /// browser, and on every change before v17, each of which was.
+    #[prost(string, tag = "6")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub client_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StopPluginRequest {
     #[prost(string, tag = "1")]
     pub instance_id: ::prost::alloc::string::String,
+    /// Why, kept with the stop's record (decisions/031; contract v17). Through
+    /// /mcp every stop carries one (W6.20).
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
 }
 /// The conductor to the launcher: remove what it made for this instance.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5918,6 +5954,16 @@ pub struct SetPluginSettingsRequest {
     /// Remove these.
     #[prost(string, repeated, tag = "3")]
     pub cleared: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why, in the words of the person or of the agent acting for them, kept
+    /// with each change's record (decisions/031; contract v17). Through /mcp
+    /// every change carries one (W6.20); a person at the page may give none.
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+    /// The settings record's updated_at_ns as it was read (contract v17): the
+    /// conductor refuses the change, naming this field, where the record has
+    /// changed since. 0 from a client built before it, checked as before.
+    #[prost(int64, tag = "5")]
+    pub against_updated_at_ns: i64,
 }
 /// What the dashboard may show. A secret's value is never here, only that it
 /// is set.
@@ -5943,6 +5989,32 @@ pub struct PluginSettingsRecord {
     /// changed, and for a clear the plugin's re-declaring a setting made.
     #[prost(string, tag = "6")]
     pub updated_by: ::prost::alloc::string::String,
+    /// Per setting ever changed, its latest change as its own record says it
+    /// (contract v17): who, when, and the delegation and client where one was
+    /// used, so the form and core's tools say when a secret was set and by
+    /// whom, never its value. Empty from a conductor before v17.
+    #[prost(message, repeated, tag = "7")]
+    pub changes: ::prost::alloc::vec::Vec<SettingLastChange>,
+}
+/// One setting's latest change (W6.11, contract v17): set or cleared, a
+/// secret's included, and never its value.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SettingLastChange {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// The deployment-local subject the dashboard stamped; empty for a clear
+    /// the plugin's re-declaring a setting made.
+    #[prost(string, tag = "2")]
+    pub changed_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub changed_at_ns: i64,
+    /// The delegation the person acted through, and its client's registered
+    /// name, as the dashboard stamped them (W4.9): empty for a change made in
+    /// a browser, and on every change before v17, each of which was.
+    #[prost(string, tag = "4")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub client_name: ::prost::alloc::string::String,
 }
 /// Sets or clears a hold, for a deployment admin, from the deployment's
 /// Settings (spec/an-edge-plugins-older-records-move-to-the-archive,
@@ -5963,6 +6035,10 @@ pub struct SetHoldRequest {
     /// raw-records, ruling 3).
     #[prost(bool, tag = "3")]
     pub write_once: bool,
+    /// Why, kept with the change's record (decisions/031; contract v17).
+    /// Through /mcp every change carries one (W6.20).
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
 }
 /// A hold as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5979,6 +6055,13 @@ pub struct Hold {
     pub updated_by: ::prost::alloc::string::String,
     #[prost(int64, tag = "5")]
     pub updated_at_ns: i64,
+    /// The delegation the person acted through and its client's name, as the
+    /// dashboard stamped them (contract v17): empty for a hold set in a
+    /// browser, and on every hold before v17, each of which was.
+    #[prost(string, tag = "6")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub client_name: ::prost::alloc::string::String,
 }
 /// The dashboard reads an edge plugin's moves for its Summary, newest first.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6019,6 +6102,13 @@ pub struct MoveRecord {
     /// When the conductor recorded it, in nanoseconds since the epoch.
     #[prost(int64, tag = "3")]
     pub at_ns: i64,
+    /// The delegation the person acted through and its client's name, from
+    /// the envelope (contract v17): empty for a window's move, for a person in
+    /// a browser, and on every move recorded before v17.
+    #[prost(string, tag = "4")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub client_name: ::prost::alloc::string::String,
 }
 /// Answered for the instance the envelope names, and no other. Secrets travel
 /// only on this reply, never on a broadcast, because the broker narrows

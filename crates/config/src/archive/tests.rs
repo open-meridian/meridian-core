@@ -34,6 +34,21 @@ fn hold(role: &str, days: u32) -> SetHoldRequest {
         role: role.into(),
         days,
         write_once: false,
+        note: String::new(),
+    }
+}
+
+/// Who made a change: the person, and the delegation where one was used.
+fn by(person: &str, delegation: &str) -> crate::store::Author {
+    crate::store::Author {
+        by: person.into(),
+        delegation: delegation.into(),
+        client: if delegation.is_empty() {
+            String::new()
+        } else {
+            "Claude".into()
+        },
+        note: String::new(),
     }
 }
 
@@ -53,6 +68,8 @@ fn allow(store: &MemoryStore) {
                 most_bytes: 53_687_091_200,
                 updated_by: "ada@example.com".into(),
                 updated_at_ns: NOW,
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
             },
             "",
         )
@@ -123,8 +140,7 @@ fn the_hold_over_an_instance_is_its_edge_roles_longest_and_every_roles() {
             &store,
             local(),
             &hold(role, days),
-            "ada@example.com",
-            "",
+            &by("ada@example.com", ""),
             NOW,
         )
         .unwrap();
@@ -136,8 +152,7 @@ fn the_hold_over_an_instance_is_its_edge_roles_longest_and_every_roles() {
         &store,
         local(),
         &hold("custody", 0),
-        "ada@example.com",
-        "",
+        &by("ada@example.com", ""),
         NOW,
     )
     .unwrap();
@@ -146,10 +161,17 @@ fn the_hold_over_an_instance_is_its_edge_roles_longest_and_every_roles() {
     assert_eq!(snapshot.holds.len(), 2);
     // An instance holding no edge role is under none.
     let other = store_with(&["operations"]);
-    set_hold(&other, local(), &hold("", 400), "ada@example.com", "", NOW).unwrap();
+    set_hold(
+        &other,
+        local(),
+        &hold("", 400),
+        &by("ada@example.com", ""),
+        NOW,
+    )
+    .unwrap();
     assert_eq!(hold_over(&other.snapshot().unwrap(), INSTANCE), (0, false));
     // A hold sent for nobody is refused.
-    assert!(set_hold(&store, local(), &hold("custody", 1), "", "", NOW).is_err());
+    assert!(set_hold(&store, local(), &hold("custody", 1), &by("", ""), NOW).is_err());
 }
 
 fn declared() -> Vec<SettingDeclaration> {
@@ -210,8 +232,7 @@ fn a_window_below_the_hold_is_refused_naming_the_setting() {
         &store,
         local(),
         &hold("custody", 2190),
-        "ada@example.com",
-        "",
+        &by("ada@example.com", ""),
         NOW,
     )
     .unwrap();
@@ -280,17 +301,24 @@ fn a_move_is_recorded_once_and_the_archive_holds_its_unit() {
         MoveOutcome::Archived,
         "activity_window_days 2555",
     );
-    record_move(&store, &snapshot, INSTANCE, archived.clone(), "", "", NOW).unwrap();
+    record_move(
+        &store,
+        &snapshot,
+        INSTANCE,
+        archived.clone(),
+        &by("", ""),
+        NOW,
+    )
+    .unwrap();
     // A retry: answered as recorded, and recorded once.
-    record_move(&store, &snapshot, INSTANCE, archived, "", "", NOW + 1).unwrap();
+    record_move(&store, &snapshot, INSTANCE, archived, &by("", ""), NOW + 1).unwrap();
     let restored = moved("activity/ACC-1/2019-03", MoveOutcome::Restored, "");
     record_move(
         &store,
         &snapshot,
         INSTANCE,
         restored,
-        "ben@example.com",
-        "DLG-1",
+        &by("ben@example.com", "DLG-1"),
         NOW + 2,
     )
     .unwrap();
@@ -305,6 +333,13 @@ fn a_move_is_recorded_once_and_the_archive_holds_its_unit() {
     .unwrap();
     assert_eq!(page.moves.len(), 2);
     assert_eq!(page.moves[0].person, "ben@example.com");
+    // The delegation and client beside the person (contract v17); a
+    // window's move names neither.
+    assert_eq!(page.moves[0].acting_through_delegation, "DLG-1");
+    assert_eq!(page.moves[0].client_name, "Claude");
+    assert!(
+        page.moves[1].acting_through_delegation.is_empty() && page.moves[1].client_name.is_empty()
+    );
     assert_eq!(
         page.moves[0].r#move.as_ref().unwrap().outcome,
         MoveOutcome::Restored as i32
@@ -324,8 +359,7 @@ fn a_deletion_inside_the_hold_or_of_an_archived_unit_by_a_window_is_refused() {
         &store,
         local(),
         &hold("custody", 2190),
-        "ada@example.com",
-        "",
+        &by("ada@example.com", ""),
         NOW,
     )
     .unwrap();
@@ -339,7 +373,7 @@ fn a_deletion_inside_the_hold_or_of_an_archived_unit_by_a_window_is_refused() {
             "activity_past_window deleted",
         )
     };
-    let refused = record_move(&store, &snapshot, INSTANCE, recent, "", "", NOW).unwrap_err();
+    let refused = record_move(&store, &snapshot, INSTANCE, recent, &by("", ""), NOW).unwrap_err();
     assert_eq!(
         meridian_bus::read_refusal(&refused).map(|(reason, _)| reason),
         Some(RefusalReason::WithinHold as i32)
@@ -352,8 +386,7 @@ fn a_deletion_inside_the_hold_or_of_an_archived_unit_by_a_window_is_refused() {
         &snapshot,
         INSTANCE,
         moved(unit, MoveOutcome::Archived, "activity_window_days 2555"),
-        "",
-        "",
+        &by("", ""),
         NOW,
     )
     .unwrap();
@@ -362,8 +395,7 @@ fn a_deletion_inside_the_hold_or_of_an_archived_unit_by_a_window_is_refused() {
         &snapshot,
         INSTANCE,
         moved(unit, MoveOutcome::Deleted, "activity_past_window deleted"),
-        "",
-        "",
+        &by("", ""),
         NOW,
     )
     .unwrap_err();
@@ -373,8 +405,7 @@ fn a_deletion_inside_the_hold_or_of_an_archived_unit_by_a_window_is_refused() {
         &snapshot,
         INSTANCE,
         moved(unit, MoveOutcome::Deleted, ""),
-        "ada@example.com",
-        "",
+        &by("ada@example.com", ""),
         NOW,
     )
     .unwrap();
@@ -394,8 +425,7 @@ fn archived_with_no_archive_allowed_is_refused_naming_record_kind() {
         &snapshot,
         INSTANCE,
         moved("u", MoveOutcome::Archived, "activity_window_days 2555"),
-        "",
-        "",
+        &by("", ""),
         NOW,
     )
     .unwrap_err();
@@ -411,8 +441,7 @@ fn archived_with_no_archive_allowed_is_refused_naming_record_kind() {
         &snapshot,
         INSTANCE,
         moved("u", MoveOutcome::Returned, "restore period 7 days"),
-        "",
-        "",
+        &by("", ""),
         NOW
     )
     .unwrap_err()
@@ -434,8 +463,7 @@ fn the_moves_page_newest_first() {
                 MoveOutcome::Archived,
                 "activity_window_days 2555",
             ),
-            "",
-            "",
+            &by("", ""),
             NOW + n as i64,
         )
         .unwrap();

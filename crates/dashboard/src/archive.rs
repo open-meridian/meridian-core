@@ -584,6 +584,15 @@ async fn command(
     Ok(())
 }
 
+/// A note the page posted with a change, if any: optional at the page,
+/// required through /mcp (contract v17, the plan's Q8).
+fn note_posted(fields: &Fields) -> String {
+    fields
+        .get("note")
+        .map(|note| note.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// The bound as posted: whole GiB, or empty for none.
 pub fn bound_posted(fields: &Fields) -> Result<u64, String> {
     let given = fields.get("most_gib").map(|v| v.trim()).unwrap_or_default();
@@ -623,6 +632,8 @@ pub async fn allow(
                 AllowArchiveRequest {
                     instance_id: instance.clone(),
                     most_bytes,
+                    // Optional at the page (contract v17, the plan's Q8).
+                    note: note_posted(&fields),
                 },
             )
             .await
@@ -653,6 +664,7 @@ pub async fn withdraw(
         "meridian.v1.WithdrawArchiveRequest",
         WithdrawArchiveRequest {
             instance_id: instance.clone(),
+            note: note_posted(&fields),
         },
     )
     .await;

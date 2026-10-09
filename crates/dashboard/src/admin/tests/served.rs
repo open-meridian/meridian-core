@@ -362,6 +362,7 @@ fn records() -> AccessRecords {
             write_once: false,
             updated_by: ADMIN.into(),
             updated_at_ns: 1_791_331_200_000_000_000,
+            ..Default::default()
         },
         meridian_domain::v1::Hold {
             role: "custody".into(),
@@ -369,6 +370,7 @@ fn records() -> AccessRecords {
             write_once: false,
             updated_by: ADMIN.into(),
             updated_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         },
     ];
     records
@@ -469,6 +471,7 @@ fn moves() -> Vec<meridian_domain::v1::MoveRecord> {
             }),
             person: String::new(),
             at_ns: 1_791_504_000_000_000_000 + n * 1_000_000_000,
+            ..Default::default()
         })
         .collect();
     moves.reverse();
@@ -758,6 +761,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 most_bytes: asked.most_bytes,
                 updated_by: by,
                 updated_at_ns: meridian_clock::SystemClock.now_ns(),
+                ..Default::default()
             };
             *archive.lock().unwrap() = Some(allowed.clone());
             Ok(("".into(), allowed.encode_to_vec()))
@@ -786,6 +790,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 write_once: asked.write_once,
                 updated_by: envelope.meta.clone().unwrap_or_default().acting_for_subject,
                 updated_at_ns: meridian_clock::SystemClock.now_ns(),
+                ..Default::default()
             };
             let mut records = held.lock().unwrap();
             records.holds.retain(|h| h.role != hold.role);

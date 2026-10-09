@@ -67,6 +67,18 @@ pub const VALUE_FIELD: &str = "value.";
 pub const CLEAR_FIELD: &str = "clear.";
 /// A table setting's cells: `table.<setting>[<row>].<column>`.
 pub const TABLE_FIELD: &str = "table.";
+/// The record's `updated_at_ns` as the form was drawn, which a change names
+/// so the conductor refuses one against a record changed since (contract
+/// v17, the plan's Q7).
+pub const AGAINST_FIELD: &str = "against_updated_at_ns";
+
+/// The hidden field carrying the record's version as drawn.
+fn against(record: &PluginSettingsRecord) -> String {
+    format!(
+        "<input type=\"hidden\" name=\"{AGAINST_FIELD}\" value=\"{}\">",
+        record.updated_at_ns
+    )
+}
 /// Blank rows the plain table offers below those held, for more.
 const BLANK_ROWS: usize = 3;
 
@@ -413,17 +425,52 @@ fn holder(declaration: &SettingDeclaration, secret: bool, wide: bool, inner: Str
     )
 }
 
+/// When a setting was last changed, and by whom, as its record says it
+/// (contract v17): "Set by Ada, 2026-10-09 14:02 UTC, through Claude".
+/// Never its value.
+fn last_change_said(
+    record: &PluginSettingsRecord,
+    name: &str,
+    named: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    let change = record.changes.iter().find(|change| change.name == name)?;
+    let who = if change.changed_by.is_empty() {
+        "the plugin's re-declaring it".to_string()
+    } else {
+        named(&change.changed_by)
+    };
+    let through = if change.client_name.is_empty() {
+        String::new()
+    } else {
+        format!(", through {}", change.client_name)
+    };
+    Some(format!(
+        "Set by {who}, {}{through}",
+        crate::custody::utc(change.changed_at_ns)
+    ))
+}
+
 fn secret_field(
     declaration: &SettingDeclaration,
     record: &PluginSettingsRecord,
     declared: &[SettingDeclaration],
     about: &str,
+    named: &dyn Fn(&str) -> String,
 ) -> String {
     let name = escape(&declaration.name);
     let set = record.secrets_set.contains(&declaration.name);
+    // Beside "set", who set it and when, on hover (contract v17): what the
+    // settings tool says, the form says.
+    let set_badge = match last_change_said(record, &declaration.name, named) {
+        Some(said) => format!(
+            " <span class=\"badge good\" title=\"{said}\" data-set-by>set</span>",
+            said = escape(&said)
+        ),
+        None => " <span class=\"badge good\">set</span>".to_string(),
+    };
     let (state, placeholder, clear) = if set {
         (
-            " <span class=\"badge good\">set</span>",
+            set_badge.as_str(),
             "Type a new value to replace it",
             format!(
                 "<label class=\"check\"><input type=\"checkbox\" name=\"{CLEAR_FIELD}{name}\"> Clear it</label>"
@@ -564,13 +611,14 @@ fn field(
     declaration: &SettingDeclaration,
     record: &PluginSettingsRecord,
     declared: &[SettingDeclaration],
+    named: &dyn Fn(&str) -> String,
 ) -> String {
     let secret = is_secret(record, declaration);
     let about = about(declaration, secret);
     // A table is on a page of its own (`table_form`) unless it is held
     // sealed, and then it is a secret like any other.
     let inner = if secret {
-        secret_field(declaration, record, declared, &about)
+        secret_field(declaration, record, declared, &about, named)
     } else if kind(declaration) == SettingType::Choice {
         choice_field(declaration, record, declared, &about)
     } else {
@@ -673,6 +721,7 @@ pub fn form(record: &PluginSettingsRecord, token: &str, development: bool) -> St
         development,
         &path(&record.plugin_instance_id),
         None,
+        &|subject| subject.to_string(),
     )
 }
 
@@ -690,6 +739,7 @@ pub fn form_with(
     development: bool,
     action: &str,
     held: Option<(&meridian_access::PluginHeld, &[String])>,
+    named: &dyn Fn(&str) -> String,
 ) -> String {
     let declared = &record.declared_settings;
     let tables: Vec<&str> = tables(record, development)
@@ -749,7 +799,7 @@ pub fn form_with(
                 .settings
                 .iter()
                 .map(|declaration| {
-                    let shown = field(declaration, record, declared);
+                    let shown = field(declaration, record, declared, named);
                     // Shown to an admin of any role it serves, set only by one
                     // of every role (W6.11, contract v15): read-only, so
                     // nothing of it is posted, else.
@@ -771,11 +821,12 @@ pub fn form_with(
         })
         .collect();
     format!(
-        "<form method=\"post\" action=\"{action}\" class=\"settings\" autocomplete=\"off\" data-settings>{token}\
+        "<form method=\"post\" action=\"{action}\" class=\"settings\" autocomplete=\"off\" data-settings>{token}{against}\
          {nav}{sections}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button></div>\
          </form><div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>\
          <script>{SCRIPT}</script>",
         action = escape(action),
+        against = against(record),
     )
 }
 
@@ -797,9 +848,10 @@ pub fn table_form(
     let about = about(declaration, false);
     format!(
         "<form method=\"post\" action=\"{action}\" class=\"table-setting\" autocomplete=\"off\" \
-         data-table-setting>{token}{grid}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">\
+         data-table-setting>{token}{against}{grid}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">\
          Save</button></div></form>",
         action = escape(action),
+        against = against(record),
         grid = table_field(declaration, record, &about, choices, named),
     )
 }
@@ -926,7 +978,7 @@ const SCRIPT: &str = r#"(function () {
 /// Why a setting is shown read-only to this person, or None when they may set
 /// it: it serves a role they do not administer (W6.11, contract v15). A
 /// declaration naming no role serves every role the plugin holds.
-fn read_only(
+pub(crate) fn read_only(
     declaration: &SettingDeclaration,
     held: &meridian_access::PluginHeld,
     plugin_roles: &[String],
@@ -949,12 +1001,15 @@ fn read_only(
 /// administer, as the refusal saying so (W6.11, contract v15): a setting is
 /// set only by one holding admin on every role it serves. None when every
 /// one is theirs to set.
+///
+/// The setting's name beside the sentence: what core's settings tool refuses
+/// by its path (W6.20, contract v17).
 pub fn not_administered(
     record: &PluginSettingsRecord,
     request: &SetPluginSettingsRequest,
     held: &meridian_access::PluginHeld,
     plugin_roles: &[String],
-) -> Option<String> {
+) -> Option<(String, String)> {
     let named = request
         .values
         .iter()
@@ -979,12 +1034,15 @@ pub fn not_administered(
             .filter(|role| !held.administers(role))
             .map(String::as_str)
             .collect();
-        return Some(format!(
-            "{} serves {}, and you do not administer {}: a setting serving several roles is set \
-             by an admin of every one",
-            label(declaration),
-            serves.join(" and "),
-            not.join(" or ")
+        return Some((
+            declaration.name.clone(),
+            format!(
+                "{} serves {}, and you do not administer {}: a setting serving several roles is \
+                 set by an admin of every one",
+                label(declaration),
+                serves.join(" and "),
+                not.join(" or ")
+            ),
         ));
     }
     None
@@ -1067,6 +1125,12 @@ pub fn request(
             });
         }
     }
+    // The record as the form was drawn (contract v17); 0 where the form
+    // carried none, a page from before, checked as before.
+    request.against_updated_at_ns = fields
+        .get(AGAINST_FIELD)
+        .and_then(|drawn| drawn.trim().parse::<i64>().ok())
+        .unwrap_or_default();
     (!request.values.is_empty() || !request.cleared.is_empty()).then_some(request)
 }
 

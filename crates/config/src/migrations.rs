@@ -111,7 +111,35 @@ pub const MIGRATIONS: &[Migration] = &[
         ),
         then: None,
     },
+    Migration {
+        version: 15,
+        name: "cores_plugin_area_is_at_parity_on_the_mcp",
+        sql: include_str!("../migrations/0015_cores_plugin_area_is_at_parity_on_the_mcp.sql"),
+        then: Some(launches_not_known),
+    },
 ];
+
+/// Migration 15's gap records (contract v17, decisions/031 point 4): for
+/// every launch, and every stop by a person, recorded before it, the
+/// delegation and client it was made through are not known, said at `at_ns`,
+/// the moment the migration ran, by the deployment's clock.
+pub fn launches_not_known(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    for (act, which) in [(1_i16, "true"), (2_i16, "state = 2 AND stopped_by <> ''")] {
+        tx.execute(
+            &format!(
+                "INSERT INTO config_plugin_launch_gap
+                        (launch_id, instance_id, launched_at_ns, act, noted_at_ns, note)
+                 SELECT launch_id, instance_id, launched_at_ns, $1, $2, $3
+                   FROM config_plugin_launch
+                  WHERE {which}
+                 ON CONFLICT (launch_id, act) DO NOTHING"
+            ),
+            &[&act, &at_ns, &crate::store::LAUNCH_THROUGH_NOT_KNOWN],
+        )
+        .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+    }
+    Ok(())
+}
 
 /// Migration 13 (contract v15): each access group's gap record, then the
 /// one-time rewrite of the entries naming no role, each group it rewrote its

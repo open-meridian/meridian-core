@@ -120,6 +120,7 @@ mod tests {
                 write_once: true,
                 updated_by: "ada@example.com".into(),
                 updated_at_ns: 1_791_417_600_000_000_000,
+                ..Default::default()
             },
         ];
         let (body, _) = section(&records, "<t>");

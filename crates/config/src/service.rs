@@ -85,8 +85,8 @@ use crate::ids;
 use crate::rules;
 use crate::sealing::SettingsKey;
 use crate::store::{
-    Author, Held, KnownPlugin, SettingChange, SettingsAuthor, Snapshot, Store, StoredSetting,
-    Withdrawal,
+    note_refused, Author, Held, KnownPlugin, SettingChange, SettingsAuthor, Snapshot, Store,
+    StoredSetting, Withdrawal,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -351,6 +351,13 @@ pub fn settings_record(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginS
         record.updated_at_ns = last.at_ns;
         record.updated_by = last.by.clone();
     }
+    // Each setting's latest change, a secret's included, never its value
+    // (contract v17).
+    record.changes = snapshot
+        .setting_changes
+        .get(plugin_instance_id)
+        .cloned()
+        .unwrap_or_default();
     record.declared_settings = declared;
     record
 }
@@ -593,22 +600,33 @@ pub fn install_named_administrator(
     let permissions = administrators(&group.user_group_id, now);
 
     // Granted by the first run that named them, no person signed in.
-    let author = Author {
-        by: String::new(),
-        delegation: String::new(),
-    };
+    let author = Author::default();
     store
         .install_first_admin(&group, &permissions, &author, now)
         .map_err(|failed| failed.to_string())
 }
 
 /// Who made a change the envelope carries: the person the dashboard stamped,
-/// and the delegation they acted through where they used one.
-fn author(envelope: &Envelope) -> Author {
+/// and the delegation they acted through where they used one, with its
+/// client's name (contract v17).
+pub(crate) fn author(envelope: &Envelope) -> Author {
     Author {
         by: subject(envelope),
         delegation: delegation(envelope),
+        client: client(envelope),
+        note: String::new(),
     }
+}
+
+/// The client's name the dashboard stamped beside the delegation (W4.9,
+/// contract v10); empty without one.
+pub(crate) fn client(envelope: &Envelope) -> String {
+    envelope
+        .meta
+        .as_ref()
+        .filter(|meta| !meta.acting_through_delegation.is_empty())
+        .map(|meta| meta.acting_through_client.clone())
+        .unwrap_or_default()
 }
 
 pub(crate) fn subject(envelope: &Envelope) -> String {
@@ -796,8 +814,7 @@ pub fn serve_with(
                 cx.store.as_ref(),
                 cx.grant,
                 &request,
-                &subject(envelope),
-                &delegation(envelope),
+                &author(envelope),
                 cx.clock.now_ns(),
             )?;
             // Each sidecar the hold covers reads hold_days afresh.
@@ -819,8 +836,7 @@ pub fn serve_with(
                 &cx.snapshot()?,
                 &publisher(envelope),
                 request,
-                &subject(envelope),
-                &delegation(envelope),
+                &author(envelope),
                 cx.clock.now_ns(),
             )
         },
@@ -861,6 +877,26 @@ pub fn serve_with(
             }
             let by = subject(envelope);
             let now = cx.clock.now_ns();
+            // A change against a record changed since it was read is refused,
+            // naming the field (contract v17): a table replaced whole from an
+            // old read would drop a person's rows. 0 is a client from before.
+            if request.against_updated_at_ns != 0 {
+                let standing = settings_record(&before, plugin).updated_at_ns;
+                if standing != request.against_updated_at_ns {
+                    return Err(meridian_bus::refusal_naming(
+                        meridian_pb::v1::RefusalReason::RecordChanged as i32,
+                        &["against_updated_at_ns".to_string()],
+                        format!(
+                            "the settings of {plugin} changed since they were read (now \
+                             {standing}, read at {}); read them again, and nothing was changed",
+                            request.against_updated_at_ns
+                        ),
+                    ));
+                }
+            }
+            if let Some(refusal) = note_refused(&request.note) {
+                return Err(refusal);
+            }
             // Every value checked, and every secret sealed, before anything
             // is written: a refusal part-way through changes nothing.
             let checked = rules::plugin_settings(&before, &request)?;
@@ -927,8 +963,8 @@ pub fn serve_with(
             }
             if !changes.is_empty() {
                 let author = SettingsAuthor {
-                    by: by.clone(),
-                    delegation: delegation(envelope),
+                    note: request.note.clone(),
+                    ..author(envelope)
                 };
                 cx.store
                     .put_plugin_settings(plugin, &changes, &author, now)

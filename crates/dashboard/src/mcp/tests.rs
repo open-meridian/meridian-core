@@ -31,8 +31,9 @@ use crate::signing::Signer;
 use crate::terminal::Person;
 use crate::web::{router, App};
 use crate::Clock;
-use meridian_access::AccessLevel;
+use meridian_access::{level_name, AccessLevel};
 use meridian_clock::SystemClock;
+use meridian_domain::v1::PluginReport;
 
 const INSTANCE: &str = "ops-1";
 const KEY_ID: &str = "dashboard-2026-10-0a1b2c3d";
@@ -403,11 +404,12 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
         names(&said),
         [
             TICKET_TOOLS.as_slice(),
+            &["dashboard__list_plugins"],
             &["ops-1__confirm", "ops-1__read_things"]
         ]
         .concat()
     );
-    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + 1];
+    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + 2];
     assert_eq!(listed["annotations"]["readOnlyHint"], true);
     assert!(listed["description"]
         .as_str()
@@ -424,7 +426,12 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
     let (_, said, _) = rpc(&h.app, Some(&viewing), &[], list()).await;
     assert_eq!(
         names(&said),
-        [TICKET_TOOLS.as_slice(), &["ops-1__read_things"]].concat()
+        [
+            TICKET_TOOLS.as_slice(),
+            &["dashboard__list_plugins"],
+            &["ops-1__read_things"]
+        ]
+        .concat()
     );
 }
 
@@ -454,8 +461,9 @@ async fn a_deployment_admins_delegation_lists_cores_tools_first_when_it_covers_t
         .filter(|n| n.starts_with("dashboard__"))
         .collect();
     assert_eq!(
-        cores, TICKET_TOOLS,
-        "the Instruments tools are the deployment admin's alone"
+        cores,
+        [TICKET_TOOLS.as_slice(), &["dashboard__list_plugins"]].concat(),
+        "the Instruments tools are the deployment admin's alone; a writer lists the plugins"
     );
 }
 
@@ -927,5 +935,701 @@ fn a_tool_is_listed_and_opened_by_the_role_it_serves() {
     assert_eq!(
         super::level_by_role(&levels(&[AccessLevel::Write]), &[], &held),
         Some(AccessLevel::Write)
+    );
+}
+
+// ── Core's plugin area (contract v17) ───────────────────────────────────
+
+/// What the stand-in conductor heard: each topic, its envelope's meta, and
+/// the request's bytes.
+type Heard = Arc<Mutex<Vec<(String, meridian_pb::v1::MessageMeta, Vec<u8>)>>>;
+
+/// A secret's value as a person typed it at the form, which no answer may
+/// ever carry; the dashboard never holds one, and this proves none leaks.
+const SEALED: &str = "SEALED-sk-live-never-shown";
+
+/// ops-1 at the edge holding custody and operations; Ada holds what
+/// `entries` gives her on it, and the deployment admin's capabilities when
+/// said; other-1 is a second plugin she administers on its one role.
+fn area_records(entries: &[(&str, AccessLevel)], deployment_admin: bool) -> AccessRecords {
+    use meridian_domain::v1::{
+        KnownPluginRoles, PluginSettingValue, PluginSettingsRecord, SettingLastChange,
+    };
+    use meridian_pb::v1::{SettingColumn, SettingColumnType, SettingDeclaration, SettingType};
+    let setting = |name: &str, kind: SettingType, roles: &[&str]| SettingDeclaration {
+        name: name.into(),
+        r#type: kind as i32,
+        roles: roles.iter().map(|r| r.to_string()).collect(),
+        ..Default::default()
+    };
+    let mut held = records(false);
+    held.access_groups[0].entries = entries
+        .iter()
+        .map(|(role, level)| AccessEntry {
+            plugin_instance_id: INSTANCE.into(),
+            level: *level as i32,
+            role: role.to_string(),
+        })
+        .chain([AccessEntry {
+            plugin_instance_id: "other-1".into(),
+            level: AccessLevel::Admin as i32,
+            role: "custody".into(),
+        }])
+        .collect();
+    held.known_plugins = vec![
+        KnownPluginRoles {
+            plugin_instance_id: INSTANCE.into(),
+            roles: vec!["custody".into(), "operations".into()],
+        },
+        KnownPluginRoles {
+            plugin_instance_id: "other-1".into(),
+            roles: vec!["custody".into()],
+        },
+    ];
+    held.plugin_settings = vec![PluginSettingsRecord {
+        plugin_instance_id: INSTANCE.into(),
+        values: vec![PluginSettingValue {
+            name: "window_days".into(),
+            value: "30".into(),
+        }],
+        secrets_set: vec!["api_key".into()],
+        updated_at_ns: 5,
+        updated_by: ADA.into(),
+        changes: vec![SettingLastChange {
+            name: "api_key".into(),
+            changed_by: ADA.into(),
+            changed_at_ns: 4,
+            acting_through_delegation: "DLG-0".into(),
+            client_name: "Claude".into(),
+        }],
+        declared_settings: vec![
+            setting("window_days", SettingType::Integer, &["custody"]),
+            setting(
+                "both_roles",
+                SettingType::Integer,
+                &["custody", "operations"],
+            ),
+            SettingDeclaration {
+                secret: true,
+                ..setting("api_key", SettingType::String, &["custody"])
+            },
+            SettingDeclaration {
+                columns: vec![
+                    SettingColumn {
+                        name: "code".into(),
+                        r#type: SettingColumnType::Text as i32,
+                        ..Default::default()
+                    },
+                    SettingColumn {
+                        name: "account".into(),
+                        r#type: SettingColumnType::ExternalAccount as i32,
+                        ..Default::default()
+                    },
+                ],
+                ..setting("links", SettingType::Table, &["custody"])
+            },
+        ],
+    }];
+    held.holds = vec![meridian_domain::v1::Hold {
+        role: "custody".into(),
+        days: 2190,
+        updated_by: ADA.into(),
+        updated_at_ns: 3,
+        ..Default::default()
+    }];
+    if deployment_admin {
+        held.permissions.push(Permission {
+            permission_id: "P-admin".into(),
+            user_group_id: "UG-1".into(),
+            account_group_id: String::new(),
+            access_group_id: meridian_access::DEPLOYMENT_ADMIN.into(),
+        });
+    }
+    held
+}
+
+/// The dashboard over `held`, ops-1 reporting, and a stand-in conductor on
+/// the bus answering every row core's plugin-area tools send, hearing each.
+fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
+    use meridian_domain::v1::{
+        Hold, PluginArchive, PluginCatalogue, PluginLaunch, PluginSettingsRecord, ReadMovesReply,
+    };
+    let cache = Arc::new(RecordsCache::default());
+    cache.store(held.clone(), SystemClock.now_ns());
+    let bus = Arc::new(Bus::single(
+        "dashboard-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(SystemClock),
+    ));
+    let heard: Heard = Arc::default();
+    let settings = held.plugin_settings[0].clone();
+    let answers: Vec<(&'static str, &'static str, Vec<u8>)> = vec![
+        (
+            super::plugin_area::SET_PLUGIN_SETTINGS,
+            "meridian.v1.PluginSettingsRecord",
+            PluginSettingsRecord {
+                updated_at_ns: 6,
+                ..settings
+            }
+            .encode_to_vec(),
+        ),
+        (
+            super::plugin_area::SET_HOLD,
+            "meridian.v1.Hold",
+            Hold {
+                role: "custody".into(),
+                days: 3650,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            crate::archive::ALLOW_ARCHIVE,
+            "meridian.v1.PluginArchive",
+            PluginArchive {
+                instance_id: INSTANCE.into(),
+                allowed: true,
+                updated_at_ns: 7,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            crate::archive::WITHDRAW_ARCHIVE,
+            "meridian.v1.PluginArchive",
+            PluginArchive {
+                instance_id: INSTANCE.into(),
+                updated_at_ns: 8,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            crate::catalogue::LAUNCH_PLUGIN,
+            "meridian.v1.PluginLaunch",
+            PluginLaunch {
+                instance_id: INSTANCE.into(),
+                state: 1,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            crate::catalogue::STOP_PLUGIN,
+            "meridian.v1.PluginLaunch",
+            PluginLaunch {
+                instance_id: INSTANCE.into(),
+                state: 2,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            crate::catalogue::PLUGIN_CATALOGUE,
+            "meridian.v1.PluginCatalogue",
+            PluginCatalogue::default().encode_to_vec(),
+        ),
+        (
+            crate::archive::READ_MOVES,
+            "meridian.v1.ReadMovesReply",
+            ReadMovesReply::default().encode_to_vec(),
+        ),
+        (
+            crate::records::ACCESS_RECORDS,
+            "meridian.v1.AccessRecords",
+            held.encode_to_vec(),
+        ),
+    ];
+    for (topic, reply_type, reply) in answers {
+        let hearing = Arc::clone(&heard);
+        bus.serve(topic, move |envelope| {
+            hearing.lock().unwrap().push((
+                topic.to_string(),
+                envelope.meta.clone().unwrap_or_default(),
+                envelope.payload.clone(),
+            ));
+            Ok((reply_type.to_string(), reply.clone()))
+        });
+    }
+    let health: Arc<crate::health::Health> = Arc::default();
+    let now = SystemClock.now_ns();
+    health.hear(
+        INSTANCE,
+        PluginReport {
+            plugin_instance_id: INSTANCE.into(),
+            roles: vec!["custody".into(), "operations".into()],
+            registered: true,
+            healthy: true,
+            reported_at_ns: now,
+            last_heartbeat_at_ns: now,
+            contract_version: "v16".into(),
+            ..Default::default()
+        },
+    );
+    let app = Arc::new(App {
+        first_run: false,
+        wizard: Arc::new(crate::first_run::WizardSession::default()),
+        records: cache,
+        sessions: Arc::new(Sessions::default()),
+        delegations: Arc::new(crate::delegation::Delegations::default()),
+        public_url: String::new(),
+        clock: Arc::new(SystemClock),
+        bus,
+        oidc: None,
+        directory: None,
+        accounts: None,
+        sign_in_failures: Default::default(),
+        secure_cookies: true,
+        plugins: None,
+        registry: None,
+        custody: Arc::default(),
+        health,
+        kit: None,
+        bounds: Arc::default(),
+        tickets: Arc::default(),
+    });
+    (app, heard)
+}
+
+/// Covers rows by role on ops-1, and the deployment admin's capabilities
+/// when said.
+fn covering_roles(rows: &[(&str, &str)], deployment_admin: bool) -> Covers {
+    Covers {
+        everything: false,
+        deployment_admin,
+        plugins: rows
+            .iter()
+            .map(|(role, level)| (INSTANCE.to_string(), role.to_string(), level.to_string()))
+            .collect(),
+        unmatched: Default::default(),
+        account_groups: ["AcG-1".to_string()].into(),
+    }
+}
+
+const AREA_READS: [&str; 5] = [
+    "dashboard__list_plugins",
+    "dashboard__read_plugin_summary",
+    "dashboard__read_moves",
+    "dashboard__read_plugin_settings",
+    "dashboard__read_plugin_access",
+];
+
+const DEPLOYMENT_ADMINS: [&str; 7] = [
+    "dashboard__allow_archive",
+    "dashboard__withdraw_archive",
+    "dashboard__read_holds",
+    "dashboard__set_hold",
+    "dashboard__read_plugin_catalogue",
+    "dashboard__launch_plugin",
+    "dashboard__stop_plugin",
+];
+
+#[tokio::test]
+async fn a_custody_admin_reads_and_sets_their_settings_and_is_refused_one_serving_operations_too() {
+    let (app, heard) = area_app(area_records(&[("custody", AccessLevel::Admin)], false));
+    let custody = token(
+        &app,
+        covering_roles(&[("custody", "admin")], false),
+        Resource::Mcp,
+    )
+    .await;
+    let (_, said, _) = rpc(&app, Some(&custody), &[], list()).await;
+    let listed = names(&said);
+    for name in AREA_READS.iter().chain(&["dashboard__set_plugin_settings"]) {
+        assert!(listed.contains(&name.to_string()), "{name} in {listed:?}");
+    }
+    for name in DEPLOYMENT_ADMINS {
+        assert!(
+            !listed.contains(&name.to_string()),
+            "{name} is a deployment admin's"
+        );
+    }
+
+    // The settings as the form shows her: may_set by role, a secret only
+    // dated, never its value.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&custody),
+        &[],
+        call(
+            "dashboard__read_plugin_settings",
+            json!({"plugin_instance_id": INSTANCE}),
+        ),
+    )
+    .await;
+    let data = &structured(&said)["data"];
+    let setting = |name: &str| {
+        data["declared_settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(setting("window_days")["may_set"], true, "{said}");
+    assert_eq!(setting("both_roles")["may_set"], false);
+    assert!(setting("both_roles")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("operations"));
+    assert_eq!(data["secrets_set"], json!(["api_key"]));
+    assert_eq!(data["changes"][0]["client_name"], "Claude");
+    assert_eq!(data["updated_at_ns"], 5);
+
+    // Set: stamped, with its note and the version read.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&custody),
+        &[],
+        call(
+            "dashboard__set_plugin_settings",
+            json!({"plugin_instance_id": INSTANCE, "value": {"window_days": 45},
+                   "against_updated_at_ns": 5, "note": "The vendor keeps 45 days."}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "made", "{said}");
+    let sent = heard.lock().unwrap().clone();
+    let (topic, meta, payload) = sent
+        .iter()
+        .find(|(topic, _, _)| topic == super::plugin_area::SET_PLUGIN_SETTINGS)
+        .cloned()
+        .unwrap();
+    assert_eq!(topic, super::plugin_area::SET_PLUGIN_SETTINGS);
+    assert_eq!(meta.acting_for_subject, ADA);
+    assert!(!meta.acting_through_delegation.is_empty());
+    assert_eq!(meta.acting_through_client, "Claude");
+    let request =
+        meridian_domain::v1::SetPluginSettingsRequest::decode(payload.as_slice()).unwrap();
+    assert_eq!(request.values[0].value, "45");
+    assert_eq!(request.note, "The vendor keeps 45 days.");
+    assert_eq!(request.against_updated_at_ns, 5);
+    let calls = app
+        .delegations
+        .calls(crate::delegation::CallsOf::Person(ADA.into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(calls[0].level, "admin on ops-1:custody");
+
+    // Refused, each by its path, nothing sent: a setting serving operations
+    // too, a secret's value either way, a note missing, a cell naming no
+    // account the plugin reported.
+    heard.lock().unwrap().clear();
+    for (arguments, path) in [
+        (
+            json!({"plugin_instance_id": INSTANCE, "value": {"both_roles": 3}, "note": "n"}),
+            "value.both_roles",
+        ),
+        (
+            json!({"plugin_instance_id": INSTANCE, "value": {"api_key": SEALED}, "note": "n"}),
+            "value.api_key",
+        ),
+        (
+            json!({"plugin_instance_id": INSTANCE, "secret": {"api_key": SEALED}, "note": "n"}),
+            "secret.api_key",
+        ),
+        (
+            json!({"plugin_instance_id": INSTANCE, "value": {"window_days": 60}}),
+            "note",
+        ),
+        (
+            json!({"plugin_instance_id": INSTANCE, "table": {"links": [{"code": "A1", "account": "ext-unknown"}]}, "note": "n"}),
+            "table.links[0].account",
+        ),
+    ] {
+        let (_, said, _) = rpc(
+            &app,
+            Some(&custody),
+            &[],
+            call("dashboard__set_plugin_settings", arguments),
+        )
+        .await;
+        let refused = structured(&said);
+        assert_eq!(refused["outcome"], "refused", "{said}");
+        assert!(
+            refused["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == path),
+            "{path} in {said}"
+        );
+        assert!(
+            !said.to_string().contains(SEALED),
+            "an answer carried the secret"
+        );
+    }
+    assert!(
+        heard
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(topic, _, _)| topic != super::plugin_area::SET_PLUGIN_SETTINGS),
+        "a refused change was sent"
+    );
+
+    // Clearing a secret is the form's Clear: allowed, typing nothing.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&custody),
+        &[],
+        call(
+            "dashboard__set_plugin_settings",
+            json!({"plugin_instance_id": INSTANCE, "clear": {"api_key": true}, "note": "The key leaked."}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "made", "{said}");
+    let sent = heard.lock().unwrap().clone();
+    let request = meridian_domain::v1::SetPluginSettingsRequest::decode(
+        sent.iter()
+            .find(|(topic, _, _)| topic == super::plugin_area::SET_PLUGIN_SETTINGS)
+            .unwrap()
+            .2
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(request.cleared, ["api_key"]);
+    assert!(request.values.is_empty());
+
+    // An admin of both sets the setting serving both.
+    let (app, _) = area_app(area_records(
+        &[
+            ("custody", AccessLevel::Admin),
+            ("operations", AccessLevel::Admin),
+        ],
+        false,
+    ));
+    let both = token(
+        &app,
+        covering_roles(&[("custody", "admin"), ("operations", "admin")], false),
+        Resource::Mcp,
+    )
+    .await;
+    let (_, said, _) = rpc(
+        &app,
+        Some(&both),
+        &[],
+        call(
+            "dashboard__set_plugin_settings",
+            json!({"plugin_instance_id": INSTANCE, "value": {"both_roles": 3}, "note": "Both."}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "made", "{said}");
+    let calls = app
+        .delegations
+        .calls(crate::delegation::CallsOf::Person(ADA.into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        calls[0].level,
+        "admin on ops-1:custody and ops-1:operations"
+    );
+}
+
+#[tokio::test]
+async fn write_or_read_on_a_plugin_lists_none_of_its_area_and_a_call_by_name_is_refused() {
+    for level in [AccessLevel::Write, AccessLevel::Read] {
+        let (app, heard) = area_app(area_records(&[("custody", level)], false));
+        let token = token(
+            &app,
+            covering_roles(&[("custody", level_name(level))], false),
+            Resource::Mcp,
+        )
+        .await;
+        let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+        let listed = names(&said);
+        let area: Vec<&String> = listed
+            .iter()
+            .filter(|n| {
+                AREA_READS.contains(&n.as_str())
+                    || DEPLOYMENT_ADMINS.contains(&n.as_str())
+                    || n.as_str() == "dashboard__set_plugin_settings"
+            })
+            .collect();
+        assert_eq!(
+            area,
+            [&"dashboard__list_plugins".to_string()],
+            "at {level:?} only the plugins are listed"
+        );
+        let (_, said, _) = rpc(
+            &app,
+            Some(&token),
+            &[],
+            call(
+                "dashboard__read_plugin_settings",
+                json!({"plugin_instance_id": INSTANCE}),
+            ),
+        )
+        .await;
+        assert_eq!(structured(&said)["reason"], "not_listed", "{said}");
+        assert!(structured(&said)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("This delegation covers"));
+        assert!(heard.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_deployment_admin_administering_no_role_reads_the_overview_and_holds_the_seven() {
+    let (app, heard) = area_app(area_records(&[], true));
+    let token = token(&app, covering_roles(&[], true), Resource::Mcp).await;
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    let listed = names(&said);
+    for name in DEPLOYMENT_ADMINS.iter().chain(&[
+        "dashboard__list_plugins",
+        "dashboard__read_plugin_summary",
+        "dashboard__read_plugin_access",
+    ]) {
+        assert!(listed.contains(&name.to_string()), "{name} in {listed:?}");
+    }
+    for name in [
+        "dashboard__read_plugin_settings",
+        "dashboard__set_plugin_settings",
+        "dashboard__read_moves",
+    ] {
+        assert!(
+            !listed.contains(&name.to_string()),
+            "{name} is an admin's of its roles"
+        );
+    }
+    // The Overview's parts, as the portal shows them: nothing of Settings,
+    // and none of the Summary's own.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__read_plugin_summary",
+            json!({"plugin_instance_id": INSTANCE}),
+        ),
+    )
+    .await;
+    let data = &structured(&said)["data"];
+    assert_eq!(data["registered"], true, "{said}");
+    assert!(data.get("figures").is_none() && data.get("declared_tools").is_none());
+    let calls = app
+        .delegations
+        .calls(crate::delegation::CallsOf::Person(ADA.into()), 1)
+        .await
+        .unwrap();
+    assert_eq!(calls[0].level, "deployment admin");
+
+    // The seven, each stamped, each with a note, each refused without one.
+    for (tool, arguments, topic) in [
+        (
+            "dashboard__set_hold",
+            json!({"role": "custody", "days": 3650}),
+            super::plugin_area::SET_HOLD,
+        ),
+        (
+            "dashboard__allow_archive",
+            json!({"instance_id": INSTANCE, "most_bytes": 0}),
+            crate::archive::ALLOW_ARCHIVE,
+        ),
+        (
+            "dashboard__withdraw_archive",
+            json!({"instance_id": INSTANCE}),
+            crate::archive::WITHDRAW_ARCHIVE,
+        ),
+        (
+            "dashboard__launch_plugin",
+            json!({"name": "snaptrade", "version": "0.13.0", "instance_id": "snaptrade-2", "approved_roles": ["custody"]}),
+            crate::catalogue::LAUNCH_PLUGIN,
+        ),
+        (
+            "dashboard__stop_plugin",
+            json!({"instance_id": INSTANCE}),
+            crate::catalogue::STOP_PLUGIN,
+        ),
+    ] {
+        heard.lock().unwrap().clear();
+        let (_, said, _) = rpc(&app, Some(&token), &[], call(tool, arguments.clone())).await;
+        assert_eq!(
+            structured(&said)["fields"][0]["path"],
+            "note",
+            "{tool}: {said}"
+        );
+        assert!(
+            heard.lock().unwrap().iter().all(|(t, _, _)| t != topic),
+            "{tool} sent without a note"
+        );
+        let mut noted = arguments;
+        noted["note"] = "Why, in words.".into();
+        let (_, said, _) = rpc(&app, Some(&token), &[], call(tool, noted)).await;
+        assert_eq!(structured(&said)["outcome"], "made", "{tool}: {said}");
+        let sent = heard.lock().unwrap().clone();
+        let (_, meta, _) = sent.iter().find(|(t, _, _)| t == topic).unwrap();
+        assert_eq!(meta.acting_for_subject, ADA, "{tool}");
+        assert!(!meta.acting_through_delegation.is_empty(), "{tool}");
+        assert_eq!(meta.acting_through_client, "Claude", "{tool}");
+    }
+    for read in ["dashboard__read_holds", "dashboard__read_plugin_catalogue"] {
+        let (_, said, _) = rpc(&app, Some(&token), &[], call(read, json!({}))).await;
+        assert_eq!(structured(&said)["outcome"], "unchanged", "{read}: {said}");
+    }
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call("dashboard__read_holds", json!({})),
+    )
+    .await;
+    assert_eq!(structured(&said)["data"]["holds"][0]["days"], 2190);
+}
+
+#[tokio::test]
+async fn a_delegation_covering_one_instance_is_refused_another_naming_what_it_reaches() {
+    let (app, _) = area_app(area_records(&[("custody", AccessLevel::Admin)], false));
+    let token = token(
+        &app,
+        covering_roles(&[("custody", "admin")], false),
+        Resource::Mcp,
+    )
+    .await;
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__read_plugin_settings",
+            json!({"plugin_instance_id": "other-1"}),
+        ),
+    )
+    .await;
+    let refused = structured(&said);
+    assert_eq!(refused["outcome"], "refused", "{said}");
+    assert_eq!(refused["fields"][0]["path"], "plugin_instance_id");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reaches: ops-1"),
+        "{said}"
+    );
+    // And the access it reads changes nothing: no tool listed changes it.
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    for name in names(&said) {
+        for word in ["grant", "permission", "access_group", "user_group"] {
+            assert!(!name.contains(word), "{name}");
+        }
+    }
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__read_plugin_access",
+            json!({"plugin_instance_id": INSTANCE}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "unchanged", "{said}");
+    assert_eq!(
+        structured(&said)["data"]["access_groups"][0]["entries"][0]["level"],
+        "ACCESS_LEVEL_ADMIN"
     );
 }

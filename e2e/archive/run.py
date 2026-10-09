@@ -200,9 +200,10 @@ def run():
     must(any(f"|{ARCHIVED}|restored|" in line and line.endswith("|local|harness") for line in moves),
          f"step 8, the restore names the person: {moves}")
     holds = [line for line in store if line.startswith("hold|")]
-    must(holds == ["hold|custody|2190|false|local|harness"], f"step 8, one hold recorded: {holds}")
+    # Set in a browser: no delegation, no client and no note (contract v17).
+    must(holds == ["hold|custody|2190|false|local|harness|||"], f"step 8, one hold recorded: {holds}")
     archives = [line for line in store if line.startswith("archive|")]
-    must(archives == ["archive|custody|true|53687091200|local|harness"],
+    must(archives == ["archive|custody|true|53687091200|local|harness|||"],
          f"step 8, one archive allowed: {archives}")
 
     took = int(time.time() - started)

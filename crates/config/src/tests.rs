@@ -1448,6 +1448,7 @@ async fn set(
                 })
                 .collect(),
             cleared: cleared.iter().map(|name| (*name).into()).collect(),
+            ..Default::default()
         },
     )
     .await
@@ -1643,6 +1644,7 @@ async fn the_plugins_own_sidecar_is_told_its_secret_opened() {
     let form = crate::store::SettingsAuthor {
         by: ADA.into(),
         delegation: String::new(),
+        ..Default::default()
     };
     let put = |name: &str, held: Option<Held>, at: i64| {
         h.store
@@ -1737,6 +1739,7 @@ async fn a_secret_that_no_longer_opens_is_withheld_rather_than_sent_sealed() {
             &crate::store::SettingsAuthor {
                 by: ADA.into(),
                 delegation: String::new(),
+                ..Default::default()
             },
             1,
         )
@@ -2016,6 +2019,7 @@ async fn an_unchanged_row_keeps_who_changed_it_and_when() {
             &crate::store::SettingsAuthor {
                 by: "local|ben".into(),
                 delegation: String::new(),
+                ..Default::default()
             },
             1,
         )
@@ -2049,6 +2053,7 @@ async fn set_as(
             })
             .collect(),
         cleared: cleared.iter().map(|name| (*name).into()).collect(),
+        ..Default::default()
     };
     let (_, bytes) = h
         .bus
@@ -2165,6 +2170,7 @@ async fn a_value_held_from_an_earlier_declaration_that_does_not_read_is_withheld
     let author = crate::store::SettingsAuthor {
         by: "local|mallory".into(),
         delegation: String::new(),
+        ..Default::default()
     };
     for unread in [
         // Rows without the conductor's stamps.
@@ -2252,6 +2258,7 @@ async fn a_sealed_value_redeclared_as_a_table_is_cleared_and_no_table_is_stored_
             &crate::store::SettingsAuthor {
                 by: ADA.into(),
                 delegation: String::new(),
+                ..Default::default()
             },
             3,
         )
@@ -2363,6 +2370,7 @@ async fn a_setting_redeclared_secret_has_its_earlier_values_redacted() {
             &crate::store::SettingsAuthor {
                 by: ADA.into(),
                 delegation: String::new(),
+                ..Default::default()
             },
             4,
         )
@@ -2929,6 +2937,7 @@ async fn a_hold_reaches_the_sidecars_it_covers_and_holds_a_window_back() {
             role: "custody".into(),
             days: 2190,
             write_once: false,
+            ..Default::default()
         },
     )
     .await
@@ -2984,9 +2993,152 @@ async fn a_hold_reaches_the_sidecars_it_covers_and_holds_a_window_back() {
             role: "oms".into(),
             days: 30,
             write_once: false,
+            ..Default::default()
         },
     )
     .await
     .unwrap_err();
     assert!(oms.contains("oms is not an edge role"), "{oms}");
+}
+
+/// Set as Ada through a delegation and its client, with a note and the
+/// record's `updated_at_ns` as read, as core's settings tool sends it
+/// (W6.20, contract v17).
+async fn set_through(
+    h: &Harness,
+    values: &[(&str, &str)],
+    cleared: &[&str],
+    note: &str,
+    against_updated_at_ns: i64,
+) -> Result<PluginSettingsRecord, String> {
+    let request = SetPluginSettingsRequest {
+        plugin_instance_id: "oms-1".into(),
+        values: values
+            .iter()
+            .map(|(name, value)| PluginSettingValue {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect(),
+        cleared: cleared.iter().map(|name| (*name).into()).collect(),
+        note: note.into(),
+        against_updated_at_ns,
+    };
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: ADA.into(),
+        acting_through_delegation: "DLG-7".into(),
+        acting_through_client: "Claude".into(),
+        account_scope: None,
+    };
+    let (_, bytes) = h
+        .bus
+        .call_stamped(
+            SET_PLUGIN_SETTINGS,
+            "meridian.v1.SetPluginSettingsRequest",
+            request.encode_to_vec(),
+            None,
+            None,
+            &stamp,
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    Ok(PluginSettingsRecord::decode(&bytes[..]).unwrap())
+}
+
+#[tokio::test]
+async fn each_settings_last_change_names_the_delegation_and_client_and_a_secret_is_only_dated() {
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    // A person at the page first: no delegation, no client.
+    let first = set(&h, "oms-1", &[("poll_minutes", "15")], &[])
+        .await
+        .unwrap();
+    let record = set_through(
+        &h,
+        &[("api_key", SECRET)],
+        &[],
+        "Rotated the key the vendor reissued.",
+        first.updated_at_ns,
+    )
+    .await
+    .unwrap();
+    let change = |name: &str| {
+        record
+            .changes
+            .iter()
+            .find(|c| c.name == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(record.changes.len(), 2, "one per setting ever changed");
+    let key = change("api_key");
+    assert_eq!(key.changed_by, ADA);
+    assert_eq!(key.changed_at_ns, FixedClock.now_ns());
+    assert_eq!(key.acting_through_delegation, "DLG-7");
+    assert_eq!(key.client_name, "Claude");
+    let poll = change("poll_minutes");
+    assert!(poll.acting_through_delegation.is_empty() && poll.client_name.is_empty());
+    assert!(
+        !contains(&record.encode_to_vec(), SECRET),
+        "never its value"
+    );
+    // The change's own record keeps the client and the note.
+    let kept = h.store.plugin_setting_changes("oms-1").unwrap();
+    let last = kept.last().unwrap();
+    assert_eq!(
+        (
+            last.name.as_str(),
+            last.delegation.as_str(),
+            last.client.as_str()
+        ),
+        ("api_key", "DLG-7", "Claude")
+    );
+    assert_eq!(last.note, "Rotated the key the vendor reissued.");
+    // And the dashboard reads the same.
+    assert_eq!(records(&h).await.plugin_settings[0].changes, record.changes);
+}
+
+#[tokio::test]
+async fn a_change_against_a_record_changed_since_it_was_read_is_refused_naming_the_field() {
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    let read = records(&h).await.plugin_settings[0].updated_at_ns;
+    assert_eq!(read, 0, "nothing ever changed");
+    set(&h, "oms-1", &[("poll_minutes", "15")], &[])
+        .await
+        .unwrap();
+    let refused = set_through(&h, &[("poll_minutes", "30")], &[], "Slower.", 7)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("against_updated_at_ns"), "{refused}");
+    let detail = refused
+        .split_once("failed: ")
+        .map_or(refused.as_str(), |(_, d)| d);
+    assert_eq!(
+        meridian_bus::read_refusal(detail).map(|(reason, _)| reason),
+        Some(meridian_pb::v1::RefusalReason::RecordChanged as i32),
+        "{refused}"
+    );
+    let snapshot = h.store.snapshot().unwrap();
+    let held = snapshot
+        .settings
+        .iter()
+        .find(|s| s.name == "poll_minutes")
+        .unwrap();
+    assert_eq!(held.held, Held::Plain("15".into()), "nothing changed");
+    // Against the record as it stands, it is made; 0 is a client from
+    // before v17, checked as before.
+    let now = records(&h).await.plugin_settings[0].updated_at_ns;
+    set_through(&h, &[("poll_minutes", "30")], &[], "Slower.", now)
+        .await
+        .unwrap();
+    set_through(&h, &[("poll_minutes", "45")], &[], "Slower still.", 0)
+        .await
+        .unwrap();
+    // A note past its bound is refused, naming it.
+    let long = "n".repeat(crate::MOST_NOTE + 1);
+    let refused = set_through(&h, &[("poll_minutes", "60")], &[], &long, 0)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("note"), "{refused}");
 }

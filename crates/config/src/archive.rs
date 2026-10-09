@@ -34,7 +34,7 @@ use meridian_pb::v1::{
     MoveOutcome, RawRecordKind, RecordMoveReply, RecordMoveRequest, RefusalReason,
 };
 
-use crate::store::{in_the_archive, Snapshot, Store};
+use crate::store::{in_the_archive, note_refused, Author, Snapshot, Store};
 
 pub const SET_HOLD: &str = "platform.config.command.set-hold";
 pub const RECORD_MOVE: &str = "platform.config.command.record-move";
@@ -290,10 +290,10 @@ pub fn record_move(
     snapshot: &Snapshot,
     instance: &str,
     moved: RecordMoveRequest,
-    person: &str,
-    delegation: &str,
+    author: &Author,
     now_ns: i64,
 ) -> Result<RecordMoveReply, String> {
+    let person = author.by.as_str();
     if instance.is_empty() {
         return Err("a move is reported by a plugin's sidecar, for its own instance".into());
     }
@@ -333,13 +333,26 @@ pub fn record_move(
             ));
         }
     }
+    // The delegation and client the person acted through, beside them
+    // (contract v17); never alone.
+    let through = !person.is_empty();
     let record = MoveRecord {
         r#move: Some(moved),
         person: person.to_string(),
         at_ns: now_ns,
+        acting_through_delegation: if through {
+            author.delegation.clone()
+        } else {
+            String::new()
+        },
+        client_name: if through && !author.delegation.is_empty() {
+            author.client.clone()
+        } else {
+            String::new()
+        },
     };
     let recorded = store
-        .record_move(instance, &record, delegation)
+        .record_move(instance, &record)
         .map_err(|failed| failed.to_string())?;
     let moved = record.r#move.unwrap_or_default();
     tracing::info!(
@@ -402,14 +415,17 @@ pub fn set_hold(
     store: &dyn Store,
     grant: ArchiveGrant,
     request: &SetHoldRequest,
-    by: &str,
-    delegation: &str,
+    author: &Author,
     now_ns: i64,
 ) -> Result<Hold, String> {
+    let by = author.by.as_str();
     if by.is_empty() {
         return Err("a hold is a deployment admin's to set, and this is sent for nobody".into());
     }
     if let Some(refusal) = hold_refused(request, grant) {
+        return Err(refusal);
+    }
+    if let Some(refusal) = note_refused(&request.note) {
         return Err(refusal);
     }
     let hold = Hold {
@@ -418,9 +434,11 @@ pub fn set_hold(
         write_once: request.write_once && request.days > 0,
         updated_by: by.to_string(),
         updated_at_ns: now_ns,
+        acting_through_delegation: author.delegation.clone(),
+        client_name: author.client.clone(),
     };
     store
-        .set_hold(&hold, delegation)
+        .set_hold(&hold, &request.note)
         .map_err(|failed| failed.to_string())?;
     tracing::info!(
         role = if hold.role.is_empty() {

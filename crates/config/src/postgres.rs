@@ -16,8 +16,8 @@ use r2d2_postgres::PostgresConnectionManager;
 
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord,
-    Permission, PluginArchive, PluginLaunch, PluginMetadata, PluginVersion, SignInRecord,
-    UserGroup,
+    Permission, PluginArchive, PluginLaunch, PluginMetadata, PluginVersion, SettingLastChange,
+    SignInRecord, UserGroup,
 };
 
 use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
@@ -26,9 +26,9 @@ use prost::Message;
 use crate::migrations;
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
-    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, RecordedMove,
-    Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoreError,
-    StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, LaunchAct,
+    LaunchNote, RecordedMove, Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot,
+    Store, StoreError, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -331,6 +331,32 @@ impl Store for PostgresStore {
             );
         }
 
+        // And each setting's latest, a secret's included, never a value
+        // (contract v17).
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (plugin_instance_id, name) plugin_instance_id, name,
+                        changed_by, changed_at_ns, through_delegation, client_name
+                   FROM config_plugin_setting_change
+                  WHERE action IN (1, 2)
+                  ORDER BY plugin_instance_id, name, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot
+                .setting_changes
+                .entry(row.get(0))
+                .or_default()
+                .push(SettingLastChange {
+                    name: row.get(1),
+                    changed_by: row.get(2),
+                    changed_at_ns: row.get(3),
+                    acting_through_delegation: row.get(4),
+                    client_name: row.get(5),
+                });
+        }
+
         for row in tx
             .query(
                 "SELECT name, version, roles, interface, sdk_version, image_digest,
@@ -377,38 +403,29 @@ impl Store for PostgresStore {
         // instance's latest archive (W6.25, W8.7, contract v16).
         for row in tx
             .query(
-                "SELECT role, days, write_once, changed_by, changed_at_ns FROM (
-                     SELECT DISTINCT ON (role) role, days, write_once, changed_by, changed_at_ns
-                       FROM config_hold_change ORDER BY role, change_id DESC) latest
-                  WHERE days > 0 ORDER BY role",
+                &format!(
+                    "SELECT {HOLD_COLUMNS} FROM (
+                         SELECT DISTINCT ON (role) * FROM config_hold_change
+                          ORDER BY role, change_id DESC) latest
+                      WHERE days > 0 ORDER BY role"
+                ),
                 &[],
             )
             .map_err(unavailable)?
         {
-            snapshot.holds.push(Hold {
-                role: row.get(0),
-                days: u32::try_from(row.get::<_, i32>(1)).unwrap_or_default(),
-                write_once: row.get(2),
-                updated_by: row.get(3),
-                updated_at_ns: row.get(4),
-            });
+            snapshot.holds.push(hold_from(&row).0);
         }
         for row in tx
             .query(
-                "SELECT DISTINCT ON (instance_id) instance_id, allowed, most_bytes, changed_by,
-                        changed_at_ns
-                   FROM config_archive_change ORDER BY instance_id, change_id DESC",
+                &format!(
+                    "SELECT DISTINCT ON (instance_id) {ARCHIVE_COLUMNS}
+                       FROM config_archive_change ORDER BY instance_id, change_id DESC"
+                ),
                 &[],
             )
             .map_err(unavailable)?
         {
-            snapshot.archives.push(PluginArchive {
-                instance_id: row.get(0),
-                allowed: row.get(1),
-                most_bytes: u64::try_from(row.get::<_, i64>(2)).unwrap_or_default(),
-                updated_by: row.get(3),
-                updated_at_ns: row.get(4),
-            });
+            snapshot.archives.push(archive_from(&row).0);
         }
 
         tx.commit().map_err(unavailable)?;
@@ -899,8 +916,8 @@ impl Store for PostgresStore {
             tx.execute(
                 "INSERT INTO config_plugin_setting_change
                         (plugin_instance_id, name, action, changed_by, changed_at_ns,
-                         value, secret, through_delegation)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                         value, secret, through_delegation, client_name, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &plugin_instance_id,
                     &change.name,
@@ -910,6 +927,8 @@ impl Store for PostgresStore {
                     &recorded,
                     &secret,
                     &author.delegation,
+                    &author.client,
+                    &author.note,
                 ],
             )
             .map_err(unavailable)?;
@@ -931,7 +950,7 @@ impl Store for PostgresStore {
             .conn()?
             .query(
                 "SELECT name, action, value, secret, changed_by, through_delegation,
-                        changed_at_ns, backfilled, note
+                        changed_at_ns, backfilled, note, client_name
                    FROM config_plugin_setting_change
                   WHERE plugin_instance_id = $1
                   ORDER BY change_id",
@@ -953,6 +972,7 @@ impl Store for PostgresStore {
                     secret: row.get(3),
                     by: row.get(4),
                     delegation: row.get(5),
+                    client: row.get(9),
                     at_ns: row.get(6),
                     backfilled: row.get(7),
                     note: row.get(8),
@@ -987,14 +1007,15 @@ impl Store for PostgresStore {
         Ok(written == 1)
     }
 
-    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool> {
+    fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {
         let written = self
             .conn()?
             .execute(
                 "INSERT INTO config_plugin_launch
                         (instance_id, name, version, image_digest, roles, launched_by,
-                         launched_at_ns, state, live)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)
+                         launched_at_ns, state, live, launched_through_delegation,
+                         launched_client_name, launch_note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -1005,6 +1026,9 @@ impl Store for PostgresStore {
                     &launch.launched_by,
                     &launch.launched_at_ns,
                     &launch.live,
+                    &launch.acting_through_delegation,
+                    &launch.client_name,
+                    &note,
                 ],
             )
             .map_err(unavailable)?;
@@ -1018,7 +1042,9 @@ impl Store for PostgresStore {
             .query_opt(
                 &format!(
                     "UPDATE config_plugin_launch
-                        SET state = $2, stopped_by = $3, stopped_at_ns = $4, failure = $5
+                        SET state = $2, stopped_by = $3, stopped_at_ns = $4, failure = $5,
+                            stopped_through_delegation = $6, stopped_client_name = $7,
+                            stop_note = $8
                       WHERE instance_id = $1 AND state = 1
                   RETURNING {LAUNCH_COLUMNS}"
                 ),
@@ -1028,35 +1054,108 @@ impl Store for PostgresStore {
                     &ending.by,
                     &ending.at_ns,
                     &ending.failure,
+                    &ending.delegation,
+                    &ending.client,
+                    &ending.note,
                 ],
             )
             .map_err(unavailable)?;
         Ok(ended.as_ref().map(launch_from))
     }
 
-    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()> {
+    fn launch_notes(&self, instance_id: &str) -> Result<Vec<LaunchNote>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT launched_at_ns, act, note, gap, at_ns FROM (
+                     SELECT launched_at_ns, 1::smallint AS act, launch_note AS note, false AS gap,
+                            launched_at_ns AS at_ns, launch_id, 0::bigint AS gap_id
+                       FROM config_plugin_launch WHERE instance_id = $1
+                     UNION ALL
+                     SELECT launched_at_ns, 2::smallint, stop_note, false, stopped_at_ns,
+                            launch_id, 0
+                       FROM config_plugin_launch WHERE instance_id = $1 AND state = 2
+                     UNION ALL
+                     SELECT launched_at_ns, act, note, true, noted_at_ns, launch_id, gap_id
+                       FROM config_plugin_launch_gap WHERE instance_id = $1) notes
+                  ORDER BY at_ns, launch_id, act, gap_id",
+                &[&instance_id],
+            )
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let act: i16 = row.get(1);
+                Ok(LaunchNote {
+                    instance_id: instance_id.to_string(),
+                    launched_at_ns: row.get(0),
+                    act: LaunchAct::from_code(act).ok_or_else(|| {
+                        StoreError::Unavailable(format!(
+                            "a launch's record names act {act}, which this binary does not know"
+                        ))
+                    })?,
+                    note: row.get(2),
+                    gap: row.get(3),
+                    at_ns: row.get(4),
+                })
+            })
+            .collect()
+    }
+
+    fn set_hold(&self, hold: &Hold, note: &str) -> Result<()> {
         let days = i32::try_from(hold.days).map_err(|_| {
             StoreError::Unavailable(format!("a hold of {} days does not fit", hold.days))
         })?;
         self.conn()?
             .execute(
                 "INSERT INTO config_hold_change
-                        (role, days, write_once, changed_by, through_delegation, changed_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                        (role, days, write_once, changed_by, through_delegation, changed_at_ns,
+                         client_name, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &hold.role,
                     &days,
                     &hold.write_once,
                     &hold.updated_by,
-                    &delegation,
+                    &hold.acting_through_delegation,
                     &hold.updated_at_ns,
+                    &hold.client_name,
+                    &note,
                 ],
             )
             .map_err(unavailable)?;
         Ok(())
     }
 
-    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()> {
+    fn hold_changes(&self) -> Result<Vec<(Hold, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                &format!("SELECT {HOLD_COLUMNS} FROM config_hold_change ORDER BY change_id"),
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(hold_from)
+            .collect())
+    }
+
+    fn archive_changes(&self, instance_id: &str) -> Result<Vec<(PluginArchive, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {ARCHIVE_COLUMNS} FROM config_archive_change
+                      WHERE instance_id = $1 ORDER BY change_id"
+                ),
+                &[&instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(archive_from)
+            .collect())
+    }
+
+    fn put_archive(&self, archive: &PluginArchive, note: &str) -> Result<()> {
         let most = i64::try_from(archive.most_bytes).map_err(|_| {
             StoreError::Unavailable(format!(
                 "a bound of {} bytes does not fit",
@@ -1067,27 +1166,24 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_archive_change
                         (instance_id, allowed, most_bytes, changed_by, through_delegation,
-                         changed_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                         changed_at_ns, client_name, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &archive.instance_id,
                     &archive.allowed,
                     &most,
                     &archive.updated_by,
-                    &delegation,
+                    &archive.acting_through_delegation,
                     &archive.updated_at_ns,
+                    &archive.client_name,
+                    &note,
                 ],
             )
             .map_err(unavailable)?;
         Ok(())
     }
 
-    fn record_move(
-        &self,
-        instance_id: &str,
-        record: &MoveRecord,
-        delegation: &str,
-    ) -> Result<bool> {
+    fn record_move(&self, instance_id: &str, record: &MoveRecord) -> Result<bool> {
         let moved = record.r#move.clone().unwrap_or_default();
         let count = i64::try_from(moved.record_count).map_err(|_| {
             StoreError::Unavailable(format!("a count of {} does not fit", moved.record_count))
@@ -1117,8 +1213,9 @@ impl Store for PostgresStore {
         tx.execute(
             "INSERT INTO config_record_move
                     (instance_id, record_kind, unit, record_count, first_received_ns,
-                     last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                     last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns,
+                    client_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 &instance_id,
                 &moved.record_kind,
@@ -1129,8 +1226,9 @@ impl Store for PostgresStore {
                 &outcome,
                 &moved.rule,
                 &record.person,
-                &delegation,
+                &record.acting_through_delegation,
                 &record.at_ns,
+                &record.client_name,
             ],
         )
         .map_err(unavailable)?;
@@ -1202,7 +1300,49 @@ fn unless_empty(value: &str) -> Option<&str> {
 }
 
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
-     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live";
+     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
+     launched_through_delegation, launched_client_name, stopped_through_delegation, \
+     stopped_client_name";
+
+/// A hold change's columns, in the order [`hold_from`] reads them.
+const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
+     through_delegation, client_name, note";
+
+/// A hold, and its change's note.
+fn hold_from(row: &postgres::Row) -> (Hold, String) {
+    (
+        Hold {
+            role: row.get(0),
+            days: u32::try_from(row.get::<_, i32>(1)).unwrap_or_default(),
+            write_once: row.get(2),
+            updated_by: row.get(3),
+            updated_at_ns: row.get(4),
+            acting_through_delegation: row.get(5),
+            client_name: row.get(6),
+        },
+        row.get(7),
+    )
+}
+
+/// An archive change's columns, in the order [`archive_from`] reads them.
+const ARCHIVE_COLUMNS: &str = "instance_id, allowed, most_bytes, changed_by, changed_at_ns, \
+     through_delegation, client_name, note";
+
+/// An archive, and its change's note.
+fn archive_from(row: &postgres::Row) -> (PluginArchive, String) {
+    (
+        PluginArchive {
+            instance_id: row.get(0),
+            allowed: row.get(1),
+            most_bytes: u64::try_from(row.get::<_, i64>(2)).unwrap_or_default(),
+            updated_by: row.get(3),
+            updated_at_ns: row.get(4),
+            acting_through_delegation: row.get(5),
+            client_name: row.get(6),
+        },
+        row.get(7),
+    )
+}
 
 fn launch_from(row: &postgres::Row) -> PluginLaunch {
     PluginLaunch {
@@ -1218,6 +1358,10 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_at_ns: row.get(9),
         failure: row.get(10),
         live: row.get(11),
+        acting_through_delegation: row.get(12),
+        client_name: row.get(13),
+        stopped_through_delegation: row.get(14),
+        stopped_client_name: row.get(15),
     }
 }
 
@@ -1309,7 +1453,8 @@ fn insert_permission(
 
 /// A move's columns, in the order [`move_of`] reads them.
 const MOVE_COLUMNS: &str = "move_id, instance_id, record_kind, unit, record_count, \
-     first_received_ns, last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns";
+     first_received_ns, last_received_ns, outcome, rule, person, through_delegation, recorded_at_ns, \
+     client_name";
 
 fn move_of(row: &postgres::Row) -> RecordedMove {
     RecordedMove {
@@ -1327,8 +1472,9 @@ fn move_of(row: &postgres::Row) -> RecordedMove {
             }),
             person: row.get(9),
             at_ns: row.get(11),
+            acting_through_delegation: row.get(10),
+            client_name: row.get(12),
         },
-        delegation: row.get(10),
     }
 }
 

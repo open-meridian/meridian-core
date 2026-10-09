@@ -631,11 +631,53 @@ async fn save_settings(
     let Some(record) = settings_of(&records, instance) else {
         return no_such_plugin(instance);
     };
-    let held = access.plugin(instance);
-    // A table's cells, each checked as the conductor checks it, an external
-    // account one the plugin reported and an instrument one the deployment
-    // holds; nothing is sent while one does not read (W6.11, contract v14).
-    let mut offered = choices(app, instance, record, &records).await;
+    let mut request = match settings_change(app, record, &records, &access, fields).await {
+        Err(SettingsRefused::Cells(_, said) | SettingsRefused::NotAdministered(_, said)) => {
+            return after_to(Err(said), back, back)
+        }
+        Ok(None) => return after_to(Ok(()), &format!("{back}&saved=none"), back),
+        Ok(Some(request)) => request,
+    };
+    // Optional at the page (contract v17, the plan's Q8).
+    request.note = field(fields, "note").trim().to_string();
+    let outcome = command::<PluginSettingsRecord>(
+        app,
+        &session,
+        "platform.config.command.set-plugin-settings",
+        "meridian.v1.SetPluginSettingsRequest",
+        request,
+    )
+    .await
+    .map(|_| ());
+    after_to(outcome, &format!("{back}&saved=1"), back)
+}
+
+/// Why a settings change was not sent (W6.11): cells that do not read, each
+/// by its path in the form's grammar without the `table.` prefix
+/// (`<setting>[<row>].<column>`), with the sentence the page shows; or a
+/// setting serving a role the person does not administer, by its name.
+pub(crate) enum SettingsRefused {
+    Cells(Vec<meridian_domain::setting_table::Problem>, String),
+    NotAdministered(String, String),
+}
+
+/// The change a form's fields ask for, checked before anything is sent: one
+/// code path for the Settings form and core's settings tool (W6.20, contract
+/// v17), so a cell refused on the page and an argument refused through
+/// `/mcp` are refused by the same code with the same path. A table's cells
+/// are checked as the conductor checks them, an external account one the
+/// plugin reported and an instrument one the deployment holds; and a
+/// setting serving several roles is set by an admin of every one (W6.11,
+/// decisions/033 point 2). None when the fields ask for no change.
+pub(crate) async fn settings_change(
+    app: &App,
+    record: &PluginSettingsRecord,
+    records: &AccessRecords,
+    access: &Access,
+    fields: &Fields,
+) -> Result<Option<meridian_domain::v1::SetPluginSettingsRequest>, SettingsRefused> {
+    let instance = record.plugin_instance_id.as_str();
+    let mut offered = choices(app, instance, record, records).await;
     // An instrument typed is checked by its ID, not against the list the
     // grid offers, which holds the first thousand records at most.
     for id in settings::posted_instruments(record, fields) {
@@ -650,32 +692,22 @@ async fn save_settings(
     }
     let problems = settings::table_problems(record, fields, &offered);
     if !problems.is_empty() {
-        return after_to(Err(settings::said(record, &problems)), back, back);
+        let said = settings::said(record, &problems);
+        return Err(SettingsRefused::Cells(problems, said));
     }
     let Some(request) = settings::request(record, fields, crate::html::is_development()) else {
-        return after_to(Ok(()), &format!("{back}&saved=none"), back);
+        return Ok(None);
     };
-    // A setting serving several roles is set by an admin of every one
-    // (W6.11, decisions/033 point 2): the dashboard, which evaluates access,
-    // checks it before sending.
     let plugin_roles = access
         .known_roles
         .get(instance)
         .cloned()
         .unwrap_or_default();
-    if let Some(refusal) = settings::not_administered(record, &request, &held, &plugin_roles) {
-        return after_to(Err(refusal), back, back);
+    let held = access.plugin(instance);
+    if let Some((name, said)) = settings::not_administered(record, &request, &held, &plugin_roles) {
+        return Err(SettingsRefused::NotAdministered(name, said));
     }
-    let outcome = command::<PluginSettingsRecord>(
-        app,
-        &session,
-        "platform.config.command.set-plugin-settings",
-        "meridian.v1.SetPluginSettingsRequest",
-        request,
-    )
-    .await
-    .map(|_| ());
-    after_to(outcome, &format!("{back}&saved=1"), back)
+    Ok(Some(request))
 }
 
 /// What the dashboard's own tabs in a plugin's area under Manage show.
@@ -760,15 +792,32 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     format!(
         "{notice}{parts}",
         notice = notice_line(manage.notice),
-        parts = summary_parts(&[
-            ("status", "Status", status),
-            ("records", "Raw records", records),
-            ("moves", "Moves", moves),
-            ("declared", "What it declares", declared),
-            ("tools", "Tools for agents", tools_section(manage.report)),
-        ]),
+        parts = summary_parts(
+            &SUMMARY_PART_KEYS
+                .iter()
+                .zip([
+                    status,
+                    records,
+                    moves,
+                    declared,
+                    tools_section(manage.report)
+                ])
+                .map(|((key, title), drawn)| (*key, *title, drawn))
+                .collect::<Vec<_>>()
+        ),
     )
 }
+
+/// The Summary's parts, by key and title, in the order drawn: each has a
+/// plugin-area tool reaching it (W6.20, contract v17; the parity check in
+/// [`crate::mcp::plugin_area`]).
+pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 5] = [
+    ("status", "Status"),
+    ("records", "Raw records"),
+    ("moves", "Moves"),
+    ("declared", "What it declares"),
+    ("tools", "Tools for agents"),
+];
 
 /// The Summary's parts -- its status and figures, an edge plugin's raw
 /// records and their moves (contract v16), what it declares, its tools -- as
@@ -964,6 +1013,7 @@ pub(crate) fn settings_section(
             development,
             action,
             held.map(|held| (held, plugin_roles.as_slice())),
+            &|subject| crate::tickets::display_name(records, subject),
         ),
     )
 }
@@ -1887,6 +1937,8 @@ async fn set_hold(
                     role: field(&fields, "role").to_string(),
                     days,
                     write_once: !field(&fields, "write_once").is_empty(),
+                    // Optional at the page (contract v17, the plan's Q8).
+                    note: field(&fields, "note").trim().to_string(),
                 },
             )
             .await

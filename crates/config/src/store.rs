@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     KnownPluginRoles, MoveRecord, Permission, PluginArchive, PluginCatalogue, PluginLaunch,
-    PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
+    PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 use meridian_pb::v1::{MoveOutcome, SettingDeclaration, StoredSpan};
 
@@ -85,13 +85,29 @@ pub struct SettingChange {
 }
 
 /// Who made a change: the person the dashboard stamped, and the delegation
-/// they acted through when they acted through a client (empty otherwise).
-/// Empty `by` for a change no person made: a migration's, or a plugin's
+/// they acted through when they acted through a client, with the client's
+/// name beside it (empty otherwise; the client from contract v17). Empty
+/// `by` for a change no person made: a migration's, or a plugin's
 /// re-declaration. A plugin sets none of its settings (W6.11, option A).
+///
+/// And why, where a change says (`note`, contract v17): kept with the
+/// change's record, required through /mcp and optional at the page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Author {
     pub by: String,
     pub delegation: String,
+    pub client: String,
+    pub note: String,
+}
+
+/// The longest a change's note may be, as a note on an instrument record.
+pub const MOST_NOTE: usize = 2_000;
+
+/// The refusal of a change's note past its bound, naming `note`; None
+/// within it.
+pub fn note_refused(note: &str) -> Option<String> {
+    (note.chars().count() > MOST_NOTE)
+        .then(|| format!("note: a note is at most {MOST_NOTE} characters, and nothing was changed"))
 }
 
 /// Who made a settings change (W6.11).
@@ -297,6 +313,8 @@ pub struct SettingChangeRecord {
     pub secret: bool,
     pub by: String,
     pub delegation: String,
+    /// The client's name beside the delegation (contract v17).
+    pub client: String,
     pub at_ns: i64,
     pub backfilled: bool,
     pub note: String,
@@ -355,6 +373,10 @@ pub struct Snapshot {
     /// the change records: who the settings record says last changed them,
     /// and when. Empty `by` for a clear the plugin's re-declaration made.
     pub settings_changed: BTreeMap<String, LastChange>,
+    /// Each setting's latest change, set or cleared, by instance, in name
+    /// order (W6.11, contract v17): who, when, and the delegation and client,
+    /// a secret's included and never a value.
+    pub setting_changes: BTreeMap<String, Vec<SettingLastChange>>,
     /// The holds on raw records standing now (W6.25, contract v16), one per
     /// edge role or one for every role (an empty role), each as its latest
     /// record says it; a hold cleared (0 days) is not among them.
@@ -365,16 +387,61 @@ pub struct Snapshot {
 }
 
 /// One move of raw records as the store keeps it (W4.13, contract v16): its
-/// number, which the moves' pages count back from, the instance, the move as
-/// recorded, and the delegation the person acted through where they used
-/// one.
+/// number, which the moves' pages count back from, the instance, and the
+/// move as recorded, the delegation and client the person acted through in
+/// it where they used one (contract v17).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedMove {
     pub move_id: i64,
     pub instance_id: String,
     pub record: MoveRecord,
-    pub delegation: String,
 }
+
+/// What a launch's or a stop's own record keeps beside the launch (W8.3,
+/// W8.4, decisions/031, contract v17): the note it was made with, or for a
+/// launch or stop made before v17, a gap record saying the delegation and
+/// client it was made through are not known (`gap`), at the moment the
+/// migration ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchNote {
+    pub instance_id: String,
+    pub launched_at_ns: i64,
+    pub act: LaunchAct,
+    pub note: String,
+    pub gap: bool,
+    pub at_ns: i64,
+}
+
+/// A launch, or its stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchAct {
+    Launched,
+    Stopped,
+}
+
+impl LaunchAct {
+    /// The `act` column's number.
+    pub fn code(self) -> i16 {
+        match self {
+            LaunchAct::Launched => 1,
+            LaunchAct::Stopped => 2,
+        }
+    }
+
+    pub fn from_code(code: i16) -> Option<Self> {
+        match code {
+            1 => Some(LaunchAct::Launched),
+            2 => Some(LaunchAct::Stopped),
+            _ => None,
+        }
+    }
+}
+
+/// What a gap record of a launch or a stop before v17 says (decisions/031,
+/// point 4).
+pub const LAUNCH_THROUGH_NOT_KNOWN: &str = "not known: before contract v17 a launch or a stop \
+     was made through the terminal on a delegation, and the delegation and client it was made \
+     through were not recorded; each since names them";
 
 /// Whether the archive holds a unit whose latest move this is: archived,
 /// restored from it, or returned to it; not once deleted.
@@ -488,16 +555,34 @@ pub const REDACTED_BY_REDECLARATION: &str =
 pub const REDACTED_BY_SEALING: &str =
     "the setting's value became sealed, a secret; by its being set so";
 
-/// How a live launch ended: stopped by an administrator, or failed.
+/// How a live launch ended: stopped by an administrator, through the
+/// delegation and client they used and with their note (contract v17), or
+/// failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ending {
     pub state: PluginLaunchState,
     pub by: String,
+    pub delegation: String,
+    pub client: String,
+    pub note: String,
     pub at_ns: i64,
     pub failure: String,
 }
 
 impl Ending {
+    /// A launch the launcher failed, no person's.
+    pub fn failed(at_ns: i64, failure: String) -> Ending {
+        Ending {
+            state: PluginLaunchState::Failed,
+            by: String::new(),
+            delegation: String::new(),
+            client: String::new(),
+            note: String::new(),
+            at_ns,
+            failure,
+        }
+    }
+
     /// The launch as it reads once ended this way.
     pub fn applied_to(&self, launch: &PluginLaunch) -> PluginLaunch {
         PluginLaunch {
@@ -505,6 +590,8 @@ impl Ending {
             stopped_by: self.by.clone(),
             stopped_at_ns: self.at_ns,
             failure: self.failure.clone(),
+            stopped_through_delegation: self.delegation.clone(),
+            stopped_client_name: self.client.clone(),
             ..launch.clone()
         }
     }
@@ -618,29 +705,43 @@ pub trait Store: Send + Sync {
 
     /// Record a launch as live, unless its instance has a live launch
     /// already: false then. Checked and written in one step, so two launches
-    /// of one instance cannot both pass.
-    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool>;
+    /// of one instance cannot both pass. Who launched it, through which
+    /// delegation and client, are the launch's own; its note is kept with it
+    /// (contract v17).
+    fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool>;
 
     /// End an instance's live launch, returning it as ended, or None when
-    /// none was live.
+    /// none was live; a stop's note kept with it.
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>>;
+
+    /// Each launch's and stop's note of one instance, and the gap records of
+    /// those made before v17, in the order recorded (contract v17).
+    fn launch_notes(&self, instance_id: &str) -> Result<Vec<LaunchNote>>;
 
     /// A hold set, changed or cleared (0 days), as its own record (W6.25,
     /// decisions/031): the role, the days and write-once as set, who
-    /// (`hold.updated_by`), through which delegation, and when
-    /// (`hold.updated_at_ns`). The snapshot's holds are each role's latest.
-    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()>;
+    /// (`hold.updated_by`), through which delegation and client, and when
+    /// (`hold.updated_at_ns`), and why (`note`). The snapshot's holds are
+    /// each role's latest.
+    fn set_hold(&self, hold: &Hold, note: &str) -> Result<()>;
+
+    /// Every hold change, in the order recorded, each with its note.
+    fn hold_changes(&self) -> Result<Vec<(Hold, String)>>;
 
     /// An instance's archive allowed, its bound changed, or withdrawn, as its
-    /// own record (W8.7, decisions/031): who and when are the archive's own
-    /// `updated_by` and `updated_at_ns`.
-    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()>;
+    /// own record (W8.7, decisions/031): who, through what and when are the
+    /// archive's own, and why `note`.
+    fn put_archive(&self, archive: &PluginArchive, note: &str) -> Result<()>;
 
-    /// A move of raw records, as its own record (W4.13, decisions/031);
-    /// false, and nothing recorded, when the unit's latest move is the same
-    /// outcome -- a retry, answered as recorded.
-    fn record_move(&self, instance_id: &str, record: &MoveRecord, delegation: &str)
-        -> Result<bool>;
+    /// Every change to one instance's archive, in the order recorded, each
+    /// with its note.
+    fn archive_changes(&self, instance_id: &str) -> Result<Vec<(PluginArchive, String)>>;
+
+    /// A move of raw records, as its own record (W4.13, decisions/031), the
+    /// delegation and client the record names with it; false, and nothing
+    /// recorded, when the unit's latest move is the same outcome -- a retry,
+    /// answered as recorded.
+    fn record_move(&self, instance_id: &str, record: &MoveRecord) -> Result<bool>;
 
     /// The latest move of one unit of a kind, if it ever moved.
     fn latest_move(

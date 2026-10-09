@@ -70,11 +70,13 @@ fn reply(allowed: bool) -> ReadMovesReply {
                 r#move: Some(moved(MoveOutcome::Restored, "")),
                 person: "ben@example.com".into(),
                 at_ns: 1_791_590_400_000_000_000,
+                ..Default::default()
             },
             MoveRecord {
                 r#move: Some(moved(MoveOutcome::Archived, "activity_window_days 2555")),
                 person: String::new(),
                 at_ns: 1_791_504_000_000_000_000,
+                ..Default::default()
             },
         ],
         next_cursor: "before-2".into(),
@@ -91,6 +93,7 @@ fn reply(allowed: bool) -> ReadMovesReply {
             most_bytes: 53_687_091_200,
             updated_by: "ada@example.com".into(),
             updated_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         }),
     }
 }

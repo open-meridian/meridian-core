@@ -90,9 +90,17 @@ fn refused(status: StatusCode, reason: impl Into<String>) -> Response {
     json(status, serde_json::json!({ "error": reason.into() }))
 }
 
+/// A deployment admin acting from a terminal, and what every request sent
+/// for them carries: the person, the delegation and its client (W4.9's
+/// stamp; contract v17, W8.3 and W8.4).
+struct Admin {
+    person: Person,
+    stamp: meridian_bus::Stamp,
+}
+
 /// A deployment admin acting from a terminal -- on a delegation covering the
 /// deployment admin's capabilities -- or the refusal.
-async fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> {
+async fn admin(app: &App, headers: &HeaderMap) -> Result<Admin, Box<Response>> {
     let caller = caller_of(app, headers).await?;
     let records = app
         .records
@@ -115,7 +123,19 @@ async fn admin(app: &App, headers: &HeaderMap) -> Result<Person, Box<Response>> 
         caller.refused(app, why).await;
         return Err(Box::new(refused(StatusCode::FORBIDDEN, why)));
     }
-    Ok(caller.person)
+    let crate::web::Through::Delegation {
+        id, client_name, ..
+    } = &caller.through;
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: caller.person.subject.clone(),
+        acting_through_delegation: id.clone(),
+        acting_through_client: client_name.clone(),
+        account_scope: None,
+    };
+    Ok(Admin {
+        person: caller.person,
+        stamp,
+    })
 }
 
 /// The admin, then their JSON: who is asking is settled before what they
@@ -124,7 +144,7 @@ async fn admin_asking<T: serde::de::DeserializeOwned>(
     app: &App,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Person, T), Box<Response>> {
+) -> Result<(Admin, T), Box<Response>> {
     let person = admin(app, headers).await?;
     let asked = serde_json::from_slice(body).map_err(|failed| {
         Box::new(refused(
@@ -135,10 +155,11 @@ async fn admin_asking<T: serde::de::DeserializeOwned>(
     Ok((person, asked))
 }
 
-/// A bus command or query sent for the admin, and its refusal's words.
+/// A bus command or query sent for the admin, stamped with the delegation
+/// and client they acted through, and its refusal's words.
 async fn ask<Rep: Message + Default>(
     app: &App,
-    person: &Person,
+    admin: &Admin,
     topic: &str,
     request_type: &str,
     request: impl Message,
@@ -146,13 +167,13 @@ async fn ask<Rep: Message + Default>(
 ) -> Result<Rep, String> {
     let (_, bytes) = app
         .bus
-        .call_for(
+        .call_stamped(
             topic,
             request_type,
             request.encode_to_vec(),
             None,
             Some(timeout),
-            &person.subject,
+            &admin.stamp,
         )
         .await
         .map_err(|failed| match failed {
@@ -331,7 +352,7 @@ async fn develop(
     request: Request,
 ) -> Response {
     let person = match admin(&app, request.headers()).await {
-        Ok(person) => person,
+        Ok(admin) => admin.person,
         Err(refusal) => return *refusal,
     };
     let Some(plugins) = app.plugins.clone() else {
@@ -453,7 +474,7 @@ async fn upload(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, upload): (Person, Upload) = match admin_asking(&app, &headers, &body).await {
+    let (person, upload): (Admin, Upload) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
@@ -603,6 +624,9 @@ struct Launch {
     /// installed for development (W8.3).
     #[serde(default)]
     live: bool,
+    /// Why, kept with the launch (contract v17); the CLI sends none yet.
+    #[serde(default)]
+    note: String,
 }
 
 async fn launch(
@@ -610,7 +634,7 @@ async fn launch(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, asked): (Person, Launch) = match admin_asking(&app, &headers, &body).await {
+    let (person, asked): (Admin, Launch) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
@@ -620,6 +644,7 @@ async fn launch(
         instance_id: asked.instance_id,
         approved_roles: asked.approved_roles,
         live: asked.live,
+        note: asked.note,
     };
     // Longer than the conductor gives the launcher, so its answer arrives.
     let launched: Result<PluginLaunch, String> = ask(
@@ -650,6 +675,9 @@ async fn launch(
 #[derive(serde::Deserialize)]
 struct Stop {
     instance_id: String,
+    /// Why, kept with the stop (contract v17); the CLI sends none yet.
+    #[serde(default)]
+    note: String,
 }
 
 async fn stop(
@@ -657,7 +685,7 @@ async fn stop(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (person, asked): (Person, Stop) = match admin_asking(&app, &headers, &body).await {
+    let (person, asked): (Admin, Stop) = match admin_asking(&app, &headers, &body).await {
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
@@ -668,6 +696,7 @@ async fn stop(
         "meridian.v1.StopPluginRequest",
         StopPluginRequest {
             instance_id: asked.instance_id,
+            note: asked.note,
         },
         Duration::from_secs(40),
     )

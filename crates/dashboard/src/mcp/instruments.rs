@@ -35,7 +35,7 @@ use crate::web::App;
 /// The most completions one call takes, as the row does.
 pub const MOST_COMPLETIONS: usize = 500;
 /// The longest a note or a source may be.
-const MOST_TEXT: usize = 2000;
+pub(super) const MOST_TEXT: usize = 2000;
 
 pub use super::{Area, Spec};
 
@@ -262,17 +262,17 @@ fn merge_schema() -> Value {
 
 /// Each field a call's arguments could not give, by its path.
 #[derive(Default)]
-struct Problems(Vec<Value>);
+pub(super) struct Problems(Vec<Value>);
 
 impl Problems {
-    fn add(&mut self, path: &str, message: impl Into<String>) {
+    pub(super) fn add(&mut self, path: &str, message: impl Into<String>) {
         self.0
             .push(json!({"path": path, "message": message.into()}));
     }
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    fn refusal(self) -> Value {
+    pub(super) fn refusal(self) -> Value {
         let detail = self
             .0
             .iter()
@@ -289,7 +289,7 @@ impl Problems {
     }
 }
 
-fn join(path: &str, name: &str) -> String {
+pub(super) fn join(path: &str, name: &str) -> String {
     if path.is_empty() {
         name.to_string()
     } else {
@@ -298,7 +298,12 @@ fn join(path: &str, name: &str) -> String {
 }
 
 /// Refuse every key of `object` not in `known`, by its path.
-fn only(object: &Map<String, Value>, known: &[&str], path: &str, problems: &mut Problems) {
+pub(super) fn only(
+    object: &Map<String, Value>,
+    known: &[&str],
+    path: &str,
+    problems: &mut Problems,
+) {
     for key in object.keys() {
         if !known.contains(&key.as_str()) {
             problems.add(
@@ -309,7 +314,7 @@ fn only(object: &Map<String, Value>, known: &[&str], path: &str, problems: &mut 
     }
 }
 
-fn text(
+pub(super) fn text(
     object: &Map<String, Value>,
     name: &str,
     path: &str,
@@ -343,7 +348,7 @@ fn text(
     }
 }
 
-fn integer(
+pub(super) fn integer(
     object: &Map<String, Value>,
     name: &str,
     path: &str,
@@ -380,7 +385,7 @@ fn enum_of<T>(
     }
 }
 
-fn object<'a>(
+pub(super) fn object<'a>(
     said: &'a Value,
     path: &str,
     problems: &mut Problems,
@@ -721,7 +726,7 @@ fn version_json(version: &InstrumentVersion) -> Value {
 
 /// One row on the bus, for the person through the delegation, stamped
 /// beside them (requirement 18).
-async fn ask<R: Message + Default>(
+pub(super) async fn ask<R: Message + Default>(
     app: &App,
     caller: &Caller,
     topic: &str,
@@ -770,7 +775,10 @@ async fn ask<R: Message + Default>(
     })
 }
 
-fn bus_refused((reason, detail, fields): (String, String, Vec<String>), prefix: &str) -> Value {
+pub(super) fn bus_refused(
+    (reason, detail, fields): (String, String, Vec<String>),
+    prefix: &str,
+) -> Value {
     refused(
         &reason,
         &detail,

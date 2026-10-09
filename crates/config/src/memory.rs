@@ -6,16 +6,17 @@ use std::sync::Mutex;
 
 use meridian_domain::v1::{
     AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord, Permission,
-    PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion, SignInRecord, UserGroup,
+    PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord,
+    UserGroup,
 };
 
 use meridian_pb::v1::{SettingDeclaration, StoredSpan};
 
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redaction_note, redeclared,
-    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, RecordedMove,
-    Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting,
-    Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, LaunchAct,
+    LaunchNote, RecordedMove, Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot,
+    Store, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -27,9 +28,11 @@ pub struct MemoryStore {
     /// Each grant change's own record (W6.7, W6.8), likewise.
     access_changes: Mutex<Vec<AccessChangeRecord>>,
     /// Each hold's and each archive's change, its own record, in order, with
-    /// the delegation it was made through (W6.25, W8.7).
+    /// its note (W6.25, W8.7; the note from contract v17).
     holds: Mutex<Vec<(Hold, String)>>,
     archives: Mutex<Vec<(PluginArchive, String)>>,
+    /// Each launch's and stop's note, in order (contract v17).
+    launch_notes: Mutex<Vec<LaunchNote>>,
     /// Each move of raw records (W4.13), numbered from 1 in order.
     moves: Mutex<Vec<RecordedMove>>,
 }
@@ -53,6 +56,7 @@ impl MemoryStore {
             access_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
+            launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
         }
     }
@@ -116,6 +120,7 @@ fn unauthored(
         secret: kind == ChangeKind::Redacted,
         by: String::new(),
         delegation: String::new(),
+        client: String::new(),
         at_ns,
         backfilled: false,
         note,
@@ -183,6 +188,20 @@ impl Store for MemoryStore {
                         at_ns: change.at_ns,
                     },
                 );
+                // Each setting's latest, in name order (contract v17).
+                let changes = snapshot
+                    .setting_changes
+                    .entry(change.plugin_instance_id.clone())
+                    .or_default();
+                changes.retain(|held| held.name != change.name);
+                changes.push(SettingLastChange {
+                    name: change.name.clone(),
+                    changed_by: change.by.clone(),
+                    changed_at_ns: change.at_ns,
+                    acting_through_delegation: change.delegation.clone(),
+                    client_name: change.client.clone(),
+                });
+                changes.sort_by(|a, b| a.name.cmp(&b.name));
             }
         }
         Ok(snapshot)
@@ -441,9 +460,10 @@ impl Store for MemoryStore {
                 secret: matches!(change.held, Some(Held::Sealed(_))),
                 by: author.by.clone(),
                 delegation: author.delegation.clone(),
+                client: author.client.clone(),
                 at_ns,
                 backfilled: false,
-                note: String::new(),
+                note: author.note.clone(),
             });
             if matches!(change.held, Some(Held::Sealed(_))) {
                 redact(
@@ -484,7 +504,7 @@ impl Store for MemoryStore {
         Ok(true)
     }
 
-    fn begin_launch(&self, launch: &PluginLaunch) -> Result<bool> {
+    fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {
         let mut state = self.state.lock().expect("store lock poisoned");
         let live = state.catalogue.launches.iter().any(|held| {
             held.instance_id == launch.instance_id
@@ -494,6 +514,17 @@ impl Store for MemoryStore {
             return Ok(false);
         }
         state.catalogue.launches.push(launch.clone());
+        self.launch_notes
+            .lock()
+            .expect("store lock poisoned")
+            .push(LaunchNote {
+                instance_id: launch.instance_id.clone(),
+                launched_at_ns: launch.launched_at_ns,
+                act: LaunchAct::Launched,
+                note: note.to_string(),
+                gap: false,
+                at_ns: launch.launched_at_ns,
+            });
         Ok(true)
     }
 
@@ -502,34 +533,72 @@ impl Store for MemoryStore {
         let live = state.catalogue.launches.iter_mut().find(|held| {
             held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
         });
-        Ok(live.map(|launch| {
+        let ended = live.map(|launch| {
             *launch = ending.applied_to(launch);
             launch.clone()
-        }))
+        });
+        if let Some(launch) = ended
+            .as_ref()
+            .filter(|_| ending.state == PluginLaunchState::Stopped)
+        {
+            self.launch_notes
+                .lock()
+                .expect("store lock poisoned")
+                .push(LaunchNote {
+                    instance_id: launch.instance_id.clone(),
+                    launched_at_ns: launch.launched_at_ns,
+                    act: LaunchAct::Stopped,
+                    note: ending.note.clone(),
+                    gap: false,
+                    at_ns: ending.at_ns,
+                });
+        }
+        Ok(ended)
     }
 
-    fn set_hold(&self, hold: &Hold, delegation: &str) -> Result<()> {
+    fn launch_notes(&self, instance_id: &str) -> Result<Vec<LaunchNote>> {
+        Ok(self
+            .launch_notes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|held| held.instance_id == instance_id)
+            .cloned()
+            .collect())
+    }
+
+    fn set_hold(&self, hold: &Hold, note: &str) -> Result<()> {
         self.holds
             .lock()
             .expect("store lock poisoned")
-            .push((hold.clone(), delegation.to_string()));
+            .push((hold.clone(), note.to_string()));
         Ok(())
     }
 
-    fn put_archive(&self, archive: &PluginArchive, delegation: &str) -> Result<()> {
+    fn hold_changes(&self) -> Result<Vec<(Hold, String)>> {
+        Ok(self.holds.lock().expect("store lock poisoned").clone())
+    }
+
+    fn put_archive(&self, archive: &PluginArchive, note: &str) -> Result<()> {
         self.archives
             .lock()
             .expect("store lock poisoned")
-            .push((archive.clone(), delegation.to_string()));
+            .push((archive.clone(), note.to_string()));
         Ok(())
     }
 
-    fn record_move(
-        &self,
-        instance_id: &str,
-        record: &MoveRecord,
-        delegation: &str,
-    ) -> Result<bool> {
+    fn archive_changes(&self, instance_id: &str) -> Result<Vec<(PluginArchive, String)>> {
+        Ok(self
+            .archives
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|(archive, _)| archive.instance_id == instance_id)
+            .cloned()
+            .collect())
+    }
+
+    fn record_move(&self, instance_id: &str, record: &MoveRecord) -> Result<bool> {
         let (kind, unit) = unit_of(record);
         let again = self
             .latest_move(instance_id, kind, unit)?
@@ -545,7 +614,6 @@ impl Store for MemoryStore {
             move_id,
             instance_id: instance_id.to_string(),
             record: record.clone(),
-            delegation: delegation.to_string(),
         });
         Ok(true)
     }

@@ -32,8 +32,8 @@ use crate::archive::{
     archive_allowed, edge_roles, roles_of, ArchiveGrant, ArchiveKind, ALLOW_ARCHIVE,
     WITHDRAW_ARCHIVE,
 };
-use crate::service::{answer_on, delegation, subject, Clock};
-use crate::store::{Ending, Snapshot, Store};
+use crate::service::{answer_on, author, subject, Clock};
+use crate::store::{note_refused, Ending, Snapshot, Store};
 
 pub const RECORD_PLUGIN_UPLOAD: &str = "platform.config.command.record-plugin-upload";
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
@@ -347,24 +347,32 @@ impl Plugins {
     ) -> Result<PluginLaunch, String> {
         let snapshot = self.snapshot()?;
         let version = launch(&snapshot, &request)?;
+        if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
+        }
         let metadata = version.metadata.clone().expect("found by it");
+        // Stamped as every change is: the person, and the delegation and
+        // client they acted through (W8.3, contract v17).
+        let by = author(envelope);
         let launched = PluginLaunch {
             instance_id: request.instance_id.clone(),
             name: metadata.name.clone(),
             version: metadata.version.clone(),
             image_digest: version.image_digest.clone(),
             roles: metadata.roles.clone(),
-            launched_by: subject(envelope),
+            launched_by: by.by,
             launched_at_ns: self.clock.now_ns(),
             state: PluginLaunchState::Launched as i32,
             live: request.live,
+            acting_through_delegation: by.delegation,
+            client_name: by.client,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
         // something the conductor has no record of.
         if !self
             .store
-            .begin_launch(&launched)
+            .begin_launch(&launched, &request.note)
             .map_err(|f| f.to_string())?
         {
             return Err(format!(
@@ -396,12 +404,7 @@ impl Plugins {
             }
             Err(failed) => {
                 // Recorded as failed, which frees the instance to try again.
-                let ending = Ending {
-                    state: PluginLaunchState::Failed,
-                    by: String::new(),
-                    at_ns: self.clock.now_ns(),
-                    failure: failed.clone(),
-                };
+                let ending = Ending::failed(self.clock.now_ns(), failed.clone());
                 self.store
                     .end_launch(&request.instance_id, &ending)
                     .map_err(|f| f.to_string())?;
@@ -452,11 +455,14 @@ impl Plugins {
         request: AllowArchiveRequest,
         envelope: &Envelope,
     ) -> Result<PluginArchive, String> {
-        let by = subject(envelope);
-        if by.is_empty() {
+        let by = author(envelope);
+        if by.by.is_empty() {
             return Err(
                 "an archive is a deployment admin's to allow, and this is sent for nobody".into(),
             );
+        }
+        if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
         }
         if self.archive.kind == ArchiveKind::None {
             return Err(format!(
@@ -494,11 +500,13 @@ impl Plugins {
             instance_id: request.instance_id.clone(),
             allowed: true,
             most_bytes: request.most_bytes,
-            updated_by: by,
+            updated_by: by.by,
             updated_at_ns: self.clock.now_ns(),
+            acting_through_delegation: by.delegation,
+            client_name: by.client,
         };
         self.store
-            .put_archive(&archive, &delegation(envelope))
+            .put_archive(&archive, &request.note)
             .map_err(|f| f.to_string())?;
         tracing::info!(
             instance = archive.instance_id,
@@ -519,12 +527,15 @@ impl Plugins {
         request: WithdrawArchiveRequest,
         envelope: &Envelope,
     ) -> Result<PluginArchive, String> {
-        let by = subject(envelope);
-        if by.is_empty() {
+        let by = author(envelope);
+        if by.by.is_empty() {
             return Err(
                 "an archive is a deployment admin's to withdraw, and this is sent for nobody"
                     .into(),
             );
+        }
+        if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
         }
         let snapshot = self.snapshot()?;
         let standing = snapshot
@@ -540,12 +551,14 @@ impl Plugins {
         };
         let archive = PluginArchive {
             allowed: false,
-            updated_by: by,
+            updated_by: by.by,
             updated_at_ns: self.clock.now_ns(),
+            acting_through_delegation: by.delegation,
+            client_name: by.client,
             ..standing
         };
         self.store
-            .put_archive(&archive, &delegation(envelope))
+            .put_archive(&archive, &request.note)
             .map_err(|f| f.to_string())?;
         tracing::info!(
             instance = archive.instance_id,
@@ -619,12 +632,7 @@ impl Plugins {
                 Ok(())
             }
             Err(failed) => {
-                let ending = Ending {
-                    state: PluginLaunchState::Failed,
-                    by: String::new(),
-                    at_ns: self.clock.now_ns(),
-                    failure: failed.clone(),
-                };
+                let ending = Ending::failed(self.clock.now_ns(), failed.clone());
                 self.store
                     .end_launch(instance, &ending)
                     .map_err(|f| f.to_string())?;
@@ -647,6 +655,9 @@ impl Plugins {
         if !live {
             return Err(format!("no launch of {} is live", request.instance_id));
         }
+        if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
+        }
         // Removed first, and recorded as stopped once it is: a launcher that
         // could not be reached leaves the launch live, and stopping can be
         // asked again, rather than recorded stopped while it runs.
@@ -657,9 +668,14 @@ impl Plugins {
                 instance_id: request.instance_id.clone(),
             },
         )?;
+        // Stamped as the launch is (W8.4, contract v17).
+        let by = author(envelope);
         let ending = Ending {
             state: PluginLaunchState::Stopped,
-            by: subject(envelope),
+            by: by.by,
+            delegation: by.delegation,
+            client: by.client,
+            note: request.note.clone(),
             at_ns: self.clock.now_ns(),
             failure: String::new(),
         };

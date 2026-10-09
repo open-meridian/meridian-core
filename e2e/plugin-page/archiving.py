@@ -95,6 +95,42 @@ def registration(port):
                               for n, l, w, a in KINDS]))).SerializeToString()
 
 
+def area_registration(port):
+    """The same plugin launched holding custody and operations, at contract
+    v17's `make e2e-plugin-area` (plans/cores-plugin-area-is-at-parity-on-the-
+    mcp): every page naming both roles, the window settings serving custody,
+    and beside them a secret and a table serving custody -- the table's
+    columns a plan code, an external account and an instrument, each cell
+    checked -- and a number serving both, which only an admin of both sets."""
+    request = sidecar_pb2.RegisterRequest.FromString(registration(port))
+    both = ["custody", "operations"]
+    for setting in request.settings:
+        setting.roles[:] = ["custody"]
+    for page in request.interface.pages:
+        page.roles[:] = both
+    column = sidecar_pb2.SettingColumn
+    request.settings.extend([
+        sidecar_pb2.SettingDeclaration(
+            name="api_key", type=sidecar_pb2.SETTING_TYPE_STRING, secret=True, label="API key",
+            description="The custodian's key: a secret.", roles=["custody"]),
+        sidecar_pb2.SettingDeclaration(
+            name="poll_minutes", type=sidecar_pb2.SETTING_TYPE_INTEGER, label="Read every",
+            unit="minutes", description="How often both sides read.", roles=both),
+        sidecar_pb2.SettingDeclaration(
+            name="plan_code_links", type=sidecar_pb2.SETTING_TYPE_TABLE, label="Plan-code links",
+            description="Which account and instrument each plan code is.", roles=["custody"],
+            columns=[
+                column(name="plan_code", label="Plan code", required=True,
+                       type=sidecar_pb2.SETTING_COLUMN_TYPE_TEXT),
+                column(name="account", label="Account",
+                       type=sidecar_pb2.SETTING_COLUMN_TYPE_EXTERNAL_ACCOUNT),
+                column(name="instrument", label="Instrument",
+                       type=sidecar_pb2.SETTING_COLUMN_TYPE_INSTRUMENT),
+            ]),
+    ])
+    return request.SerializeToString()
+
+
 def file_of(base, unit):
     return os.path.join(base, "units", unit.replace("/", "__") + ".jsonl")
 

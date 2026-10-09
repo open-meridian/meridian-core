@@ -96,6 +96,22 @@ fn records() -> AccessRecords {
     }
 }
 
+/// A launch or a stop from the terminal is sent stamped with the person,
+/// the delegation and its client (W8.3, W8.4, contract v17): the stand-in
+/// refuses one that is not, so the tests below hold the stamp.
+fn stamped(envelope: &meridian_bus::Envelope) -> Result<(), String> {
+    let meta = envelope.meta.clone().unwrap_or_default();
+    if meta.acting_for_subject.is_empty()
+        || meta.acting_through_delegation.is_empty()
+        || meta.acting_through_client.is_empty()
+    {
+        return Err(format!(
+            "not stamped with the delegation and client: {meta:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// A conductor answering W8 as told: snaptrade 0.1.0 is recorded.
 fn conductor(bus: &Bus) {
     bus.serve(PLUGIN_CATALOGUE, |_| {
@@ -146,6 +162,7 @@ fn conductor(bus: &Bus) {
         ))
     });
     bus.serve(LAUNCH_PLUGIN, |envelope| {
+        stamped(&envelope)?;
         let request = LaunchPluginRequest::decode(&envelope.payload[..]).unwrap();
         if request.approved_roles != vec!["custody".to_string()] {
             return Err("the approval names roles none, and snaptrade 0.1.0 declares custody; an approval of something other than what runs is no approval".into());
@@ -161,6 +178,7 @@ fn conductor(bus: &Bus) {
         ))
     });
     bus.serve(STOP_PLUGIN, |envelope| {
+        stamped(&envelope)?;
         let request = StopPluginRequest::decode(&envelope.payload[..]).unwrap();
         if request.instance_id != "snaptrade-1" {
             return Err(format!("no launch of {} is live", request.instance_id));

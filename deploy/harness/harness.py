@@ -60,6 +60,11 @@ the same image with the list on stdin:
       Prints the plugin's Summary under Manage, where its raw records are
       drawn (W6.9): with --until, again until it says TEXT.
 
+  view [--tab TAB] [--until TEXT] [--seconds N]
+      Prints a tab of the plugin's view in the admin portal, as the admin
+      reads it (contract v17): settings, a table's setting-NAME, access, or
+      the Overview without --tab; with --until, again until it says TEXT.
+
   account NAME [--seconds N]
       Defines an account (W6.3) and prints its ID, for a plugin whose page
       links only to an account that exists.
@@ -521,6 +526,26 @@ def summary(args):
 
     page = until(seconds, answered, f"{INSTANCE}'s Summary")
     print(page.body)
+
+
+def view(args):
+    seconds = number(args, "--seconds", 60)
+    tab = option(args, "--tab", None)
+    wanted = option(args, "--until", None)
+    if args:
+        raise Failed(f"view takes no {args[0]!r}")
+    admin = signed_in()
+    path = VIEW + (f"?tab={urllib.parse.quote(tab)}" if tab else "")
+
+    def answered():
+        page = admin.get(path)
+        if page.status != 200:
+            raise Failed(f"its view: {page.status} {sentence(page)}")
+        if wanted is not None and wanted not in html.unescape(page.body):
+            raise Failed(f"its view does not say {wanted!r} yet")
+        return page
+
+    print(until(seconds, answered, f"{INSTANCE}'s view").body)
 
 
 def account(args):
@@ -1518,7 +1543,7 @@ def mcp(args):
 
 
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
-            "summary": summary, "account": account, "page": page,
+            "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
             "instruments": instruments, "instrument": instrument, "mcp": mcp,
             "ticket": ticket, "inbox": inbox}

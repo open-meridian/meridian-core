@@ -32,7 +32,7 @@ same tag. The runtime image carries none of it.
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
 | `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
 | `activity.sql` | The custodian's activity and each connection's latest sync status, as the street keeps them, as stable, sorted lines (contract v14), which `store activity` prints |
-| `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), which `store moves` prints; never a record's content |
+| `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), and from contract v17 each setting change and the delegation, client and note of each change, which `store moves` prints; never a record's content, nor a setting's value |
 
 ## Taking it out of the image
 
@@ -152,6 +152,7 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `hold DAYS [--role ROLE] [--write-once] [--expect-refused TEXT]` | From contract v16: sets the hold on raw records on the deployment's Settings, as a deployment admin does, for one edge role or every one; 0 days clears it. With `--expect-refused`, fails unless it is refused saying `TEXT`. `settings ... --expect-refused TEXT` likewise expects a window below the hold refused, naming the setting. |
 | `archive allow [--bound-gib N]` / `archive withdraw` | From contract v16: allows the plugin an archive, with a bound in GiB or none, or withdraws it, on its Manage page, and prints what its Summary then says. |
 | `summary [--until TEXT] [--seconds N]` | Prints the plugin's Summary under Manage, where from contract v16 its raw records are drawn: per kind what its storage and its archive hold, and its moves; with `--until`, again until it says `TEXT`. |
+| `view [--tab TAB] [--until TEXT] [--seconds N]` | From contract v17: prints a tab of the plugin's view in the admin portal -- `settings`, a table's `setting-<name>`, `access`, or the Overview without `--tab` -- as the admin reads it; with `--until`, again until it says `TEXT`. |
 | `account NAME [--seconds N]` | Defines an account and prints its ID, for a page that links only to an account that exists. |
 | `page --level admin\|write\|read PATH [--until TEXT] [--seconds N]` | Opens a session on the plugin's own host at that level (Manage, Open, View), GETs `PATH`, prints the status and then the body; with `--until`, again until the body says `TEXT`. |
 | `form --level L --page PATH --post PATH [--csrf-field NAME] [--from-page NAME ...] [--expect TEXT] FIELD=VALUE ...` | In such a session, reads `--page`, takes its CSRF field (`csrf`, the SDK's name) and each field `--from-page` names (repeated, or comma separated) with the value the page gives it -- a proposal's digest, say -- and posts them with the fields you give, urlencoded, to `--post`; prints the status and the body. A field you give wins over one taken from the page; a field the page does not have fails. With `--expect`, fails unless the body says `TEXT`. A 4xx or 5xx fails. |
@@ -187,12 +188,15 @@ proof that the page links.
     $H run --rm -T store moves
 
 `store moves` (contract v16) prints each move of raw records the conductor
-recorded, and each hold and archive change, one line each, sorted, never a
-record's content:
+recorded, and each hold and archive change, and from contract v17 each
+setting change, one line each, sorted, never a record's content nor a
+setting's value; a change names the delegation and client it was made
+through and its note, each empty for one made in a browser without one:
 
     move|<instance>|<kind>|<unit>|<archived|restored|returned|deleted>|<records>|<first received ns>|<last received ns>|<rule>|<person>
-    hold|<role, empty for every one>|<days>|<write-once>|<set by>
-    archive|<instance>|<allowed>|<most bytes>|<set by>
+    hold|<role, empty for every one>|<days>|<write-once>|<set by>|<delegation>|<client>|<note>
+    archive|<instance>|<allowed>|<most bytes>|<set by>|<delegation>|<client>|<note>
+    setting|<instance>|<name>|<set|cleared|gap|redacted>|<secret>|<set by>|<delegation>|<client>|<note>
 
 `store tickets` (contract v13) prints the dashboard's tickets, one line each,
 and the records each names and its notes, sorted, and never a text:

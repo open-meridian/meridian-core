@@ -424,19 +424,22 @@ fn one_live_launch_per_instance_and_it_ends_once() {
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
-    assert!(store.begin_launch(&launch("snaptrade-1")).unwrap());
+    assert!(store.begin_launch(&launch("snaptrade-1"), "").unwrap());
     assert!(
-        !store.begin_launch(&launch("snaptrade-1")).unwrap(),
+        !store.begin_launch(&launch("snaptrade-1"), "").unwrap(),
         "live already"
     );
     assert!(
-        store.begin_launch(&launch("snaptrade-2")).unwrap(),
+        store.begin_launch(&launch("snaptrade-2"), "").unwrap(),
         "another instance"
     );
 
     let stop = Ending {
         state: PluginLaunchState::Stopped,
         by: "local|ada".into(),
+        delegation: "DLG-9".into(),
+        client: "meridian on ada-laptop".into(),
+        note: "Retiring this connection.".into(),
         at_ns: 3,
         failure: String::new(),
     };
@@ -451,13 +454,99 @@ fn one_live_launch_per_instance_and_it_ends_once() {
         "none live now"
     );
     assert!(
-        store.begin_launch(&launch("snaptrade-1")).unwrap(),
+        store.begin_launch(&launch("snaptrade-1"), "").unwrap(),
         "free again"
     );
 
     let launches = store.snapshot().unwrap().catalogue.launches;
     assert_eq!(launches.len(), 3);
     assert_eq!(launches[0], stop.applied_to(&launch("snaptrade-1")));
+    // The stop names its delegation and client, and keeps its note
+    // (contract v17).
+    assert_eq!(launches[0].stopped_through_delegation, "DLG-9");
+    assert_eq!(launches[0].stopped_client_name, "meridian on ada-laptop");
+    let notes = store.launch_notes("snaptrade-1").unwrap();
+    assert!(notes
+        .iter()
+        .any(|n| n.act == meridian_config::LaunchAct::Stopped
+            && n.note == "Retiring this connection."
+            && !n.gap));
+}
+
+/// Contract v17 (W8.3, W8.4): a launch names the delegation and client it
+/// was made through and keeps its note; and every launch and stop recorded
+/// before migration 15 gets one gap record each, at the moment it ran,
+/// never an invented delegation.
+#[test]
+fn a_launch_keeps_its_stamp_and_note_and_those_before_v17_a_gap_record() {
+    let (store, url) = store_at("launch_gaps");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let through = PluginLaunch {
+        acting_through_delegation: "DLG-1".into(),
+        client_name: "Claude".into(),
+        ..launch("snaptrade-1")
+    };
+    assert!(store
+        .begin_launch(&through, "Bringing SnapTrade in.")
+        .unwrap());
+    let read = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(read[0].acting_through_delegation, "DLG-1");
+    assert_eq!(read[0].client_name, "Claude");
+    let notes = store.launch_notes("snaptrade-1").unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note, "Bringing SnapTrade in.");
+    assert_eq!(notes[0].act, meridian_config::LaunchAct::Launched);
+
+    // As a launch and a stop made before v17 stand: re-run migration 15's
+    // gap records over a launch row naming no delegation, and see one gap
+    // per act, at the migration's moment, and once only.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .execute(
+            "INSERT INTO config_plugin_launch (instance_id, name, version, image_digest, roles,
+                     launched_by, launched_at_ns, state, stopped_by, stopped_at_ns)
+             VALUES ('old-1', 'snaptrade', '0.1.0', $1, '{custody}', 'local|ada', 5, 2,
+                     'local|ada', 6)",
+            &[&format!("sha256:{}", "a".repeat(64))],
+        )
+        .unwrap();
+    let gaps = |client: &mut postgres::Client| -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM config_plugin_launch_gap WHERE instance_id = 'old-1'",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(gaps(&mut client), 0);
+    for at in [77, 78] {
+        let mut tx = client.transaction().unwrap();
+        meridian_config::migrations::launches_not_known(&mut tx, at).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        gaps(&mut client),
+        2,
+        "once per launch and act, however often run"
+    );
+    let notes = store.launch_notes("old-1").unwrap();
+    let gapped: Vec<_> = notes.iter().filter(|n| n.gap).collect();
+    assert_eq!(gapped.len(), 2);
+    assert!(gapped
+        .iter()
+        .all(|n| n.at_ns == 77 && n.note == meridian_config::LAUNCH_THROUGH_NOT_KNOWN));
+    let old = store
+        .snapshot()
+        .unwrap()
+        .catalogue
+        .launches
+        .into_iter()
+        .find(|l| l.instance_id == "old-1")
+        .unwrap();
+    assert!(old.acting_through_delegation.is_empty() && old.stopped_client_name.is_empty());
 }
 
 #[test]
@@ -469,7 +558,7 @@ fn two_launches_of_one_instance_at_once_admit_one() {
     let racing: Vec<_> = (0..8)
         .map(|_| {
             let store = Arc::clone(&store);
-            std::thread::spawn(move || store.begin_launch(&launch("snaptrade-1")).unwrap())
+            std::thread::spawn(move || store.begin_launch(&launch("snaptrade-1"), "").unwrap())
         })
         .collect();
     let admitted = racing
@@ -490,8 +579,8 @@ fn a_live_launch_is_read_back_as_live() {
         live: true,
         ..launch("snaptrade-1")
     };
-    assert!(store.begin_launch(&live).unwrap());
-    assert!(store.begin_launch(&launch("snaptrade-2")).unwrap());
+    assert!(store.begin_launch(&live, "").unwrap());
+    assert!(store.begin_launch(&launch("snaptrade-2"), "").unwrap());
     let launches = store.snapshot().unwrap().catalogue.launches;
     let read = |instance: &str| {
         launches
@@ -658,6 +747,8 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
             &SettingsAuthor {
                 by: "local|grace".into(),
                 delegation: "DLG-7".into(),
+                client: "Claude".into(),
+                note: "The key leaked; cleared it.".into(),
             },
             9,
         )
@@ -1139,7 +1230,7 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
 fn author(by: &str) -> SettingsAuthor {
     SettingsAuthor {
         by: by.into(),
-        delegation: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1719,13 +1810,28 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         write_once: false,
         updated_by: "ada@example.com".into(),
         updated_at_ns: at,
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
     };
     store.set_hold(&hold("custody", 2190, 1), "").unwrap();
-    store.set_hold(&hold("", 400, 2), "DLG-1").unwrap();
+    let through = Hold {
+        acting_through_delegation: "DLG-1".into(),
+        client_name: "Claude".into(),
+        ..hold("", 400, 2)
+    };
+    store.set_hold(&through, "The records rule.").unwrap();
     store.set_hold(&hold("custody", 3650, 3), "").unwrap();
     store.set_hold(&hold("", 0, 4), "").unwrap();
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.holds, vec![hold("custody", 3650, 3)]);
+    // Each change its own record, with its delegation, client and note
+    // (contract v17).
+    let changes = store.hold_changes().unwrap();
+    assert_eq!(changes.len(), 4);
+    assert_eq!(
+        changes[1],
+        (through.clone(), "The records rule.".to_string())
+    );
 
     let archive = PluginArchive {
         instance_id: "snaptrade-1".into(),
@@ -1733,11 +1839,21 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         most_bytes: 53_687_091_200,
         updated_by: "ada@example.com".into(),
         updated_at_ns: 5,
+        acting_through_delegation: "DLG-1".into(),
+        client_name: "Claude".into(),
     };
-    store.put_archive(&archive, "").unwrap();
+    store
+        .put_archive(&archive, "Archive past seven years.")
+        .unwrap();
+    assert_eq!(
+        store.archive_changes("snaptrade-1").unwrap(),
+        vec![(archive.clone(), "Archive past seven years.".to_string())]
+    );
     let withdrawn = PluginArchive {
         allowed: false,
         updated_at_ns: 6,
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
         ..archive.clone()
     };
     store.put_archive(&withdrawn, "").unwrap();
@@ -1759,47 +1875,43 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         }),
         person: person.into(),
         at_ns: at,
+        acting_through_delegation: if person == "ben@example.com" {
+            "DLG-2".into()
+        } else {
+            String::new()
+        },
+        client_name: if person == "ben@example.com" {
+            "Claude".into()
+        } else {
+            String::new()
+        },
     };
     assert!(store
-        .record_move(
-            "snaptrade-1",
-            &moved("u1", MoveOutcome::Archived, "", 10),
-            ""
-        )
+        .record_move("snaptrade-1", &moved("u1", MoveOutcome::Archived, "", 10))
         .unwrap());
     assert!(
         !store
-            .record_move(
-                "snaptrade-1",
-                &moved("u1", MoveOutcome::Archived, "", 11),
-                ""
-            )
+            .record_move("snaptrade-1", &moved("u1", MoveOutcome::Archived, "", 11))
             .unwrap(),
         "a retry is recorded once"
     );
     assert!(store
         .record_move(
             "snaptrade-1",
-            &moved("u1", MoveOutcome::Restored, "ben@example.com", 12),
-            "DLG-2"
+            &moved("u1", MoveOutcome::Restored, "ben@example.com", 12)
         )
+        .unwrap());
+    assert!(store
+        .record_move("snaptrade-1", &moved("u2", MoveOutcome::Archived, "", 13))
         .unwrap());
     assert!(store
         .record_move(
             "snaptrade-1",
-            &moved("u2", MoveOutcome::Archived, "", 13),
-            ""
+            &moved("u2", MoveOutcome::Deleted, "ada@example.com", 14)
         )
         .unwrap());
     assert!(store
-        .record_move(
-            "snaptrade-1",
-            &moved("u2", MoveOutcome::Deleted, "ada@example.com", 14),
-            ""
-        )
-        .unwrap());
-    assert!(store
-        .record_move("other-1", &moved("u9", MoveOutcome::Archived, "", 15), "")
+        .record_move("other-1", &moved("u9", MoveOutcome::Archived, "", 15))
         .unwrap());
 
     let latest = store
@@ -1819,7 +1931,8 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         older.iter().map(|m| m.record.at_ns).collect::<Vec<_>>(),
         [12, 10]
     );
-    assert_eq!(older[0].delegation, "DLG-2");
+    assert_eq!(older[0].record.acting_through_delegation, "DLG-2");
+    assert_eq!(older[0].record.client_name, "Claude");
     let archived = store.archived("snaptrade-1").unwrap();
     assert_eq!(archived.len(), 1);
     assert_eq!(

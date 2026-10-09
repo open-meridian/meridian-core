@@ -100,6 +100,10 @@ keeping two kinds of raw record in its storage and moving them to its
 archive, back for a person and away (`make e2e-archive`): archiving.py beside
 this says how.
 
+With STAND_IN_AREA set beside it, the same holds custody and operations, a
+secret, a table setting and a setting serving both (`make e2e-plugin-area`,
+contract v17): archiving.py's area_registration says what it declares.
+
 With STAND_IN_TOOLS set it is a plugin built at contract v15 holding custody
 and operations (`make e2e-access-per-role`, steps 5 and 6): it registers
 declaring v15, its pages naming both roles and no setting, and three MCP
@@ -238,6 +242,8 @@ def heartbeat(nine=False):
 TOOLS = bool(os.environ.get("STAND_IN_TOOLS"))
 # ── Contract v16: at the edge, its raw records archived (STAND_IN_ARCHIVE) ──
 ARCHIVING = bool(os.environ.get("STAND_IN_ARCHIVE"))
+# ── Contract v17: the same at the edge, holding two roles (STAND_IN_AREA) ──
+AREA = bool(os.environ.get("STAND_IN_AREA"))
 if ARCHIVING:
     import archiving
 BOTH = ["custody", "operations"]
@@ -285,7 +291,7 @@ def register():
         response_deserializer=sidecar_pb2.RegisterReply.FromString,
     )
     if ARCHIVING:
-        request = archiving.registration(PORT)
+        request = archiving.area_registration(PORT) if AREA else archiving.registration(PORT)
     else:
         request = v15_registration() if TOOLS else older_registration()
     for _ in range(60):

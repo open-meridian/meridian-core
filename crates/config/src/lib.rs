@@ -49,8 +49,9 @@ pub use service::{
 };
 pub use store::{
     AccessChangeKind, AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin,
-    LastChange, RecordedMove, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store,
-    StoreError, StoredSetting, Withdrawal,
+    LastChange, LaunchAct, LaunchNote, RecordedMove, SettingChange, SettingChangeRecord,
+    SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
+    LAUNCH_THROUGH_NOT_KNOWN, MOST_NOTE,
 };
 
 #[cfg(test)]

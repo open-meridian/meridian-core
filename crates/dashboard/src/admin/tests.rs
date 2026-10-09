@@ -812,6 +812,7 @@ fn snaptrade() -> PluginSettingsRecord {
         secrets_set: vec!["snaptrade_client_id".into()],
         updated_at_ns: 0,
         updated_by: String::new(),
+        changes: Vec::new(),
         declared_settings: vec![
             SettingDeclaration {
                 label: "Client ID".into(),
@@ -1322,8 +1323,11 @@ fn the_compact_form_posts_what_the_form_always_did() {
         let mut names: Vec<&str> = posted.keys().map(String::as_str).collect();
         names.sort_unstable();
         // Every field the form had, a hidden one too: the user secret under
-        // a personal key, and a developer's setting in its closed section.
+        // a personal key, and a developer's setting in its closed section;
+        // and from contract v17 the record's version as drawn, which a
+        // change names so one against a record changed since is refused.
         let mut expected = vec![
+            "against_updated_at_ns",
             "secret.snaptrade_client_id",
             "secret.snaptrade_consumer_key",
             "secret.user_secret",
@@ -3012,12 +3016,14 @@ fn a_setting_serving_several_roles_is_set_only_by_an_admin_of_every_one() {
         ..Default::default()
     };
     assert_eq!(
-        settings::not_administered(&record, &setting("poll_minutes"), &custody_admin, &roles),
+        settings::not_administered(&record, &setting("poll_minutes"), &custody_admin, &roles)
+            .map(|(_, said)| said),
         None,
         "custody's own setting is custody's admin's"
     );
-    let refused =
-        settings::not_administered(&record, &setting("api_key"), &custody_admin, &roles).unwrap();
+    let refused = settings::not_administered(&record, &setting("api_key"), &custody_admin, &roles)
+        .unwrap()
+        .1;
     assert!(
         refused.contains("API key serves custody and operations")
             && refused.contains("do not administer operations"),
@@ -3063,9 +3069,43 @@ fn a_setting_serving_a_role_not_administered_is_shown_read_only() {
         },
     );
     let roles = vec!["custody".to_string(), "operations".to_string()];
-    let form = settings::form_with(&record, "", false, "/x", Some((&custody_admin, &roles)));
+    let form = settings::form_with(
+        &record,
+        "",
+        false,
+        "/x",
+        Some((&custody_admin, &roles)),
+        &|s| s.to_string(),
+    );
     assert_eq!(form.matches("data-read-only").count(), 1, "{form}");
     assert!(form.contains("Serves custody and operations: set by an admin of every one"));
-    let all = settings::form_with(&record, "", false, "/x", None);
+    let all = settings::form_with(&record, "", false, "/x", None, &|s| s.to_string());
     assert!(!all.contains("data-read-only"));
+}
+
+/// Contract v17: beside a secret's "set", who set it, when and through
+/// which client, never its value; and the record's version as drawn, which
+/// a change names.
+#[test]
+fn a_secrets_set_says_by_whom_and_when_and_the_form_carries_its_version() {
+    let mut record = snaptrade();
+    record.updated_at_ns = 1_790_380_800_000_000_000;
+    record.changes = vec![meridian_domain::v1::SettingLastChange {
+        name: "snaptrade_client_id".into(),
+        changed_by: "local|ada".into(),
+        changed_at_ns: 1_790_380_800_000_000_000,
+        acting_through_delegation: "DLG-1".into(),
+        client_name: "Claude".into(),
+    }];
+    let form = settings::form_with(&record, "", false, "/x", None, &|subject| {
+        if subject == "local|ada" {
+            "Ada".to_string()
+        } else {
+            subject.to_string()
+        }
+    });
+    assert!(form.contains("data-set-by"), "{form}");
+    assert!(form.contains("Set by Ada, 2026-09-26"), "{form}");
+    assert!(form.contains("through Claude"));
+    assert!(form.contains("name=\"against_updated_at_ns\" value=\"1790380800000000000\""));
 }

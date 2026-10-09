@@ -339,6 +339,16 @@ message SetPluginSettingsRequest {
 
   // Remove these.
   repeated string cleared = 3;
+
+  // Why, in the words of the person or of the agent acting for them, kept
+  // with each change's record (decisions/031; contract v17). Through /mcp
+  // every change carries one (W6.20); a person at the page may give none.
+  string note = 4;
+
+  // The settings record's updated_at_ns as it was read (contract v17): the
+  // conductor refuses the change, naming this field, where the record has
+  // changed since. 0 from a client built before it, checked as before.
+  int64 against_updated_at_ns = 5;
 }
 
 // What the dashboard may show. A secret's value is never here, only that it
@@ -358,6 +368,29 @@ message PluginSettingsRecord {
   // stamped on the Settings form (W6.11). Empty while nothing was ever
   // changed, and for a clear the plugin's re-declaring a setting made.
   string updated_by = 6;
+
+  // Per setting ever changed, its latest change as its own record says it
+  // (contract v17): who, when, and the delegation and client where one was
+  // used, so the form and core's tools say when a secret was set and by
+  // whom, never its value. Empty from a conductor before v17.
+  repeated SettingLastChange changes = 7;
+}
+
+// One setting's latest change (W6.11, contract v17): set or cleared, a
+// secret's included, and never its value.
+message SettingLastChange {
+  string name = 1;
+
+  // The deployment-local subject the dashboard stamped; empty for a clear
+  // the plugin's re-declaring a setting made.
+  string changed_by = 2;
+  int64 changed_at_ns = 3;
+
+  // The delegation the person acted through, and its client's registered
+  // name, as the dashboard stamped them (W4.9): empty for a change made in
+  // a browser, and on every change before v17, each of which was.
+  string acting_through_delegation = 4;
+  string client_name = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -381,6 +414,10 @@ message SetHoldRequest {
   // deployment's archive cannot lock (kernel/edge-plugins-own-storage-for-
   // raw-records, ruling 3).
   bool write_once = 3;
+
+  // Why, kept with the change's record (decisions/031; contract v17).
+  // Through /mcp every change carries one (W6.20).
+  string note = 4;
 }
 
 // A hold as the conductor records it.
@@ -393,6 +430,12 @@ message Hold {
   // when. Each change is its own record (decisions/031).
   string updated_by = 4;
   int64 updated_at_ns = 5;
+
+  // The delegation the person acted through and its client's name, as the
+  // dashboard stamped them (contract v17): empty for a hold set in a
+  // browser, and on every hold before v17, each of which was.
+  string acting_through_delegation = 6;
+  string client_name = 7;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,6 +477,12 @@ message MoveRecord {
 
   // When the conductor recorded it, in nanoseconds since the epoch.
   int64 at_ns = 3;
+
+  // The delegation the person acted through and its client's name, from
+  // the envelope (contract v17): empty for a window's move, for a person in
+  // a browser, and on every move recorded before v17.
+  string acting_through_delegation = 4;
+  string client_name = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

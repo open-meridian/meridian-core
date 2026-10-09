@@ -106,6 +106,10 @@ message LaunchPluginRequest {
   // (W8.3, spec/live-plugin-development).
   bool live = 6;
 
+  // Why, kept with the launch's record (decisions/031; contract v17).
+  // Through /mcp every launch carries one (W6.20).
+  string note = 7;
+
   // Tags, retired with them (decisions/026).
   reserved 5;
   reserved "approved_tags";
@@ -136,6 +140,16 @@ message PluginLaunch {
   string failure = 12;
   // Launched in the live shape (W8.3).
   bool live = 13;
+
+  // The delegation the person who launched it acted through and its
+  // client's name, and the same for the stop, as the dashboard stamped them
+  // (contract v17). A launch or stop before v17 was made through the
+  // terminal on a delegation that was not recorded: these are empty, and
+  // the store keeps a gap record saying so (decisions/031).
+  string acting_through_delegation = 14;
+  string client_name = 15;
+  string stopped_through_delegation = 16;
+  string stopped_client_name = 17;
 
   // Tags, retired with them (decisions/026).
   reserved 6;
@@ -190,12 +204,20 @@ message AllowArchiveRequest {
 
   // The most bytes it may hold; 0 for no bound.
   uint64 most_bytes = 2;
+
+  // Why, kept with the change's record (decisions/031; contract v17).
+  // Through /mcp every change carries one (W6.20).
+  string note = 3;
 }
 
 // A deployment admin withdraws it: the instance is restarted without it,
 // and what it holds is kept until an admin removes it.
 message WithdrawArchiveRequest {
   string instance_id = 1;
+
+  // Why, kept with the change's record (decisions/031; contract v17).
+  // Through /mcp every change carries one (W6.20).
+  string note = 2;
 }
 
 // An instance's archive, as the conductor records it.
@@ -212,6 +234,12 @@ message PluginArchive {
   // the dashboard stamped, and when. Each is its own record (decisions/031).
   string updated_by = 4;
   int64 updated_at_ns = 5;
+
+  // The delegation the person acted through and its client's name, as the
+  // dashboard stamped them (contract v17): empty for a change made in a
+  // browser, and on every change before v17, each of which was.
+  string acting_through_delegation = 6;
+  string client_name = 7;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,6 +248,10 @@ message PluginArchive {
 
 message StopPluginRequest {
   string instance_id = 1;
+
+  // Why, kept with the stop's record (decisions/031; contract v17). Through
+  // /mcp every stop carries one (W6.20).
+  string note = 2;
 }
 
 // The conductor to the launcher: remove what it made for this instance.
