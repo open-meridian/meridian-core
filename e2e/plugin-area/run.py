@@ -41,6 +41,15 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    carries the secret's value; `store moves` prints each change its own
    record, naming the person, the delegation, the client and the note.
 
+Throughout (contract v17's fixes): each agent connects through the consent
+page, which must list exactly the tools tools/list then lists for what was
+allowed -- a custody admin's, a writer and reader's, a deployment admin's
+(`mcp connect --check-consent`); and each change's note reads back through
+the read tools beside who made it and through which client: a setting's last
+change, the secret's clear, the archive allowed and withdrawn, and the hold.
+A launch's note is held by core's unit tests, the harness having no
+launcher.
+
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
 """
@@ -107,8 +116,11 @@ LISTS = []
 
 
 def connect(person, client, *covers):
+    """Connected through the consent page, which must list exactly the tools
+    tools/list then lists (--check-consent)."""
     said = runner("mcp", "connect", *[a for c in covers for a in ("--covers", c)],
-                  "--client", client, person=person)
+                  "--client", client, "--check-consent", person=person)
+    must("the consent page listed the" in said, f"{client}: the consent page was not checked: {said}")
     delegation = said.split("through delegation ", 1)[1].split(",", 1)[0].strip()
     must(delegation, f"{client} connected through no delegation: {said}")
     return delegation
@@ -221,6 +233,14 @@ def run():
     rows = [v["value"] for v in tabled["values"] if v["name"] == "plan_code_links"]
     must(rows and rows[0][0]["plan_code"] == "OQKR" and rows[0][0]["changed_by"] == "local|cat",
          f"step 1, the table's rows, stamped with who: {rows}")
+    # Each setting's last change reads back with who, through what, and why.
+    last = {c["name"]: c for c in tabled["changes"]}
+    for name, note in [("activity_window_days", "Keep activity a little past seven years."),
+                       ("plan_code_links", "The 401(k)'s money market fund code.")]:
+        must(last.get(name, {}).get("note") == note and last[name]["changed_by"] == "local|cat"
+             and last[name]["client_name"] == "Cat's agent"
+             and last[name]["acting_through_delegation"] == cat,
+             f"step 1, {name}'s last change names Cat, her client and the note: {last.get(name)}")
     runner("view", "--tab", "settings", "--until", "Last changed by Cat Ruiz")
 
     # 2. A secret: never its value, either way; cleared as the form's Clear.
@@ -241,8 +261,9 @@ def run():
     keyed = [c for c in cleared["changes"] if c["name"] == "api_key"]
     must(keyed and keyed[0]["changed_by"] == "local|cat"
          and keyed[0]["acting_through_delegation"] == cat
-         and keyed[0]["client_name"] == "Cat's agent",
-         f"step 2, its last change names Cat, her delegation and her client: {keyed}")
+         and keyed[0]["client_name"] == "Cat's agent"
+         and keyed[0]["note"] == "The key was shown in a screenshot; cleared it.",
+         f"step 2, its last change names Cat, her delegation, her client and why: {keyed}")
 
     # 3. Write and read: none of the area's tools but the plugins.
     listed = tools("ben", "Ben's agent")
@@ -278,8 +299,10 @@ def run():
     archived = call(*as_cat, "dashboard__read_plugin_summary", {"plugin_instance_id": INSTANCE},
                     "unchanged")["data"].get("archive") or {}
     must(archived.get("allowed") is True and archived.get("most_bytes") == GIB_50
-         and archived.get("client_name") == "Admin's agent",
-         f"step 4, the Summary's raw records show the archive allowed: {archived}")
+         and archived.get("client_name") == "Admin's agent"
+         and archived.get("updated_by") == "local|harness"
+         and archived.get("note") == "Seven years of activity, in the archive past its window.",
+         f"step 4, the Summary's raw records show the archive allowed, by whom and why: {archived}")
     call(*as_admin, "dashboard__withdraw_archive",
          {"instance_id": INSTANCE, "note": "Not until the bucket is in place."}, "made")
     call(*as_admin, "dashboard__set_hold",
@@ -291,8 +314,14 @@ def run():
          f"step 4, a window below the hold is refused on the tool as on the page: {below}")
     holds = call(*as_admin, "dashboard__read_holds", {}, "unchanged")["data"]["holds"]
     must(holds and holds[0]["days"] == 2190 and holds[0]["client_name"] == "Admin's agent"
-         and holds[0]["acting_through_delegation"] == admin,
-         f"step 4, the hold, set through the admin's client: {holds}")
+         and holds[0]["acting_through_delegation"] == admin
+         and holds[0]["updated_by"] == "local|harness"
+         and holds[0]["note"] == "The records rule: six years.",
+         f"step 4, the hold, set through the admin's client, and why: {holds}")
+    after = call(*as_cat, "dashboard__read_moves", {"plugin_instance_id": INSTANCE},
+                 "unchanged")["data"].get("archive") or {}
+    must(after.get("allowed") is False and after.get("note") == "Not until the bucket is in place.",
+         f"step 4, the archive's withdrawal reads back with why: {after}")
 
     # 5. The catalogue, a stop and a launch, as the terminal's.
     catalogue = call(*as_admin, "dashboard__read_plugin_catalogue", {}, "unchanged")["data"]
@@ -352,7 +381,8 @@ def run():
           "withdraws it, sets a hold the settings tool then holds a window to, and reads the "
           "catalogue, a stop and a launch answered by the conductor; no tool list held an access "
           "change, no answer the secret, and each change is its own record naming the person, the "
-          "delegation, the client and the note")
+          "delegation, the client and the note; each consent page listed exactly what tools/list "
+          "then listed, and each change's note read back beside who made it")
 
 
 def main():

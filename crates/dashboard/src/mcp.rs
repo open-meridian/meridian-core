@@ -425,6 +425,22 @@ pub struct Tool {
 }
 
 impl Tool {
+    /// Its title, as `tools/list` answers it.
+    pub fn title(&self) -> &str {
+        match &self.owner {
+            Owner::Dashboard(spec) => spec.title,
+            Owner::Plugin { declared, .. } => &declared.title,
+        }
+    }
+
+    /// Whether it only reads (`readOnlyHint`).
+    pub fn reads(&self) -> bool {
+        match &self.owner {
+            Owner::Dashboard(spec) => spec.reads,
+            Owner::Plugin { declared, .. } => declared.reads,
+        }
+    }
+
     fn owner_name(&self) -> &str {
         match &self.owner {
             Owner::Dashboard(_) => DASHBOARD,
@@ -532,26 +548,38 @@ pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> 
         .records
         .current(now)
         .map_err(|stale| stale.to_string())?;
-    let access = caller.access(&records);
+    Ok(listed_to(&caller.access(&records), &app.health.view(), now))
+}
+
+/// Every tool narrowed `access` reaches now, among the plugins `reports`
+/// says are running: what `tools/list` answers, and what the consent page
+/// shows each row of access granting (W6.17, W6.20), from this one place so
+/// the two cannot drift. Core's first, each behind its area's gate, then
+/// each running plugin's that one of its levels is held for on one of its
+/// roles.
+pub fn listed_to(
+    access: &meridian_access::Access,
+    reports: &BTreeMap<String, PluginReport>,
+    now: i64,
+) -> Vec<Tool> {
     let mut tools = Vec::new();
     for spec in instruments::SPECS
         .iter()
         .chain(tickets::SPECS)
         .chain(plugin_area::SPECS)
     {
-        if spec.area.open_to(&access) {
+        if spec.area.open_to(access) {
             tools.push(Tool {
                 name: format!("{DASHBOARD}__{}", spec.name),
                 owner: Owner::Dashboard(spec),
             });
         }
     }
-    let reports: BTreeMap<String, PluginReport> = app.health.view();
     for (instance, report) in reports {
-        if !running(&report, now) {
+        if !running(report, now) {
             continue;
         }
-        let held = access.plugin(&instance);
+        let held = access.plugin(instance);
         if !held.holds_any() {
             continue;
         }
@@ -580,7 +608,7 @@ pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> 
             });
         }
     }
-    Ok(tools)
+    tools
 }
 
 /// A tool's answer: its outcome, its typed content, and whether it is an

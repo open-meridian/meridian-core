@@ -163,18 +163,24 @@ impl Store for MemoryStore {
         snapshot.records.known_plugins = known_plugins(&snapshot.plugins);
         // Each role's latest hold, a cleared one left out; each instance's
         // latest archive.
-        for (hold, _) in self.holds.lock().expect("store lock poisoned").iter() {
+        for (hold, note) in self.holds.lock().expect("store lock poisoned").iter() {
             snapshot.holds.retain(|held| held.role != hold.role);
             if hold.days > 0 {
-                snapshot.holds.push(hold.clone());
+                snapshot.holds.push(Hold {
+                    note: note.clone(),
+                    ..hold.clone()
+                });
             }
         }
         snapshot.holds.sort_by(|a, b| a.role.cmp(&b.role));
-        for (archive, _) in self.archives.lock().expect("store lock poisoned").iter() {
+        for (archive, note) in self.archives.lock().expect("store lock poisoned").iter() {
             snapshot
                 .archives
                 .retain(|held| held.instance_id != archive.instance_id);
-            snapshot.archives.push(archive.clone());
+            snapshot.archives.push(PluginArchive {
+                note: note.clone(),
+                ..archive.clone()
+            });
         }
         snapshot
             .archives
@@ -200,6 +206,7 @@ impl Store for MemoryStore {
                     changed_at_ns: change.at_ns,
                     acting_through_delegation: change.delegation.clone(),
                     client_name: change.client.clone(),
+                    note: change.note.clone(),
                 });
                 changes.sort_by(|a, b| a.name.cmp(&b.name));
             }
@@ -513,7 +520,10 @@ impl Store for MemoryStore {
         if live {
             return Ok(false);
         }
-        state.catalogue.launches.push(launch.clone());
+        state.catalogue.launches.push(PluginLaunch {
+            note: note.to_string(),
+            ..launch.clone()
+        });
         self.launch_notes
             .lock()
             .expect("store lock poisoned")

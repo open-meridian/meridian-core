@@ -400,9 +400,10 @@ form.consent:has(input[name=covers][value=everything]:checked) .summary-some,\
 form.consent:has(input[name=covers][value=some]:checked) .summary-everything{display:none}\
 form.consent .picker-option{flex-wrap:wrap}form.consent .picker-option label.check{flex:1 1 14rem}\
 form.consent .picker-option label.check select{margin-left:auto}\
-form.consent details.reach{flex:1 0 100%;margin:0 0 .35rem 1.5rem;font-size:.84rem;color:var(--ink-soft)}\
+form.consent details.reach{flex:1 0 calc(100% - 1.5rem);min-width:0;margin:0 0 .35rem 1.5rem;font-size:.84rem;color:var(--ink-soft)}\
 form.consent details.reach>summary{cursor:pointer;color:var(--accent)}form.consent details.reach p{margin:.2rem 0}\
 form.consent details.reach .hint{display:inline;margin:0}\
+form.consent details.reach .reach-tools{max-height:7.5rem;overflow-y:auto;overscroll-behavior:contain}\
 form.consent fieldset.deployment{max-height:none}\
 form.consent section.summary{margin:1rem 0 0;padding:.75rem 1rem;border:1px solid var(--line);border-radius:var(--radius);\
 background:var(--page)}form.consent section.summary h2{font-size:.95rem;margin:0 0 .35rem}\

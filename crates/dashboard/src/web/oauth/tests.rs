@@ -1146,3 +1146,314 @@ async fn forty_plugins_and_three_hundred_account_groups_make_one_short_page() {
         body_of(decided).await
     );
 }
+
+// ── The consent page lists what tools/list lists (contract v17) ─────────
+
+/// ops-1 holds custody and operations and reports a tool on each level and
+/// one naming no role; Ada is a deployment admin and nothing else, Cat
+/// administers custody, and Ben reads operations for one account group.
+fn three_kinds() -> AccessRecords {
+    use meridian_domain::v1::KnownPluginRoles;
+    let entry = |role: &str, level: meridian_access::AccessLevel| AccessEntry {
+        plugin_instance_id: "ops-1".into(),
+        level: level as i32,
+        role: role.into(),
+    };
+    let people = |id: &str, name: &str| UserGroup {
+        user_group_id: format!("UG-{id}"),
+        name: name.into(),
+        directory_groups: vec![],
+        logins: vec![format!("local|{id}")],
+    };
+    let permit = |id: &str, group: &str, accounts: &str| Permission {
+        permission_id: format!("P-{id}"),
+        user_group_id: format!("UG-{id}"),
+        account_group_id: accounts.into(),
+        access_group_id: group.into(),
+    };
+    AccessRecords {
+        accounts: records().accounts,
+        account_groups: records().account_groups,
+        access_groups: vec![
+            AccessGroup {
+                access_group_id: "AX-cat".into(),
+                name: "Custody admins".into(),
+                entries: vec![entry("custody", meridian_access::AccessLevel::Admin)],
+                ..Default::default()
+            },
+            AccessGroup {
+                access_group_id: "AX-ben".into(),
+                name: "Operations readers".into(),
+                entries: vec![entry("operations", meridian_access::AccessLevel::Read)],
+                ..Default::default()
+            },
+        ],
+        user_groups: vec![
+            people("ada", "Admins"),
+            people("cat", "Custody"),
+            people("ben", "Operations"),
+        ],
+        permissions: vec![
+            permit("ada", meridian_access::DEPLOYMENT_ADMIN, ""),
+            permit("cat", "AX-cat", ""),
+            permit("ben", "AX-ben", "AG-1"),
+        ],
+        known_plugins: vec![KnownPluginRoles {
+            plugin_instance_id: "ops-1".into(),
+            roles: vec!["custody".into(), "operations".into()],
+        }],
+        ..Default::default()
+    }
+}
+
+/// The three of them signing in here, ops-1 running and reporting its tools.
+fn app_of_three() -> Arc<App> {
+    use meridian_access::AccessLevel::{Admin, Read, Write};
+    use meridian_domain::v1::PluginReport;
+    use meridian_pb::v1::ToolDeclaration;
+    let accounts = crate::accounts::InMemory::default();
+    for (name, display_name) in [("ada", "Ada Park"), ("cat", "Cat Ruiz"), ("ben", "Ben Ito")] {
+        accounts
+            .put(&crate::accounts::LocalAccount {
+                name: name.into(),
+                display_name: display_name.into(),
+                password_hash: crate::accounts::hash_password("correct horse battery")
+                    .expect("hashed"),
+                created_at_ns: T0,
+                ..Default::default()
+            })
+            .expect("stored");
+    }
+    let tool = |name: &str, roles: &[&str], levels: &[meridian_access::AccessLevel], reads| {
+        ToolDeclaration {
+            name: name.into(),
+            title: name.replace('_', " "),
+            levels: levels.iter().map(|l| *l as i32).collect(),
+            reads,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        }
+    };
+    let app = app_with(Some(three_kinds()), T0, T0);
+    let mut built = Arc::try_unwrap(app).ok().expect("one reference");
+    built.accounts = Some(Arc::new(accounts));
+    built.clock = Arc::new(Moving(AtomicI64::new(T0)));
+    built.public_url = format!("https://{HOST_NAME}");
+    built.health.hear(
+        "ops-1",
+        PluginReport {
+            plugin_instance_id: "ops-1".into(),
+            roles: vec!["custody".into(), "operations".into()],
+            registered: true,
+            healthy: true,
+            reported_at_ns: T0,
+            last_heartbeat_at_ns: T0,
+            declared_tools: vec![
+                tool("read_positions", &["operations"], &[Read], true),
+                tool("post_breaks", &["custody"], &[Write], false),
+                tool("tune_feed", &["custody"], &[Admin], false),
+                tool("plugin_status", &[], &[Read, Admin], true),
+            ],
+            ..Default::default()
+        },
+    );
+    Arc::new(built)
+}
+
+/// The consent page `name` is shown for an agent asking for `/mcp`.
+async fn consent_for_mcp(app: &Arc<App>, client_id: &str, name: &str) -> String {
+    let asked = get_page(
+        app,
+        &authorising(client_id, &format!("https://{HOST_NAME}/mcp")),
+    )
+    .await;
+    let page = body_of(asked).await;
+    let id = hidden(&page, "authorize");
+    let signed_in = post_form(
+        app,
+        "/sign-in",
+        format!("name={name}&password=correct+horse+battery&authorize={id}"),
+    )
+    .await;
+    assert_eq!(signed_in.status(), StatusCode::OK);
+    body_of(signed_in).await
+}
+
+/// Each row's tools as the page lists them: `data-reach` to the names in
+/// its `data-tools`.
+fn rows_listed(page: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut rows = BTreeMap::new();
+    for part in page.split("<p data-reach=\"").skip(1) {
+        let reach = &part[..part.find('"').unwrap()];
+        let marker = "data-tools=\"";
+        let at = part.find(marker).unwrap() + marker.len();
+        let names = &part[at..at + part[at..].find('"').unwrap()];
+        rows.insert(
+            reach.to_string(),
+            names.split_whitespace().map(String::from).collect(),
+        );
+    }
+    rows
+}
+
+/// Every row the page offers, at the most it offers: each select's highest
+/// level, the deployment admin's capabilities where offered, every account
+/// group; as the form posts them.
+fn everything_offered(page: &str) -> String {
+    let mut fields = Vec::new();
+    for select in page.split("<select name=\"level\"").skip(1) {
+        let marker = "<option value=\"";
+        let top = select
+            .split(marker)
+            .skip(1)
+            .map(|option| &option[..option.find('"').unwrap()])
+            .find(|value| !value.is_empty())
+            .expect("a level held");
+        fields.push(format!("level={}", encoded(top)));
+    }
+    if page.contains("name=\"deployment_admin\"") {
+        fields.push("deployment_admin=1".into());
+    }
+    for group in page.split("name=\"account_group\" value=\"").skip(1) {
+        fields.push(format!(
+            "account_group={}",
+            &group[..group.find('"').unwrap()]
+        ));
+    }
+    fields.join("&")
+}
+
+/// What `tools/list` answers through a delegation `name` allowed with
+/// `answer` on the consent page.
+async fn listed_through(app: &Arc<App>, name: &str, answer: &str) -> BTreeSet<String> {
+    let client_id = register_agent(app).await;
+    let page = consent_for_mcp(app, &client_id, name).await;
+    let decided = post_form(
+        app,
+        "/oauth/authorize",
+        format!(
+            "request={}&confirm={}&decision=allow&covers=some&days=30&{answer}",
+            hidden(&page, "request"),
+            hidden(&page, "confirm")
+        ),
+    )
+    .await;
+    assert_eq!(
+        decided.status(),
+        StatusCode::FOUND,
+        "{}",
+        body_of(decided).await
+    );
+    let code = query(&location(&decided), "code").expect("a code");
+    let issued = post_form(
+        app,
+        "/oauth/token",
+        format!(
+            "grant_type=authorization_code&code={code}&code_verifier={VERIFIER}\
+             &redirect_uri={}&client_id={}&resource={}",
+            encoded(BACK),
+            encoded(&client_id),
+            encoded(&format!("https://{HOST_NAME}/mcp"))
+        ),
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let token = json_of(issued).await["access_token"]
+        .as_str()
+        .expect("a token")
+        .to_string();
+    let listed = send(
+        app,
+        Request::post("/mcp")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    json_of(listed).await["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_consent_page_lists_each_tool_tools_list_answers_for_each_kind_of_person() {
+    // Contract v17: the page says, under each row, every tool a delegation
+    // covering it is listed -- core's plugin-area tools with the plugin's
+    // own -- from the one source tools/list answers from; allowing all it
+    // offers lists exactly the union of what its rows say.
+    let app = app_of_three();
+    for (name, must, never) in [
+        (
+            "ada",
+            vec![
+                "dashboard__complete_instruments",
+                "dashboard__file_ticket",
+                "dashboard__list_plugins",
+                "dashboard__read_plugin_summary",
+                "dashboard__set_hold",
+                "dashboard__launch_plugin",
+                "dashboard__read_plugin_access",
+            ],
+            vec!["dashboard__read_plugin_settings", "ops-1__tune_feed"],
+        ),
+        (
+            "cat",
+            vec![
+                "dashboard__read_plugin_settings",
+                "dashboard__set_plugin_settings",
+                "dashboard__read_moves",
+                "dashboard__file_ticket",
+                "ops-1__tune_feed",
+                "ops-1__plugin_status",
+            ],
+            vec![
+                "dashboard__set_hold",
+                "dashboard__complete_instruments",
+                "ops-1__read_positions",
+            ],
+        ),
+        (
+            "ben",
+            vec![
+                "dashboard__list_plugins",
+                "dashboard__file_ticket",
+                "ops-1__read_positions",
+                "ops-1__plugin_status",
+            ],
+            vec![
+                "dashboard__read_plugin_settings",
+                "dashboard__read_plugin_summary",
+                "dashboard__set_hold",
+                "ops-1__tune_feed",
+            ],
+        ),
+    ] {
+        let page = consent_for_mcp(&app, &register_agent(&app).await, name).await;
+        let rows = rows_listed(&page);
+        assert!(!rows.is_empty(), "{name}: no row lists a tool: {page}");
+        let said: BTreeSet<String> = rows.values().flatten().cloned().collect();
+        for tool in &must {
+            assert!(
+                said.contains(*tool),
+                "{name}: the page lists {tool}: {rows:?}"
+            );
+        }
+        for tool in &never {
+            assert!(
+                !said.contains(*tool),
+                "{name}: the page grants no {tool}: {rows:?}"
+            );
+        }
+        // Each row's titles are shown, reads and acts apart.
+        assert!(page.contains("Reads: "), "{name}");
+        let listed = listed_through(&app, name, &everything_offered(&page)).await;
+        assert_eq!(said, listed, "{name}: the page and tools/list agree");
+    }
+}

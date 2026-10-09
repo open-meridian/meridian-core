@@ -3076,8 +3076,11 @@ async fn each_settings_last_change_names_the_delegation_and_client_and_a_secret_
     assert_eq!(key.changed_at_ns, FixedClock.now_ns());
     assert_eq!(key.acting_through_delegation, "DLG-7");
     assert_eq!(key.client_name, "Claude");
+    // Its note is read beside who made it (contract v17).
+    assert_eq!(key.note, "Rotated the key the vendor reissued.");
     let poll = change("poll_minutes");
     assert!(poll.acting_through_delegation.is_empty() && poll.client_name.is_empty());
+    assert!(poll.note.is_empty(), "none given at the page");
     assert!(
         !contains(&record.encode_to_vec(), SECRET),
         "never its value"

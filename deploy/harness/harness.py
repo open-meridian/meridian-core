@@ -119,7 +119,7 @@ the same image with the list on stdin:
       value goes with the source given, and the dashboard stamps the admin.
 
   mcp connect [--covers everything | --covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...]
-              [--client NAME]
+              [--client NAME] [--check-consent]
       Connects an MCP client as the admin, as an agent's client does (W6.17,
       W6.20): registers it (named "harness agent" unless --client says), sends
       her through the dashboard's authorisation for the `/mcp` resource with
@@ -129,7 +129,9 @@ the same image with the list on stdin:
       -- on All accounts, for 30 days; or with `--covers everything`, all she
       holds now and is granted later (W6.17's "Everything"); and exchanges the code for a token
       pair, kept for the run in the runner's state. Prints the delegation and
-      how many tools it reaches.
+      how many tools it reaches. With --check-consent, fails unless the tools
+      the consent page listed under what she allowed are exactly the tools
+      tools/list then lists (contract v17).
 
   mcp list [--expect NAME ...]
       Prints the tools the connected delegation reaches, one name per line,
@@ -1112,9 +1114,42 @@ def keep_state(state):
     os.replace(MCP_STATE + ".new", MCP_STATE)
 
 
+LEVELS_DOWN = ["admin", "write", "read"]
+
+
+def consent_rows(page):
+    """Each row's tools as the consent page lists them (contract v17): its
+    `data-reach` (deployment_admin, or INSTANCE:ROLE:LEVEL as the form posts
+    it) to the names in its `data-tools`, which are what tools/list answers
+    through a delegation covering that row alone."""
+    return {html.unescape(reach): set(html.unescape(names).split())
+            for reach, names in re.findall(r'<p data-reach="([^"]*)" data-tools="([^"]*)"', page)}
+
+
+def consent_said(rows, covers):
+    """What the consent page says a delegation covering `covers` grants: the
+    union of its rows' tools, a level picked including those held below it
+    (as the page's select says, "Manage, with Open and View")."""
+    if covers == ["everything"]:
+        return set().union(*rows.values()) if rows else set()
+    said = set()
+    for covered in covers:
+        if covered == "deployment_admin":
+            said |= rows.get("deployment_admin", set())
+            continue
+        parts = covered.split(":")
+        instance, role, level = (parts[0], "", parts[1]) if len(parts) == 2 else parts
+        for below in LEVELS_DOWN[LEVELS_DOWN.index(level):]:
+            said |= rows.get(f"{instance}:{role}:{below}", set())
+    return said
+
+
 def mcp_connect(args):
     covers = options(args, "--covers")
     client_name = option(args, "--client", "harness agent")
+    check_consent = "--check-consent" in args
+    if check_consent:
+        args.remove("--check-consent")
     if args:
         raise Failed(f"mcp connect takes no {args[0]!r}")
     status, said, _ = send_json("POST", "/oauth/register",
@@ -1177,6 +1212,13 @@ def mcp_connect(args):
                 "refresh": issued["refresh_token"], "delegation": issued["delegation_id"],
                 "saved": {}})
     tools = rpc("tools/list")["tools"]
+    if check_consent:
+        said = consent_said(consent_rows(consent.body), covers)
+        listed = {tool["name"] for tool in tools}
+        if said != listed:
+            raise Failed(f"the consent page said {sorted(said - listed)} that tools/list does not "
+                         f"list, and tools/list lists {sorted(listed - said)} the page did not say")
+        print(f"mcp: the consent page listed the {len(said)} tools tools/list lists")
     print(f"mcp: connected through delegation {issued['delegation_id']}, {len(tools)} tools")
 
 

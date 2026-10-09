@@ -5466,6 +5466,11 @@ pub struct PluginLaunch {
     pub stopped_through_delegation: ::prost::alloc::string::String,
     #[prost(string, tag = "17")]
     pub stopped_client_name: ::prost::alloc::string::String,
+    /// Why it was launched, as kept with the launch (contract v17): required
+    /// through /mcp; empty where none was given, and on every launch before
+    /// v17.
+    #[prost(string, tag = "18")]
+    pub note: ::prost::alloc::string::String,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -5555,6 +5560,11 @@ pub struct PluginArchive {
     pub acting_through_delegation: ::prost::alloc::string::String,
     #[prost(string, tag = "7")]
     pub client_name: ::prost::alloc::string::String,
+    /// Why, as kept with its latest change (contract v17): required through
+    /// /mcp, optional at the page; empty where none was given, and on every
+    /// change before v17.
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StopPluginRequest {
@@ -6015,6 +6025,11 @@ pub struct SettingLastChange {
     pub acting_through_delegation: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub client_name: ::prost::alloc::string::String,
+    /// Why, as kept with that change (contract v17): the words of whoever made
+    /// it -- required through /mcp, optional at the form -- or the store's own
+    /// where it backfilled the record. Empty where none was given.
+    #[prost(string, tag = "6")]
+    pub note: ::prost::alloc::string::String,
 }
 /// Sets or clears a hold, for a deployment admin, from the deployment's
 /// Settings (spec/an-edge-plugins-older-records-move-to-the-archive,
@@ -6062,6 +6077,11 @@ pub struct Hold {
     pub acting_through_delegation: ::prost::alloc::string::String,
     #[prost(string, tag = "7")]
     pub client_name: ::prost::alloc::string::String,
+    /// Why, as kept with its latest change (contract v17): required through
+    /// /mcp, optional at the page; empty where none was given, and on every
+    /// change before v17.
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
 }
 /// The dashboard reads an edge plugin's moves for its Summary, newest first.
 #[derive(Clone, PartialEq, ::prost::Message)]

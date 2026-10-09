@@ -336,7 +336,7 @@ impl Store for PostgresStore {
         for row in tx
             .query(
                 "SELECT DISTINCT ON (plugin_instance_id, name) plugin_instance_id, name,
-                        changed_by, changed_at_ns, through_delegation, client_name
+                        changed_by, changed_at_ns, through_delegation, client_name, note
                    FROM config_plugin_setting_change
                   WHERE action IN (1, 2)
                   ORDER BY plugin_instance_id, name, change_id DESC",
@@ -354,6 +354,7 @@ impl Store for PostgresStore {
                     changed_at_ns: row.get(3),
                     acting_through_delegation: row.get(4),
                     client_name: row.get(5),
+                    note: row.get(6),
                 });
         }
 
@@ -1302,13 +1303,13 @@ fn unless_empty(value: &str) -> Option<&str> {
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
-     stopped_client_name";
+     stopped_client_name, launch_note";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
      through_delegation, client_name, note";
 
-/// A hold, and its change's note.
+/// A hold, its change's note on it (contract v17), and the note.
 fn hold_from(row: &postgres::Row) -> (Hold, String) {
     (
         Hold {
@@ -1319,6 +1320,7 @@ fn hold_from(row: &postgres::Row) -> (Hold, String) {
             updated_at_ns: row.get(4),
             acting_through_delegation: row.get(5),
             client_name: row.get(6),
+            note: row.get(7),
         },
         row.get(7),
     )
@@ -1328,7 +1330,7 @@ fn hold_from(row: &postgres::Row) -> (Hold, String) {
 const ARCHIVE_COLUMNS: &str = "instance_id, allowed, most_bytes, changed_by, changed_at_ns, \
      through_delegation, client_name, note";
 
-/// An archive, and its change's note.
+/// An archive, its change's note on it (contract v17), and the note.
 fn archive_from(row: &postgres::Row) -> (PluginArchive, String) {
     (
         PluginArchive {
@@ -1339,6 +1341,7 @@ fn archive_from(row: &postgres::Row) -> (PluginArchive, String) {
             updated_at_ns: row.get(4),
             acting_through_delegation: row.get(5),
             client_name: row.get(6),
+            note: row.get(7),
         },
         row.get(7),
     )
@@ -1362,6 +1365,7 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         client_name: row.get(13),
         stopped_through_delegation: row.get(14),
         stopped_client_name: row.get(15),
+        note: row.get(16),
     }
 }
 

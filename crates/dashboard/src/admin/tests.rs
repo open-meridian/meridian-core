@@ -3096,6 +3096,7 @@ fn a_secrets_set_says_by_whom_and_when_and_the_form_carries_its_version() {
         changed_at_ns: 1_790_380_800_000_000_000,
         acting_through_delegation: "DLG-1".into(),
         client_name: "Claude".into(),
+        ..Default::default()
     }];
     let form = settings::form_with(&record, "", false, "/x", None, &|subject| {
         if subject == "local|ada" {

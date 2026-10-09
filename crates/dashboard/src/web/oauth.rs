@@ -585,7 +585,10 @@ async fn consent_shown(
         .filter(|d| &d.client_id != client_id)
         .max_by_key(|d| d.renewed_at_ns.max(d.made_at_ns));
     let tools = match asked.resource {
-        Resource::Mcp => Some(tool_rows(app)),
+        Resource::Mcp => match tool_rows(app, person, &holdable, now) {
+            Ok(rows) => Some(rows),
+            Err(why) => return refused(&why),
+        },
         Resource::Terminal => None,
     };
     Html(consent_page(&Consenting {
@@ -602,72 +605,110 @@ async fn consent_shown(
     .into_response()
 }
 
-/// The tools each row of access reaches, for a client asking for `/mcp`
-/// (W6.17, W6.20, Q5): under each plugin, role and level, the plugin's tools
-/// that role and level serve, by title, reads and acts apart; under the
-/// deployment admin's capabilities, core's own.
-pub(crate) struct ToolRows {
-    pub plugins: BTreeMap<(String, String, String), Vec<(String, bool)>>,
-    pub deployment_admin: Vec<(String, bool)>,
+/// One tool a row of access grants, as the consent page names it: its name
+/// on the surface, its title, and whether it only reads.
+struct Granted {
+    name: String,
+    title: String,
+    reads: bool,
 }
 
-pub(crate) fn tool_rows(app: &App) -> ToolRows {
-    let mut plugins: BTreeMap<(String, String, String), Vec<(String, bool)>> = BTreeMap::new();
-    for (instance, report) in app.health.view() {
-        for tool in &report.declared_tools {
-            // A tool naming no role is a role-less plugin's, or one reported
-            // before v15: its row is the plugin's as a whole.
-            let roles = if tool.roles.is_empty() {
-                vec![String::new()]
-            } else {
-                tool.roles.clone()
-            };
-            for role in &roles {
-                for level in &tool.levels {
-                    if let Ok(level) = AccessLevel::try_from(*level) {
-                        plugins
-                            .entry((
-                                instance.clone(),
-                                role.clone(),
-                                level_name(level).to_string(),
-                            ))
-                            .or_default()
-                            .push((tool.title.clone(), tool.reads));
-                    }
-                }
-            }
+/// The tools each row of access grants, for a client asking for `/mcp`
+/// (W6.17, W6.20, Q5): under each plugin, role and level held, and under
+/// the deployment admin's capabilities, every tool a delegation covering
+/// that row alone is listed by `tools/list` now -- the plugin's own and
+/// core's, reads and acts apart. Each is [`crate::mcp::listed_to`] over the
+/// person's access narrowed to the row, the one source `tools/list` answers
+/// from, so the page and the surface cannot drift; and since every gate is
+/// "any of", what a delegation lists is the union of its rows'.
+struct ToolRows {
+    plugins: BTreeMap<(String, String, String), Vec<Granted>>,
+    deployment_admin: Vec<Granted>,
+}
+
+fn tool_rows(
+    app: &App,
+    person: &Person,
+    holdable: &Holdable,
+    now: i64,
+) -> Result<ToolRows, String> {
+    let records = app
+        .records
+        .current(now)
+        .map_err(|stale| stale.to_string())?;
+    let access = person_access(&records, &person.subject, &person.directory_groups);
+    let reports = app.health.view();
+    let granted = |covers: Covers| -> Vec<Granted> {
+        let narrowed = crate::delegation::narrow(access.clone(), &covers, &records);
+        crate::mcp::listed_to(&narrowed, &reports, now)
+            .iter()
+            .map(|tool| Granted {
+                name: tool.name.clone(),
+                title: tool.title().to_string(),
+                reads: tool.reads(),
+            })
+            .collect()
+    };
+    let mut plugins = BTreeMap::new();
+    for ((instance, role), held) in &holdable.plugins {
+        for level in held {
+            let row = (
+                instance.clone(),
+                role.clone(),
+                level_name(*level).to_string(),
+            );
+            let tools = granted(Covers {
+                plugins: [row.clone()].into(),
+                ..Covers::default()
+            });
+            plugins.insert(row, tools);
         }
     }
-    ToolRows {
+    let deployment_admin = if holdable.deployment_admin {
+        granted(Covers {
+            deployment_admin: true,
+            ..Covers::default()
+        })
+    } else {
+        Vec::new()
+    };
+    Ok(ToolRows {
         plugins,
-        deployment_admin: crate::mcp::instruments::SPECS
-            .iter()
-            .map(|spec| (spec.title.to_string(), spec.reads))
-            .collect(),
-    }
+        deployment_admin,
+    })
 }
 
-fn tools_said(tools: &[(String, bool)]) -> String {
-    if tools.is_empty() {
-        return String::new();
-    }
+/// A row's tools on the page: its line, `data-reach` naming the row as the
+/// form posts it and `data-tools` the names `tools/list` answers, so a check
+/// can hold the page to the surface; the titles, reads and acts apart.
+fn tools_said(reach: &str, lead: &str, tools: &[Granted]) -> String {
     let said = |reads: bool| {
         tools
             .iter()
-            .filter(|(_, r)| *r == reads)
-            .map(|(title, _)| escape(title))
+            .filter(|tool| tool.reads == reads)
+            .map(|tool| escape(&tool.title))
             .collect::<Vec<_>>()
             .join(", ")
     };
     let (reads, acts) = (said(true), said(false));
-    let mut out = String::from("<span class=\"hint tools\">");
+    let mut out = format!(
+        "<p data-reach=\"{reach}\" data-tools=\"{names}\">{lead}<span class=\"hint tools\">",
+        reach = escape(reach),
+        names = escape(
+            &tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    );
     if !reads.is_empty() {
         out.push_str(&format!("Reads: {reads}. "));
     }
     if !acts.is_empty() {
         out.push_str(&format!("Acts: {acts}."));
     }
-    out.push_str("</span>");
+    out.push_str("</span></p>");
     out
 }
 
@@ -740,30 +781,37 @@ fn level_select(
 /// reaches a tool. With the titles, for the search to find the plugin by.
 fn reached(instance: &str, role: &str, held: &[AccessLevel], tools: &ToolRows) -> (String, String) {
     let mut lines = String::new();
+    let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut titles: BTreeSet<&str> = BTreeSet::new();
     for level in held {
-        let Some(reached) = tools.plugins.get(&(
-            instance.to_string(),
-            role.to_string(),
-            level_name(*level).to_string(),
-        )) else {
+        let name = level_name(*level);
+        let Some(reached) =
+            tools
+                .plugins
+                .get(&(instance.to_string(), role.to_string(), name.to_string()))
+        else {
             continue;
         };
-        titles.extend(reached.iter().map(|(title, _)| title.as_str()));
-        lines.push_str(&format!(
-            "<p><strong>{}</strong> {}</p>",
-            button(*level),
-            tools_said(reached)
+        if reached.is_empty() {
+            continue;
+        }
+        names.extend(reached.iter().map(|tool| tool.name.as_str()));
+        titles.extend(reached.iter().map(|tool| tool.title.as_str()));
+        lines.push_str(&tools_said(
+            &format!("{instance}:{role}:{name}"),
+            &format!("<strong>{}</strong> ", button(*level)),
+            reached,
         ));
     }
-    if titles.is_empty() {
+    if names.is_empty() {
         return (String::new(), String::new());
     }
     (
         format!(
-            "<details class=\"reach\"><summary>{n} tool{s}</summary>{lines}</details>",
-            n = titles.len(),
-            s = if titles.len() == 1 { "" } else { "s" },
+            "<details class=\"reach\"><summary>{n} tool{s}</summary>\
+             <div class=\"reach-tools\">{lines}</div></details>",
+            n = names.len(),
+            s = if names.len() == 1 { "" } else { "s" },
         ),
         titles.into_iter().collect::<Vec<_>>().join(" "),
     )
@@ -890,9 +938,10 @@ fn consent_page(consenting: &Consenting) -> String {
             .filter(|t| !t.deployment_admin.is_empty())
             .map(|t| {
                 format!(
-                    "<details class=\"reach\"><summary>{} tools</summary><p>{}</p></details>",
+                    "<details class=\"reach\"><summary>{} tools</summary>\
+                     <div class=\"reach-tools\">{}</div></details>",
                     t.deployment_admin.len(),
-                    tools_said(&t.deployment_admin)
+                    tools_said("deployment_admin", "", &t.deployment_admin)
                 )
             })
             .unwrap_or_default();

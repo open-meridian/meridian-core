@@ -1001,6 +1001,7 @@ fn area_records(entries: &[(&str, AccessLevel)], deployment_admin: bool) -> Acce
             changed_at_ns: 4,
             acting_through_delegation: "DLG-0".into(),
             client_name: "Claude".into(),
+            note: "Rotated after the vendor's notice.".into(),
         }],
         declared_settings: vec![
             setting("window_days", SettingType::Integer, &["custody"]),
@@ -1035,6 +1036,9 @@ fn area_records(entries: &[(&str, AccessLevel)], deployment_admin: bool) -> Acce
         days: 2190,
         updated_by: ADA.into(),
         updated_at_ns: 3,
+        acting_through_delegation: "DLG-0".into(),
+        client_name: "Claude".into(),
+        note: "The records rule: six years.".into(),
         ..Default::default()
     }];
     if deployment_admin {
@@ -1127,12 +1131,36 @@ fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
         (
             crate::catalogue::PLUGIN_CATALOGUE,
             "meridian.v1.PluginCatalogue",
-            PluginCatalogue::default().encode_to_vec(),
+            PluginCatalogue {
+                launches: vec![PluginLaunch {
+                    instance_id: INSTANCE.into(),
+                    state: 1,
+                    launched_by: ADA.into(),
+                    acting_through_delegation: "DLG-0".into(),
+                    client_name: "Claude".into(),
+                    note: "The custodian's second account.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
         ),
         (
             crate::archive::READ_MOVES,
             "meridian.v1.ReadMovesReply",
-            ReadMovesReply::default().encode_to_vec(),
+            ReadMovesReply {
+                archive: Some(PluginArchive {
+                    instance_id: INSTANCE.into(),
+                    allowed: true,
+                    updated_by: ADA.into(),
+                    acting_through_delegation: "DLG-0".into(),
+                    client_name: "Claude".into(),
+                    note: "Seven years of activity.".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
         ),
         (
             crate::records::ACCESS_RECORDS,
@@ -1287,7 +1315,26 @@ async fn a_custody_admin_reads_and_sets_their_settings_and_is_refused_one_servin
         .contains("operations"));
     assert_eq!(data["secrets_set"], json!(["api_key"]));
     assert_eq!(data["changes"][0]["client_name"], "Claude");
+    // A change's note is readable beside who made it (contract v17).
+    assert_eq!(
+        data["changes"][0]["note"],
+        "Rotated after the vendor's notice."
+    );
     assert_eq!(data["updated_at_ns"], 5);
+    let (_, said, _) = rpc(
+        &app,
+        Some(&custody),
+        &[],
+        call(
+            "dashboard__read_moves",
+            json!({"plugin_instance_id": INSTANCE}),
+        ),
+    )
+    .await;
+    let archive = &structured(&said)["data"]["archive"];
+    assert_eq!(archive["updated_by"], ADA, "{said}");
+    assert_eq!(archive["client_name"], "Claude", "{said}");
+    assert_eq!(archive["note"], "Seven years of activity.", "{said}");
 
     // Set: stamped, with its note and the version read.
     let (_, said, _) = rpc(
@@ -1590,7 +1637,24 @@ async fn a_deployment_admin_administering_no_role_reads_the_overview_and_holds_t
         call("dashboard__read_holds", json!({})),
     )
     .await;
-    assert_eq!(structured(&said)["data"]["holds"][0]["days"], 2190);
+    let hold = &structured(&said)["data"]["holds"][0];
+    assert_eq!(hold["days"], 2190);
+    // Each change's note comes back beside who made it, and through which
+    // delegation and client (contract v17).
+    assert_eq!(hold["updated_by"], ADA, "{said}");
+    assert_eq!(hold["client_name"], "Claude", "{said}");
+    assert_eq!(hold["note"], "The records rule: six years.", "{said}");
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call("dashboard__read_plugin_catalogue", json!({})),
+    )
+    .await;
+    let launch = &structured(&said)["data"]["launches"][0];
+    assert_eq!(launch["launched_by"], ADA, "{said}");
+    assert_eq!(launch["client_name"], "Claude", "{said}");
+    assert_eq!(launch["note"], "The custodian's second account.", "{said}");
 }
 
 #[tokio::test]

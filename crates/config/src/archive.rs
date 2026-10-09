@@ -436,6 +436,7 @@ pub fn set_hold(
         updated_at_ns: now_ns,
         acting_through_delegation: author.delegation.clone(),
         client_name: author.client.clone(),
+        note: request.note.clone(),
     };
     store
         .set_hold(&hold, &request.note)

@@ -366,6 +366,7 @@ impl Plugins {
             live: request.live,
             acting_through_delegation: by.delegation,
             client_name: by.client,
+            note: request.note.clone(),
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
@@ -504,6 +505,7 @@ impl Plugins {
             updated_at_ns: self.clock.now_ns(),
             acting_through_delegation: by.delegation,
             client_name: by.client,
+            note: request.note.clone(),
         };
         self.store
             .put_archive(&archive, &request.note)
@@ -555,6 +557,7 @@ impl Plugins {
             updated_at_ns: self.clock.now_ns(),
             acting_through_delegation: by.delegation,
             client_name: by.client,
+            note: request.note.clone(),
             ..standing
         };
         self.store

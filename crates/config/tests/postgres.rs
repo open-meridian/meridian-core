@@ -494,6 +494,8 @@ fn a_launch_keeps_its_stamp_and_note_and_those_before_v17_a_gap_record() {
     let read = store.snapshot().unwrap().catalogue.launches;
     assert_eq!(read[0].acting_through_delegation, "DLG-1");
     assert_eq!(read[0].client_name, "Claude");
+    // The launch's note is read with it (contract v17).
+    assert_eq!(read[0].note, "Bringing SnapTrade in.");
     let notes = store.launch_notes("snaptrade-1").unwrap();
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].note, "Bringing SnapTrade in.");
@@ -1812,11 +1814,13 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         updated_at_ns: at,
         acting_through_delegation: String::new(),
         client_name: String::new(),
+        note: String::new(),
     };
     store.set_hold(&hold("custody", 2190, 1), "").unwrap();
     let through = Hold {
         acting_through_delegation: "DLG-1".into(),
         client_name: "Claude".into(),
+        note: "The records rule.".into(),
         ..hold("", 400, 2)
     };
     store.set_hold(&through, "The records rule.").unwrap();
@@ -1832,6 +1836,17 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         changes[1],
         (through.clone(), "The records rule.".to_string())
     );
+    // The latest change's note is read with the hold (contract v17).
+    store
+        .set_hold(
+            &Hold {
+                note: "Six years.".into(),
+                ..hold("custody", 2190, 5)
+            },
+            "Six years.",
+        )
+        .unwrap();
+    assert_eq!(store.snapshot().unwrap().holds[0].note, "Six years.");
 
     let archive = PluginArchive {
         instance_id: "snaptrade-1".into(),
@@ -1841,6 +1856,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         updated_at_ns: 5,
         acting_through_delegation: "DLG-1".into(),
         client_name: "Claude".into(),
+        note: "Archive past seven years.".into(),
     };
     store
         .put_archive(&archive, "Archive past seven years.")
@@ -1854,6 +1870,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         updated_at_ns: 6,
         acting_through_delegation: String::new(),
         client_name: String::new(),
+        note: String::new(),
         ..archive.clone()
     };
     store.put_archive(&withdrawn, "").unwrap();
@@ -1940,7 +1957,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
         "u2 was deleted; u1 is in the archive"
     );
 
-    // Nothing is ever updated: four hold records, two archive records.
+    // Nothing is ever updated: five hold records, two archive records.
     let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let mut count = |table: &str| -> i64 {
         client
@@ -1948,7 +1965,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
             .unwrap()
             .get(0)
     };
-    assert_eq!(count("config_hold_change"), 4);
+    assert_eq!(count("config_hold_change"), 5);
     assert_eq!(count("config_archive_change"), 2);
     assert_eq!(count("config_record_move"), 5);
 }

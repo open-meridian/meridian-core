@@ -391,6 +391,11 @@ message SettingLastChange {
   // a browser, and on every change before v17, each of which was.
   string acting_through_delegation = 4;
   string client_name = 5;
+
+  // Why, as kept with that change (contract v17): the words of whoever made
+  // it -- required through /mcp, optional at the form -- or the store's own
+  // where it backfilled the record. Empty where none was given.
+  string note = 6;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -436,6 +441,11 @@ message Hold {
   // browser, and on every hold before v17, each of which was.
   string acting_through_delegation = 6;
   string client_name = 7;
+
+  // Why, as kept with its latest change (contract v17): required through
+  // /mcp, optional at the page; empty where none was given, and on every
+  // change before v17.
+  string note = 8;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

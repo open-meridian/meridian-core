@@ -133,7 +133,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_summary",
         "Read a plugin's Summary",
-        "one instance's Summary, as its admin reads it under Manage: its status (registered, healthy and why not, the version and contract it runs), the figures it reports, its raw records (what storage holds of each kind, the hold over it, what the archive holds and its bound), what it declares and the tools it offered, admitted and refused; and the admin portal's Overview with its connections. A deployment admin who administers none of its roles reads the Overview's parts.",
+        "one instance's Summary, as its admin reads it under Manage: its status (registered, healthy and why not, the version and contract it runs), the figures it reports, its raw records (what storage holds of each kind, the hold over it, what the archive holds, its bound and its last change with its note), what it declares and the tools it offered, admitted and refused; and the admin portal's Overview with its connections. A deployment admin who administers none of its roles reads the Overview's parts.",
         true,
         Gate::AdminOrDeployment,
         instance_schema,
@@ -149,7 +149,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_settings",
         "Read a plugin's settings",
-        "an instance's settings as its Settings form shows this person: each declared setting, the roles it serves, whether they may set it (may_set) and if not why (detail); each value that is not secret, a table's rows with changed_by and changed_at; a secret's being set (secrets_set), by whom and when (changes), never its value; updated_at_ns, which a change names as against_updated_at_ns; and the external accounts a table's column offers.",
+        "an instance's settings as its Settings form shows this person: each declared setting, the roles it serves, whether they may set it (may_set) and if not why (detail); each value that is not secret, a table's rows with changed_by and changed_at; a secret's being set (secrets_set); each setting's last change (changes): by whom, when, through which delegation and client, and its note, never a value; updated_at_ns, which a change names as against_updated_at_ns; and the external accounts a table's column offers.",
         true,
         Gate::Admin,
         instance_schema,
@@ -181,7 +181,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_holds",
         "Read the holds",
-        "the deployment's holds on raw records, as its Settings' Holds tab shows them: per edge role, or every one with an empty role, the least days a record is kept, write-once, who set it, when, and the delegation and client they acted through.",
+        "the deployment's holds on raw records, as its Settings' Holds tab shows them: per edge role, or every one with an empty role, the least days a record is kept, write-once, who set it, when, the delegation and client they acted through, and the note saying why.",
         true,
         Gate::DeploymentAdmin,
         nothing_schema,
@@ -197,7 +197,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_catalogue",
         "Read the plugin catalogue",
-        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, and the delegation and client they acted through.",
+        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the launch's note.",
         true,
         Gate::DeploymentAdmin,
         nothing_schema,
@@ -373,6 +373,7 @@ fn archive_json(archive: &PluginArchive) -> Value {
         "updated_at_ns": archive.updated_at_ns,
         "acting_through_delegation": archive.acting_through_delegation,
         "client_name": archive.client_name,
+        "note": archive.note,
     })
 }
 
@@ -385,6 +386,7 @@ fn hold_json(hold: &Hold) -> Value {
         "updated_at_ns": hold.updated_at_ns,
         "acting_through_delegation": hold.acting_through_delegation,
         "client_name": hold.client_name,
+        "note": hold.note,
     })
 }
 
@@ -434,6 +436,7 @@ fn launch_json(launch: &PluginLaunch) -> Value {
         "client_name": launch.client_name,
         "stopped_through_delegation": launch.stopped_through_delegation,
         "stopped_client_name": launch.stopped_client_name,
+        "note": launch.note,
     })
 }
 
@@ -496,6 +499,7 @@ fn last_change_json(change: &SettingLastChange) -> Value {
         "changed_at_ns": change.changed_at_ns,
         "acting_through_delegation": change.acting_through_delegation,
         "client_name": change.client_name,
+        "note": change.note,
     })
 }
 

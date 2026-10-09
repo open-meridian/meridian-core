@@ -70,6 +70,7 @@ fn allow(store: &MemoryStore) {
                 updated_at_ns: NOW,
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
+                note: String::new(),
             },
             "",
         )
