@@ -529,8 +529,10 @@ fn declaration_json(declaration: &SettingDeclaration) -> Value {
 
 /// The settings as the form shows this person (W6.11): the record by its
 /// fields, a table's value its rows, and each declared setting the form
-/// shows with whether they may set it (`may_set`) and, if not, why
-/// (`detail`). Never a secret's value: the record holds none.
+/// shows as a `SettingShown` (its name ruled 2026-10-09, kept by the
+/// dashboard in the dictionary, no proto): the declaration's own fields,
+/// whether they may set it (`may_set`) and, if not, why (`detail`). Never a
+/// secret's value: the record holds none.
 fn settings_json(
     record: &PluginSettingsRecord,
     held: &meridian_access::PluginHeld,

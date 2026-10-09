@@ -1267,6 +1267,18 @@ async fn a_custody_admin_reads_and_sets_their_settings_and_is_refused_one_servin
             .cloned()
             .unwrap()
     };
+    // Each a SettingShown: the declaration's fields, may_set, and detail
+    // only where may_set is false (the dictionary's dashboard.yaml).
+    for shown in data["declared_settings"].as_array().unwrap() {
+        let may = shown["may_set"]
+            .as_bool()
+            .expect("may_set on every setting");
+        assert_eq!(shown.get("detail").is_some(), !may, "{shown}");
+        assert!(
+            shown["name"].is_string() && shown.get("roles").is_some(),
+            "{shown}"
+        );
+    }
     assert_eq!(setting("window_days")["may_set"], true, "{said}");
     assert_eq!(setting("both_roles")["may_set"], false);
     assert!(setting("both_roles")["detail"]
