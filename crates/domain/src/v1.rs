@@ -6021,6 +6021,15 @@ pub struct DatasetRef {
     /// unset in a read's answer.
     #[prost(message, optional, tag = "5")]
     pub declaration: ::core::option::Option<::meridian_pb::v1::DatasetDeclaration>,
+    /// For the Data sources page, in a listing of datasets (W10.9; approved
+    /// 2026-10-10): the rows the lake keeps of the dataset carrying a value as
+    /// reported beside a field left not known; and the identifiers and venues
+    /// its instance reported missing (W3.2, W3.15), as the lake heard them. 0
+    /// in a read's answer and on an entitlements change.
+    #[prost(uint64, tag = "6")]
+    pub unconverted_count: u64,
+    #[prost(uint64, tag = "7")]
+    pub miss_count: u64,
 }
 /// A price of one kind for one subject. An FX rate is the price of one
 /// currency's cash instrument in another (spec/the-lake, Q3); the lake never

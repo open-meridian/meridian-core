@@ -42,7 +42,7 @@ platform.config.command.set-plugin-settings	command	dashboard	conductor
 platform.config.command.stop-plugin	command	dashboard	conductor
 platform.config.command.withdraw-archive	command	dashboard	conductor
 platform.config.command.withdraw-permission	command	dashboard	conductor
-platform.config.event.entitlements-changed	event	conductor	lake,sidecar
+platform.config.event.entitlements-changed	event	conductor	lake,sidecar,launcher
 platform.config.event.person-signed-in	event	dashboard	conductor
 platform.config.event.plugin-configuration-changed	event	conductor	sidecar
 platform.config.event.unlinked-external-accounts	event	sidecar	dashboard
@@ -54,7 +54,7 @@ platform.config.query.filed-tickets	query	sidecar	dashboard
 platform.config.query.first-run-sealing-key	query	dashboard	first-run
 platform.config.query.moves	query	dashboard	conductor
 platform.config.query.plugin-access	query	sidecar	conductor
-platform.config.query.plugin-catalogue	query	dashboard	conductor
+platform.config.query.plugin-catalogue	query	dashboard,lake	conductor
 platform.config.query.plugin-configuration	query	sidecar	conductor
 platform.custody.*.event.external-accounts	event	custody	dashboard,conductor
 platform.custody.*.event.sync-status	event	custody	dashboard,street
@@ -77,15 +77,15 @@ platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,com
 platform.reference.command.complete-instruments	command	dashboard	instrument
 platform.reference.command.merge-instruments	command	dashboard	instrument
 platform.reference.event.instrument-applied	event	instrument	dashboard
-platform.reference.event.instrument-missing	event	custody,dgm	instrument
+platform.reference.event.instrument-missing	event	custody,dgm	instrument,lake
 platform.reference.event.instrument-pulled	event	conductor	instrument
 platform.reference.event.instrument-replaced	event	instrument	street,bor,lake
-platform.reference.event.venue-missing	event	dgm	instrument,conductor
+platform.reference.event.venue-missing	event	dgm	instrument,conductor,lake
 platform.reference.query.ask-platform-for-instrument	query	dashboard	conductor
 platform.reference.query.list-instruments-to-complete	query	dashboard	instrument
 platform.reference.query.read-instrument-history	query	dashboard	instrument
-platform.reference.query.resolve-identifier	query	custody,dgm	instrument
-platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor	instrument
+platform.reference.query.resolve-identifier	query	custody,dgm,lake,street,bor	instrument
+platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor,lake	instrument
 platform.reference.query.resolve-venue	query	dgm	instrument
 platform.street.command.re-resolve-activity	command	custody	street
 platform.street.command.record-activity	command	custody	street
