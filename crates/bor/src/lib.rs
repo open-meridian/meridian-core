@@ -44,6 +44,7 @@
 //! decimal, summed and never rounded (decisions/023).
 
 pub mod book;
+pub mod cash;
 pub mod dates;
 pub mod decide;
 pub mod ids;

@@ -131,6 +131,36 @@ impl Store for MemoryStore {
     fn sync_statuses(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage> {
         self.read()?.sync_statuses_page(read)
     }
+
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {
+        Ok(self.read()?.cash.values().cloned().collect())
+    }
+
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()> {
+        self.write()?
+            .cash
+            .entry(resolution.code.clone())
+            .or_insert_with(|| resolution.clone());
+        Ok(())
+    }
+
+    fn currency_codes(&self) -> Result<Vec<String>> {
+        let held = self.read()?;
+        let mut codes: Vec<String> = held
+            .holdings
+            .iter()
+            .filter_map(|h| h.market_value.as_ref().map(|m| m.currency.clone()))
+            .chain(
+                held.positions
+                    .values()
+                    .filter_map(|p| p.market_value.as_ref().map(|m| m.currency.clone())),
+            )
+            .filter(|code| meridian_domain::money::is_iso4217(code))
+            .collect();
+        codes.sort();
+        codes.dedup();
+        Ok(codes)
+    }
 }
 
 /// The street store's contents, and every rule about them.
@@ -172,6 +202,9 @@ pub(crate) struct Held {
     /// Each re-resolution of an activity, in the order recorded (W2.16,
     /// contract v15). The activity in `activities` stays as first recorded.
     pub(crate) re_resolutions: Vec<ReResolution>,
+
+    /// Each code's cash instrument as resolved (contract v18).
+    pub(crate) cash: BTreeMap<String, meridian_domain::money::Resolution>,
 }
 
 impl Held {

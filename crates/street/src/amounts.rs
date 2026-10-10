@@ -134,7 +134,15 @@ impl Money {
             None => Exact::ZERO,
             Some(amount) => Exact::from_wire(amount).map_err(|why| Refused { field, why })?,
         };
-        Ok(Self::new(amount, wire.currency_code.clone()))
+        // A fiat currency by its code, as before; a token's amount, which a
+        // plugin names by its cash instrument alone (contract v18), by that
+        // instrument's ID in the same place.
+        let currency = if wire.currency_code.is_empty() {
+            wire.instrument_id.clone()
+        } else {
+            wire.currency_code.clone()
+        };
+        Ok(Self::new(amount, currency))
     }
 
     /// From the wire, where unset means the venue reported no amount: absent,
@@ -147,11 +155,22 @@ impl Money {
             .transpose()
     }
 
+    /// As the street answers it: naming its cash instrument (contract v18),
+    /// a fiat code's as this process resolved it, a token's as kept.
     pub fn to_wire(&self) -> Option<WireMoney> {
+        let fiat = meridian_domain::money::is_iso4217(&self.currency);
         Some(WireMoney {
             amount: Some(self.amount.to_wire()),
-            currency_code: self.currency.clone(),
-            instrument_id: String::new(),
+            currency_code: if fiat || self.currency.is_empty() {
+                self.currency.clone()
+            } else {
+                String::new()
+            },
+            instrument_id: if fiat {
+                meridian_domain::money::known(&self.currency).unwrap_or_default()
+            } else {
+                self.currency.clone()
+            },
         })
     }
 }

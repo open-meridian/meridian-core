@@ -139,7 +139,21 @@ impl Sidecar {
         field: &str,
         value: Option<&domain::Money>,
     ) -> Result<(), Status> {
-        self.exact(field, value.and_then(|money| money.amount.as_ref()))
+        self.exact(field, value.and_then(|money| money.amount.as_ref()))?;
+        // From contract v18 a Money names its asset (decisions/023 as
+        // amended): a fiat currency by its ISO 4217 code, or its cash
+        // instrument; a token's code in currency_code, or neither, refused.
+        // A plugin built before keeps the code it always sent.
+        let built_at = self
+            .registration()
+            .map_or(0, |held| crate::contract::declared(&held.contract_version));
+        if let Some(money) = value.filter(|_| built_at >= 18) {
+            if let Err(refusal) = meridian_domain::money::asset_of(field, money) {
+                self.note_refusal(&refusal);
+                return Err(Status::invalid_argument(refusal));
+            }
+        }
+        Ok(())
     }
 
     /// A business date the plugin named, a day that exists (contract v18,

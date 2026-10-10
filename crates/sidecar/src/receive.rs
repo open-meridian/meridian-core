@@ -130,6 +130,7 @@ struct Waiting {
 impl Waiting {
     /// A delivery queued after any loss before it, or dropped and counted
     /// when the queue is full.
+    #[cfg(test)]
     fn push(&self, delivery: plugin::Delivery, row: &str) {
         self.push_keyed(delivery, row, None)
     }

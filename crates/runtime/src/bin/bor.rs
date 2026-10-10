@@ -104,6 +104,14 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // Each currency's cash instrument (contract v18): the codes held
+        // before resolved once and said to be filled in.
+        meridian_bor::cash::load(store.as_ref());
+        tokio::spawn(meridian_bor::cash::sweep_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            meridian_bor::cash::SWEEP_EVERY,
+        ));
 
         // W9.9: subscribed before this returns; only the following is
         // spawned. And swept, for a replacement said while this was away.

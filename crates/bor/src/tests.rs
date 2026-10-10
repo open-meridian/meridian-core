@@ -1688,3 +1688,40 @@ async fn a_pending_line_may_name_no_value_date() {
     assert_eq!(read(&pending.quantity), "2.5");
     assert_eq!(read(&aapl.settled_quantity), "12.5");
 }
+
+/// Contract v18 (decisions/023 as amended): a lot's cost named by its code
+/// is resolved to the currency's cash instrument before it is journalled,
+/// kept as its own record, and answered naming it; the entry stays as sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lots_cost_is_answered_naming_its_cash_instrument() {
+    let (bus, store) = wired();
+    bus.serve(crate::cash::RESOLVE_IDENTIFIER, |envelope| {
+        let asked =
+            meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..]).unwrap();
+        let usd = asked.identifiers[0].value == "USD";
+        Ok((
+            "meridian.v1.ResolveIdentifierReply".into(),
+            meridian_domain::v1::ResolveIdentifierReply {
+                found: usd,
+                instrument_id: if usd { USD.into() } else { String::new() },
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let reply = open(&bus).await;
+    let cost = position(&reply, AAPL).lots[0]
+        .terms
+        .as_ref()
+        .unwrap()
+        .cost
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (cost.currency_code.as_str(), cost.instrument_id.as_str()),
+        ("USD", USD)
+    );
+    let kept = store.cash_instruments().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].instrument_id, USD);
+}

@@ -1392,6 +1392,89 @@ impl Store for PostgresStore {
             as_of,
         })
     }
+
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT currency_code, instrument_id, resolved_at_ns, backfilled
+                   FROM street_cash_instrument ORDER BY currency_code",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| meridian_domain::money::Resolution {
+                code: row.get(0),
+                instrument_id: row.get(1),
+                resolved_at_ns: row.get(2),
+                backfilled: row.get(3),
+            })
+            .collect())
+    }
+
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO street_cash_instrument
+                        (currency_code, instrument_id, resolved_at_ns, backfilled)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (currency_code) DO NOTHING",
+                &[
+                    &resolution.code,
+                    &resolution.instrument_id,
+                    &resolution.resolved_at_ns,
+                    &resolution.backfilled,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn currency_codes(&self) -> Result<Vec<String>> {
+        // Every currency column the street's tables hold, as the schema
+        // says them: an amount's code beside its number.
+        let mut conn = self.conn()?;
+        let columns = conn
+            .query(
+                "SELECT table_name, column_name FROM information_schema.columns
+                  WHERE table_schema = current_schema() AND data_type = 'text'
+                    AND (column_name = 'currency' OR column_name LIKE '%\\_currency')
+                    AND table_name = ANY($1)",
+                &[&vec![
+                    "holding",
+                    "custodial_position",
+                    "statement",
+                    "statement_figures",
+                    "statement_collateral",
+                    "holding_lot",
+                    "holding_amendment",
+                    "activity",
+                ]],
+            )
+            .map_err(unavailable)?;
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let union = columns
+            .iter()
+            .map(|row| {
+                let table: String = row.get(0);
+                let column: String = row.get(1);
+                format!("SELECT \"{column}\" AS code FROM \"{table}\"")
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        Ok(conn
+            .query(
+                &format!(
+                    "SELECT DISTINCT code FROM ({union}) codes WHERE code ~ '^[A-Z]{{3}}$' ORDER BY code"
+                ),
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
 }
 
 /// The activity held under an activity's source, account and the

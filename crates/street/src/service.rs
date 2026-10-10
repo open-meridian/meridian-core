@@ -165,6 +165,13 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 
         let request = RecordHoldingsStatementRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable statement: {failed}"))?;
+        // Each code it names resolved to its cash instrument (contract v18).
+        crate::cash::ensure_blocking(
+            &opening_bus,
+            &statements,
+            &meridian_domain::money::codes(&request),
+            statement_clock.now_ns(),
+        );
 
         let cause = cause_of(&envelope, statement_clock.now_ns());
         let opening = open_statement(statements.as_ref(), &request, &cause)
@@ -201,6 +208,12 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 
         let request = RecordHoldingRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable holding: {failed}"))?;
+        crate::cash::ensure_blocking(
+            &announcing,
+            &holdings,
+            &meridian_domain::money::codes(&request),
+            holding_clock.now_ns(),
+        );
 
         let cause = cause_of(&envelope, holding_clock.now_ns());
         let recorded = record_holding(holdings.as_ref(), &request, &cause)
@@ -286,12 +299,19 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 
         let request = RecordActivityRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable activity: {failed}"))?;
+        crate::cash::ensure_blocking(
+            &activity_bus,
+            &activities,
+            &meridian_domain::money::codes(&request),
+            activity_clock.now_ns(),
+        );
 
         let cause = cause_of(&envelope, activity_clock.now_ns());
         let recorded = record_activity(activities.as_ref(), &request, &cause)
             .map_err(|failed| failed.to_string())?;
 
-        if let Some(event) = recorded.event {
+        if let Some(mut event) = recorded.event {
+            meridian_domain::money::fill_known(&mut event);
             let meta = envelope.meta.as_ref();
             activity_bus
                 .publish(
@@ -356,8 +376,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let request = ListActivitiesRequest::decode(&envelope.payload[..])
             .map_err(|failed| format!("undecodable query: {failed}"))?;
 
-        let reply = list_activities(reading_activity.as_ref(), &request, &scope_of(&envelope))
+        let mut reply = list_activities(reading_activity.as_ref(), &request, &scope_of(&envelope))
             .map_err(|failed| failed.to_string())?;
+        meridian_domain::money::fill_known(&mut reply);
 
         Ok((
             "meridian.v1.ListActivitiesReply".to_string(),
@@ -1489,6 +1510,67 @@ mod tests {
                 .to_string()
                 .contains("no activity is recorded as never-sent"),
             "{refused}"
+        );
+    }
+    /// Contract v18 (decisions/023 as amended): a code an amount names is
+    /// resolved to its cash instrument before the amount is recorded, kept as
+    /// its own record, and every amount answered names it; a token's amount,
+    /// named by its instrument alone, is kept and read back as that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_amount_is_answered_naming_its_cash_instrument_and_a_tokens_by_its_own() {
+        use meridian_domain::v1::{CustodialPositionUpdatedEvent, Money};
+        let (bus, store) = wired();
+        bus.serve(crate::cash::RESOLVE_IDENTIFIER, |envelope| {
+            let asked =
+                meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            let xts = asked.identifiers[0].value == "XTS";
+            Ok((
+                "meridian.v1.ResolveIdentifierReply".into(),
+                meridian_domain::v1::ResolveIdentifierReply {
+                    found: xts,
+                    instrument_id: if xts { "LCL-XTS".into() } else { String::new() },
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let statement_id = open(&bus).await;
+        let mut fiat = row(&statement_id);
+        fiat.market_value = Some(Money {
+            amount: quantity("10"),
+            currency_code: "XTS".into(),
+            instrument_id: String::new(),
+        });
+        record(&bus, fiat).await;
+        let event =
+            CustodialPositionUpdatedEvent::decode(&next(&mut announced).await.envelope.payload[..])
+                .unwrap();
+        let value = event.position.unwrap().market_value.unwrap();
+        assert_eq!(
+            (value.currency_code.as_str(), value.instrument_id.as_str()),
+            ("XTS", "LCL-XTS")
+        );
+        let kept = store.cash_instruments().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].backfilled, "resolved as it arrived");
+
+        let mut token = row(&statement_id);
+        token.instrument_id = "INS-01J8XQ4M7K0000000000USDC".into();
+        token.market_value = Some(Money {
+            amount: quantity("5"),
+            currency_code: String::new(),
+            instrument_id: "LCL-USDC".into(),
+        });
+        record(&bus, token).await;
+        let event =
+            CustodialPositionUpdatedEvent::decode(&next(&mut announced).await.envelope.payload[..])
+                .unwrap();
+        let value = event.position.unwrap().market_value.unwrap();
+        assert_eq!(
+            (value.currency_code.as_str(), value.instrument_id.as_str()),
+            ("", "LCL-USDC")
         );
     }
 }

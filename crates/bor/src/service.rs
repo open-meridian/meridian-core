@@ -212,7 +212,8 @@ fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
 
 /// A command's answer for the book's entries.
 fn entry_reply(made: &Made) -> BookEntryReply {
-    BookEntryReply {
+    // Each amount naming its cash instrument (contract v18).
+    let mut reply = BookEntryReply {
         entry: Some(made.entry.meta.clone()),
         journal: Some(made.changes.first.clone()),
         positions: made
@@ -224,7 +225,9 @@ fn entry_reply(made: &Made) -> BookEntryReply {
         breaks: made.changes.breaks.clone(),
         figures: made.changes.figures.clone(),
         attributes: made.changes.attributes.clone(),
-    }
+    };
+    meridian_domain::money::fill_known(&mut reply);
+    reply
 }
 
 fn decided(made: Made, reply: Vec<u8>) -> Decided {
@@ -248,43 +251,44 @@ pub fn announce(bus: &Bus, decided: &Decided, correlation: Option<&str>, causati
         }
     };
     for (record, previous) in &decided.changes.positions {
-        say(
-            POSITION_CHANGED,
-            "meridian.v1.PositionChangedEvent",
-            PositionChangedEvent {
+        say(POSITION_CHANGED, "meridian.v1.PositionChangedEvent", {
+            let mut event = PositionChangedEvent {
                 position: Some(record.clone()),
                 previous_trade_date_quantity: Some(previous.to_wire()),
                 entry: Some(entry.meta.clone()),
                 journal: record.last_change.clone(),
                 cause: Some(entry.cause.clone()),
-            }
-            .encode_to_vec(),
-        );
+            };
+            meridian_domain::money::fill_known(&mut event);
+            event.encode_to_vec()
+        });
     }
     for record in &decided.changes.breaks {
-        say(
-            BREAK_CHANGED,
-            "meridian.v1.BreakChangedEvent",
-            BreakChangedEvent {
+        say(BREAK_CHANGED, "meridian.v1.BreakChangedEvent", {
+            let mut event = BreakChangedEvent {
                 break_record: Some(record.clone()),
                 entry: Some(entry.meta.clone()),
                 journal: record.last_change.clone(),
                 cause: Some(entry.cause.clone()),
-            }
-            .encode_to_vec(),
-        );
+            };
+            meridian_domain::money::fill_known(&mut event);
+            event.encode_to_vec()
+        });
     }
     for record in &decided.changes.figures {
         say(
             ACCOUNT_FIGURES_RECORDED,
             "meridian.v1.AccountFiguresRecordedEvent",
-            AccountFiguresRecordedEvent {
-                figures: Some(record.clone()),
-                entry: Some(entry.meta.clone()),
-                journal: record.last_change.clone(),
-                cause: Some(entry.cause.clone()),
-            }
-            .encode_to_vec(),
+            {
+                let mut event = AccountFiguresRecordedEvent {
+                    figures: Some(record.clone()),
+                    entry: Some(entry.meta.clone()),
+                    journal: record.last_change.clone(),
+                    cause: Some(entry.cause.clone()),
+                };
+                meridian_domain::money::fill_known(&mut event);
+                event.encode_to_vec()
+            },
         );
     }
     if let Some(record) = &decided.changes.attributes {
@@ -357,6 +361,12 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(RECORD_OPENING_BALANCE, move |envelope| {
             let request: RecordOpeningBalanceRequest =
                 decode(&envelope, "meridian.v1.RecordOpeningBalanceRequest")?;
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
             let mut ctx = context_of(&envelope, clock.as_ref());
             let named = decide::instruments_named(&[], &request.positions);
             let found = references(&bus2, &named, ctx.received_at_ns);
@@ -383,6 +393,12 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(RECORD_BREAK, move |envelope| {
             let request: RecordBreakRequest = decode(&envelope, "meridian.v1.RecordBreakRequest")?;
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
             let ctx = context_of(&envelope, clock.as_ref());
             command(
                 &bus2,
@@ -405,6 +421,12 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(RECORD_ACCOUNT_FIGURES, move |envelope| {
             let request: RecordAccountFiguresRequest =
                 decode(&envelope, "meridian.v1.RecordAccountFiguresRequest")?;
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
             let ctx = context_of(&envelope, clock.as_ref());
             command(
                 &bus2,
@@ -470,6 +492,12 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(RESOLVE_BREAK, move |envelope| {
             let request: ResolveBreakRequest =
                 decode(&envelope, "meridian.v1.ResolveBreakRequest")?;
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
             let mut ctx = context_of(&envelope, clock.as_ref());
             if let Some(meridian_domain::v1::resolve_break_request::Resolution::Adjustment(
                 adjustment,
@@ -576,15 +604,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
-        Ok((
-            "meridian.v1.ListPositionsReply".to_string(),
-            ListPositionsReply {
+        Ok(("meridian.v1.ListPositionsReply".to_string(), {
+            let mut reply = ListPositionsReply {
                 positions: page.records,
                 next_cursor: page.next_cursor,
                 as_of: Some(watermark_of(&page.as_of)),
-            }
-            .encode_to_vec(),
-        ))
+            };
+            meridian_domain::money::fill_known(&mut reply);
+            reply.encode_to_vec()
+        }))
     });
 
     let reading = store.clone();
@@ -611,15 +639,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
-        Ok((
-            "meridian.v1.ListBreaksReply".to_string(),
-            ListBreaksReply {
+        Ok(("meridian.v1.ListBreaksReply".to_string(), {
+            let mut reply = ListBreaksReply {
                 breaks: page.records,
                 next_cursor: page.next_cursor,
                 as_of: Some(watermark_of(&page.as_of)),
-            }
-            .encode_to_vec(),
-        ))
+            };
+            meridian_domain::money::fill_known(&mut reply);
+            reply.encode_to_vec()
+        }))
     });
 
     let reading = store.clone();
@@ -645,15 +673,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
-        Ok((
-            "meridian.v1.ListAccountFiguresReply".to_string(),
-            ListAccountFiguresReply {
+        Ok(("meridian.v1.ListAccountFiguresReply".to_string(), {
+            let mut reply = ListAccountFiguresReply {
                 figures: page.records,
                 next_cursor: page.next_cursor,
                 as_of: Some(watermark_of(&page.as_of)),
-            }
-            .encode_to_vec(),
-        ))
+            };
+            meridian_domain::money::fill_known(&mut reply);
+            reply.encode_to_vec()
+        }))
     });
 
     let reading = store;

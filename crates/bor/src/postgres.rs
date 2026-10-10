@@ -886,6 +886,78 @@ impl Store for PostgresStore {
         tx.commit().map_err(unavailable)?;
         Ok(replayed)
     }
+
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT currency_code, instrument_id, resolved_at_ns, backfilled
+                   FROM book_cash_instrument ORDER BY currency_code",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| meridian_domain::money::Resolution {
+                code: row.get(0),
+                instrument_id: row.get(1),
+                resolved_at_ns: row.get(2),
+                backfilled: row.get(3),
+            })
+            .collect())
+    }
+
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO book_cash_instrument
+                        (currency_code, instrument_id, resolved_at_ns, backfilled)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (currency_code) DO NOTHING",
+                &[
+                    &resolution.code,
+                    &resolution.instrument_id,
+                    &resolution.resolved_at_ns,
+                    &resolution.backfilled,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn currency_codes(&self) -> Result<Vec<String>> {
+        use meridian_domain::money::{codes, is_iso4217};
+        let mut conn = self.conn()?;
+        let mut found = std::collections::BTreeSet::new();
+        for row in conn
+            .query(
+                "SELECT cost_currency FROM book_lot WHERE cost_currency IS NOT NULL
+                 UNION SELECT base_currency_code FROM book_attributes",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let code: String = row.get(0);
+            if is_iso4217(&code) {
+                found.insert(code);
+            }
+        }
+        for row in conn
+            .query("SELECT record FROM book_figures", &[])
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            found.extend(codes(
+                &AccountFigures::decode(bytes.as_slice()).map_err(unreadable)?,
+            ));
+        }
+        for row in conn
+            .query("SELECT record FROM book_break", &[])
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            found.extend(codes(&Break::decode(bytes.as_slice()).map_err(unreadable)?));
+        }
+        Ok(found.into_iter().collect())
+    }
 }
 
 fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {

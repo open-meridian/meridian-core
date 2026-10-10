@@ -24,6 +24,7 @@ struct State {
     requests: HashMap<String, Vec<u8>>,
     by_message: HashMap<String, String>,
     by_key: HashMap<(String, String), String>,
+    cash: BTreeMap<String, meridian_domain::money::Resolution>,
 }
 
 pub struct MemoryStore {
@@ -330,6 +331,38 @@ impl Store for MemoryStore {
         }
         state.books = books;
         Ok(replayed)
+    }
+
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {
+        Ok(self.state().cash.values().cloned().collect())
+    }
+
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()> {
+        self.state()
+            .cash
+            .entry(resolution.code.clone())
+            .or_insert_with(|| resolution.clone());
+        Ok(())
+    }
+
+    fn currency_codes(&self) -> Result<Vec<String>> {
+        use meridian_domain::money::{codes, is_iso4217};
+        let state = self.state();
+        let mut found = std::collections::BTreeSet::new();
+        for book in state.books.values() {
+            for figures in book.figures.values() {
+                found.extend(codes(figures));
+            }
+            for held in book.breaks.values() {
+                found.extend(codes(held));
+            }
+            if let Some(attributes) = &book.attributes {
+                if is_iso4217(&attributes.base_currency_code) {
+                    found.insert(attributes.base_currency_code.clone());
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 }
 

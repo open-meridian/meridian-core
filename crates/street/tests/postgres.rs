@@ -2284,3 +2284,30 @@ fn a_re_resolution_is_kept_beside_the_activity_chained_apart_and_read_with_it() 
         "{refused}"
     );
 }
+
+#[test]
+fn a_codes_resolution_is_kept_once_and_the_codes_held_are_read() {
+    use meridian_domain::money::Resolution;
+    let store = store();
+    let resolution = |instrument: &str| Resolution {
+        code: "XTS".into(),
+        instrument_id: instrument.into(),
+        resolved_at_ns: 1,
+        backfilled: true,
+    };
+    store.keep_cash_instrument(&resolution("LCL-XTS")).unwrap();
+    store
+        .keep_cash_instrument(&resolution("LCL-OTHER"))
+        .unwrap();
+    let kept: Vec<_> = store
+        .cash_instruments()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.code == "XTS")
+        .collect();
+    assert_eq!(kept, vec![resolution("LCL-XTS")], "the first stands");
+    // Whatever the shared database holds, every code read is one.
+    for code in store.currency_codes().unwrap() {
+        assert!(meridian_domain::money::is_iso4217(&code), "{code}");
+    }
+}

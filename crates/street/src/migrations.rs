@@ -98,6 +98,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "an_activity_re_resolved",
         sql: include_str!("../migrations/0010_an_activity_re_resolved.sql"),
     },
+    Migration {
+        version: 11,
+        name: "money_names_its_instrument",
+        sql: include_str!("../migrations/0011_money_names_its_instrument.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

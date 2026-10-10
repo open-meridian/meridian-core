@@ -313,4 +313,14 @@ pub trait Store: Send + Sync {
     /// Rebuild every projection from the journal (`meridian-bor rebuild`),
     /// and say how many entries were replayed.
     fn rebuild(&self) -> Result<usize>;
+
+    /// Each code's cash instrument as resolved (contract v18), its own
+    /// record.
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>>;
+
+    /// Keep a code's resolution, once: a code resolved already is left.
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()>;
+
+    /// Every ISO 4217 code an amount or a base currency the book holds is in.
+    fn currency_codes(&self) -> Result<Vec<String>>;
 }

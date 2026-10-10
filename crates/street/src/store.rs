@@ -1249,6 +1249,16 @@ pub trait Store: Send + Sync {
     /// W2.14. The latest sync status of each connection within the read's
     /// scope, or every one recorded since a watermark, in the order recorded.
     fn sync_statuses(&self, read: &SyncStatusesRead) -> Result<SyncStatusPage>;
+
+    /// Each code's cash instrument as resolved (contract v18), its own
+    /// record.
+    fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>>;
+
+    /// Keep a code's resolution, once: a code resolved already is left.
+    fn keep_cash_instrument(&self, resolution: &meridian_domain::money::Resolution) -> Result<()>;
+
+    /// Every ISO 4217 code an amount the street keeps is in.
+    fn currency_codes(&self) -> Result<Vec<String>>;
 }
 
 /// Refuse an activity that names no account, source or identifier: the

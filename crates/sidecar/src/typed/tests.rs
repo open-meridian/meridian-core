@@ -2330,3 +2330,51 @@ async fn a_role_less_page_on_two_roles_is_refused_from_v15_and_serves_both_from_
         "built before v15, it serves every role"
     );
 }
+
+/// Contract v18 (decisions/023 as amended): a plugin built at v18 names a
+/// Money's asset -- a fiat currency by its code, or its cash instrument -- and
+/// a token's code in currency_code, or neither, is refused naming the field;
+/// one built before keeps the code it always sent.
+#[tokio::test]
+async fn a_v18_plugins_money_names_its_asset_and_a_tokens_code_is_refused() {
+    use meridian_pb::plugin::v1::Money;
+    let money = |code: &str, instrument: &str| {
+        Some(Money {
+            amount: Some(wire("10")),
+            currency_code: code.into(),
+            instrument_id: instrument.into(),
+        })
+    };
+    let (sidecar, _, recorded) = registered_at(&["custody"], None, "v18").await;
+    for (said, field) in [
+        (money("USDC", ""), "currency_code"),
+        (money("", ""), "names no asset"),
+    ] {
+        let refused = sidecar
+            .record_holding(Request::new(RecordHoldingParams {
+                market_value: said,
+                ..holding("ext-1")
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(refused.message().contains(field), "{}", refused.message());
+    }
+    sidecar
+        .record_holding(Request::new(RecordHoldingParams {
+            market_value: money("", "LCL-USDC"),
+            ..holding("ext-1")
+        }))
+        .await
+        .unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    let (older, _, _) = registered_at(&["custody"], None, "v16").await;
+    older
+        .record_holding(Request::new(RecordHoldingParams {
+            market_value: money("BTC", ""),
+            ..holding("ext-1")
+        }))
+        .await
+        .unwrap();
+}

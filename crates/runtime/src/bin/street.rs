@@ -95,6 +95,15 @@ fn run() -> Result<(), String> {
         // announces itself and then cannot answer is worse than one that
         // has not arrived.
         meridian_street::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // Each currency's cash instrument (contract v18): the codes held
+        // before resolved once and said to be filled in, then any the
+        // instrument store did not answer for.
+        meridian_street::cash::load(store.as_ref());
+        tokio::spawn(meridian_street::cash::sweep_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            meridian_street::cash::SWEEP_EVERY,
+        ));
 
         // W3.9. Subscribed before this returns, like the handlers above;
         // only the moving is spawned.

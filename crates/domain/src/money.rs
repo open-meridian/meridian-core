@@ -169,3 +169,216 @@ mod tests {
         assert_eq!(token.currency_code, "", "a token has no ISO 4217 code");
     }
 }
+
+// ── Every Money a message carries ────────────────────────────────────────
+
+/// A message whose amounts a store fills with their cash instruments on what
+/// it answers, and reads the codes of on what it is sent (decisions/023 as
+/// amended): each Money it carries, however nested, visited once.
+pub trait Monies {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money));
+}
+
+impl Monies for Money {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        visit(self)
+    }
+}
+
+impl<T: Monies> Monies for Option<T> {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        if let Some(held) = self.as_mut() {
+            held.monies(visit)
+        }
+    }
+}
+
+impl<T: Monies> Monies for Vec<T> {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        for held in self.iter_mut() {
+            held.monies(visit)
+        }
+    }
+}
+
+/// Each named field visited, in order.
+macro_rules! monies {
+    ($($ty:ident { $($field:ident),* })*) => {
+        $(impl Monies for crate::v1::$ty {
+            fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+                $(self.$field.monies(visit);)*
+            }
+        })*
+    };
+}
+
+monies! {
+    LotTerms { unit_cost, cost }
+    Lot { terms }
+    BookPosition { lots }
+    OpeningLot { terms }
+    OpeningPosition { lots }
+    MovementLine { opens_lot }
+    Adjustment { lines, basis_adjustments }
+    BreakDifference { book, street }
+    Break { differences }
+    ReportedCollateral { value, value_after_haircut }
+    StatementFigures { buying_power, margin_requirement, maintenance_excess, initial_margin,
+        variation_margin, net_liquidation, collateral }
+    ReportedPositionValue { market_value, margin_requirement }
+    AgreementFigures { figures, position_values }
+    AccountFigures { figures, position_values }
+    ReportedLot { cost }
+    CustodialPosition { market_value, cost_basis, lots, margin_requirement, average_cost }
+    CustodialActivity { price, amount }
+    UnresolvedHolding { market_value }
+    Price { price }
+    Bar { open, high, low, close, vwap }
+    BookEntryReply { positions, breaks, figures }
+    ListPositionsReply { positions }
+    ListBreaksReply { breaks }
+    ListAccountFiguresReply { figures }
+    PositionChangedEvent { position }
+    BreakChangedEvent { break_record }
+    AccountFiguresRecordedEvent { figures }
+    RecordOpeningBalanceRequest { positions }
+    RecordAccountFiguresRequest { agreements }
+    RecordBreakRequest { differences }
+    CustodialPositionUpdatedEvent { position }
+    ActivityRecordedEvent { activity }
+    ListActivitiesReply { activities }
+    ListCustodialPositionsReply { positions, unresolved }
+    StatementRecordedEvent { figures }
+    ListStatementsReply { statements }
+    RecordHoldingRequest { market_value, cost_basis, lots, margin_requirement, average_cost }
+    RecordHoldingsStatementRequest { buying_power, margin_requirement, maintenance_excess, figures }
+    RecordActivityRequest { activity }
+}
+
+impl Monies for crate::v1::BasisAdjustment {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        use crate::v1::basis_adjustment::Cost;
+        match self.cost.as_mut() {
+            Some(Cost::CostChange(money)) | Some(Cost::StatedCost(money)) => visit(money),
+            None => {}
+        }
+    }
+}
+
+impl Monies for crate::v1::BreakValue {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        if let Some(crate::v1::break_value::Value::Amount(money)) = self.value.as_mut() {
+            visit(money)
+        }
+    }
+}
+
+impl Monies for crate::v1::ResolveBreakRequest {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        if let Some(crate::v1::resolve_break_request::Resolution::Adjustment(adjustment)) =
+            self.resolution.as_mut()
+        {
+            adjustment.monies(visit)
+        }
+    }
+}
+
+/// The ISO 4217 codes a message's amounts name alone, each once.
+pub fn codes<M: Monies + Clone>(message: &M) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    message.clone().monies(&mut |money| {
+        if money.instrument_id.is_empty() && is_iso4217(&money.currency_code) {
+            found.insert(money.currency_code.clone());
+        }
+    });
+    found.into_iter().collect()
+}
+
+// ── The codes this process has resolved ──────────────────────────────────
+
+fn resolved() -> &'static std::sync::RwLock<CashInstruments> {
+    static RESOLVED: std::sync::OnceLock<std::sync::RwLock<CashInstruments>> =
+        std::sync::OnceLock::new();
+    RESOLVED.get_or_init(Default::default)
+}
+
+/// A code's cash instrument, as this process learned it: from its store's
+/// own records at start, or the instrument store's answer since. A code
+/// names one cash instrument for a deployment's life, so one process-wide
+/// map serves every reader in it.
+pub fn learn(code: &str, instrument: &str) {
+    if let Ok(mut held) = resolved().write() {
+        held.insert(code, instrument);
+    }
+}
+
+/// The cash instrument a code was resolved to here, where it was.
+pub fn known(code: &str) -> Option<String> {
+    resolved()
+        .read()
+        .ok()
+        .and_then(|held| held.instrument(code).map(str::to_string))
+}
+
+/// Every amount a message carries filled with what this process has
+/// resolved: what a store answers and announces.
+pub fn fill_known<M: Monies>(message: &mut M) {
+    let held = match resolved().read() {
+        Ok(held) => held.clone(),
+        Err(_) => return,
+    };
+    message.monies(&mut |money| held.fill(money));
+}
+
+#[cfg(test)]
+mod monies_tests {
+    use super::*;
+    use crate::v1::{BookPosition, Lot, LotTerms, PositionChangedEvent};
+
+    #[test]
+    fn every_amount_a_message_nests_is_visited_and_filled_once_resolved() {
+        let mut event = PositionChangedEvent {
+            position: Some(BookPosition {
+                lots: vec![Lot {
+                    terms: Some(LotTerms {
+                        unit_cost: Some(Money {
+                            amount: None,
+                            currency_code: "ZZQ".into(),
+                            instrument_id: String::new(),
+                        }),
+                        cost: None,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(codes(&event), vec!["ZZQ"]);
+        learn("ZZQ", "LCL-ZZQ");
+        fill_known(&mut event);
+        let filled = &event.position.as_ref().unwrap().lots[0]
+            .terms
+            .as_ref()
+            .unwrap()
+            .unit_cost;
+        assert_eq!(filled.as_ref().unwrap().instrument_id, "LCL-ZZQ");
+        assert!(codes(&event).is_empty(), "nothing named by its code alone");
+    }
+}
+
+/// A code's resolution to its cash instrument, as a store keeps it, its own
+/// record (decisions/031): what, to what, when, and whether it was filled in
+/// for amounts recorded before contract v18 (`backfilled`), at the moment it
+/// was resolved, never back-dated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub code: String,
+    pub instrument_id: String,
+    pub resolved_at_ns: i64,
+    pub backfilled: bool,
+}
+
+/// How a store says a resolution was made.
+pub const RESOLVED_BY: &str = "resolved by its ISO 4217 code through the instrument store";

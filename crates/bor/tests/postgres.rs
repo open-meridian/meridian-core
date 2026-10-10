@@ -426,3 +426,26 @@ async fn a_rebuild_reproduces_every_projection() {
     });
     assert_eq!(read(&dated.records[0].trade_date_quantity), "12.5");
 }
+
+#[test]
+fn a_codes_resolution_is_kept_once_in_the_book() {
+    use meridian_domain::money::Resolution;
+    let store = store();
+    let resolution = |instrument: &str| Resolution {
+        code: "XTS".into(),
+        instrument_id: instrument.into(),
+        resolved_at_ns: 1,
+        backfilled: true,
+    };
+    store.keep_cash_instrument(&resolution("LCL-XTS")).unwrap();
+    store
+        .keep_cash_instrument(&resolution("LCL-OTHER"))
+        .unwrap();
+    assert!(store
+        .cash_instruments()
+        .unwrap()
+        .contains(&resolution("LCL-XTS")));
+    for code in store.currency_codes().unwrap() {
+        assert!(meridian_domain::money::is_iso4217(&code), "{code}");
+    }
+}

@@ -85,6 +85,7 @@
 
 pub mod activity;
 pub mod amounts;
+pub mod cash;
 pub mod ids;
 pub mod migrations;
 pub mod positions;
