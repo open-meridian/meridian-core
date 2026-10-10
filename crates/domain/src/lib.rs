@@ -17,10 +17,13 @@
 //! conductor check alike, cell by cell (W6.11, contract v14).
 
 pub mod asset_class;
+pub mod date;
 pub mod exact;
 pub mod instrument_type;
+pub mod money;
 pub mod setting_table;
 pub mod text;
+pub mod zones;
 
 /// The roles at the edge, which alone may own storage for their raw external
 /// records (decisions/028, ruled point 1 and its amendment for `reporting`;
