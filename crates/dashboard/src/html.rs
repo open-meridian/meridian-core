@@ -400,15 +400,38 @@ form.consent:has(input[name=covers][value=everything]:checked) .summary-some,\
 form.consent:has(input[name=covers][value=some]:checked) .summary-everything{display:none}\
 form.consent .picker-option{flex-wrap:wrap}form.consent .picker-option label.check{flex:1 1 14rem}\
 form.consent .picker-option label.check select{margin-left:auto}\
-form.consent details.reach{flex:1 0 calc(100% - 1.5rem);min-width:0;margin:0 0 .35rem 1.5rem;font-size:.84rem;color:var(--ink-soft)}\
-form.consent details.reach>summary{cursor:pointer;color:var(--accent)}form.consent details.reach p{margin:.2rem 0}\
-form.consent details.reach .hint{display:inline;margin:0}\
-form.consent details.reach .reach-tools{max-height:7.5rem;overflow-y:auto;overscroll-behavior:contain}\
 form.consent fieldset.deployment{max-height:none}\
-form.consent section.summary{margin:1rem 0 0;padding:.75rem 1rem;border:1px solid var(--line);border-radius:var(--radius);\
+form.consent section.summary{margin:.6rem 0 0;padding:.5rem .9rem;border:1px solid var(--line);border-radius:var(--radius);\
 background:var(--page)}form.consent section.summary h2{font-size:.95rem;margin:0 0 .35rem}\
 form.consent section.summary .hint{margin:.35rem 0 0}\
-form.consent .consent-foot{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}form.consent .consent-foot button{margin:0}";
+form.consent .consent-foot{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:.6rem}\
+form.consent .consent-foot button{margin:0}\
+form.consent .consent-foot label.until{display:flex;align-items:center;gap:.4rem;margin:0 auto 0 0;font-weight:550}\
+form.consent .consent-foot label.until select{width:auto;margin:0}\
+body:has(form.consent){height:100vh;height:100dvh;min-height:0;overflow:hidden}\
+main.sheet:has(form.consent){flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden;\
+max-width:76rem;margin:1rem auto;padding:1.1rem 1.5rem}\
+main.sheet:has(form.consent)>p{margin:.2rem 0;font-size:.9rem}\
+form.consent{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;margin-top:.5rem}\
+form.consent .consent-panes{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);gap:1rem}\
+form.consent.with-tools .consent-panes{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}\
+form.consent .consent-choose,form.consent .consent-tools{min-height:0;overflow:auto;overscroll-behavior:contain}\
+form.consent .consent-tools{padding:.6rem .85rem;border:1px solid var(--line);border-radius:var(--radius);\
+background:var(--page);font-size:.84rem;color:var(--ink-soft)}\
+form.consent .consent-tools h2{font-size:.95rem;margin:0 0 .2rem;color:var(--ink)}form.consent .consent-tools>.hint{margin:0 0 .5rem}\
+form.consent .tool-row{padding:.35rem 0 .35rem .6rem;border-left:3px solid transparent;border-top:1px solid var(--line-soft)}\
+form.consent .tool-row[data-chosen]{border-left-color:var(--accent)}\
+form.consent .tool-row h3{margin:0 0 .15rem;font-size:.86rem;color:var(--ink)}form.consent .tool-row p{margin:.1rem 0}\
+form.consent .tool-row .hint{display:inline;margin:0}\
+form.consent .consent-tabs{display:none}\
+form.consent section.summary{flex:none}form.consent section.summary p{margin:.15rem 0}\
+@media (max-width:56rem){form.consent.with-tools .consent-panes{grid-template-columns:minmax(0,1fr);grid-auto-rows:minmax(0,1fr)}\
+form.consent.tabbed .consent-tabs{display:flex;flex:none;overflow:visible;margin:.25rem 0 .5rem;padding:.1rem 0 .4rem}\
+form.consent.tabbed .consent-panes{grid-auto-rows:auto;grid-template-rows:minmax(0,1fr)}\
+form.consent.tabbed[data-pane=choose] .consent-tools,form.consent.tabbed[data-pane=tools] .consent-choose{display:none}\
+main.sheet:has(form.consent){margin:0;padding:.75rem 1rem}\
+form.consent section.summary{padding:.5rem .75rem}form.consent section.summary h2{display:none}\
+form.consent section.summary .hint{display:none}}";
 
 /// Whether this deployment was installed for development
 /// (spec/live-plugin-development, ruling 2). Process-wide, set once at start

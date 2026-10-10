@@ -776,12 +776,12 @@ fn level_select(
     )
 }
 
-/// What a plugin's levels reach on the MCP surface, folded away under it:
-/// each level held and its tools, reads and acts apart. Empty when no level
-/// reaches a tool. With the titles, for the search to find the plugin by.
+/// One row of access in the tools panel: what it is called and, for each
+/// level held on it, its tools, reads and acts apart; with the titles, for
+/// the plugins' search to find the row by. Empty when no level reaches a
+/// tool.
 fn reached(instance: &str, role: &str, held: &[AccessLevel], tools: &ToolRows) -> (String, String) {
     let mut lines = String::new();
-    let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut titles: BTreeSet<&str> = BTreeSet::new();
     for level in held {
         let name = level_name(*level);
@@ -795,7 +795,6 @@ fn reached(instance: &str, role: &str, held: &[AccessLevel], tools: &ToolRows) -
         if reached.is_empty() {
             continue;
         }
-        names.extend(reached.iter().map(|tool| tool.name.as_str()));
         titles.extend(reached.iter().map(|tool| tool.title.as_str()));
         lines.push_str(&tools_said(
             &format!("{instance}:{role}:{name}"),
@@ -803,15 +802,22 @@ fn reached(instance: &str, role: &str, held: &[AccessLevel], tools: &ToolRows) -
             reached,
         ));
     }
-    if names.is_empty() {
+    if lines.is_empty() {
         return (String::new(), String::new());
     }
+    let named = if role.is_empty() {
+        escape(instance)
+    } else {
+        format!(
+            "{} <span class=\"id\">{}</span>",
+            escape(instance),
+            escape(role)
+        )
+    };
     (
         format!(
-            "<details class=\"reach\"><summary>{n} tool{s}</summary>\
-             <div class=\"reach-tools\">{lines}</div></details>",
-            n = names.len(),
-            s = if names.len() == 1 { "" } else { "s" },
+            "<div class=\"tool-row\" data-row=\"{row}\"><h3>{named}</h3>{lines}</div>",
+            row = escape(&format!("{instance}:{role}")),
         ),
         titles.into_iter().collect::<Vec<_>>().join(" "),
     )
@@ -933,24 +939,22 @@ fn consent_page(consenting: &Consenting) -> String {
     };
 
     let mut choices = String::new();
+    // The tools panel (W6.17, W6.20): every row of access the person may
+    // allow, each with every tool it grants, all on the page before Allow.
+    let mut panel = String::new();
     if holdable.deployment_admin {
-        let reach = tools
-            .filter(|t| !t.deployment_admin.is_empty())
-            .map(|t| {
-                format!(
-                    "<details class=\"reach\"><summary>{} tools</summary>\
-                     <div class=\"reach-tools\">{}</div></details>",
-                    t.deployment_admin.len(),
-                    tools_said("deployment_admin", "", &t.deployment_admin)
-                )
-            })
-            .unwrap_or_default();
+        if let Some(t) = tools.filter(|t| !t.deployment_admin.is_empty()) {
+            panel.push_str(&format!(
+                "<div class=\"tool-row\" data-row=\"deployment_admin\"><h3>Deployment admin</h3>{}</div>",
+                tools_said("deployment_admin", "", &t.deployment_admin)
+            ));
+        }
         choices.push_str(&format!(
             "<fieldset class=\"checks deployment\"><legend>This deployment</legend>\
              <div class=\"picker-option\"><label class=\"check\"><input type=\"checkbox\" \
              name=\"deployment_admin\" value=\"1\"{on}> <span class=\"option-label\">Deployment \
              admin: its own settings, accounts and plugins, but never who holds access</span>\
-             </label>{reach}</div></fieldset>",
+             </label></div></fieldset>",
             on = checked(picked.deployment_admin),
         ));
     }
@@ -959,15 +963,15 @@ fn consent_page(consenting: &Consenting) -> String {
             .plugins
             .iter()
             .map(|((instance, role), held)| {
-                let (after, also) = tools
+                let (row, also) = tools
                     .map(|t| reached(instance, role, held, t))
                     .unwrap_or_default();
+                panel.push_str(&row);
                 Choice {
                     value: format!("{instance}:{role}"),
                     label: instance.clone(),
                     detail: role.clone(),
                     also,
-                    after,
                     control: level_select(instance, role, held, picked.level_on(instance, role)),
                     ..Default::default()
                 }
@@ -1036,32 +1040,70 @@ fn consent_page(consenting: &Consenting) -> String {
     );
     let for_days =
         format!(" For <span data-days>{days}</span> days, recorded as yours, through it.");
+    // Every tool the page grants, counted once, for the panel's tab.
+    let granted: BTreeSet<&str> = tools
+        .map(|t| {
+            t.deployment_admin
+                .iter()
+                .filter(|_| holdable.deployment_admin)
+                .chain(t.plugins.values().flatten())
+                .map(|tool| tool.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    // One screen (every page fits one screen, the product owner,
+    // 2026-10-04): the choices and the tools side by side, each scrolling
+    // in its own panel, the summary and Allow kept in view below them; on a
+    // phone, a tab each. Without script both show, one above the other.
+    let (tabs, pane) = match tools {
+        None => (String::new(), String::new()),
+        Some(_) => (
+            format!(
+                "<nav class=\"tabs consent-tabs\" aria-label=\"The choices and the tools\">\
+                 <a href=\"#consent-choose\" data-pane=\"choose\" aria-current=\"page\">What it may do</a>\
+                 <a href=\"#consent-tools\" data-pane=\"tools\">Its tools ({n})</a></nav>",
+                n = granted.len()
+            ),
+            format!(
+                "<section class=\"consent-tools\" id=\"consent-tools\" aria-labelledby=\"consent-tools-title\">\
+                 <h2 id=\"consent-tools-title\">The tools each choice grants</h2>\
+                 <p class=\"hint\">On this deployment's MCP surface, now: tick a row and its client \
+                 is listed these, reads and acts apart.</p>{}</section>",
+                if panel.is_empty() {
+                    "<p class=\"empty\">No choice here reaches a tool yet.</p>".to_string()
+                } else {
+                    panel
+                }
+            ),
+        ),
+    };
     page(
         "Allow a client",
         &format!(
             "<h1>Allow a client to act as you</h1>{who}{renewing}{started}\
-             <p><strong>Only allow it if you started this yourself, just now.</strong> If you \
+             <p class=\"consent-warn\"><strong>Only allow it if you started this yourself, just now.</strong> If you \
              did not, somebody is asking you to let them in.</p>\
-             <form method=\"post\" action=\"/oauth/authorize\" class=\"consent\">\
+             <form method=\"post\" action=\"/oauth/authorize\" class=\"consent{with}\" data-pane=\"choose\">\
              <input type=\"hidden\" name=\"request\" value=\"{id}\">\
-             <input type=\"hidden\" name=\"confirm\" value=\"{confirm}\">\
+             <input type=\"hidden\" name=\"confirm\" value=\"{confirm}\">{tabs}\
+             <div class=\"consent-panes\"><div class=\"consent-choose\" id=\"consent-choose\">\
              <fieldset class=\"choice covers\"><legend>What it may do</legend>\
              <div class=\"options\">\
              <label class=\"option\"><input type=\"radio\" name=\"covers\" value=\"everything\"{all}> \
              <span class=\"option-label\">Everything you hold, as that changes</span></label>\
              <label class=\"option\"><input type=\"radio\" name=\"covers\" value=\"some\"{some}> \
              <span class=\"option-label\">Only what is ticked</span></label></div>{from}\
-             <div class=\"choices\">{choices}</div></fieldset>\
-             <label>Until<select name=\"days\">{lasts}</select></label>\
+             <div class=\"choices\">{choices}</div></fieldset></div>{pane}</div>\
              <section class=\"summary\" aria-live=\"polite\"><h2>What it will be able to do</h2>\
              <p class=\"summary-everything\">{everything}{for_days}</p>\
              <p class=\"summary-some\"><span data-summary>{some_said}</span>{for_days}</p>\
              <p class=\"hint\">You are told a week before it lapses. You can revoke it at any \
              time from Connected clients.</p></section>\
-             <div class=\"consent-foot\">\
+             <div class=\"consent-foot\"><label class=\"until\">Until<select name=\"days\">{lasts}</select></label>\
              <button name=\"decision\" value=\"allow\" class=\"primary\">Allow</button> \
              <button name=\"decision\" value=\"deny\">Don't allow</button></div>\
              </form><script>(function () {{{picker_script}{consent_script}}})();</script>",
+            with = if tools.is_some() { " with-tools" } else { "" },
             id = escape(id),
             confirm = escape(confirm),
             all = checked(start.everything),
@@ -1114,8 +1156,40 @@ const CONSENT_SCRIPT: &str = r#"
     var days = form.querySelector("select[name=days]").value;
     Array.prototype.forEach.call(form.querySelectorAll("[data-days]"), function (span) { span.textContent = days; });
   }
-  form.addEventListener("change", update);
+  // The tools panel: each row marked while it is ticked, all of them under
+  // Everything; and on a phone, the choices and the tools a tab each.
+  function mark() {
+    var all = form.querySelector("input[name=covers][value=everything]");
+    var everything = all && all.checked;
+    Array.prototype.forEach.call(form.querySelectorAll(".tool-row[data-row]"), function (row) {
+      var key = row.getAttribute("data-row"), on = everything;
+      if (!on && key === "deployment_admin") {
+        var admin = form.querySelector("input[name=deployment_admin]");
+        on = !!(admin && admin.checked);
+      } else if (!on) {
+        Array.prototype.forEach.call(form.querySelectorAll("select[name=level]"), function (select) {
+          if (select.value && select.value.slice(0, select.value.lastIndexOf(":")) === key) on = true;
+        });
+      }
+      if (on) row.setAttribute("data-chosen", ""); else row.removeAttribute("data-chosen");
+    });
+  }
+  var tabs = form.querySelector(".consent-tabs");
+  if (tabs) {
+    form.classList.add("tabbed");
+    Array.prototype.forEach.call(tabs.querySelectorAll("a[data-pane]"), function (tab) {
+      tab.addEventListener("click", function (event) {
+        event.preventDefault();
+        form.setAttribute("data-pane", tab.getAttribute("data-pane"));
+        Array.prototype.forEach.call(tabs.querySelectorAll("a"), function (other) {
+          if (other === tab) other.setAttribute("aria-current", "page"); else other.removeAttribute("aria-current");
+        });
+      });
+    });
+  }
+  form.addEventListener("change", function () { update(); mark(); });
   update();
+  mark();
 "#;
 
 /// What the person ticked, held to what they hold now.

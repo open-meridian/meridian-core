@@ -824,7 +824,7 @@ fn choices_of(page: &str) -> &str {
     let start = page.find("<div class=\"choices\">").expect("choices");
     let end = start
         + page[start..]
-            .find("</div></fieldset><label>Until")
+            .find("</div></fieldset></div>")
             .expect("their end");
     &page[start..end]
 }
@@ -857,7 +857,9 @@ async fn the_individual_choices_show_only_for_only_what_is_ticked_and_need_no_sc
     }
     // The form's controls are plain ones: posted as they are without the
     // script, which only searches and says the summary again.
-    assert!(page.contains("<form method=\"post\" action=\"/oauth/authorize\" class=\"consent\">"));
+    assert!(page.contains(
+        "<form method=\"post\" action=\"/oauth/authorize\" class=\"consent\" data-pane=\"choose\">"
+    ));
 }
 
 #[tokio::test]
@@ -1451,8 +1453,11 @@ async fn the_consent_page_lists_each_tool_tools_list_answers_for_each_kind_of_pe
                 "{name}: the page grants no {tool}: {rows:?}"
             );
         }
-        // Each row's titles are shown, reads and acts apart.
+        // Each row's titles are shown, reads and acts apart, in the tools
+        // panel beside the choices, none folded away.
         assert!(page.contains("Reads: "), "{name}");
+        assert!(page.contains("<section class=\"consent-tools\""), "{name}");
+        assert!(!page.contains("<details"), "{name}: no tool is folded away");
         let listed = listed_through(&app, name, &everything_offered(&page)).await;
         assert_eq!(said, listed, "{name}: the page and tools/list agree");
     }
