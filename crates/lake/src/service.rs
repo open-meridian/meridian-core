@@ -537,6 +537,17 @@ impl Lake {
         }
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         reply.watermark = Some(watermark(&heads, &datasets));
+        // What the `lake_record_to_delivery_ms` band reads: from the batch
+        // sent to its rows published.
+        let sent_at = envelope.meta.as_ref().map_or(0, |m| m.published_at_ns);
+        if sent_at > 0 && reply.recorded + reply.restated > 0 {
+            tracing::info!(
+                lake_record_to_delivery_ms = (self.clock.now_ns() - sent_at).max(0) / 1_000_000,
+                recorded = reply.recorded,
+                restated = reply.restated,
+                "a batch recorded and published"
+            );
+        }
         if !want_id.is_empty() {
             self.settle(
                 want_id,
@@ -786,6 +797,9 @@ impl Lake {
 
     /// Rows past each dataset's retention removed, each removal recorded.
     pub fn apply_retention(&self) {
+        for (dataset, rows) in self.rows_per_dataset() {
+            tracing::info!(dataset, lake_rows_per_dataset = rows, "rows kept");
+        }
         let now = self.clock.now_ns();
         let config = self.config();
         for dataset in config.datasets.keys() {

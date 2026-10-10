@@ -281,9 +281,8 @@ class Reader:
         self.following = None
 
     async def on_price(self, heard):
-        for price in heard.message.prices:
-            self.heard.append(price_json(price))
-            log(heard=self.heard[-1])
+        self.heard.append(price_json(heard.message.price))
+        log(heard=self.heard[-1])
 
     async def follow(self, subjects):
         if self.following is None:
