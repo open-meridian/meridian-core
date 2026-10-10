@@ -73,7 +73,7 @@ fn person(subject: &str, name: &str) -> SignInRecord {
     }
 }
 
-fn records() -> AccessRecords {
+pub(crate) fn records() -> AccessRecords {
     let account = |id: &str, name: &str| AccountRecord {
         account_id: id.into(),
         name: name.into(),

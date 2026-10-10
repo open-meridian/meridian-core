@@ -20,6 +20,12 @@
 //! Settings, behind a stand-in conductor answering ReadMoves, AllowArchive,
 //! WithdrawArchive and SetHold as the real one records them.
 //!
+//! And, from contract v18, the Data sources page: twenty-four datasets of
+//! eight instances, with their licences, entitlements and counts, and the
+//! priorities, behind a stand-in lake and conductor answering ListDatasets,
+//! ListSourcePriorities, SetDatasetLicence, SetDatasetEntitlement and
+//! SetSourcePriority, the last with the stale guard.
+//!
 //! Ignored in the ordinary run: it serves until it is stopped. The person
 //! signed in is a deployment admin, administering every plugin, and the
 //! session it starts is printed for the browser to present.
@@ -619,6 +625,92 @@ fn set(
     Ok(())
 }
 
+/// The datasets the Data sources page lists (contract v18): eight `dgm`
+/// instances of three datasets each, long names among them, the first two
+/// entitled to three readers each, one licence set and one person's terms.
+fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
+    use meridian_domain::v1::{DatasetEntitlement, DatasetRef, ListDatasetsReply};
+    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence};
+    let vendors = [
+        ("coinbase-1", "Coinbase", ""),
+        ("kraken-1", "Kraken", ""),
+        ("alpaca-1", "IEX", "Alpaca"),
+        ("tradier-1", "Consolidated tape", "Tradier"),
+        (
+            "fed-h10-1",
+            "Board of Governors of the Federal Reserve System",
+            "",
+        ),
+        ("databento-1", "Nasdaq, NYSE and Cboe summary", "Databento"),
+        ("massive-1", "Massive", ""),
+        ("tiingo-1", "Tiingo", ""),
+    ];
+    let mut reply = ListDatasetsReply::default();
+    for (n, (instance, vendor, aggregator)) in vendors.iter().enumerate() {
+        for (k, key) in ["daily", "live", "fx_and_rates_by_release"]
+            .iter()
+            .enumerate()
+        {
+            let dataset = format!("{instance}:{key}");
+            reply.datasets.push(DatasetRef {
+                dataset: dataset.clone(),
+                instance: instance.to_string(),
+                vendor: vendor.to_string(),
+                aggregator: aggregator.to_string(),
+                declaration: Some(DatasetDeclaration {
+                    key: key.to_string(),
+                    vendor: vendor.to_string(),
+                    aggregator: aggregator.to_string(),
+                    data_types: vec!["meridian.v1.Price".into(), "meridian.v1.Bar".into()],
+                    modes: vec![1, 2],
+                    cadence: 86_400,
+                    licence_default: Some(DatasetLicence {
+                        kept: k != 1,
+                        retention_days: if k == 2 { 3650 } else { 0 },
+                        personal_use: n == 2,
+                        ..Default::default()
+                    }),
+                    day_time_zone: "America/New_York".into(),
+                    ..Default::default()
+                }),
+                unconverted_count: (n * 3 + k) as u64 * 7,
+                miss_count: (n + k) as u64,
+            });
+            if n < 2 || (n == 2 && k == 0) {
+                for reader in ["sample-reporting-1", "board-1", "compliance-1"] {
+                    reply.entitlements.push(DatasetEntitlement {
+                        dataset: dataset.clone(),
+                        instance: reader.into(),
+                        allowed: true,
+                        fields: if reader == "board-1" {
+                            vec!["meridian.v1.Price.price".into()]
+                        } else {
+                            vec![]
+                        },
+                        updated_by: ADMIN.into(),
+                        updated_at_ns: 1_791_417_600_000_000_000
+                            + (n * 3 + k) as i64 * 60_000_000_000,
+                        note: "The book's valuation reads it.".into(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    reply.licences.push(DatasetLicence {
+        dataset: "coinbase-1:daily".into(),
+        kept: true,
+        retention_days: 2555,
+        derived_use: true,
+        display: true,
+        updated_by: ADMIN.into(),
+        updated_at_ns: 1_791_417_600_000_000_000,
+        note: "Seven years, as the firm keeps its records.".into(),
+        ..Default::default()
+    });
+    reply
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "serves until stopped: make e2e-settings-page runs it for the browser"]
 async fn serve_a_plugins_settings_pages_for_a_browser() {
@@ -799,6 +891,137 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 records.holds.push(hold.clone());
             }
             Ok(("".into(), hold.encode_to_vec()))
+        });
+    }
+
+    // The stand-in lake and conductor behind the Data sources page (contract
+    // v18): the listing kept, each licence and entitlement replacing its
+    // own, each priority replaced whole against what was read.
+    let lake = Arc::new(Mutex::new((
+        lake_listing(),
+        vec![
+            meridian_domain::v1::SourcePriority {
+                data_type: "meridian.v1.Price".into(),
+                kind: 1,
+                datasets: vec![
+                    "coinbase-1:daily".into(),
+                    "kraken-1:daily".into(),
+                    "alpaca-1:daily".into(),
+                ],
+                updated_by: ADMIN.into(),
+                updated_at_ns: 1_791_417_600_000_000_000,
+                note: "The exchanges' own closes first.".into(),
+                ..Default::default()
+            },
+            meridian_domain::v1::SourcePriority {
+                data_type: "meridian.v1.Bar".into(),
+                datasets: vec!["databento-1:daily".into(), "massive-1:daily".into()],
+                updated_by: ADMIN.into(),
+                updated_at_ns: 1_791_417_600_000_000_000,
+                ..Default::default()
+            },
+        ],
+    )));
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(crate::admin::data_sources::LIST_DATASETS, move |_| {
+            Ok(("".into(), lake.lock().unwrap().0.encode_to_vec()))
+        });
+    }
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(
+            crate::admin::data_sources::LIST_SOURCE_PRIORITIES,
+            move |_| {
+                let priorities = lake.lock().unwrap().1.clone();
+                Ok((
+                    "".into(),
+                    meridian_domain::v1::ListSourcePrioritiesReply { priorities }.encode_to_vec(),
+                ))
+            },
+        );
+    }
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(
+            crate::admin::data_sources::SET_DATASET_LICENCE,
+            move |envelope| {
+                let asked =
+                    meridian_domain::v1::SetDatasetLicenceRequest::decode(&envelope.payload[..])
+                        .map_err(|e| e.to_string())?;
+                let licence = meridian_pb::v1::DatasetLicence {
+                    dataset: asked.dataset.clone(),
+                    updated_by: envelope.meta.clone().unwrap_or_default().acting_for_subject,
+                    updated_at_ns: meridian_clock::SystemClock.now_ns(),
+                    note: asked.note,
+                    ..asked.licence.unwrap_or_default()
+                };
+                let mut held = lake.lock().unwrap();
+                held.0.licences.retain(|l| l.dataset != licence.dataset);
+                held.0.licences.push(licence.clone());
+                Ok(("".into(), licence.encode_to_vec()))
+            },
+        );
+    }
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(
+            crate::admin::data_sources::SET_DATASET_ENTITLEMENT,
+            move |envelope| {
+                let asked = meridian_domain::v1::SetDatasetEntitlementRequest::decode(
+                    &envelope.payload[..],
+                )
+                .map_err(|e| e.to_string())?;
+                let entitlement = meridian_domain::v1::DatasetEntitlement {
+                    dataset: asked.dataset,
+                    instance: asked.instance,
+                    allowed: asked.allowed,
+                    fields: asked.fields,
+                    updated_by: envelope.meta.clone().unwrap_or_default().acting_for_subject,
+                    updated_at_ns: meridian_clock::SystemClock.now_ns(),
+                    note: asked.note,
+                    ..Default::default()
+                };
+                let mut held = lake.lock().unwrap();
+                held.0.entitlements.retain(|e| {
+                    !(e.dataset == entitlement.dataset && e.instance == entitlement.instance)
+                });
+                held.0.entitlements.push(entitlement.clone());
+                Ok(("".into(), entitlement.encode_to_vec()))
+            },
+        );
+    }
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(crate::admin::data_sources::SET_SOURCE_PRIORITY, move |envelope| {
+            let asked = meridian_domain::v1::SetSourcePriorityRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let mut held = lake.lock().unwrap();
+            let standing = held
+                .1
+                .iter()
+                .find(|p| p.data_type == asked.data_type && p.kind == asked.kind)
+                .map_or(0, |p| p.updated_at_ns);
+            if standing != asked.against_updated_at_ns {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::RecordChanged as i32,
+                    &["against_updated_at_ns".to_string()],
+                    "the priority changed since it was read; read it again, and nothing was changed",
+                ));
+            }
+            let priority = meridian_domain::v1::SourcePriority {
+                data_type: asked.data_type,
+                kind: asked.kind,
+                datasets: asked.datasets,
+                updated_by: envelope.meta.clone().unwrap_or_default().acting_for_subject,
+                updated_at_ns: meridian_clock::SystemClock.now_ns(),
+                note: asked.note,
+                ..Default::default()
+            };
+            held.1
+                .retain(|p| !(p.data_type == priority.data_type && p.kind == priority.kind));
+            held.1.push(priority.clone());
+            Ok(("".into(), priority.encode_to_vec()))
         });
     }
 

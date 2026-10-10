@@ -59,6 +59,7 @@ use crate::terminal::Unavailable;
 use crate::web::App;
 
 pub mod bounds;
+pub mod data_sources;
 pub mod instruments;
 pub mod plugin_area;
 pub mod tickets;
@@ -98,7 +99,10 @@ answered as withheld until a person releases it on the ticket's page. No tool ac
 assigning, resolving, closing, reopening and releasing are a person's, at the ticket's page. \
 Core's plugin-area tools read and change what the dashboard draws for a plugin, each at its page's \
 own role and level and on the instance named (dashboard__list_plugins finds them): its Summary, \
-moves, settings and access, the archive, the holds, and launching and stopping it. Two exceptions, \
+moves, settings and access, the archive, the holds, and launching and stopping it. The Data \
+sources tools, a deployment admin's, list the datasets the lake serves and the priority a default \
+read takes, and set a dataset's licence, a plugin's entitlement to it and a priority; none reads a \
+price. Two exceptions, \
 and only two: no tool reads or takes a secret setting's value -- a person enters one at the \
 Settings form, and clearing one is allowed -- and no tool changes who holds access. Every change \
 carries a note saying why, and is its own record naming the person, the delegation and the client. \
@@ -396,6 +400,9 @@ pub enum Area {
     /// The parts of a plugin's area core draws (contract v17), each at its
     /// page's gate ([`plugin_area::Gate`]).
     Plugins(plugin_area::Gate),
+    /// The Data sources page's (contract v18): the deployment admin's
+    /// capabilities.
+    DataSources,
 }
 
 impl Area {
@@ -404,6 +411,7 @@ impl Area {
             Area::Instruments => "Instruments",
             Area::Tickets => "Tickets",
             Area::Plugins(_) => "Plugins",
+            Area::DataSources => "Data sources",
         }
     }
 
@@ -417,6 +425,7 @@ impl Area {
                     || access.plugins.values().any(|held| held.holds_any())
             }
             Area::Plugins(gate) => gate.open_to(access),
+            Area::DataSources => access.deployment_admin,
         }
     }
 }
@@ -497,6 +506,7 @@ impl Tool {
                             Area::Instruments => spec.description.to_string(),
                             Area::Tickets => tickets::described(spec),
                             Area::Plugins(_) => plugin_area::described(spec),
+                            Area::DataSources => data_sources::described(spec),
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -637,6 +647,7 @@ pub fn listed_to(
         .iter()
         .chain(tickets::SPECS)
         .chain(plugin_area::SPECS)
+        .chain(data_sources::SPECS)
     {
         if spec.area.open_to(access) {
             tools.push(Tool {
@@ -782,6 +793,12 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
             // The gate it was admitted under, as the record names it
             // (contract v17): `admin on snaptrade-1:custody`.
             Area::Plugins(_) => plugin_area::call(app, caller, spec, arguments).await,
+            // At the deployment admin's capabilities, as the record names
+            // the level of the plugin area's deployment-admin tools.
+            Area::DataSources => (
+                data_sources::call(app, caller, spec, arguments).await,
+                "deployment admin".to_string(),
+            ),
         },
         Owner::Plugin {
             instance,

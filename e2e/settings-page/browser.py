@@ -24,7 +24,13 @@ needed?" So, in headless Chromium:
   om-pager, which upgrades; Allow archive's dialog within the viewport;
   allowing with a bound and withdrawing, each back on the Summary saying so;
   and the deployment's Holds tab and its dialog, a hold set from it held --
-  each page and open dialog fitting one screen at both sizes.
+  each page and open dialog fitting one screen at both sizes;
+- the Data sources page (contract v18): its Datasets, Entitlements and
+  Priority tabs, one line a row on the kit's pager, which upgrades, with no
+  cell cut off; its licence, entitlement and priority dialogs within the
+  viewport; a licence set and a priority changed from them held, and a
+  priority sent against what was read before refused as changed -- each tab
+  and open dialog fitting one screen at both sizes.
 
 PASS=fit checks the fit alone (the development deployment's run, whose
 Developer group and banner the ordinary run has not). Prints one line per
@@ -463,6 +469,91 @@ def the_raw_records_and_the_holds(browser, prefix):
         ctx.close()
 
 
+DATA_SOURCES = f"{BASE}/admin/data-sources"
+
+# The cells the ellipsis cuts whose title does not hold their text whole: a
+# long dataset name, vendor or order of datasets is cut on its one line, and
+# read whole in its title.
+CUT_UNTITLED = """(table) => [...document.querySelectorAll(table + ' td')]
+  .filter((c) => c.offsetParent !== null && c.scrollWidth > c.clientWidth + 1)
+  .filter((c) => !(c.title || '').includes(c.textContent.trim().split(' one person')[0]))
+  .map((c) => c.textContent.trim())"""
+
+
+def the_data_sources_page(browser, prefix):
+    """Contract v18: the Data sources page's three tabs and its three
+    dialogs, at both sizes, and its forms posted."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        for tab, table in [("datasets", "table.datasets"), ("entitlements", "table.entitlements"),
+                           ("priority", "table.priorities")]:
+            page.goto(f"{DATA_SOURCES}#{tab}")
+            settled(page)
+            upgraded = page.evaluate(
+                f"() => !!document.querySelector('#{tab} om-pager') && "
+                f"customElements.get('om-pager') !== undefined")
+            check(upgraded, f"at {size} the {tab} tab's rows are paged by the kit's om-pager")
+            rows = page.eval_on_selector_all(f"#{tab} {table} tbody tr", "rows => rows.length")
+            check(rows > 0, f"at {size} the {tab} tab lists its rows: {rows}")
+            cut = page.evaluate(CUT_UNTITLED, f"#{tab} {table}")
+            check(not cut, f"at {size} no cell of {tab} is cut off but one whose title holds it whole: {cut}")
+            problems = page.evaluate(FIT)
+            check(not problems, f"the Data sources page's {tab} tab at {size} fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-data-sources-{tab}-{size}.png"))
+        for tab, opener, dialog in [
+            ("datasets", "#datasets table.datasets tbody tr:first-child td:first-child button", "licence"),
+            ("datasets", "#datasets table.datasets tbody tr:first-child td.actions button[data-dialog-open=entitle]",
+             "entitle"),
+            ("priority", "#priority button[aria-label='Add a priority']", "priority-dialog"),
+        ]:
+            page.goto(f"{DATA_SOURCES}#{tab}")
+            settled(page)
+            page.click(opener)
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the {dialog} dialog stays within the viewport"
+                  f"{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the {dialog} dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-data-sources-{dialog}-{size}.png"))
+        if size == "desktop" and PASS != "fit":
+            page.goto(f"{DATA_SOURCES}#datasets")
+            settled(page)
+            page.click("#datasets table.datasets tbody tr:first-child td:first-child button")
+            page.wait_for_timeout(300)
+            page.fill("dialog#licence input[name=retention_days]", "3650")
+            page.fill("dialog#licence input[name=note]", "Ten years, as the firm now keeps them.")
+            page.click("dialog#licence button[type=submit]")
+            settled(page)
+            listed = page.text_content("#datasets")
+            check("kept 3,650 days" in listed, f"a licence set from its dialog is held: {listed[:300]!r}")
+            page.goto(f"{DATA_SOURCES}#priority")
+            settled(page)
+            page.click("#priority table.priorities tbody tr:first-child td.actions button")
+            page.wait_for_timeout(300)
+            page.fill("dialog#priority-dialog textarea[name=datasets]", "kraken-1:daily\ncoinbase-1:daily")
+            page.click("dialog#priority-dialog button[type=submit]")
+            settled(page)
+            listed = page.text_content("#priority")
+            check("kraken-1:daily then coinbase-1:daily" in listed,
+                  f"a priority changed from its dialog is held: {listed[:300]!r}")
+            # Sent against what was read before the change: refused as changed.
+            stale = page.request.post(f"{DATA_SOURCES}/priority", form={
+                "form_token": page.get_attribute("input[name=form_token]", "value"),
+                "data_type": "meridian.v1.Price", "kind": "close", "datasets": "alpaca-1:daily",
+                "against_updated_at_ns": "1791417600000000000", "note": "Read before."},
+                max_redirects=0)
+            check(stale.status == 400 and "changed since it was read" in stale.text(),
+                  f"a priority sent against an older read is refused as changed: {stale.status}")
+        check(not errors, f"the Data sources page at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def the_icon_is_linked_and_served(browser):
     """The product owner, 2026-10-06: the Open Meridian icon on the
     deployment too."""
@@ -506,6 +597,7 @@ with sync_playwright() as playwright:
         without_script_the_plain_table_posts(browser)
     the_access_editor_has_a_row_per_role(browser, prefix)
     the_raw_records_and_the_holds(browser, prefix)
+    the_data_sources_page(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),

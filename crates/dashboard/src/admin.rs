@@ -58,6 +58,13 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
         .route("/admin/holds", post(set_hold))
+        .route("/admin/data-sources", get(data_sources_page))
+        .route("/admin/data-sources/licence", post(set_dataset_licence))
+        .route(
+            "/admin/data-sources/entitlement",
+            post(set_dataset_entitlement),
+        )
+        .route("/admin/data-sources/priority", post(set_source_priority))
         .route("/admin/instruments", get(instruments_page))
         .route("/admin/instruments/complete", post(complete_instruments))
         .route("/admin/instruments/accept", post(accept_offers))
@@ -354,6 +361,7 @@ pub(crate) fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod books;
+pub mod data_sources;
 pub mod holds;
 pub mod instruments;
 mod overview;
@@ -1945,4 +1953,182 @@ async fn set_hold(
             .map(|_| ()),
         }
     })
+}
+
+// ── The Data sources page ───────────────────────────────────────────────────
+
+fn data_sources_chrome(session: &Session) -> Chrome<'_> {
+    Chrome {
+        crumbs: format!(
+            "{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_here("Data sources", None)
+        ),
+        // Reported as the dashboard's page: the ticket subjects name no
+        // lake (contract v13's SUBJECTS).
+        ..admin_chrome(session)
+    }
+}
+
+/// W10.1, W10.2: the Data sources page, for a deployment admin.
+async fn data_sources_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let (listed, priorities) = tokio::join!(
+        data_sources::datasets(&app.bus, &session.subject),
+        data_sources::priorities(&app.bus, &session.subject),
+    );
+    let body = data_sources::page(
+        &listed,
+        &priorities,
+        &records,
+        &token_input(&session),
+        field(&query, "done"),
+    );
+    Html(page_with(
+        "Data sources",
+        &body,
+        &data_sources_chrome(&session),
+    ))
+    .into_response()
+}
+
+const DATA_SOURCES: &str = "/admin/data-sources";
+
+/// A list typed as words between commas, blanks dropped.
+fn words(fields: &Fields, name: &str) -> Vec<String> {
+    list(fields, name)
+}
+
+/// A refusal's words, without the code it travels with: what the page says.
+fn refusal_words(detail: String) -> String {
+    meridian_bus::read_refusal(&detail).map_or(detail.clone(), |(_, words)| words.to_string())
+}
+
+/// W10.1: a deployment admin licenses a dataset, replacing its terms whole.
+async fn set_dataset_licence(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let outcome = match field(&fields, "retention_days").parse::<u32>() {
+        Err(_) => Err(format!(
+            "{:?} is not a number of days",
+            field(&fields, "retention_days")
+        )),
+        Ok(retention_days) => command::<meridian_pb::v1::DatasetLicence>(
+            &app,
+            &session,
+            data_sources::SET_DATASET_LICENCE,
+            "meridian.v1.SetDatasetLicenceRequest",
+            meridian_domain::v1::SetDatasetLicenceRequest {
+                dataset: field(&fields, "dataset").to_string(),
+                licence: Some(meridian_pb::v1::DatasetLicence {
+                    kept: !field(&fields, "kept").is_empty(),
+                    retention_days,
+                    derived_use: !field(&fields, "derived_use").is_empty(),
+                    display: !field(&fields, "display").is_empty(),
+                    default_fields: words(&fields, "default_fields"),
+                    personal_use: !field(&fields, "personal_use").is_empty(),
+                    ..Default::default()
+                }),
+                // Optional at the page, as a hold's is; through /mcp
+                // every change carries one.
+                note: field(&fields, "note").to_string(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(refusal_words),
+    };
+    after_to(outcome, DATA_SOURCES, DATA_SOURCES)
+}
+
+/// W10.1: a deployment admin entitles a plugin instance to a dataset, or
+/// withdraws it (no `allowed`).
+async fn set_dataset_entitlement(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let outcome = command::<meridian_domain::v1::DatasetEntitlement>(
+        &app,
+        &session,
+        data_sources::SET_DATASET_ENTITLEMENT,
+        "meridian.v1.SetDatasetEntitlementRequest",
+        meridian_domain::v1::SetDatasetEntitlementRequest {
+            dataset: field(&fields, "dataset").to_string(),
+            instance: field(&fields, "instance").to_string(),
+            allowed: !field(&fields, "allowed").is_empty(),
+            fields: words(&fields, "fields"),
+            note: field(&fields, "note").to_string(),
+        },
+    )
+    .await
+    .map(|_| ())
+    .map_err(refusal_words);
+    after_to(outcome, DATA_SOURCES, DATA_SOURCES)
+}
+
+/// W10.2: a deployment admin sets a priority, replaced whole, against the
+/// priority as it was read.
+async fn set_source_priority(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let kind = field(&fields, "kind");
+    let outcome = match (
+        field(&fields, "against_updated_at_ns").parse::<i64>(),
+        kind.is_empty()
+            .then_some(meridian_domain::v1::PriceKind::Unspecified)
+            .or_else(|| data_sources::kind_of(kind)),
+    ) {
+        (Err(_), _) => Err("the priority as it was read is not said; read it again".to_string()),
+        (_, None) => Err(format!("{kind:?} is not a kind of price")),
+        (Ok(against_updated_at_ns), Some(kind)) => command::<meridian_domain::v1::SourcePriority>(
+            &app,
+            &session,
+            data_sources::SET_SOURCE_PRIORITY,
+            "meridian.v1.SetSourcePriorityRequest",
+            meridian_domain::v1::SetSourcePriorityRequest {
+                data_type: field(&fields, "data_type").to_string(),
+                kind: kind as i32,
+                datasets: lines(&fields, "datasets"),
+                note: field(&fields, "note").to_string(),
+                against_updated_at_ns,
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(refusal_words),
+    };
+    after_to(outcome, DATA_SOURCES, DATA_SOURCES)
 }

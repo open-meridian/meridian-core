@@ -60,22 +60,11 @@ impl DataConfig {
     /// until one is set (spec/the-lake, Q8); a dataset declaring none is
     /// kept, with no retention set.
     pub fn licence(&self, dataset: &str) -> DatasetLicence {
-        if let Some(licence) = self.licences.get(dataset) {
-            return licence.clone();
-        }
-        self.declaration(dataset)
-            .and_then(|d| d.licence_default.clone())
-            .map(|terms| DatasetLicence {
-                dataset: dataset.to_string(),
-                ..terms
-            })
-            .unwrap_or(DatasetLicence {
-                dataset: dataset.to_string(),
-                kept: true,
-                derived_use: true,
-                display: true,
-                ..Default::default()
-            })
+        lake::effective_licence(
+            dataset,
+            self.licences.get(dataset),
+            self.declaration(dataset),
+        )
     }
 
     /// Whether a dataset serves a data type.

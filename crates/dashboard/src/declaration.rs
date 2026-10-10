@@ -9,8 +9,8 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    NotCarried, NotCarriedReason, NotCarriedSeen, PluginDeclaration, RawRecordKind,
-    StorageDeclaration,
+    Catalogue, DatasetDeclaration, DatasetLicence, NotCarried, NotCarriedReason, NotCarriedSeen,
+    ObservationMode, PluginDeclaration, RawRecordKind, StorageDeclaration,
 };
 
 use crate::html::escape;
@@ -24,6 +24,81 @@ pub struct Declared {
     pub not_carried: Vec<DeclaredNotCarried>,
     #[serde(default)]
     pub storage: Option<DeclaredStorage>,
+    /// A dgm's catalogue (W8.1, contract v18): absent from a version
+    /// declaring none, as the SDK uploads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue: Option<DeclaredCatalogue>,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredCatalogue {
+    #[serde(default)]
+    pub datasets: Vec<DeclaredDataset>,
+}
+
+/// One dataset as an upload carries it: each mode in its word (`pull`,
+/// `push`, `stream`), as a reason not carried is.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredDataset {
+    pub key: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub aggregator: String,
+    #[serde(default)]
+    pub data_types: Vec<String>,
+    #[serde(default)]
+    pub modes: Vec<String>,
+    #[serde(default)]
+    pub cadence: u32,
+    #[serde(default)]
+    pub history: u32,
+    #[serde(default)]
+    pub licence_default: Option<DeclaredLicence>,
+    #[serde(default)]
+    pub day_time_zone: String,
+    #[serde(default)]
+    pub day_end_minute: u32,
+    #[serde(default)]
+    pub venue_id: String,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredLicence {
+    #[serde(default)]
+    pub kept: bool,
+    #[serde(default)]
+    pub retention_days: u32,
+    #[serde(default)]
+    pub derived_use: bool,
+    #[serde(default)]
+    pub display: bool,
+    #[serde(default)]
+    pub default_fields: Vec<String>,
+    #[serde(default)]
+    pub personal_use: bool,
+}
+
+/// A mode as the wire numbers it, from its word or the enum's name.
+fn mode_of(text: &str) -> Option<ObservationMode> {
+    ObservationMode::from_str_name(text)
+        .or_else(|| {
+            ObservationMode::from_str_name(&format!(
+                "OBSERVATION_MODE_{}",
+                text.to_ascii_uppercase()
+            ))
+        })
+        .filter(|mode| *mode != ObservationMode::Unspecified)
+}
+
+/// A mode's word, as an upload carries it and the catalogue lists it.
+pub fn mode_word(mode: i32) -> &'static str {
+    match ObservationMode::try_from(mode) {
+        Ok(ObservationMode::Pull) => "pull",
+        Ok(ObservationMode::Push) => "push",
+        Ok(ObservationMode::Stream) => "stream",
+        _ => "",
+    }
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -104,9 +179,74 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 })
                 .collect(),
         }),
-        // A dgm's catalogue (W8.1, contract v18): read from the version's
-        // metadata once the lake is built (row 4).
-        catalogue: None,
+        // A dgm's catalogue (W8.1, contract v18), which the conductor holds
+        // to the dictionary's bounds when it records the version.
+        catalogue: match &declared.catalogue {
+            None => None,
+            Some(catalogue) => Some(catalogue_from_json(catalogue)?),
+        },
+    })
+}
+
+fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, String> {
+    let mut datasets = Vec::new();
+    for (i, dataset) in catalogue.datasets.iter().enumerate() {
+        let mut modes = Vec::new();
+        for (j, word) in dataset.modes.iter().enumerate() {
+            let mode = mode_of(word).ok_or_else(|| {
+                format!(
+                    "declaration.catalogue.datasets[{i}].modes[{j}] {word:?} is none of pull, push \
+                     and stream"
+                )
+            })?;
+            modes.push(mode as i32);
+        }
+        datasets.push(DatasetDeclaration {
+            key: dataset.key.clone(),
+            vendor: dataset.vendor.clone(),
+            aggregator: dataset.aggregator.clone(),
+            data_types: dataset.data_types.clone(),
+            modes,
+            cadence: dataset.cadence,
+            history: dataset.history,
+            licence_default: dataset.licence_default.as_ref().map(|l| DatasetLicence {
+                kept: l.kept,
+                retention_days: l.retention_days,
+                derived_use: l.derived_use,
+                display: l.display,
+                default_fields: l.default_fields.clone(),
+                personal_use: l.personal_use,
+                ..Default::default()
+            }),
+            day_time_zone: dataset.day_time_zone.clone(),
+            day_end_minute: dataset.day_end_minute,
+            venue_id: dataset.venue_id.clone(),
+        });
+    }
+    Ok(Catalogue { datasets })
+}
+
+/// A dataset's catalogue entry as JSON, its modes in their words.
+pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
+    serde_json::json!({
+        "key": dataset.key,
+        "vendor": dataset.vendor,
+        "aggregator": dataset.aggregator,
+        "data_types": dataset.data_types,
+        "modes": dataset.modes.iter().map(|m| mode_word(*m)).collect::<Vec<_>>(),
+        "cadence": dataset.cadence,
+        "history": dataset.history,
+        "licence_default": dataset.licence_default.as_ref().map(|l| serde_json::json!({
+            "kept": l.kept,
+            "retention_days": l.retention_days,
+            "derived_use": l.derived_use,
+            "display": l.display,
+            "default_fields": l.default_fields,
+            "personal_use": l.personal_use,
+        })),
+        "day_time_zone": dataset.day_time_zone,
+        "day_end_minute": dataset.day_end_minute,
+        "venue_id": dataset.venue_id,
     })
 }
 
@@ -128,6 +268,9 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
                 "window_days": kind.window_days,
                 "archivable": kind.archivable,
             })).collect::<Vec<_>>(),
+        })),
+        "catalogue": declaration.catalogue.as_ref().map(|catalogue| serde_json::json!({
+            "datasets": catalogue.datasets.iter().map(dataset_json).collect::<Vec<_>>(),
         })),
     })
 }
@@ -236,6 +379,38 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("not_carried[0].reason"));
+    }
+
+    #[test]
+    fn a_catalogue_s_modes_travel_as_words_as_the_sdk_uploads_them() {
+        let declared: Declared = serde_json::from_value(serde_json::json!({
+            "secret_settings": [],
+            "not_carried": [],
+            "storage": null,
+            "catalogue": {"datasets": [{
+                "key": "daily", "vendor": "Coinbase", "aggregator": "",
+                "data_types": ["meridian.v1.Price"], "modes": ["pull", "push"],
+                "cadence": 86400, "history": 365,
+                "licence_default": {"kept": true, "retention_days": 0, "derived_use": true,
+                                    "display": true, "default_fields": [], "personal_use": true},
+                "day_time_zone": "UTC", "day_end_minute": 0, "venue_id": ""
+            }]}
+        }))
+        .unwrap();
+        let declaration = from_json(&declared).unwrap();
+        let dataset = &declaration.catalogue.as_ref().unwrap().datasets[0];
+        assert_eq!(
+            dataset.modes,
+            vec![ObservationMode::Pull as i32, ObservationMode::Push as i32]
+        );
+        assert!(dataset.licence_default.as_ref().unwrap().personal_use);
+        let back = to_json(&declaration);
+        assert_eq!(back["catalogue"]["datasets"][0]["modes"][1], "push");
+        let mut bad = declared.clone();
+        bad.catalogue.as_mut().unwrap().datasets[0].modes[0] = "poll".into();
+        assert!(from_json(&bad)
+            .unwrap_err()
+            .contains("catalogue.datasets[0].modes[0]"));
     }
 
     #[test]

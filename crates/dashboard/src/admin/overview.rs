@@ -1060,7 +1060,8 @@ pub fn render(
     };
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1>\
-         <a class=\"button\" href=\"/admin/instruments\">Instruments</a></div>\
+         <a class=\"button\" href=\"/admin/instruments\">Instruments</a>\
+         <a class=\"button\" href=\"/admin/data-sources\">Data sources</a></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
          <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}</script>",
         sections.concat(),
@@ -1109,7 +1110,7 @@ fn roles_said(records: &AccessRecords, instance: &str) -> String {
 /// Tabs, dialogs, the pickers ([`picker::SCRIPT`], between the two halves),
 /// and a question before anything destructive. Without it the page is every
 /// section at once and every form posts as it did.
-const SCRIPT_START: &str = r##"(function () {
+pub(super) const SCRIPT_START: &str = r##"(function () {
   var root = document.querySelector(".admin");
   if (!root) return;
   root.classList.add("js");
@@ -1211,7 +1212,7 @@ pub(super) const NOTE_SCRIPT: &str = r##"
   })();
 "##;
 
-const SCRIPT_END: &str = r##"
+pub(super) const SCRIPT_END: &str = r##"
   // One dialog per kind of record: a New opens it empty, an Edit fills it
   // from the record it was drawn with (data-fill: fields by name, and boxes
   // ticked by name), and its heading and button say which.

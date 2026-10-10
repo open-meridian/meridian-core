@@ -186,6 +186,33 @@ pub fn entitled_fields(
     out
 }
 
+/// The licence enforced (W10.1; spec/the-lake, Q8): the deployment's, or
+/// the catalogue's default until one is set; a dataset declaring none is
+/// kept, with no retention set. The lake keeps by it, and the Data sources
+/// page draws it.
+pub fn effective_licence(
+    dataset: &str,
+    set: Option<&DatasetLicence>,
+    declaration: Option<&DatasetDeclaration>,
+) -> DatasetLicence {
+    if let Some(licence) = set {
+        return licence.clone();
+    }
+    declaration
+        .and_then(|d| d.licence_default.clone())
+        .map(|terms| DatasetLicence {
+            dataset: dataset.to_string(),
+            ..terms
+        })
+        .unwrap_or(DatasetLicence {
+            dataset: dataset.to_string(),
+            kept: true,
+            derived_use: true,
+            display: true,
+            ..Default::default()
+        })
+}
+
 /// A dataset's ID in a deployment: its instance, a colon, and its key.
 pub fn dataset_id(instance: &str, key: &str) -> String {
     format!("{instance}:{key}")

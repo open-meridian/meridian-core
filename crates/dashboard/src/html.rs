@@ -190,6 +190,15 @@ font:inherit;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:n
 table.holds .wide,table.holds .dates,table.kinds [data-archived]{display:none}table.kinds th:first-child{width:30%}\
 table.kinds th.num{width:44%}\
 table.holds .actions{display:none}table.holds th:first-child{width:38%}table.holds th:nth-child(2){width:30%}}\
+table.datasets td button.link,table.priorities td button.link{border:0;background:none;box-shadow:none;padding:0;\
+min-height:0;color:var(--accent);font:inherit;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+table.datasets th:first-child{width:17%}table.datasets th.num{width:7.5rem}table.datasets th.actions{width:10rem}\
+table.entitlements th.actions{width:10.5rem}table.priorities th:first-child{width:12rem}table.priorities th.actions{width:5rem}\
+table.datasets td.actions,table.entitlements td.actions,table.priorities td.actions{text-align:right}\
+table.entitlements form.inline{display:inline}\
+@media (max-width:640px){table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
+table.priorities .dates,table.priorities .actions{display:none}table.datasets th:first-child{width:42%}\
+table.datasets th.actions{width:5.5rem}table.entitlements th.actions{width:6.5rem}table.priorities th:first-child{width:36%}}\
 .figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\
 box-shadow:var(--shadow)}.figure-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}\
 .figure-label{min-width:0;color:var(--ink-soft);font-size:.86rem;font-weight:550;overflow-wrap:anywhere}\
