@@ -162,106 +162,6 @@ fn unreachable(detail: String) -> AskPlatformForInstrumentReply {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use meridian_bus::MemoryBackend;
-    use meridian_domain::v1::Identifier as PbIdentifier;
-
-    use super::*;
-    use crate::platform::tests::{failure, platform as platform_with, record_json, reply, Fake};
-
-    const NOW: i64 = 1_757_376_000_000_000_000;
-
-    fn bus() -> Arc<Bus> {
-        Arc::new(Bus::single(
-            "conductor-1",
-            Arc::new(MemoryBackend::new()),
-            Arc::new(meridian_clock::ManualClock::at(NOW)),
-        ))
-    }
-
-    fn asking(identifiers: Vec<PbIdentifier>) -> AskPlatformForInstrumentRequest {
-        AskPlatformForInstrumentRequest {
-            instrument_id: "LCL-USD".into(),
-            identifiers,
-            as_of_ns: NOW,
-        }
-    }
-
-    fn usd() -> PbIdentifier {
-        PbIdentifier {
-            scheme: "iso4217".into(),
-            value: "USD".into(),
-            source: String::new(),
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_answer_is_given_to_the_person_and_published_naming_the_record() {
-        let bus = bus();
-        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
-        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-USD")))]);
-        let conductor =
-            Conductor::new(bus.clone(), Arc::new(platform_with(transport)), bus.clock());
-
-        let reply = conductor.ask(&asking(vec![usd()]), "", "").await;
-        assert!(reply.reachable && reply.found);
-        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-USD");
-
-        let heard = pulled.recv().await.unwrap();
-        let event = PullInstrumentReply::decode(&heard.envelope.payload[..]).unwrap();
-        assert_eq!(event.for_instrument_id, "LCL-USD");
-        assert_eq!(event.instrument.unwrap().instrument_id, "INS-USD");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_platform_away_is_said_and_nothing_is_published() {
-        let bus = bus();
-        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
-        let transport = Fake::new(vec![
-            failure("no route to host"),
-            failure("no route to host"),
-            failure("no route to host"),
-        ]);
-        let conductor =
-            Conductor::new(bus.clone(), Arc::new(platform_with(transport)), bus.clock());
-
-        let reply = conductor.ask(&asking(vec![usd()]), "", "").await;
-        assert!(!reply.reachable);
-        assert!(!reply.detail.is_empty());
-        let quiet = tokio::time::timeout(Duration::from_millis(100), pulled.recv()).await;
-        assert!(quiet.is_err(), "nothing to keep, so nothing published");
-    }
-
-    #[tokio::test]
-    async fn a_record_with_no_open_identifier_is_not_asked_about() {
-        let bus = bus();
-        let transport = Fake::new(vec![]);
-        let conductor = Conductor::new(
-            bus.clone(),
-            Arc::new(platform_with(transport.clone())),
-            bus.clock(),
-        );
-        let reply = conductor
-            .ask(
-                &asking(vec![PbIdentifier {
-                    scheme: "cusip".into(),
-                    value: "037833100".into(),
-                    source: String::new(),
-                }]),
-                "",
-                "",
-            )
-            .await;
-        assert!(reply.reachable && !reply.found);
-        assert_eq!(
-            transport.calls(),
-            0,
-            "a licensed scheme never leaves the deployment"
-        );
-    }
-}
-
 /// W3.15, heard (contract v18): a venue a plugin's source named that the
 /// deployment does not hold.
 pub const VENUE_MISSING: &str = "platform.reference.event.venue-missing";
@@ -387,4 +287,104 @@ pub fn public_codes(
         .collect();
     codes.sort_by_key(|i| i.scheme != "iso10383");
     codes
+}
+
+#[cfg(test)]
+mod tests {
+    use meridian_bus::MemoryBackend;
+    use meridian_domain::v1::Identifier as PbIdentifier;
+
+    use super::*;
+    use crate::platform::tests::{failure, platform as platform_with, record_json, reply, Fake};
+
+    const NOW: i64 = 1_757_376_000_000_000_000;
+
+    fn bus() -> Arc<Bus> {
+        Arc::new(Bus::single(
+            "conductor-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        ))
+    }
+
+    fn asking(identifiers: Vec<PbIdentifier>) -> AskPlatformForInstrumentRequest {
+        AskPlatformForInstrumentRequest {
+            instrument_id: "LCL-USD".into(),
+            identifiers,
+            as_of_ns: NOW,
+        }
+    }
+
+    fn usd() -> PbIdentifier {
+        PbIdentifier {
+            scheme: "iso4217".into(),
+            value: "USD".into(),
+            source: String::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_given_to_the_person_and_published_naming_the_record() {
+        let bus = bus();
+        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-USD")))]);
+        let conductor =
+            Conductor::new(bus.clone(), Arc::new(platform_with(transport)), bus.clock());
+
+        let reply = conductor.ask(&asking(vec![usd()]), "", "").await;
+        assert!(reply.reachable && reply.found);
+        assert_eq!(reply.instrument.unwrap().instrument_id, "INS-USD");
+
+        let heard = pulled.recv().await.unwrap();
+        let event = PullInstrumentReply::decode(&heard.envelope.payload[..]).unwrap();
+        assert_eq!(event.for_instrument_id, "LCL-USD");
+        assert_eq!(event.instrument.unwrap().instrument_id, "INS-USD");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_platform_away_is_said_and_nothing_is_published() {
+        let bus = bus();
+        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let transport = Fake::new(vec![
+            failure("no route to host"),
+            failure("no route to host"),
+            failure("no route to host"),
+        ]);
+        let conductor =
+            Conductor::new(bus.clone(), Arc::new(platform_with(transport)), bus.clock());
+
+        let reply = conductor.ask(&asking(vec![usd()]), "", "").await;
+        assert!(!reply.reachable);
+        assert!(!reply.detail.is_empty());
+        let quiet = tokio::time::timeout(Duration::from_millis(100), pulled.recv()).await;
+        assert!(quiet.is_err(), "nothing to keep, so nothing published");
+    }
+
+    #[tokio::test]
+    async fn a_record_with_no_open_identifier_is_not_asked_about() {
+        let bus = bus();
+        let transport = Fake::new(vec![]);
+        let conductor = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(transport.clone())),
+            bus.clock(),
+        );
+        let reply = conductor
+            .ask(
+                &asking(vec![PbIdentifier {
+                    scheme: "cusip".into(),
+                    value: "037833100".into(),
+                    source: String::new(),
+                }]),
+                "",
+                "",
+            )
+            .await;
+        assert!(reply.reachable && !reply.found);
+        assert_eq!(
+            transport.calls(),
+            0,
+            "a licensed scheme never leaves the deployment"
+        );
+    }
 }

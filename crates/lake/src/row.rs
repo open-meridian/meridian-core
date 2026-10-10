@@ -49,7 +49,10 @@ impl DataType {
     }
 }
 
-/// A row: a price or a bar.
+/// A row: a price or a bar. A bar is the larger, and unboxed: rows live
+/// for one batch of at most 500, and every one is decoded from and encoded
+/// to the wire whole.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
     Price(Price),

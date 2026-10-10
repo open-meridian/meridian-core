@@ -34,13 +34,16 @@ pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-chang
 /// The segment a lake row's topic names its dataset by.
 pub const DATASET: &str = "{dataset}";
 
+/// By dataset, the fields a plugin may read; an empty set for every field.
+type Fields = BTreeMap<String, BTreeSet<String>>;
+
 /// The plugin's entitlements, as the conductor last published them: by
 /// dataset, the fields it may read, an empty set for every field. None
 /// until the configuration is first heard, when it reads nothing.
 #[derive(Clone)]
 pub struct Entitled {
     instance: String,
-    held: Arc<RwLock<Option<BTreeMap<String, BTreeSet<String>>>>>,
+    held: Arc<RwLock<Option<Fields>>>,
     watching: Arc<AtomicBool>,
     changed: Arc<watch::Sender<u64>>,
 }

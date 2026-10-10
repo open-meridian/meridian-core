@@ -173,7 +173,7 @@ fn a_priority_carries_the_stale_guard_and_what_is_served_wants_and_misses_are_ke
         .iter()
         .any(|s| s.dataset == dataset && s.readers == vec!["reporting-1"]));
     assert!(
-        store.counts().unwrap().get(&dataset).is_none(),
+        !store.counts().unwrap().contains_key(&dataset),
         "no value kept"
     );
 

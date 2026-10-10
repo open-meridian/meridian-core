@@ -188,12 +188,12 @@ impl Store for PostgresStore {
         let mut previous = BTreeMap::new();
         for row in &rows {
             let key = (row.data_type().code(), row.meta().row_key.clone());
-            if !latest.contains_key(&key) {
-                latest.insert(key, latest_of(&mut tx, dataset, row)?);
+            if let std::collections::btree_map::Entry::Vacant(held) = latest.entry(key) {
+                held.insert(latest_of(&mut tx, dataset, row)?);
             }
             let subject = (row.data_type().code(), row.subject().to_string());
-            if !previous.contains_key(&subject) {
-                previous.insert(subject, previous_of(&mut tx, dataset, row)?);
+            if let std::collections::btree_map::Entry::Vacant(held) = previous.entry(subject) {
+                held.insert(previous_of(&mut tx, dataset, row)?);
             }
         }
         let done = number(
