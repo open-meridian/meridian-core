@@ -138,8 +138,21 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// instance with `REFUSAL_REASON_WITHIN_HOLD` ([`crate::moves`]). A plugin
 /// built on it would meet `UNIMPLEMENTED` at its first move on an older
 /// sidecar, rather than a refusal at registration naming both versions. A
-/// plugin built before declares no kinds and moves nothing.
-pub const CONTRACT_CURRENT: u32 = 16;
+/// plugin built before declares no kinds and moves nothing. v17 numbered a
+/// revision of core's alone, which no plugin declares (its Q9). v18 is the
+/// lake's 1a (spec/the-lake; sdk-contract/the-lake-prices-the-book-contract):
+/// a `dgm`'s catalogue in the declaration, held to W4.1's rules at
+/// registration; its prices and bars recorded in batches of 1 to 500, the
+/// wants it hears and declines, resolving securities and venues and
+/// reporting both missing; the reading roles' reads of prices, bars and the
+/// datasets, and the conflated deliveries of each, narrowed to the subjects a
+/// receive names, of the datasets the plugin is entitled to alone, its fields
+/// stripped by its entitlement ([`crate::lake`]); a business date typed and
+/// refused when it is no date; and a Money naming its cash instrument, which
+/// a plugin may still name by its ISO 4217 code alone (decisions/023 as
+/// amended). A plugin built before declares no catalogue and hears no lake
+/// row.
+pub const CONTRACT_CURRENT: u32 = 18;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -387,7 +400,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v16); rebuild it against v2 or later"
+                 (v2 through v18); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -396,11 +409,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v17"),
+            admit("v19"),
             Err(
-                "the plugin was built against contract v17, newer than this sidecar \
-                 (v2 through v16); upgrade the runtime, or rebuild the plugin against \
-                 v16 or earlier"
+                "the plugin was built against contract v19, newer than this sidecar \
+                 (v2 through v18); upgrade the runtime, or rebuild the plugin against \
+                 v18 or earlier"
                     .into()
             )
         );
@@ -411,7 +424,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v16"
+                "the plugin declared no contract version; this sidecar accepts v2 through v18"
                     .into()
             )
         );

@@ -142,6 +142,18 @@ impl Sidecar {
         self.exact(field, value.and_then(|money| money.amount.as_ref()))
     }
 
+    /// A business date the plugin named, a day that exists (contract v18,
+    /// ruling 3 of 2026-10-09), or the refusal naming its field.
+    pub(crate) fn dates_stand(&self, payload_type: &str, payload: &[u8]) -> Result<(), Status> {
+        match crate::lake::dates_refused(payload_type, payload) {
+            None => Ok(()),
+            Some(refusal) => {
+                self.note_refusal(&refusal);
+                Err(Status::invalid_argument(refusal))
+            }
+        }
+    }
+
     /// An enum value the plugin sent, refused naming its field when the
     /// contract does not define it: proto3 carries any number, so an asset
     /// class of 99 would otherwise reach the bus as though it were one
@@ -230,6 +242,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        self.dates_stand(payload_type, &message.encode_to_vec())?;
         let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
             let (claims, roles) = self.vouched_for_configuration(
                 &topic,
@@ -299,6 +312,7 @@ impl Sidecar {
         self.granted(&topic)?;
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
+        self.dates_stand(payload_type, &message.encode_to_vec())?;
         // A command naming no account names none: a statement from a plugin
         // built before v7 is admitted with no account (crate::older).
         let account = account.filter(|account| !account.is_empty());

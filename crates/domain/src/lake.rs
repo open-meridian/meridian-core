@@ -72,6 +72,120 @@ pub fn is_field_of(declaration: &DatasetDeclaration, entry: &str) -> bool {
     type_of_entry(entry).is_some_and(|data_type| types_served(declaration).contains(&data_type))
 }
 
+/// The fields a reader may not read of a price, removed (W10.1: the
+/// receiving sidecar strips its plugin's deliveries, the lake its replies):
+/// each field entry not in `allowed`, an empty set allowing every field. The
+/// envelope is never removed. Answers the entries removed.
+pub fn strip_price(
+    price: &mut crate::v1::Price,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(PRICE_FIELDS[1]) {
+        price.kind = 0;
+    }
+    if gone(PRICE_FIELDS[2]) {
+        price.price = None;
+    }
+    if gone(PRICE_FIELDS[3]) {
+        price.basis = 0;
+    }
+    removed
+}
+
+/// [`strip_price`], for a bar.
+pub fn strip_bar(
+    bar: &mut crate::v1::Bar,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(BAR_FIELDS[1]) {
+        bar.open = None;
+    }
+    if gone(BAR_FIELDS[2]) {
+        bar.high = None;
+    }
+    if gone(BAR_FIELDS[3]) {
+        bar.low = None;
+    }
+    if gone(BAR_FIELDS[4]) {
+        bar.close = None;
+    }
+    if gone(BAR_FIELDS[5]) {
+        bar.volume = None;
+    }
+    if gone(BAR_FIELDS[6]) {
+        bar.vwap = None;
+    }
+    if gone(BAR_FIELDS[7]) {
+        bar.trade_count = None;
+    }
+    removed
+}
+
+/// The fields a plugin instance may read of each dataset it is entitled to,
+/// from the data configuration whole: its entitlement's fields, or, where
+/// those name none, the licence's default fields -- the deployment's licence,
+/// or its catalogue's default until one is set; an empty set for every field.
+pub fn entitled_fields(
+    event: &crate::v1::EntitlementsChangedEvent,
+    instance: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entitlement in event
+        .entitlements
+        .iter()
+        .filter(|e| e.instance == instance && e.allowed)
+    {
+        let Some(dataset) = event
+            .datasets
+            .iter()
+            .find(|d| d.dataset == entitlement.dataset)
+        else {
+            continue;
+        };
+        let fields = if entitlement.fields.is_empty() {
+            event
+                .licences
+                .iter()
+                .find(|l| l.dataset == entitlement.dataset)
+                .map(|l| l.default_fields.clone())
+                .or_else(|| {
+                    dataset
+                        .declaration
+                        .as_ref()
+                        .and_then(|d| d.licence_default.as_ref())
+                        .map(|l| l.default_fields.clone())
+                })
+                .unwrap_or_default()
+        } else {
+            entitlement.fields.clone()
+        };
+        out.insert(entitlement.dataset.clone(), fields.into_iter().collect());
+    }
+    out
+}
+
 /// A dataset's ID in a deployment: its instance, a colon, and its key.
 pub fn dataset_id(instance: &str, key: &str) -> String {
     format!("{instance}:{key}")

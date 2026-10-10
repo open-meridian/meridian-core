@@ -109,10 +109,12 @@ impl Loss {
     }
 }
 
-/// What waits for the plugin, in order, and a loss not yet said.
+/// What waits for the plugin, in order, and a loss not yet said. A
+/// conflated row's delivery waits under its key, so a later value replaces
+/// one not yet delivered (decisions/024): latest value first.
 #[derive(Default)]
 struct Queue {
-    items: VecDeque<plugin::Delivery>,
+    items: VecDeque<(Option<String>, plugin::Delivery)>,
     /// Deliveries waiting, its losses not counted.
     waiting: usize,
     lost: Option<Loss>,
@@ -129,7 +131,25 @@ impl Waiting {
     /// A delivery queued after any loss before it, or dropped and counted
     /// when the queue is full.
     fn push(&self, delivery: plugin::Delivery, row: &str) {
+        self.push_keyed(delivery, row, None)
+    }
+
+    /// A delivery queued, or, for a conflated row whose key already waits,
+    /// put in its place: a superseded value is dropped, never the latest.
+    fn push_keyed(&self, delivery: plugin::Delivery, row: &str, key: Option<String>) {
         let mut queue = self.queue.lock().expect("receive queue poisoned");
+        if let Some(key) = &key {
+            if let Some(waiting) = queue
+                .items
+                .iter_mut()
+                .find(|(held, _)| held.as_deref() == Some(key.as_str()))
+            {
+                waiting.1 = delivery;
+                drop(queue);
+                self.ready.notify_one();
+                return;
+            }
+        }
         if queue.waiting >= QUEUE {
             if queue.lost.is_none() {
                 tracing::warn!(row, "the plugin's delivery queue is full; dropping");
@@ -140,9 +160,9 @@ impl Waiting {
                 .add(Some(1), Some(row));
         } else {
             if let Some(loss) = queue.lost.take() {
-                queue.items.push_back(loss.delivered());
+                queue.items.push_back((None, loss.delivered()));
             }
-            queue.items.push_back(delivery);
+            queue.items.push_back((key, delivery));
             queue.waiting += 1;
         }
         drop(queue);
@@ -164,7 +184,7 @@ impl Waiting {
     /// gone, the loss after them.
     fn pop(&self) -> Option<plugin::Delivery> {
         let mut queue = self.queue.lock().expect("receive queue poisoned");
-        if let Some(item) = queue.items.pop_front() {
+        if let Some((_, item)) = queue.items.pop_front() {
             if !matches!(item.item, Some(plugin::delivery::Item::Lost(_))) {
                 queue.waiting -= 1;
             }
@@ -209,9 +229,40 @@ impl Sidecar {
             chosen
         };
 
+        // The subjects wanted of the lake's rows (contract v18; spec/the-lake,
+        // Q12): only rows about them are delivered, and none without them.
+        if request.subjects.len() > 500 {
+            let refusal = format!(
+                "subjects names {}; a receive names at most 500",
+                request.subjects.len()
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        let lake = Lake {
+            entitled: self.entitled.clone(),
+            subjects: Arc::new(request.subjects.iter().cloned().collect()),
+        };
+        self.entitled.watch(&self.bus);
+
         let waiting = Arc::new(Waiting::default());
         let (open, closed) = watch::channel(());
         for row in chosen {
+            // A row naming its dataset in its topic is heard on the subject
+            // of each dataset the plugin is entitled to, and on no other's,
+            // as entitlements change (W10.1).
+            if row.topic.contains(crate::lake::DATASET) {
+                tokio::spawn(per_dataset(
+                    row,
+                    Arc::clone(&self.bus),
+                    Arc::clone(&waiting),
+                    self.configuration.clone(),
+                    self.instance_id().to_string(),
+                    lake.clone(),
+                    closed.clone(),
+                ));
+                continue;
+            }
             let subscription = self.bus.subscribe(row.topic);
             tokio::spawn(forward(
                 row,
@@ -219,6 +270,7 @@ impl Sidecar {
                 Arc::clone(&waiting),
                 self.configuration.clone(),
                 self.instance_id().to_string(),
+                lake.clone(),
                 closed.clone(),
             ));
         }
@@ -246,6 +298,51 @@ impl Sidecar {
     }
 }
 
+/// What a receive decides the lake's rows by: the plugin's entitlements
+/// and the subjects it named.
+#[derive(Clone)]
+struct Lake {
+    entitled: crate::lake::Entitled,
+    subjects: Arc<BTreeSet<String>>,
+}
+
+/// A row naming its dataset in its topic, heard on each entitled dataset's
+/// subject: one forwarder per dataset, another started as one is entitled;
+/// a dataset withdrawn is filtered at delivery.
+async fn per_dataset(
+    row: &'static Row,
+    bus: Arc<meridian_bus::Bus>,
+    waiting: Arc<Waiting>,
+    configuration: Configuration,
+    instance: String,
+    lake: Lake,
+    mut closed: watch::Receiver<()>,
+) {
+    let mut changes = lake.entitled.changes();
+    let mut heard: BTreeSet<String> = BTreeSet::new();
+    loop {
+        for dataset in lake.entitled.datasets() {
+            if heard.insert(dataset.clone()) {
+                let subscription =
+                    bus.subscribe(&row.topic.replace(crate::lake::DATASET, &dataset));
+                tokio::spawn(forward(
+                    row,
+                    subscription,
+                    Arc::clone(&waiting),
+                    configuration.clone(),
+                    instance.clone(),
+                    lake.clone(),
+                    closed.clone(),
+                ));
+            }
+        }
+        tokio::select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            _ = closed.changed() => return,
+        }
+    }
+}
+
 /// One row's subscription, read, filtered by the read scope and queued for
 /// the plugin, its losses said; until the stream ends or the bus does.
 async fn forward(
@@ -254,6 +351,7 @@ async fn forward(
     waiting: Arc<Waiting>,
     configuration: Configuration,
     instance: String,
+    lake: Lake,
     mut closed: watch::Receiver<()>,
 ) {
     let drops = subscription.drop_count();
@@ -280,7 +378,7 @@ async fn forward(
             waiting.lose(None, None);
         }
         if let Some(heard) = heard {
-            deliver(row, heard, &waiting, &configuration, &instance).await;
+            deliver(row, heard, &waiting, &configuration, &instance, &lake).await;
         }
     }
 }
@@ -292,8 +390,31 @@ async fn deliver(
     waiting: &Waiting,
     configuration: &Configuration,
     instance: &str,
+    lake: &Lake,
 ) {
-    let envelope = heard.envelope;
+    let mut envelope = heard.envelope;
+    // A lake row (contract v18): a want to the instance serving its dataset
+    // alone; a recorded row of a dataset the plugin is entitled to, about a
+    // subject it named, its fields stripped by its entitlement, waiting
+    // under its key.
+    let mut key = None;
+    if let Some(said) = crate::lake::said(&envelope.payload_type, &envelope.payload) {
+        if said.is_want {
+            if meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
+                return;
+            }
+        } else {
+            let Some(fields) = lake.entitled.fields(&said.dataset) else {
+                return;
+            };
+            if !said.subjects.iter().any(|s| lake.subjects.contains(s)) {
+                return;
+            }
+            envelope.payload =
+                crate::lake::stripped(&envelope.payload_type, &envelope.payload, &fields);
+        }
+        key = Some(said.key);
+    }
     if envelope.payload_type != row.payload_type {
         tracing::warn!(
             row = row.name,
@@ -330,7 +451,7 @@ async fn deliver(
         .cause
         .as_ref()
         .is_some_and(|cause| cause.instance_id == instance);
-    waiting.push(
+    waiting.push_keyed(
         plugin::Delivery {
             meta: Some(plugin::DeliveryMeta {
                 message_id: meta.message_id,
@@ -345,6 +466,7 @@ async fn deliver(
             item: Some(read.item),
         },
         row.name,
+        key,
     );
 }
 

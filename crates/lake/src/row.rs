@@ -220,54 +220,10 @@ impl Observation {
     /// field entry not in `allowed`, an empty set allowing every field. The
     /// envelope is never removed. Answers the entries it removed.
     pub fn strip(&mut self, allowed: &BTreeSet<String>) -> Vec<&'static str> {
-        if allowed.is_empty() {
-            return Vec::new();
-        }
-        let mut removed = Vec::new();
-        let mut take = |entry: &'static str| -> bool {
-            let gone = !allowed.contains(entry);
-            if gone {
-                removed.push(entry);
-            }
-            gone
-        };
         match self {
-            Observation::Price(price) => {
-                if take("meridian.v1.Price.kind") {
-                    price.kind = 0;
-                }
-                if take("meridian.v1.Price.price") {
-                    price.price = None;
-                }
-                if take("meridian.v1.Price.basis") {
-                    price.basis = 0;
-                }
-            }
-            Observation::Bar(bar) => {
-                if take("meridian.v1.Bar.open") {
-                    bar.open = None;
-                }
-                if take("meridian.v1.Bar.high") {
-                    bar.high = None;
-                }
-                if take("meridian.v1.Bar.low") {
-                    bar.low = None;
-                }
-                if take("meridian.v1.Bar.close") {
-                    bar.close = None;
-                }
-                if take("meridian.v1.Bar.volume") {
-                    bar.volume = None;
-                }
-                if take("meridian.v1.Bar.vwap") {
-                    bar.vwap = None;
-                }
-                if take("meridian.v1.Bar.trade_count") {
-                    bar.trade_count = None;
-                }
-            }
+            Observation::Price(price) => lake::strip_price(price, allowed),
+            Observation::Bar(bar) => lake::strip_bar(bar, allowed),
         }
-        removed
     }
 }
 

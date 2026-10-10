@@ -16,6 +16,7 @@ pub mod contract;
 pub mod figures;
 pub mod front_door;
 pub mod grants;
+pub mod lake;
 pub mod legacy;
 pub mod live;
 mod moves;

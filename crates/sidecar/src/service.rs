@@ -127,6 +127,10 @@ pub struct Sidecar {
     /// the conductor last said it (W4.7).
     pub(crate) configuration: crate::configuration::Configuration,
 
+    /// The plugin's entitlements to the lake's datasets, as the conductor
+    /// last published them (contract v18, W10.1).
+    pub(crate) entitled: crate::lake::Entitled,
+
     /// Grants refused, and the latest reason, for the plugin report (W4.8):
     /// the sidecar sees refusals the plugin cannot report about itself.
     pub(crate) refusals: Arc<std::sync::Mutex<(i64, String)>>,
@@ -196,7 +200,9 @@ impl Sidecar {
             Arc::clone(&bus),
             identity.instance_id.clone(),
         );
+        let entitled = crate::lake::Entitled::new(identity.instance_id.clone());
         Self {
+            entitled,
             clock: bus.clock(),
             bus,
             deployment_id: deployment_id.into(),
@@ -392,9 +398,20 @@ impl SidecarService for Sidecar {
         // secret, a reason for what it does not carry, and storage only at
         // the edge (decisions/028). Refused at the door, naming the field.
         if let Some(declaration) = &req.declaration {
-            if let Some(refusal_reason) =
+            // And a dgm's catalogue (contract v18, W4.1): on a version holding
+            // dgm alone, each key once, its data types and fields the lake's,
+            // its time zone one the tz database names.
+            let refused =
                 crate::edge::declaration_refused(declaration, &req.settings, &self.identity.roles)
-            {
+                    .or_else(|| {
+                        declaration.catalogue.as_ref().and_then(|catalogue| {
+                            meridian_domain::lake::catalogue_refused(
+                                catalogue,
+                                &self.identity.roles,
+                            )
+                        })
+                    });
+            if let Some(refusal_reason) = refused {
                 return Ok(Response::new(RegisterReply {
                     admitted: false,
                     refusal_reason,
@@ -427,6 +444,11 @@ impl SidecarService for Sidecar {
         // No grants at all is admitted: a plugin holding no role, or only
         // roles no row names yet, registers and is refused every topic
         // (decisions/020). The reference plugin is one.
+
+        // Its entitlements to the lake's datasets, heard from now on
+        // (contract v18): the conductor publishes the configuration on this
+        // plugin's first registration.
+        self.entitled.watch(&self.bus);
 
         *self.state.write().expect("state lock poisoned") = Some(Registration {
             instance_id: self.identity.instance_id.clone(),
@@ -809,9 +831,66 @@ mod tests {
         }
     }
 
+    /// Contract v18, W4.1: a catalogue on a version not holding dgm, or one
+    /// breaking the rules, refuses the registration naming it; a dgm's
+    /// catalogue within them registers.
+    #[tokio::test]
+    async fn a_catalogue_is_a_dgms_and_held_to_its_rules_at_registration() {
+        use meridian_pb::v1::{Catalogue, DatasetDeclaration, PluginDeclaration};
+        let catalogue = |zone: &str| PluginDeclaration {
+            catalogue: Some(Catalogue {
+                datasets: vec![DatasetDeclaration {
+                    key: "daily".into(),
+                    vendor: "Coinbase".into(),
+                    data_types: vec!["meridian.v1.Price".into()],
+                    modes: vec![1],
+                    day_time_zone: zone.into(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let register = |roles: &[&str], declaration: PluginDeclaration| {
+            let sidecar = Sidecar::new(
+                Arc::new(Bus::single(
+                    "sidecar-1",
+                    Arc::new(MemoryBackend::new()),
+                    Arc::new(meridian_clock::SystemClock),
+                )),
+                "dep-local-1",
+                Identity::new("plugin-1", roles.iter().map(|r| r.to_string()).collect()),
+            );
+            async move {
+                sidecar
+                    .register(Request::new(RegisterRequest {
+                        schema_version: "v18".into(),
+                        declaration: Some(declaration),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+            }
+        };
+        let custody = register(&["custody"], catalogue("Etc/UTC")).await;
+        assert!(
+            !custody.admitted && custody.refusal_reason.contains("not dgm"),
+            "{}",
+            custody.refusal_reason
+        );
+        let zone = register(&["dgm"], catalogue("Mars/Base")).await;
+        assert!(
+            !zone.admitted && zone.refusal_reason.contains("day_time_zone"),
+            "{}",
+            zone.refusal_reason
+        );
+        let dgm = register(&["dgm"], catalogue("Etc/UTC")).await;
+        assert!(dgm.admitted, "{}", dgm.refusal_reason);
+    }
+
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v17"] {
+        for declared in ["v1", "v19"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -820,7 +899,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v16"));
+            assert!(reply.refusal_reason.contains("v2 through v18"));
             assert!(sc.registration().is_none());
         }
     }

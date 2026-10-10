@@ -307,3 +307,150 @@ fn a_bus_drop_is_said_with_no_count_and_no_row_which_is_every_row() {
         (3, vec!["A".to_string(), "B".to_string()])
     );
 }
+
+/// Contract v18 (W10.1, W10.5; spec/the-lake, Q12): a reader hears the
+/// recorded rows of the datasets it is entitled to, about the subjects it
+/// named, the fields it may not read stripped; a dataset it is not entitled
+/// to, and a subject it did not name, are not delivered.
+#[tokio::test]
+async fn a_reader_hears_its_entitled_datasets_rows_about_its_subjects_stripped() {
+    use meridian_domain::v1::{
+        DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, ObservationMeta, Price,
+        PricesRecordedEvent, Source, SubjectRef,
+    };
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.{dataset}.event.prices-recorded\tevent\tlake\treporting\n\
+         platform.config.event.entitlements-changed\tevent\tconductor\tlake,sidecar\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\nreporting\trole\nlake\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::single(
+        "reporting-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    let sidecar = Sidecar::under(
+        &contract,
+        Arc::clone(&bus),
+        "DEP-test",
+        Identity::new("reporting-1", vec!["reporting".into()]),
+    );
+    sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v18".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let configuration = EntitlementsChangedEvent {
+        datasets: ["coinbase-1:daily", "kraken-1:daily"]
+            .iter()
+            .map(|d| DatasetRef {
+                dataset: d.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+        entitlements: vec![DatasetEntitlement {
+            dataset: "coinbase-1:daily".into(),
+            instance: "reporting-1".into(),
+            allowed: true,
+            fields: vec![
+                "meridian.v1.Price.price".into(),
+                "meridian.v1.Price.kind".into(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    bus.publish(
+        crate::lake::ENTITLEMENTS_CHANGED,
+        "meridian.v1.EntitlementsChangedEvent",
+        configuration.encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest {
+            rows: vec!["PricesRecorded".into()],
+            subjects: vec!["LCL-BTC".into()],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let price = |dataset: &str, subject: &str| PricesRecordedEvent {
+        price: Some(Price {
+            meta: Some(ObservationMeta {
+                subjects: vec![SubjectRef {
+                    entity_id: subject.into(),
+                }],
+                source: Some(Source {
+                    dataset: dataset.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            kind: 1,
+            basis: 1,
+            ..Default::default()
+        }),
+    };
+    for (dataset, subject) in [
+        ("kraken-1:daily", "LCL-BTC"),
+        ("coinbase-1:daily", "LCL-ETH"),
+        ("coinbase-1:daily", "LCL-BTC"),
+    ] {
+        bus.publish(
+            &format!("platform.lake.{dataset}.event.prices-recorded"),
+            "meridian.v1.PricesRecordedEvent",
+            price(dataset, subject).encode_to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    let delivery = next(&mut stream).await;
+    let Some(plugin::delivery::Item::PricesRecorded(heard)) = delivery.item else {
+        panic!("{delivery:?}");
+    };
+    let heard = heard.price.unwrap();
+    let meta = heard.meta.unwrap();
+    assert_eq!(meta.source.unwrap().dataset, "coinbase-1:daily");
+    assert_eq!(meta.subjects[0].entity_id, "LCL-BTC");
+    assert_eq!(heard.kind, 1, "an entitled field kept");
+    assert_eq!(heard.basis, 0, "a field not entitled stripped");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "nothing else was delivered"
+    );
+}
+
+#[test]
+fn a_conflated_rows_later_value_replaces_the_one_waiting() {
+    let waiting = Waiting::default();
+    let delivery = |row: &str| plugin::Delivery {
+        meta: Some(plugin::DeliveryMeta {
+            row: row.into(),
+            ..Default::default()
+        }),
+        item: None,
+    };
+    waiting.push_keyed(delivery("first"), "PricesRecorded", Some("k".into()));
+    waiting.push_keyed(delivery("other"), "PricesRecorded", Some("j".into()));
+    waiting.push_keyed(delivery("latest"), "PricesRecorded", Some("k".into()));
+    assert_eq!(waiting.pop().unwrap().meta.unwrap().row, "latest");
+    assert_eq!(waiting.pop().unwrap().meta.unwrap().row, "other");
+    assert!(waiting.pop().is_none());
+}
