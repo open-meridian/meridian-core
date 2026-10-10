@@ -58,6 +58,13 @@ pub struct NatsBackend {
     /// Shared with every subscription's forwarding task, which is where a
     /// drop happens.
     dropped: Arc<AtomicU64>,
+
+    /// What `publish` hands the broker, in the order it was published: one
+    /// task takes each in turn, so a publisher's messages reach the broker,
+    /// and so each subscriber, in the order they were sent. A batch of the
+    /// lake's trades is heard in its sequence (contract v19), which a task
+    /// per message did not keep.
+    outbox: mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
 impl NatsBackend {
@@ -83,11 +90,21 @@ impl NatsBackend {
                 detail: failed.to_string(),
             })?;
 
+        let (outbox, mut sending) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        let publishing = client.clone();
+        tokio::spawn(async move {
+            while let Some((subject, bytes)) = sending.recv().await {
+                if let Err(failed) = publishing.publish(subject.clone(), bytes.into()).await {
+                    tracing::warn!(topic = subject, %failed, "the broker did not take a message");
+                }
+            }
+        });
         Ok(Self {
             client,
             handle: tokio::runtime::Handle::current(),
             sequences: Mutex::new(HashMap::new()),
             dropped: Arc::new(AtomicU64::new(0)),
+            outbox,
         })
     }
 
@@ -154,17 +171,17 @@ impl Backend for NatsBackend {
 
         let sequence = self.next_sequence(topic);
         let bytes = envelope.encode_to_vec();
-        let client = self.client.clone();
-        let subject = topic.to_string();
 
-        // Spawned rather than awaited: publish is synchronous above this
+        // Queued rather than awaited: publish is synchronous above this
         // trait, and blocking a caller on a broker round trip would make every
-        // publisher wait for the slowest link in the deployment.
-        self.handle.spawn(async move {
-            if let Err(failed) = client.publish(subject.clone(), bytes.into()).await {
-                tracing::warn!(topic = subject, %failed, "the broker did not take a message");
-            }
-        });
+        // publisher wait for the slowest link in the deployment. One queue,
+        // taken in order, so what is published in order arrives in order.
+        if self.outbox.send((topic.to_string(), bytes)).is_err() {
+            tracing::warn!(
+                topic,
+                "the broker's publishing task has stopped; a message was not sent"
+            );
+        }
 
         Ok(sequence)
     }
