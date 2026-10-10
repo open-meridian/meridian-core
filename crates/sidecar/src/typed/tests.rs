@@ -2378,3 +2378,117 @@ async fn a_v18_plugins_money_names_its_asset_and_a_tokens_code_is_refused() {
         .await
         .unwrap();
 }
+
+// ── Contract v18: a dgm reads an instrument's record (W3.6) ─────────────────
+
+/// Ruled 2026-10-10: a `dgm` reads the record of an instrument another
+/// source resolved -- the book's, from a custodian's CUSIP and symbol -- to
+/// find among its identifiers one its vendor takes. Against the contract
+/// this runtime was built with, so a revision taking the row from `dgm`
+/// fails here; a role the row does not name is still refused, before
+/// anything leaves.
+#[tokio::test]
+async fn a_dgm_resolves_an_instrument_and_a_role_without_the_row_is_still_refused() {
+    use meridian_domain::v1::{
+        Identifier as Named, InstrumentRecord, ResolveInstrumentReply, ResolveInstrumentRequest,
+    };
+    use meridian_pb::plugin::v1::ResolveInstrumentParams;
+
+    const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
+    for (held, granted) in [("dgm", true), ("custody", false), ("signal", false)] {
+        let bus = Arc::new(Bus::single(
+            "alpaca-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
+            Ok((
+                "meridian.v1.PluginConfiguration".into(),
+                PluginConfiguration {
+                    plugin_instance_id: "alpaca-1".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let keeping = Arc::clone(&asked);
+        bus.serve(RESOLVE_INSTRUMENT, move |envelope| {
+            let request = ResolveInstrumentRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            keeping.lock().unwrap().push(request.instrument_id.clone());
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: request.instrument_id,
+                        identifiers: vec![
+                            Named {
+                                scheme: "cusip".into(),
+                                value: "74347X831".into(),
+                                source: String::new(),
+                            },
+                            Named {
+                                scheme: "symbol".into(),
+                                value: "TQQQ".into(),
+                                source: "snaptrade".into(),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let sidecar = Sidecar::under(
+            Contract::embedded(),
+            Arc::clone(&bus),
+            "DEP-test",
+            Identity::new("alpaca-1", vec![held.to_string()]),
+        );
+        let reply = sidecar
+            .register(Request::new(RegisterRequest {
+                schema_version: "v2".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.admitted, "{held}: {}", reply.refusal_reason);
+        assert_eq!(
+            reply.publish_grants.iter().any(|t| t == RESOLVE_INSTRUMENT),
+            granted,
+            "{held}'s grants: {:?}",
+            reply.publish_grants
+        );
+
+        let answer = sidecar
+            .resolve_instrument(Request::new(ResolveInstrumentParams {
+                instrument_id: "LCL-TQQQ".into(),
+                as_of_ns: 1_760_000_000_000_000_000,
+            }))
+            .await;
+        if granted {
+            let record = answer.expect("a dgm reads the record").into_inner();
+            assert!(record.found);
+            let symbols: Vec<_> = record
+                .instrument
+                .unwrap()
+                .identifiers
+                .into_iter()
+                .filter(|i| i.scheme == "symbol")
+                .map(|i| (i.source, i.value))
+                .collect();
+            assert_eq!(symbols, [("snaptrade".to_string(), "TQQQ".to_string())]);
+            assert_eq!(*asked.lock().unwrap(), ["LCL-TQQQ"]);
+        } else {
+            let refused = answer.unwrap_err();
+            assert_eq!(refused.code(), Code::PermissionDenied, "{held}");
+            assert!(
+                asked.lock().unwrap().is_empty(),
+                "{held}'s ask left the sidecar"
+            );
+        }
+    }
+}

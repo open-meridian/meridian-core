@@ -85,7 +85,7 @@ platform.reference.query.ask-platform-for-instrument	query	dashboard	conductor
 platform.reference.query.list-instruments-to-complete	query	dashboard	instrument
 platform.reference.query.read-instrument-history	query	dashboard	instrument
 platform.reference.query.resolve-identifier	query	custody,dgm,lake,street,bor	instrument
-platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor,lake	instrument
+platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor,lake,dgm	instrument
 platform.reference.query.resolve-venue	query	dgm	instrument
 platform.street.command.re-resolve-activity	command	custody	street
 platform.street.command.record-activity	command	custody	street
