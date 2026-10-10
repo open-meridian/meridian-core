@@ -101,10 +101,11 @@ impl Conductor {
         };
         let asked = tokio::time::timeout(
             ASKING,
-            self.platform.ask(&request.identifiers, as_of_ns, now_ns),
+            self.platform
+                .ask_with_venues(&request.identifiers, as_of_ns, now_ns),
         )
         .await;
-        let record = match asked {
+        let (record, venues) = match asked {
             Err(_) => {
                 return unreachable("the platform did not answer in time".into());
             }
@@ -130,8 +131,8 @@ impl Conductor {
                 instrument: Some(record.clone()),
                 for_instrument_id: request.instrument_id.clone(),
                 // The venues the platform's answer names (contract v18,
-                // W3.5): carried once the conductor pulls them (row 4).
-                venues: Vec::new(),
+                // W3.5): its listing venue and that venue's operating venue.
+                venues,
             }
             .encode_to_vec(),
             Some(correlation).filter(|c| !c.is_empty()),
@@ -259,4 +260,131 @@ mod tests {
             "a licensed scheme never leaves the deployment"
         );
     }
+}
+
+/// W3.15, heard (contract v18): a venue a plugin's source named that the
+/// deployment does not hold.
+pub const VENUE_MISSING: &str = "platform.reference.event.venue-missing";
+
+/// How long one venue's codes are not asked about again: a plugin reports a
+/// miss each time it meets the venue, and the platform needs asking once
+/// (W3.15: the conductor asks again when the venue is next reported, after
+/// this).
+const ASKED_AGAIN_AFTER: Duration = Duration::from_secs(600);
+
+/// Asks the platform about each venue a plugin reports missing, by its public
+/// codes alone, one venue at a time and never the whole list, and publishes
+/// what came back for the instrument store to keep (W3.15, W3.3, W3.5). No
+/// person asks: the ask carries no holding and no licensed identifier.
+pub struct VenueAsker {
+    bus: Arc<Bus>,
+    platform: Arc<Platform>,
+    clock: Arc<dyn Clock>,
+}
+
+impl VenueAsker {
+    pub fn new(bus: Arc<Bus>, platform: Arc<Platform>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            bus,
+            platform,
+            clock,
+        }
+    }
+
+    /// Subscribe before returning; the loop that asks is what is left.
+    pub fn start(self) -> impl std::future::Future<Output = ()> {
+        let mut missing = self.bus.subscribe(VENUE_MISSING);
+        async move {
+            let mut asked: std::collections::BTreeMap<(String, String, String), i64> =
+                std::collections::BTreeMap::new();
+            while let Some(delivery) = missing.recv().await {
+                let Ok(event) = meridian_domain::v1::MissingVenueDetectedEvent::decode(
+                    &delivery.envelope.payload[..],
+                ) else {
+                    tracing::warn!("a venue reported missing did not decode");
+                    continue;
+                };
+                let now = self.clock.now_ns();
+                asked.retain(|_, at| now - *at < ASKED_AGAIN_AFTER.as_nanos() as i64);
+                for identifier in public_codes(&event.identifiers) {
+                    let key = (
+                        identifier.scheme.clone(),
+                        identifier.value.clone(),
+                        identifier.source.clone(),
+                    );
+                    if asked.contains_key(&key) {
+                        continue;
+                    }
+                    asked.insert(key, now);
+                    let as_of = if event.as_of_ns > 0 {
+                        event.as_of_ns
+                    } else {
+                        now
+                    };
+                    let pulled = tokio::time::timeout(
+                        ASKING,
+                        self.platform.pull_venue(&identifier, as_of, now),
+                    )
+                    .await;
+                    let venues = match pulled {
+                        Err(_) => {
+                            tracing::warn!(
+                                scheme = identifier.scheme,
+                                value = identifier.value,
+                                "the platform did not answer a venue's ask in time"
+                            );
+                            continue;
+                        }
+                        Ok(Err(failed)) => {
+                            tracing::warn!(scheme = identifier.scheme, value = identifier.value, %failed, "a venue's ask failed");
+                            continue;
+                        }
+                        Ok(Ok(venues)) => venues,
+                    };
+                    if venues.is_empty() {
+                        tracing::info!(
+                            scheme = identifier.scheme,
+                            value = identifier.value,
+                            "the platform holds no venue by these codes yet"
+                        );
+                        continue;
+                    }
+                    let meta = delivery.envelope.meta.clone().unwrap_or_default();
+                    if let Err(failed) = self.bus.publish(
+                        INSTRUMENT_PULLED,
+                        "meridian.v1.PullInstrumentReply",
+                        PullInstrumentReply {
+                            found: false,
+                            instrument: None,
+                            for_instrument_id: String::new(),
+                            venues,
+                        }
+                        .encode_to_vec(),
+                        Some(meta.correlation_id.as_str()).filter(|c| !c.is_empty()),
+                        Some(meta.message_id.as_str()).filter(|c| !c.is_empty()),
+                    ) {
+                        tracing::warn!(%failed, "a venue the platform answered was not published");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A venue's public codes, which alone are asked by: a MIC under `iso10383`,
+/// and a vendor's code as a `symbol` with its source. A MIC first.
+pub fn public_codes(
+    identifiers: &[meridian_domain::v1::Identifier],
+) -> Vec<meridian_domain::v1::Identifier> {
+    let mut codes: Vec<_> = identifiers
+        .iter()
+        .filter(|i| {
+            (i.scheme == "iso10383" && i.source.is_empty() && !i.value.is_empty())
+                || (i.scheme == "symbol" && !i.source.is_empty() && !i.value.is_empty())
+        })
+        .cloned()
+        .collect();
+    codes.sort_by_key(|i| i.scheme != "iso10383");
+    codes
 }

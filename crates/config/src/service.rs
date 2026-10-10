@@ -414,6 +414,10 @@ struct Context {
     grant: crate::archive::ArchiveGrant,
     /// The kinds of raw record each plugin last declared (W4.1, W4.8).
     kinds: crate::archive::Kinds,
+    /// The instances heard registered since this started: the first report
+    /// of each publishes the data configuration, so its sidecar hears its
+    /// entitlements (contract v18).
+    registered: Mutex<BTreeSet<String>>,
 }
 
 impl Context {
@@ -535,6 +539,21 @@ impl Context {
                 problems.join("; ")
             ))
         }
+    }
+
+    /// The deployment's data configuration, published whole (W10.1).
+    fn publish_data(&self) -> Result<(), String> {
+        let event = crate::data::configuration(&self.snapshot()?, self.clock.now_ns());
+        self.bus
+            .publish(
+                crate::data::ENTITLEMENTS_CHANGED,
+                "meridian.v1.EntitlementsChangedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|failed| failed.to_string())
     }
 
     /// Announce each plugin whose configuration a change moved. Carries no
@@ -755,6 +774,7 @@ pub fn serve_with(
         reported: Mutex::new(BTreeMap::new()),
         grant,
         kinds: Mutex::new(BTreeMap::new()),
+        registered: Mutex::new(BTreeSet::new()),
     });
 
     // Links made before an account held one external account at most are
@@ -822,6 +842,66 @@ pub fn serve_with(
             Ok(hold)
         },
     );
+
+    answer(
+        &context,
+        crate::data::SET_DATASET_LICENCE,
+        (
+            "meridian.v1.SetDatasetLicenceRequest",
+            "meridian.v1.DatasetLicence",
+        ),
+        |cx, request: meridian_domain::v1::SetDatasetLicenceRequest, envelope| {
+            let licence = crate::data::set_licence(
+                cx.store.as_ref(),
+                &cx.snapshot()?,
+                &request,
+                &author(envelope),
+                cx.clock.now_ns(),
+            )?;
+            cx.publish_data()?;
+            Ok(licence)
+        },
+    );
+
+    answer(
+        &context,
+        crate::data::SET_DATASET_ENTITLEMENT,
+        (
+            "meridian.v1.SetDatasetEntitlementRequest",
+            "meridian.v1.DatasetEntitlement",
+        ),
+        |cx, request: meridian_domain::v1::SetDatasetEntitlementRequest, envelope| {
+            let entitlement = crate::data::set_entitlement(
+                cx.store.as_ref(),
+                &cx.snapshot()?,
+                &request,
+                &author(envelope),
+                cx.clock.now_ns(),
+            )?;
+            cx.publish_data()?;
+            Ok(entitlement)
+        },
+    );
+
+    // The data configuration, on the conductor's start and every minute
+    // besides (W10.1): whoever started since hears it whole.
+    let publishing = Arc::clone(&context);
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(crate::data::REPUBLISH_EVERY);
+        loop {
+            every.tick().await;
+            let cx = Arc::clone(&publishing);
+            match tokio::task::spawn_blocking(move || cx.publish_data()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(failed)) => {
+                    tracing::warn!("the data configuration was not published: {failed}")
+                }
+                Err(failed) => {
+                    tracing::warn!("the data configuration was not published: {failed}")
+                }
+            }
+        }
+    });
 
     answer(
         &context,
@@ -1526,6 +1606,23 @@ pub fn serve_with(
                     held.insert(plugin.plugin_instance_id.clone(), kinds);
                 }
             }
+            // Its catalogue (contract v18), kept whole; a change, or its
+            // first registration since this started, publishes the data
+            // configuration.
+            let catalogue = (report.registered && own).then(|| {
+                report
+                    .declaration
+                    .as_ref()
+                    .and_then(|declaration| declaration.catalogue.clone())
+                    .unwrap_or_default()
+            });
+            let first = report.registered
+                && own
+                && noting
+                    .registered
+                    .lock()
+                    .map(|mut heard| heard.insert(plugin.plugin_instance_id.clone()))
+                    .unwrap_or(false);
             let declared = (report.registered && own).then_some(report.declared_settings);
             let store = Arc::clone(&noting.store);
             let instance = plugin.plugin_instance_id.clone();
@@ -1533,8 +1630,20 @@ pub fn serve_with(
             // as secret or not, is cleared as the declaration is kept, the
             // clear its own record naming the re-declaration (W6.11).
             let now = noting.clock.now_ns();
+            let catalogued = Arc::clone(&noting);
             let keeping = move || -> Result<Vec<String>, crate::StoreError> {
                 store.record_plugin(&plugin)?;
+                let changed = match &catalogue {
+                    Some(catalogue) => {
+                        store.record_catalogue(&plugin.plugin_instance_id, catalogue, now)?
+                    }
+                    None => false,
+                };
+                if changed || first {
+                    if let Err(failed) = catalogued.publish_data() {
+                        tracing::warn!("the data configuration was not published: {failed}");
+                    }
+                }
                 match declared {
                     Some(declared) => {
                         store.record_declared_settings(&plugin.plugin_instance_id, &declared, now)

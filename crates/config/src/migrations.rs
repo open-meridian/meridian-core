@@ -117,6 +117,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0015_cores_plugin_area_is_at_parity_on_the_mcp.sql"),
         then: Some(launches_not_known),
     },
+    Migration {
+        version: 16,
+        name: "the_lake_prices_the_book",
+        sql: include_str!("../migrations/0016_the_lake_prices_the_book.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 15's gap records (contract v17, decisions/031 point 4): for

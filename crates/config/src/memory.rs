@@ -35,6 +35,9 @@ pub struct MemoryStore {
     launch_notes: Mutex<Vec<LaunchNote>>,
     /// Each move of raw records (W4.13), numbered from 1 in order.
     moves: Mutex<Vec<RecordedMove>>,
+    /// Each licence and entitlement change, in order (contract v18).
+    licences: Mutex<Vec<meridian_pb::v1::DatasetLicence>>,
+    entitlements: Mutex<Vec<meridian_domain::v1::DatasetEntitlement>>,
 }
 
 impl MemoryStore {
@@ -58,6 +61,8 @@ impl MemoryStore {
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
+            licences: Mutex::new(Vec::new()),
+            entitlements: Mutex::new(Vec::new()),
         }
     }
 
@@ -185,6 +190,30 @@ impl Store for MemoryStore {
         snapshot
             .archives
             .sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+        // Each dataset's latest licence, and each entitlement's latest.
+        for licence in self.licences.lock().expect("store lock poisoned").iter() {
+            snapshot
+                .licences
+                .retain(|held| held.dataset != licence.dataset);
+            snapshot.licences.push(licence.clone());
+        }
+        snapshot.licences.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+        for entitlement in self
+            .entitlements
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+        {
+            snapshot.entitlements.retain(|held| {
+                (held.dataset.as_str(), held.instance.as_str())
+                    != (entitlement.dataset.as_str(), entitlement.instance.as_str())
+            });
+            snapshot.entitlements.push(entitlement.clone());
+        }
+        snapshot.entitlements.sort_by(|a, b| {
+            (a.dataset.as_str(), a.instance.as_str())
+                .cmp(&(b.dataset.as_str(), b.instance.as_str()))
+        });
         for change in self.changes.lock().expect("store lock poisoned").iter() {
             if matches!(change.kind, ChangeKind::Set | ChangeKind::Cleared) {
                 snapshot.settings_changed.insert(
@@ -665,6 +694,66 @@ impl Store for MemoryStore {
         let latest = self.latest_moves(instance_id);
         Ok(archived_spans(
             latest.iter().filter_map(|held| held.record.r#move.as_ref()),
+        ))
+    }
+
+    fn record_catalogue(
+        &self,
+        instance_id: &str,
+        catalogue: &meridian_pb::v1::Catalogue,
+        _at_ns: i64,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        if state.catalogues.get(instance_id) == Some(catalogue) {
+            return Ok(false);
+        }
+        state
+            .catalogues
+            .insert(instance_id.to_string(), catalogue.clone());
+        Ok(true)
+    }
+
+    fn set_dataset_licence(&self, licence: &meridian_pb::v1::DatasetLicence) -> Result<()> {
+        self.licences
+            .lock()
+            .expect("store lock poisoned")
+            .push(licence.clone());
+        Ok(())
+    }
+
+    fn set_dataset_entitlement(
+        &self,
+        entitlement: &meridian_domain::v1::DatasetEntitlement,
+    ) -> Result<()> {
+        self.entitlements
+            .lock()
+            .expect("store lock poisoned")
+            .push(entitlement.clone());
+        Ok(())
+    }
+
+    fn dataset_changes(
+        &self,
+        dataset: &str,
+    ) -> Result<(
+        Vec<meridian_pb::v1::DatasetLicence>,
+        Vec<meridian_domain::v1::DatasetEntitlement>,
+    )> {
+        Ok((
+            self.licences
+                .lock()
+                .expect("store lock poisoned")
+                .iter()
+                .filter(|l| l.dataset == dataset)
+                .cloned()
+                .collect(),
+            self.entitlements
+                .lock()
+                .expect("store lock poisoned")
+                .iter()
+                .filter(|e| e.dataset == dataset)
+                .cloned()
+                .collect(),
         ))
     }
 }

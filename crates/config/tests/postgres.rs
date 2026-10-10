@@ -1978,3 +1978,56 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
     assert_eq!(count("config_archive_change"), 2);
     assert_eq!(count("config_record_move"), 5);
 }
+
+#[test]
+fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
+    use meridian_domain::v1::DatasetEntitlement;
+    use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence};
+
+    let store = store("data");
+    let catalogue = Catalogue {
+        datasets: vec![DatasetDeclaration {
+            key: "daily".into(),
+            vendor: "Coinbase".into(),
+            data_types: vec!["meridian.v1.Price".into()],
+            modes: vec![1],
+            ..Default::default()
+        }],
+    };
+    assert!(store.record_catalogue("coinbase-1", &catalogue, 1).unwrap());
+    assert!(
+        !store.record_catalogue("coinbase-1", &catalogue, 2).unwrap(),
+        "unchanged"
+    );
+    let licence = |days: u32, at: i64| DatasetLicence {
+        dataset: "coinbase-1:daily".into(),
+        kept: true,
+        retention_days: days,
+        updated_by: "local|ada".into(),
+        updated_at_ns: at,
+        note: "terms".into(),
+        ..Default::default()
+    };
+    store.set_dataset_licence(&licence(30, 3)).unwrap();
+    store.set_dataset_licence(&licence(60, 4)).unwrap();
+    let entitlement = |allowed: bool, at: i64| DatasetEntitlement {
+        dataset: "coinbase-1:daily".into(),
+        instance: "reporting-1".into(),
+        allowed,
+        updated_by: "local|ada".into(),
+        updated_at_ns: at,
+        ..Default::default()
+    };
+    store
+        .set_dataset_entitlement(&entitlement(true, 5))
+        .unwrap();
+    store
+        .set_dataset_entitlement(&entitlement(false, 6))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.catalogues.get("coinbase-1"), Some(&catalogue));
+    assert_eq!(snapshot.licences, vec![licence(60, 4)]);
+    assert_eq!(snapshot.entitlements, vec![entitlement(false, 6)]);
+    let (licences, entitlements) = store.dataset_changes("coinbase-1:daily").unwrap();
+    assert_eq!((licences.len(), entitlements.len()), (2, 2));
+}

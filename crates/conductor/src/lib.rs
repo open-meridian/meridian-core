@@ -47,7 +47,10 @@ pub mod platform;
 
 mod ask;
 
-pub use ask::{Clock, Conductor, ASK_PLATFORM_FOR_INSTRUMENT, INSTRUMENT_PULLED};
+pub use ask::{
+    public_codes, Clock, Conductor, VenueAsker, ASK_PLATFORM_FOR_INSTRUMENT, INSTRUMENT_PULLED,
+    VENUE_MISSING,
+};
 pub use assertions::{DeploymentKey, SigningError};
 pub use platform::{
     ComponentReport, Config, Enrolment, HttpTransport, Platform, PlatformError, Transport,

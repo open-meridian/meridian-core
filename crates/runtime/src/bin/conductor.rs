@@ -227,6 +227,13 @@ fn run() -> Result<(), String> {
         // here reacts to a miss any more (contract v10, decisions/030).
         Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock()).serve();
 
+        // W3.15 (contract v18): a venue a plugin reported missing, asked of
+        // the platform by its public codes and kept by the instrument store.
+        tokio::spawn(
+            meridian_conductor::VenueAsker::new(Arc::clone(&bus), Arc::clone(&platform), clock())
+                .start(),
+        );
+
         // W5.19 outward, W5.20 inward: this component holds the key, so it
         // is the one that can tell the platform anything, and what it tells
         // it includes what the others have said about themselves.

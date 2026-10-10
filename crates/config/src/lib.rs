@@ -25,6 +25,7 @@
 //! does not, and `make check-crate-boundaries` keeps it that way.
 
 pub mod archive;
+pub mod data;
 pub mod ids;
 pub mod migrations;
 pub mod plugins;

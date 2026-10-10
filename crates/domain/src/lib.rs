@@ -20,6 +20,7 @@ pub mod asset_class;
 pub mod date;
 pub mod exact;
 pub mod instrument_type;
+pub mod lake;
 pub mod money;
 pub mod setting_table;
 pub mod text;

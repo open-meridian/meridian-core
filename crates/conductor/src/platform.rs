@@ -46,7 +46,7 @@ use meridian_domain::asset_class;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
     EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
-    RedeemClaimCodeReply,
+    RedeemClaimCodeReply, VenueRecord,
 };
 use serde::Deserialize;
 
@@ -261,6 +261,69 @@ impl Platform {
             }
         }
         Ok(None)
+    }
+
+    /// W3.3 with the venues its answer names (contract v18): the first
+    /// record found by the open identifiers, strongest first, and its listing
+    /// venue and that venue's operating venue, which the instrument store
+    /// keeps (W3.5).
+    pub async fn ask_with_venues(
+        &self,
+        identifiers: &[PbIdentifier],
+        as_of_ns: i64,
+        now_ns: i64,
+    ) -> Result<Option<(PbInstrument, Vec<VenueRecord>)>, PlatformError> {
+        for identifier in open_identifiers_strongest_first(identifiers) {
+            let path = if identifier.scheme == GLOBAL_ID {
+                format!(
+                    "/api/v1/reference/instruments/{}?as_of_ns={}",
+                    encode(&identifier.value),
+                    as_of_ns
+                )
+            } else {
+                format!(
+                    "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
+                    encode(&identifier.scheme),
+                    encode(&identifier.value),
+                    as_of_ns
+                )
+            };
+            let response = self.call(Method::Get, &path, None, now_ns).await?;
+            if let Some(found) = found_with_venues(response)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// W3.15's ask, by W3.3's pull (contract v18): the one venue a reported
+    /// venue's public codes name -- a MIC under `iso10383`, or a vendor's
+    /// code as a `symbol` with its source -- or none where the platform holds
+    /// none. Never the whole list: one venue at a time, on demand.
+    pub async fn pull_venue(
+        &self,
+        identifier: &PbIdentifier,
+        as_of_ns: i64,
+        now_ns: i64,
+    ) -> Result<Vec<VenueRecord>, PlatformError> {
+        let mut path = format!(
+            "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
+            encode(&identifier.scheme),
+            encode(&identifier.value),
+            as_of_ns
+        );
+        if !identifier.source.is_empty() {
+            path.push_str(&format!("&source={}", encode(&identifier.source)));
+        }
+        let response = self.call(Method::Get, &path, None, now_ns).await?;
+        if response.status == 404 {
+            return Ok(Vec::new());
+        }
+        let reply: WireReply = read(&response)?;
+        if !reply.found.unwrap_or(true) {
+            return Ok(Vec::new());
+        }
+        reply.venues.into_iter().map(into_venue).collect()
     }
 
     /// W3.3, by the master's own name for the instrument.
@@ -620,6 +683,36 @@ struct WireReply {
     minted: Option<bool>,
     conflict: Option<bool>,
     instrument: Option<WireRecord>,
+    /// The venues the answer names (contract v18).
+    #[serde(default)]
+    venues: Vec<WireVenue>,
+}
+
+/// A venue master's record, as the platform's answer carries it (W3.5).
+#[derive(Debug, Deserialize)]
+struct WireVenue {
+    #[serde(default)]
+    venue_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    country_code: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    identifiers: Vec<WireIdentifier>,
+    #[serde(default)]
+    operating_venue_id: String,
+    #[serde(default)]
+    time_zone: String,
+    #[serde(default)]
+    version: i64,
+    #[serde(default)]
+    valid_from_ns: i64,
+    #[serde(default)]
+    record_time_ns: i64,
+    #[serde(default)]
+    lifecycle_state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +727,8 @@ struct WireRecord {
     currency: String,
     #[serde(default)]
     exchange_mic: String,
+    #[serde(default)]
+    listing_venue_id: String,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -654,6 +749,76 @@ struct WireIdentifier {
     value: String,
     #[serde(default)]
     source: String,
+}
+
+/// The reply's record and the venues it names, or nothing when the platform
+/// said it had none.
+fn found_with_venues(
+    response: Response,
+) -> Result<Option<(PbInstrument, Vec<VenueRecord>)>, PlatformError> {
+    if response.status == 404 {
+        return Ok(None);
+    }
+    let reply: WireReply = read(&response)?;
+    if !reply.found.unwrap_or(true) {
+        return Ok(None);
+    }
+    let Some(record) = reply.instrument else {
+        return Ok(None);
+    };
+    let venues = reply
+        .venues
+        .into_iter()
+        .map(into_venue)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((into_record(record)?, venues)))
+}
+
+/// A venue as the instrument store keeps it, its kind and lifecycle checked
+/// as an instrument's state is: a name the schema does not define is refused,
+/// never read as unspecified.
+fn into_venue(venue: WireVenue) -> Result<VenueRecord, PlatformError> {
+    if !venue.venue_id.starts_with("VEN-") {
+        return Err(PlatformError::Malformed(format!(
+            "a venue arrived with ID {:?}, not the venue master's",
+            venue.venue_id
+        )));
+    }
+    let kind = meridian_domain::v1::VenueKind::from_str_name(&venue.kind).ok_or_else(|| {
+        PlatformError::Malformed(format!(
+            "{} arrived as kind {:?}, which the schema does not define",
+            venue.venue_id, venue.kind
+        ))
+    })? as i32;
+    let lifecycle_state =
+        meridian_domain::v1::InstrumentLifecycleState::from_str_name(&venue.lifecycle_state)
+            .ok_or_else(|| {
+                PlatformError::Malformed(format!(
+                    "{} arrived in lifecycle state {:?}, which the schema does not define",
+                    venue.venue_id, venue.lifecycle_state
+                ))
+            })? as i32;
+    Ok(VenueRecord {
+        venue_id: venue.venue_id,
+        name: venue.name,
+        country_code: venue.country_code,
+        kind,
+        identifiers: venue
+            .identifiers
+            .into_iter()
+            .map(|identifier| PbIdentifier {
+                scheme: identifier.scheme,
+                value: identifier.value,
+                source: identifier.source,
+            })
+            .collect(),
+        operating_venue_id: venue.operating_venue_id,
+        time_zone: venue.time_zone,
+        version: venue.version,
+        valid_from_ns: venue.valid_from_ns,
+        record_time_ns: venue.record_time_ns,
+        lifecycle_state,
+    })
 }
 
 /// The reply's record, or nothing when the platform said it had none.
@@ -767,6 +932,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         asset_class,
         currency: record.currency,
         exchange_mic: record.exchange_mic,
+        listing_venue_id: record.listing_venue_id,
         description: record.description,
         lifecycle_state,
         version: record.version,
@@ -1239,6 +1405,56 @@ pub(crate) mod tests {
             value: value.into(),
             source: source.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_venue_is_pulled_by_its_codes_one_at_a_time_and_an_unknown_kind_refused() {
+        let venue = serde_json::json!({"found": true, "venues": [{
+            "venue_id": "VEN-01JA0000000000000XNYS0", "name": "New York Stock Exchange",
+            "country_code": "US", "kind": "VENUE_KIND_EXCHANGE",
+            "identifiers": [{"scheme": "iso10383", "value": "XNYS", "source": ""}],
+            "operating_venue_id": "", "time_zone": "America/New_York", "version": 1,
+            "valid_from_ns": 1, "record_time_ns": 2,
+            "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE"}]})
+        .to_string();
+        let transport = Fake::new(vec![
+            Ok(reply(200, &venue)),
+            Ok(reply(
+                404,
+                r#"{"found": false, "miss_reason": "MISS_REASON_NOT_FOUND"}"#,
+            )),
+            Ok(reply(
+                200,
+                &venue.replace("VENUE_KIND_EXCHANGE", "VENUE_KIND_CASINO"),
+            )),
+        ]);
+        let platform = platform(transport.clone());
+        let mic = PbIdentifier {
+            scheme: "iso10383".into(),
+            value: "XNYS".into(),
+            source: String::new(),
+        };
+        let pulled = platform.pull_venue(&mic, AS_OF, NOW).await.unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].venue_id, "VEN-01JA0000000000000XNYS0");
+        assert_eq!(pulled[0].time_zone, "America/New_York");
+        let vendor = PbIdentifier {
+            scheme: "symbol".into(),
+            value: "coinbase".into(),
+            source: "coinbase".into(),
+        };
+        assert!(platform
+            .pull_venue(&vendor, AS_OF, NOW)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(platform.pull_venue(&mic, AS_OF, NOW).await.is_err());
+        let urls = transport.urls();
+        assert!(
+            urls[0].contains("identifiers/resolve?scheme=iso10383&value=XNYS"),
+            "{urls:?}"
+        );
+        assert!(urls[1].ends_with("&source=coinbase"), "{urls:?}");
     }
 
     #[tokio::test]

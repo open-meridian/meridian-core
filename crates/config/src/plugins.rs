@@ -196,6 +196,13 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             ));
         }
     }
+    // A dgm's catalogue (W8.1, contract v18), as `meridian plugin check`
+    // says first and the sidecar again at registration.
+    if let Some(catalogue) = &declaration.catalogue {
+        if let Some(refused) = meridian_domain::lake::catalogue_refused(catalogue, roles) {
+            return Err(refused);
+        }
+    }
     if let Some(storage) = &declaration.storage {
         if !roles
             .iter()
@@ -438,6 +445,8 @@ impl Plugins {
                     by = launched.launched_by,
                     "a plugin launched"
                 );
+                // Its datasets join the data configuration (W8.3, v18).
+                crate::data::publish(&self.bus, self.store.as_ref(), self.clock.now_ns());
                 Ok(launched)
             }
             Err(failed) => {
@@ -730,6 +739,7 @@ impl Plugins {
             by = stopped.stopped_by,
             "a plugin stopped"
         );
+        crate::data::publish(&self.bus, self.store.as_ref(), self.clock.now_ns());
         Ok(stopped)
     }
 }

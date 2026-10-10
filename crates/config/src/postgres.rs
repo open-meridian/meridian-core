@@ -428,6 +428,49 @@ impl Store for PostgresStore {
         {
             snapshot.archives.push(archive_from(&row).0);
         }
+        // The data configuration (contract v18): each catalogue, each
+        // dataset's latest licence and each entitlement's latest.
+        for row in tx
+            .query(
+                "SELECT plugin_instance_id, catalogue FROM config_plugin_catalogue
+                  ORDER BY plugin_instance_id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(1);
+            snapshot.catalogues.insert(
+                row.get(0),
+                meridian_pb::v1::Catalogue::decode(&bytes[..]).map_err(unavailable)?,
+            );
+        }
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (dataset) licence FROM config_dataset_licence_change
+                  ORDER BY dataset, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            snapshot
+                .licences
+                .push(meridian_pb::v1::DatasetLicence::decode(&bytes[..]).map_err(unavailable)?);
+        }
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (dataset, instance) entitlement
+                   FROM config_dataset_entitlement_change
+                  ORDER BY dataset, instance, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            snapshot.entitlements.push(
+                meridian_domain::v1::DatasetEntitlement::decode(&bytes[..]).map_err(unavailable)?,
+            );
+        }
 
         tx.commit().map_err(unavailable)?;
         Ok(snapshot)
@@ -1291,6 +1334,100 @@ impl Store for PostgresStore {
             .filter_map(|row| move_of(row).record.r#move)
             .collect();
         Ok(archived_spans(&latest))
+    }
+
+    fn record_catalogue(
+        &self,
+        instance_id: &str,
+        catalogue: &meridian_pb::v1::Catalogue,
+        at_ns: i64,
+    ) -> Result<bool> {
+        let bytes = catalogue.encode_to_vec();
+        let changed = self
+            .conn()?
+            .execute(
+                "INSERT INTO config_plugin_catalogue (plugin_instance_id, catalogue, recorded_at_ns)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (plugin_instance_id) DO UPDATE
+                    SET catalogue = excluded.catalogue, recorded_at_ns = excluded.recorded_at_ns
+                  WHERE config_plugin_catalogue.catalogue IS DISTINCT FROM excluded.catalogue",
+                &[&instance_id, &bytes, &at_ns],
+            )
+            .map_err(unavailable)?;
+        Ok(changed > 0)
+    }
+
+    fn set_dataset_licence(&self, licence: &meridian_pb::v1::DatasetLicence) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_dataset_licence_change (dataset, licence, changed_at_ns)
+                 VALUES ($1, $2, $3)",
+                &[
+                    &licence.dataset,
+                    &licence.encode_to_vec(),
+                    &licence.updated_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn set_dataset_entitlement(
+        &self,
+        entitlement: &meridian_domain::v1::DatasetEntitlement,
+    ) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_dataset_entitlement_change
+                        (dataset, instance, entitlement, changed_at_ns)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &entitlement.dataset,
+                    &entitlement.instance,
+                    &entitlement.encode_to_vec(),
+                    &entitlement.updated_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn dataset_changes(
+        &self,
+        dataset: &str,
+    ) -> Result<(
+        Vec<meridian_pb::v1::DatasetLicence>,
+        Vec<meridian_domain::v1::DatasetEntitlement>,
+    )> {
+        let mut conn = self.conn()?;
+        let mut licences = Vec::new();
+        for row in conn
+            .query(
+                "SELECT licence FROM config_dataset_licence_change WHERE dataset = $1
+                  ORDER BY change_id",
+                &[&dataset],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            licences
+                .push(meridian_pb::v1::DatasetLicence::decode(&bytes[..]).map_err(unavailable)?);
+        }
+        let mut entitlements = Vec::new();
+        for row in conn
+            .query(
+                "SELECT entitlement FROM config_dataset_entitlement_change WHERE dataset = $1
+                  ORDER BY change_id",
+                &[&dataset],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(0);
+            entitlements.push(
+                meridian_domain::v1::DatasetEntitlement::decode(&bytes[..]).map_err(unavailable)?,
+            );
+        }
+        Ok((licences, entitlements))
     }
 }
 

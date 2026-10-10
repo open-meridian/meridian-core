@@ -13,12 +13,13 @@
 
 use std::collections::BTreeMap;
 
+use meridian_domain::v1::DatasetEntitlement;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     KnownPluginRoles, MoveRecord, Permission, PluginArchive, PluginCatalogue, PluginLaunch,
     PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
-use meridian_pb::v1::{MoveOutcome, SettingDeclaration, StoredSpan};
+use meridian_pb::v1::{Catalogue, DatasetLicence, MoveOutcome, SettingDeclaration, StoredSpan};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -384,6 +385,16 @@ pub struct Snapshot {
     /// Each instance's archive as its latest record says it (W8.7, contract
     /// v16), allowed or withdrawn; an instance never allowed one has none.
     pub archives: Vec<PluginArchive>,
+    /// What each instance's catalogue declares (W4.1, W8.3, contract v18),
+    /// as its sidecar's report or its launched version last carried it.
+    pub catalogues: BTreeMap<String, Catalogue>,
+    /// Each dataset's licence as its latest record says it (W10.1): the
+    /// deployment's, set by a deployment admin. A dataset with none is read
+    /// by its catalogue's default.
+    pub licences: Vec<DatasetLicence>,
+    /// Each entitlement as its latest record says it, by dataset and
+    /// instance, a withdrawn one (`allowed` false) included.
+    pub entitlements: Vec<DatasetEntitlement>,
 }
 
 /// One move of raw records as the store keeps it (W4.13, contract v16): its
@@ -759,4 +770,27 @@ pub trait Store: Send + Sync {
     /// What the archive holds of each of an instance's kinds
     /// ([`archived_spans`]).
     fn archived(&self, instance_id: &str) -> Result<Vec<StoredSpan>>;
+
+    /// What an instance's catalogue declares, replaced whole (W4.1, contract
+    /// v18); true when it differs from what was kept.
+    fn record_catalogue(
+        &self,
+        instance_id: &str,
+        catalogue: &Catalogue,
+        at_ns: i64,
+    ) -> Result<bool>;
+
+    /// A dataset's licence as set, its own record (W10.1, decisions/031):
+    /// who, through what, when and why are the licence's own.
+    fn set_dataset_licence(&self, licence: &DatasetLicence) -> Result<()>;
+
+    /// An entitlement set or withdrawn, its own record (W10.1).
+    fn set_dataset_entitlement(&self, entitlement: &DatasetEntitlement) -> Result<()>;
+
+    /// Every licence and entitlement change of one dataset, in the order
+    /// recorded.
+    fn dataset_changes(
+        &self,
+        dataset: &str,
+    ) -> Result<(Vec<DatasetLicence>, Vec<DatasetEntitlement>)>;
 }
