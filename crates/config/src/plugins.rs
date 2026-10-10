@@ -237,6 +237,21 @@ fn listed(items: &BTreeSet<&str>) -> String {
     }
 }
 
+/// Whether an instance name is one of core's own (contract v18; v17's
+/// security review, Nit 3): a component's name (`dashboard`, `lake`), a
+/// component's instance (`dashboard-1`), or the runtime's broker user. A
+/// plugin launched as one would list its tools in core's `dashboard__`
+/// namespace or speak as a component on the broker.
+pub fn is_reserved(contract: &Contract, instance_id: &str) -> bool {
+    let component = |name: &str| contract.is_component(name);
+    if instance_id == "runtime" || component(instance_id) {
+        return true;
+    }
+    instance_id.rsplit_once('-').is_some_and(|(head, tail)| {
+        !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && component(head)
+    })
+}
+
 /// The version a launch runs, if it is recorded and the approval is exactly
 /// what it declares (W8.3).
 pub fn launch<'a>(
@@ -248,6 +263,28 @@ pub fn launch<'a>(
             "`{}` is not an instance: lowercase letters, digits and single hyphens, starting \
              with a letter, at most 63",
             request.instance_id
+        ));
+    }
+    if is_reserved(Contract::embedded(), &request.instance_id) {
+        return Err(format!(
+            "`{}` is one of core's own names, which no plugin instance takes",
+            request.instance_id
+        ));
+    }
+    // An instance's ID names one plugin for good (contract v18; v17's
+    // security review, Nit 3): its settings, secrets opened for it, the
+    // access entries and the delegations naming it would otherwise apply
+    // to another plugin's code.
+    if let Some(earlier) = snapshot
+        .catalogue
+        .launches
+        .iter()
+        .find(|held| held.instance_id == request.instance_id && held.name != request.name)
+    {
+        return Err(format!(
+            "{} was launched as {} before; an instance's ID names one plugin, and its settings, \
+             access and delegations stay with it, so {} launches under another ID",
+            request.instance_id, earlier.name, request.name
         ));
     }
     let version = snapshot

@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "terminal_sessions_retired",
         sql: include_str!("../migrations/0006_terminal_sessions_retired.sql"),
     },
+    Migration {
+        version: 7,
+        name: "a_new_tool_asks_again",
+        sql: include_str!("../migrations/0007_a_new_tool_asks_again.sql"),
+    },
 ];
 
 const HISTORY: &str = "\

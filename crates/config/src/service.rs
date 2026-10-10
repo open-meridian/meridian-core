@@ -879,20 +879,30 @@ pub fn serve_with(
             let now = cx.clock.now_ns();
             // A change against a record changed since it was read is refused,
             // naming the field (contract v17): a table replaced whole from an
-            // old read would drop a person's rows. 0 is a client from before.
-            if request.against_updated_at_ns != 0 {
-                let standing = settings_record(&before, plugin).updated_at_ns;
-                if standing != request.against_updated_at_ns {
-                    return Err(meridian_bus::refusal_naming(
-                        meridian_pb::v1::RefusalReason::RecordChanged as i32,
-                        &["against_updated_at_ns".to_string()],
-                        format!(
-                            "the settings of {plugin} changed since they were read (now \
-                             {standing}, read at {}); read them again, and nothing was changed",
-                            request.against_updated_at_ns
-                        ),
-                    ));
-                }
+            // old read would drop a person's rows. Every change carries the
+            // guard (contract v18, W6.11; v17's security review, I1): only
+            // the dashboard sends this command, so 0 reads as "against a
+            // record never saved", refused once anything has been saved.
+            let standing = settings_record(&before, plugin).updated_at_ns;
+            if standing != request.against_updated_at_ns {
+                let said = if request.against_updated_at_ns == 0 {
+                    format!(
+                        "the settings of {plugin} were saved at {standing}, and this change \
+                         is against a record never saved; read them again, and nothing was \
+                         changed"
+                    )
+                } else {
+                    format!(
+                        "the settings of {plugin} changed since they were read (now \
+                         {standing}, read at {}); read them again, and nothing was changed",
+                        request.against_updated_at_ns
+                    )
+                };
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::RecordChanged as i32,
+                    &["against_updated_at_ns".to_string()],
+                    said,
+                ));
             }
             if let Some(refusal) = note_refused(&request.note) {
                 return Err(refusal);

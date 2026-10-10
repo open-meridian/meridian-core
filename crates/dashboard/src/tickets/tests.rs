@@ -212,6 +212,7 @@ fn covering(instance: &str, level: &str, groups: &[&str]) -> Covers {
         plugins: [(instance.to_string(), String::new(), level.to_string())].into(),
         unmatched: Default::default(),
         account_groups: groups.iter().map(|g| g.to_string()).collect(),
+        acting: None,
     }
 }
 

@@ -1428,12 +1428,20 @@ async fn reported_by(
     panic!("the report was not kept");
 }
 
+/// Set as the dashboard's form does: against the record as it was read
+/// (contract v18, W6.11).
 async fn set(
     h: &Harness,
     plugin: &str,
     values: &[(&str, &str)],
     cleared: &[&str],
 ) -> Result<PluginSettingsRecord, String> {
+    let against = records(h)
+        .await
+        .plugin_settings
+        .iter()
+        .find(|record| record.plugin_instance_id == plugin)
+        .map_or(0, |record| record.updated_at_ns);
     ask(
         h,
         SET_PLUGIN_SETTINGS,
@@ -1448,6 +1456,7 @@ async fn set(
                 })
                 .collect(),
             cleared: cleared.iter().map(|name| (*name).into()).collect(),
+            against_updated_at_ns: against,
             ..Default::default()
         },
     )
@@ -2043,6 +2052,13 @@ async fn set_as(
     values: &[(&str, &str)],
     cleared: &[&str],
 ) -> Result<PluginSettingsRecord, String> {
+    // Against the record as read, as the form sends it (contract v18).
+    let against = records(h)
+        .await
+        .plugin_settings
+        .iter()
+        .find(|record| record.plugin_instance_id == "oms-1")
+        .map_or(0, |record| record.updated_at_ns);
     let request = SetPluginSettingsRequest {
         plugin_instance_id: "oms-1".into(),
         values: values
@@ -2053,6 +2069,7 @@ async fn set_as(
             })
             .collect(),
         cleared: cleared.iter().map(|name| (*name).into()).collect(),
+        against_updated_at_ns: against,
         ..Default::default()
     };
     let (_, bytes) = h
@@ -3129,19 +3146,53 @@ async fn a_change_against_a_record_changed_since_it_was_read_is_refused_naming_t
         .find(|s| s.name == "poll_minutes")
         .unwrap();
     assert_eq!(held.held, Held::Plain("15".into()), "nothing changed");
-    // Against the record as it stands, it is made; 0 is a client from
-    // before v17, checked as before.
+    // Against the record as it stands, it is made; 0 once anything is
+    // saved is "against a record never saved", refused naming the field
+    // (contract v18; v17's security review, I1).
     let now = records(&h).await.plugin_settings[0].updated_at_ns;
     set_through(&h, &[("poll_minutes", "30")], &[], "Slower.", now)
         .await
         .unwrap();
-    set_through(&h, &[("poll_minutes", "45")], &[], "Slower still.", 0)
+    let never = set_through(&h, &[("poll_minutes", "45")], &[], "Slower still.", 0)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(never.contains("against_updated_at_ns"), "{never}");
+    assert!(never.contains("never saved"), "{never}");
     // A note past its bound is refused, naming it.
+    let now = records(&h).await.plugin_settings[0].updated_at_ns;
     let long = "n".repeat(crate::MOST_NOTE + 1);
-    let refused = set_through(&h, &[("poll_minutes", "60")], &[], &long, 0)
+    let refused = set_through(&h, &[("poll_minutes", "60")], &[], &long, now)
         .await
         .unwrap_err();
     assert!(refused.contains("note"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_change_against_a_never_saved_read_is_made_only_while_nothing_is_saved() {
+    // v17's security review, I1: an agent reads a record never saved (0); a
+    // person then saves at the page; the agent's change against 0 is
+    // refused, never replacing what the person saved.
+    let h = harness("dashboard-1");
+    reported(&h, true, declared(), 1).await;
+    assert_eq!(records(&h).await.plugin_settings[0].updated_at_ns, 0);
+    set(&h, "oms-1", &[("poll_minutes", "15")], &[])
+        .await
+        .unwrap();
+    let refused = set_through(&h, &[("poll_minutes", "30")], &[], "Agent's read.", 0)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("against_updated_at_ns"), "{refused}");
+    let held = h.store.snapshot().unwrap();
+    let held = held
+        .settings
+        .iter()
+        .find(|s| s.name == "poll_minutes")
+        .unwrap();
+    assert_eq!(held.held, Held::Plain("15".into()), "the person's stands");
+    // On a record still never saved, a change against 0 is made.
+    let fresh = harness("dashboard-1");
+    reported(&fresh, true, declared(), 1).await;
+    set_through(&fresh, &[("poll_minutes", "30")], &[], "First.", 0)
+        .await
+        .unwrap();
 }

@@ -1126,7 +1126,8 @@ pub fn request(
         }
     }
     // The record as the form was drawn (contract v17); 0 where the form
-    // carried none, a page from before, checked as before.
+    // carried none, which the conductor reads as "against settings never
+    // saved", refused once any are (contract v18, W6.11).
     request.against_updated_at_ns = fields
         .get(AGAINST_FIELD)
         .and_then(|drawn| drawn.trim().parse::<i64>().ok())

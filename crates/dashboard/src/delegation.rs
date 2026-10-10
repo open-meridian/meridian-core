@@ -185,6 +185,13 @@ pub struct Covers {
     pub unmatched: BTreeSet<(String, String)>,
     /// The account groups whose accounts it reaches.
     pub account_groups: BTreeSet<String>,
+    /// The tools that change something its consent page listed (contract
+    /// v18; the MCP spec, ruled 2026-10-09): a tool a release or a plugin
+    /// adds to one of its rows later reaches it only after fresh consent.
+    /// None for one covering everything, which follows the person's grants,
+    /// and for one narrowed before v18 until it is first evaluated, when it
+    /// is filled with what it reached then ([`Delegations::backfill_acting`]).
+    pub acting: Option<BTreeSet<String>>,
 }
 
 impl Covers {
@@ -626,6 +633,10 @@ pub struct Delegation {
     pub last_refusal: Option<(i64, String)>,
     pub directory_groups: Vec<String>,
     pub groups_read_at_ns: i64,
+    /// When a delegation narrowed before v18 had its consented tools filled
+    /// in from what it reached then (decisions/031); None for one whose
+    /// consent page recorded them.
+    pub acting_backfilled_at_ns: Option<i64>,
 }
 
 impl Delegation {
@@ -1278,10 +1289,26 @@ impl Delegations {
         self.stored(move |store| store.rewrite(&id, &covers)).await
     }
 
+    /// A delegation narrowed before v18, its consented tools filled in once
+    /// from the tools that change something it reaches now, said to be
+    /// filled at `now_ns` (contract v18; decisions/031).
+    pub async fn backfill_acting(
+        &self,
+        id: &str,
+        acting: Vec<String>,
+        now_ns: i64,
+    ) -> Result<(), Unavailable> {
+        let id = id.to_string();
+        self.stored(move |store| store.backfill_acting(&id, &acting, now_ns))
+            .await
+    }
+
     /// Record why a request on a delegation was refused, for the person and
-    /// the admin to read.
+    /// the admin to read: at most [`MOST_REFUSAL`] characters of it
+    /// (contract v18; v17's security review, Nit 4), so a megabyte of
+    /// unknown keys is not kept and shown.
     pub async fn refused(&self, id: &str, why: &str, now_ns: i64) -> Result<(), Unavailable> {
-        let (id, why) = (id.to_string(), why.to_string());
+        let (id, why) = (id.to_string(), capped(why));
         self.stored(move |store| store.refused(&id, &why, now_ns))
             .await
     }
@@ -1500,6 +1527,20 @@ pub(crate) async fn connected_for_tests(
         .await
         .expect("issued")
         .access_token
+}
+
+/// The most of a refusal's words a delegation keeps (contract v18; v17's
+/// security review, Nit 4).
+pub const MOST_REFUSAL: usize = 1_000;
+
+/// A refusal's words as kept: whole within [`MOST_REFUSAL`] characters,
+/// otherwise cut there and said to be cut.
+pub fn capped(why: &str) -> String {
+    if why.chars().count() <= MOST_REFUSAL {
+        return why.to_string();
+    }
+    let kept: String = why.chars().take(MOST_REFUSAL).collect();
+    format!("{kept}... (cut at {MOST_REFUSAL} characters)")
 }
 
 #[cfg(test)]

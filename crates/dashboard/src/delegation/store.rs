@@ -65,6 +65,10 @@ pub trait DelegationStore: Send + Sync {
 
     fn refused(&self, id: &str, why: &str, now_ns: i64) -> Result<(), String>;
 
+    /// Fill a delegation narrowed before v18 with the tools that change
+    /// something it reaches now, once: nothing where it holds a list.
+    fn backfill_acting(&self, id: &str, acting: &[String], now_ns: i64) -> Result<(), String>;
+
     /// Every delegation narrowed at consent, revoked or not, by when made.
     fn narrowed(&self) -> Result<Vec<Delegation>, String>;
 
@@ -215,6 +219,7 @@ impl DelegationStore for InMemory {
                 delegation.expires_at_ns = grant.expires_at_ns;
                 delegation.directory_groups = grant.directory_groups.clone();
                 delegation.groups_read_at_ns = now_ns;
+                delegation.acting_backfilled_at_ns = None;
                 delegation.clone()
             }
             None => {
@@ -233,6 +238,7 @@ impl DelegationStore for InMemory {
                     last_refusal: None,
                     directory_groups: grant.directory_groups.clone(),
                     groups_read_at_ns: now_ns,
+                    acting_backfilled_at_ns: None,
                 };
                 kept.delegations
                     .insert(delegation.id.clone(), delegation.clone());
@@ -333,6 +339,16 @@ impl DelegationStore for InMemory {
     fn refused(&self, id: &str, why: &str, now_ns: i64) -> Result<(), String> {
         if let Some(delegation) = self.lock().delegations.get_mut(id) {
             delegation.last_refusal = Some((now_ns, why.to_string()));
+        }
+        Ok(())
+    }
+
+    fn backfill_acting(&self, id: &str, acting: &[String], now_ns: i64) -> Result<(), String> {
+        if let Some(delegation) = self.lock().delegations.get_mut(id) {
+            if delegation.covers.acting.is_none() && !delegation.covers.everything {
+                delegation.covers.acting = Some(acting.iter().cloned().collect());
+                delegation.acting_backfilled_at_ns = Some(now_ns);
+            }
         }
         Ok(())
     }
@@ -441,7 +457,8 @@ const DELEGATION_COLUMNS: &str = "d.delegation_id, d.subject, d.display_name, d.
      c.name, d.covers_everything, d.covers_deployment_admin, d.covers_plugins, \
      d.covers_account_groups, d.made_at_ns, d.renewed_at_ns, d.expires_at_ns, \
      d.revoked_at_ns, d.revoked_by, d.revoked_why, d.last_used_at_ns, \
-     d.last_refused_at_ns, d.last_refusal, d.directory_groups, d.groups_read_at_ns";
+     d.last_refused_at_ns, d.last_refusal, d.directory_groups, d.groups_read_at_ns, \
+     d.covers_acting, d.acting_backfilled_at_ns";
 
 fn delegation_of(row: &postgres::Row) -> Delegation {
     let plugins: Vec<String> = row.get(7);
@@ -459,6 +476,9 @@ fn delegation_of(row: &postgres::Row) -> Delegation {
             plugins: rows_of(&plugins).0,
             unmatched: rows_of(&plugins).1,
             account_groups: row.get::<_, Vec<String>>(8).into_iter().collect(),
+            acting: row
+                .get::<_, Option<Vec<String>>>(20)
+                .map(|acting| acting.into_iter().collect()),
         },
         made_at_ns: row.get(9),
         renewed_at_ns: row.get(10),
@@ -473,6 +493,7 @@ fn delegation_of(row: &postgres::Row) -> Delegation {
             .map(|at| (at, row.get::<_, Option<String>>(17).unwrap_or_default())),
         directory_groups: row.get(18),
         groups_read_at_ns: row.get(19),
+        acting_backfilled_at_ns: row.get(21),
     }
 }
 
@@ -643,6 +664,11 @@ impl DelegationStore for InPostgres {
         }
         let plugins = plugins_of(&grant.covers);
         let groups: Vec<String> = grant.covers.account_groups.iter().cloned().collect();
+        let acting: Option<Vec<String>> = grant
+            .covers
+            .acting
+            .as_ref()
+            .map(|acting| acting.iter().cloned().collect());
         // The standing one renewed, or a new one: the partial unique index
         // makes the two one statement, whichever replica asks first.
         let id: String = tx
@@ -651,8 +677,8 @@ impl DelegationStore for InPostgres {
                      (delegation_id, subject, display_name, client_id, covers_everything,
                       covers_deployment_admin, covers_plugins, covers_account_groups,
                       made_at_ns, renewed_at_ns, expires_at_ns, directory_groups,
-                      groups_read_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $9)
+                      groups_read_at_ns, covers_acting, acting_backfilled_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $9, $12, NULL)
                  ON CONFLICT (subject, client_id) WHERE revoked_at_ns IS NULL DO UPDATE
                     SET display_name = excluded.display_name,
                         covers_everything = excluded.covers_everything,
@@ -662,7 +688,9 @@ impl DelegationStore for InPostgres {
                         renewed_at_ns = excluded.renewed_at_ns,
                         expires_at_ns = excluded.expires_at_ns,
                         directory_groups = excluded.directory_groups,
-                        groups_read_at_ns = excluded.groups_read_at_ns
+                        groups_read_at_ns = excluded.groups_read_at_ns,
+                        covers_acting = excluded.covers_acting,
+                        acting_backfilled_at_ns = NULL
                  RETURNING delegation_id",
                 &[
                     &token(),
@@ -676,6 +704,7 @@ impl DelegationStore for InPostgres {
                     &now_ns,
                     &grant.expires_at_ns,
                     &grant.directory_groups,
+                    &acting,
                 ],
             )
             .map_err(said)?
@@ -839,6 +868,18 @@ impl DelegationStore for InPostgres {
                 "UPDATE dashboard_delegation SET last_refused_at_ns = $2, last_refusal = $3
                   WHERE delegation_id = $1",
                 &[&id, &now_ns, &why],
+            )
+            .map_err(said)?;
+        Ok(())
+    }
+
+    fn backfill_acting(&self, id: &str, acting: &[String], now_ns: i64) -> Result<(), String> {
+        self.database
+            .conn()?
+            .execute(
+                "UPDATE dashboard_delegation SET covers_acting = $2, acting_backfilled_at_ns = $3
+                  WHERE delegation_id = $1 AND covers_acting IS NULL AND NOT covers_everything",
+                &[&id, &acting, &now_ns],
             )
             .map_err(said)?;
         Ok(())

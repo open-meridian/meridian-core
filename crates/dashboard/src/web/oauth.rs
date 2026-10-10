@@ -584,8 +584,13 @@ async fn consent_shown(
         .iter()
         .filter(|d| &d.client_id != client_id)
         .max_by_key(|d| d.renewed_at_ns.max(d.made_at_ns));
+    // What the standing delegation consented to, so the page names the
+    // tools that change something added since (contract v18).
+    let consented = standing
+        .filter(|d| !d.covers.everything)
+        .and_then(|d| d.covers.acting.as_ref());
     let tools = match asked.resource {
-        Resource::Mcp => match tool_rows(app, person, &holdable, now) {
+        Resource::Mcp => match tool_rows(app, person, &holdable, consented, now) {
             Ok(rows) => Some(rows),
             Err(why) => return refused(&why),
         },
@@ -611,6 +616,10 @@ struct Granted {
     name: String,
     title: String,
     reads: bool,
+    /// It changes something and was added since the standing delegation's
+    /// consent: named as new, and reached only once allowed again
+    /// (contract v18).
+    new: bool,
 }
 
 /// The tools each row of access grants, for a client asking for `/mcp`
@@ -630,6 +639,7 @@ fn tool_rows(
     app: &App,
     person: &Person,
     holdable: &Holdable,
+    consented: Option<&BTreeSet<String>>,
     now: i64,
 ) -> Result<ToolRows, String> {
     let records = app
@@ -646,6 +656,7 @@ fn tool_rows(
                 name: tool.name.clone(),
                 title: tool.title().to_string(),
                 reads: tool.reads(),
+                new: !tool.reads() && consented.is_some_and(|c| !c.contains(&tool.name)),
             })
             .collect()
     };
@@ -678,6 +689,28 @@ fn tool_rows(
     })
 }
 
+/// The tools that change something a delegation covering `covers` lists
+/// now: [`crate::mcp::listed_to`] over the person's access narrowed to it,
+/// the one source the consent page and `tools/list` answer from.
+fn consented_acting(
+    app: &App,
+    person: &Person,
+    covers: &Covers,
+    now: i64,
+) -> Result<BTreeSet<String>, String> {
+    let records = app
+        .records
+        .current(now)
+        .map_err(|stale| stale.to_string())?;
+    let access = person_access(&records, &person.subject, &person.directory_groups);
+    let narrowed = crate::delegation::narrow(access, covers, &records);
+    Ok(crate::mcp::listed_to(&narrowed, &app.health.view(), now)
+        .iter()
+        .filter(|tool| !tool.reads())
+        .map(|tool| tool.name.clone())
+        .collect())
+}
+
 /// A row's tools on the page: its line, `data-reach` naming the row as the
 /// form posts it and `data-tools` the names `tools/list` answers, so a check
 /// can hold the page to the surface; the titles, reads and acts apart.
@@ -686,7 +719,13 @@ fn tools_said(reach: &str, lead: &str, tools: &[Granted]) -> String {
         tools
             .iter()
             .filter(|tool| tool.reads == reads)
-            .map(|tool| escape(&tool.title))
+            .map(|tool| {
+                if tool.new {
+                    format!("<mark class=\"new\">{} (new)</mark>", escape(&tool.title))
+                } else {
+                    escape(&tool.title)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -1314,7 +1353,19 @@ async fn decide(
             Err(why) => return refused(&why),
         };
         match consent_of(&fields, &holdable) {
-            Ok(consent) => Some(consent),
+            Ok(mut consent) => {
+                // The tools that change something this consent's page
+                // listed, kept so one added later asks again (contract v18;
+                // the MCP spec, ruled 2026-10-09). One covering everything
+                // follows the person's grants and keeps none.
+                if !consent.covers.everything {
+                    match consented_acting(&app, &person, &consent.covers, now) {
+                        Ok(acting) => consent.covers.acting = Some(acting),
+                        Err(why) => return refused(&why),
+                    }
+                }
+                Some(consent)
+            }
             Err(why) => return not_accepted(&why),
         }
     } else {

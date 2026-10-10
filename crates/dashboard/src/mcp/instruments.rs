@@ -272,8 +272,13 @@ impl Problems {
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    pub(super) fn refusal(self) -> Value {
-        let detail = self
+    /// The refusal naming each field, at most [`MOST_PROBLEMS`] of them,
+    /// and how many more (contract v18; v17's security review, Nit 4): a
+    /// megabyte of unknown keys is not a megabyte of refusal.
+    pub(super) fn refusal(mut self) -> Value {
+        let more = self.0.len().saturating_sub(MOST_PROBLEMS);
+        self.0.truncate(MOST_PROBLEMS);
+        let mut detail = self
             .0
             .iter()
             .map(|p| {
@@ -285,9 +290,15 @@ impl Problems {
             })
             .collect::<Vec<_>>()
             .join("; ");
+        if more > 0 {
+            detail.push_str(&format!("; and {more} more not listed"));
+        }
         refused("invalid_arguments", &detail, self.0)
     }
 }
+
+/// The most fields one refusal names.
+pub(super) const MOST_PROBLEMS: usize = 50;
 
 pub(super) fn join(path: &str, name: &str) -> String {
     if path.is_empty() {

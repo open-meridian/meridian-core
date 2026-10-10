@@ -936,7 +936,15 @@ async fn one_level_is_picked_per_plugin_and_includes_those_held_below_it() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(delegation.covers, Covers::default());
+    // Narrowed to nothing, so the tools that change something it consented
+    // to are none (contract v18).
+    assert_eq!(
+        delegation.covers,
+        Covers {
+            acting: Some(Default::default()),
+            ..Covers::default()
+        }
+    );
 }
 
 #[tokio::test]

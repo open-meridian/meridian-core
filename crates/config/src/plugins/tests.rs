@@ -645,3 +645,59 @@ async fn an_archive_allowed_through_a_delegation_records_it_and_the_client() {
     assert!(!withdrawn.allowed);
     assert_eq!(withdrawn.client_name, "meridian on ada-laptop");
 }
+
+/// v17's security review, Nit 3 (contract v18): core's own names are no
+/// instance's, and a stopped instance's ID is never relaunched as another
+/// plugin, whose code its settings, secrets and access would then reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn core_names_are_reserved_and_an_instance_id_names_one_plugin() {
+    let (bus, _launcher) = harness();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    for name in [
+        "dashboard",
+        "dashboard-1",
+        "lake",
+        "conductor",
+        "runtime",
+        "launcher-1",
+    ] {
+        let refused = launch(&bus, launching(name, &["custody"]))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("core's own names"), "{name}: {refused}");
+    }
+    assert!(!super::is_reserved(Contract::embedded(), "dashboards"));
+    assert!(!super::is_reserved(Contract::embedded(), "snaptrade-1"));
+
+    launch(&bus, launching("broker-1", &["custody"]))
+        .await
+        .unwrap();
+    let _: PluginLaunch = ask(
+        &bus,
+        STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "broker-1".into(),
+            note: "Moving it.".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut other = snaptrade("0.1.0");
+    other.metadata.as_mut().unwrap().name = "imposter".into();
+    upload(&bus, other).await.unwrap();
+    let reused = launch(
+        &bus,
+        LaunchPluginRequest {
+            name: "imposter".into(),
+            ..launching("broker-1", &["custody"])
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(reused.contains("launched as snaptrade before"), "{reused}");
+    // The same plugin takes its ID again.
+    launch(&bus, launching("broker-1", &["custody"]))
+        .await
+        .unwrap();
+}

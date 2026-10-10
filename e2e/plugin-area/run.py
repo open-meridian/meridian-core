@@ -18,7 +18,8 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    saying whether she may set it and, for the one serving both roles, why
    not; sets a window against the version read, with a note, and replaces
    the table's rows; a change against the version it read before is refused
-   naming against_updated_at_ns; a cell naming no instrument is refused at
+   naming against_updated_at_ns, and so is one naming none (contract v18);
+   a cell naming no instrument is refused at
    table.plan_code_links[0].instrument, the setting serving operations too
    at value.poll_minutes; and the admin portal's Settings form says she last
    changed them.
@@ -151,6 +152,13 @@ def refused_at(answer, path):
     return any(field.get("path") == path for field in answer.get("fields", []))
 
 
+def version_read(person, client):
+    """updated_at_ns as the settings tool reads it now: what every change
+    names as against_updated_at_ns (contract v18, W6.11)."""
+    return call(person, client, "dashboard__read_plugin_settings",
+                {"plugin_instance_id": INSTANCE}, "unchanged")["data"]["updated_at_ns"]
+
+
 def setting(data, name):
     found = [d for d in data["declared_settings"] if d["name"] == name]
     must(found, f"no setting {name} in {json.dumps(data)[:400]}")
@@ -215,16 +223,25 @@ def run():
     call(*as_cat, "dashboard__set_plugin_settings",
          {"plugin_instance_id": INSTANCE,
           "table": {"plan_code_links": [{"plan_code": "OQKR", "account": "ext-e2e"}]},
+          "against_updated_at_ns": version_read(*as_cat),
           "note": "The 401(k)'s money market fund code."}, "made")
+    # Every change names the version it read (contract v18; v17's security
+    # review, I1): left out, it is refused by name.
+    unguarded = call(*as_cat, "dashboard__set_plugin_settings",
+                     {"plugin_instance_id": INSTANCE, "value": {"activity_window_days": 2600},
+                      "note": "No version named."}, "refused")
+    must(refused_at(unguarded, "against_updated_at_ns"),
+         f"step 1, a change naming no version is refused by name: {unguarded}")
     bad = call(*as_cat, "dashboard__set_plugin_settings",
                {"plugin_instance_id": INSTANCE,
                 "table": {"plan_code_links": [{"plan_code": "OQKR", "account": "ext-e2e",
                                                "instrument": "LCL-none"}]},
-                "note": "n"}, "refused")
+                "against_updated_at_ns": version_read(*as_cat), "note": "n"}, "refused")
     must(refused_at(bad, "table.plan_code_links[0].instrument"),
          f"step 1, a cell naming no record is refused at its path: {bad}")
     served = call(*as_cat, "dashboard__set_plugin_settings",
-                  {"plugin_instance_id": INSTANCE, "value": {"poll_minutes": 5}, "note": "n"},
+                  {"plugin_instance_id": INSTANCE, "value": {"poll_minutes": 5},
+                   "against_updated_at_ns": version_read(*as_cat), "note": "n"},
                   "refused")
     must(refused_at(served, "value.poll_minutes") and "operations" in served.get("detail", ""),
          f"step 1, a setting serving operations too is refused naming it: {served}")
@@ -250,10 +267,12 @@ def run():
         ({"value": {"activity_window_days": 2650}}, "note"),
     ]:
         refused = call(*as_cat, "dashboard__set_plugin_settings",
-                       {"plugin_instance_id": INSTANCE, **arguments}, "refused")
+                       {"plugin_instance_id": INSTANCE,
+                        "against_updated_at_ns": version_read(*as_cat), **arguments}, "refused")
         must(refused_at(refused, path), f"step 2, refused at {path}: {refused}")
     call(*as_cat, "dashboard__set_plugin_settings",
          {"plugin_instance_id": INSTANCE, "clear": {"api_key": True},
+          "against_updated_at_ns": version_read(*as_cat),
           "note": "The key was shown in a screenshot; cleared it."}, "made")
     cleared = call(*as_cat, "dashboard__read_plugin_settings", {"plugin_instance_id": INSTANCE},
                    "unchanged")["data"]
@@ -309,7 +328,7 @@ def run():
          {"role": "custody", "days": 2190, "note": "The records rule: six years."}, "made")
     below = call(*as_cat, "dashboard__set_plugin_settings",
                  {"plugin_instance_id": INSTANCE, "value": {"activity_window_days": 30},
-                  "note": "Shorter."}, "refused")
+                  "against_updated_at_ns": version_read(*as_cat), "note": "Shorter."}, "refused")
     must(refused_at(below, "value.activity_window_days") and "below the hold" in below.get("detail", ""),
          f"step 4, a window below the hold is refused on the tool as on the page: {below}")
     holds = call(*as_admin, "dashboard__read_holds", {}, "unchanged")["data"]["holds"]
