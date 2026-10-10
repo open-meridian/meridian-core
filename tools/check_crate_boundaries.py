@@ -36,7 +36,7 @@ import sys
 
 # The crates that own a store. Depending on one means holding its types, which
 # means holding its schema.
-OWNS_A_STORE = ("meridian-street", "meridian-bor", "meridian-instrument")
+OWNS_A_STORE = ("meridian-street", "meridian-bor", "meridian-lake", "meridian-instrument")
 
 ALLOWLIST = "tools/crate-boundary-allowlist.txt"
 

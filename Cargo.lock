@@ -1889,6 +1889,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-lake"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "meridian-bus",
+ "meridian-clock",
+ "meridian-domain",
+ "meridian-pb",
+ "postgres",
+ "prost",
+ "r2d2",
+ "r2d2_postgres",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "meridian-pb"
 version = "0.1.0"
 source = "git+https://github.com/open-meridian/meridian-schema.git?rev=81425cb0f19d1e031ff1c021b5f9e10aa85c40f2#81425cb0f19d1e031ff1c021b5f9e10aa85c40f2"
@@ -1914,6 +1933,7 @@ dependencies = [
  "meridian-domain",
  "meridian-first-run",
  "meridian-instrument",
+ "meridian-lake",
  "meridian-pb",
  "meridian-sidecar",
  "meridian-street",

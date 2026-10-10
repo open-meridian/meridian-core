@@ -133,7 +133,9 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["create", "get", "list", "delete"]
+    # patch: a launched plugin's entitled datasets written as an annotation
+    # the broker reads (contract v18, W10.1).
+    verbs: ["create", "get", "list", "delete", "patch"]
   {{- if .Values.pluginStorage.enabled }}
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]

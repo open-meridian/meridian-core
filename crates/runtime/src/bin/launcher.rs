@@ -12,10 +12,11 @@
 use std::sync::Arc;
 
 use meridian_domain::v1::{
-    CreatePluginReply, CreatePluginRequest, RemovePluginReply, RemovePluginRequest,
+    CreatePluginReply, CreatePluginRequest, EntitlementsChangedEvent, RemovePluginReply,
+    RemovePluginRequest,
 };
 use meridian_first_run::cluster::ApiServer;
-use meridian_runtime::launched::{INSTANCE_LABEL, LAUNCHED_SELECTOR};
+use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
     checked, claim, manifest, reusable, template_for, with_archive, Shapes, StorageShapes,
     CREATE_PLUGIN, REMOVE_PLUGIN,
@@ -137,6 +138,53 @@ impl Launcher {
         Ok(())
     }
 
+    /// Each launched plugin's entitled datasets written on its Deployment,
+    /// where they differ, for the broker's reconcile to grant their subjects
+    /// (contract v18, W10.1; approved 2026-10-10). Nothing restarts: the
+    /// annotation is the Deployment's, not its pods'.
+    async fn entitle(&self, event: &EntitlementsChangedEvent) -> Result<(), String> {
+        let list = self
+            .api
+            .deployments(LAUNCHED_SELECTOR)
+            .await
+            .map_err(|failed| failed.0)?;
+        for item in list["items"].as_array().into_iter().flatten() {
+            let metadata = &item["metadata"];
+            let (Some(name), Some(instance)) = (
+                metadata["name"].as_str(),
+                metadata["labels"][INSTANCE_LABEL].as_str(),
+            ) else {
+                continue;
+            };
+            let mut entitled: Vec<&str> = event
+                .entitlements
+                .iter()
+                .filter(|e| e.allowed && e.instance == instance)
+                .filter(|e| event.datasets.iter().any(|d| d.dataset == e.dataset))
+                .map(|e| e.dataset.as_str())
+                .collect();
+            entitled.sort();
+            entitled.dedup();
+            let wanted = entitled.join(",");
+            let held = metadata["annotations"][DATASETS_ANNOTATION]
+                .as_str()
+                .unwrap_or_default();
+            if held == wanted {
+                continue;
+            }
+            self.api
+                .annotate_deployment(name, DATASETS_ANNOTATION, &wanted)
+                .await
+                .map_err(|failed| failed.0)?;
+            tracing::info!(
+                instance,
+                datasets = wanted,
+                "a plugin's entitled datasets written"
+            );
+        }
+        Ok(())
+    }
+
     fn remove(&self, request: RemovePluginRequest) -> Result<RemovePluginReply, String> {
         let mine = self.existing(&request.instance_id, &format!("{LAUNCHED_SELECTOR},"))?;
         let mut removed = false;
@@ -245,6 +293,22 @@ fn run() -> Result<(), String> {
                     .map_err(|failed| format!("undecodable RemovePluginRequest: {failed}"))?;
                 let gone = removing.remove(request)?;
                 Ok(("meridian.v1.RemovePluginReply".into(), gone.encode_to_vec()))
+            });
+            // The data configuration (contract v18, W10.1): each launched
+            // plugin's entitled datasets written for the broker.
+            let mut configuration = bus.subscribe("platform.config.event.entitlements-changed");
+            let entitling = Arc::clone(&launcher);
+            tokio::spawn(async move {
+                while let Some(heard) = configuration.recv().await {
+                    let Ok(event) = EntitlementsChangedEvent::decode(&heard.envelope.payload[..])
+                    else {
+                        tracing::warn!("a data configuration did not read");
+                        continue;
+                    };
+                    if let Err(failed) = entitling.entitle(&event).await {
+                        tracing::warn!(%failed, "the entitled datasets were not written");
+                    }
+                }
             });
             tracing::info!(instance_id, "the launcher is serving");
             ready.serving();

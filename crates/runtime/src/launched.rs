@@ -26,18 +26,22 @@ pub const LAUNCHED_SELECTOR: &str = "meridian.dev/launched=true";
 pub const INSTANCE_LABEL: &str = "meridian.dev/instance";
 /// Its roles, comma-separated, as the conductor approved them (W8.3).
 pub const ROLES_ANNOTATION: &str = "meridian.dev/roles";
+/// The datasets it is entitled to, comma-separated, as the launcher last
+/// heard the data configuration (contract v18, W10.1; approved 2026-10-10).
+pub const DATASETS_ANNOTATION: &str = "meridian.dev/datasets";
 
 /// A plugin the launcher launched: which instance, holding which roles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launched {
     pub instance_id: String,
     pub roles: Vec<String>,
+    pub datasets: Vec<String>,
 }
 
 impl Launched {
     pub fn instance(&self) -> Instance {
         let roles: Vec<&str> = self.roles.iter().map(String::as_str).collect();
-        Instance::plugin(&self.instance_id, &roles)
+        Instance::plugin(&self.instance_id, &roles).with_datasets(self.datasets.clone())
     }
 }
 
@@ -74,9 +78,18 @@ pub fn from_deployments(list: &serde_json::Value) -> Vec<Launched> {
                 .filter(|role| !role.is_empty())
                 .map(String::from)
                 .collect();
+            let datasets = metadata["annotations"][DATASETS_ANNOTATION]
+                .as_str()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|dataset| !dataset.is_empty())
+                .map(String::from)
+                .collect();
             Some(Launched {
                 instance_id: instance_id.to_string(),
                 roles,
+                datasets,
             })
         })
         .collect();

@@ -242,3 +242,44 @@ fn the_compiled_in_contract_generates() {
         .publish
         .contains(&"platform.street.command.record-statement".to_string()));
 }
+
+/// Contract v18, W10.1 (approved 2026-10-10): a reader subscribes to the
+/// dataset subjects it is entitled to and no other; the lake, with the
+/// runtime's credential, publishes on every dataset's.
+#[test]
+fn a_reader_is_granted_the_subjects_of_the_datasets_it_is_entitled_to_alone() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.{dataset}.event.prices-recorded\tevent\tlake\treporting\n\
+         platform.lake.query.list-prices\tquery\treporting\tlake\n",
+        "name\tkind\nreporting\trole\nlake\tcomponent\nsidecar\tcomponent\n\
+         instrument\tcomponent\nstreet\tcomponent\nbor\tcomponent\nconductor\tcomponent\n",
+    )
+    .unwrap();
+    let entitled = Instance::plugin("reporting-1", &["reporting"])
+        .with_datasets(vec!["coinbase-1:daily".into(), "bad.dataset".into()]);
+    let user = instance_user(&contract, &entitled, Password::Env("X".into())).unwrap();
+    assert!(user
+        .subscribe
+        .contains(&"platform.lake.coinbase-1:daily.event.prices-recorded".to_string()));
+    assert!(
+        !user
+            .subscribe
+            .iter()
+            .any(|s| s.contains("bad.dataset") || s.contains('{') || s.contains(".*.event.prices")),
+        "{:?}",
+        user.subscribe
+    );
+    let none = instance_user(
+        &contract,
+        &Instance::plugin("reporting-2", &["reporting"]),
+        Password::Env("Y".into()),
+    )
+    .unwrap();
+    assert!(!none.subscribe.iter().any(|s| s.contains("prices-recorded")));
+    let runtime = users(&contract, &[]).unwrap();
+    let runtime = runtime.iter().find(|u| u.user == "runtime").unwrap();
+    assert!(runtime
+        .publish
+        .contains(&"platform.lake.*.event.prices-recorded".to_string()));
+}

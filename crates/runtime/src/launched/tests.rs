@@ -27,11 +27,13 @@ fn a_launched_plugin_is_its_instance_and_the_roles_it_was_approved_with() {
         vec![
             Launched {
                 instance_id: "reference-1".into(),
-                roles: vec![]
+                roles: vec![],
+                datasets: vec![],
             },
             Launched {
                 instance_id: "snaptrade-2".into(),
-                roles: vec!["custody".into(), "reporting".into()]
+                roles: vec!["custody".into(), "reporting".into()],
+                datasets: vec![],
             },
         ],
         "sorted, one per instance, and nothing that does not name one"
@@ -42,6 +44,7 @@ fn plugin(instance: &str) -> Launched {
     Launched {
         instance_id: instance.into(),
         roles: vec![],
+        datasets: vec![],
     }
 }
 
@@ -130,18 +133,22 @@ fn a_launched_plugin_is_admitted_by_a_hash_and_its_roles_topics() {
         Launched {
             instance_id: "snaptrade-2".into(),
             roles: vec!["custody".into()],
+            datasets: vec![],
         },
         Launched {
             instance_id: "odd-1".into(),
             roles: vec!["not-a-role".into()],
+            datasets: vec![],
         },
         Launched {
             instance_id: "custody-test-1".into(),
             roles: vec![],
+            datasets: vec![],
         },
         Launched {
             instance_id: "waiting-1".into(),
             roles: vec![],
+            datasets: vec![],
         },
     ];
     let hashes = BTreeMap::from([
@@ -178,4 +185,20 @@ fn a_launched_plugin_is_admitted_by_a_hash_and_its_roles_topics() {
         1,
         "the chart's instance keeps its own credential"
     );
+}
+
+#[test]
+fn a_launched_plugins_entitled_datasets_are_read_from_its_annotation() {
+    let mut entitled = deployment(Some("reporting-1"), Some("reporting"));
+    entitled["metadata"]["annotations"][DATASETS_ANNOTATION] =
+        "coinbase-1:daily, kraken-1:daily".into();
+    let launched = from_deployments(&serde_json::json!({"items": [entitled]}));
+    assert_eq!(
+        launched[0].datasets,
+        vec!["coinbase-1:daily", "kraken-1:daily"]
+    );
+    match launched[0].instance() {
+        Instance::Plugin { datasets, .. } => assert_eq!(datasets.len(), 2),
+        other => panic!("{other:?}"),
+    }
 }

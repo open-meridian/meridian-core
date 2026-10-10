@@ -290,6 +290,26 @@ impl ApiServer {
         Ok(true)
     }
 
+    /// Set one annotation on a Deployment in this namespace, by merge patch,
+    /// leaving everything else alone: what the launcher writes a launched
+    /// plugin's entitled datasets as (contract v18).
+    pub async fn annotate_deployment(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), ClusterError> {
+        self.patch(
+            &format!(
+                "/apis/apps/v1/namespaces/{}/deployments/{name}",
+                self.namespace
+            ),
+            "application/merge-patch+json",
+            serde_json::json!({ "metadata": { "annotations": { key: value } } }),
+        )
+        .await
+    }
+
     /// A Secret's data, decoded. Keys whose value is not text are left out.
     pub async fn secret_text(&self, name: &str) -> Result<BTreeMap<String, String>, ClusterError> {
         use base64::Engine;

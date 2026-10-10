@@ -1,0 +1,25 @@
+[package]
+name = "meridian-lake"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The lake: what sources say about entities, one shape per data type, append-only and bitemporal"
+
+[dependencies]
+meridian-clock.workspace = true
+meridian-domain.workspace = true
+meridian-pb.workspace = true
+meridian-bus = { path = "../bus" }
+prost.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+postgres.workspace = true
+r2d2.workspace = true
+r2d2_postgres.workspace = true
+base64.workspace = true
+uuid.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

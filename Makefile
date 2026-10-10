@@ -159,13 +159,13 @@ test:
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
 		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
-			-p meridian-bor --test postgres \
+			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 			-p meridian-runtime --test grants --test waiting \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the four stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.

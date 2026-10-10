@@ -27,7 +27,12 @@ use meridian_sidecar::Contract;
 const INBOX: &str = "_INBOX.>";
 
 /// The components this deployment's runtime hosts, sharing one credential.
-const RUNTIME_COMPONENTS: [&str; 4] = ["instrument", "street", "bor", "conductor"];
+const RUNTIME_COMPONENTS: [&str; 5] = ["instrument", "street", "bor", "lake", "conductor"];
+
+/// The segment a lake row's subject names its dataset by (W10.5; topics.md,
+/// "Pattern"): the lake publishes on every dataset's, and a plugin subscribes
+/// to the datasets it is entitled to alone (contract v18, W10.1).
+const DATASET: &str = "{dataset}";
 
 /// Components holding a credential of their own rather than the runtime's.
 ///
@@ -45,6 +50,9 @@ pub enum Instance {
     Plugin {
         instance_id: String,
         roles: Vec<String>,
+        /// The datasets it is entitled to (contract v18): the only dataset
+        /// subjects it may subscribe to.
+        datasets: Vec<String>,
     },
     Component {
         instance_id: String,
@@ -57,6 +65,21 @@ impl Instance {
         Instance::Plugin {
             instance_id: instance_id.into(),
             roles: roles.iter().map(|role| role.to_string()).collect(),
+            datasets: Vec::new(),
+        }
+    }
+
+    /// The same plugin, entitled to these datasets.
+    pub fn with_datasets(self, entitled: Vec<String>) -> Self {
+        match self {
+            Instance::Plugin {
+                instance_id, roles, ..
+            } => Instance::Plugin {
+                instance_id,
+                roles,
+                datasets: entitled,
+            },
+            component => component,
         }
     }
 
@@ -105,6 +128,7 @@ pub struct User {
 /// and the grammar already restricts it to the tail, so this cannot produce a
 /// subject meaning something else.
 fn subject(pattern: &str) -> String {
+    let pattern = &pattern.replace(DATASET, "*");
     if pattern == "**" {
         return ">".to_string();
     }
@@ -158,6 +182,18 @@ pub fn permissions_for(
     roles: &[String],
     instance_id: &str,
 ) -> Result<(Vec<String>, Vec<String>), String> {
+    permissions_entitled(contract, roles, instance_id, &[])
+}
+
+/// [`permissions_for`], with the datasets the instance is entitled to
+/// (contract v18, W10.1): a row naming a dataset in its topic is granted on
+/// each of those datasets' subjects, and on no other.
+pub fn permissions_entitled(
+    contract: &Contract,
+    roles: &[String],
+    instance_id: &str,
+    datasets: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
     let granted = contract.grants_for(roles)?;
     let sidecar = contract.component("sidecar");
     let mut publish = BTreeSet::new();
@@ -166,12 +202,27 @@ pub fn permissions_for(
         publish.insert(subject(&scoped(topic, instance_id, roles)));
     }
     for topic in granted.subscribe.iter().chain(&sidecar.subscribe) {
+        if topic.contains(DATASET) {
+            for dataset in datasets.iter().filter(|d| dataset_reads(d)) {
+                subscribe.insert(subject(&topic.replace(DATASET, dataset)));
+            }
+            continue;
+        }
         subscribe.insert(subject(topic));
     }
     Ok((
         publish.into_iter().collect(),
         subscribe.into_iter().collect(),
     ))
+}
+
+/// Whether a dataset's ID can stand in a subject: one segment, no wildcard
+/// and no space.
+fn dataset_reads(dataset: &str) -> bool {
+    !dataset.is_empty()
+        && dataset
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'.' | b'*' | b'>'))
 }
 
 fn variable(user: &str) -> String {
@@ -235,8 +286,12 @@ pub fn instance_user(
     password: Password,
 ) -> Result<User, String> {
     let (mut publish, mut subscribe, note) = match instance {
-        Instance::Plugin { instance_id, roles } => {
-            let (publish, subscribe) = permissions_for(contract, roles, instance_id)
+        Instance::Plugin {
+            instance_id,
+            roles,
+            datasets,
+        } => {
+            let (publish, subscribe) = permissions_entitled(contract, roles, instance_id, datasets)
                 .map_err(|refusal| format!("{instance_id} is launched with {refusal}"))?;
             let held = if roles.is_empty() {
                 "no role, so no topics but its sidecar's own".to_string()

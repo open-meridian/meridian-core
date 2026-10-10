@@ -295,7 +295,18 @@ fn instance(item: &serde_json::Value) -> Result<Instance, String> {
         .as_array()
         .map(|items| items.iter().filter_map(|role| role.as_str()).collect())
         .unwrap_or_default();
-    Ok(Instance::plugin(instance_id, &roles))
+    // The datasets it is entitled to (contract v18), where the list names
+    // them: compose and the harness write them at start and on `entitle`.
+    let datasets: Vec<String> = item["datasets"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|dataset| dataset.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Instance::plugin(instance_id, &roles).with_datasets(datasets))
 }
 
 fn run() -> Result<(), String> {
