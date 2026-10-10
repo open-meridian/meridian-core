@@ -11,22 +11,27 @@
 //! The platform's answer to a person's ask (W3.3) is never applied as a record
 //! of its own: its INS- ID joins the record as an identifier -- added, never
 //! substituted (decisions/030, choice 2) -- and its values are offers.
+//!
+//! An identifier leaving a record has its window closed at that date, never
+//! deleted (contract v19, W3.5): moved by a merge, or ended by the platform's
+//! answer once a person accepts the end, which a completion carries as the
+//! identifier with its `valid_until_ns`.
 
 use meridian_domain::instrument_type;
 use meridian_domain::v1::{
-    instrument_value, AssetClass, CompleteInstrumentsRequest, InstrumentCompletion,
-    InstrumentCompletionResult, InstrumentRecord as PbInstrument, InstrumentType,
-    MergeInstrumentsRequest,
+    instrument_value, AssetClass, BinaryEventContract, CompleteInstrumentsRequest,
+    InstrumentCompletion, InstrumentCompletionResult, InstrumentRecord as PbInstrument,
+    InstrumentType, MergeInstrumentsRequest, MissReason,
 };
 use meridian_pb::v1::{Refusal, RefusalReason};
 use meridian_symbology::{GLOBAL_ID, OPEN};
 
 use crate::record::{
-    asked_from_wire, asset_class_name, dated, field_from_wire, is_currency, to_wire, value_words,
+    asked_from_wire, asset_class_name, field_from_wire, is_currency, to_wire, value_words,
     CURRENCY_SCHEME,
 };
 use crate::replace::current;
-use crate::resolve::{identifier_change, keep_offers};
+use crate::resolve::{identifier_change, keep_offers, window_for};
 use crate::store::{
     Asked, Change, Conflict, Field, Instrument, Offer, Result, Source, Store, Version, Written,
 };
@@ -257,7 +262,14 @@ fn complete_one(
                         problems.push((
                             RefusalReason::Incomplete,
                             path("instrument_type"),
-                            "an instrument type is one of the list: money_market_fund".into(),
+                            format!(
+                                "an instrument type is one of the list: {}",
+                                instrument_type::TYPES
+                                    .iter()
+                                    .map(|kind| instrument_type::short(*kind))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
                         ));
                         continue;
                     }
@@ -284,6 +296,25 @@ fn complete_one(
                     None,
                 )
             }
+            instrument_value::Value::BinaryEventContract(contract) => {
+                match payout_named(store, contract, now_ns)? {
+                    Ok(named) => (
+                        Field::BinaryEventContract,
+                        instrument_type::contract_to_text(&named),
+                        None,
+                    ),
+                    Err(wrong) => {
+                        for (field, words) in wrong {
+                            problems.push((
+                                RefusalReason::Incomplete,
+                                path(&format!("binary_event_contract.{field}")),
+                                words,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
             instrument_value::Value::Identifier(identifier) => {
                 let asked = asked_from_wire(identifier);
                 if asked.scheme.is_empty() || asked.value.is_empty() {
@@ -294,12 +325,51 @@ fn complete_one(
                     ));
                     continue;
                 }
+                // An end stated (contract v19, W3.5): the identifier left the
+                // record then, as the platform's offer said; its window closes.
+                if identifier.valid_until_ns > 0 {
+                    if !record.holds(&asked) {
+                        if !record.carries(&asked) {
+                            problems.push((
+                                RefusalReason::Incomplete,
+                                path("identifier"),
+                                format!(
+                                    "{}:{} is not on {}, so it cannot leave it",
+                                    asked.scheme, asked.value, record.instrument_id
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    record.close(&asked, identifier.valid_until_ns);
+                    changes_held = true;
+                    record.set_source(Source {
+                        acting_through_delegation: delegation.to_string(),
+                        client_name: client.to_string(),
+                        field: Field::Identifier,
+                        identifier: Some(asked.clone()),
+                        source: source.to_string(),
+                        person: person.to_string(),
+                        instance_id: String::new(),
+                        recorded_at_ns: now_ns,
+                        note: completion.note.trim().to_string(),
+                    });
+                    changes.push(Change {
+                        field: Field::Identifier.name().into(),
+                        scheme: asked.scheme.clone(),
+                        namespace: asked.source.clone(),
+                        before: asked.value.clone(),
+                        after: String::new(),
+                        source: source.to_string(),
+                    });
+                    continue;
+                }
                 (Field::Identifier, asked.value.clone(), Some(asked))
             }
         };
 
         if let Some(asked) = identifier {
-            if record.carries(&asked) {
+            if record.holds(&asked) {
                 continue;
             }
             let others = held_elsewhere(store, &asked, &record.instrument_id)?;
@@ -319,7 +389,7 @@ fn complete_one(
                 ));
                 continue;
             }
-            record.identifiers.push(dated(&asked));
+            record.identifiers.push(window_for(store, &asked)?);
             record.set_source(Source {
                 acting_through_delegation: delegation.to_string(),
                 client_name: client.to_string(),
@@ -407,6 +477,19 @@ fn complete_one(
             ),
             "a money market fund's attributes are set only on a record whose type is money \
              market fund"
+                .into(),
+        ));
+    }
+    // And a binary event contract's to one (contract v19, W3.10).
+    if !record.binary_event_contract.is_empty() && kind != InstrumentType::BinaryEventContract {
+        problems.push((
+            RefusalReason::Incomplete,
+            at_value(
+                |value| matches!(value, instrument_value::Value::BinaryEventContract(_)),
+                "binary_event_contract",
+            ),
+            "a binary event contract's attributes are set only on a record whose type is \
+             binary event contract"
                 .into(),
         ));
     }
@@ -614,9 +697,13 @@ pub fn merge_as(
     let mut stays = kept.clone();
     let mut changes: Vec<Change> = Vec::new();
 
-    for identifier in &merged.identifiers {
+    // The merged record's identifiers move to the one that stays, each with
+    // the window it had; on the merged record each window closes now, never
+    // deleted (contract v19, W3.5), so a resolve as of a date before still
+    // meets it, and follows its replacement to the record that stays.
+    for identifier in merged.held_now() {
         let asked = identifier.asked();
-        if stays.carries(&asked) {
+        if stays.holds(&asked) {
             continue;
         }
         stays.identifiers.push(identifier.clone());
@@ -643,6 +730,7 @@ pub fn merge_as(
         Field::Description,
         Field::InstrumentType,
         Field::MoneyMarketFund,
+        Field::BinaryEventContract,
     ] {
         let (ours, theirs) = (kept.value(field), merged.value(field));
         if theirs.is_empty() || ours == theirs {
@@ -701,6 +789,19 @@ pub fn merge_as(
     }
 
     let mut gone = merged.clone();
+    let mut left = Vec::new();
+    for identifier in merged.held_now() {
+        let asked = identifier.asked();
+        gone.close(&asked, now_ns);
+        left.push(Change {
+            field: Field::Identifier.name().into(),
+            scheme: asked.scheme.clone(),
+            namespace: asked.source.clone(),
+            before: asked.value.clone(),
+            after: String::new(),
+            source: format!("merged into {kept_id}"),
+        });
+    }
     gone.version = merged.version + 1;
     gone.record_time_ns = now_ns;
     let gone_entry = Version {
@@ -709,7 +810,7 @@ pub fn merge_as(
         instrument_id: gone.instrument_id.clone(),
         version: gone.version,
         operation: "merged-into".into(),
-        changes: Vec::new(),
+        changes: left,
         person: person.to_string(),
         instance_id: String::new(),
         note: note.to_string(),
@@ -766,8 +867,8 @@ pub fn keep_platform_answer(
                 ids.push(current(store, &answer.instrument_id)?);
             }
             note_conflict(store, vec![global], ids, now_ns)?;
-        } else if !record.carries(&global) {
-            record.identifiers.push(dated(&global));
+        } else if !record.holds(&global) {
+            record.identifiers.push(window_for(store, &global)?);
             record.set_source(Source {
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
@@ -790,6 +891,7 @@ pub fn keep_platform_answer(
         source: words.clone(),
         instance_id: String::new(),
         offered_at_ns: now_ns,
+        valid_until_ns: 0,
     };
     let mut offers = Vec::new();
     let class = asset_class_name(answer.asset_class);
@@ -806,13 +908,47 @@ pub fn keep_platform_answer(
             None,
         ));
     }
+    // Its type and a binary event contract's attributes (contract v19): the
+    // type only under the class the answer gives beside it, as a plugin's.
+    if let Ok(kind) = InstrumentType::try_from(answer.instrument_type) {
+        if instrument_type::class_of(kind).is_some_and(|class| class as i32 == answer.asset_class) {
+            offers.push(offer(
+                Field::InstrumentType,
+                instrument_type::name(kind).to_string(),
+                None,
+            ));
+            if kind == InstrumentType::BinaryEventContract {
+                if let Some(contract) = answer.binary_event_contract.as_ref() {
+                    if let Ok(Ok(named)) = payout_named(store, contract, now_ns) {
+                        offers.push(offer(
+                            Field::BinaryEventContract,
+                            instrument_type::contract_to_text(&named),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+    }
     for identifier in &answer.identifiers {
         let asked = asked_from_wire(identifier);
         if asked.source.is_empty()
             && OPEN.contains(&asked.scheme.as_str())
             && asked.scheme != GLOBAL_ID
         {
-            offers.push(offer(Field::Identifier, asked.value.clone(), Some(asked)));
+            if identifier.valid_until_ns > 0 {
+                // The master ended it (contract v19, the plan's Q34): an offer
+                // to close its window here, where the record holds it, in
+                // force once a person accepts it (decisions/030, choice 2).
+                if record.holds(&asked) {
+                    offers.push(Offer {
+                        valid_until_ns: identifier.valid_until_ns,
+                        ..offer(Field::Identifier, asked.value.clone(), Some(asked))
+                    });
+                }
+            } else {
+                offers.push(offer(Field::Identifier, asked.value.clone(), Some(asked)));
+            }
         }
     }
     let offered = keep_offers(&mut record, offers);
@@ -876,13 +1012,66 @@ fn note_conflict(
 ) -> Result<()> {
     instrument_ids.sort();
     instrument_ids.dedup();
+    // A completion or the platform's ID meeting another record's identifier:
+    // no reason (contract v19, the plan's Q35).
     store.note_conflict(Conflict {
         identifiers,
         instrument_ids,
         reported_by: String::new(),
         first_seen_ns: now_ns,
         last_seen_ns: now_ns,
+        reason: MissReason::Unspecified as i32,
     })
+}
+
+/// A binary event contract's attributes held to W3.10, its payout naming
+/// its cash instrument where the store holds one record for its ISO 4217
+/// code (contract v19): the attributes as kept, or what is wrong, each by
+/// its field. A payout naming an instrument the deployment does not hold, or
+/// a code and an instrument naming two assets, is refused.
+pub(crate) fn payout_named(
+    store: &dyn Store,
+    contract: &BinaryEventContract,
+    now_ns: i64,
+) -> Result<std::result::Result<BinaryEventContract, Vec<(&'static str, String)>>> {
+    let wrong = instrument_type::contract_refused(contract);
+    if !wrong.is_empty() {
+        return Ok(Err(wrong));
+    }
+    let mut named = contract.clone();
+    let payout = named.payout.get_or_insert_with(Default::default);
+    payout.currency_code = payout.currency_code.trim().to_string();
+    payout.instrument_id = payout.instrument_id.trim().to_string();
+    if !payout.instrument_id.is_empty() && store.by_id(&payout.instrument_id)?.is_none() {
+        return Ok(Err(vec![(
+            "payout.instrument_id",
+            format!("{} is no record the deployment holds", payout.instrument_id),
+        )]));
+    }
+    if !payout.currency_code.is_empty() {
+        let mut cash: Vec<String> = Vec::new();
+        for record in store.matching(CURRENCY_SCHEME, &payout.currency_code, "", now_ns)? {
+            let became = current(store, &record.instrument_id)?;
+            if !cash.contains(&became) {
+                cash.push(became);
+            }
+        }
+        match (cash.as_slice(), payout.instrument_id.is_empty()) {
+            ([one], true) => payout.instrument_id = one.clone(),
+            ([one], false) if *one != payout.instrument_id => {
+                return Ok(Err(vec![(
+                    "payout",
+                    format!(
+                        "currency_code {} names {one}, and instrument_id names {}; both set \
+                         name the same asset",
+                        payout.currency_code, payout.instrument_id
+                    ),
+                )]))
+            }
+            _ => {}
+        }
+    }
+    Ok(Ok(named))
 }
 
 #[cfg(test)]
@@ -905,6 +1094,7 @@ mod tests {
                     scheme: scheme.into(),
                     value: value.into(),
                     source: source.into(),
+                    ..Default::default()
                 }],
                 as_of_ns: NOW,
                 ..Default::default()
@@ -1308,6 +1498,7 @@ mod tests {
                         scheme: "figi".into(),
                         value: "BBG000SPAXX1".into(),
                         source: String::new(),
+                        ..Default::default()
                     }),
                     "OpenFIGI",
                 )],
@@ -1434,6 +1625,7 @@ mod tests {
                 scheme: "iso4217".into(),
                 value: "USD".into(),
                 source: String::new(),
+                ..Default::default()
             }],
             asset_class: AssetClass::Cash as i32,
             currency: "USD".into(),
@@ -1469,5 +1661,256 @@ mod tests {
                 .is_none(),
             "the same answer again changes nothing"
         );
+    }
+
+    fn ticker() -> Asked {
+        Asked {
+            scheme: "symbol".into(),
+            value: "ZZ".into(),
+            source: "snaptrade".into(),
+        }
+    }
+
+    fn resolve_ticker(store: &MemoryStore, as_of_ns: i64, now_ns: i64) -> String {
+        let reply = resolve_identifier(
+            store,
+            &ResolveIdentifierRequest {
+                identifiers: vec![crate::record::asked_to_wire(&ticker())],
+                as_of_ns,
+                ..Default::default()
+            },
+            "custody-snaptrade-1",
+            now_ns,
+        )
+        .unwrap()
+        .reply;
+        assert!(reply.found, "{reply:?}");
+        reply.instrument_id
+    }
+
+    #[test]
+    fn a_ticker_reassigned_answers_each_record_for_its_own_dates() {
+        // decisions/034, W3.5: the platform ends the ticker on the record
+        // that held it, a person accepts the end, and another security is
+        // given it later. Its window on the first record is closed, never
+        // deleted: as of a date before, the first answers; after, the second.
+        let store = MemoryStore::new();
+        let first = resolve_ticker(&store, NOW, NOW);
+        let left = NOW + 10;
+        let answer = PbInstrument {
+            instrument_id: "INS-01J8XQ4M7K000000000000ZZ".into(),
+            identifiers: vec![PbIdentifier {
+                valid_until_ns: left,
+                ..crate::record::asked_to_wire(&Asked {
+                    scheme: "ticker".into(),
+                    value: "ZZ".into(),
+                    source: String::new(),
+                })
+            }],
+            version: 3,
+            ..Default::default()
+        };
+        // The platform's ended identifier is offered only where the record
+        // holds it: this record holds the brokerage symbol, not the ticker.
+        let kept = keep_platform_answer(&store, &first, &answer, NOW + 11)
+            .unwrap()
+            .unwrap();
+        assert!(!kept.offers.iter().any(|offer| offer.valid_until_ns > 0));
+
+        // A person ends the symbol, as an accepted end would.
+        let ended = one(
+            &store,
+            &completing(
+                &first,
+                kept.version,
+                vec![value(
+                    instrument_value::Value::Identifier(PbIdentifier {
+                        valid_until_ns: left,
+                        ..crate::record::asked_to_wire(&ticker())
+                    }),
+                    "the platform, record INS-01J8XQ4M7K000000000000ZZ version 3",
+                )],
+                "delisted; the platform ended the symbol",
+            ),
+        );
+        assert!(ended.refusal.is_none(), "{ended:?}");
+        let record = ended.instrument.unwrap();
+        let window = record
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.value == "ZZ")
+            .expect("kept, never deleted");
+        assert_eq!(window.valid_until_ns, left);
+
+        // Another security is given the symbol after it left.
+        let second = resolve_ticker(&store, NOW + 20, NOW + 20);
+        assert_ne!(second, first, "a new record for the new security");
+        let held = store.by_id(&second).unwrap().unwrap();
+        assert_eq!(
+            held.identifiers[0].valid_from_ns, left,
+            "its window opens where the last closed"
+        );
+        assert_eq!(resolve_ticker(&store, NOW + 5, NOW + 21), first);
+        assert_eq!(resolve_ticker(&store, NOW + 30, NOW + 22), second);
+        assert!(store.conflicts().unwrap().is_empty(), "no date answers two");
+    }
+
+    #[test]
+    fn a_merge_closes_the_merged_records_windows_and_keeps_them() {
+        let store = MemoryStore::new();
+        let a = minted(&store, "symbol", "AAA", "snaptrade");
+        let b = minted(&store, "figi", "BBG000AAA001", "");
+        let merged = merge(
+            &store,
+            &MergeInstrumentsRequest {
+                kept_instrument_id: a.clone(),
+                kept_version: 1,
+                merged_instrument_id: b.clone(),
+                merged_version: 1,
+                note: "one security".into(),
+                ..Default::default()
+            },
+            ADA,
+            NOW + 1,
+        )
+        .unwrap()
+        .unwrap();
+        let figi = Asked {
+            scheme: "figi".into(),
+            value: "BBG000AAA001".into(),
+            source: String::new(),
+        };
+        assert!(merged.stays.holds(&figi));
+        assert!(merged.merged.carries(&figi) && !merged.merged.holds(&figi));
+        assert_eq!(
+            merged.merged.identifiers[0].valid_to_ns,
+            Some(NOW + 1),
+            "closed at the merge"
+        );
+    }
+
+    #[test]
+    fn a_binary_event_contract_is_completed_with_its_payout_named() {
+        let store = MemoryStore::new();
+        let usd = minted(&store, "iso4217", "USD", "");
+        let id = minted(&store, "symbol", "KXFED-26NOV", "kalshi");
+        let contract = BinaryEventContract {
+            payout: Some(meridian_domain::v1::Money {
+                amount: Some(meridian_domain::exact::Exact::new(1, 0).unwrap().to_wire()),
+                currency_code: "USD".into(),
+                instrument_id: String::new(),
+            }),
+            closes_at_ns: 1_793_548_800_000_000_000,
+        };
+        let done = one(
+            &store,
+            &completing(
+                &id,
+                1,
+                vec![
+                    value(
+                        instrument_value::Value::AssetClass(AssetClass::EventContract as i32),
+                        "stated by kalshi-1",
+                    ),
+                    value(
+                        instrument_value::Value::InstrumentType(
+                            InstrumentType::BinaryEventContract as i32,
+                        ),
+                        "stated by kalshi-1",
+                    ),
+                    value(
+                        instrument_value::Value::BinaryEventContract(contract.clone()),
+                        "the venue's contract terms",
+                    ),
+                ],
+                "",
+            ),
+        );
+        assert!(done.refusal.is_none(), "{done:?}");
+        let record = done.instrument.unwrap();
+        let kept = record.binary_event_contract.unwrap();
+        assert_eq!(
+            kept.payout.as_ref().unwrap().instrument_id,
+            usd,
+            "its cash instrument"
+        );
+        assert_eq!(kept.closes_at_ns, contract.closes_at_ns);
+
+        // On a record that is not one, refused naming the value.
+        let other = minted(&store, "symbol", "SPY", "snaptrade");
+        let refused = one(
+            &store,
+            &completing(
+                &other,
+                1,
+                vec![value(
+                    instrument_value::Value::BinaryEventContract(contract),
+                    "the venue's contract terms",
+                )],
+                "",
+            ),
+        );
+        let refusal = refused.refusal.unwrap();
+        assert_eq!(refusal.reason, RefusalReason::Incomplete as i32);
+        assert_eq!(refusal.fields, vec!["values[0].binary_event_contract"]);
+    }
+
+    #[test]
+    fn a_completions_conflict_has_no_reason_and_a_resolves_is_ambiguous() {
+        let store = MemoryStore::new();
+        let a = minted(&store, "symbol", "AAA", "snaptrade");
+        let b = minted(&store, "figi", "BBG000AAA002", "");
+        let refused = one(
+            &store,
+            &completing(
+                &a,
+                1,
+                vec![value(
+                    instrument_value::Value::Identifier(PbIdentifier {
+                        scheme: "figi".into(),
+                        value: "BBG000AAA002".into(),
+                        ..Default::default()
+                    }),
+                    "a statement",
+                )],
+                "",
+            ),
+        );
+        assert!(refused.refusal.is_some());
+        let listed = store.conflicts().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].reason, MissReason::Unspecified as i32);
+        let _ = b;
+
+        // A resolve meeting both records lists them ambiguous.
+        let reply = resolve_identifier(
+            &store,
+            &ResolveIdentifierRequest {
+                identifiers: vec![
+                    PbIdentifier {
+                        scheme: "figi".into(),
+                        value: "BBG000AAA002".into(),
+                        ..Default::default()
+                    },
+                    PbIdentifier {
+                        scheme: "symbol".into(),
+                        value: "AAA".into(),
+                        source: "snaptrade".into(),
+                        ..Default::default()
+                    },
+                ],
+                as_of_ns: NOW,
+                ..Default::default()
+            },
+            "custody-snaptrade-1",
+            NOW + 2,
+        )
+        .unwrap()
+        .reply;
+        assert_eq!(reply.miss_reason, MissReason::Ambiguous as i32);
+        let flagged = store.conflicts().unwrap();
+        assert!(flagged
+            .iter()
+            .any(|conflict| conflict.reason == MissReason::Ambiguous as i32));
     }
 }

@@ -42,6 +42,7 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
             scheme: "figi".into(),
             value: figi,
             source: String::new(),
+            ..Default::default()
         }],
         as_of_ns: stamp,
         ..Default::default()
@@ -100,6 +101,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_record_minted_while_the_platf
                 scheme: "symbol".into(),
                 value: format!("ZZ{stamp}"),
                 source: "snaptrade".into(),
+                ..Default::default()
             }],
             as_of_ns: stamp,
             ..Default::default()

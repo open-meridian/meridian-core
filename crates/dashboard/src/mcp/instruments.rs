@@ -525,6 +525,7 @@ fn value(
                 scheme: text(id, "scheme", &at, true, problems).to_ascii_lowercase(),
                 value: text(id, "value", &at, true, problems),
                 source: text(id, "source", &at, false, problems),
+                ..Default::default()
             })
         }
     };
@@ -647,6 +648,9 @@ fn value_json(value: &InstrumentValue) -> Value {
         Some(instrument_value::Value::MoneyMarketFund(f)) => {
             json!({"money_market_fund": fund_json(f)})
         }
+        Some(instrument_value::Value::BinaryEventContract(c)) => {
+            json!({"binary_event_contract": contract_json(c)})
+        }
         None => json!({}),
     };
     out["source"] = value.source.clone().into();
@@ -659,6 +663,25 @@ fn fund_json(fund: &MoneyMarketFund) -> Value {
         "investors": enum_name::<MoneyMarketFundInvestors>(fund.investors, |v| v.as_str_name()),
         "nav": enum_name::<MoneyMarketFundNav>(fund.nav, |v| v.as_str_name()),
         "liquidity_fee": enum_name::<LiquidityFeeRegime>(fund.liquidity_fee, |v| v.as_str_name()),
+    })
+}
+
+/// A binary event contract's attributes as a tool answers them (contract
+/// v19): the payout's amount as text, its asset, and when trading closes.
+fn contract_json(contract: &meridian_domain::v1::BinaryEventContract) -> Value {
+    let payout = contract.payout.clone().unwrap_or_default();
+    json!({
+        "payout": {
+            "amount": payout
+                .amount
+                .as_ref()
+                .and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok())
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
+            "currency_code": payout.currency_code,
+            "instrument_id": payout.instrument_id,
+        },
+        "closes_at_ns": contract.closes_at_ns,
     })
 }
 

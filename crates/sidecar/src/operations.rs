@@ -71,6 +71,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
         }
         message.account_id = self.linked_account("meridian.v1.RecordHoldingsStatementRequest", &message.external_account_id).await?;
+        for stamped0 in message.figures.iter_mut() {
+            for stamped1 in stamped0.collateral.iter_mut() {
+                for stamped2 in stamped1.unresolved_identifiers.iter_mut() {
+                    stamped2.valid_from_ns = Default::default();
+                    stamped2.valid_until_ns = Default::default();
+                }
+            }
+        }
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-statement", "meridian.v1.RecordHoldingsStatementRequest", message, account, acting_for).await
     }
@@ -108,6 +116,10 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.known("side", message.side, domain::HoldingSide::try_from(message.side).is_ok())?;
         self.known("available_basis", message.available_basis, domain::AvailableBasis::try_from(message.available_basis).is_ok())?;
         message.account_id = self.linked_account("meridian.v1.RecordHoldingRequest", &message.external_account_id).await?;
+        for stamped0 in message.unresolved_identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = Some(message.account_id.clone());
         self.command_typed("platform.street.command.record-holding", "meridian.v1.RecordHoldingRequest", message, account, acting_for).await
     }
@@ -195,9 +207,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
-        let message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
+        let mut message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
         self.known("stated_asset_class", message.stated_asset_class, domain::AssetClass::try_from(message.stated_asset_class).is_ok())?;
         self.known("stated_instrument_type", message.stated_instrument_type, domain::InstrumentType::try_from(message.stated_instrument_type).is_ok())?;
+        for stamped0 in message.identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = None;
         self.call_typed("platform.reference.query.resolve-identifier", "meridian.v1.ResolveIdentifierRequest", message, account, None).await
     }
@@ -211,6 +227,10 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.known("asset_class", message.asset_class, domain::AssetClass::try_from(message.asset_class).is_ok())?;
         self.known("reason", message.reason, domain::MissReason::try_from(message.reason).is_ok())?;
         message.publisher_instance_id = self.instance_id().to_string();
+        for stamped0 in message.identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         self.publish_typed("platform.reference.event.instrument-missing", "meridian.v1.MissingInstrumentDetectedEvent", message).await
     }
 
@@ -328,7 +348,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<plugin::RecordAccountFiguresResult>, Status> {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
-        let message: domain::RecordAccountFiguresRequest = self.as_domain(params)?;
+        let mut message: domain::RecordAccountFiguresRequest = self.as_domain(params)?;
         for (i0, held0) in message.agreements.iter().enumerate() {
             if let Some(held1) = held0.figures.as_ref() {
                 self.exact_money(&format!("agreements[{i0}].figures.buying_power"), held1.buying_power.as_ref())?;
@@ -349,6 +369,15 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.known(&format!("agreements[{i0}].position_values[{i1}].side"), held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
                 self.exact_money(&format!("agreements[{i0}].position_values[{i1}].market_value"), held1.market_value.as_ref())?;
                 self.exact_money(&format!("agreements[{i0}].position_values[{i1}].margin_requirement"), held1.margin_requirement.as_ref())?;
+            }
+        }
+        for stamped0 in message.agreements.iter_mut() {
+            let stamped1 = stamped0.figures.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.collateral.iter_mut() {
+                for stamped3 in stamped2.unresolved_identifiers.iter_mut() {
+                    stamped3.valid_from_ns = Default::default();
+                    stamped3.valid_until_ns = Default::default();
+                }
             }
         }
         let account = Some(message.account_id.clone());
@@ -484,7 +513,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::ResolveVenueParams>,
     ) -> Result<Response<plugin::ResolveVenueResult>, Status> {
-        let message: domain::ResolveVenueRequest = self.as_domain(request.into_inner())?;
+        let mut message: domain::ResolveVenueRequest = self.as_domain(request.into_inner())?;
+        for stamped0 in message.identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = None;
         self.call_typed("platform.reference.query.resolve-venue", "meridian.v1.ResolveVenueRequest", message, account, None).await
     }
@@ -497,6 +530,10 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut message: domain::MissingVenueDetectedEvent = self.as_domain(request.into_inner())?;
         self.known("reason", message.reason, domain::MissReason::try_from(message.reason).is_ok())?;
         message.publisher_instance_id = self.instance_id().to_string();
+        for stamped0 in message.identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         self.publish_typed("platform.reference.event.venue-missing", "meridian.v1.MissingVenueDetectedEvent", message).await
     }
 
@@ -589,6 +626,113 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.lake.command.record-bars", "meridian.v1.RecordBarsRequest", message, account, acting_for).await
     }
 
+    /// W10.4: `platform.lake.command.record-trades` (preview).
+    async fn record_trades(
+        &self,
+        request: Request<plugin::RecordTradesParams>,
+    ) -> Result<Response<plugin::RecordTradesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordTradesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_TRADES_REQUEST_TRADES_COUNT;
+        if !bound.admits(message.trades.len()) {
+            let refusal = format!(
+                "trades holds {} rows; a batch is {} to {}",
+                message.trades.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.trades.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("trades[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+            }
+            self.exact_money(&format!("trades[{i0}].price"), held0.price.as_ref())?;
+            self.exact(&format!("trades[{i0}].quantity"), held0.quantity.as_ref())?;
+            if let Some(held1) = held0.attributes.as_ref() {
+                if let Some(held2) = held1.consolidated.as_ref() {
+                    self.known(&format!("trades[{i0}].attributes.consolidated.high_low"), held2.high_low, domain::Eligible::try_from(held2.high_low).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.consolidated.open"), held2.open, domain::Eligible::try_from(held2.open).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.consolidated.close"), held2.close, domain::Eligible::try_from(held2.close).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.consolidated.volume"), held2.volume, domain::Eligible::try_from(held2.volume).is_ok())?;
+                }
+                if let Some(held2) = held1.market_centre.as_ref() {
+                    self.known(&format!("trades[{i0}].attributes.market_centre.high_low"), held2.high_low, domain::Eligible::try_from(held2.high_low).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.market_centre.open"), held2.open, domain::Eligible::try_from(held2.open).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.market_centre.close"), held2.close, domain::Eligible::try_from(held2.close).is_ok())?;
+                    self.known(&format!("trades[{i0}].attributes.market_centre.volume"), held2.volume, domain::Eligible::try_from(held2.volume).is_ok())?;
+                }
+                for (i2, &value) in held1.characteristics.iter().enumerate() {
+                    self.known(&format!("trades[{i0}].attributes.characteristics[{i2}]"), value, domain::TradeCharacteristic::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("trades[{i0}].aggressor"), held0.aggressor, domain::Aggressor::try_from(held0.aggressor).is_ok())?;
+        }
+        for stamped0 in message.trades.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.trades.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-trades", "meridian.v1.RecordTradesRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-quotes` (preview).
+    async fn record_quotes(
+        &self,
+        request: Request<plugin::RecordQuotesParams>,
+    ) -> Result<Response<plugin::RecordQuotesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordQuotesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_QUOTES_REQUEST_QUOTES_COUNT;
+        if !bound.admits(message.quotes.len()) {
+            let refusal = format!(
+                "quotes holds {} rows; a batch is {} to {}",
+                message.quotes.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.quotes.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("quotes[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+            }
+            self.exact_money(&format!("quotes[{i0}].bid"), held0.bid.as_ref())?;
+            self.exact_money(&format!("quotes[{i0}].ask"), held0.ask.as_ref())?;
+            self.exact(&format!("quotes[{i0}].bid_quantity"), held0.bid_quantity.as_ref())?;
+            self.exact(&format!("quotes[{i0}].ask_quantity"), held0.ask_quantity.as_ref())?;
+            for (i1, &value) in held0.characteristics.iter().enumerate() {
+                self.known(&format!("quotes[{i0}].characteristics[{i1}]"), value, domain::QuoteCharacteristic::try_from(value).is_ok())?;
+            }
+        }
+        for stamped0 in message.quotes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.quotes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-quotes", "meridian.v1.RecordQuotesRequest", message, account, acting_for).await
+    }
+
     /// W10.6: `platform.lake.query.list-prices` (preview).
     async fn list_prices(
         &self,
@@ -610,6 +754,26 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let message: domain::ListBarsRequest = self.as_domain(request.into_inner())?;
         let account = None;
         self.call_typed("platform.lake.query.list-bars", "meridian.v1.ListBarsRequest", message, account, None).await
+    }
+
+    /// W10.6: `platform.lake.query.list-trades` (preview).
+    async fn list_trades(
+        &self,
+        request: Request<plugin::ListTradesParams>,
+    ) -> Result<Response<plugin::ListTradesResult>, Status> {
+        let message: domain::ListTradesRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-trades", "meridian.v1.ListTradesRequest", message, account, None).await
+    }
+
+    /// W10.6: `platform.lake.query.list-quotes` (preview).
+    async fn list_quotes(
+        &self,
+        request: Request<plugin::ListQuotesParams>,
+    ) -> Result<Response<plugin::ListQuotesResult>, Status> {
+        let message: domain::ListQuotesRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-quotes", "meridian.v1.ListQuotesRequest", message, account, None).await
     }
 
     /// W10.7: `platform.lake.command.decline-want` (preview).
@@ -740,6 +904,20 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.lake.event.want-withdrawn",
         payload_type: "meridian.v1.WantWithdrawnEvent",
         read: want_withdrawn,
+    },
+    crate::receive::Row {
+        name: "TradesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.trades-recorded",
+        payload_type: "meridian.v1.TradesRecordedEvent",
+        read: trades_recorded,
+    },
+    crate::receive::Row {
+        name: "QuotesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.quotes-recorded",
+        payload_type: "meridian.v1.QuotesRecordedEvent",
+        read: quotes_recorded,
     },
 ];
 
@@ -883,5 +1061,27 @@ fn want_withdrawn(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeE
         journal: None,
         cause: None,
         item: plugin::delivery::Item::WantWithdrawn(message),
+    })
+}
+
+/// W10.5: a TradesRecordedEvent, unconflated, unscoped.
+fn trades_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::TradesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::TradesRecorded(message),
+    })
+}
+
+/// W10.5: a QuotesRecordedEvent, conflated, unscoped.
+fn quotes_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::QuotesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::QuotesRecorded(message),
     })
 }

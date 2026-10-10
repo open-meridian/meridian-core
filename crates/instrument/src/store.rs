@@ -49,6 +49,11 @@ impl Identifier {
         self.valid_from_ns <= as_of_ns && self.valid_to_ns.is_none_or(|end| end > as_of_ns)
     }
 
+    /// Whether it is on the record now: its window not closed.
+    pub fn open(&self) -> bool {
+        self.valid_to_ns.is_none()
+    }
+
     /// The identifier without its dates.
     pub fn asked(&self) -> Asked {
         Asked {
@@ -70,6 +75,8 @@ pub enum Field {
     /// fund's attributes.
     InstrumentType,
     MoneyMarketFund,
+    /// Contract v19: a binary event contract's attributes.
+    BinaryEventContract,
 }
 
 impl Field {
@@ -82,6 +89,7 @@ impl Field {
             Field::Identifier => "identifier",
             Field::InstrumentType => "instrument_type",
             Field::MoneyMarketFund => "money_market_fund",
+            Field::BinaryEventContract => "binary_event_contract",
         }
     }
 
@@ -93,6 +101,7 @@ impl Field {
             "identifier" => Some(Field::Identifier),
             "instrument_type" => Some(Field::InstrumentType),
             "money_market_fund" => Some(Field::MoneyMarketFund),
+            "binary_event_contract" => Some(Field::BinaryEventContract),
             _ => None,
         }
     }
@@ -149,6 +158,12 @@ pub struct Offer {
     pub instance_id: String,
 
     pub offered_at_ns: i64,
+
+    /// For [`Field::Identifier`], when the source says the identifier left
+    /// the record (contract v19, W3.5): an offer to close its window there,
+    /// in force once a person accepts it. 0 for an offer to add one, and for
+    /// every other field.
+    pub valid_until_ns: i64,
 }
 
 impl Offer {
@@ -158,6 +173,7 @@ impl Offer {
             && self.value == other.value
             && self.identifier == other.identifier
             && self.instance_id == other.instance_id
+            && self.valid_until_ns == other.valid_until_ns
     }
 }
 
@@ -196,6 +212,11 @@ pub struct Instrument {
     /// person states them (contract v11).
     pub money_market_fund: String,
 
+    /// A binary event contract's attributes, one line of text
+    /// (`instrument_type::contract_to_text`), or empty until a person states
+    /// them (contract v19).
+    pub binary_event_contract: String,
+
     /// The venue it is listed on, the venue master's ID (contract v18), from
     /// the platform's answer to a person's ask; empty where none is known.
     pub listing_venue_id: String,
@@ -215,6 +236,51 @@ impl Instrument {
         })
     }
 
+    /// Whether the identifier is on the record now, its window open
+    /// (contract v19): one that left it is carried, closed, and not held.
+    pub fn holds(&self, asked: &Asked) -> bool {
+        self.identifiers.iter().any(|held| {
+            held.open()
+                && held.scheme == asked.scheme
+                && held.value == asked.value
+                && held.source == asked.source
+        })
+    }
+
+    /// Whether the identifier named the record at `as_of_ns`, by its window.
+    pub fn named_at(&self, asked: &Asked, as_of_ns: i64) -> bool {
+        self.identifiers.iter().any(|held| {
+            held.covers(as_of_ns)
+                && held.scheme == asked.scheme
+                && held.value == asked.value
+                && held.source == asked.source
+        })
+    }
+
+    /// Close the identifier's open window at `until_ns` (contract v19,
+    /// W3.5): it left the record then, and is kept, never deleted, so a
+    /// resolve as of a date before still answers this record. True when one
+    /// was open.
+    pub fn close(&mut self, asked: &Asked, until_ns: i64) -> bool {
+        let mut closed = false;
+        for held in self.identifiers.iter_mut().filter(|held| {
+            held.open()
+                && held.scheme == asked.scheme
+                && held.value == asked.value
+                && held.source == asked.source
+        }) {
+            // Never before it opened: a window is at least empty, not negative.
+            held.valid_to_ns = Some(until_ns.max(held.valid_from_ns));
+            closed = true;
+        }
+        closed
+    }
+
+    /// The identifiers on the record now.
+    pub fn held_now(&self) -> impl Iterator<Item = &Identifier> {
+        self.identifiers.iter().filter(|held| held.open())
+    }
+
     /// The value in force for a field other than an identifier.
     pub fn value(&self, field: Field) -> &str {
         match field {
@@ -224,6 +290,7 @@ impl Instrument {
             Field::Identifier => "",
             Field::InstrumentType => &self.instrument_type,
             Field::MoneyMarketFund => &self.money_market_fund,
+            Field::BinaryEventContract => &self.binary_event_contract,
         }
     }
 
@@ -235,6 +302,7 @@ impl Instrument {
             Field::Identifier => {}
             Field::InstrumentType => self.instrument_type = value,
             Field::MoneyMarketFund => self.money_market_fund = value,
+            Field::BinaryEventContract => self.binary_event_contract = value,
         }
     }
 
@@ -367,6 +435,13 @@ pub struct Conflict {
     pub reported_by: String,
     pub first_seen_ns: i64,
     pub last_seen_ns: i64,
+
+    /// Where it came from (contract v19, W3.11; the plan's Q35): a
+    /// `MissReason`, ambiguous where a resolve met several records, flagged
+    /// for a person's curation and never escalated; unspecified where a join
+    /// or a completion met another record's identifier. Once ambiguous, it
+    /// stays so.
+    pub reason: i32,
 }
 
 impl Conflict {
@@ -425,6 +500,12 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub trait Store: Send + Sync {
     /// The record, if it is held, with its sources and offers.
     fn by_id(&self, instrument_id: &str) -> Result<Option<Instrument>>;
+
+    /// Every window this identifier has had on any record, with the record
+    /// it was on (contract v19): what a joining identifier's window opens
+    /// after, so no date answers two records.
+    fn windows(&self, scheme: &str, value: &str, source: &str)
+        -> Result<Vec<(String, Identifier)>>;
 
     /// Every record this identifier mapped to at `as_of_ns`.
     ///
@@ -539,6 +620,33 @@ impl Held {
         found
     }
 
+    pub(crate) fn windows(
+        &self,
+        scheme: &str,
+        value: &str,
+        source: &str,
+    ) -> Vec<(String, Identifier)> {
+        let mut found: Vec<(String, Identifier)> = self
+            .by_id
+            .values()
+            .flat_map(|instrument| {
+                instrument
+                    .identifiers
+                    .iter()
+                    .filter(|identifier| {
+                        identifier.scheme == scheme
+                            && identifier.value == value
+                            && identifier.source == source
+                    })
+                    .map(|identifier| (instrument.instrument_id.clone(), identifier.clone()))
+            })
+            .collect();
+        found.sort_by(|left, right| {
+            (&left.0, left.1.valid_from_ns).cmp(&(&right.0, right.1.valid_from_ns))
+        });
+        found
+    }
+
     pub(crate) fn all(&self) -> Vec<Instrument> {
         let mut all: Vec<Instrument> = self.by_id.values().cloned().collect();
         all.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
@@ -598,6 +706,9 @@ impl Held {
                 held.last_seen_ns = conflict.last_seen_ns;
                 if held.reported_by.is_empty() {
                     held.reported_by = conflict.reported_by;
+                }
+                if held.reason == 0 {
+                    held.reason = conflict.reason;
                 }
             }
             None => {

@@ -731,6 +731,13 @@ struct WireRecord {
     listing_venue_id: String,
     #[serde(default)]
     description: String,
+    /// Its type, spelled as the asset class is (contract v19); empty for none.
+    #[serde(default)]
+    instrument_type: String,
+    /// A binary event contract's payout and close (contract v19); null for
+    /// a record that is not one.
+    #[serde(default)]
+    binary_event_contract: Option<WireContract>,
     #[serde(default)]
     lifecycle_state: String,
     #[serde(default)]
@@ -741,6 +748,27 @@ struct WireRecord {
     record_time_ns: i64,
 }
 
+/// meridian.v1.BinaryEventContract as the platform's answer carries it.
+#[derive(Debug, Deserialize)]
+struct WireContract {
+    #[serde(default)]
+    payout: Option<WireMoney>,
+    #[serde(default)]
+    closes_at_ns: i64,
+}
+
+/// A Money as the platform's answer carries it: the amount as text, so
+/// nothing passes through a float.
+#[derive(Debug, Deserialize)]
+struct WireMoney {
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    currency_code: String,
+    #[serde(default)]
+    instrument_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireIdentifier {
     #[serde(default)]
@@ -749,6 +777,25 @@ struct WireIdentifier {
     value: String,
     #[serde(default)]
     source: String,
+    /// Its window on the record (contract v19, the plan's Q34): from,
+    /// inclusive, and until, exclusive, 0 while it is on the record. A
+    /// deployment's pull carries the identifiers the master ended, closed.
+    #[serde(default)]
+    valid_from_ns: i64,
+    #[serde(default)]
+    valid_until_ns: i64,
+}
+
+impl WireIdentifier {
+    fn into_wire(self) -> PbIdentifier {
+        PbIdentifier {
+            scheme: self.scheme,
+            value: self.value,
+            source: self.source,
+            valid_from_ns: self.valid_from_ns,
+            valid_until_ns: self.valid_until_ns,
+        }
+    }
 }
 
 /// The reply's record and the venues it names, or nothing when the platform
@@ -806,11 +853,7 @@ fn into_venue(venue: WireVenue) -> Result<VenueRecord, PlatformError> {
         identifiers: venue
             .identifiers
             .into_iter()
-            .map(|identifier| PbIdentifier {
-                scheme: identifier.scheme,
-                value: identifier.value,
-                source: identifier.source,
-            })
+            .map(WireIdentifier::into_wire)
             .collect(),
         operating_venue_id: venue.operating_venue_id,
         time_zone: venue.time_zone,
@@ -918,17 +961,58 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
                 ))
             })? as i32;
 
+    // Its type (contract v19): the enum's name or the ruled spelling; one the
+    // schema does not define is refused, as an undefined class is.
+    let instrument_type = meridian_domain::instrument_type::read(&record.instrument_type)
+        .ok_or_else(|| {
+            PlatformError::Malformed(format!(
+                "{} arrived with instrument type {:?}, which the schema does not define",
+                record.instrument_id, record.instrument_type
+            ))
+        })? as i32;
+    let binary_event_contract = match record.binary_event_contract {
+        None => None,
+        Some(contract) => {
+            let payout = match contract.payout {
+                None => None,
+                Some(money) => Some(meridian_domain::v1::Money {
+                    amount: if money.amount.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            money
+                                .amount
+                                .trim()
+                                .parse::<meridian_domain::exact::Exact>()
+                                .map_err(|_| {
+                                    PlatformError::Malformed(format!(
+                                        "{} arrived with a payout of {:?}, which is no decimal",
+                                        record.instrument_id, money.amount
+                                    ))
+                                })?
+                                .to_wire(),
+                        )
+                    },
+                    currency_code: money.currency_code,
+                    instrument_id: money.instrument_id,
+                }),
+            };
+            Some(meridian_domain::v1::BinaryEventContract {
+                payout,
+                closes_at_ns: contract.closes_at_ns,
+            })
+        }
+    };
+
     Ok(PbInstrument {
         instrument_id: record.instrument_id,
         identifiers: record
             .identifiers
             .into_iter()
-            .map(|identifier| PbIdentifier {
-                scheme: identifier.scheme,
-                value: identifier.value,
-                source: identifier.source,
-            })
+            .map(WireIdentifier::into_wire)
             .collect(),
+        instrument_type,
+        binary_event_contract,
         asset_class,
         currency: record.currency,
         exchange_mic: record.exchange_mic,
@@ -1386,11 +1470,13 @@ pub(crate) mod tests {
                     scheme: "symbol".into(),
                     value: "ZZTOP".into(),
                     source: "snaptrade".into(),
+                    ..Default::default()
                 },
                 PbIdentifier {
                     scheme: "figi".into(),
                     value: "BBG000ZZTOP1".into(),
                     source: String::new(),
+                    ..Default::default()
                 },
             ],
             as_of_ns: AS_OF,
@@ -1404,6 +1490,7 @@ pub(crate) mod tests {
             scheme: scheme.into(),
             value: value.into(),
             source: source.into(),
+            ..Default::default()
         }
     }
 
@@ -1433,6 +1520,7 @@ pub(crate) mod tests {
             scheme: "iso10383".into(),
             value: "XNYS".into(),
             source: String::new(),
+            ..Default::default()
         };
         let pulled = platform.pull_venue(&mic, AS_OF, NOW).await.unwrap();
         assert_eq!(pulled.len(), 1);
@@ -1442,6 +1530,7 @@ pub(crate) mod tests {
             scheme: "symbol".into(),
             value: "coinbase".into(),
             source: "coinbase".into(),
+            ..Default::default()
         };
         assert!(platform
             .pull_venue(&vendor, AS_OF, NOW)
@@ -1473,6 +1562,64 @@ pub(crate) mod tests {
         assert!(transport.urls()[0].starts_with(&format!(
             "{ADDRESS}/api/v1/reference/instruments/INS-ONE?as_of_ns="
         )));
+    }
+
+    #[tokio::test]
+    async fn a_pull_carries_the_event_contract_and_each_identifiers_window() {
+        // Contract v19: the type and its payout and close, and the
+        // identifiers the master ended, their windows closed (the plan's Q34).
+        let body = serde_json::json!({
+            "found": true,
+            "instrument": {
+                "instrument_id": "INS-KXFED",
+                "identifiers": [
+                    {"scheme": "ticker", "value": "KXFED-26NOV", "source": "",
+                     "valid_from_ns": 5, "valid_until_ns": 0},
+                    {"scheme": "ticker", "value": "KXFED-OLD", "source": "",
+                     "valid_from_ns": 1, "valid_until_ns": 5}
+                ],
+                "asset_class": "ASSET_CLASS_EVENT_CONTRACT",
+                "instrument_type": "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
+                "binary_event_contract": {
+                    "payout": {"amount": "1", "currency_code": "USD", "instrument_id": ""},
+                    "closes_at_ns": 1793548800000000000_i64
+                },
+                "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                "version": 2
+            }
+        })
+        .to_string();
+        let transport = Fake::new(vec![Ok(reply(200, &body))]);
+        let record = platform(transport)
+            .pull_instrument("INS-KXFED", AS_OF, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.instrument_type,
+            meridian_domain::v1::InstrumentType::BinaryEventContract as i32
+        );
+        let contract = record.binary_event_contract.unwrap();
+        assert_eq!(contract.closes_at_ns, 1_793_548_800_000_000_000);
+        let payout = contract.payout.unwrap();
+        assert_eq!(payout.currency_code, "USD");
+        assert_eq!(
+            meridian_domain::exact::Exact::from_wire(&payout.amount.unwrap())
+                .unwrap()
+                .to_string(),
+            "1"
+        );
+        assert_eq!(record.identifiers[1].valid_until_ns, 5, "ended, closed");
+        assert_eq!(record.identifiers[0].valid_until_ns, 0);
+
+        let wrong = body.replace(
+            "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
+            "INSTRUMENT_TYPE_ETF",
+        );
+        let refused = platform(Fake::new(vec![Ok(reply(200, &wrong))]))
+            .pull_instrument("INS-KXFED", AS_OF, NOW)
+            .await;
+        assert!(refused.is_err(), "a type the schema does not define");
     }
 
     #[tokio::test]

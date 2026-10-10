@@ -33,6 +33,18 @@
 //! An asset class, a currency or a description a plugin sends with its resolve
 //! is kept on the record as an offer, with the instance as its source, in force
 //! only when a person accepts it (W3.10; the spec's Q6).
+//!
+//! # Every date the store holds (contract v19, decisions/034)
+//!
+//! Each identifier on a record keeps its window, and one that leaves a record
+//! has its window closed, never deleted, so a resolve as of a date answers the
+//! record that held the identifier then. One joining a record opens its
+//! window where the last window of that identifier on any record closed --
+//! from the start where none ever did -- so no date answers two records for
+//! one identifier, and none falls between them. A conflict a resolve met is
+//! listed with the reason ambiguous, flagged for a person and never escalated
+//! (W3.4); asked read-only, as `reporting` asks, nothing is minted, joined,
+//! offered or listed (W3.1).
 
 use meridian_domain::v1::{
     AssetClass, MissReason, MissingInstrumentDetectedEvent, ResolveIdentifierReply,
@@ -42,11 +54,11 @@ use meridian_domain::v1::{
 use meridian_symbology::rank;
 
 use crate::ids;
-use crate::record::{asked_from_wire, asset_class_name, dated, is_currency, to_wire};
+use crate::record::{asked_from_wire, asset_class_name, is_currency, to_wire};
 use crate::replace::current;
 use crate::store::{
-    Asked, Change, Conflict, Field, IdentifierSet, Instrument, Offer, Result, Source, Stood, Store,
-    Version, Written,
+    Asked, Change, Conflict, Field, Identifier, IdentifierSet, Instrument, Offer, Result, Source,
+    Stood, Store, Version, Written,
 };
 
 /// What a resolve answered, and the record it changed to answer it.
@@ -71,6 +83,28 @@ pub fn resolve_identifier(
     request: &ResolveIdentifierRequest,
     instance_id: &str,
     now_ns: i64,
+) -> Result<Resolution> {
+    resolve(store, request, instance_id, now_ns, false)
+}
+
+/// W3.1 asked read-only (contract v19, approved 2026-10-10): the record the
+/// store holds for the date, and nothing written. Nothing matched is a miss,
+/// not found, never a record minted; several matched is a miss, ambiguous,
+/// with no conflict listed; a match joins nothing and keeps no offer.
+pub fn resolve_identifier_read_only(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    now_ns: i64,
+) -> Result<Resolution> {
+    resolve(store, request, "", now_ns, true)
+}
+
+fn resolve(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    instance_id: &str,
+    now_ns: i64,
+    read_only: bool,
 ) -> Result<Resolution> {
     let asked: Vec<Asked> = IdentifierSet::new(
         request
@@ -113,6 +147,8 @@ pub fn resolve_identifier(
 
         match candidates.len() {
             0 => continue,
+            1 if read_only => return Ok(unchanged(resolved(candidates.remove(0), false))),
+            _ if read_only => return Ok(unchanged(missed(MissReason::Ambiguous))),
             1 => {
                 return joined(
                     store,
@@ -125,13 +161,46 @@ pub fn resolve_identifier(
                 )
             }
             _ => {
-                note(store, meeting, candidates, instance_id, now_ns)?;
+                // A resolve that met several records: flagged for the
+                // deployment's own person, never escalated (W3.4, W3.11).
+                note(
+                    store,
+                    meeting,
+                    candidates,
+                    instance_id,
+                    now_ns,
+                    MissReason::Ambiguous,
+                )?;
                 return Ok(unchanged(missed(MissReason::Ambiguous)));
             }
         }
     }
 
+    if read_only {
+        return Ok(unchanged(missed(MissReason::NotFound)));
+    }
     mint(store, request, asked, instance_id, now_ns)
+}
+
+/// An identifier joining a record (contract v19, W3.5): its window opens
+/// where the last window it had on any record closed, so a resolve as of a
+/// date before answers the record that held it then; from the start where it
+/// was never on a record before, since a deployment keeps no effective dating
+/// of its own on the day it first hears of one.
+pub(crate) fn window_for(store: &dyn Store, asked: &Asked) -> Result<Identifier> {
+    let from = store
+        .windows(&asked.scheme, &asked.value, &asked.source)?
+        .iter()
+        .filter_map(|(_, window)| window.valid_to_ns)
+        .max()
+        .unwrap_or(0);
+    Ok(Identifier {
+        scheme: asked.scheme.clone(),
+        value: asked.value.clone(),
+        source: asked.source.clone(),
+        valid_from_ns: from,
+        valid_to_ns: None,
+    })
 }
 
 /// One record matched: join the set's other identifiers to it, unless one of
@@ -152,14 +221,28 @@ fn joined(
     };
 
     let mut joining = Vec::new();
-    for identifier in asked.iter().filter(|each| !record.carries(each)) {
+    // Joined where the record neither holds it now nor held it on the date
+    // asked: a statement of a date it was on the record says nothing new.
+    for identifier in asked
+        .iter()
+        .filter(|each| !record.holds(each) && !record.named_at(each, request.as_of_ns))
+    {
         let others = holders(store, identifier, request.as_of_ns, &found)?;
         if !others.is_empty() {
             let mut ids = vec![found.clone()];
             ids.extend(others);
             let mut identifiers = meeting.clone();
             identifiers.push(identifier.clone());
-            note(store, identifiers, ids, instance_id, now_ns)?;
+            // The resolve met several records through the identifier it
+            // would join: ambiguous, as its answer says.
+            note(
+                store,
+                identifiers,
+                ids,
+                instance_id,
+                now_ns,
+                MissReason::Ambiguous,
+            )?;
             return Ok(unchanged(missed(MissReason::Ambiguous)));
         }
         joining.push(identifier.clone());
@@ -168,7 +251,7 @@ fn joined(
     let expected = record.version;
     let mut changes = Vec::new();
     for identifier in &joining {
-        record.identifiers.push(dated(identifier));
+        record.identifiers.push(window_for(store, identifier)?);
         record.set_source(Source {
             acting_through_delegation: String::new(),
             client_name: String::new(),
@@ -226,7 +309,10 @@ fn mint(
     let instrument_id = ids::local(now_ns);
     let mut candidate = Instrument {
         instrument_id: instrument_id.clone(),
-        identifiers: asked.iter().map(dated).collect(),
+        identifiers: asked
+            .iter()
+            .map(|identifier| window_for(store, identifier))
+            .collect::<Result<Vec<_>>>()?,
         asset_class: String::new(),
         currency: String::new(),
         exchange_mic: String::new(),
@@ -237,6 +323,7 @@ fn mint(
         record_time_ns: now_ns,
         instrument_type: String::new(),
         money_market_fund: String::new(),
+        binary_event_contract: String::new(),
         listing_venue_id: String::new(),
         sources: asked
             .iter()
@@ -272,7 +359,21 @@ fn mint(
         record_time_ns: now_ns,
     };
 
-    let (record, stood) = store.mint(candidate, &set.key(), first)?;
+    // A set given again after its identifiers left the record minted for it
+    // (contract v19): a new record, keyed by where its windows open, so it
+    // never meets the old one and two racing resolves still meet one.
+    let opened = candidate
+        .identifiers
+        .iter()
+        .map(|identifier| identifier.valid_from_ns)
+        .max()
+        .unwrap_or(0);
+    let key = if opened > 0 {
+        format!("{}@{opened}", set.key())
+    } else {
+        set.key()
+    };
+    let (record, stood) = store.mint(candidate, &key, first)?;
     match stood {
         Stood::Minted => Ok(Resolution {
             reply: resolved(record.instrument_id.clone(), true),
@@ -309,6 +410,7 @@ pub fn conflict_reported(
     if ids.len() < 2 {
         return Ok(false);
     }
+    // A connector's ambiguous resolve: flagged for a person (W3.2, W3.11).
     note(
         store,
         meeting,
@@ -319,6 +421,7 @@ pub fn conflict_reported(
         } else {
             now_ns
         },
+        MissReason::Ambiguous,
     )?;
     Ok(true)
 }
@@ -415,6 +518,7 @@ fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) ->
         source: words.clone(),
         instance_id: instance_id.to_string(),
         offered_at_ns: now_ns,
+        valid_until_ns: 0,
     };
     let mut offers = Vec::new();
     if let Ok(class) = AssetClass::try_from(request.stated_asset_class) {
@@ -455,10 +559,12 @@ pub(crate) fn keep_offers(record: &mut Instrument, offers: Vec<Offer>) -> bool {
     let mut changed = false;
     for offer in offers {
         let in_force = match offer.field {
+            // An offer to add one is in force once the record holds it; an
+            // offer to end one (contract v19) once it does not.
             Field::Identifier => offer
                 .identifier
                 .as_ref()
-                .is_some_and(|identifier| record.carries(identifier)),
+                .is_some_and(|identifier| record.holds(identifier) == (offer.valid_until_ns == 0)),
             field => record.value(field) == offer.value,
         };
         if in_force || record.offers.iter().any(|held| held.same_as(&offer)) {
@@ -484,6 +590,7 @@ fn note(
     mut instrument_ids: Vec<String>,
     reported_by: &str,
     now_ns: i64,
+    reason: MissReason,
 ) -> Result<()> {
     instrument_ids.sort();
     instrument_ids.dedup();
@@ -498,6 +605,7 @@ fn note(
         reported_by: reported_by.to_string(),
         first_seen_ns: now_ns,
         last_seen_ns: now_ns,
+        reason: reason as i32,
     })
 }
 
@@ -573,6 +681,7 @@ mod tests {
             scheme: scheme.into(),
             value: value.into(),
             source: source.into(),
+            ..Default::default()
         }
     }
 
@@ -614,6 +723,7 @@ mod tests {
             record_time_ns: 0,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            binary_event_contract: String::new(),
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
@@ -980,6 +1090,7 @@ mod tests {
                 scheme: "symbol".into(),
                 value: "SPAXX".into(),
                 source: "snaptrade".into(),
+                ..Default::default()
             }],
             as_of_ns: 1,
             stated_asset_class: AssetClass::Fund as i32,
@@ -1009,5 +1120,69 @@ mod tests {
             .offers
             .iter()
             .any(|offer| offer.field == Field::InstrumentType));
+    }
+
+    #[test]
+    fn asked_read_only_nothing_is_minted_joined_offered_or_listed() {
+        // Contract v19: `reporting` resolves its reporting currency.
+        let store = MemoryStore::new();
+        let eur = resolve(&store, &request(vec![asked("iso4217", "EUR", "")])).instrument_id;
+        let mut stating = request(vec![
+            asked("iso4217", "EUR", ""),
+            asked("figi", "BBG000EUR001", ""),
+        ]);
+        stating.stated_description = "Euro".into();
+        let found = resolve_identifier_read_only(&store, &stating, NOW + 1).unwrap();
+        assert_eq!(found.reply.instrument_id, eur);
+        assert!(found.changed.is_none());
+        let held = store.by_id(&eur).unwrap().unwrap();
+        assert_eq!(held.identifiers.len(), 1, "nothing joined");
+        assert!(held.offers.is_empty() || held.offers.iter().all(|o| o.source == "ISO 4217"));
+
+        let none = resolve_identifier_read_only(
+            &store,
+            &request(vec![asked("iso4217", "CHF", "")]),
+            NOW + 2,
+        )
+        .unwrap();
+        assert!(!none.reply.found);
+        assert_eq!(none.reply.miss_reason, MissReason::NotFound as i32);
+        assert_eq!(store.count().unwrap(), 1, "nothing minted");
+
+        hold(
+            &store,
+            platform_record("INS-A", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        hold(
+            &store,
+            platform_record("INS-B", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        let two = resolve_identifier_read_only(
+            &store,
+            &request(vec![asked("figi", "BBG000B9XRY4", "")]),
+            NOW + 3,
+        )
+        .unwrap();
+        assert_eq!(two.reply.miss_reason, MissReason::Ambiguous as i32);
+        assert!(store.conflicts().unwrap().is_empty(), "nothing listed");
+    }
+
+    #[test]
+    fn a_resolves_conflict_is_flagged_ambiguous() {
+        let store = MemoryStore::new();
+        hold(
+            &store,
+            platform_record("INS-A", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        hold(
+            &store,
+            platform_record("INS-B", vec![("figi", "BBG000B9XRY4", "", 0)]),
+        );
+        resolve(&store, &request(vec![asked("figi", "BBG000B9XRY4", "")]));
+        let listed = store.conflicts().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].reason, MissReason::Ambiguous as i32);
+        let wire = to_wire(&store.by_id("INS-A").unwrap().unwrap());
+        assert_eq!(wire.identifiers[0].valid_until_ns, 0, "on the record");
     }
 }

@@ -42,7 +42,7 @@ pub fn list_to_complete(
         .filter_map(|scheme| {
             let held: BTreeSet<&str> = live
                 .iter()
-                .flat_map(|record| record.identifiers.iter())
+                .flat_map(|record| record.held_now())
                 .filter(|identifier| identifier.scheme == *scheme)
                 .map(|identifier| identifier.value.as_str())
                 .collect();
@@ -118,6 +118,8 @@ pub fn list_to_complete(
             reported_by: conflict.reported_by,
             first_seen_ns: conflict.first_seen_ns,
             last_seen_ns: conflict.last_seen_ns,
+            // Contract v19: ambiguous where a resolve met it.
+            reason: conflict.reason,
         });
     }
 
@@ -211,6 +213,7 @@ mod tests {
                     scheme: scheme.into(),
                     value: value.into(),
                     source: String::new(),
+                    ..Default::default()
                 }],
                 as_of_ns: NOW,
                 ..Default::default()

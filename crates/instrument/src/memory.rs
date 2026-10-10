@@ -49,6 +49,15 @@ impl Store for MemoryStore {
         Ok(self.read()?.matching(scheme, value, source, as_of_ns))
     }
 
+    fn windows(
+        &self,
+        scheme: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<Vec<(String, crate::store::Identifier)>> {
+        Ok(self.read()?.windows(scheme, value, source))
+    }
+
     fn all(&self) -> Result<Vec<Instrument>> {
         Ok(self.read()?.all())
     }
@@ -138,6 +147,7 @@ mod tests {
             record_time_ns: 0,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            binary_event_contract: String::new(),
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),

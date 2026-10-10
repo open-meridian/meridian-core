@@ -264,6 +264,43 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        if let When::After(watermark) = &query.when {
+            // The rows each partition named recorded after its sequence
+            // there, by the partition's own key (contract v19, the plan's Q33).
+            let (datasets, after): (Vec<String>, Vec<i64>) = watermark
+                .iter()
+                .filter(|(dataset, _)| query.datasets.contains(dataset))
+                .map(|(dataset, sequence)| (dataset.clone(), *sequence as i64))
+                .unzip();
+            let cut_off = if query.as_of_ns == 0 {
+                i64::MAX
+            } else {
+                query.as_of_ns
+            };
+            let rows = tx
+                .query(
+                    "SELECT body FROM lake_row
+                       JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
+                         ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
+                      WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
+                      ORDER BY lake_row.dataset, sequence",
+                    &[
+                        &datasets,
+                        &after,
+                        &query.subjects,
+                        &query.data_type.code(),
+                        &cut_off,
+                    ],
+                )
+                .map_err(unavailable)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let body: Vec<u8> = row.get(0);
+                out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
+            }
+            tx.commit().map_err(unavailable)?;
+            return Ok(as_of(out, query.as_of_ns));
+        }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
         let cut_off = if query.as_of_ns == 0 {
             i64::MAX
@@ -284,6 +321,7 @@ impl Store for PostgresStore {
                 if *until_ns == 0 { i64::MAX } else { *until_ns },
                 i64::MAX,
             ),
+            When::After(_) => unreachable!("answered above"),
         };
         let rows = tx
             .query(
@@ -348,6 +386,18 @@ impl Store for PostgresStore {
                 )
             })
             .collect())
+    }
+
+    fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
+        let found: Option<i64> = self
+            .conn()?
+            .query_one(
+                "SELECT min(sequence) FROM lake_row WHERE dataset = $1",
+                &[&dataset],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        Ok(found.map(|sequence| sequence as u64))
     }
 
     fn set_priority(

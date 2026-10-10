@@ -234,6 +234,8 @@ monies! {
     UnresolvedHolding { market_value }
     Price { price }
     Bar { open, high, low, close, vwap }
+    Trade { price }
+    Quote { bid, ask }
     BookEntryReply { positions, breaks, figures }
     ListPositionsReply { positions }
     ListBreaksReply { breaks }

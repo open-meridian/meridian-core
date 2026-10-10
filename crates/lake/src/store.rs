@@ -32,6 +32,11 @@ pub enum When {
     BusinessDate(Date),
     /// A valid-time range, from inclusive to until exclusive.
     Range { from_ns: i64, until_ns: i64 },
+    /// The rows each dataset partition named recorded after its sequence
+    /// there, whatever their valid time (contract v19, W10.6; the plan's
+    /// Q33): how a reader that lost trades catches up. A partition not named
+    /// answers nothing.
+    After(BTreeMap<String, u64>),
 }
 
 /// What a store reads: the rows of these datasets about these subjects, as
@@ -169,6 +174,11 @@ pub trait Store: Send + Sync {
     /// Rows kept per dataset, and of them those carrying a value as reported.
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
+    /// The lowest sequence a dataset's partition still keeps, where it keeps
+    /// any (contract v19): a watermark below it asks for rows retention
+    /// removed.
+    fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>>;
+
     /// A priority replaced whole, journalled, against the one read
     /// (contract v17's stale guard): refused when it has moved.
     fn set_priority(
@@ -239,5 +249,8 @@ pub fn matches(row: &Observation, query: &Query) -> bool {
         When::Range { from_ns, until_ns } => {
             meta.valid_from_ns >= *from_ns && (*until_ns == 0 || meta.valid_from_ns < *until_ns)
         }
+        When::After(watermark) => watermark
+            .get(row.dataset())
+            .is_some_and(|after| meta.sequence > *after),
     }
 }

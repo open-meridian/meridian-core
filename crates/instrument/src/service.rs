@@ -534,6 +534,7 @@ mod tests {
                 scheme: "symbol".into(),
                 value: "SNAP1".into(),
                 source: "snaptrade".into(),
+                ..Default::default()
             }],
             as_of_ns: NOW,
             ..Default::default()
@@ -781,6 +782,7 @@ mod tests {
             scheme: "iso10383".into(),
             value: "XNYS".into(),
             source: String::new(),
+            ..Default::default()
         };
         let venue = VenueRecord {
             venue_id: "VEN-XNYS".into(),

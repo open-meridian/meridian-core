@@ -718,6 +718,7 @@ pub(crate) fn to_wire_identifier(identifier: &Identifier) -> PbIdentifier {
         scheme: identifier.scheme.clone(),
         value: identifier.value.clone(),
         source: identifier.source.clone(),
+        ..Default::default()
     }
 }
 
@@ -833,6 +834,7 @@ mod tests {
                 scheme: "symbol".into(),
                 value: "ZZTOP".into(),
                 source: "snaptrade".into(),
+                ..Default::default()
             }],
             quantity: quantity("5"),
             market_value: usd("0"),
@@ -1111,6 +1113,7 @@ mod tests {
             scheme: "symbol".into(),
             value: "AAPL".into(),
             source: "snaptrade".into(),
+            ..Default::default()
         }];
 
         assert!(matches!(
@@ -1491,6 +1494,7 @@ mod tests {
             scheme: "symbol".into(),
             value: "ZZTOP".into(),
             source: "snaptrade".into(),
+            ..Default::default()
         }];
         let fourth = record_holding(&store, &last, &at(NOW)).unwrap();
 

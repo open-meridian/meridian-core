@@ -218,6 +218,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record
             scheme: "symbol".into(),
             value: "ZZTOP".into(),
             source: "snaptrade".into(),
+            ..Default::default()
         }],
         as_of_ns: NOW,
         stated_currency: "USD".into(),
@@ -542,8 +543,25 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
 
     // Several roles hold the union; a role the contract gives nothing holds
     // nothing, and adds nothing to another.
-    let with_ems = contract.grants_for(&roles(&["custody", "ems"])).unwrap();
-    assert_eq!(with_ems, custody);
+    let with_match = contract.grants_for(&roles(&["custody", "match"])).unwrap();
+    assert_eq!(with_match, custody);
+
+    // The lake's 1b (contract v19): ems reads and hears trades and quotes,
+    // and the datasets it may read; reporting hears neither (the plan's Q9
+    // and Q37), and resolves an identifier, read-only.
+    let ems = contract.grants_for(&roles(&["ems"])).unwrap();
+    assert!(ems.may_publish(meridian_lake::service::LIST_TRADES));
+    assert!(ems.may_publish(meridian_lake::service::LIST_QUOTES));
+    assert!(ems.may_publish(meridian_lake::service::LIST_DATASETS));
+    assert!(ems.may_subscribe("platform.lake.{dataset}.event.trades-recorded"));
+    assert!(!ems.may_publish(meridian_lake::service::LIST_PRICES));
+    let reporting = contract.grants_for(&roles(&["reporting"])).unwrap();
+    assert!(reporting.may_publish("platform.reference.query.resolve-identifier"));
+    assert!(!reporting.may_publish(meridian_lake::service::LIST_TRADES));
+    assert!(!reporting.may_subscribe("platform.lake.{dataset}.event.trades-recorded"));
+    let dgm = contract.grants_for(&roles(&["dgm"])).unwrap();
+    assert!(dgm.may_publish(meridian_lake::service::RECORD_TRADES));
+    assert!(dgm.may_publish(meridian_lake::service::RECORD_QUOTES));
 
     // Denial is by refusal for a name that is not a role, never by granting it
     // nothing and letting it register.

@@ -42,6 +42,7 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0004_instrument_type.sql"),
     include_str!("../migrations/0005_delegation.sql"),
     include_str!("../migrations/0006_the_venue_master.sql"),
+    include_str!("../migrations/0007_identity_never_reused.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
@@ -49,9 +50,9 @@ const SCHEMA: &[&str] = &[
 /// migrated, rather than failing later on the first record.
 const NEWEST_TABLE: &str = "instrument_venue";
 
-/// And the column the newest file adds (0005, contract v12: the delegation
-/// on a version), with its table, which a table check cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument", "listing_venue_id");
+/// And the column the newest file adds (0007, contract v19: a conflict's
+/// reason), with its table, which a table check cannot see.
+const NEWEST_COLUMN: (&str, &str) = ("instrument_conflict", "reason");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -293,6 +294,7 @@ impl PostgresStore {
                     source: REPORTED_BEFORE_V10.into(),
                     instance_id: String::new(),
                     offered_at_ns: record.record_time_ns,
+                    valid_until_ns: 0,
                 });
             }
             let entry = Version {
@@ -336,7 +338,8 @@ impl PostgresStore {
             .query(
                 "SELECT instrument_id, asset_class, currency, exchange_mic, description,
                         lifecycle_state, version, valid_from_ns, record_time_ns,
-                        instrument_type, money_market_fund, listing_venue_id
+                        instrument_type, money_market_fund, listing_venue_id,
+                        binary_event_contract
                    FROM instrument
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id",
@@ -360,6 +363,7 @@ impl PostgresStore {
                 instrument_type: row.get(9),
                 money_market_fund: row.get(10),
                 listing_venue_id: row.get(11),
+                binary_event_contract: row.get(12),
                 sources: Vec::new(),
                 offers: Vec::new(),
             })
@@ -375,7 +379,7 @@ impl PostgresStore {
                 "SELECT instrument_id, scheme, value, source, valid_from_ns, valid_to_ns
                    FROM instrument_identifier
                   WHERE instrument_id = ANY($1)
-                  ORDER BY instrument_id, scheme, source, value",
+                  ORDER BY instrument_id, scheme, source, value, valid_from_ns",
                 &[&ids],
             )
             .map_err(unavailable)?
@@ -425,7 +429,7 @@ impl PostgresStore {
         for row in conn
             .query(
                 "SELECT instrument_id, field, scheme, namespace, value, source, instance_id,
-                        offered_at_ns
+                        offered_at_ns, valid_until_ns
                    FROM instrument_offer
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id, offered_at_ns, field, value",
@@ -446,6 +450,7 @@ impl PostgresStore {
                     source: row.get(5),
                     instance_id: row.get(6),
                     offered_at_ns: row.get(7),
+                    valid_until_ns: row.get(8),
                 });
             }
         }
@@ -516,8 +521,8 @@ impl PostgresStore {
             tx.execute(
                 "INSERT INTO instrument_offer
                         (instrument_id, field, scheme, namespace, value, source, instance_id,
-                         offered_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         offered_at_ns, valid_until_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT DO NOTHING",
                 &[
                     id,
@@ -528,6 +533,7 @@ impl PostgresStore {
                     &offer.source,
                     &offer.instance_id,
                     &offer.offered_at_ns,
+                    &offer.valid_until_ns,
                 ],
             )
             .map_err(unavailable)?;
@@ -632,6 +638,38 @@ impl Store for PostgresStore {
         Self::load(&mut conn, &ids)
     }
 
+    fn windows(
+        &self,
+        scheme: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<Vec<(String, Identifier)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT instrument_id, valid_from_ns, valid_to_ns
+                   FROM instrument_identifier
+                  WHERE scheme = $1 AND value = $2 AND source = $3
+                  ORDER BY instrument_id, valid_from_ns",
+                &[&scheme, &value, &source],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    Identifier {
+                        scheme: scheme.to_string(),
+                        value: value.to_string(),
+                        source: source.to_string(),
+                        valid_from_ns: row.get(1),
+                        valid_to_ns: row.get(2),
+                    },
+                )
+            })
+            .collect())
+    }
+
     fn all(&self) -> Result<Vec<Instrument>> {
         let mut conn = self.conn()?;
         let ids: Vec<String> = conn
@@ -672,8 +710,9 @@ impl Store for PostgresStore {
                 "INSERT INTO instrument (instrument_id, asset_class, currency, exchange_mic,
                                          description, lifecycle_state, version, valid_from_ns,
                                          record_time_ns, mint_key, instrument_type,
-                                         money_market_fund, listing_venue_id)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                         money_market_fund, listing_venue_id,
+                                         binary_event_contract)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                  ON CONFLICT (mint_key) WHERE mint_key IS NOT NULL DO NOTHING",
                 &[
                     &candidate.instrument_id,
@@ -689,6 +728,7 @@ impl Store for PostgresStore {
                     &candidate.instrument_type,
                     &candidate.money_market_fund,
                     &candidate.listing_venue_id,
+                    &candidate.binary_event_contract,
                 ],
             )
             .map_err(unavailable)?
@@ -721,7 +761,7 @@ impl Store for PostgresStore {
                     SET asset_class = $2, currency = $3, exchange_mic = $4, description = $5,
                         lifecycle_state = $6, version = $7, valid_from_ns = $8,
                         record_time_ns = $9, instrument_type = $11, money_market_fund = $12,
-                        listing_venue_id = $13
+                        listing_venue_id = $13, binary_event_contract = $14
                   WHERE instrument_id = $1 AND version = $10",
                 &[
                     &record.instrument_id,
@@ -737,6 +777,7 @@ impl Store for PostgresStore {
                     &record.instrument_type,
                     &record.money_market_fund,
                     &record.listing_venue_id,
+                    &record.binary_event_contract,
                 ],
             )
             .map_err(unavailable)?;
@@ -812,14 +853,17 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO instrument_conflict
                         (conflict_key, identifiers, instrument_ids, reported_by, first_seen_ns,
-                         last_seen_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                         last_seen_ns, reason)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (conflict_key) DO UPDATE
                         SET instrument_ids = EXCLUDED.instrument_ids,
                             last_seen_ns = EXCLUDED.last_seen_ns,
                             reported_by = CASE WHEN instrument_conflict.reported_by = ''
                                                THEN EXCLUDED.reported_by
-                                               ELSE instrument_conflict.reported_by END",
+                                               ELSE instrument_conflict.reported_by END,
+                            reason = CASE WHEN instrument_conflict.reason = 0
+                                          THEN EXCLUDED.reason
+                                          ELSE instrument_conflict.reason END",
                 &[
                     &conflict.key(),
                     &identifiers,
@@ -827,6 +871,7 @@ impl Store for PostgresStore {
                     &conflict.reported_by,
                     &conflict.first_seen_ns,
                     &conflict.last_seen_ns,
+                    &conflict.reason,
                 ],
             )
             .map_err(unavailable)?;
@@ -837,7 +882,8 @@ impl Store for PostgresStore {
         let rows = self
             .conn()?
             .query(
-                "SELECT identifiers, instrument_ids, reported_by, first_seen_ns, last_seen_ns
+                "SELECT identifiers, instrument_ids, reported_by, first_seen_ns, last_seen_ns,
+                        reason
                    FROM instrument_conflict
                   ORDER BY first_seen_ns, conflict_key",
                 &[],
@@ -861,6 +907,7 @@ impl Store for PostgresStore {
                     reported_by: row.get(2),
                     first_seen_ns: row.get(3),
                     last_seen_ns: row.get(4),
+                    reason: row.get(5),
                 }
             })
             .collect())

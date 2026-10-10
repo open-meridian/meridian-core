@@ -13,7 +13,14 @@
 //! What no kept row answers becomes a want of the instance serving the
 //! dataset where its catalogue says it can be asked, and the reader is told
 //! it was asked; otherwise why not: declined by its source, older than its
-//! history, not kept, or not covered.
+//! history, not kept, or not covered. A decline stands for the date or range
+//! its want asked, or the latest, and for no other (contract v19).
+//!
+//! The latest is chosen per subject, dataset, kind, venue and the row's
+//! asset (contract v19, approved 2026-10-10): BTC priced in USD and in USDC
+//! on one venue answers both, as a quote's latest per its asset. A catch-up
+//! after a watermark (trades, the plan's Q33) asks no source: what was not
+//! recorded since is nothing new.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,12 +79,17 @@ pub struct Read {
     pub as_of_ns: i64,
 }
 
+/// What a source declined, by dataset, subject and the date or range its
+/// want asked ([`asked`]): its reason and when (contract v19).
+pub type Declined = BTreeMap<(String, String, String), (UnansweredReason, i64)>;
+
 /// What a read is answered against besides the store.
 pub struct Against<'a> {
     pub config: &'a DataConfig,
     pub priorities: &'a [SourcePriority],
-    /// What a source declined, by dataset and subject: its reason and when.
-    pub declined: &'a BTreeMap<(String, String), (UnansweredReason, i64)>,
+    /// What a source declined, by dataset, subject and the date or range
+    /// its want asked ([`asked`]): its reason and when.
+    pub declined: &'a Declined,
     /// Each replaced record and the one that stays (W10.8).
     pub aliases: &'a BTreeMap<String, String>,
     pub now_ns: i64,
@@ -85,6 +97,17 @@ pub struct Against<'a> {
 
 /// How long a source's decline answers for it before it is asked again.
 pub const DECLINE_STANDS_NS: i64 = NS_PER_DAY;
+
+/// What a want asked, as a decline is kept by (contract v19, approved
+/// 2026-10-10): its business date, its range, or the latest at a time.
+pub fn asked(when: &When) -> String {
+    match when {
+        When::BusinessDate(date) => format!("date {date}"),
+        When::Range { from_ns, until_ns } => format!("range {from_ns} {until_ns}"),
+        When::Latest { at_ns } => format!("latest {at_ns}"),
+        When::After(_) => "after".to_string(),
+    }
+}
 
 fn order_for(read: &Read, against: &Against<'_>, kind: i32, readable: &[String]) -> Vec<String> {
     if !read.sources.named.is_empty() {
@@ -122,6 +145,66 @@ fn silent(row: &Observation, against: &Against<'_>) -> bool {
     cadence > 0 && row.meta().recorded_at_ns < against.now_ns - cadence * 1_000_000_000
 }
 
+/// A fixed zone's offset from UTC, where the zone never moves its clocks:
+/// UTC and its names, and the `Etc/GMT±N` zones (whose sign is the POSIX
+/// one, inverted). `None` for a zone that keeps daylight saving, whose
+/// offset only a time zone database knows, and the kernel holds none.
+fn fixed_offset_ns(zone: &str) -> Option<i64> {
+    const HOUR: i64 = 3_600 * 1_000_000_000;
+    match zone {
+        "" | "UTC" | "Etc/UTC" | "Etc/GMT" | "GMT" | "Etc/Universal" | "Universal" | "Etc/Zulu"
+        | "Zulu" | "Etc/UCT" | "UCT" | "Etc/GMT0" | "Etc/GMT+0" | "Etc/GMT-0" | "GMT0"
+        | "Etc/Greenwich" | "Greenwich" => Some(0),
+        _ => {
+            let rest = zone.strip_prefix("Etc/GMT")?;
+            let hours: i64 = rest.parse().ok()?;
+            Some(-hours * HOUR)
+        }
+    }
+}
+
+/// A range of trades or quotes held to one day of a dataset as it declares
+/// its day (contract v19, W10.6; ruled 2026-10-09): its time zone and the
+/// minute its day ends, never a calendar. Where the zone's offset is fixed
+/// the range lies within one of its days; where the zone keeps daylight
+/// saving, which the kernel cannot place, it is at most one day long, the
+/// longest such day (25 hours). `until_ns` is exclusive. The refusal names
+/// the range and the day.
+pub fn within_a_day(
+    dataset: &str,
+    declaration: Option<&meridian_pb::v1::DatasetDeclaration>,
+    from_ns: i64,
+    until_ns: i64,
+) -> Result<(), String> {
+    let zone = declaration.map_or("", |d| d.day_time_zone.as_str());
+    let end_minute = declaration.map_or(0, |d| i64::from(d.day_end_minute));
+    let said = || {
+        format!(
+            "valid_from_ns to valid_until_ns spans more than one day of {dataset} as it declares \
+             its day ({}, ending at minute {end_minute}); trades and quotes are read a day at a time",
+            if zone.is_empty() { "Etc/UTC" } else { zone }
+        )
+    };
+    if until_ns <= from_ns {
+        return Err("valid_until_ns is after valid_from_ns".into());
+    }
+    match fixed_offset_ns(zone) {
+        Some(offset) => {
+            let day_of =
+                |ns: i64| (ns + offset - end_minute * 60 * 1_000_000_000).div_euclid(NS_PER_DAY);
+            if day_of(from_ns) != day_of(until_ns - 1) {
+                return Err(said());
+            }
+        }
+        None => {
+            if until_ns - from_ns > NS_PER_DAY + NS_PER_DAY / 24 {
+                return Err(said());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Why a dataset holds nothing for a subject, and whether to ask it.
 fn why_not(
     read: &Read,
@@ -130,9 +213,10 @@ fn why_not(
     subject: &str,
 ) -> (UnansweredReason, bool) {
     let config = against.config;
-    if let Some((reason, at)) = against
-        .declined
-        .get(&(dataset.to_string(), subject.to_string()))
+    if let Some((reason, at)) =
+        against
+            .declined
+            .get(&(dataset.to_string(), subject.to_string(), asked(&read.when)))
     {
         if against.now_ns - at < DECLINE_STANDS_NS {
             return (*reason, false);
@@ -157,10 +241,11 @@ fn why_not(
     (UnansweredReason::NotCovered, false)
 }
 
-/// The latest in force per subject, dataset, kind, venue and length: what a
-/// read of the latest at a valid time answers.
+/// The latest in force per subject, dataset, kind, venue, length and asset:
+/// what a read of the latest at a valid time answers.
 fn latest_in_force(rows: Vec<Observation>) -> Vec<Observation> {
-    let mut chosen: BTreeMap<(String, String, i32, String, i64), Observation> = BTreeMap::new();
+    type Key = (String, String, i32, String, i64, String);
+    let mut chosen: BTreeMap<Key, Observation> = BTreeMap::new();
     for row in rows {
         let key = (
             row.subject().to_string(),
@@ -168,6 +253,7 @@ fn latest_in_force(rows: Vec<Observation>) -> Vec<Observation> {
             row.kind(),
             row.venue().to_string(),
             row.interval_ns(),
+            row.asset(),
         );
         let later = |held: &Observation| {
             (row.meta().valid_from_ns, row.meta().sequence)
@@ -287,6 +373,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
 
     let mut asks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut chosen: Vec<Observation> = Vec::new();
+    let catching_up = matches!(read.when, When::After(_));
     for subject in &read.subjects {
         // The kinds to answer: those asked, or those any dataset holds; a
         // bar's is 0.
@@ -312,6 +399,12 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             } else {
                 order_for(read, against, kind, &candidates)
             };
+            if catching_up {
+                // A catch-up answers what was recorded since, from every
+                // partition named, and asks nothing of a source.
+                chosen.extend(held);
+                continue;
+            }
             if read.sources.side_by_side {
                 for dataset in &order {
                     let of: Vec<&Observation> =
@@ -432,6 +525,9 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     let standing = matches!(read.when, When::Latest { at_ns: 0 });
     for (dataset, subjects) in asks {
         let cadence = config.declaration(&dataset).map_or(0, |d| d.cadence);
+        // Kept current: by its schedule where it has a cadence, by the
+        // vendor's stream where it is streamed (contract v19, W10.7).
+        let current = cadence > 0 || config.has_mode(&dataset, ObservationMode::Stream);
         out.asks.push(Ask {
             dataset,
             data_type: read.data_type,
@@ -439,7 +535,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             kinds: read.kinds.clone(),
             interval_ns: read.interval_ns,
             when: read.when.clone(),
-            standing: standing && cadence > 0,
+            standing: standing && current,
         });
     }
     Ok(out)

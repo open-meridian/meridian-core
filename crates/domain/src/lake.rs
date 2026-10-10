@@ -1,7 +1,8 @@
 //! The lake's vocabulary, read alike by the sidecar, the conductor, the lake
 //! and the dashboard (contract v18, W10; spec/the-lake).
 //!
-//! The data types of the lake's 1a and the dictionary entries of their
+//! The data types of the lake's 1a and 1b (contract v19: trades and quotes)
+//! and the dictionary entries of their
 //! fields (matrix/boundaries/fields/lake.yaml), by which a catalogue names the
 //! optional fields a dataset fills and an entitlement the fields a plugin may
 //! read; a dataset's ID in a deployment; and a catalogue held to the rules
@@ -22,8 +23,13 @@ pub const PRICE: &str = "meridian.v1.Price";
 /// Open, high, low and close over an interval.
 pub const BAR: &str = "meridian.v1.Bar";
 
-/// The lake's data types in the 1a.
-pub const DATA_TYPES: [&str; 2] = [PRICE, BAR];
+/// One trade as its source reported it (contract v19).
+pub const TRADE: &str = "meridian.v1.Trade";
+/// The best bid and offer (contract v19).
+pub const QUOTE: &str = "meridian.v1.Quote";
+
+/// The lake's data types: the 1a's, and the 1b's from contract v19.
+pub const DATA_TYPES: [&str; 4] = [PRICE, BAR, TRADE, QUOTE];
 
 const PRICE_FIELDS: [&str; 4] = [
     "meridian.v1.Price.meta",
@@ -42,12 +48,32 @@ const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.trade_count",
 ];
 
+const TRADE_FIELDS: [&str; 7] = [
+    "meridian.v1.Trade.meta",
+    "meridian.v1.Trade.price",
+    "meridian.v1.Trade.quantity",
+    "meridian.v1.Trade.attributes",
+    "meridian.v1.Trade.aggressor",
+    "meridian.v1.Trade.source_sequence",
+    "meridian.v1.Trade.cancelled",
+];
+const QUOTE_FIELDS: [&str; 6] = [
+    "meridian.v1.Quote.meta",
+    "meridian.v1.Quote.bid",
+    "meridian.v1.Quote.ask",
+    "meridian.v1.Quote.bid_quantity",
+    "meridian.v1.Quote.ask_quantity",
+    "meridian.v1.Quote.characteristics",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
     match data_type {
         PRICE => &PRICE_FIELDS,
         BAR => &BAR_FIELDS,
+        TRADE => &TRADE_FIELDS,
+        QUOTE => &QUOTE_FIELDS,
         _ => &[],
     }
 }
@@ -141,6 +167,103 @@ pub fn strip_bar(
         bar.trade_count = None;
     }
     removed
+}
+
+/// [`strip_price`], for a trade (contract v19).
+pub fn strip_trade(
+    trade: &mut crate::v1::Trade,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(TRADE_FIELDS[1]) {
+        trade.price = None;
+    }
+    if gone(TRADE_FIELDS[2]) {
+        trade.quantity = None;
+    }
+    if gone(TRADE_FIELDS[3]) {
+        trade.attributes = None;
+    }
+    if gone(TRADE_FIELDS[4]) {
+        trade.aggressor = 0;
+    }
+    if gone(TRADE_FIELDS[5]) {
+        trade.source_sequence = 0;
+    }
+    if gone(TRADE_FIELDS[6]) {
+        trade.cancelled = false;
+    }
+    removed
+}
+
+/// [`strip_price`], for a quote (contract v19).
+pub fn strip_quote(
+    quote: &mut crate::v1::Quote,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(QUOTE_FIELDS[1]) {
+        quote.bid = None;
+    }
+    if gone(QUOTE_FIELDS[2]) {
+        quote.ask = None;
+    }
+    if gone(QUOTE_FIELDS[3]) {
+        quote.bid_quantity = None;
+    }
+    if gone(QUOTE_FIELDS[4]) {
+        quote.ask_quantity = None;
+    }
+    if gone(QUOTE_FIELDS[5]) {
+        quote.characteristics.clear();
+    }
+    removed
+}
+
+/// The asset a row is priced in, by its Money's cash instrument (or its
+/// code, before the lake resolves it): what a price's and a quote's latest
+/// is chosen per, and their deliveries conflated per (contract v19, W10.5,
+/// W10.6). Empty for a row with no amount.
+pub fn asset_key(money: Option<&crate::v1::Money>) -> String {
+    money
+        .map(|m| {
+            if m.instrument_id.is_empty() {
+                m.currency_code.clone()
+            } else {
+                m.instrument_id.clone()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// A quote's asset: its bid's, or its ask's where the bid side is empty.
+pub fn quote_asset(quote: &crate::v1::Quote) -> String {
+    let bid = asset_key(quote.bid.as_ref());
+    if bid.is_empty() {
+        asset_key(quote.ask.as_ref())
+    } else {
+        bid
+    }
 }
 
 /// The fields a plugin instance may read of each dataset it is entitled to,
@@ -429,7 +552,7 @@ mod tests {
             ),
             (
                 DatasetDeclaration {
-                    data_types: vec!["meridian.v1.Trade".into()],
+                    data_types: vec!["meridian.v1.Order".into()],
                     ..daily()
                 },
                 "data_types[0]",
@@ -496,6 +619,13 @@ mod tests {
         assert!(is_field_of(&declared, "meridian.v1.Bar.vwap"));
         assert!(is_field_of(&declared, "meridian.v1.Price.price"));
         assert!(!is_field_of(&declared, "meridian.v1.Trade.price"));
+        let streamed = DatasetDeclaration {
+            data_types: vec![TRADE.into(), QUOTE.into()],
+            ..daily()
+        };
+        assert!(is_field_of(&streamed, "meridian.v1.Trade.price"));
+        assert!(is_field_of(&streamed, "meridian.v1.Quote.bid"));
+        assert_eq!(refused(streamed, &["dgm"]), None);
         assert_eq!(instance_of("coinbase-1:daily"), Some("coinbase-1"));
         assert_eq!(dataset_id("coinbase-1", "daily"), "coinbase-1:daily");
     }

@@ -202,6 +202,7 @@ mod tests {
                     scheme: "symbol".into(),
                     value: "ZZTOP".into(),
                     source: "snaptrade".into(),
+                    ..Default::default()
                 }],
                 quantity: quantity("5"),
                 market_value: usd("0"),

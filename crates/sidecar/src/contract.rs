@@ -151,8 +151,15 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// refused when it is no date; and a Money naming its cash instrument, which
 /// a plugin may still name by its ISO 4217 code alone (decisions/023 as
 /// amended). A plugin built before declares no catalogue and hears no lake
-/// row.
-pub const CONTRACT_CURRENT: u32 = 18;
+/// row. v19 is the lake's 1b (sdk-contract/the-lake-trades-and-quotes-
+/// contract): a `dgm`'s trades and quotes recorded in batches, `signal`'s and
+/// `ems`'s reads of them and their deliveries -- quotes conflated per subject,
+/// dataset, venue and asset, trades never, every one delivered and a loss
+/// caught up after the watermark last seen -- the binary event contract on a
+/// record a plugin reads, an identifier's window, stamped empty on what a
+/// plugin sends, `reporting` resolving an identifier, and `ems` reading the
+/// datasets. A plugin built before records and hears neither.
+pub const CONTRACT_CURRENT: u32 = 19;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -400,7 +407,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v18); rebuild it against v2 or later"
+                 (v2 through v19); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -409,11 +416,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v19"),
+            admit("v20"),
             Err(
-                "the plugin was built against contract v19, newer than this sidecar \
-                 (v2 through v18); upgrade the runtime, or rebuild the plugin against \
-                 v18 or earlier"
+                "the plugin was built against contract v20, newer than this sidecar \
+                 (v2 through v19); upgrade the runtime, or rebuild the plugin against \
+                 v19 or earlier"
                     .into()
             )
         );
@@ -424,7 +431,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v18"
+                "the plugin declared no contract version; this sidecar accepts v2 through v19"
                     .into()
             )
         );

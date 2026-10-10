@@ -86,6 +86,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
         description: String::new(),
         instrument_type: String::new(),
         money_market_fund: String::new(),
+        binary_event_contract: String::new(),
         listing_venue_id: String::new(),
         lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
         version: 1,
@@ -98,6 +99,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
             source: "stated by custody-1".into(),
             instance_id: "custody-1".into(),
             offered_at_ns: 100,
+            valid_until_ns: 0,
         }],
     }
 }
@@ -275,6 +277,7 @@ fn a_conflict_is_listed_once_and_brought_up_to_date() {
         reported_by: String::new(),
         first_seen_ns: 10,
         last_seen_ns: 10,
+        reason: 0,
     };
     store.note_conflict(conflict.clone()).unwrap();
     store
@@ -510,4 +513,94 @@ fn a_venue_is_kept_at_its_newest_version_and_a_record_keeps_its_listing_venue() 
         .unwrap();
     let back = store.by_id(&listed.instrument_id).unwrap().unwrap();
     assert_eq!(back.listing_venue_id, id);
+}
+
+#[test]
+fn a_closed_window_an_ended_offer_a_contract_and_a_conflicts_reason_are_kept() {
+    // Contract v19: an identifier that left the record kept with its window
+    // closed, matched only for dates it covered; a binary event contract's
+    // attributes; the platform's end offered; a conflict's reason.
+    let store = store();
+    let id = unique("LCL-V19");
+    let symbol = unique("ZZ");
+    let set = IdentifierSet::new([asked("symbol", &symbol, "kalshi")]).key();
+    let mut held = record(&id, vec![identifier("symbol", &symbol, "kalshi", 0)]);
+    store
+        .mint(held.clone(), &set, entry(&id, 1, "mint"))
+        .unwrap();
+
+    held.identifiers[0].valid_to_ns = Some(500);
+    held.instrument_type = "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT".into();
+    held.binary_event_contract = "1|USD|LCL-USD|1793548800000000000".into();
+    held.offers.push(Offer {
+        field: Field::Identifier,
+        value: symbol.clone(),
+        identifier: Some(asked("symbol", &symbol, "kalshi")),
+        source: "the platform, record INS-1 version 2".into(),
+        instance_id: String::new(),
+        offered_at_ns: 400,
+        valid_until_ns: 450,
+    });
+    held.version = 2;
+    assert_eq!(
+        store.write(held, 1, entry(&id, 2, "complete")).unwrap(),
+        Written::Stored
+    );
+    let read = store.by_id(&id).unwrap().unwrap();
+    assert_eq!(
+        read.identifiers[0].valid_to_ns,
+        Some(500),
+        "closed, never deleted"
+    );
+    assert_eq!(
+        read.binary_event_contract,
+        "1|USD|LCL-USD|1793548800000000000"
+    );
+    assert!(read.offers.iter().any(|offer| offer.valid_until_ns == 450));
+    assert_eq!(
+        store
+            .matching("symbol", &symbol, "kalshi", 499)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .matching("symbol", &symbol, "kalshi", 500)
+        .unwrap()
+        .is_empty());
+    let windows = store.windows("symbol", &symbol, "kalshi").unwrap();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].1.valid_to_ns, Some(500));
+
+    let figi = unique("BBG");
+    store
+        .note_conflict(Conflict {
+            identifiers: vec![asked("figi", &figi, "")],
+            instrument_ids: vec!["LCL-A".into(), "LCL-B".into()],
+            reported_by: "custody-1".into(),
+            first_seen_ns: 10,
+            last_seen_ns: 10,
+            reason: 2,
+        })
+        .unwrap();
+    // Seen again with no reason: once ambiguous, it stays so.
+    store
+        .note_conflict(Conflict {
+            identifiers: vec![asked("figi", &figi, "")],
+            instrument_ids: vec!["LCL-A".into(), "LCL-B".into()],
+            reported_by: String::new(),
+            first_seen_ns: 20,
+            last_seen_ns: 20,
+            reason: 0,
+        })
+        .unwrap();
+    let listed: Vec<Conflict> = store
+        .conflicts()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.identifiers[0].value == figi)
+        .collect();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].reason, 2);
+    assert_eq!(listed[0].last_seen_ns, 20);
 }

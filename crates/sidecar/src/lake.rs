@@ -12,6 +12,12 @@
 //! plugin holding ten instruments hears rows about those ten, never a whole
 //! market. A want is delivered to the instance serving its dataset alone.
 //!
+//! **Conflated, or not** (decisions/024; contract v19): prices latest value
+//! first per subject, dataset, kind, venue and asset, bars per subject,
+//! dataset, venue and interval start, quotes per subject, dataset, venue and
+//! asset; trades never, each delivered or its loss marked, and the plugin
+//! reads those recorded after the watermark it last saw (W4.3, W10.6).
+//!
 //! **A business date is a date** (ruling 3 of 2026-10-09): a batch or a read
 //! naming one that is not a day that exists is refused here, naming its
 //! field, before anything is sent.
@@ -23,8 +29,8 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
-    ObservationMeta, ObservationsWantedEvent, PricesRecordedEvent, RecordBarsRequest,
-    RecordPricesRequest, WantWithdrawnEvent,
+    ObservationMeta, ObservationsWantedEvent, PricesRecordedEvent, QuotesRecordedEvent,
+    RecordBarsRequest, RecordPricesRequest, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -117,9 +123,11 @@ pub(crate) struct Said {
     pub dataset: String,
     pub subjects: Vec<String>,
     /// The latest value first under load, per this key (decisions/024):
-    /// a price per subject, dataset, kind and venue; a bar per subject,
-    /// dataset, venue and interval start; a want per want.
-    pub key: String,
+    /// a price per subject, dataset, kind, venue and asset; a bar per
+    /// subject, dataset, venue and interval start; a quote per subject,
+    /// dataset, venue and asset (contract v19); a want per want. None for a
+    /// trade, which is never conflated.
+    pub key: Option<String>,
     pub is_want: bool,
 }
 
@@ -140,12 +148,13 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         "meridian.v1.PricesRecordedEvent" => {
             let price = PricesRecordedEvent::decode(payload).ok()?.price?;
             let (dataset, subjects, venue) = meta_said(price.meta.as_ref());
+            let asset = meridian_domain::lake::asset_key(price.price.as_ref());
             Some(Said {
-                key: format!(
-                    "price|{}|{dataset}|{}|{venue}",
+                key: Some(format!(
+                    "price|{}|{dataset}|{}|{venue}|{asset}",
                     subjects.first().cloned().unwrap_or_default(),
                     price.kind
-                ),
+                )),
                 dataset,
                 subjects,
                 is_want: false,
@@ -156,10 +165,34 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
             let from = bar.meta.as_ref().map_or(0, |m| m.valid_from_ns);
             let (dataset, subjects, venue) = meta_said(bar.meta.as_ref());
             Some(Said {
-                key: format!(
+                key: Some(format!(
                     "bar|{}|{dataset}|{venue}|{from}",
                     subjects.first().cloned().unwrap_or_default()
-                ),
+                )),
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
+        "meridian.v1.TradesRecordedEvent" => {
+            let trade = TradesRecordedEvent::decode(payload).ok()?.trade?;
+            let (dataset, subjects, _) = meta_said(trade.meta.as_ref());
+            Some(Said {
+                key: None,
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
+        "meridian.v1.QuotesRecordedEvent" => {
+            let quote = QuotesRecordedEvent::decode(payload).ok()?.quote?;
+            let (dataset, subjects, venue) = meta_said(quote.meta.as_ref());
+            let asset = meridian_domain::lake::quote_asset(&quote);
+            Some(Said {
+                key: Some(format!(
+                    "quote|{}|{dataset}|{venue}|{asset}",
+                    subjects.first().cloned().unwrap_or_default()
+                )),
                 dataset,
                 subjects,
                 is_want: false,
@@ -168,7 +201,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         "meridian.v1.ObservationsWantedEvent" => {
             let want = ObservationsWantedEvent::decode(payload).ok()?;
             Some(Said {
-                key: format!("want|{}", want.want_id),
+                key: Some(format!("want|{}", want.want_id)),
                 dataset: want.dataset,
                 subjects: Vec::new(),
                 is_want: true,
@@ -177,7 +210,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         "meridian.v1.WantWithdrawnEvent" => {
             let withdrawn = WantWithdrawnEvent::decode(payload).ok()?;
             Some(Said {
-                key: format!("want|{}", withdrawn.want_id),
+                key: Some(format!("want|{}", withdrawn.want_id)),
                 dataset: withdrawn.dataset,
                 subjects: Vec::new(),
                 is_want: true,
@@ -207,6 +240,24 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             Ok(mut event) => {
                 if let Some(bar) = event.bar.as_mut() {
                     meridian_domain::lake::strip_bar(bar, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
+        "meridian.v1.TradesRecordedEvent" => match TradesRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(trade) = event.trade.as_mut() {
+                    meridian_domain::lake::strip_trade(trade, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
+        "meridian.v1.QuotesRecordedEvent" => match QuotesRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(quote) = event.quote.as_mut() {
+                    meridian_domain::lake::strip_quote(quote, allowed);
                 }
                 event.encode_to_vec()
             }
@@ -316,7 +367,10 @@ mod tests {
         let said = said("meridian.v1.PricesRecordedEvent", &price.encode_to_vec()).unwrap();
         assert_eq!(said.dataset, "coinbase-1:daily");
         assert_eq!(said.subjects, vec!["LCL-BTC"]);
-        assert_eq!(said.key, "price|LCL-BTC|coinbase-1:daily|1|");
+        assert_eq!(
+            said.key.as_deref(),
+            Some("price|LCL-BTC|coinbase-1:daily|1||")
+        );
         let batch = RecordPricesRequest {
             prices: vec![price.price.unwrap()],
             want_id: String::new(),
@@ -332,5 +386,84 @@ mod tests {
             ..Default::default()
         };
         assert!(dates_refused("meridian.v1.ListPricesRequest", &read.encode_to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_trade_is_never_conflated_and_a_quote_or_price_is_keyed_by_its_asset() {
+        use meridian_domain::v1::{Money, Quote, Trade};
+        let meta = || {
+            Some(ObservationMeta {
+                subjects: vec![SubjectRef {
+                    entity_id: "LCL-BTC".into(),
+                }],
+                source: Some(Source {
+                    dataset: "coinbase-1:live".into(),
+                    venue_id: "VEN-1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let in_asset = |instrument: &str| Money {
+            instrument_id: instrument.into(),
+            ..Default::default()
+        };
+        let trade = TradesRecordedEvent {
+            trade: Some(Trade {
+                meta: meta(),
+                price: Some(in_asset("LCL-USD")),
+                ..Default::default()
+            }),
+        };
+        let said_trade = said("meridian.v1.TradesRecordedEvent", &trade.encode_to_vec()).unwrap();
+        assert_eq!(said_trade.key, None, "every trade delivered");
+        assert_eq!(said_trade.dataset, "coinbase-1:live");
+        assert_eq!(said_trade.subjects, vec!["LCL-BTC"]);
+        let quote = |asset: &str| QuotesRecordedEvent {
+            quote: Some(Quote {
+                meta: meta(),
+                bid: Some(in_asset(asset)),
+                ..Default::default()
+            }),
+        };
+        let usd = said(
+            "meridian.v1.QuotesRecordedEvent",
+            &quote("LCL-USD").encode_to_vec(),
+        )
+        .unwrap()
+        .key;
+        let usdc = said(
+            "meridian.v1.QuotesRecordedEvent",
+            &quote("LCL-USDC").encode_to_vec(),
+        )
+        .unwrap()
+        .key;
+        assert_eq!(
+            usd.as_deref(),
+            Some("quote|LCL-BTC|coinbase-1:live|VEN-1|LCL-USD")
+        );
+        assert_ne!(usd, usdc, "BTC in USD and in USDC never collapse");
+        let price = |asset: &str| PricesRecordedEvent {
+            price: Some(Price {
+                meta: meta(),
+                kind: 2,
+                price: Some(in_asset(asset)),
+                ..Default::default()
+            }),
+        };
+        assert_ne!(
+            said(
+                "meridian.v1.PricesRecordedEvent",
+                &price("LCL-USD").encode_to_vec()
+            )
+            .unwrap()
+            .key,
+            said(
+                "meridian.v1.PricesRecordedEvent",
+                &price("LCL-USDC").encode_to_vec()
+            )
+            .unwrap()
+            .key
+        );
     }
 }

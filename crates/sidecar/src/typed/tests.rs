@@ -175,6 +175,7 @@ fn holding(external: &str) -> RecordHoldingParams {
             scheme: "symbol".into(),
             value: "AAPL".into(),
             source: "snaptrade".into(),
+            ..Default::default()
         }],
         quantity: Some(wire("12.5")),
         market_value: Some(Money {
@@ -2428,11 +2429,13 @@ async fn a_dgm_resolves_an_instrument_and_a_role_without_the_row_is_still_refuse
                                 scheme: "cusip".into(),
                                 value: "74347X831".into(),
                                 source: String::new(),
+                                ..Default::default()
                             },
                             Named {
                                 scheme: "symbol".into(),
                                 value: "TQQQ".into(),
                                 source: "snaptrade".into(),
+                                ..Default::default()
                             },
                         ],
                         ..Default::default()

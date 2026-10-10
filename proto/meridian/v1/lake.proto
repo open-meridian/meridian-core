@@ -3,9 +3,10 @@
 //
 // Derived from workflow W10 (the lake; spec/the-lake, accepted 2026-10-02,
 // and plans/the-lake-prices-the-book, accepted 2026-10-03 and refreshed
-// 2026-10-09), contract v18, the lake's 1a: prices and bars, the catalogue,
-// licences and entitlements, source priority, and wants. Every message here
-// traces to a matrix row; see matrix/matrix.tsv.
+// 2026-10-09 and 2026-10-10): contract v18, the lake's 1a -- prices and bars,
+// the catalogue, licences and entitlements, source priority, and wants -- and
+// contract v19, the lake's 1b: trades and quotes. Every message here traces
+// to a matrix row; see matrix/matrix.tsv.
 //
 // The lake is append-only and bitemporal. A `dgm` records rows in batches; the
 // lake records, sequences and publishes each on its dataset's subject; a
@@ -91,7 +92,7 @@ message ObservationMeta {
 // One entity a row is about.
 message SubjectRef {
   // The deployment's own ID for the entity: an instrument's in the lake's
-  // 1a. 1 to 64 characters.
+  // 1a and 1b. 1 to 64 characters.
   string entity_id = 1;
 }
 
@@ -109,7 +110,9 @@ message Source {
   string dataset = 3;
 
   // The venue the observation originated on, the venue master's ID; empty
-  // when it is not venue-specific, which is the consolidated view.
+  // when it is not venue-specific, which is the consolidated view. A trade's
+  // is the venue it printed on (contract v19): the market centre a
+  // consolidated dataset's trade names, a FINRA print's reporting facility.
   string venue_id = 4;
 }
 
@@ -237,6 +240,147 @@ message Bar {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The data types of the lake's 1b (contract v19)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One trade as its source reported it. Valid from its event time at its venue,
+// `valid_until_ns` 0, and no business date: real-time data is keyed by UTC
+// instants. The consolidator's, the reporting facility's and the vendor's
+// times are `source_times`. A correction or a withdrawal is a new version
+// under the same row key.
+message Trade {
+  ObservationMeta meta = 1;
+
+  // The trade's price per unit of the subject, naming its cash instrument.
+  Money price = 2;
+
+  // The quantity traded, in units of the instrument: more than zero.
+  Decimal quantity = 3;
+
+  // What the trade may count for, and its characteristics, in the platform's
+  // words: converted from the source's condition codes at the edge, never a
+  // vendor's code.
+  TradeAttributes attributes = 4;
+
+  // The side that took liquidity; unspecified when the source does not say,
+  // never guessed from the price's movement.
+  Aggressor aggressor = 5;
+
+  // The source's own sequence number; 0 when it gives none. Not the lake's.
+  uint64 source_sequence = 6;
+
+  // True in a version saying the source withdrew the trade.
+  bool cancelled = 7;
+}
+
+// What a trade may count for (spec/the-lake, "Trade attributes"): written on
+// each trade, so no reader needs a table to compute a bar.
+message TradeAttributes {
+  // For the consolidated bar across venues.
+  Eligibility consolidated = 1;
+
+  // For its own venue's bar.
+  Eligibility market_centre = 2;
+
+  // Its characteristics: 0 to 16. None is a regular trade, unless
+  // `meta.unconverted` names a code that did not convert.
+  repeated TradeCharacteristic characteristics = 3;
+}
+
+// Whether a trade may set each statistic of a bar; not whether it did.
+message Eligibility {
+  Eligible high_low = 1;
+  Eligible open = 2;
+  Eligible close = 3;
+  Eligible volume = 4;
+}
+
+// Whether a trade may set a statistic.
+enum Eligible {
+  // Not known: a code the `dgm` could not convert. A reader computing a bar
+  // reads it as not eligible, and says so.
+  ELIGIBLE_UNSPECIFIED = 0;
+  ELIGIBLE_ELIGIBLE = 1;
+  ELIGIBLE_NOT_ELIGIBLE = 2;
+}
+
+// The side that took liquidity.
+enum Aggressor {
+  // Not known.
+  AGGRESSOR_UNSPECIFIED = 0;
+  // The buyer took the offer.
+  AGGRESSOR_BUY = 1;
+  // The seller hit the bid.
+  AGGRESSOR_SELL = 2;
+}
+
+// A trade's characteristics in the platform's words: a closed list grown by
+// revision, none a vendor's code.
+enum TradeCharacteristic {
+  // Refused.
+  TRADE_CHARACTERISTIC_UNSPECIFIED = 0;
+  // Printed by the venue's opening auction.
+  TRADE_CHARACTERISTIC_OPENING_AUCTION = 1;
+  // Printed by the venue's closing auction.
+  TRADE_CHARACTERISTIC_CLOSING_AUCTION = 2;
+  // Printed by another auction: a reopening after a halt, an intraday auction.
+  TRADE_CHARACTERISTIC_OTHER_AUCTION = 3;
+  // Smaller than the instrument's round lot.
+  TRADE_CHARACTERISTIC_ODD_LOT = 4;
+  // Outside the venue's regular session.
+  TRADE_CHARACTERISTIC_EXTENDED_HOURS = 5;
+  // Reported out of its time order.
+  TRADE_CHARACTERISTIC_OUT_OF_SEQUENCE = 6;
+  // Reported later than its venue's rules require.
+  TRADE_CHARACTERISTIC_LATE_REPORT = 7;
+  // Priced as an average over several executions.
+  TRADE_CHARACTERISTIC_AVERAGE_PRICE = 8;
+  // Settling other than on the regular cycle: cash, next day, seller's option.
+  TRADE_CHARACTERISTIC_NON_REGULAR_SETTLEMENT = 9;
+  // Part of an order sweeping several venues at once.
+  TRADE_CHARACTERISTIC_INTERMARKET_SWEEP = 10;
+  // Priced from another instrument or a benchmark, not by the market at the
+  // time.
+  TRADE_CHARACTERISTIC_DERIVATIVELY_PRICED = 11;
+  // Priced at a reference price from earlier in the day.
+  TRADE_CHARACTERISTIC_PRIOR_REFERENCE_PRICE = 12;
+  // Executed contingent on another trade.
+  TRADE_CHARACTERISTIC_CONTINGENT = 13;
+  // A cross of two orders by one participant.
+  TRADE_CHARACTERISTIC_CROSS = 14;
+}
+
+// The best bid and offer, on a venue or consolidated: in force from its valid
+// time until the next quote for the same subject, dataset, venue and asset. Keyed by
+// UTC instants, with no business date. Book depth is not in slice 1.
+message Quote {
+  ObservationMeta meta = 1;
+
+  // The best price on each side, naming its cash instrument, one asset for
+  // both; unset when that side is empty.
+  optional Money bid = 2;
+  optional Money ask = 3;
+
+  // The quantity at each price, in units of the instrument, more than zero;
+  // unset when the source gives none.
+  optional Decimal bid_quantity = 4;
+  optional Decimal ask_quantity = 5;
+
+  // The quote's state: 0 to 4. None is firm and trading.
+  repeated QuoteCharacteristic characteristics = 6;
+}
+
+// A quote's state in the platform's words.
+enum QuoteCharacteristic {
+  // Refused.
+  QUOTE_CHARACTERISTIC_UNSPECIFIED = 0;
+  // Not firm: a price a participant need not trade at.
+  QUOTE_CHARACTERISTIC_INDICATIVE = 1;
+  // Trading in the subject is halted.
+  QUOTE_CHARACTERISTIC_HALTED = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W10.4, W10.5 — a `dgm` records; the lake records and publishes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -260,6 +404,26 @@ message RecordBarsRequest {
   string want_id = 2;
 }
 
+// A batch of trades, recorded whole or refused naming the item and field:
+// 1 to 500 (contract v19).
+message RecordTradesRequest {
+  repeated Trade trades = 1;
+
+  // The want these answer, as it was delivered; empty for rows recorded
+  // unasked.
+  string want_id = 2;
+}
+
+// A batch of quotes, recorded whole or refused naming the item and field:
+// 1 to 500 (contract v19).
+message RecordQuotesRequest {
+  repeated Quote quotes = 1;
+
+  // The want these answer, as it was delivered; empty for rows recorded
+  // unasked.
+  string want_id = 2;
+}
+
 // What a batch did, once it committed.
 message RecordObservationsReply {
   // Rows recorded for the first time.
@@ -277,7 +441,7 @@ message RecordObservationsReply {
 
 // A price the lake recorded, on its dataset's subject: one row, with its
 // version and sequence. Delivered latest value first per subject, dataset,
-// kind and venue (conflated).
+// kind, venue and, from contract v19, the price's asset (conflated).
 message PricesRecordedEvent {
   Price price = 1;
 }
@@ -286,6 +450,20 @@ message PricesRecordedEvent {
 // first per subject, dataset, venue and interval start (conflated).
 message BarsRecordedEvent {
   Bar bar = 1;
+}
+
+// A trade the lake recorded, on its dataset's subject (contract v19). Never
+// conflated: every trade is delivered, at most once, and a reader that lost
+// some catches up from the lake by the watermark it last saw (ListTrades).
+message TradesRecordedEvent {
+  Trade trade = 1;
+}
+
+// A quote the lake recorded, on its dataset's subject (contract v19).
+// Delivered latest value first per subject, dataset, venue and the quote's
+// asset (conflated).
+message QuotesRecordedEvent {
+  Quote quote = 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,7 +519,10 @@ enum UnansweredReason {
 
 // Prices for subjects, at one of: the latest in force at a valid time
 // (`at_ns`, 0 for now); a business date; or a valid-time range, from
-// inclusive to exclusive. Exactly one is given; none is the latest now.
+// inclusive to exclusive. Exactly one is given; none is the latest now. The
+// latest is chosen per subject, dataset, kind, venue and the price's asset
+// (contract v19), so a subject priced in two assets on one venue answers
+// both.
 message ListPricesRequest {
   // 1 to 500.
   repeated SubjectRef subjects = 1;
@@ -411,6 +592,70 @@ message ListBarsReply {
   string next_cursor = 5;
 }
 
+// Trades for subjects (contract v19): a valid-time range, from inclusive to
+// exclusive, within one day of each dataset as it declares its day; or the
+// rows recorded after a watermark, whatever their valid time, which is how a
+// reader that lost trades catches up, a late or out-of-sequence print
+// included. Exactly one is given.
+message ListTradesRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+
+  SourceChoice sources = 2;
+
+  int64 valid_from_ns = 3;
+  int64 valid_until_ns = 4;
+
+  // The watermark the reader last saw: the rows each dataset partition it
+  // names recorded after its sequence there.
+  Watermark after_watermark = 5;
+
+  // The recorded-time cut-off, 0 for now: what the lake knew then.
+  int64 as_of_ns = 6;
+
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 7;
+  string cursor = 8;
+}
+
+message ListTradesReply {
+  repeated Trade trades = 1;
+  repeated Unanswered unanswered = 2;
+  repeated DatasetRef datasets = 3;
+  Watermark watermark = 4;
+  string next_cursor = 5;
+}
+
+// Quotes for subjects (contract v19), at one of: the latest in force at a
+// valid time (`at_ns`, 0 for now), per subject, dataset, venue and the
+// quote's asset; or a valid-time range within one day of each dataset as it
+// declares its day. A reader that lost quotes reads the latest in force.
+message ListQuotesRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+
+  SourceChoice sources = 2;
+
+  int64 at_ns = 3;
+  int64 valid_from_ns = 4;
+  int64 valid_until_ns = 5;
+
+  // The recorded-time cut-off, 0 for now.
+  int64 as_of_ns = 6;
+
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 7;
+  string cursor = 8;
+}
+
+message ListQuotesReply {
+  repeated Quote quotes = 1;
+  repeated Unanswered unanswered = 2;
+  repeated DatasetRef datasets = 3;
+  Watermark watermark = 4;
+  string next_cursor = 5;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // W10.7 — a read the lake cannot answer is wanted of the `dgm`
 // ─────────────────────────────────────────────────────────────────────────────
@@ -423,8 +668,9 @@ message ObservationsWantedEvent {
 
   string dataset = 2;
 
-  // The data type, by its message's full name: meridian.v1.Price or
-  // meridian.v1.Bar.
+  // The data type, by its message's full name: meridian.v1.Price,
+  // meridian.v1.Bar, and from contract v19 meridian.v1.Trade or
+  // meridian.v1.Quote.
   string data_type = 3;
 
   // 1 to 500.
@@ -442,7 +688,8 @@ message ObservationsWantedEvent {
   int64 valid_from_ns = 8;
   int64 valid_until_ns = 9;
 
-  // Keep the subjects current until the want is withdrawn (W10.7).
+  // Keep the subjects current until the want is withdrawn (W10.7): by the
+  // vendor's stream where the dataset is streamed, by its schedule otherwise.
   bool standing = 10;
 }
 
@@ -452,7 +699,10 @@ message WantWithdrawnEvent {
   string dataset = 2;
 }
 
-// What a `dgm` cannot serve of a want, per subject, with its reason.
+// What a `dgm` cannot serve of a want, per subject, with its reason. It
+// stands for the date or range the want asked, or for the latest where it
+// asked the latest, and for nothing else (contract v19): a later want of
+// another date is asked again.
 message DeclineWantRequest {
   string want_id = 1;
 
@@ -498,10 +748,11 @@ message DatasetEntitlement {
 // of datasets a default read takes, with failover (W10.2). Journalled by the
 // lake.
 message SourcePriority {
-  // By its message's full name: meridian.v1.Price or meridian.v1.Bar.
+  // By its message's full name: meridian.v1.Price, meridian.v1.Bar, and from
+  // contract v19 meridian.v1.Trade or meridian.v1.Quote.
   string data_type = 1;
 
-  // For prices, the kind; unspecified for bars.
+  // For prices, the kind; unspecified for the other data types.
   PriceKind kind = 2;
 
   // First to last. At most 16.

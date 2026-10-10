@@ -458,7 +458,7 @@ async fn deliver(
             envelope.payload =
                 crate::lake::stripped(&envelope.payload_type, &envelope.payload, &fields);
         }
-        key = Some(said.key);
+        key = said.key;
     }
     if envelope.payload_type != row.payload_type {
         tracing::warn!(

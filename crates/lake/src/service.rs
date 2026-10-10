@@ -1,10 +1,16 @@
 //! Where the lake meets the bus (W10).
 //!
-//! Three commands and four queries in; three events heard and one more kept
-//! from; three queries asked; four events out. A `dgm` records prices and bars
-//! in batches and declines what it cannot serve of a want; the reading roles
-//! read prices, bars and the datasets; the dashboard sets and lists the
-//! priority and lists the datasets. The conductor's data configuration is
+//! Five commands and six queries in; three events heard and one more kept
+//! from; three queries asked; six events out. A `dgm` records prices, bars,
+//! and from contract v19 trades and quotes, in batches, and declines what it
+//! cannot serve of a want; the reading roles read prices, bars and the
+//! datasets, and `signal` and `ems` trades and quotes; the dashboard sets and
+//! lists the priority and lists the datasets.
+//!
+//! Trades are published unconflated, every one, and a reader that lost some
+//! reads those recorded after the watermark it last saw (W10.5, W10.6; the
+//! plan's Q33); quotes are conflated per subject, dataset, venue and asset,
+//! as prices are per subject, dataset, kind, venue and asset. The conductor's data configuration is
 //! heard and kept; a merged record (W3.8) is followed by alias; the misses a
 //! plugin reports (W3.2, W3.15) are counted. The instrument store is asked
 //! whether a row's subjects are held (W3.6) and what cash instrument a
@@ -31,13 +37,16 @@ use meridian_domain::v1::PartitionSequence;
 use meridian_domain::v1::{
     BarsRecordedEvent, DatasetRef, DeclineWantReply, DeclineWantRequest, EntitlementsChangedEvent,
     Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest, ListDatasetsReply,
-    ListDatasetsRequest, ListPricesReply, ListPricesRequest, ListSourcePrioritiesReply,
-    ListSourcePrioritiesRequest, MissingInstrumentDetectedEvent, MissingVenueDetectedEvent,
-    ObservationsWantedEvent, PluginCatalogue, PluginCatalogueRequest, PluginLaunchState,
-    PriceBasis, PriceKind, PricesRecordedEvent, RecordBarsRequest, RecordObservationsReply,
-    RecordPricesRequest, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    ListDatasetsRequest, ListPricesReply, ListPricesRequest, ListQuotesReply, ListQuotesRequest,
+    ListSourcePrioritiesReply, ListSourcePrioritiesRequest, ListTradesReply, ListTradesRequest,
+    MissingInstrumentDetectedEvent, MissingVenueDetectedEvent, ObservationsWantedEvent,
+    PluginCatalogue, PluginCatalogueRequest, PluginLaunchState, PriceBasis, PriceKind,
+    PricesRecordedEvent, QuoteCharacteristic, QuotesRecordedEvent, RecordBarsRequest,
+    RecordObservationsReply, RecordPricesRequest, RecordQuotesRequest, RecordTradesRequest,
+    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
     ResolveInstrumentRequest, SetSourcePriorityRequest, SourceChoice, SourcePriority,
-    SourceTimeKind, SubjectRef, Unanswered, UnansweredReason, WantWithdrawnEvent, Watermark,
+    SourceTimeKind, SubjectRef, TradeCharacteristic, TradesRecordedEvent, Unanswered,
+    UnansweredReason, WantWithdrawnEvent, Watermark,
 };
 use meridian_pb::bounds;
 use prost::Message;
@@ -51,10 +60,14 @@ use crate::store::{Store, WantChange, WantChangeKind, When};
 
 pub const RECORD_PRICES: &str = "platform.lake.command.record-prices";
 pub const RECORD_BARS: &str = "platform.lake.command.record-bars";
+pub const RECORD_TRADES: &str = "platform.lake.command.record-trades";
+pub const RECORD_QUOTES: &str = "platform.lake.command.record-quotes";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
 pub const LIST_BARS: &str = "platform.lake.query.list-bars";
+pub const LIST_TRADES: &str = "platform.lake.query.list-trades";
+pub const LIST_QUOTES: &str = "platform.lake.query.list-quotes";
 pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
@@ -72,6 +85,8 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
     match data_type {
         DataType::Price => format!("platform.lake.{dataset}.event.prices-recorded"),
         DataType::Bar => format!("platform.lake.{dataset}.event.bars-recorded"),
+        DataType::Trade => format!("platform.lake.{dataset}.event.trades-recorded"),
+        DataType::Quote => format!("platform.lake.{dataset}.event.quotes-recorded"),
     }
 }
 
@@ -86,6 +101,10 @@ const ASK_AGAIN_NS: i64 = 60 * 1_000_000_000;
 /// retention is applied.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15);
 pub const RETENTION_EVERY: Duration = Duration::from_secs(3600);
+
+/// How often the trades recorded are logged, per second over the minute:
+/// what the `lake_trades_recorded_per_second` band reads (contract v19, Q40).
+pub const TRADES_LOGGED_EVERY: Duration = Duration::from_secs(60);
 
 /// How long the catalogue's launched versions are read again after.
 const VERSIONS_FOR_NS: i64 = 300 * 1_000_000_000;
@@ -126,7 +145,11 @@ pub struct Lake {
     clock: Arc<dyn Clock>,
     config: RwLock<DataConfig>,
     wants: Mutex<Wants>,
-    declined: Mutex<BTreeMap<(String, String), (UnansweredReason, i64)>>,
+    /// What a source declined, by dataset, subject and the date or range its
+    /// want asked (contract v19): its reason and when.
+    declined: Mutex<read::Declined>,
+    /// Trades recorded since the band last read them.
+    trades_recorded: std::sync::atomic::AtomicU64,
     held: Mutex<BTreeSet<String>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
@@ -189,6 +212,7 @@ impl Lake {
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
             declined: Mutex::new(BTreeMap::new()),
+            trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeSet::new()),
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
@@ -257,6 +281,7 @@ impl Lake {
                         scheme: ISO4217.into(),
                         value: code.to_string(),
                         source: String::new(),
+                        ..Default::default()
                     }],
                     as_of_ns,
                     ..Default::default()
@@ -384,6 +409,19 @@ impl Lake {
                 &format!("{at}.meta.business_date"),
                 &meta.business_date,
             )?;
+            // Real-time data is keyed by UTC instants, with no business date
+            // (contract v19; ruling 3 of 2026-10-09).
+            if data_type.real_time() && !meta.business_date.is_empty() {
+                return Err(format!(
+                    "{at}.meta.business_date: a {} names no business date; it is keyed by its \
+                     valid time",
+                    if data_type == DataType::Trade {
+                        "trade"
+                    } else {
+                        "quote"
+                    }
+                ));
+            }
             if meta.source_times.len() > 6 {
                 return Err(format!(
                     "{at}.meta.source_times names {}; at most 6",
@@ -457,6 +495,17 @@ impl Lake {
                     instruments.len()
                 ));
             }
+            if data_type == DataType::Quote && instruments.len() > 1 {
+                return Err(format!(
+                    "{at}: a quote's two sides are in one asset, and these are in {}",
+                    instruments.len()
+                ));
+            }
+            match &row {
+                Observation::Trade(trade) => trade_refused(&at, trade)?,
+                Observation::Quote(quote) => quote_refused(&at, quote)?,
+                _ => {}
+            }
             if let Observation::Bar(bar) = &row {
                 if let Some(volume) = &bar.volume {
                     let exact = meridian_domain::exact::Exact::from_wire(volume)
@@ -492,10 +541,11 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
-        let bound = if field == "prices" {
-            bounds::RECORD_PRICES_REQUEST_PRICES_COUNT
-        } else {
-            bounds::RECORD_BARS_REQUEST_BARS_COUNT
+        let bound = match field {
+            "prices" => bounds::RECORD_PRICES_REQUEST_PRICES_COUNT,
+            "trades" => bounds::RECORD_TRADES_REQUEST_TRADES_COUNT,
+            "quotes" => bounds::RECORD_QUOTES_REQUEST_QUOTES_COUNT,
+            _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
             return Err(format!(
@@ -533,6 +583,15 @@ impl Lake {
             for row in &done.rows {
                 subjects.extend(row.subjects());
                 self.publish(&dataset, row);
+            }
+            let trades = done
+                .rows
+                .iter()
+                .filter(|row| row.data_type() == DataType::Trade)
+                .count() as u64;
+            if trades > 0 {
+                self.trades_recorded
+                    .fetch_add(trades, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -574,6 +633,20 @@ impl Lake {
                 "meridian.v1.BarsRecordedEvent",
                 BarsRecordedEvent {
                     bar: Some(bar.clone()),
+                }
+                .encode_to_vec(),
+            ),
+            Observation::Trade(trade) => (
+                "meridian.v1.TradesRecordedEvent",
+                TradesRecordedEvent {
+                    trade: Some(trade.clone()),
+                }
+                .encode_to_vec(),
+            ),
+            Observation::Quote(quote) => (
+                "meridian.v1.QuotesRecordedEvent",
+                QuotesRecordedEvent {
+                    quote: Some(quote.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -640,7 +713,7 @@ impl Lake {
             let (date, from, until) = match &ask.when {
                 When::BusinessDate(date) => (date.to_string(), 0, 0),
                 When::Range { from_ns, until_ns } => (String::new(), *from_ns, *until_ns),
-                When::Latest { .. } => (String::new(), 0, 0),
+                When::Latest { .. } | When::After(_) => (String::new(), 0, 0),
             };
             let mut kinds = ask.kinds.clone();
             kinds.sort();
@@ -828,37 +901,93 @@ impl Lake {
         envelope: &Envelope,
     ) -> Result<ReadAnswer, String> {
         let reader = reader_of(envelope);
-        let field = |name: &str| name.to_string();
         if !bounds::LIST_PRICES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return Err(format!(
-                "{}: subjects names {}; 1 to 500",
-                field("subjects"),
+                "subjects names {}; 1 to 500",
                 request.subjects.len()
             ));
         }
-        let given = [
-            request.at_ns != 0,
-            !request.business_date.is_empty(),
-            request.valid_from_ns != 0 || request.valid_until_ns != 0,
-        ];
-        if given.iter().filter(|g| **g).count() > 1 {
-            return Err("at_ns, business_date and a valid-time range: at most one is given".into());
-        }
-        let when = if let Some(date) =
-            meridian_domain::date::optional("business_date", &request.business_date)?
-        {
-            When::BusinessDate(date)
-        } else if given[2] {
-            if request.valid_until_ns != 0 && request.valid_until_ns <= request.valid_from_ns {
-                return Err("valid_until_ns is after valid_from_ns".into());
+        let ranged = request.valid_from_ns != 0 || request.valid_until_ns != 0;
+        let after = request
+            .after
+            .as_ref()
+            .filter(|watermark| !watermark.partitions.is_empty());
+        let when = match request.data_type {
+            // Trades (contract v19): a valid-time range, or the rows recorded
+            // after a watermark (the plan's Q33); exactly one.
+            DataType::Trade => match (ranged, after) {
+                (true, None) => When::Range {
+                    from_ns: request.valid_from_ns,
+                    until_ns: request.valid_until_ns,
+                },
+                (false, Some(watermark)) => {
+                    let mut at: BTreeMap<String, u64> = BTreeMap::new();
+                    for (i, partition) in watermark.partitions.iter().enumerate() {
+                        if at
+                            .insert(partition.partition.clone(), partition.sequence)
+                            .is_some()
+                        {
+                            return Err(format!(
+                                "after_watermark.partitions[{i}] {:?} is named twice",
+                                partition.partition
+                            ));
+                        }
+                    }
+                    When::After(at)
+                }
+                _ => {
+                    return Err(
+                        "a valid-time range or after_watermark: exactly one is given".into(),
+                    )
+                }
+            },
+            // Quotes (contract v19): the latest in force at a time, or a
+            // valid-time range; at most one.
+            DataType::Quote => {
+                if request.at_ns != 0 && ranged {
+                    return Err("at_ns and a valid-time range: at most one is given".into());
+                }
+                if ranged {
+                    When::Range {
+                        from_ns: request.valid_from_ns,
+                        until_ns: request.valid_until_ns,
+                    }
+                } else {
+                    When::Latest {
+                        at_ns: request.at_ns,
+                    }
+                }
             }
-            When::Range {
-                from_ns: request.valid_from_ns,
-                until_ns: request.valid_until_ns,
-            }
-        } else {
-            When::Latest {
-                at_ns: request.at_ns,
+            DataType::Price | DataType::Bar => {
+                let given = [
+                    request.at_ns != 0,
+                    !request.business_date.is_empty(),
+                    ranged,
+                ];
+                if given.iter().filter(|g| **g).count() > 1 {
+                    return Err(
+                        "at_ns, business_date and a valid-time range: at most one is given".into(),
+                    );
+                }
+                if let Some(date) =
+                    meridian_domain::date::optional("business_date", &request.business_date)?
+                {
+                    When::BusinessDate(date)
+                } else if ranged {
+                    if request.valid_until_ns != 0
+                        && request.valid_until_ns <= request.valid_from_ns
+                    {
+                        return Err("valid_until_ns is after valid_from_ns".into());
+                    }
+                    When::Range {
+                        from_ns: request.valid_from_ns,
+                        until_ns: request.valid_until_ns,
+                    }
+                } else {
+                    When::Latest {
+                        at_ns: request.at_ns,
+                    }
+                }
             }
         };
         let sources = request.sources.unwrap_or_default();
@@ -896,6 +1025,25 @@ impl Lake {
             n => n.min(500) as usize,
         };
         let config = self.config();
+        // A range of trades or quotes is one day of each dataset that could
+        // answer it, as it declares its day (contract v19, W10.6).
+        let mut when = when;
+        if request.data_type.real_time() {
+            if let When::Range { from_ns, until_ns } = when {
+                let until_ns = if until_ns == 0 {
+                    self.clock.now_ns().max(from_ns + 1)
+                } else {
+                    until_ns
+                };
+                for dataset in config.readable(&reader, request.data_type) {
+                    if !sources.named.is_empty() && !sources.named.contains(&dataset) {
+                        continue;
+                    }
+                    read::within_a_day(&dataset, config.declaration(&dataset), from_ns, until_ns)?;
+                }
+                when = When::Range { from_ns, until_ns };
+            }
+        }
         let priorities = self
             .store
             .priorities()
@@ -929,6 +1077,48 @@ impl Lake {
         )?;
         if offset == 0 {
             self.want(answered.asks.clone(), &reader);
+        }
+        // What a catch-up cannot answer, per partition it named (contract
+        // v19): a dataset not read, one not kept, or rows since the
+        // watermark that retention removed.
+        let mut answered = answered;
+        if let When::After(watermark) = &read.when {
+            let readable = config.readable(&reader, read.data_type);
+            let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+            for (dataset, sequence) in watermark {
+                let reason = if !readable.contains(dataset) {
+                    Some(
+                        if config.datasets.contains_key(dataset)
+                            && config.serves(dataset, read.data_type)
+                        {
+                            UnansweredReason::NotEntitled
+                        } else {
+                            UnansweredReason::NotCovered
+                        },
+                    )
+                } else if !config.licence(dataset).kept {
+                    Some(UnansweredReason::NotKept)
+                } else {
+                    let head = heads.get(dataset).copied().unwrap_or(0);
+                    let lowest = self
+                        .store
+                        .lowest_kept(dataset)
+                        .map_err(|failed| failed.to_string())?;
+                    let removed = match lowest {
+                        Some(lowest) => lowest > sequence + 1,
+                        None => head > *sequence,
+                    };
+                    (head > *sequence && removed).then_some(UnansweredReason::BeyondHistory)
+                };
+                if let Some(reason) = reason {
+                    answered.not_served.push(read::NotServed {
+                        subject: String::new(),
+                        dataset: dataset.clone(),
+                        field: String::new(),
+                        reason,
+                    });
+                }
+            }
         }
         let total = answered.rows.len();
         let rows: Vec<Observation> = answered.rows.into_iter().skip(offset).take(page).collect();
@@ -1032,8 +1222,11 @@ impl Lake {
             DataType::Price if kind == PriceKind::Unspecified => {
                 return Err("kind: a price's priority names its kind".into())
             }
-            DataType::Bar if kind != PriceKind::Unspecified => {
-                return Err("kind: a bar's priority names no kind".into())
+            DataType::Bar | DataType::Trade | DataType::Quote if kind != PriceKind::Unspecified => {
+                return Err(format!(
+                    "kind: a priority for {} names no kind; only prices have one",
+                    data_type.name()
+                ))
             }
             _ => {}
         }
@@ -1116,13 +1309,13 @@ impl Lake {
                 request.subjects.len()
             ));
         }
-        let dataset = self
+        let (dataset, asked) = self
             .wants
             .lock()
             .expect("wants poisoned")
             .open
             .get(&request.want_id)
-            .map(|w| w.event.dataset.clone())
+            .map(|w| (w.event.dataset.clone(), want_asked(&w.event)))
             .ok_or_else(|| format!("want_id: no want {} is open", request.want_id))?;
         if lake::instance_of(&dataset) != Some(instance.as_str()) {
             return Err(format!(
@@ -1136,9 +1329,14 @@ impl Lake {
             .map(|s| s.entity_id.clone())
             .collect();
         {
+            // For the date or range the want asked, or the latest, alone
+            // (contract v19, approved 2026-10-10).
             let mut declined = self.declined.lock().expect("declined poisoned");
             for subject in &subjects {
-                declined.insert((dataset.clone(), subject.clone()), (reason, now));
+                declined.insert(
+                    (dataset.clone(), subject.clone(), asked.clone()),
+                    (reason, now),
+                );
             }
         }
         self.settle(
@@ -1161,7 +1359,108 @@ impl Lake {
     }
 }
 
-/// A read's request, prices' or bars'.
+/// What a want asked, as a decline of it is kept by: its business date, its
+/// range, or the latest (contract v19).
+fn want_asked(event: &ObservationsWantedEvent) -> String {
+    let when = if let Ok(date) = Date::parse(&event.business_date) {
+        When::BusinessDate(date)
+    } else if event.valid_from_ns != 0 || event.valid_until_ns != 0 {
+        When::Range {
+            from_ns: event.valid_from_ns,
+            until_ns: event.valid_until_ns,
+        }
+    } else {
+        When::Latest { at_ns: 0 }
+    };
+    read::asked(&when)
+}
+
+/// A trade held to W10.4 (contract v19): a price naming its asset with an
+/// amount, a quantity more than zero, characteristics each in the list and at
+/// most sixteen, and an aggressor and eligibilities the enums hold.
+fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), String> {
+    match trade.price.as_ref() {
+        None => {
+            return Err(format!(
+                "{at}.price is required: a trade with no price is refused"
+            ))
+        }
+        Some(price) if price.amount.is_none() => {
+            return Err(format!("{at}.price.amount is required"))
+        }
+        Some(_) => {}
+    }
+    match trade.quantity.as_ref() {
+        None => return Err(format!("{at}.quantity is required, more than zero")),
+        Some(quantity) => {
+            let exact = meridian_domain::exact::Exact::from_wire(quantity)
+                .map_err(|out| format!("{at}.quantity {out}"))?;
+            if exact <= meridian_domain::exact::Exact::ZERO {
+                return Err(format!("{at}.quantity is more than zero"));
+            }
+        }
+    }
+    if let Some(attributes) = trade.attributes.as_ref() {
+        if !bounds::TRADE_ATTRIBUTES_CHARACTERISTICS_COUNT.admits(attributes.characteristics.len())
+        {
+            return Err(format!(
+                "{at}.attributes.characteristics names {}; at most 16",
+                attributes.characteristics.len()
+            ));
+        }
+        for (j, value) in attributes.characteristics.iter().enumerate() {
+            let known =
+                TradeCharacteristic::try_from(*value).unwrap_or(TradeCharacteristic::Unspecified);
+            if known == TradeCharacteristic::Unspecified {
+                return Err(format!(
+                    "{at}.attributes.characteristics[{j}] is unspecified: a code that did not \
+                     convert travels as reported in unconverted"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A quote held to W10.4 (contract v19): each side's amount stated, each
+/// quantity more than zero, characteristics each in the list and at most
+/// four. Its two sides in one asset is checked beside its amounts.
+fn quote_refused(at: &str, quote: &meridian_domain::v1::Quote) -> Result<(), String> {
+    for (name, side) in [("bid", &quote.bid), ("ask", &quote.ask)] {
+        if side.as_ref().is_some_and(|money| money.amount.is_none()) {
+            return Err(format!("{at}.{name}.amount is required"));
+        }
+    }
+    for (name, quantity) in [
+        ("bid_quantity", &quote.bid_quantity),
+        ("ask_quantity", &quote.ask_quantity),
+    ] {
+        if let Some(quantity) = quantity {
+            let exact = meridian_domain::exact::Exact::from_wire(quantity)
+                .map_err(|out| format!("{at}.{name} {out}"))?;
+            if exact <= meridian_domain::exact::Exact::ZERO {
+                return Err(format!("{at}.{name} is more than zero"));
+            }
+        }
+    }
+    if !bounds::QUOTE_CHARACTERISTICS_COUNT.admits(quote.characteristics.len()) {
+        return Err(format!(
+            "{at}.characteristics names {}; at most 4",
+            quote.characteristics.len()
+        ));
+    }
+    for (j, value) in quote.characteristics.iter().enumerate() {
+        let known =
+            QuoteCharacteristic::try_from(*value).unwrap_or(QuoteCharacteristic::Unspecified);
+        if known == QuoteCharacteristic::Unspecified {
+            return Err(format!("{at}.characteristics[{j}] is unspecified"));
+        }
+    }
+    Ok(())
+}
+
+/// A read's request: prices', bars', and from contract v19 trades' or
+/// quotes'.
 pub struct ReadRequest {
     pub data_type: DataType,
     pub subjects: Vec<SubjectRef>,
@@ -1175,8 +1474,12 @@ pub struct ReadRequest {
     pub as_of_ns: i64,
     pub page_size: u32,
     pub cursor: String,
+    /// A trades read's catch-up (contract v19): the watermark the reader
+    /// last saw.
+    pub after: Option<Watermark>,
 }
 
+#[derive(Debug)]
 pub struct ReadAnswer {
     pub rows: Vec<Observation>,
     pub unanswered: Vec<Unanswered>,
@@ -1273,6 +1576,126 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     serve_on(
         &bus,
         &lake,
+        RECORD_TRADES,
+        (
+            "meridian.v1.RecordTradesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordTradesRequest, envelope| {
+            lake.record(
+                "trades",
+                request.trades.into_iter().map(Observation::Trade).collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_QUOTES,
+        (
+            "meridian.v1.RecordQuotesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordQuotesRequest, envelope| {
+            lake.record(
+                "quotes",
+                request.quotes.into_iter().map(Observation::Quote).collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_TRADES,
+        (
+            "meridian.v1.ListTradesRequest",
+            "meridian.v1.ListTradesReply",
+        ),
+        |lake, request: ListTradesRequest, envelope| {
+            let answer = lake.read(
+                ReadRequest {
+                    data_type: DataType::Trade,
+                    subjects: request.subjects,
+                    kinds: Vec::new(),
+                    interval_ns: 0,
+                    sources: request.sources,
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: request.valid_from_ns,
+                    valid_until_ns: request.valid_until_ns,
+                    as_of_ns: request.as_of_ns,
+                    page_size: request.page_size,
+                    cursor: request.cursor,
+                    after: request.after_watermark,
+                },
+                envelope,
+            )?;
+            Ok(ListTradesReply {
+                trades: answer
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        Observation::Trade(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect(),
+                unanswered: answer.unanswered,
+                datasets: answer.datasets,
+                watermark: Some(answer.watermark),
+                next_cursor: answer.next_cursor,
+            })
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_QUOTES,
+        (
+            "meridian.v1.ListQuotesRequest",
+            "meridian.v1.ListQuotesReply",
+        ),
+        |lake, request: ListQuotesRequest, envelope| {
+            let answer = lake.read(
+                ReadRequest {
+                    data_type: DataType::Quote,
+                    subjects: request.subjects,
+                    kinds: Vec::new(),
+                    interval_ns: 0,
+                    sources: request.sources,
+                    at_ns: request.at_ns,
+                    business_date: String::new(),
+                    valid_from_ns: request.valid_from_ns,
+                    valid_until_ns: request.valid_until_ns,
+                    as_of_ns: request.as_of_ns,
+                    page_size: request.page_size,
+                    cursor: request.cursor,
+                    after: None,
+                },
+                envelope,
+            )?;
+            Ok(ListQuotesReply {
+                quotes: answer
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        Observation::Quote(q) => Some(q),
+                        _ => None,
+                    })
+                    .collect(),
+                unanswered: answer.unanswered,
+                datasets: answer.datasets,
+                watermark: Some(answer.watermark),
+                next_cursor: answer.next_cursor,
+            })
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
         LIST_PRICES,
         (
             "meridian.v1.ListPricesRequest",
@@ -1293,6 +1716,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     as_of_ns: request.as_of_ns,
                     page_size: request.page_size,
                     cursor: request.cursor,
+                    after: None,
                 },
                 envelope,
             )?;
@@ -1302,7 +1726,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .into_iter()
                     .filter_map(|r| match r {
                         Observation::Price(p) => Some(p),
-                        Observation::Bar(_) => None,
+                        _ => None,
                     })
                     .collect(),
                 unanswered: answer.unanswered,
@@ -1332,6 +1756,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     as_of_ns: request.as_of_ns,
                     page_size: request.page_size,
                     cursor: request.cursor,
+                    after: None,
                 },
                 envelope,
             )?;
@@ -1341,7 +1766,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .into_iter()
                     .filter_map(|r| match r {
                         Observation::Bar(b) => Some(b),
-                        Observation::Price(_) => None,
+                        _ => None,
                     })
                     .collect(),
                 unanswered: answer.unanswered,
@@ -1427,6 +1852,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             let _ = tokio::task::spawn_blocking(move || lake.sweep_wants()).await;
         }
     });
+    let counting = Arc::clone(&lake);
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(TRADES_LOGGED_EVERY);
+        every.tick().await;
+        loop {
+            every.tick().await;
+            counting.log_trades_recorded(TRADES_LOGGED_EVERY);
+        }
+    });
     let keeping = Arc::clone(&lake);
     tokio::spawn(async move {
         let mut every = tokio::time::interval(RETENTION_EVERY);
@@ -1488,6 +1922,22 @@ impl Lake {
         if let Err(failed) = self.store.count_miss(instance, now) {
             tracing::warn!(%failed, "a miss was not counted");
         }
+    }
+
+    /// Trades recorded over the window just ended, per second: what the
+    /// `lake_trades_recorded_per_second` band reads (contract v19, the plan's
+    /// Q40). Answers what it logged.
+    pub fn log_trades_recorded(&self, window: Duration) -> f64 {
+        let trades = self
+            .trades_recorded
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        let per_second = trades as f64 / window.as_secs_f64().max(1.0);
+        tracing::info!(
+            lake_trades_recorded_per_second = per_second,
+            trades,
+            "trades recorded this minute"
+        );
+        per_second
     }
 
     /// Rows kept per dataset: what the `lake_rows_per_dataset` band reads.

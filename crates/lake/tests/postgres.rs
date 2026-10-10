@@ -196,3 +196,79 @@ fn a_priority_carries_the_stale_guard_and_what_is_served_wants_and_misses_are_ke
     store.keep_configuration(&event).unwrap();
     assert!(store.configuration().unwrap().is_some());
 }
+
+/// A trade, as the 1b records it (contract v19): keyed by its valid time,
+/// with no business date.
+fn trade(dataset: &str, row_key: &str, subject: &str, valid_from_ns: i64) -> Observation {
+    Observation::Trade(meridian_domain::v1::Trade {
+        meta: Some(ObservationMeta {
+            row_key: row_key.into(),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+            }],
+            source: Some(Source {
+                instance: "coinbase-1".into(),
+                dataset: dataset.into(),
+                ..Default::default()
+            }),
+            valid_from_ns,
+            ..Default::default()
+        }),
+        price: Some(Money {
+            amount: Some(meridian_pb::v1::Decimal {
+                high: 0,
+                low: 62_000,
+                scale: 0,
+            }),
+            currency_code: "USD".into(),
+            instrument_id: "LCL-USD".into(),
+        }),
+        quantity: Some(meridian_pb::v1::Decimal {
+            high: 0,
+            low: 5,
+            scale: 1,
+        }),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    store
+        .record(
+            &dataset,
+            vec![
+                trade(&dataset, "t1", &subject, 500),
+                trade(&dataset, "t2", &subject, 600),
+            ],
+            1_000,
+        )
+        .unwrap();
+    // A late print, recorded after the reader's watermark of 2.
+    store
+        .record(
+            &dataset,
+            vec![trade(&dataset, "late", &subject, 100)],
+            2_000,
+        )
+        .unwrap();
+    let after = store
+        .read(&Query {
+            datasets: vec![dataset.clone()],
+            subjects: vec![subject.clone()],
+            data_type: DataType::Trade,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::After([(dataset.clone(), 2)].into()),
+            as_of_ns: 0,
+        })
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].meta().row_key, "late");
+    assert_eq!(after[0].meta().sequence, 3);
+    assert_eq!(store.lowest_kept(&dataset).unwrap(), Some(1));
+    assert_eq!(store.lowest_kept(&unique("none")).unwrap(), None);
+}

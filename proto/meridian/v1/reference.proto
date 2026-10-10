@@ -18,6 +18,8 @@ syntax = "proto3";
 package meridian.v1;
 
 import "meridian/v1/sidecar.proto";
+// Money: a binary event contract's payout (contract v19).
+import "meridian/v1/amounts.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The record
@@ -91,6 +93,28 @@ enum InstrumentType {
   // and aims to keep its value, with the attributes of MoneyMarketFund.
   // Held as a fund, never as cash, even where a custodian sweeps cash into it.
   INSTRUMENT_TYPE_MONEY_MARKET_FUND = 1;
+
+  // Under event_contract (contract v19): a contract paying a fixed amount if
+  // an event happens and nothing if it does not, with the attributes of
+  // BinaryEventContract. A venue's YES and NO tokens are two instruments,
+  // each one.
+  INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT = 2;
+}
+
+// A binary event contract's attributes (contract v19; plans/the-lake-prices-
+// the-book, Q38): what it pays and when trading in it closes. Which outcome
+// it pays on stays in its description, the venue's words, until the outcome
+// is an observation (vL1c); the outcome and its settlement are not the
+// record's.
+message BinaryEventContract {
+  // What one contract pays if the event happens, naming its cash instrument:
+  // 1 USD at Kalshi, 1 in the venue's USDC instrument at Polymarket. A
+  // contract's price divided by this is its implied probability, a reader's
+  // computation, never stored.
+  Money payout = 1;
+
+  // When trading in it closes, as the venue states it; 0 when it states none.
+  int64 closes_at_ns = 2;
 }
 
 // A money market fund's attributes, from SEC rule 2a-7 as amended in 2023
@@ -159,6 +183,16 @@ message Identifier {
   // The namespace a source-scoped identifier belongs to, e.g. "snaptrade".
   // Empty for a global scheme.
   string source = 3;
+
+  // When the identifier named the record it is on (contract v19;
+  // decisions/034): from, inclusive, and until, exclusive, 0 until it left.
+  // An identifier that leaves a record has its window closed at that date,
+  // never deleted, so a resolve as of a date before answers the record that
+  // held it. Filled by the instrument store on what it answers and by the
+  // platform on a pull; a plugin never sets either, and the sidecar sends
+  // both empty.
+  int64 valid_from_ns = 4;
+  int64 valid_until_ns = 5;
 }
 
 // The canonical instrument record.
@@ -181,7 +215,10 @@ message InstrumentRecord {
   // and nothing about whether it is resolved; or the "INS-" ID of a record
   // applied from the platform before contract v10, which it keeps. A global
   // ID the platform answers later joins `identifiers` (scheme
-  // `open_meridian`), never replacing this.
+  // `open_meridian`), never replacing this. Never reused (decisions/034): a
+  // retired, decommissioned or replaced record keeps its ID, and no other
+  // record is ever given it, so a position or an order storing it names one
+  // instrument for as long as it survives.
   string instrument_id = 1;
 
   // The full identifier set. An amend replaces this authoritatively.
@@ -239,6 +276,10 @@ message InstrumentRecord {
   // on no venue, or its venue is not yet known.
   string listing_venue_id = 16;
 
+  // A binary event contract's attributes (contract v19); set only on a
+  // record whose type is binary event contract.
+  BinaryEventContract binary_event_contract = 17;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
@@ -255,6 +296,8 @@ enum InstrumentField {
   // Contract v11.
   INSTRUMENT_FIELD_INSTRUMENT_TYPE = 5;
   INSTRUMENT_FIELD_MONEY_MARKET_FUND = 6;
+  // Contract v19.
+  INSTRUMENT_FIELD_BINARY_EVENT_CONTRACT = 7;
 }
 
 // One value for a deployment's record, set or offered, with where it came
@@ -272,6 +315,8 @@ message InstrumentValue {
     InstrumentType instrument_type = 6;
     // Contract v11: on a money market fund only, each attribute stated.
     MoneyMarketFund money_market_fund = 7;
+    // Contract v19: on a binary event contract only, its payout stated.
+    BinaryEventContract binary_event_contract = 8;
   }
 
   // Where the value came from, in words: a statement, a prospectus, "ISO
@@ -537,6 +582,15 @@ message DefineInstrumentRequest {
   // the master does not hold is refused, naming it.
   string listing_venue_id = 10;
 
+  // Its type within its asset class (contract v19): the binary event
+  // contract, under event_contract, is the one type the master's records
+  // take; unspecified for none. A type under another class is refused.
+  InstrumentType instrument_type = 11;
+
+  // A binary event contract's attributes (contract v19): required with that
+  // type, its payout stated; refused with any other.
+  BinaryEventContract binary_event_contract = 12;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 2;
@@ -568,6 +622,11 @@ message AmendInstrumentRequest {
   // The venue it is listed on, the venue master's ID (contract v18). A venue
   // the master does not hold is refused, naming it.
   string listing_venue_id = 11;
+
+  // Its type and a binary event contract's attributes, replaced as the rest
+  // is (contract v19), as on a define.
+  InstrumentType instrument_type = 12;
+  BinaryEventContract binary_event_contract = 13;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
@@ -832,7 +891,8 @@ message AssignClassReply {
 // W3 — resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Why a resolution did not produce exactly one instrument.
+// Why a resolution did not produce exactly one instrument; on a conflict
+// (contract v19), whether a resolve met it.
 enum MissReason {
   MISS_REASON_UNSPECIFIED = 0;
 
@@ -844,7 +904,12 @@ enum MissReason {
   MISS_REASON_AMBIGUOUS = 2;
 }
 
-// Reverse resolution: identifiers to an instrument, as of a date.
+// Reverse resolution: identifiers to an instrument, as of a date. Answered
+// from every date the instrument store holds, without the platform (contract
+// v19): an identifier that left a record answers the record that held it on
+// the date asked. Asked by `reporting` (contract v19), it is read-only:
+// nothing is minted, joined, offered or listed, and nothing matched is a
+// miss, not found.
 message ResolveIdentifierRequest {
   // At least one. Matched strongest-first: a global scheme before a
   // source-scoped symbol.
@@ -886,6 +951,9 @@ message ResolveIdentifierReply {
 // Forward resolution: an instrument identifier to its record.
 message ResolveInstrumentRequest {
   string instrument_id = 1;
+
+  // Selects the version whose values were in force on the date, never which
+  // record: an instrument ID is never reused (decisions/034). 0 for now.
   int64 as_of_ns = 2;
 }
 
@@ -1123,6 +1191,12 @@ message InstrumentConflict {
 
   int64 first_seen_ns = 4;
   int64 last_seen_ns = 5;
+
+  // Where it came from (contract v19): ambiguous where a resolve met several
+  // records, flagged for a person's curation and never escalated (W3.4);
+  // unspecified where a join or a completion met another record's
+  // identifier. Nothing of it is told to the platform.
+  MissReason reason = 6;
 }
 
 // How many identifiers of a licensed scheme the deployment's records carry

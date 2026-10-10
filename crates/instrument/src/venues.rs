@@ -85,11 +85,13 @@ mod tests {
                     scheme: ISO10383.into(),
                     value: mic.into(),
                     source: String::new(),
+                    ..Default::default()
                 },
                 Identifier {
                     scheme: "symbol".into(),
                     value: "NYSE".into(),
                     source: "alpaca".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -102,6 +104,7 @@ mod tests {
                 scheme: scheme.into(),
                 value: value.into(),
                 source: source.into(),
+                ..Default::default()
             }],
             as_of_ns,
         }

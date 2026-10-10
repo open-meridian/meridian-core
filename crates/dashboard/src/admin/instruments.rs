@@ -406,6 +406,7 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 scheme: filled.identifier_scheme.trim().to_ascii_lowercase(),
                 value: filled.identifier_value.trim().to_string(),
                 source: filled.identifier_namespace.trim().to_string(),
+                ..Default::default()
             })),
             source: filled.identifier_source.trim().to_string(),
         });
@@ -466,6 +467,9 @@ fn field_of(value: &InstrumentValue) -> i32 {
         Some(instrument_value::Value::Identifier(_)) => InstrumentField::Identifier,
         Some(instrument_value::Value::InstrumentType(_)) => InstrumentField::InstrumentType,
         Some(instrument_value::Value::MoneyMarketFund(_)) => InstrumentField::MoneyMarketFund,
+        Some(instrument_value::Value::BinaryEventContract(_)) => {
+            InstrumentField::BinaryEventContract
+        }
         None => InstrumentField::Unspecified,
     }) as i32
 }
@@ -479,6 +483,9 @@ fn value_words(value: &InstrumentValue) -> String {
         Some(instrument_value::Value::InstrumentType(kind)) => type_words(*kind).to_string(),
         Some(instrument_value::Value::MoneyMarketFund(fund)) => {
             instrument_type::fund_words(&instrument_type::fund_to_text(fund))
+        }
+        Some(instrument_value::Value::BinaryEventContract(contract)) => {
+            instrument_type::contract_words(&instrument_type::contract_to_text(contract))
         }
         None => String::new(),
     }
@@ -1166,6 +1173,7 @@ mod tests {
                     scheme: "symbol".into(),
                     value: "SNAP1".into(),
                     source: "snaptrade".into(),
+                    ..Default::default()
                 }],
                 version: 2,
                 sources: vec![InstrumentValueSource {
@@ -1174,6 +1182,7 @@ mod tests {
                         scheme: "symbol".into(),
                         value: "SNAP1".into(),
                         source: "snaptrade".into(),
+                        ..Default::default()
                     }),
                     source: "reported by custody-snaptrade-1".into(),
                     instance_id: "custody-snaptrade-1".into(),

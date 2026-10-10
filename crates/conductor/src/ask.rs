@@ -320,6 +320,7 @@ mod tests {
             scheme: "iso4217".into(),
             value: "USD".into(),
             source: String::new(),
+            ..Default::default()
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
                     scheme: "cusip".into(),
                     value: "037833100".into(),
                     source: String::new(),
+                    ..Default::default()
                 }]),
                 "",
                 "",

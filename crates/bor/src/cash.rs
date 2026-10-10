@@ -50,6 +50,7 @@ async fn resolve(bus: &Bus, code: &str, as_of_ns: i64) -> Option<String> {
                     scheme: money::ISO4217.into(),
                     value: code.to_string(),
                     source: String::new(),
+                    ..Default::default()
                 }],
                 as_of_ns,
                 ..Default::default()

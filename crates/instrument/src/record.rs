@@ -27,14 +27,12 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
     offers.extend(derived_offers(instrument).iter().map(offer_to_wire));
     PbInstrument {
         instrument_id: instrument.instrument_id.clone(),
+        // Each with its window (contract v19, the plan's Q34): one that left
+        // the record is answered closed, never left out.
         identifiers: instrument
             .identifiers
             .iter()
-            .map(|identifier| PbIdentifier {
-                scheme: identifier.scheme.clone(),
-                value: identifier.value.clone(),
-                source: identifier.source.clone(),
-            })
+            .map(identifier_to_wire)
             .collect(),
         asset_class: asset_class_value(&instrument.asset_class),
         currency: instrument.currency.clone(),
@@ -48,8 +46,24 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         offers,
         instrument_type: type_value(&instrument.instrument_type),
         money_market_fund: instrument_type::fund_from_text(&instrument.money_market_fund),
+        // Contract v19.
+        binary_event_contract: instrument_type::contract_from_text(
+            &instrument.binary_event_contract,
+        ),
         // The venue master's ID (contract v18).
         listing_venue_id: instrument.listing_venue_id.clone(),
+    }
+}
+
+/// An identifier on a record with its window: from, inclusive, and until,
+/// exclusive, 0 while it is on the record (contract v19).
+pub fn identifier_to_wire(identifier: &Identifier) -> PbIdentifier {
+    PbIdentifier {
+        scheme: identifier.scheme.clone(),
+        value: identifier.value.clone(),
+        source: identifier.source.clone(),
+        valid_from_ns: identifier.valid_from_ns,
+        valid_until_ns: identifier.valid_to_ns.unwrap_or(0),
     }
 }
 
@@ -68,6 +82,7 @@ pub fn value_words(field: Field, value: &str) -> String {
             .unwrap_or(value)
             .to_string(),
         Field::MoneyMarketFund => instrument_type::fund_words(value),
+        Field::BinaryEventContract => instrument_type::contract_words(value),
         _ => value.to_string(),
     }
 }
@@ -102,13 +117,18 @@ fn offer_to_wire(offer: &Offer) -> OfferedValue {
                 Field::MoneyMarketFund => instrument_value::Value::MoneyMarketFund(
                     instrument_type::fund_from_text(&offer.value).unwrap_or_default(),
                 ),
-                Field::Identifier => instrument_value::Value::Identifier(
-                    offer
+                Field::BinaryEventContract => instrument_value::Value::BinaryEventContract(
+                    instrument_type::contract_from_text(&offer.value).unwrap_or_default(),
+                ),
+                // An offer to end one carries its end (contract v19, W3.5).
+                Field::Identifier => instrument_value::Value::Identifier(PbIdentifier {
+                    valid_until_ns: offer.valid_until_ns,
+                    ..offer
                         .identifier
                         .as_ref()
                         .map(asked_to_wire)
-                        .unwrap_or_default(),
-                ),
+                        .unwrap_or_default()
+                }),
             }),
             source: offer.source.clone(),
         }),
@@ -122,6 +142,7 @@ pub fn asked_to_wire(asked: &Asked) -> PbIdentifier {
         scheme: asked.scheme.clone(),
         value: asked.value.clone(),
         source: asked.source.clone(),
+        ..Default::default()
     }
 }
 
@@ -153,6 +174,7 @@ pub fn field_to_wire(field: Field) -> InstrumentField {
         Field::Identifier => InstrumentField::Identifier,
         Field::InstrumentType => InstrumentField::InstrumentType,
         Field::MoneyMarketFund => InstrumentField::MoneyMarketFund,
+        Field::BinaryEventContract => InstrumentField::BinaryEventContract,
     }
 }
 
@@ -164,14 +186,16 @@ pub fn field_from_wire(value: i32) -> Option<Field> {
         InstrumentField::Identifier => Some(Field::Identifier),
         InstrumentField::InstrumentType => Some(Field::InstrumentType),
         InstrumentField::MoneyMarketFund => Some(Field::MoneyMarketFund),
+        InstrumentField::BinaryEventContract => Some(Field::BinaryEventContract),
         InstrumentField::Unspecified => None,
     }
 }
 
 /// What a record lacks: an asset class or a currency, which the book requires
-/// (W9.1), a description (W3.11), and for a money market fund its attributes
-/// (contract v11), which the book's one lot at stable value waits on.
-/// Computed from the fields; nobody sets it.
+/// (W9.1), a description (W3.11), for a money market fund its attributes
+/// (contract v11), which the book's one lot at stable value waits on, and for
+/// a binary event contract its payout and close (contract v19). Computed
+/// from the fields; nobody sets it.
 pub fn lacks(instrument: &Instrument) -> Vec<Field> {
     let mut lacking: Vec<Field> = [Field::AssetClass, Field::Currency, Field::Description]
         .into_iter()
@@ -181,6 +205,12 @@ pub fn lacks(instrument: &Instrument) -> Vec<Field> {
         && instrument_type::fund_from_text(&instrument.money_market_fund).is_none()
     {
         lacking.push(Field::MoneyMarketFund);
+    }
+    if instrument_type::read(&instrument.instrument_type)
+        == Some(InstrumentType::BinaryEventContract)
+        && instrument_type::contract_from_text(&instrument.binary_event_contract).is_none()
+    {
+        lacking.push(Field::BinaryEventContract);
     }
     lacking
 }
@@ -202,8 +232,7 @@ pub fn complete(instrument: &Instrument) -> bool {
 /// 2026-10-02: a record identified by `iso4217` with no class counts as cash).
 pub fn derived_offers(instrument: &Instrument) -> Vec<Offer> {
     let Some(code) = instrument
-        .identifiers
-        .iter()
+        .held_now()
         .find(|identifier| identifier.scheme == CURRENCY_SCHEME && is_currency(&identifier.value))
         .map(|identifier| identifier.value.clone())
     else {
@@ -228,6 +257,7 @@ fn derived(field: Field, value: String, instrument: &Instrument) -> Offer {
         source: ISO_4217.into(),
         instance_id: String::new(),
         offered_at_ns: instrument.record_time_ns,
+        valid_until_ns: 0,
     }
 }
 
@@ -284,6 +314,7 @@ mod tests {
             record_time_ns: 5,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            binary_event_contract: String::new(),
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),

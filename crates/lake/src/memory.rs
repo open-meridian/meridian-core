@@ -208,6 +208,16 @@ impl Store for MemoryStore {
         Ok(counts)
     }
 
+    fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
+        Ok(self
+            .lock()
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset)
+            .map(|row| row.meta().sequence)
+            .min())
+    }
+
     fn set_priority(
         &self,
         priority: &SourcePriority,

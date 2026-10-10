@@ -240,6 +240,7 @@ fn read(
                 as_of_ns,
                 page_size: 0,
                 cursor: String::new(),
+                after: None,
             },
             &envelope(reader, reader != "dashboard-1", ""),
         )
@@ -442,6 +443,7 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 as_of_ns: 0,
                 page_size: 0,
                 cursor: String::new(),
+                after: None,
             },
             &envelope("reporting-1", true, ""),
         )
@@ -900,6 +902,7 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         as_of_ns: 0,
         page_size: 0,
         cursor: String::new(),
+        after: None,
     };
     let invalid = tokio::task::block_in_place(|| {
         h.lake
@@ -944,4 +947,368 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
             .unwrap();
     assert!(mine.datasets.is_empty() && mine.entitlements.is_empty());
     let _ = h.clock.now_ns();
+}
+
+// ── Contract v19: the lake's 1b ────────────────────────────────────────────
+
+const VENUE: &str = "VEN-01JA0000000000000CBEXC";
+
+/// The 1a's configuration, with coinbase-1:live beside it: trades and quotes,
+/// streamed, its day UTC; signal-1 entitled to it, every field.
+fn live_configuration() -> EntitlementsChangedEvent {
+    let mut c = configuration(true, &[]);
+    c.datasets.push(DatasetRef {
+        dataset: "coinbase-1:live".into(),
+        instance: "coinbase-1".into(),
+        vendor: "Coinbase".into(),
+        declaration: Some(DatasetDeclaration {
+            key: "live".into(),
+            vendor: "Coinbase".into(),
+            data_types: vec!["meridian.v1.Trade".into(), "meridian.v1.Quote".into()],
+            modes: vec![ObservationMode::Stream as i32],
+            day_time_zone: "Etc/UTC".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    c.entitlements.push(DatasetEntitlement {
+        dataset: "coinbase-1:live".into(),
+        instance: "signal-1".into(),
+        allowed: true,
+        ..Default::default()
+    });
+    c
+}
+
+fn live_meta(row_key: &str, valid_from_ns: i64) -> Option<ObservationMeta> {
+    Some(ObservationMeta {
+        row_key: row_key.into(),
+        subjects: vec![SubjectRef {
+            entity_id: BTC.into(),
+        }],
+        source: Some(Source {
+            instance: "coinbase-1".into(),
+            dataset: "coinbase-1:live".into(),
+            venue_id: VENUE.into(),
+            ..Default::default()
+        }),
+        valid_from_ns,
+        ..Default::default()
+    })
+}
+
+fn trade(row_key: &str, valid_from_ns: i64, price: &str) -> meridian_domain::v1::Trade {
+    meridian_domain::v1::Trade {
+        meta: live_meta(row_key, valid_from_ns),
+        price: money(price, "USD", ""),
+        quantity: decimal("0.5"),
+        attributes: Some(meridian_domain::v1::TradeAttributes::default()),
+        aggressor: meridian_domain::v1::Aggressor::Buy as i32,
+        source_sequence: 7,
+        cancelled: false,
+    }
+}
+
+fn quote(
+    row_key: &str,
+    valid_from_ns: i64,
+    bid: Option<Money>,
+    ask: Option<Money>,
+) -> meridian_domain::v1::Quote {
+    meridian_domain::v1::Quote {
+        meta: live_meta(row_key, valid_from_ns),
+        bid,
+        ask,
+        bid_quantity: decimal("1"),
+        ask_quantity: decimal("2"),
+        characteristics: vec![],
+    }
+}
+
+fn record_rows(
+    h: &Harness,
+    field: &str,
+    rows: Vec<Observation>,
+) -> Result<meridian_domain::v1::RecordObservationsReply, String> {
+    tokio::task::block_in_place(|| {
+        h.lake
+            .record(field, rows, "", &envelope("coinbase-1", true, ""))
+    })
+}
+
+fn live_read(
+    h: &Harness,
+    data_type: DataType,
+    range: (i64, i64),
+    at_ns: i64,
+    after: Option<meridian_domain::v1::Watermark>,
+) -> Result<service::ReadAnswer, String> {
+    tokio::task::block_in_place(|| {
+        h.lake.read(
+            ReadRequest {
+                data_type,
+                subjects: vec![SubjectRef {
+                    entity_id: BTC.into(),
+                }],
+                kinds: vec![],
+                interval_ns: 0,
+                sources: None,
+                at_ns,
+                business_date: String::new(),
+                valid_from_ns: range.0,
+                valid_until_ns: range.1,
+                as_of_ns: 0,
+                page_size: 0,
+                cursor: String::new(),
+                after,
+            },
+            &envelope("signal-1", true, ""),
+        )
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trades_are_heard_every_one_and_a_loss_is_caught_up_by_watermark_late_print_included() {
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let mut heard = h
+        .bus
+        .subscribe("platform.lake.coinbase-1:live.event.trades-recorded");
+    let first = record_rows(
+        &h,
+        "trades",
+        vec![
+            Observation::Trade(trade("t1", NOW + 1_000, "62000")),
+            Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(first.recorded, 2);
+    let seen = first.watermark.unwrap();
+    for wanted in ["t1", "t2"] {
+        let event = meridian_domain::v1::TradesRecordedEvent::decode(
+            &heard.recv().await.unwrap().envelope.payload[..],
+        )
+        .unwrap();
+        let trade = event.trade.unwrap();
+        assert_eq!(
+            trade.meta.as_ref().unwrap().row_key,
+            wanted,
+            "every one, in order"
+        );
+        assert_eq!(trade.price.as_ref().unwrap().instrument_id, USD);
+    }
+
+    // A late print, its valid time before the reader's range had passed,
+    // recorded after the watermark the reader last saw; and a withdrawal.
+    h.clock.advance(5_000);
+    let mut withdrawn = trade("t1", NOW + 1_000, "62000");
+    withdrawn.cancelled = true;
+    record_rows(
+        &h,
+        "trades",
+        vec![
+            Observation::Trade(trade("late", NOW - DAY / 2, "61990")),
+            Observation::Trade(withdrawn),
+        ],
+    )
+    .unwrap();
+    let caught = live_read(&h, DataType::Trade, (0, 0), 0, Some(seen.clone())).unwrap();
+    let keys: Vec<(String, u64, bool)> = caught
+        .rows
+        .iter()
+        .map(|row| match row {
+            Observation::Trade(t) => (
+                t.meta.as_ref().unwrap().row_key.clone(),
+                t.meta.as_ref().unwrap().version,
+                t.cancelled,
+            ),
+            _ => panic!("a trade"),
+        })
+        .collect();
+    assert!(keys.contains(&("late".to_string(), 1, false)), "{keys:?}");
+    assert!(
+        keys.contains(&("t1".to_string(), 2, true)),
+        "the withdrawal, a new version"
+    );
+    assert!(
+        !keys.iter().any(|(k, _, _)| k == "t2"),
+        "nothing seen before"
+    );
+    assert!(caught.unanswered.is_empty(), "{:?}", caught.unanswered);
+
+    // A range read of the day answers by valid time; past a day, refused.
+    let day = live_read(&h, DataType::Trade, (NOW, NOW + DAY), 0, None).unwrap();
+    assert_eq!(day.rows.len(), 2, "t1 at its latest version, and t2");
+    let wide = live_read(&h, DataType::Trade, (NOW - DAY / 2, NOW + DAY / 2), 0, None);
+    assert!(wide.unwrap_err().contains("more than one day"));
+    let both = live_read(&h, DataType::Trade, (NOW, NOW + DAY), 0, Some(seen));
+    assert!(both.unwrap_err().contains("exactly one"));
+
+    let n = h
+        .lake
+        .log_trades_recorded(std::time::Duration::from_secs(60));
+    assert!(n > 0.0, "the band reads the trades recorded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trade_or_quote_is_refused_naming_its_field() {
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let refused = |row: Observation, field: &str| record_rows(&h, field, vec![row]).unwrap_err();
+    let mut nothing = trade("t", NOW, "1");
+    nothing.quantity = decimal("0");
+    assert!(refused(Observation::Trade(nothing), "trades").contains("trades[0].quantity"));
+    let mut dated = trade("t", NOW, "1");
+    dated.meta.as_mut().unwrap().business_date = "2026-10-08".into();
+    assert!(refused(Observation::Trade(dated), "trades").contains("business_date"));
+    let mut unconverted = trade("t", NOW, "1");
+    unconverted.attributes = Some(meridian_domain::v1::TradeAttributes {
+        characteristics: vec![0],
+        ..Default::default()
+    });
+    assert!(refused(Observation::Trade(unconverted), "trades")
+        .contains("trades[0].attributes.characteristics[0]"));
+    let mut priceless = trade("t", NOW, "1");
+    priceless.price = None;
+    assert!(refused(Observation::Trade(priceless), "trades").contains("trades[0].price"));
+    let two = quote("q", NOW, money("1", "USD", ""), money("1.01", "", USDC));
+    assert!(refused(Observation::Quote(two), "quotes").contains("one asset"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    // BTC's last in USD and in USDC on one venue: both answer (approved
+    // 2026-10-10), never one for both.
+    let on_venue = |key: &str, at: i64, money: Option<Money>| Price {
+        meta: Some(ObservationMeta {
+            row_key: key.into(),
+            subjects: vec![SubjectRef {
+                entity_id: BTC.into(),
+            }],
+            source: Some(Source {
+                instance: "coinbase-1".into(),
+                dataset: "coinbase-1:daily".into(),
+                venue_id: VENUE.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: at,
+            ..Default::default()
+        }),
+        kind: PriceKind::Last as i32,
+        price: money,
+        basis: PriceBasis::PerUnit as i32,
+    };
+    record(
+        &h,
+        "coinbase-1",
+        vec![
+            on_venue("usd-1", NOW - 10, money("62000", "USD", "")),
+            on_venue("usd-2", NOW - 5, money("62010", "USD", "")),
+            on_venue("usdc-1", NOW - 7, money("61990", "", USDC)),
+        ],
+        "",
+    )
+    .unwrap();
+    let latest = read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0);
+    let mut keys: Vec<String> = latest
+        .rows
+        .iter()
+        .map(|row| row.meta().row_key.clone())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["usd-2", "usdc-1"]);
+
+    // Quotes likewise, per subject, dataset, venue and the quote's asset.
+    record_rows(
+        &h,
+        "quotes",
+        vec![
+            Observation::Quote(quote(
+                "q-usd-1",
+                NOW - 3,
+                money("1", "USD", ""),
+                money("2", "USD", ""),
+            )),
+            Observation::Quote(quote("q-usd-2", NOW - 2, money("1.5", "USD", ""), None)),
+            Observation::Quote(quote(
+                "q-usdc",
+                NOW - 4,
+                money("1", "", USDC),
+                money("2", "", USDC),
+            )),
+        ],
+    )
+    .unwrap();
+    let quotes = live_read(&h, DataType::Quote, (0, 0), 0, None).unwrap();
+    let mut keys: Vec<String> = quotes
+        .rows
+        .iter()
+        .map(|row| row.meta().row_key.clone())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["q-usd-2", "q-usdc"], "a one-sided quote stands");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decline_stands_for_the_date_asked_only_and_a_streamed_latest_is_standing() {
+    let h = harness();
+    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    read(
+        &h,
+        "reporting-1",
+        &[AAPL],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    tokio::task::block_in_place(|| {
+        h.lake.decline(
+            DeclineWantRequest {
+                want_id: want.want_id,
+                subjects: vec![SubjectRef {
+                    entity_id: AAPL.into(),
+                }],
+                reason: UnansweredReason::NotCovered as i32,
+            },
+            &envelope("coinbase-1", true, ""),
+        )
+    })
+    .unwrap();
+    let named = SourceChoice {
+        named: vec!["coinbase-1:daily".into()],
+        ..Default::default()
+    };
+    let declined = read(&h, "reporting-1", &[AAPL], "2026-10-07", named.clone(), 0);
+    assert_eq!(
+        declined.unanswered[0].reason,
+        UnansweredReason::NotCovered as i32
+    );
+    // Another date of the same dataset and subject is asked again.
+    let other = read(&h, "reporting-1", &[AAPL], "2026-10-06", named, 0);
+    assert_eq!(
+        other.unanswered[0].reason,
+        UnansweredReason::AskedSource as i32
+    );
+    let again = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert_eq!(again.business_date, "2026-10-06");
+
+    // The latest of a streamed dataset, with no cadence: a standing want,
+    // kept current from the vendor's stream (W10.7).
+    h.lake.configured(&live_configuration());
+    let none = live_read(&h, DataType::Quote, (0, 0), 0, None).unwrap();
+    assert_eq!(
+        none.unanswered[0].reason,
+        UnansweredReason::AskedSource as i32
+    );
+    let streamed =
+        ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+            .unwrap();
+    assert_eq!(streamed.data_type, "meridian.v1.Quote");
+    assert!(streamed.standing);
 }

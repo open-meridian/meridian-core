@@ -94,11 +94,13 @@ fn unknown_identifiers() -> Vec<PbIdentifier> {
             scheme: "symbol".into(),
             value: format!("ZZ{stamp}"),
             source: "snaptrade".into(),
+            ..Default::default()
         },
         PbIdentifier {
             scheme: "figi".into(),
             value: format!("BBG{stamp}"),
             source: String::new(),
+            ..Default::default()
         },
     ]
 }

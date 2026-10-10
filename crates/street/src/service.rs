@@ -818,6 +818,7 @@ mod tests {
             scheme: "symbol".into(),
             value: "ZZTOP".into(),
             source: "snaptrade".into(),
+            ..Default::default()
         }];
 
         assert!(!record(&bus, unresolved).await.resolved);

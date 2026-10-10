@@ -94,6 +94,7 @@ mod tests {
             scheme: scheme.into(),
             value: "x".into(),
             source: source.into(),
+            ..Default::default()
         }
     }
 
