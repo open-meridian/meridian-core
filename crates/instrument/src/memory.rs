@@ -94,6 +94,23 @@ impl Store for MemoryStore {
             .get(instrument_id)
             .map(|(replaced_by, _)| replaced_by.clone()))
     }
+
+    fn keep_venue(&self, venue: &meridian_domain::v1::VenueRecord, _now_ns: i64) -> Result<bool> {
+        let mut held = self.write_lock()?;
+        if held
+            .venues
+            .get(&venue.venue_id)
+            .is_some_and(|kept| kept.version >= venue.version)
+        {
+            return Ok(false);
+        }
+        held.venues.insert(venue.venue_id.clone(), venue.clone());
+        Ok(true)
+    }
+
+    fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>> {
+        Ok(self.read()?.venues.values().cloned().collect())
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +138,7 @@ mod tests {
             record_time_ns: 0,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }

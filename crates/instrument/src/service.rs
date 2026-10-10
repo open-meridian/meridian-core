@@ -69,6 +69,9 @@ pub const MERGE_INSTRUMENTS: &str = "platform.reference.command.merge-instrument
 pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
     "platform.reference.query.list-instruments-to-complete";
 
+/// W3.14 (contract v18). Which venue a set of identifiers names.
+pub const RESOLVE_VENUE: &str = "platform.reference.query.resolve-venue";
+
 /// W3.12. A record's history.
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
 
@@ -113,6 +116,22 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
                 resolution.reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (store, clock) = (store.clone(), clock.clone());
+        bus.serve(RESOLVE_VENUE, move |envelope| {
+            let request: meridian_domain::v1::ResolveVenueRequest =
+                decode(&envelope, "meridian.v1.ResolveVenueRequest")?;
+            if request.identifiers.is_empty() {
+                return Err("identifiers: at least one names the venue".into());
+            }
+            let reply = crate::venues::resolve_venue(store.as_ref(), &request, clock.now_ns())
+                .map_err(|failed| failed.to_string())?;
+            Ok((
+                "meridian.v1.ResolveVenueReply".to_string(),
+                reply.encode_to_vec(),
             ))
         });
     }
@@ -375,8 +394,34 @@ impl Reactor {
                         return Handled::Ignored(format!("undecodable answer: {failed}"))
                     }
                 };
+                // The venues the answer carries, kept whatever else it
+                // carries (W3.5, contract v18): a venue asked about by its
+                // codes arrives with no instrument (W3.15).
+                if !reply.venues.is_empty() {
+                    let (store, venues) = (self.store.clone(), reply.venues.clone());
+                    let kept = tokio::task::spawn_blocking(move || {
+                        venues
+                            .iter()
+                            .map(|venue| store.keep_venue(venue, now_ns))
+                            .collect::<crate::Result<Vec<bool>>>()
+                    })
+                    .await;
+                    match kept {
+                        Ok(Ok(kept)) => tracing::info!(
+                            kept = kept.iter().filter(|k| **k).count(),
+                            carried = kept.len(),
+                            "venues the platform answered with"
+                        ),
+                        Ok(Err(failed)) => tracing::warn!(%failed, "venues were not kept"),
+                        Err(failed) => tracing::warn!(%failed, "venues were not kept"),
+                    }
+                }
                 let Some(record) = reply.instrument.filter(|_| reply.found) else {
-                    return Handled::Ignored("an answer carrying no record".into());
+                    return if reply.venues.is_empty() {
+                        Handled::Ignored("an answer carrying no record".into())
+                    } else {
+                        Handled::Kept(true)
+                    };
                 };
                 if reply.for_instrument_id.is_empty() {
                     // Before v10 a pulled record was applied as a record of
@@ -712,5 +757,108 @@ mod tests {
         let held = store.by_id(&minted.instrument_id).unwrap().unwrap();
         assert!(held.identifiers.iter().any(|i| i.value == "INS-SNAP"));
         assert!(held.asset_class.is_empty());
+    }
+
+    /// Contract v18: a venue the platform answered by its codes arrives with
+    /// no instrument and is kept; a plugin then resolves it (W3.14); an
+    /// instrument's answer names its listing venue, which the record keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pulled_venue_is_kept_and_resolved_and_a_record_keeps_its_listing_venue() {
+        use meridian_domain::v1::{ResolveVenueReply, ResolveVenueRequest, VenueRecord};
+        let bus = bus();
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        serve_queries(&bus, store.clone(), bus.clock());
+        let reactor = Reactor::new(bus.clone(), store.clone(), bus.clock());
+        let delivery = |reply: PullInstrumentReply| Delivery {
+            envelope: Envelope {
+                meta: None,
+                payload_type: "meridian.v1.PullInstrumentReply".into(),
+                payload: reply.encode_to_vec(),
+            },
+            sequence: 1,
+        };
+        let mic = PbIdentifier {
+            scheme: "iso10383".into(),
+            value: "XNYS".into(),
+            source: String::new(),
+        };
+        let venue = VenueRecord {
+            venue_id: "VEN-XNYS".into(),
+            name: "New York Stock Exchange".into(),
+            identifiers: vec![mic.clone()],
+            version: 1,
+            ..Default::default()
+        };
+        let asked = ResolveVenueRequest {
+            identifiers: vec![mic],
+            as_of_ns: NOW,
+        };
+        let missed: ResolveVenueReply = ask(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            asked.clone(),
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(!missed.found);
+        assert_eq!(
+            reactor
+                .react(delivery(PullInstrumentReply {
+                    found: false,
+                    instrument: None,
+                    for_instrument_id: String::new(),
+                    venues: vec![venue],
+                }))
+                .await,
+            Handled::Kept(true)
+        );
+        let found: ResolveVenueReply = ask(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            asked,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.venue.unwrap().venue_id, "VEN-XNYS");
+
+        let minted: ResolveIdentifierReply = ask(
+            &bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            snap(),
+            "",
+        )
+        .await
+        .unwrap();
+        reactor
+            .react(delivery(PullInstrumentReply {
+                found: true,
+                instrument: Some(PbInstrument {
+                    instrument_id: "INS-SNAP".into(),
+                    listing_venue_id: "VEN-XNYS".into(),
+                    version: 1,
+                    ..Default::default()
+                }),
+                for_instrument_id: minted.instrument_id.clone(),
+                venues: Vec::new(),
+            }))
+            .await;
+        let held: ResolveInstrumentReply = ask(
+            &bus,
+            RESOLVE_INSTRUMENT,
+            "meridian.v1.ResolveInstrumentRequest",
+            ResolveInstrumentRequest {
+                instrument_id: minted.instrument_id,
+                as_of_ns: NOW,
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.instrument.unwrap().listing_venue_id, "VEN-XNYS");
     }
 }

@@ -237,6 +237,7 @@ fn mint(
         record_time_ns: now_ns,
         instrument_type: String::new(),
         money_market_fund: String::new(),
+        listing_venue_id: String::new(),
         sources: asked
             .iter()
             .map(|identifier| Source {
@@ -613,6 +614,7 @@ mod tests {
             record_time_ns: 0,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }

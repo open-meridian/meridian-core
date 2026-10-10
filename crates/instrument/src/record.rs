@@ -48,9 +48,8 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         offers,
         instrument_type: type_value(&instrument.instrument_type),
         money_market_fund: instrument_type::fund_from_text(&instrument.money_market_fund),
-        // The venue master's ID (contract v18): kept once the store holds
-        // venues (row 4).
-        listing_venue_id: String::new(),
+        // The venue master's ID (contract v18).
+        listing_venue_id: instrument.listing_venue_id.clone(),
     }
 }
 
@@ -285,6 +284,7 @@ mod tests {
             record_time_ns: 5,
             instrument_type: String::new(),
             money_market_fund: String::new(),
+            listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
         }

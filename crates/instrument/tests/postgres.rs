@@ -86,6 +86,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
         description: String::new(),
         instrument_type: String::new(),
         money_market_fund: String::new(),
+        listing_venue_id: String::new(),
         lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
         version: 1,
         valid_from_ns: 0,
@@ -469,4 +470,44 @@ fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleare
     admin
         .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
         .unwrap();
+}
+
+#[test]
+fn a_venue_is_kept_at_its_newest_version_and_a_record_keeps_its_listing_venue() {
+    use meridian_domain::v1::VenueRecord;
+    let store = store();
+    let id = format!("VEN-{}", unique("xnys"));
+    let venue = |version: i64, name: &str| VenueRecord {
+        venue_id: id.clone(),
+        name: name.into(),
+        version,
+        ..Default::default()
+    };
+    assert!(store.keep_venue(&venue(2, "NYSE"), 1).unwrap());
+    assert!(!store.keep_venue(&venue(1, "Old"), 2).unwrap());
+    assert!(store
+        .keep_venue(&venue(3, "New York Stock Exchange"), 3)
+        .unwrap());
+    let held: Vec<_> = store
+        .venues()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.venue_id == id)
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].name, "New York Stock Exchange");
+
+    let mut listed = minted(&store, "listed");
+    let before = listed.version;
+    listed.listing_venue_id = id.clone();
+    listed.version += 1;
+    store
+        .write(
+            listed.clone(),
+            before,
+            entry(&listed.instrument_id, listed.version, "platform"),
+        )
+        .unwrap();
+    let back = store.by_id(&listed.instrument_id).unwrap().unwrap();
+    assert_eq!(back.listing_venue_id, id);
 }

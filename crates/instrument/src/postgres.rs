@@ -41,16 +41,17 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0003_records.sql"),
     include_str!("../migrations/0004_instrument_type.sql"),
     include_str!("../migrations/0005_delegation.sql"),
+    include_str!("../migrations/0006_the_venue_master.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_conflict";
+const NEWEST_TABLE: &str = "instrument_venue";
 
 /// And the column the newest file adds (0005, contract v12: the delegation
 /// on a version), with its table, which a table check cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument_version", "client_name");
+const NEWEST_COLUMN: (&str, &str) = ("instrument", "listing_venue_id");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -335,7 +336,7 @@ impl PostgresStore {
             .query(
                 "SELECT instrument_id, asset_class, currency, exchange_mic, description,
                         lifecycle_state, version, valid_from_ns, record_time_ns,
-                        instrument_type, money_market_fund
+                        instrument_type, money_market_fund, listing_venue_id
                    FROM instrument
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id",
@@ -358,6 +359,7 @@ impl PostgresStore {
                 record_time_ns: row.get(8),
                 instrument_type: row.get(9),
                 money_market_fund: row.get(10),
+                listing_venue_id: row.get(11),
                 sources: Vec::new(),
                 offers: Vec::new(),
             })
@@ -670,8 +672,8 @@ impl Store for PostgresStore {
                 "INSERT INTO instrument (instrument_id, asset_class, currency, exchange_mic,
                                          description, lifecycle_state, version, valid_from_ns,
                                          record_time_ns, mint_key, instrument_type,
-                                         money_market_fund)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                         money_market_fund, listing_venue_id)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (mint_key) WHERE mint_key IS NOT NULL DO NOTHING",
                 &[
                     &candidate.instrument_id,
@@ -686,6 +688,7 @@ impl Store for PostgresStore {
                     &set_key,
                     &candidate.instrument_type,
                     &candidate.money_market_fund,
+                    &candidate.listing_venue_id,
                 ],
             )
             .map_err(unavailable)?
@@ -717,7 +720,8 @@ impl Store for PostgresStore {
                 "UPDATE instrument
                     SET asset_class = $2, currency = $3, exchange_mic = $4, description = $5,
                         lifecycle_state = $6, version = $7, valid_from_ns = $8,
-                        record_time_ns = $9, instrument_type = $11, money_market_fund = $12
+                        record_time_ns = $9, instrument_type = $11, money_market_fund = $12,
+                        listing_venue_id = $13
                   WHERE instrument_id = $1 AND version = $10",
                 &[
                     &record.instrument_id,
@@ -732,6 +736,7 @@ impl Store for PostgresStore {
                     &expected,
                     &record.instrument_type,
                     &record.money_market_fund,
+                    &record.listing_venue_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -900,6 +905,44 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
 
         Ok(row.map(|row| row.get(0)))
+    }
+
+    fn keep_venue(&self, venue: &meridian_domain::v1::VenueRecord, now_ns: i64) -> Result<bool> {
+        use prost::Message;
+        let kept = self
+            .conn()?
+            .execute(
+                "INSERT INTO instrument_venue (venue_id, version, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (venue_id) DO UPDATE
+                    SET version = excluded.version, record = excluded.record,
+                        kept_at_ns = excluded.kept_at_ns
+                  WHERE instrument_venue.version < excluded.version",
+                &[
+                    &venue.venue_id,
+                    &venue.version,
+                    &venue.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(kept > 0)
+    }
+
+    fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>> {
+        use prost::Message;
+        let rows = self
+            .conn()?
+            .query("SELECT record FROM instrument_venue ORDER BY venue_id", &[])
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::VenueRecord::decode(&bytes[..]).map_err(|failed| {
+                    StoreError::Unavailable(format!("a kept venue did not read: {failed}"))
+                })
+            })
+            .collect()
     }
 }
 

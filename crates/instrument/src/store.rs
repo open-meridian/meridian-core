@@ -196,6 +196,10 @@ pub struct Instrument {
     /// person states them (contract v11).
     pub money_market_fund: String,
 
+    /// The venue it is listed on, the venue master's ID (contract v18), from
+    /// the platform's answer to a person's ask; empty where none is known.
+    pub listing_venue_id: String,
+
     /// Where each value in force came from.
     pub sources: Vec<Source>,
 
@@ -478,6 +482,13 @@ pub trait Store: Send + Sync {
 
     /// What `instrument_id` was replaced by, if it was.
     fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>>;
+
+    /// Keep a venue the platform's answer carried (W3.5, contract v18),
+    /// unless one at its version or later is kept: true when it was.
+    fn keep_venue(&self, venue: &meridian_domain::v1::VenueRecord, now_ns: i64) -> Result<bool>;
+
+    /// Every venue kept, ordered by ID.
+    fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>>;
 }
 
 /// A store's contents, for an implementation to reuse.
@@ -494,6 +505,9 @@ pub(crate) struct Held {
 
     /// Replaced ID to what replaced it, and when.
     pub(crate) replacements: HashMap<String, (String, i64)>,
+
+    /// The venues kept, by ID (contract v18).
+    pub(crate) venues: std::collections::BTreeMap<String, meridian_domain::v1::VenueRecord>,
 }
 
 impl Held {

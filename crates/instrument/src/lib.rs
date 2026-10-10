@@ -32,6 +32,7 @@ pub mod replace;
 pub mod resolve;
 pub mod service;
 pub mod store;
+pub mod venues;
 
 mod memory;
 

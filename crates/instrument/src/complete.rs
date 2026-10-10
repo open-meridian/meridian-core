@@ -816,6 +816,20 @@ pub fn keep_platform_answer(
         }
     }
     let offered = keep_offers(&mut record, offers);
+    // The venue it is listed on (contract v18, W3.5): the platform's ID for a
+    // venue the answer carried, kept where the record names none yet; never
+    // over one it names.
+    if record.listing_venue_id.is_empty() && answer.listing_venue_id.starts_with("VEN-") {
+        record.listing_venue_id = answer.listing_venue_id.clone();
+        changes.push(Change {
+            field: "listing_venue_id".into(),
+            scheme: String::new(),
+            namespace: String::new(),
+            before: String::new(),
+            after: answer.listing_venue_id.clone(),
+            source: words.clone(),
+        });
+    }
     if changes.is_empty() && !offered {
         return Ok(None);
     }
