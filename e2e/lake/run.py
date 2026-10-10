@@ -331,7 +331,7 @@ def run():
         "note": "The symbol was freed by a delisting.",
         "values": [{"identifier": {"scheme": "symbol", "value": "ZZOLD", "source": "coinbase",
                                    "valid_until_ns": left}, "source": "the venue's notice"}]}]}, "made")
-    window = [i for i in ended["data"]["completions"][0]["record"]["identifiers"] if i["value"] == "ZZOLD"]
+    window = [i for i in ended["results"][0]["record"]["identifiers"] if i["value"] == "ZZOLD"]
     must(window and window[0].get("valid_until_ns") == left,
          f"step 9, the symbol's window closed, never deleted: {ended}")
     after = left + 1_000_000_000

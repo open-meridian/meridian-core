@@ -531,7 +531,7 @@ def buttons(browser, instance=INSTANCE, seconds=45):
     deadline = time.monotonic() + seconds
     while True:
         page = browser.get(dash("/"))
-        card = page.body.split(f'<li data-instance="{instance}">', 1)
+        card = re.split(r'<li[^>]*\bdata-instance="' + re.escape(instance) + '">', page.body, maxsplit=1)
         if len(card) > 1 or time.monotonic() > deadline:
             break
         time.sleep(2)

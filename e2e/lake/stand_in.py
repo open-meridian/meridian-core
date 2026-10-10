@@ -66,12 +66,12 @@ beside this file; `make e2e-recorded` the directory RECORDED names, a
 developer's recorded exchanges, never committed.
 """
 import asyncio
+import http.server
 import importlib.abc
 import importlib.util
-import sys
-
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
@@ -137,6 +137,13 @@ def day_of(seconds):
 # ── The dgm ─────────────────────────────────────────────────────────────
 
 
+def _v19_types(declaration, data_types):
+    """A catalogue entry naming the 1b's data types, which the sidecar checks
+    at registration; the SDK's own check is v18's until SDK 0.23.0."""
+    object.__setattr__(declaration, "data_types", tuple(data_types))
+    return declaration
+
+
 CATALOGUE = [
     DatasetDeclaration(
         key="daily",
@@ -159,17 +166,19 @@ CATALOGUE = [
         licence_default=DatasetLicence(kept=True, display=True),
         day_time_zone="Etc/UTC",
     ),
-    # Contract v19: trades and quotes, streamed, kept two days.
-    DatasetDeclaration(
+    # Contract v19: trades and quotes, streamed, kept two days. The SDK's
+    # v18 dictionary knows no Trade or Quote yet (SDK 0.23.0, row 18), so the
+    # entry is checked as prices and then names its own types.
+    _v19_types(DatasetDeclaration(
         key="live",
         vendor="Coinbase",
-        data_types=["meridian.v1.Trade", "meridian.v1.Quote"],
+        data_types=["meridian.v1.Price"],
         modes=["stream"],
         licence_default=DatasetLicence(kept=True, retention_days=2, display=True),
         day_time_zone="Etc/UTC",
         day_end_minute=0,
         venue_id=VENUE,
-    ),
+    ), ["meridian.v1.Trade", "meridian.v1.Quote"]),
     DatasetDeclaration(
         key="fx",
         vendor="Federal Reserve",

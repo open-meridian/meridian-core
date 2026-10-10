@@ -274,6 +274,17 @@ INSIDE = """() => {
 }"""
 
 
+def on_its_page(page, row):
+    """Turn the kit's pager holding `row` (kit 0.11.0 pages Settings' lists)
+    until the row is shown."""
+    page.evaluate("""row => {
+      const found = document.querySelector(row);
+      const pager = found && found.closest('om-pager');
+      for (let i = 0; pager && i < 50 && found.offsetParent === null; i++) pager.turn(1);
+    }""", row)
+    page.wait_for_timeout(100)
+
+
 def the_access_editor_has_a_row_per_role(browser, prefix):
     """Access per role (contract v15): the access group dialog's rows, one a
     plugin role, one line each, paged by the kit; an entry on a role its
@@ -290,11 +301,14 @@ def the_access_editor_has_a_row_per_role(browser, prefix):
         check(not problems, f"the Access groups tab at {size} fits one screen"
               f"{': ' + '; '.join(problems) if problems else ''}")
         page.screenshot(path=os.path.join(OUT, f"{prefix}-access-groups-{size}.png"))
-        listed = page.inner_text("#access-groups")
+        # Every group, on whichever page the kit's pager shows it (kit
+        # 0.11.0 pages Settings' lists): its whole text, spaces collapsed.
+        listed = " ".join(page.eval_on_selector("#access-groups", "e => e.textContent").split())
         check("ops-1 operations write" in listed and "ops-1 custody read" in listed,
               f"at {size} each group lists its entries by role")
         check("holds nothing" in listed, f"at {size} the entry on a role ops-1 no longer holds is flagged")
 
+        on_its_page(page, "tr[data-id='AX-RECON']")
         page.click("tr[data-id='AX-RECON'] button[data-dialog-open]")
         page.wait_for_timeout(500)
         editor = page.locator("dialog#access-group om-pager")
@@ -528,6 +542,10 @@ def the_data_sources_page(browser, prefix):
             settled(page)
             page.click("#datasets table.datasets tbody tr:first-child td:first-child button")
             page.wait_for_timeout(300)
+            # "Kept for" shows once kept is ticked (kit 0.11.0's gate).
+            page.check("dialog#licence input[name=kept]")
+            check(page.is_visible("dialog#licence input[name=retention_days]"),
+                  "the licence's Kept for shows once kept is ticked")
             page.fill("dialog#licence input[name=retention_days]", "3650")
             page.fill("dialog#licence input[name=note]", "Ten years, as the firm now keeps them.")
             page.click("dialog#licence button[type=submit]")
