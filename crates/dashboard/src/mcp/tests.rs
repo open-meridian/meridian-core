@@ -1134,11 +1134,14 @@ fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
             PluginCatalogue {
                 launches: vec![PluginLaunch {
                     instance_id: INSTANCE.into(),
-                    state: 1,
                     launched_by: ADA.into(),
                     acting_through_delegation: "DLG-0".into(),
                     client_name: "Claude".into(),
                     note: "The custodian's second account.".into(),
+                    state: 2,
+                    stopped_by: ADA.into(),
+                    stopped_client_name: "Claude".into(),
+                    stopped_note: "Replaced by the new connection.".into(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -1655,6 +1658,12 @@ async fn a_deployment_admin_administering_no_role_reads_the_overview_and_holds_t
     assert_eq!(launch["launched_by"], ADA, "{said}");
     assert_eq!(launch["client_name"], "Claude", "{said}");
     assert_eq!(launch["note"], "The custodian's second account.", "{said}");
+    assert_eq!(launch["stopped_by"], ADA, "{said}");
+    assert_eq!(launch["stopped_client_name"], "Claude", "{said}");
+    assert_eq!(
+        launch["stopped_note"], "Replaced by the new connection.",
+        "{said}"
+    );
 }
 
 #[tokio::test]

@@ -592,6 +592,7 @@ impl Ending {
             failure: self.failure.clone(),
             stopped_through_delegation: self.delegation.clone(),
             stopped_client_name: self.client.clone(),
+            stopped_note: self.note.clone(),
             ..launch.clone()
         }
     }

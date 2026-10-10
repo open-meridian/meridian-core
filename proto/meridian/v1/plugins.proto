@@ -156,6 +156,11 @@ message PluginLaunch {
   // v17.
   string note = 18;
 
+  // Why it was stopped, as kept with the stop (contract v17): required
+  // through /mcp; empty while not stopped, where none was given, and on
+  // every stop before v17.
+  string stopped_note = 19;
+
   // Tags, retired with them (decisions/026).
   reserved 6;
   reserved "tags";

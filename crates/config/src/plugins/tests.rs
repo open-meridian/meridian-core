@@ -569,6 +569,10 @@ async fn a_launch_and_a_stop_through_a_delegation_record_it_and_the_client() {
     assert_eq!(launched.launched_by, ADA);
     assert_eq!(launched.acting_through_delegation, "DLG-1");
     assert_eq!(launched.client_name, "meridian on ada-laptop");
+    assert_eq!(
+        launched.note,
+        "Bringing SnapTrade in for the Growth accounts."
+    );
     let stopped: PluginLaunch = ask_through(
         &bus,
         STOP_PLUGIN,
@@ -583,6 +587,13 @@ async fn a_launch_and_a_stop_through_a_delegation_record_it_and_the_client() {
     assert_eq!(stopped.stopped_by, ADA);
     assert_eq!(stopped.stopped_through_delegation, "DLG-1");
     assert_eq!(stopped.stopped_client_name, "meridian on ada-laptop");
+    // Each note is read back with the launch, the stop's beside the launch's
+    // (contract v17).
+    assert_eq!(
+        stopped.note,
+        "Bringing SnapTrade in for the Growth accounts."
+    );
+    assert_eq!(stopped.stopped_note, "Retired.");
     assert_eq!(catalogue(&bus).await.launches[0], stopped);
     // A browser's call names neither.
     launch(&bus, launching("snaptrade-2", &["custody"]))

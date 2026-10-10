@@ -450,6 +450,14 @@ fn one_live_launch_per_instance_and_it_ends_once() {
         .expect("was live");
     assert_eq!(stopped.state, PluginLaunchState::Stopped as i32);
     assert_eq!(stopped.stopped_at_ns, 3);
+    // The stop's note is kept and read with the launch (contract v17).
+    assert_eq!(stopped.stopped_note, "Retiring this connection.");
+    let read = store.snapshot().unwrap().catalogue.launches;
+    let ended = read
+        .iter()
+        .find(|l| l.instance_id == "snaptrade-1")
+        .expect("recorded");
+    assert_eq!(ended.stopped_note, "Retiring this connection.");
     assert!(
         store.end_launch("snaptrade-1", &stop).unwrap().is_none(),
         "none live now"

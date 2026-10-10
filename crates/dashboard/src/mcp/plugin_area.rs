@@ -197,7 +197,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_catalogue",
         "Read the plugin catalogue",
-        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the launch's note.",
+        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop.",
         true,
         Gate::DeploymentAdmin,
         nothing_schema,
@@ -437,6 +437,7 @@ fn launch_json(launch: &PluginLaunch) -> Value {
         "stopped_through_delegation": launch.stopped_through_delegation,
         "stopped_client_name": launch.stopped_client_name,
         "note": launch.note,
+        "stopped_note": launch.stopped_note,
     })
 }
 

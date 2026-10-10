@@ -1303,7 +1303,7 @@ fn unless_empty(value: &str) -> Option<&str> {
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
-     stopped_client_name, launch_note";
+     stopped_client_name, launch_note, stop_note";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
@@ -1366,6 +1366,7 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_through_delegation: row.get(14),
         stopped_client_name: row.get(15),
         note: row.get(16),
+        stopped_note: row.get(17),
     }
 }
 

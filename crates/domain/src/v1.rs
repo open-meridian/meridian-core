@@ -5750,6 +5750,11 @@ pub struct PluginLaunch {
     /// v17.
     #[prost(string, tag = "18")]
     pub note: ::prost::alloc::string::String,
+    /// Why it was stopped, as kept with the stop (contract v17): required
+    /// through /mcp; empty while not stopped, where none was given, and on
+    /// every stop before v17.
+    #[prost(string, tag = "19")]
+    pub stopped_note: ::prost::alloc::string::String,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
