@@ -562,6 +562,106 @@ fn instrument_id(n: usize) -> String {
     format!("INS-{n:04}")
 }
 
+/// The first sixty records lack their class and currency: what the
+/// Instruments page lists to complete (W3.11), paged and searched.
+fn incomplete(id: &str) -> bool {
+    id[4..].parse::<usize>().is_ok_and(|n| n <= 60)
+}
+
+/// A record as the stand-in instrument store answers it: a fund with its
+/// symbol, complete from the sixty-first; INS-0007 a binary event contract
+/// whose old ticker the platform ended (contract v19), offered as an end.
+fn instrument_listed(id: String) -> InstrumentToComplete {
+    use meridian_domain::v1::{instrument_value, InstrumentField, InstrumentValue, OfferedValue};
+    let lacking = incomplete(&id);
+    let n = &id[4..];
+    let mut record = InstrumentRecord {
+        identifiers: vec![Identifier {
+            scheme: "symbol".into(),
+            value: format!("F{n}"),
+            ..Default::default()
+        }],
+        description: format!("Fund {n}"),
+        instrument_id: id.clone(),
+        version: 2,
+        ..Default::default()
+    };
+    if !lacking {
+        record.asset_class = meridian_domain::v1::AssetClass::Fund as i32;
+        record.currency = "USD".into();
+    }
+    if id == "INS-0007" {
+        record.description = "Fed cuts rates in November, YES".into();
+        record.identifiers.push(Identifier {
+            scheme: "ticker".into(),
+            value: "KXFED-OLD".into(),
+            valid_from_ns: 1_790_000_000_000_000_000,
+            valid_until_ns: 1_791_000_000_000_000_000,
+            ..Default::default()
+        });
+        record.offers.push(OfferedValue {
+            value: Some(InstrumentValue {
+                value: Some(instrument_value::Value::Identifier(Identifier {
+                    scheme: "symbol".into(),
+                    value: format!("F{n}"),
+                    valid_until_ns: 1_791_500_000_000_000_000,
+                    ..Default::default()
+                })),
+                source: "the platform, record INS-9 version 3".into(),
+            }),
+            ..Default::default()
+        });
+        record.offers.push(OfferedValue {
+            value: Some(InstrumentValue {
+                value: Some(instrument_value::Value::AssetClass(
+                    meridian_domain::v1::AssetClass::EventContract as i32,
+                )),
+                source: "stated by kalshi-1".into(),
+            }),
+            ..Default::default()
+        });
+    }
+    InstrumentToComplete {
+        instrument: Some(record),
+        lacks: if lacking {
+            vec![
+                InstrumentField::AssetClass as i32,
+                InstrumentField::Currency as i32,
+            ]
+        } else {
+            Vec::new()
+        },
+        complete: !lacking,
+        complete_for_book: !lacking,
+    }
+}
+
+/// Twelve conflicts, every other one a plugin's resolve (contract v19).
+fn conflicts() -> Vec<meridian_domain::v1::InstrumentConflict> {
+    (1..=12)
+        .map(|n| meridian_domain::v1::InstrumentConflict {
+            identifiers: vec![Identifier {
+                scheme: "figi".into(),
+                value: format!("BBG00000{n:04}"),
+                ..Default::default()
+            }],
+            instrument_ids: vec![instrument_id(100 + n), instrument_id(200 + n)],
+            reported_by: if n % 2 == 0 {
+                "coinbase-1".into()
+            } else {
+                String::new()
+            },
+            reason: if n % 2 == 0 {
+                meridian_domain::v1::MissReason::Ambiguous as i32
+            } else {
+                0
+            },
+            first_seen_ns: n as i64,
+            last_seen_ns: n as i64,
+        })
+        .collect()
+}
+
 /// The stand-in conductor's change to the settings record: as the real one
 /// makes it, each table checked and its rows stamped, or its refusal.
 fn set(
@@ -776,35 +876,41 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         |envelope| {
             let asked = ListInstrumentsToCompleteRequest::decode(&envelope.payload[..])
                 .map_err(|e| e.to_string())?;
+            let wanted = |id: &String| {
+                if asked.instrument_id.is_empty() {
+                    asked.include_complete || incomplete(id)
+                } else {
+                    *id == asked.instrument_id
+                }
+            };
             let instruments = (1..=250)
                 .map(instrument_id)
-                .filter(|id| asked.instrument_id.is_empty() || *id == asked.instrument_id)
-                .map(|id| InstrumentToComplete {
-                    instrument: Some(InstrumentRecord {
-                        identifiers: vec![Identifier {
-                            scheme: "symbol".into(),
-                            value: format!("F{}", &id[4..]),
-                            ..Default::default()
-                        }],
-                        description: format!("Fund {}", &id[4..]),
-                        instrument_id: id,
-                        ..Default::default()
-                    }),
-                    complete: true,
-                    complete_for_book: true,
-                    ..Default::default()
-                })
+                .filter(wanted)
+                .map(instrument_listed)
                 .collect();
             Ok((
                 "".into(),
                 ListInstrumentsToCompleteReply {
                     instruments,
+                    conflicts: if asked.instrument_id.is_empty() {
+                        conflicts()
+                    } else {
+                        Vec::new()
+                    },
+                    incomplete_for_book: 60,
+                    incomplete: 60,
                     ..Default::default()
                 }
                 .encode_to_vec(),
             ))
         },
     );
+    bus.serve(crate::admin::instruments::READ_INSTRUMENT_HISTORY, |_| {
+        Ok((
+            "".into(),
+            meridian_domain::v1::ReadInstrumentHistoryReply::default().encode_to_vec(),
+        ))
+    });
 
     // The stand-in conductor's archive and moves (contract v16): ReadMoves
     // answered from the moves above, an archive allowed or withdrawn as

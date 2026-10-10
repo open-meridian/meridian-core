@@ -504,8 +504,8 @@ async fn set_priority(app: &App, caller: &Caller, arguments: &Value) -> Value {
         (lake::PRICE, PriceKind::Unspecified) => {
             problems.add("kind", "a price's priority names its kind")
         }
-        (lake::BAR, k) if k != PriceKind::Unspecified => {
-            problems.add("kind", "a bar's priority names no kind")
+        (lake::BAR | lake::TRADE | lake::QUOTE, k) if k != PriceKind::Unspecified => {
+            problems.add("kind", "only a price's priority names a kind")
         }
         _ => {}
     }

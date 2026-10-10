@@ -151,7 +151,9 @@ fn each_kind_is_one_line_of_storage_and_archive_and_each_move_one_line() {
             && page.contains(">1.2 GiB of 50 GiB</td>"),
         "every kind together against the bound: {page}"
     );
-    assert!(page.contains("<om-pager><table class=\"list one-line moves\" data-moves=\"2\">"));
+    assert!(page.contains(
+        "<om-pager search=\"Search moves\"><table class=\"list one-line moves\" data-moves=\"2\">"
+    ));
     assert!(page.contains("data-move=\"Restored\""));
     assert!(page.contains("activity_window_days 2555"));
     assert!(

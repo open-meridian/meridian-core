@@ -1505,7 +1505,8 @@ fn table_field(
     format!(
         "<div class=\"table-head\"><h2>{caption}</h2>{count}{who}</div>{about}{unread}\
          <input type=\"hidden\" name=\"{TABLE_FIELD}{field}\" value=\"1\">\
-         <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\">\
+         <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\" \
+         search=\"Search {caption}\">\
          <script type=\"application/json\">{json}</script>\
          <div class=\"table-wrap\"><table class=\"one-line\"><caption>{caption}</caption>\
          <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>",

@@ -1103,8 +1103,10 @@ e2e-plugin-area:
 # restatement read as version 2 and as of before it, a reader not entitled
 # refused, an invalid date refused, a want coalesced and answered and a
 # standing want withdrawn, a price on a venue ID and one in USDC on its
-# instrument, the stale guard on priority, and `store lake` (e2e/lake/run.py
-# says each step). Its own compose project. The exchanges are the synthetic
+# instrument, the stale guard on priority; from contract v19 trades heard
+# every one by an ems plugin and caught up by watermark, quotes latest per
+# asset, an ambiguous resolve flagged and a reassigned symbol answered by its
+# date; and `store lake` (e2e/lake/run.py says each step). Its own compose project. The exchanges are the synthetic
 # ones committed in e2e/lake/exchanges.
 E2E_LAKE_SETUP = \
 	DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null && \

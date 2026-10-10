@@ -1,9 +1,9 @@
--- The lake (contract v18, W10), as stable, sorted lines, which `store lake`
+-- The lake (contract v18, W10; trades and quotes from v19), as stable, sorted lines, which `store lake`
 -- prints: what a run asserts the lake kept. One line per row version kept,
 -- per priority, per want change, per serving of a dataset not kept, per
 -- removal, per instance's misses and per alias:
 --
---   row|dataset|price or bar|sequence|row key|version|subject|kind or interval ns|venue|business date|previous sequence|unconverted
+--   row|dataset|price, bar, trade or quote|sequence|row key|version|subject|kind or interval ns|venue|business date|previous sequence|unconverted
 --   priority|data type|kind|changes
 --   want|dataset|asked, answered, declined or withdrawn|subjects|reason
 --   served|dataset|first sequence|last sequence|subjects|fields|readers
@@ -15,7 +15,8 @@
 -- read under their entitlements; nor a time a run cannot state. A want's ID
 -- is the lake's, so a line names its dataset and subjects instead.
 SELECT line FROM (
-    SELECT 'row|' || dataset || '|' || CASE data_type WHEN 1 THEN 'price' WHEN 2 THEN 'bar' ELSE '?' END
+    SELECT 'row|' || dataset || '|' || CASE data_type WHEN 1 THEN 'price' WHEN 2 THEN 'bar'
+                                                         WHEN 3 THEN 'trade' WHEN 4 THEN 'quote' ELSE '?' END
         || '|' || sequence || '|' || row_key || '|' || version || '|' || subject || '|'
         || CASE data_type WHEN 2 THEN interval_ns::text ELSE kind::text END || '|' || venue_id || '|'
         || COALESCE(business_date::text, '') || '|' || previous_sequence || '|' || unconverted AS line

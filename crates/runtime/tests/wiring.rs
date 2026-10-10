@@ -555,6 +555,20 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(ems.may_publish(meridian_lake::service::LIST_DATASETS));
     assert!(ems.may_subscribe("platform.lake.{dataset}.event.trades-recorded"));
     assert!(!ems.may_publish(meridian_lake::service::LIST_PRICES));
+    // portfolio and oms hear neither (ruled 2026-10-10: portfolio shapes
+    // orders and oms aggregates them; signal and ems take high-resolution
+    // data).
+    for role in ["portfolio", "oms"] {
+        let reader = contract.grants_for(&roles(&[role])).unwrap();
+        assert!(
+            !reader.may_publish(meridian_lake::service::LIST_TRADES),
+            "{role}"
+        );
+        assert!(
+            !reader.may_subscribe("platform.lake.{dataset}.event.trades-recorded"),
+            "{role}"
+        );
+    }
     let reporting = contract.grants_for(&roles(&["reporting"])).unwrap();
     assert!(reporting.may_publish("platform.reference.query.resolve-identifier"));
     assert!(!reporting.may_publish(meridian_lake::service::LIST_TRADES));

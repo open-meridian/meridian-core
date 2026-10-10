@@ -363,7 +363,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
             .to_string()
     } else {
         format!(
-            "<om-pager><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
+            "<om-pager search=\"Search datasets\"><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
              <th>Dataset</th><th class=\"wide\">Vendor</th><th class=\"wide\">Serves</th>\
              <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
@@ -379,7 +379,8 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <div class=\"dialog-body\"><input type=\"hidden\" name=\"dataset\">\
          <label class=\"check\"><input type=\"checkbox\" name=\"kept\" value=\"1\"> The lake may keep its rows \
          (otherwise served, not kept)</label>\
-         <label>Kept for, in days <input name=\"retention_days\" type=\"number\" min=\"0\" max=\"36500\" \
+         <label data-om-applies-when=\"kept\" data-om-one-of=\"1\">Kept for, in days \
+         <input name=\"retention_days\" type=\"number\" min=\"0\" max=\"36500\" \
          step=\"1\" inputmode=\"numeric\" required></label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"derived_use\" value=\"1\"> Derived data may be made</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"display\" value=\"1\"> It may be shown</label>\
@@ -456,7 +457,7 @@ fn entitlements_tab(rows: &[Row], records: &AccessRecords, token: &str) -> Strin
             .to_string();
     }
     format!(
-        "<om-pager><table class=\"list one-line entitlements\" data-entitlements=\"{n}\"><thead><tr>\
+        "<om-pager search=\"Search entitlements\"><table class=\"list one-line entitlements\" data-entitlements=\"{n}\"><thead><tr>\
          <th>Dataset</th><th>Plugin</th><th class=\"wide\">Fields</th><th class=\"wide\">Set by</th>\
          <th>Set</th><th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
         n = rows.iter().map(|r| r.entitled.len()).sum::<usize>()
@@ -512,7 +513,7 @@ fn priority_tab(
             .to_string()
     } else {
         format!(
-            "<om-pager><table class=\"list one-line priorities\" data-priorities=\"{n}\"><thead><tr>\
+            "<om-pager search=\"Search priorities\"><table class=\"list one-line priorities\" data-priorities=\"{n}\"><thead><tr>\
              <th>For</th><th>Datasets, first to last</th><th class=\"wide\">Set by</th><th>Set</th>\
              <th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
             n = priorities.len()
@@ -530,9 +531,10 @@ fn priority_tab(
          <div class=\"dialog-head\"><h2 id=\"priority-dialog-title\" data-title-new=\"Set a priority\">Set a priority</h2></div>\
          <div class=\"dialog-body\"><input type=\"hidden\" name=\"against_updated_at_ns\" value=\"0\">\
          <label>Data type <select name=\"data_type\"><option value=\"{price}\">Price</option>\
-         <option value=\"{bar}\">Bar</option></select></label>\
-         <label>Kind, for prices <select name=\"kind\"><option value=\"\">None (bars)</option>\
-         <option value=\"close\">Close</option><option value=\"last\">Last</option>\
+         <option value=\"{bar}\">Bar</option><option value=\"{trade}\">Trade</option>\
+         <option value=\"{quote}\">Quote</option></select></label>\
+         <label data-om-applies-when=\"data_type\" data-om-one-of=\"{price}\">Kind, for prices \
+         <select name=\"kind\" required><option value=\"close\">Close</option><option value=\"last\">Last</option>\
          <option value=\"nav\">NAV</option><option value=\"settlement\">Settlement</option></select></label>\
          <label>Datasets, first to last, one a line <textarea name=\"datasets\" rows=\"3\" required></textarea></label>\
          <label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label>\
@@ -542,13 +544,15 @@ fn priority_tab(
          <button type=\"submit\" class=\"primary\" data-label-new=\"Set\">Set</button></div></form></dialog>",
         price = lake::PRICE,
         bar = lake::BAR,
+        trade = lake::TRADE,
+        quote = lake::QUOTE,
     );
     (body, dialog)
 }
 
 /// A tab shown measures its pager again, as on a resize: a pager measured
 /// while its tab was hidden pages nothing.
-const PAGER_SCRIPT: &str = r#"
+pub(super) const PAGER_SCRIPT: &str = r#"
 (function () {
   function measure() { window.setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 0); }
   window.addEventListener("hashchange", measure);

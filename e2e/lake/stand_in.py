@@ -19,6 +19,32 @@ On a want naming a business date the exchange file holds, it records that
 day's close against the want; on a standing want it records nothing, and
 hears it withdrawn.
 
+From contract v19 (the lake's 1b) it declares `live` as well -- trades and
+quotes, streamed -- and serves:
+
+  /trades    records three trades and three quotes of BTC on the venue, two
+             quotes in dollars (the second for the first) and one in USDC;
+  /late      records a late print, its valid time a day before, and the
+             first trade withdrawn, as a new version;
+  /identity  resolves a symbol and a FIGI to two records, then both together
+             (ambiguous: the conflict listed, nothing minted or escalated);
+  /resolve-as-of?scheme=S&value=V&source=N&as_of=NS
+             one resolve as of a date, answering the record.
+
+STAND_IN_LAKE=desk is an `ems` plugin hearing trades and quotes (a raw
+receive of TradesRecorded and QuotesRecorded) and serving:
+
+  /follow?subject=ID...      hears trades and quotes about them;
+  /heard                     each trade and quote heard, with its sequence;
+  /catch-up?after=N          ListTrades after the watermark live:N;
+  /quotes?subject=ID         ListQuotes, the latest in force;
+  /quotes-wanted?subject=ID  ListQuotes of a subject nothing recorded.
+
+Until SDK 0.23.0 carries the 1b's typed operations (the plan's row 18), the
+plugin's wire for v19 is meridian-schema's own generated module at the
+revision core pins (e2e/lake/wire, copied unchanged), in place of the SDK's
+v18 copy: a superset, so the SDK's own operations run on it unchanged.
+
 STAND_IN_LAKE=reader serves:
 
   /follow?subject=ID...                     hears what is recorded for them;
@@ -40,7 +66,10 @@ beside this file; `make e2e-recorded` the directory RECORDED names, a
 developer's recorded exchanges, never committed.
 """
 import asyncio
-import http.server
+import importlib.abc
+import importlib.util
+import sys
+
 import json
 import os
 import threading
@@ -49,8 +78,26 @@ import urllib.parse
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-import meridian
-from meridian import (
+
+class _Wire(importlib.abc.MetaPathFinder):
+    """The v19 wire from meridian-schema, under the SDK's own module names,
+    until SDK 0.23.0 carries it (the plan's row 18)."""
+
+    HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire")
+    NAMES = {"meridian.plugin.v1.operations_pb2": "operations_pb2.py",
+             "meridian.plugin.v1.operations_pb2_grpc": "operations_pb2_grpc.py"}
+
+    def find_spec(self, name, path=None, target=None):
+        file = self.NAMES.get(name)
+        if not file:
+            return None
+        return importlib.util.spec_from_file_location(name, os.path.join(self.HERE, file))
+
+
+sys.meta_path.insert(0, _Wire())
+
+import meridian  # noqa: E402
+from meridian import (  # noqa: E402
     Bar,
     DatasetDeclaration,
     DatasetLicence,
@@ -63,8 +110,8 @@ from meridian import (
     SourceChoice,
     SourceTime,
 )
-from meridian.operations import as_money
-from meridian.plugin.v1 import operations_pb2 as ops
+from meridian.operations import as_decimal, as_money  # noqa: E402
+from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
 
 KIND = os.environ.get("STAND_IN_LAKE", "dgm")
 PORT = 8088
@@ -111,6 +158,17 @@ CATALOGUE = [
         cadence=30,
         licence_default=DatasetLicence(kept=True, display=True),
         day_time_zone="Etc/UTC",
+    ),
+    # Contract v19: trades and quotes, streamed, kept two days.
+    DatasetDeclaration(
+        key="live",
+        vendor="Coinbase",
+        data_types=["meridian.v1.Trade", "meridian.v1.Quote"],
+        modes=["stream"],
+        licence_default=DatasetLicence(kept=True, retention_days=2, display=True),
+        day_time_zone="Etc/UTC",
+        day_end_minute=0,
+        venue_id=VENUE,
     ),
     DatasetDeclaration(
         key="fx",
@@ -241,7 +299,92 @@ class Dgm:
         self.withdrawn.append({"want_id": heard.message.want_id, "dataset": heard.message.dataset})
         log(withdrawn=self.withdrawn[-1])
 
+    # ── The lake's 1b (contract v19) ──
+
+    def live_meta(self, row_key, at_ns):
+        return ops.ObservationMeta(
+            row_key=row_key,
+            subjects=[ops.SubjectRef(entity_id=self.ids["btc"])],
+            source=ops.Source(dataset=self.dataset("live"), venue_id=VENUE),
+            valid_from_ns=at_ns,
+        )
+
+    def money(self, amount, code="USD", instrument=""):
+        return ops.Money(amount=_decimal(amount), currency_code=code, instrument_id=instrument)
+
+    def trade(self, row_key, at_ns, price, cancelled=False):
+        return ops.Trade(
+            meta=self.live_meta(row_key, at_ns),
+            price=self.money(price),
+            quantity=_decimal("0.25"),
+            attributes=ops.TradeAttributes(),
+            aggressor=ops.AGGRESSOR_BUY,
+            source_sequence=int(row_key.split("-")[-1]) if row_key[-1].isdigit() else 0,
+            cancelled=cancelled,
+        )
+
+    async def trades(self):
+        await self.resolve()
+        now = time.time_ns()
+        self.at = now
+        trades = [self.trade(f"BTC-USD-T-{n}", now + n * 1000, f"62000.{n}") for n in (1, 2, 3)]
+        done = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=trades))
+        quotes = [
+            ops.Quote(meta=self.live_meta("BTC-USD-Q-1", now), bid=self.money("61999"),
+                      ask=self.money("62001"), bid_quantity=_decimal("1"), ask_quantity=_decimal("2")),
+            ops.Quote(meta=self.live_meta("BTC-USD-Q-2", now + 5000), bid=self.money("62000"),
+                      ask=self.money("62002"), bid_quantity=_decimal("1"), ask_quantity=_decimal("2")),
+            ops.Quote(meta=self.live_meta("BTC-USDC-Q-1", now + 3000),
+                      bid=self.money("61998", "", self.ids["usdc"]),
+                      ask=self.money("62003", "", self.ids["usdc"])),
+        ]
+        quoted = await self.plugin._operations().RecordQuotes(ops.RecordQuotesParams(quotes=quotes))
+        said = {"trades": done.recorded, "quotes": quoted.recorded,
+                "head": max(p.sequence for p in quoted.watermark.partitions)}
+        log(trades=said)
+        return said
+
+    async def late(self):
+        await self.resolve()
+        rows = [self.trade("BTC-USD-T-9", self.at - DAY_NS, "61500.9"),
+                self.trade("BTC-USD-T-1", self.at + 1000, "62000.1", cancelled=True)]
+        done = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=rows))
+        said = {"recorded": done.recorded, "restated": done.restated}
+        log(late=said)
+        return said
+
+    async def resolve_as_of(self, query):
+        one = lambda name: query.get(name, [""])[0]
+        found = await self.plugin._operations().ResolveIdentifier(ops.ResolveIdentifierParams(
+            identifiers=[ops.Identifier(scheme=one("scheme"), value=one("value"), source=one("source"))],
+            as_of_ns=int(one("as_of") or 0)))
+        return {"found": found.found, "instrument_id": found.instrument_id,
+                "miss_reason": ops.MissReason.Name(found.miss_reason), "minted": found.minted}
+
+    async def identity(self):
+        symbol = ops.Identifier(scheme="symbol", value="ZZAMB", source="coinbase")
+        figi = ops.Identifier(scheme="figi", value="BBG000ZZAMB1")
+        first = await self.plugin._operations().ResolveIdentifier(
+            ops.ResolveIdentifierParams(identifiers=[symbol]))
+        second = await self.plugin._operations().ResolveIdentifier(
+            ops.ResolveIdentifierParams(identifiers=[figi]))
+        both = await self.plugin._operations().ResolveIdentifier(
+            ops.ResolveIdentifierParams(identifiers=[symbol, figi]))
+        said = {"symbol": first.instrument_id, "figi": second.instrument_id,
+                "both": {"found": both.found, "miss_reason": ops.MissReason.Name(both.miss_reason),
+                         "minted": both.minted}}
+        log(identity=said)
+        return said
+
     async def answer(self, path, query):
+        if path == "/trades":
+            return await self.trades()
+        if path == "/late":
+            return await self.late()
+        if path == "/identity":
+            return await self.identity()
+        if path == "/resolve-as-of":
+            return await self.resolve_as_of(query)
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -336,6 +479,84 @@ class Reader:
         return {"page": "the lake's reading stand-in"}
 
 
+# ── The desk: an ems plugin hearing trades and quotes (contract v19) ────
+
+
+def _decimal(text):
+    """A decimal as the wire carries it: a 128-bit integer, its upper half
+    signed, and its scale."""
+    exact = Decimal(text)
+    scale = max(0, -exact.as_tuple().exponent)
+    units = int(exact.scaleb(scale))
+    return ops.Decimal(high=units >> 64, low=units & ((1 << 64) - 1), scale=scale)
+
+
+def _amount(decimal):
+    return str(as_decimal(decimal))
+
+
+def trade_json(trade):
+    meta = trade.meta
+    return {"row_key": meta.row_key, "version": meta.version, "sequence": meta.sequence,
+            "dataset": meta.source.dataset, "venue_id": meta.source.venue_id,
+            "valid_from_ns": meta.valid_from_ns, "amount": _amount(trade.price.amount),
+            "instrument_id": trade.price.instrument_id, "cancelled": trade.cancelled}
+
+
+def quote_json(quote):
+    meta = quote.meta
+    side = quote.bid if quote.HasField("bid") else quote.ask
+    return {"row_key": meta.row_key, "version": meta.version, "sequence": meta.sequence,
+            "bid": _amount(quote.bid.amount) if quote.HasField("bid") else "",
+            "instrument_id": side.instrument_id}
+
+
+class Desk:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.trades = []
+        self.quotes = []
+        self.lost = 0
+        self.following = None
+
+    async def hear(self, subjects):
+        call = self.plugin._operations().Receive(
+            ops.ReceiveRequest(rows=["TradesRecorded", "QuotesRecorded"], subjects=subjects))
+        async for delivery in call:
+            which = delivery.WhichOneof("item")
+            if which == "trades_recorded":
+                self.trades.append(trade_json(delivery.trades_recorded.trade))
+                log(heard_trade=self.trades[-1])
+            elif which == "quotes_recorded":
+                self.quotes.append(quote_json(delivery.quotes_recorded.quote))
+                log(heard_quote=self.quotes[-1])
+            elif which == "lost":
+                self.lost += 1
+
+    async def answer(self, path, query):
+        subjects = query.get("subject", [])
+        refs = [ops.SubjectRef(entity_id=s) for s in subjects]
+        if path == "/follow":
+            if self.following is None:
+                self.following = asyncio.ensure_future(self.hear(subjects))
+            return {"following": subjects}
+        if path == "/heard":
+            return {"trades": self.trades, "quotes": self.quotes, "lost": self.lost}
+        if path == "/catch-up":
+            after = int(query.get("after", ["0"])[0])
+            dataset = query.get("dataset", ["coin:live"])[0]
+            answer = await self.plugin._operations().ListTrades(ops.ListTradesParams(
+                subjects=refs, after_watermark=ops.Watermark(
+                    partitions=[ops.PartitionSequence(partition=dataset, sequence=after)])))
+            return {"trades": [trade_json(t) for t in answer.trades],
+                    "unanswered": [ops.UnansweredReason.Name(u.reason) for u in answer.unanswered]}
+        if path in ("/quotes", "/quotes-wanted"):
+            answer = await self.plugin._operations().ListQuotes(ops.ListQuotesParams(subjects=refs))
+            return {"quotes": [quote_json(q) for q in answer.quotes],
+                    "unanswered": [ops.UnansweredReason.Name(u.reason) for u in answer.unanswered]}
+        return {"page": "the lake's desk stand-in"}
+
+
 # ── Serving the page ────────────────────────────────────────────────────
 
 
@@ -371,6 +592,11 @@ async def main():
         served = Dgm(plugin)
         asyncio.ensure_future(plugin.receive(observations_wanted=served.on_want,
                                              want_withdrawn=served.on_withdrawn))
+    elif KIND == "desk":
+        plugin = await meridian.connect(
+            interface=Interface(PORT, "Desk stand-in", pages=[Page("/", "Trades", levels=["read"])]),
+        )
+        served = Desk(plugin)
     else:
         plugin = await meridian.connect(
             interface=Interface(PORT, "Reader stand-in", pages=[Page("/", "Prices", levels=["read"])]),

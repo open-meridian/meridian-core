@@ -803,9 +803,9 @@ def instrument_rows(admin):
     page = admin.get("/admin/instruments")
     if page.status != 200:
         raise Failed(f"/admin/instruments: {page.status} {sentence(page)}")
-    table = re.search(r'<table class="list" id="instruments-table">(.*?)</table>', page.body, re.S)
+    table = re.search(r'<table class="list[^"]*" id="instruments-table">(.*?)</table>', page.body, re.S)
     rows = []
-    for row in re.findall(r"<tr>(.*?)</tr>", table.group(1) if table else "", re.S):
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", table.group(1) if table else "", re.S):
         found = re.search(r'<a href="/admin/instruments/([^"]+)">', row)
         if not found:
             continue

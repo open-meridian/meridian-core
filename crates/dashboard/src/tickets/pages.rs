@@ -479,9 +479,10 @@ async fn tickets_page(
         .iter()
         .map(|t| {
             format!(
-                "<tr data-id=\"{id}\" data-state=\"{state}\"><td class=\"name\"><a href=\"/tickets/{id}\">{title}</a>\
-                 <span class=\"hint\"><code>{id}</code></span>{held}</td><td>{concerns}</td><td>{kind}</td>\
-                 <td>{badge}</td><td>{by}</td><td>{seen}</td></tr>",
+                "<tr data-id=\"{id}\" data-state=\"{state}\"><td class=\"name\" title=\"{title} {id}\">\
+                 <a href=\"/tickets/{id}\">{title}</a> <code>{id}</code>{held}</td>\
+                 <td title=\"{concerns}\">{concerns}</td><td class=\"wide\">{kind}</td>\
+                 <td>{badge}</td><td class=\"wide\">{by}</td><td class=\"wide num\">{seen}</td></tr>",
                 id = escape(&t.ticket_id),
                 state = t.state.as_str(),
                 title = escape(&t.title),
@@ -505,9 +506,10 @@ async fn tickets_page(
             .to_string()
     } else {
         format!(
-            "<div class=\"scroll\"><table class=\"list\" id=\"tickets-table\"><thead><tr><th>Ticket</th>\
-             <th>Concerns</th><th>Kind</th><th>State</th><th>Filed by</th><th>Seen</th></tr></thead>\
-             <tbody>{rows}</tbody></table></div>"
+            "<om-pager search=\"Search tickets\"><table class=\"list one-line\" id=\"tickets-table\">\
+             <thead><tr><th>Ticket</th><th>Concerns</th><th class=\"wide\">Kind</th><th>State</th>\
+             <th class=\"wide\">Filed by</th><th class=\"wide num\">Seen</th></tr></thead>\
+             <tbody>{rows}</tbody></table></om-pager>"
         )
     };
     let body = format!(
@@ -619,16 +621,72 @@ pub fn report_form(session: &Session, access: &Access, prefill: &Prefill) -> Str
     }
     format!(
         "<form class=\"report\" method=\"post\" action=\"/tickets\">{token}{hidden}{concerns}\
+         <label>Kind<select name=\"kind\">{kinds}</select></label>\
          <label>What is wrong, in a line<input name=\"title\" maxlength=\"120\" required></label>\
-         <label>What you saw<textarea name=\"seen\" rows=\"6\" maxlength=\"8000\">{seen}</textarea></label>\
+         {said}\
          <p class=\"hint\">Plain text. An account named by its identifier here narrows who sees \
          the ticket to those who may read it; an account named only in words does not. Nothing \
          you write leaves the deployment.</p>\
-         <label>Kind<select name=\"kind\">{kinds}</select></label>\
          <div class=\"form-foot\"><button type=\"submit\" class=\"primary\">File the ticket</button></div></form>",
         token = token_input(session),
-        seen = escape(&prefill.seen),
+        said = KINDS
+            .iter()
+            .enumerate()
+            .map(|(at, (kind, _))| {
+                // What the kind asks of the person (kit 0.11.0's gate): one
+                // box shows, for the kind chosen.
+                format!(
+                    "<label data-om-applies-when=\"kind\" data-om-one-of=\"{name}\">{asked}\
+                     <textarea name=\"seen\" rows=\"6\" maxlength=\"8000\">{seen}</textarea></label>",
+                    name = super::kind_name(*kind as i32),
+                    asked = SEEN_ASKED[at],
+                    seen = if at == 0 {
+                        escape(&prefill.seen)
+                    } else {
+                        String::new()
+                    },
+                )
+            })
+            .collect::<String>(),
     )
+}
+
+/// What "Report a problem" asks for each kind, in its order.
+const SEEN_ASKED: [&str; 4] = [
+    "What you saw, and what you expected",
+    "Which two records disagree, and how",
+    "What is missing, or what should change",
+    "What you want to do",
+];
+
+/// What a work form cites: one `cites` box shows for the choice made (kit
+/// 0.11.0's gate); without script each posts, and the one for the
+/// resolution chosen is read -- the note's number first, the version second.
+fn cites_for(fields: &Value) -> String {
+    match fields.get("cites") {
+        Some(Value::Array(said)) => {
+            let at = usize::from(field(fields, "resolution") == "version");
+            said.get(at)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        }
+        _ => field(fields, "cites").to_string(),
+    }
+}
+
+/// What a report says it saw: the one box shown for its kind, or, without
+/// script, the first that says anything.
+fn seen_of(fields: &Value) -> String {
+    match fields.get("seen") {
+        Some(Value::Array(said)) => said
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default()
+            .to_string(),
+        _ => field(fields, "seen").to_string(),
+    }
 }
 
 async fn report_page(
@@ -724,7 +782,7 @@ fn filing_from_form(fields: &Value) -> Result<FileTicketRequest, Refused> {
     };
     Ok(FileTicketRequest {
         title: field(fields, "title").to_string(),
-        seen: field(fields, "seen").to_string(),
+        seen: seen_of(fields),
         kind: super::parse_kind(field(fields, "kind"))
             .ok_or_else(|| Refused::invalid("kind", "defect, discrepancy, request or question"))?,
         concerns: Some(TicketSubject {
@@ -1037,7 +1095,10 @@ fn acts(
                 "resolve",
                 "<label>Resolved by<select name=\"resolution\"><option value=\"note\">A note, by its number</option>\
                  <option value=\"version\">A version</option></select></label>\
-                 <label>Which<input name=\"cites\" required placeholder=\"the note's number, or the version\"></label>",
+                 <label data-om-applies-when=\"resolution\" data-om-one-of=\"note\">The note's number\
+                 <input name=\"cites\" required inputmode=\"numeric\" placeholder=\"3\"></label>\
+                 <label data-om-applies-when=\"resolution\" data-om-one-of=\"version\">The version\
+                 <input name=\"cites\" required placeholder=\"0.4.1\"></label>",
                 "Resolve",
             ));
         } else {
@@ -1064,7 +1125,8 @@ fn acts(
             "close",
             &format!(
                 "<label>Closed as<select name=\"resolution\">{reasons}</select></label>\
-                 <label>The other ticket, for a duplicate<input name=\"cites\" placeholder=\"TKT-...\"></label>"
+                 <label data-om-applies-when=\"resolution\" data-om-one-of=\"duplicate\">The other ticket\
+                 <input name=\"cites\" required placeholder=\"TKT-...\"></label>"
             ),
             "Close",
         ));
@@ -1132,7 +1194,7 @@ async fn work_posted(
         owner: field(&fields, "owner").to_string(),
         due: field(&fields, "due").to_string(),
         resolution: field(&fields, "resolution").to_string(),
-        cites: field(&fields, "cites").to_string(),
+        cites: cites_for(&fields),
         release: field(&fields, "release").to_string(),
         against_notes: field(&fields, "against_notes").parse().ok(),
     };
@@ -1226,9 +1288,9 @@ async fn inbox_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         .iter()
         .map(|(notice, ticket)| {
             format!(
-                "<li data-kind=\"{kind}\" data-ticket=\"{id}\"{unread}><span class=\"badge{tone}\">{said}</span> \
-                 <a href=\"/tickets/{id}\">{title}</a> <span class=\"hint\"><code>{id}</code></span>\
-                 <p class=\"provenance\">{author}, {when}</p></li>",
+                "<tr data-kind=\"{kind}\" data-ticket=\"{id}\"{unread}><td><span class=\"badge{tone}\">{said}</span></td>\
+                 <td title=\"{title} {id}\"><a href=\"/tickets/{id}\">{title}</a> <code>{id}</code></td>\
+                 <td class=\"wide provenance\">{author}</td><td>{when}</td></tr>",
                 kind = escape(&notice.kind),
                 id = escape(&notice.ticket_id),
                 unread = if notice.read { "" } else { " data-unread" },
@@ -1263,7 +1325,11 @@ async fn inbox_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
              act on changes, it is listed here.</p></div>"
                 .to_string()
         } else {
-            format!("<ol class=\"notices\">{rows}</ol>")
+            format!(
+                "<om-pager search=\"Search the inbox\"><table class=\"list one-line notices\">\
+                 <thead><tr><th>What</th><th>Ticket</th><th class=\"wide\">By</th><th>When</th></tr></thead>\
+                 <tbody>{rows}</tbody></table></om-pager>"
+            )
         }
     );
     Html(page_with(

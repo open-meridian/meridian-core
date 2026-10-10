@@ -600,7 +600,7 @@ async fn home_links_each_plugin_a_person_may_open() {
     // link: the button is the way in.
     assert!(
         home.body.contains(
-            "<li data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
+            "<li class=\"list-row\" data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
              <span class=\"plugin-main\"><span class=\"plugin-icon\" aria-hidden=\"true\">s</span>\
              <span class=\"plugin-text\"><span class=\"plugin-name\">snaptrade-1</span></span></span>\
              <span class=\"plugin-levels\""
@@ -1006,7 +1006,7 @@ async fn an_admins_home_links_every_plugin_launched() {
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     let card = home
         .body
-        .split("<li data-instance=\"snaptrade-1\">")
+        .split("<li class=\"list-row\" data-instance=\"snaptrade-1\">")
         .nth(1)
         .unwrap_or_else(|| panic!("{}", home.body))
         .split("</li>")
@@ -1031,7 +1031,7 @@ async fn an_admins_home_links_every_plugin_launched() {
     // Both views, the list first; the tiles a switch away.
     assert!(home
         .body
-        .contains("<ul class=\"plugins list\" id=\"home-plugins\" data-plugins>"));
+        .contains("<om-pager><ul class=\"plugins list\" id=\"home-plugins\" data-plugins>"));
     assert!(home.body.contains("data-view=\"tiles\""));
     assert!(
         !home.body.contains("data-filter=\"home-plugins\""),
@@ -1068,10 +1068,15 @@ async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search
         ))
     });
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    assert_eq!(home.body.matches("<li data-instance=").count(), 150);
+    assert_eq!(
+        home.body
+            .matches("<li class=\"list-row\" data-instance=")
+            .count(),
+        150
+    );
     let order: Vec<&str> = home
         .body
-        .split("<li data-instance=\"")
+        .split("<li class=\"list-row\" data-instance=\"")
         .skip(1)
         .map(|rest| rest.split('"').next().unwrap())
         .collect();

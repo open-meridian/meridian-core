@@ -390,7 +390,9 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                  <span class=\"filter-count\" data-filter-count=\"home-plugins\" aria-live=\"polite\" hidden></span></div>",
             );
         }
-        body.push_str("<ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
+        // Paged by the kit's om-pager, as many as fit (kit 0.11.0): each card
+        // a row of it.
+        body.push_str("<om-pager><ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
         for instance in listed.iter().map(|i| i.as_str()) {
             // A button per level held (W6.9), where a page can be opened.
             let openable = app.plugins.is_some() && crate::plugins::is_instance(instance);
@@ -412,7 +414,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             ));
         }
         body.push_str(
-            "</ul><p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>",
+            "</ul></om-pager><p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>",
         );
     }
     body.push_str(&format!("<script>{HOME_SCRIPT}</script>"));
@@ -474,7 +476,7 @@ fn plugin_card(
     );
     if levels.is_empty() {
         return format!(
-            "<li data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
+            "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
              <span class=\"plugin-open\">Not open to you yet</span></div></li>",
             id = escape(instance)
         );
@@ -493,7 +495,7 @@ fn plugin_card(
             })
             .collect();
     format!(
-        "<li data-instance=\"{id}\"><div class=\"plugin-card\"><span class=\"plugin-main\">{text}</span>\
+        "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\"><span class=\"plugin-main\">{text}</span>\
          <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
         id = escape(instance),
         label = escape(title),

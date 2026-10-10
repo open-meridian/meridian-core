@@ -152,8 +152,8 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// a plugin may still name by its ISO 4217 code alone (decisions/023 as
 /// amended). A plugin built before declares no catalogue and hears no lake
 /// row. v19 is the lake's 1b (sdk-contract/the-lake-trades-and-quotes-
-/// contract): a `dgm`'s trades and quotes recorded in batches, `signal`'s and
-/// `ems`'s reads of them and their deliveries -- quotes conflated per subject,
+/// contract): a `dgm`'s trades and quotes recorded in batches, their reads
+/// and deliveries to `signal` and `ems` -- quotes conflated per subject,
 /// dataset, venue and asset, trades never, every one delivered and a loss
 /// caught up after the watermark last seen -- the binary event contract on a
 /// record a plugin reads, an identifier's window, stamped empty on what a

@@ -77,7 +77,7 @@ border-radius:var(--radius-lg);padding:1rem 1.1rem;margin:1rem 0}\
 ol.notes,ol.notices{list-style:none;margin:0;padding:0}\
 ol.notes>li,ol.notices>li{padding:.7rem 0;border-top:1px solid var(--line-soft)}\
 ol.notes>li:first-child,ol.notices>li:first-child{border-top:0}\
-ol.notices>li[data-unread]>a{font-weight:650}\
+table.notices tr[data-unread] a{font-weight:650}\
 dl.ticket-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.3rem 1rem;margin:.8rem 0 0}\
 dl.ticket-facts dt{color:var(--ink-soft)}dl.ticket-facts dd{margin:0;overflow-wrap:anywhere}\
 ul.references{margin:0;padding-left:1.1rem}\
@@ -314,6 +314,10 @@ fieldset.access-editor .pager .button{padding-left:.6rem;padding-right:.6rem}\
 ul.plugins{list-style:none;margin:1.25rem 0 0;padding:0}\
 ul.plugins.list{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow)}\
 ul.plugins.list li+li{border-top:1px solid var(--line-soft)}\
+ul.plugins.list li.list-row{display:block;padding:0;min-height:0;border-bottom:0}\
+form.complete .fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.35rem 1rem;align-items:end}\
+form.complete .fields>label{margin:0}form.complete .fields>label.check{grid-column:1/-1}\
+@media (max-width:40rem){form.complete .fields{grid-template-columns:repeat(2,minmax(0,1fr));gap:.3rem .6rem}}\
 .plugin-card{display:flex;align-items:center;gap:.9rem;padding:.85rem 1.1rem;color:var(--ink);min-width:0}\
 a.plugin-card:hover{background:var(--hover);text-decoration:none}\
 ul.plugins.list li:first-child .plugin-card{border-radius:var(--radius-lg) var(--radius-lg) 0 0}\
@@ -500,6 +504,13 @@ fn kit_links(body: &str) -> String {
     for name in components(body) {
         links.push_str(&format!(
             "<script type=\"module\" src=\"{base}components/{name}.js\"></script>"
+        ));
+    }
+    // Fields gated on a choice (kit 0.11.0): the kit's gate, which a page
+    // naming no component would not otherwise load.
+    if body.contains("data-om-applies-when") {
+        links.push_str(&format!(
+            "<script type=\"module\" src=\"{base}lib/gate.js\"></script>"
         ));
     }
     links

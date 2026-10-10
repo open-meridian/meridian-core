@@ -28,9 +28,20 @@ harness's admin, Ben, who holds read on `book`.
 7. Priority: set at the page for closes; the tool refuses a change against
    what it read before (the stale guard), and takes one against what it
    reads now.
-8. `store lake` prints each row version kept, numbered with no holes, the
+8. Trades and quotes (contract v19, the lake's 1b): `desk`, an ems plugin
+   entitled to `coin:live`, follows BTC; `coin` records three trades and
+   three quotes; `desk` hears every trade (never conflated) and the quotes;
+   `coin` records a late print and a withdrawal, which `desk` catches up by
+   the watermark it last saw, the late print included; the latest quotes are
+   one per asset, the second dollar quote standing for the first; a quote
+   nothing recorded is wanted, standing, of the streamed dataset.
+9. Identity (decisions/034): a symbol and a FIGI resolve to two records, and
+   both together are ambiguous -- nothing minted, the conflict listed with
+   reason ambiguous; a symbol the admin ends on its record answers that
+   record as of a date before, and a new record as of a date after.
+10. `store lake` prints each row version kept, numbered with no holes, the
    restatement as version 2, the want asked once and answered, the standing
-   want withdrawn, and the priority's changes.
+   want withdrawn, the priority's changes, and the trades and quotes.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -130,10 +141,11 @@ def run():
     started = time.time()
     compose("down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
-    for instance in ("coin", "book", "other"):
+    for instance in ("coin", "book", "other", "desk"):
         runner("ready", "--instance", instance)
     runner("grant", "--instance", "book", "--level", "read")
     runner("grant", "--instance", "other", "--level", "read")
+    runner("grant", "--instance", "desk", "--level", "read")
     runner("grant", "--instance", "book", "--level", "read", "--to", "ben")
     runner("mcp", "connect", "--covers", "deployment_admin")
     listed = runner("mcp", "list").split()
@@ -260,7 +272,77 @@ def run():
           "against_updated_at_ns": close[0]["updated_at_ns"], "note": "Confirmed."}, "made")
     runner("entitle", "--instance", "book", "coin:ticks", "--withdraw", "note=Not needed.")
 
-    # 8. The store.
+    # 8. Trades and quotes (contract v19).
+    held = until(60, lambda: (lambda d: d if "coin:live" in d else None)(datasets_listed()),
+                 "step 8, coin:live was not listed")
+    runner("entitle", "--instance", "desk", "coin:live", "note=The desk works orders on it.")
+    page("desk", "read", f"/follow?subject={btc}")
+    time.sleep(3)
+    traded = page("coin", "admin", "/trades")
+    must(traded["trades"] == 3 and traded["quotes"] == 3, f"step 8, what coin recorded: {traded}")
+
+    def heard_trades():
+        heard = page("desk", "read", "/heard")
+        return heard if len(heard["trades"]) >= 3 and heard["quotes"] else None
+    heard = until(60, heard_trades, "step 8, desk did not hear the three trades")
+    keys = [t["row_key"] for t in heard["trades"]]
+    must(keys == ["BTC-USD-T-1", "BTC-USD-T-2", "BTC-USD-T-3"],
+         f"step 8, every trade heard, in order, none dropped for a later one: {keys}")
+    must(all(t["venue_id"].startswith("VEN-") and t["instrument_id"] for t in heard["trades"]),
+         f"step 8, a trade names its venue and its price's cash instrument: {heard['trades']}")
+    seen = max(t["sequence"] for t in heard["trades"])
+    late = page("coin", "admin", "/late")
+    must(late == {"recorded": 1, "restated": 1}, f"step 8, the late print and the withdrawal: {late}")
+    caught = page("desk", "read", f"/catch-up?subject={btc}&after={seen}")
+    caught_keys = sorted((t["row_key"], t["version"], t["cancelled"]) for t in caught["trades"])
+    must(("BTC-USD-T-9", 1, False) in caught_keys and ("BTC-USD-T-1", 2, True) in caught_keys,
+         f"step 8, caught up after the watermark, the late print included: {caught}")
+    must(not [k for k in caught_keys if k[0] == "BTC-USD-T-2"],
+         f"step 8, nothing seen before the watermark again: {caught}")
+    quotes = page("desk", "read", f"/quotes?subject={btc}")["quotes"]
+    must(sorted(q["row_key"] for q in quotes) == ["BTC-USD-Q-2", "BTC-USDC-Q-1"],
+         f"step 8, the latest quote per asset: {quotes}")
+    must(any(q["instrument_id"] == usdc for q in quotes), f"step 8, a USDC quote on USDC's instrument: {quotes}")
+    wanted = page("desk", "read", f"/quotes-wanted?subject={usdc}")
+    must("UNANSWERED_REASON_ASKED_SOURCE" in wanted["unanswered"], f"step 8, a quote wanted: {wanted}")
+    until(60, lambda: [w for w in page("coin", "admin", "/wants")["wants"]
+                       if w["dataset"] == "coin:live" and w["standing"]],
+          "step 8, coin heard no standing want of the streamed dataset")
+
+    # 9. Identity: an ambiguous resolve listed with its reason, never minted;
+    # a symbol ended on its record answers each record for its own dates.
+    identity = page("coin", "admin", "/identity")
+    must(identity["symbol"] and identity["figi"] and identity["symbol"] != identity["figi"],
+         f"step 9, a symbol and a FIGI on two records: {identity}")
+    must(identity["both"] == {"found": False, "miss_reason": "MISS_REASON_AMBIGUOUS", "minted": False},
+         f"step 9, both together ambiguous, nothing minted: {identity}")
+    listed = call("dashboard__list_instruments_to_complete", {"include_complete": True}, "unchanged")["data"]
+    flagged = [c for c in listed["conflicts"]
+               if sorted(c["instrument_ids"]) == sorted([identity["symbol"], identity["figi"]])]
+    must(flagged and flagged[0]["reason"] == "MISS_REASON_AMBIGUOUS",
+         f"step 9, the conflict listed with reason ambiguous: {listed['conflicts']}")
+    before = time.time_ns()
+    old = page("coin", "admin", f"/resolve-as-of?scheme=symbol&value=ZZOLD&source=coinbase&as_of={before}")
+    must(old["found"] and old["minted"], f"step 9, the old symbol's record: {old}")
+    held = call("dashboard__read_instrument", {"instrument_id": old["instrument_id"]}, "unchanged")["data"]
+    left = before + 1_000_000_000
+    ended = call("dashboard__complete_instruments", {"completions": [{
+        "instrument_id": old["instrument_id"], "against_version": held["version"],
+        "note": "The symbol was freed by a delisting.",
+        "values": [{"identifier": {"scheme": "symbol", "value": "ZZOLD", "source": "coinbase",
+                                   "valid_until_ns": left}, "source": "the venue's notice"}]}]}, "made")
+    window = [i for i in ended["data"]["completions"][0]["record"]["identifiers"] if i["value"] == "ZZOLD"]
+    must(window and window[0].get("valid_until_ns") == left,
+         f"step 9, the symbol's window closed, never deleted: {ended}")
+    after = left + 1_000_000_000
+    new = page("coin", "admin", f"/resolve-as-of?scheme=symbol&value=ZZOLD&source=coinbase&as_of={after}")
+    must(new["found"] and new["instrument_id"] != old["instrument_id"],
+         f"step 9, given to another record after it left: {new}")
+    then = page("coin", "admin", f"/resolve-as-of?scheme=symbol&value=ZZOLD&source=coinbase&as_of={before}")
+    must(then["instrument_id"] == old["instrument_id"],
+         f"step 9, as of a date before, the record that held it: {then}")
+
+    # 10. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
     daily_rows = [line.split("|") for line in lines if line.startswith("row|coin:daily|")]
@@ -278,6 +360,10 @@ def run():
     must(any(line.startswith("want|coin:ticks|withdrawn|") for line in lines),
          f"step 8, the standing want withdrawn: {lines}")
     must("priority|meridian.v1.Price|1|2" in lines, f"step 8, the priority's two changes: {lines}")
+    live_rows = [line.split("|") for line in lines if line.startswith("row|coin:live|")]
+    live_sequences = sorted(int(row[3]) for row in live_rows)
+    must(live_sequences == list(range(1, len(live_sequences) + 1)) and len(live_sequences) == 8,
+         f"step 10, live's trades and quotes numbered from its head with no holes: {live_sequences}")
 
     took = int(time.time() - started)
     print(f"{NAME} OK in {took}s: on the plugin harness, a dgm's three datasets listed by the "
@@ -288,8 +374,12 @@ def run():
           "and read as version 2, version 1 read as of before it; a reader not entitled refused, "
           "and an invalid date refused naming business_date; a day not recorded asked once for two "
           "reads and recorded against the want, a standing want withdrawn; the priority set at the "
-          "page, a stale change refused by the tool and a current one taken; and `store lake` "
-          "printing each version numbered with no holes, the want and the priority's changes")
+          "page, a stale change refused by the tool and a current one taken; trades heard every "
+          "one by an ems plugin and a loss caught up by watermark, a late print included, the "
+          "latest quote per asset and a standing want of a streamed dataset; an ambiguous resolve "
+          "listed with its reason and nothing minted, a symbol ended on its record answering each "
+          "record for its own dates; and `store lake` printing each version numbered with no "
+          "holes, the want and the priority's changes")
 
 
 def main():

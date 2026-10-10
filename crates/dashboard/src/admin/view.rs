@@ -359,7 +359,7 @@ fn access(records: &AccessRecords, instance: &str, may_grant: bool) -> String {
         "<p class=\"empty\">No user group holds access to it yet.</p>".to_string()
     } else {
         format!(
-            "<om-pager><table class=\"list one-line access\"><thead><tr><th>User group</th>\
+            "<om-pager search=\"Search access\"><table class=\"list one-line access\"><thead><tr><th>User group</th>\
              <th>Role</th><th>Level</th><th>On accounts</th></tr></thead><tbody>{rows}</tbody></table></om-pager>"
         )
     };

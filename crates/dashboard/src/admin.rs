@@ -1709,8 +1709,9 @@ async fn instrument_page(
 async fn complete_instruments(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Form(fields): Form<Fields>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let fields = once(&pairs);
     let (session, _) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
@@ -1734,6 +1735,10 @@ async fn complete_instruments(
         fund_nav: field(&fields, "fund_nav").into(),
         fund_liquidity_fee: field(&fields, "fund_liquidity_fee").into(),
         fund_source: field(&fields, "fund_source").into(),
+        contract_amount: field(&fields, "contract_amount").into(),
+        contract_asset: field(&fields, "contract_asset").into(),
+        contract_closes: field(&fields, "contract_closes").into(),
+        contract_source: field(&fields, "contract_source").into(),
         identifier_scheme: field(&fields, "identifier_scheme").into(),
         identifier_value: field(&fields, "identifier_value").into(),
         identifier_namespace: field(&fields, "identifier_namespace").into(),
@@ -1744,6 +1749,8 @@ async fn complete_instruments(
         description_held: field(&fields, "description_held").into(),
         instrument_type_held: field(&fields, "instrument_type_held").into(),
         fund_held: field(&fields, "fund_held").into(),
+        contract_held: field(&fields, "contract_held").into(),
+        ends: every(&pairs, "end"),
     };
     let back = format!("/admin/instruments/{}", filled.instrument_id);
     let outcome = match instruments::completion(&filled) {
@@ -2024,7 +2031,15 @@ async fn set_dataset_licence(
     if let Err(response) = form_token_matches(&session, &fields) {
         return *response;
     }
-    let outcome = match field(&fields, "retention_days").parse::<u32>() {
+    // "Kept for" is gated on "kept" (kit 0.11.0): read only with it, and a
+    // licence serving rows unkept keeps nothing for any time.
+    let kept = !field(&fields, "kept").is_empty();
+    let retention = if kept {
+        field(&fields, "retention_days")
+    } else {
+        "0"
+    };
+    let outcome = match retention.parse::<u32>() {
         Err(_) => Err(format!(
             "{:?} is not a number of days",
             field(&fields, "retention_days")
@@ -2037,7 +2052,7 @@ async fn set_dataset_licence(
             meridian_domain::v1::SetDatasetLicenceRequest {
                 dataset: field(&fields, "dataset").to_string(),
                 licence: Some(meridian_pb::v1::DatasetLicence {
-                    kept: !field(&fields, "kept").is_empty(),
+                    kept,
                     retention_days,
                     derived_use: !field(&fields, "derived_use").is_empty(),
                     display: !field(&fields, "display").is_empty(),
@@ -2104,7 +2119,13 @@ async fn set_source_priority(
     if let Err(response) = form_token_matches(&session, &fields) {
         return *response;
     }
-    let kind = field(&fields, "kind");
+    // "Kind, for prices" is gated on the data type (kit 0.11.0): read only
+    // for prices, which alone have one.
+    let kind = if field(&fields, "data_type") == meridian_domain::lake::PRICE {
+        field(&fields, "kind")
+    } else {
+        ""
+    };
     let outcome = match (
         field(&fields, "against_updated_at_ns").parse::<i64>(),
         kind.is_empty()

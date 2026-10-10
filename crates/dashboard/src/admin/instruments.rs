@@ -23,7 +23,7 @@ use meridian_domain::v1::{
     CompleteInstrumentsReply, CompleteInstrumentsRequest, Identifier, InstrumentCompletion,
     InstrumentField, InstrumentRecord, InstrumentToComplete, InstrumentType, InstrumentValue,
     InstrumentVersion, LiquidityFeeRegime, ListInstrumentsToCompleteReply,
-    ListInstrumentsToCompleteRequest, MergeInstrumentsReply, MergeInstrumentsRequest,
+    ListInstrumentsToCompleteRequest, MergeInstrumentsReply, MergeInstrumentsRequest, MissReason,
     MoneyMarketFund, MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
     OfferedValue, ReadInstrumentHistoryReply, ReadInstrumentHistoryRequest,
 };
@@ -62,12 +62,49 @@ const CLASSES: [(AssetClass, &str); 7] = [
     (AssetClass::Cash, "Cash"),
 ];
 
-/// The instrument types, as the form offers them (contract v11), each under
-/// its asset class.
-const TYPES: [(InstrumentType, &str); 1] = [(
-    InstrumentType::MoneyMarketFund,
-    "Money market fund (a fund)",
-)];
+/// The instrument types, as the form offers them (contract v11; the binary
+/// event contract from contract v19), each under its asset class: the form
+/// offers a type only while its class is chosen.
+const TYPES: [(InstrumentType, AssetClass, &str); 2] = [
+    (
+        InstrumentType::MoneyMarketFund,
+        AssetClass::Fund,
+        "Money market fund",
+    ),
+    (
+        InstrumentType::BinaryEventContract,
+        AssetClass::EventContract,
+        "Binary event contract",
+    ),
+];
+
+/// A moment as a `datetime-local` field holds it, in UTC: `2026-11-03T00:00`.
+fn utc_field(ns: i64) -> String {
+    if ns <= 0 {
+        return String::new();
+    }
+    let date = meridian_domain::date::Date::of_utc_instant(ns);
+    let in_day = ns.rem_euclid(86_400 * 1_000_000_000) / 1_000_000_000;
+    format!("{date}T{:02}:{:02}", in_day / 3600, (in_day % 3600) / 60)
+}
+
+/// What a `datetime-local` field said, read as UTC; empty is 0, none stated.
+fn utc_of_field(text: &str) -> Result<i64, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let bad = || format!("{text:?} is not a date and time (2026-11-03T00:00)");
+    let (date, time) = text.split_once('T').ok_or_else(bad)?;
+    let date = meridian_domain::date::Date::parse(date).map_err(|_| bad())?;
+    let mut parts = time.split(':');
+    let hour: i64 = parts.next().and_then(|h| h.parse().ok()).ok_or_else(bad)?;
+    let minute: i64 = parts.next().and_then(|m| m.parse().ok()).ok_or_else(bad)?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return Err(bad());
+    }
+    Ok((date.days_since_epoch() * 86_400 + hour * 3_600 + minute * 60) * 1_000_000_000)
+}
 
 fn type_words(value: i32) -> &'static str {
     instrument_type::words(InstrumentType::try_from(value).unwrap_or(InstrumentType::Unspecified))
@@ -300,6 +337,13 @@ pub struct Filled {
     pub fund_nav: String,
     pub fund_liquidity_fee: String,
     pub fund_source: String,
+    /// Contract v19: a binary event contract's payout -- its amount, and its
+    /// asset by ISO 4217 code or cash instrument -- when trading closes (a
+    /// `datetime-local`, UTC), and their source.
+    pub contract_amount: String,
+    pub contract_asset: String,
+    pub contract_closes: String,
+    pub contract_source: String,
     pub identifier_scheme: String,
     pub identifier_value: String,
     pub identifier_namespace: String,
@@ -314,6 +358,10 @@ pub struct Filled {
     pub description_held: String,
     pub instrument_type_held: String,
     pub fund_held: String,
+    pub contract_held: String,
+    /// The platform's ends accepted (contract v19, W3.5): each an ended
+    /// identifier as the page offered it, as JSON.
+    pub ends: Vec<String>,
 }
 
 /// One record's completion from its form, or why the form cannot be sent.
@@ -359,7 +407,19 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
             source: filled.description_source.trim().to_string(),
         });
     }
-    if !filled.instrument_type.is_empty() && filled.instrument_type != filled.instrument_type_held {
+    // A field gated on a choice is read only with its choice (kit 0.11.0's
+    // gate hides and disables it otherwise; without script it posts): a type
+    // under the class chosen, a fund's attributes for a money market fund, a
+    // contract's for a binary event contract.
+    let class_chosen = filled.asset_class.parse::<i32>().ok();
+    let type_chosen = filled.instrument_type.parse::<i32>().ok();
+    let type_fits = TYPES.iter().any(|(kind, class, _)| {
+        Some(*kind as i32) == type_chosen && Some(*class as i32) == class_chosen
+    });
+    if !filled.instrument_type.is_empty()
+        && type_fits
+        && filled.instrument_type != filled.instrument_type_held
+    {
         let kind: i32 = filled
             .instrument_type
             .parse()
@@ -375,7 +435,8 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
         &filled.fund_nav,
         &filled.fund_liquidity_fee,
     ];
-    if attributes.iter().any(|attribute| !attribute.is_empty()) {
+    let fund_chosen = type_fits && type_chosen == Some(InstrumentType::MoneyMarketFund as i32);
+    if fund_chosen && attributes.iter().any(|attribute| !attribute.is_empty()) {
         let number = |text: &str| text.parse::<i32>().unwrap_or(0);
         let fund = MoneyMarketFund {
             category: number(&filled.fund_category),
@@ -399,6 +460,59 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 source: filled.fund_source.trim().to_string(),
             });
         }
+    }
+    let contract_chosen =
+        type_fits && type_chosen == Some(InstrumentType::BinaryEventContract as i32);
+    let contract_said = [
+        &filled.contract_amount,
+        &filled.contract_asset,
+        &filled.contract_closes,
+    ];
+    if contract_chosen && contract_said.iter().any(|said| !said.trim().is_empty()) {
+        let amount = filled.contract_amount.trim();
+        let amount = amount
+            .parse::<meridian_domain::exact::Exact>()
+            .map_err(|_| format!("{amount:?} is not an amount the contract pays"))?;
+        let asset = filled.contract_asset.trim();
+        let (currency_code, instrument_id) = if meridian_domain::money::is_iso4217(asset) {
+            (asset.to_string(), String::new())
+        } else {
+            (String::new(), asset.to_string())
+        };
+        let contract = meridian_domain::v1::BinaryEventContract {
+            payout: Some(meridian_domain::v1::Money {
+                amount: Some(amount.to_wire()),
+                currency_code,
+                instrument_id,
+            }),
+            closes_at_ns: utc_of_field(&filled.contract_closes)?,
+        };
+        if instrument_type::contract_to_text(&contract) != filled.contract_held {
+            if filled.contract_source.trim().is_empty() {
+                return Err("say where the binary event contract's terms came from".into());
+            }
+            values.push(InstrumentValue {
+                value: Some(instrument_value::Value::BinaryEventContract(contract)),
+                source: filled.contract_source.trim().to_string(),
+            });
+        }
+    }
+    // The platform's end of an identifier, accepted: the window closes on
+    // the date it said (contract v19, W3.5), with the offer's source.
+    for end in &filled.ends {
+        let said: serde_json::Value = serde_json::from_str(end)
+            .map_err(|_| "an end offered could not be read; draw the page again".to_string())?;
+        let text = |name: &str| said[name].as_str().unwrap_or_default().to_string();
+        values.push(InstrumentValue {
+            value: Some(instrument_value::Value::Identifier(Identifier {
+                scheme: text("scheme"),
+                value: text("value"),
+                source: text("namespace"),
+                valid_from_ns: 0,
+                valid_until_ns: said["until"].as_i64().unwrap_or(0),
+            })),
+            source: text("source"),
+        });
     }
     if !filled.identifier_scheme.trim().is_empty() || !filled.identifier_value.trim().is_empty() {
         values.push(InstrumentValue {
@@ -507,6 +621,9 @@ fn lacks_words(lacks: &[i32]) -> String {
             InstrumentField::Currency => Some("currency"),
             InstrumentField::Description => Some("description"),
             InstrumentField::MoneyMarketFund => Some("the money market fund's attributes"),
+            InstrumentField::BinaryEventContract => {
+                Some("the binary event contract's payout and close")
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -568,7 +685,7 @@ pub fn list_page(
         }
     };
 
-    let mut counts = format!(
+    let counts = format!(
         "<p class=\"hint\"><strong>{}</strong> the book cannot use (no asset class or no \
          currency), <strong>{}</strong> lacking something. Each value you set is kept with its \
          source and your name.</p>",
@@ -598,7 +715,7 @@ pub fn list_page(
             )
         })
         .collect();
-    counts.push_str(&format!(
+    let licensed = format!(
         "<section class=\"admin-section\" id=\"licensed\"><div class=\"section-head\"><div>\
          <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, kept \
          here under your own licence and never sent anywhere.</p></div></div>{}</section>",
@@ -607,53 +724,96 @@ pub fn list_page(
         } else {
             format!("<ul class=\"facts\">{}</ul>", licensed.concat())
         }
-    ));
+    );
 
+    let conflict_rows: String = listed
+        .conflicts
+        .iter()
+        .enumerate()
+        .map(|(n, conflict)| {
+            let ids: Vec<String> = conflict.instrument_ids.clone();
+            let records: String = ids
+                .iter()
+                .map(|id| {
+                    format!(
+                        "<a href=\"/admin/instruments/{id}\">{id}</a>",
+                        id = escape(id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" and ");
+            let identifiers = conflict
+                .identifiers
+                .iter()
+                .map(identifier_words)
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Contract v19 (W3.11, the plan's Q35): a resolve met it, flagged
+            // for a person; nothing of it is told to the platform.
+            let why = if conflict.reason == MissReason::Ambiguous as i32 {
+                "<span class=\"badge warn\" data-reason=\"ambiguous\" title=\"A plugin's resolve \
+                 met more than one record: flagged for you, never sent to the platform\">a resolve \
+                 met both</span>"
+            } else {
+                "<span class=\"badge\" title=\"A completion, a join or the platform's ID met \
+                 another record's identifier\">an identifier held twice</span>"
+            };
+            format!(
+                "<tr data-conflict=\"{n}\"><td title=\"{identifiers}\">{identifiers}</td>\
+                 <td>{records}</td><td>{why}</td><td class=\"wide\" title=\"{by}\">{by}</td>\
+                 <td class=\"actions\"><button type=\"button\" data-dialog-open=\"merge-{n}\">Merge</button></td></tr>",
+                identifiers = escape(&identifiers),
+                by = escape(if conflict.reported_by.is_empty() {
+                    "—"
+                } else {
+                    &conflict.reported_by
+                }),
+            )
+        })
+        .collect();
+    let merge_dialogs: String = listed
+        .conflicts
+        .iter()
+        .enumerate()
+        .map(|(n, conflict)| {
+            let ids: Vec<String> = conflict.instrument_ids.clone();
+            let choices: String = ids
+                .iter()
+                .enumerate()
+                .map(|(at, id)| {
+                    format!(
+                        "<label class=\"choice\"><input type=\"radio\" name=\"kept_instrument_id\" \
+                         value=\"{id}\"{checked}> keep {id}</label>",
+                        id = escape(id),
+                        checked = if at == 0 { " checked" } else { "" }
+                    )
+                })
+                .collect();
+            format!(
+                "<dialog id=\"merge-{n}\" aria-labelledby=\"merge-{n}-title\"><form method=\"post\" \
+                 action=\"/admin/instruments/merge\">{token}\
+                 <div class=\"dialog-head\"><h2 id=\"merge-{n}-title\">Merge {ids_said}</h2></div>\
+                 <div class=\"dialog-body\"><input type=\"hidden\" name=\"instrument_ids\" value=\"{ids_list}\">\
+                 <p class=\"hint\">The positions held under the one merged move onto the one that \
+                 stays; its identifiers' windows on it close now, never deleted.</p>{choices}\
+                 <label>Why they are one security <input name=\"note\" required></label></div>\
+                 <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
+                 <button type=\"submit\" class=\"primary\">Merge</button></div></form></dialog>",
+                ids_said = escape(&ids.join(" and ")),
+                ids_list = escape(&ids.join(",")),
+            )
+        })
+        .collect();
     let conflicts = if listed.conflicts.is_empty() {
-        "<p class=\"empty\">None.</p>".to_string()
+        "<p class=\"empty\" data-conflicts=\"0\">None.</p>".to_string()
     } else {
-        listed
-            .conflicts
-            .iter()
-            .map(|conflict| {
-                let ids: Vec<String> = conflict.instrument_ids.clone();
-                let choices: String = ids
-                    .iter()
-                    .enumerate()
-                    .map(|(at, id)| {
-                        format!(
-                            "<label class=\"choice\"><input type=\"radio\" name=\"kept_instrument_id\" \
-                             value=\"{id}\"{checked}> keep <a href=\"/admin/instruments/{id}\">{id}</a></label>",
-                            id = escape(id),
-                            checked = if at == 0 { " checked" } else { "" }
-                        )
-                    })
-                    .collect();
-                format!(
-                    "<form class=\"panel\" method=\"post\" action=\"/admin/instruments/merge\">{token}\
-                     <p><strong>{}</strong> meet{} {}{}</p>\
-                     <input type=\"hidden\" name=\"instrument_ids\" value=\"{}\">{choices}\
-                     <label>Why they are one security <input name=\"note\" required></label>\
-                     <div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Merge</button></div></form>",
-                    escape(
-                        &conflict
-                            .identifiers
-                            .iter()
-                            .map(identifier_words)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    if conflict.identifiers.len() == 1 { "s" } else { "" },
-                    escape(&ids.join(" and ")),
-                    if conflict.reported_by.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", reported by {}", escape(&conflict.reported_by))
-                    },
-                    escape(&ids.join(",")),
-                )
-            })
-            .collect()
+        format!(
+            "<om-pager search=\"Search conflicts\"><table class=\"list one-line conflicts\" \
+             data-conflicts=\"{n}\"><thead><tr><th>Identifiers</th><th>Records</th><th>Why</th>\
+             <th class=\"wide\">Reported by</th><th class=\"actions\"></th></tr></thead>\
+             <tbody>{conflict_rows}</tbody></table></om-pager>{merge_dialogs}",
+            n = listed.conflicts.len()
+        )
     };
 
     let rows: String = listed
@@ -667,21 +827,22 @@ pub fn list_page(
                 .filter_map(|offer| offer.value.as_ref())
                 .map(|value| format!("{} ({})", value_words(value), value.source))
                 .collect();
+            let ids = record
+                .identifiers
+                .iter()
+                .filter(|identifier| identifier.valid_until_ns == 0)
+                .map(identifier_words)
+                .collect::<Vec<_>>()
+                .join("; ");
             format!(
-                "<tr><td><input type=\"checkbox\" name=\"instrument_id\" value=\"{id}\" form=\"accept\"{disabled} \
+                "<tr data-id=\"{id}\"><td><input type=\"checkbox\" name=\"instrument_id\" value=\"{id}\" form=\"accept\"{disabled} \
                  aria-label=\"Accept the values offered for {id}\"></td>\
-                 <td><a href=\"/admin/instruments/{id}\">{id}</a><span class=\"id\">{ids}</span></td>\
-                 <td>{class}</td><td>{currency}</td><td>{description}</td><td>{lacks}{book}</td><td>{offered}</td></tr>",
+                 <td title=\"{id}: {ids}\"><a href=\"/admin/instruments/{id}\">{id}</a> <span class=\"id\">{ids}</span></td>\
+                 <td>{class}</td><td class=\"wide\">{currency}</td><td title=\"{description}\">{description}</td>\
+                 <td title=\"{lacks}\">{lacks}{book}</td><td class=\"wide\" title=\"{offered}\">{offered}</td></tr>",
                 id = escape(&record.instrument_id),
                 disabled = if offered.is_empty() { " disabled" } else { "" },
-                ids = escape(
-                    &record
-                        .identifiers
-                        .iter()
-                        .map(identifier_words)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
+                ids = escape(&ids),
                 class = escape(class_name(record.asset_class)),
                 currency = escape(&record.currency),
                 description = escape(&record.description),
@@ -702,21 +863,31 @@ pub fn list_page(
             "<form id=\"accept\" method=\"post\" action=\"/admin/instruments/accept\">{token}\
              <div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Accept offered values \
              for the records ticked</button></div></form>\
-             <table class=\"list\" id=\"instruments-table\"><thead><tr><th></th><th>Record</th><th>Asset class</th>\
-             <th>Currency</th><th>Description</th><th>Lacks</th><th>Offered</th></tr></thead><tbody>{rows}</tbody></table>"
+             <om-pager search=\"Search instruments\"><table class=\"list one-line\" id=\"instruments-table\">\
+             <thead><tr><th></th><th>Record</th><th>Asset class</th>\
+             <th class=\"wide\">Currency</th><th>Description</th><th>Lacks</th><th class=\"wide\">Offered</th>\
+             </tr></thead><tbody>{rows}</tbody></table></om-pager>"
         )
     };
 
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><div><h1>Instruments</h1>\
          <p class=\"hint\">The deployment's own instrument records. An opening balance naming one \
-         the book cannot use is refused until it is complete.</p></div></div>{notice}{counts}\
+         the book cannot use is refused until it is complete.</p></div></div>{notice}\
+         <nav class=\"tabs\"><a href=\"#to-complete\" data-tab=\"to-complete\">To complete</a>\
+         <a href=\"#conflicts\" data-tab=\"conflicts\">Conflicts ({conflicts_n})</a>\
+         <a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a></nav>\
          <section class=\"admin-section\" id=\"to-complete\"><div class=\"section-head\"><div>\
-         <h2>Records to complete</h2></div></div>{table}</section>\
+         <h2>Records to complete</h2>{counts}</div></div>{table}</section>\
          <section class=\"admin-section\" id=\"conflicts\"><div class=\"section-head\"><div>\
          <h2>Conflicts</h2><p class=\"hint\">Identifiers that meet two records. Merge them if \
          they are one security; the positions held under the one merged move onto the one that \
-         stays.</p></div></div>{conflicts}</section></div>"
+         stays.</p></div></div>{conflicts}</section>{licensed}</div>\
+         <script>{}{}{}</script>",
+        super::overview::SCRIPT_START,
+        super::overview::SCRIPT_END,
+        super::data_sources::PAGER_SCRIPT,
+        conflicts_n = listed.conflicts.len(),
     )
 }
 
@@ -773,7 +944,13 @@ pub fn record_page(
             let source = record
                 .sources
                 .iter()
-                .find(|source| source.identifier.as_ref() == Some(identifier))
+                .find(|source| {
+                    source.identifier.as_ref().is_some_and(|held| {
+                        held.scheme == identifier.scheme
+                            && held.value == identifier.value
+                            && held.source == identifier.source
+                    })
+                })
                 .map(|source| {
                     if source.instance_id.is_empty() {
                         source.source.clone()
@@ -782,10 +959,30 @@ pub fn record_page(
                     }
                 })
                 .unwrap_or_default();
+            // Its window (contract v19): one that left the record is kept,
+            // its window closed, never deleted.
+            let window = match (identifier.valid_from_ns, identifier.valid_until_ns) {
+                (_, until) if until > 0 => {
+                    format!("; left the record {}", instrument_type::utc_minute(until))
+                }
+                (from, _) if from > 0 => {
+                    format!(
+                        "; on the record since {}",
+                        instrument_type::utc_minute(from)
+                    )
+                }
+                _ => String::new(),
+            };
             format!(
-                "<tr><th>Identifier</th><td>{}</td><td class=\"hint\">{}</td></tr>",
+                "<tr{left}><th>Identifier</th><td>{}</td><td class=\"hint\">{}{}</td></tr>",
                 escape(&identifier_words(identifier)),
-                escape(&source)
+                escape(&source),
+                escape(&window),
+                left = if identifier.valid_until_ns > 0 {
+                    " data-left"
+                } else {
+                    ""
+                },
             )
         })
         .collect();
@@ -820,6 +1017,17 @@ pub fn record_page(
                 .money_market_fund
                 .as_ref()
                 .map(|fund| instrument_type::fund_words(&instrument_type::fund_to_text(fund)))
+                .unwrap_or_default()
+        ),
+    ) + &format!(
+        "<table class=\"list\"><tbody>{}</tbody></table>",
+        field_row(
+            "Binary event contract",
+            InstrumentField::BinaryEventContract,
+            record
+                .binary_event_contract
+                .as_ref()
+                .map(|c| instrument_type::contract_words(&instrument_type::contract_to_text(c)))
                 .unwrap_or_default()
         ),
     );
@@ -875,14 +1083,59 @@ pub fn record_page(
         ),
     };
     let type_options: String = std::iter::once("<option value=\"\">Not set</option>".to_string())
-        .chain(TYPES.iter().map(|(value, name)| {
+        .chain(TYPES.iter().map(|(value, class, name)| {
             let value = (*value as i32).to_string();
             format!(
-                "<option value=\"{value}\"{}>{name}</option>",
-                if value == kind { " selected" } else { "" }
+                "<option value=\"{value}\" data-om-applies-when=\"asset_class\" \
+                 data-om-one-of=\"{class}\"{}>{name}</option>",
+                if value == kind { " selected" } else { "" },
+                class = *class as i32,
             )
         }))
         .collect();
+    // The classes a type is under: the type's fields show for them alone.
+    let typed_classes = serde_json::to_string(
+        &TYPES
+            .iter()
+            .map(|(_, class, _)| (*class as i32).to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    let contract = record.binary_event_contract.clone().unwrap_or_default();
+    let contract_payout = contract.payout.clone().unwrap_or_default();
+    let contract_source = if record.binary_event_contract.is_some() {
+        source_words(&record, InstrumentField::BinaryEventContract)
+    } else {
+        String::new()
+    };
+    let contract_fields = format!(
+        "<label {gate}>Pays, per contract <input name=\"contract_amount\" inputmode=\"decimal\" \
+         placeholder=\"1\" value=\"{amount}\"></label>\
+         <label {gate}>Paid in: a code, or its record <input name=\"contract_asset\" \
+         placeholder=\"USD\" value=\"{asset}\"></label>\
+         <label {gate}>Trading closes, UTC <input type=\"datetime-local\" name=\"contract_closes\" \
+         value=\"{closes}\"></label>\
+         <label {gate}>Where they came from <input name=\"contract_source\" value=\"{source}\"></label>",
+        gate = format!(
+            "data-om-applies-when=\"instrument_type\" data-om-one-of=\"{}\"",
+            InstrumentType::BinaryEventContract as i32
+        ),
+        amount = escape(
+            &contract_payout
+                .amount
+                .as_ref()
+                .and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok())
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        ),
+        asset = escape(if contract_payout.currency_code.is_empty() {
+            &contract_payout.instrument_id
+        } else {
+            &contract_payout.currency_code
+        }),
+        closes = escape(&utc_field(contract.closes_at_ns)),
+        source = escape(&contract_source),
+    );
     let fund = record.money_market_fund.unwrap_or_default();
     let fund_source = if record.money_market_fund.is_some() {
         source_words(&record, InstrumentField::MoneyMarketFund)
@@ -901,13 +1154,22 @@ pub fn record_page(
         format!("<select name=\"{name}\">{options}</select>")
     };
     let fund_fields = format!(
-        "<label>Instrument type <select name=\"instrument_type\" data-initial=\"{kind}\">{type_options}</select></label>\
-         <label>Where it came from <input name=\"instrument_type_source\" value=\"{kind_source}\"{kind_offer}></label>\
-         <label>Money market fund: category {category}</label>\
-         <label>investors {investors}</label>\
-         <label>net asset value {nav}</label>\
-         <label>liquidity fee {fee}</label>\
-         <label>Where they came from <input name=\"fund_source\" value=\"{fund_source}\"></label>",
+        "<label {class_gate}>Instrument type <select name=\"instrument_type\" data-initial=\"{kind}\">{type_options}</select></label>\
+         <label {class_gate}>Where it came from <input name=\"instrument_type_source\" value=\"{kind_source}\"{kind_offer}></label>\
+         <label {fund_gate}>Money market fund: category {category}</label>\
+         <label {fund_gate}>investors {investors}</label>\
+         <label {fund_gate}>net asset value {nav}</label>\
+         <label {fund_gate}>liquidity fee {fee}</label>\
+         <label {fund_gate}>Where they came from <input name=\"fund_source\" value=\"{fund_source}\"></label>\
+         {contract_fields}",
+        class_gate = format!(
+            "data-om-applies-when=\"asset_class\" data-om-one-of='{}'",
+            escape(&typed_classes)
+        ),
+        fund_gate = format!(
+            "data-om-applies-when=\"instrument_type\" data-om-one-of=\"{}\"",
+            InstrumentType::MoneyMarketFund as i32
+        ),
         kind = escape(&kind),
         kind_source = escape(&kind_source),
         kind_offer = if kind_offer.is_empty() {
@@ -968,7 +1230,7 @@ pub fn record_page(
         }
     };
     let form = format!(
-        "<form method=\"post\" action=\"/admin/instruments/complete\" class=\"panel\" id=\"complete\">{token}\
+        "<form method=\"post\" action=\"/admin/instruments/complete\" class=\"panel complete\" id=\"complete\">{token}\
          <input type=\"hidden\" name=\"instrument_id\" value=\"{id}\">\
          <input type=\"hidden\" name=\"against_version\" value=\"{version}\">\
          <input type=\"hidden\" name=\"asset_class_held\" value=\"{class_held}\">\
@@ -976,7 +1238,8 @@ pub fn record_page(
          <input type=\"hidden\" name=\"description_held\" value=\"{description_held}\">\
          <input type=\"hidden\" name=\"instrument_type_held\" value=\"{type_held}\">\
          <input type=\"hidden\" name=\"fund_held\" value=\"{fund_held}\">\
-         <div class=\"fields\">\
+         <input type=\"hidden\" name=\"contract_held\" value=\"{contract_held}\">\
+         {ends}<div class=\"fields\">\
          <label>Asset class <select name=\"asset_class\" data-initial=\"{class}\">{options}</select></label>\
          <label>Where it came from <input name=\"asset_class_source\" value=\"{class_source}\"{class_offer}></label>\
          <label>Currency <input name=\"currency\" maxlength=\"3\" pattern=\"[A-Za-z]{{3}}\" placeholder=\"USD\" value=\"{currency}\" data-initial=\"{currency}\"></label>\
@@ -984,12 +1247,14 @@ pub fn record_page(
          <label>Description <input name=\"description\" value=\"{description}\" data-initial=\"{description}\"></label>\
          <label>Where it came from <input name=\"description_source\" value=\"{description_source}\"{description_offer}></label>\
          {fund_fields}\
-         <label>Add an identifier: scheme <input name=\"identifier_scheme\" placeholder=\"figi\"></label>\
-         <label>value <input name=\"identifier_value\"></label>\
-         <label>namespace, for a source's own symbol <input name=\"identifier_namespace\" placeholder=\"empty for a global scheme\"></label>\
-         <label>Where it came from <input name=\"identifier_source\"></label>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"adding\" value=\"identifier\"> Add an identifier</label>\
+         <label {adding}>Scheme <input name=\"identifier_scheme\" placeholder=\"figi\"></label>\
+         <label {adding}>Value <input name=\"identifier_value\"></label>\
+         <label {adding}>Namespace <input name=\"identifier_namespace\" placeholder=\"none: a global scheme\"></label>\
+         <label {adding}>Where it came from <input name=\"identifier_source\"></label>\
          <label>Why, when you change a value already set <input name=\"note\"></label>\
          </div><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save</button></div></form>",
+        adding = "data-om-applies-when=\"adding\" data-om-one-of=\"identifier\"",
         version = record.version,
         class_held = escape(&if record.asset_class == 0 {
             String::new()
@@ -1006,6 +1271,14 @@ pub fn record_page(
                 .map(instrument_type::fund_to_text)
                 .unwrap_or_default()
         ),
+        contract_held = escape(
+            &record
+                .binary_event_contract
+                .as_ref()
+                .map(instrument_type::contract_to_text)
+                .unwrap_or_default()
+        ),
+        ends = ends_offered(&record),
         class = escape(&class),
         class_source = escape(&class_source),
         class_offer = offered_attr(&class_offer),
@@ -1060,6 +1333,9 @@ pub fn record_page(
                         Ok(InstrumentField::Description) => "description".to_string(),
                         Ok(InstrumentField::InstrumentType) => "instrument type".to_string(),
                         Ok(InstrumentField::MoneyMarketFund) => "money market fund".to_string(),
+                        Ok(InstrumentField::BinaryEventContract) => {
+                            "binary event contract".to_string()
+                        }
                         _ => change
                             .identifier
                             .as_ref()
@@ -1068,6 +1344,9 @@ pub fn record_page(
                     };
                     if change.before.is_empty() {
                         format!("{field}: {} ({})", change.after, change.source)
+                    } else if change.after.is_empty() && change.identifier.is_some() {
+                        // An identifier that left the record (contract v19).
+                        format!("{field}: {} left ({})", change.before, change.source)
                     } else {
                         format!(
                             "{field}: {} to {} ({})",
@@ -1083,12 +1362,13 @@ pub fn record_page(
                 version.instance_id.clone()
             };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td title=\"{changes}\">{changes}</td><td class=\"wide\">{}</td>\
+                 <td class=\"wide\">{}</td></tr>",
                 version.version,
                 escape(&version.operation),
-                escape(&changes),
                 escape(&who),
                 escape(&version.note),
+                changes = escape(&changes),
             )
         })
         .collect();
@@ -1098,20 +1378,69 @@ pub fn record_page(
          <p class=\"hint\">Version {version}. {book}</p></div>\
          <form method=\"post\" action=\"/admin/instruments/{id}/ask\">{token}\
          <button type=\"submit\">Ask the platform</button></form></div>{asked_html}\
-         <section class=\"admin-section\"><div class=\"section-head\"><div><h2>What it says</h2></div></div>{values}</section>\
-         <section class=\"admin-section\"><div class=\"section-head\"><div><h2>Complete it</h2>\
+         <nav class=\"tabs\"><a href=\"#says\" data-tab=\"says\">What it says</a>\
+         <a href=\"#complete-it\" data-tab=\"complete-it\">Complete it</a>\
+         <a href=\"#history\" data-tab=\"history\">History</a></nav>\
+         <section class=\"admin-section\" id=\"says\"><div class=\"section-head\"><div><h2>What it says</h2></div></div>{values}</section>\
+         <section class=\"admin-section\" id=\"complete-it\"><div class=\"section-head\"><div><h2>Complete it</h2>\
          <p class=\"hint\">Each value says where it came from. A value offered is filled in with its \
          source; change the value and say where the new one came from.</p></div></div>{form}</section>\
-         <section class=\"admin-section\"><div class=\"section-head\"><div><h2>History</h2></div></div>\
-         <table class=\"list\"><thead><tr><th>Version</th><th>What</th><th>Changes</th><th>Who</th>\
-         <th>Note</th></tr></thead><tbody>{history}</tbody></table></section></div>\
-         <script>{FORM_SCRIPT}</script>",
+         <section class=\"admin-section\" id=\"history\"><div class=\"section-head\"><div><h2>History</h2></div></div>\
+         <om-pager><table class=\"list one-line\"><thead><tr><th>Version</th><th>What</th><th>Changes</th><th class=\"wide\">Who</th>\
+         <th class=\"wide\">Note</th></tr></thead><tbody>{history}</tbody></table></om-pager></section></div>\
+         <script>{}{}{}{FORM_SCRIPT}</script>",
+        super::overview::SCRIPT_START,
+        super::overview::SCRIPT_END,
+        super::data_sources::PAGER_SCRIPT,
         version = record.version,
         book = if item.complete_for_book {
             "The book can use it."
         } else {
             "The book cannot use it until it has an asset class and a currency."
         },
+    )
+}
+
+/// The platform's ends of identifiers on the record (contract v19, W3.5):
+/// each an offer to close an identifier's window on the date the platform
+/// says it left, accepted by ticking it, with the offer's source; a note says
+/// why, as for any value already held.
+fn ends_offered(record: &InstrumentRecord) -> String {
+    let boxes: String = record
+        .offers
+        .iter()
+        .filter_map(|offer| match offer.value.as_ref() {
+            Some(InstrumentValue {
+                value: Some(instrument_value::Value::Identifier(id)),
+                source,
+            }) if id.valid_until_ns > 0 => Some((id, source)),
+            _ => None,
+        })
+        .map(|(id, source)| {
+            let said = serde_json::json!({
+                "scheme": id.scheme,
+                "namespace": id.source,
+                "value": id.value,
+                "until": id.valid_until_ns,
+                "source": source,
+            });
+            format!(
+                "<label class=\"check\"><input type=\"checkbox\" name=\"end\" value=\"{value}\"> \
+                 {words} left {when} ({source})</label>",
+                value = escape(&said.to_string()),
+                words = escape(&identifier_words(id)),
+                when = escape(&instrument_type::utc_minute(id.valid_until_ns)),
+                source = escape(source),
+            )
+        })
+        .collect();
+    if boxes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<fieldset class=\"ends\" title=\"Ticked, its window here closes on that date; it is \
+         kept, never deleted, so a resolve as of a date before still answers this record.\">\
+         <legend>Ended by the platform: tick to accept</legend>{boxes}</fieldset>"
     )
 }
 
@@ -1301,9 +1630,15 @@ mod tests {
             "{held_page}"
         );
         assert!(!held_page.contains("none fee"), "{held_page}");
+        // Its class and type held, as the form posts them back: the fund's
+        // fields are gated on the type (kit 0.11.0).
         let fund = |source: &str| Filled {
             instrument_id: "LCL-1".into(),
             against_version: "2".into(),
+            asset_class: (AssetClass::Fund as i32).to_string(),
+            asset_class_held: (AssetClass::Fund as i32).to_string(),
+            instrument_type: (InstrumentType::MoneyMarketFund as i32).to_string(),
+            instrument_type_held: (InstrumentType::MoneyMarketFund as i32).to_string(),
             fund_category: (MoneyMarketFundCategory::Government as i32).to_string(),
             fund_investors: (MoneyMarketFundInvestors::Retail as i32).to_string(),
             fund_nav: (MoneyMarketFundNav::Stable as i32).to_string(),
@@ -1385,5 +1720,123 @@ mod tests {
         assert!(home_notice(Some(1)).contains("1 instrument record the book"));
         assert!(home_notice(Some(0)).is_empty());
         assert!(home_notice(None).is_empty());
+    }
+
+    #[test]
+    fn fields_gated_on_a_choice_are_read_only_with_it_and_a_contract_goes_with_its_terms() {
+        let page = record_page(&waiting(), &[], None, "");
+        assert!(
+            page.contains("data-om-applies-when=\"instrument_type\""),
+            "{page}"
+        );
+        assert!(page.contains("name=\"contract_amount\""));
+        assert!(page.contains(&format!(
+            "data-om-one-of=\"{}\">Binary event contract</option>",
+            AssetClass::EventContract as i32
+        )));
+        let contract = |class: AssetClass, source: &str| Filled {
+            instrument_id: "LCL-1".into(),
+            against_version: "2".into(),
+            asset_class: (class as i32).to_string(),
+            instrument_type: (InstrumentType::BinaryEventContract as i32).to_string(),
+            instrument_type_source: "stated by kalshi-1".into(),
+            asset_class_source: "stated by kalshi-1".into(),
+            contract_amount: "1".into(),
+            contract_asset: "USD".into(),
+            contract_closes: "2026-11-01T00:00".into(),
+            contract_source: source.into(),
+            ..Default::default()
+        };
+        let request =
+            completion(&contract(AssetClass::EventContract, "the venue's terms")).unwrap();
+        let values = &request.completions[0].values;
+        let Some(instrument_value::Value::BinaryEventContract(terms)) =
+            &values.last().unwrap().value
+        else {
+            panic!("{values:?}");
+        };
+        assert_eq!(terms.closes_at_ns, 1_793_491_200_000_000_000);
+        assert_eq!(terms.payout.as_ref().unwrap().currency_code, "USD");
+        assert!(completion(&contract(AssetClass::EventContract, ""))
+            .unwrap_err()
+            .contains("terms came from"));
+        // Under another class, the type and its terms are not read.
+        let other = completion(&contract(AssetClass::Equity, "x")).unwrap();
+        assert!(other.completions[0].values.iter().all(|v| !matches!(
+            v.value,
+            Some(instrument_value::Value::BinaryEventContract(_))
+                | Some(instrument_value::Value::InstrumentType(_))
+        )));
+        assert_eq!(utc_field(1_793_491_200_000_000_000), "2026-11-01T00:00");
+    }
+
+    #[test]
+    fn an_end_the_platform_offered_is_ticked_and_sent_with_its_source() {
+        let mut item = waiting();
+        if let Some(record) = item.instrument.as_mut() {
+            record.offers.push(OfferedValue {
+                value: Some(InstrumentValue {
+                    value: Some(instrument_value::Value::Identifier(Identifier {
+                        scheme: "symbol".into(),
+                        value: "SNAP1".into(),
+                        source: "snaptrade".into(),
+                        valid_until_ns: 1_793_491_200_000_000_000,
+                        ..Default::default()
+                    })),
+                    source: "the platform, record INS-1 version 2".into(),
+                }),
+                ..Default::default()
+            });
+            record.identifiers[0].valid_from_ns = 5;
+        }
+        let page = record_page(&item, &[], None, "");
+        assert!(page.contains("Ended by the platform"), "{page}");
+        assert!(page.contains("left 2026-11-01 00:00 UTC"), "{page}");
+        let end = serde_json::json!({
+            "scheme": "symbol", "namespace": "snaptrade", "value": "SNAP1",
+            "until": 1_793_491_200_000_000_000_i64, "source": "the platform, record INS-1 version 2",
+        })
+        .to_string();
+        let request = completion(&Filled {
+            instrument_id: "LCL-1".into(),
+            against_version: "2".into(),
+            note: "delisted".into(),
+            ends: vec![end],
+            ..Default::default()
+        })
+        .unwrap();
+        let value = &request.completions[0].values[0];
+        assert_eq!(value.source, "the platform, record INS-1 version 2");
+        let Some(instrument_value::Value::Identifier(id)) = &value.value else {
+            panic!();
+        };
+        assert_eq!(id.valid_until_ns, 1_793_491_200_000_000_000);
+    }
+
+    #[test]
+    fn the_list_pages_and_searches_and_a_resolves_conflict_says_so() {
+        let listed = Ok(ListInstrumentsToCompleteReply {
+            instruments: vec![waiting()],
+            conflicts: vec![meridian_domain::v1::InstrumentConflict {
+                identifiers: vec![Identifier {
+                    scheme: "figi".into(),
+                    value: "BBG1".into(),
+                    ..Default::default()
+                }],
+                instrument_ids: vec!["LCL-1".into(), "LCL-2".into()],
+                reason: MissReason::Ambiguous as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let page = list_page(&listed, "", "");
+        assert!(
+            page.contains("<om-pager search=\"Search instruments\">"),
+            "{page}"
+        );
+        assert!(page.contains("<om-pager search=\"Search conflicts\">"));
+        assert!(page.contains("data-reason=\"ambiguous\""));
+        assert!(page.contains("data-dialog-open=\"merge-0\""));
+        assert!(page.contains("<dialog id=\"merge-0\""));
     }
 }

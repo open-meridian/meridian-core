@@ -2757,7 +2757,7 @@ fn the_settings_form_holds_no_table_and_each_table_has_a_page_of_its_own() {
          <input type=\"hidden\" name=\"form_token\" value=\"t\">"
     ));
     assert!(page.contains(
-        "<om-entry-grid name=\"table.plan_code_links\" caption=\"Plan-code links\" max-rows=\"200\">"
+        "<om-entry-grid name=\"table.plan_code_links\" caption=\"Plan-code links\" max-rows=\"200\" search=\"Search Plan-code links\">"
     ));
     assert!(
         !page.contains("narrow="),

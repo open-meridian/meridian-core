@@ -462,7 +462,7 @@ pub fn sections(panel: &Panel) -> (String, String) {
         "<p class=\"empty\" data-moves=\"0\">Nothing has moved yet.</p>".to_string()
     } else {
         format!(
-            "<om-pager><table class=\"list one-line moves\" data-moves=\"{n}\"><thead><tr><th>When</th>\
+            "<om-pager search=\"Search moves\"><table class=\"list one-line moves\" data-moves=\"{n}\"><thead><tr><th>When</th>\
              <th>What</th><th class=\"wide\">Kind</th><th>Unit</th><th class=\"wide\">Records</th>\
              <th class=\"wide\">By</th></tr></thead>\
              <tbody>{rows}</tbody></table></om-pager>",

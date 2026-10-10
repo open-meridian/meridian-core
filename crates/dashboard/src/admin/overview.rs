@@ -151,8 +151,8 @@ fn listing(id: &str, class: &str, noun: &str, search: &str, head: &str, rows: &s
         "<div class=\"filter-row\"><input class=\"filter\" type=\"search\" data-filter=\"{id}\" hidden \
          placeholder=\"{search}\" aria-label=\"Search {noun}\">\
          <span class=\"filter-count\" data-filter-count=\"{id}\" aria-live=\"polite\" hidden></span></div>\
-         <div class=\"scroll\"><table class=\"list{class}\" id=\"{id}\" data-sortable><thead><tr>{head}</tr></thead>\
-         <tbody>{rows}</tbody></table></div>\
+         <om-pager><div class=\"scroll\"><table class=\"list{class}\" id=\"{id}\" data-sortable><thead><tr>{head}</tr></thead>\
+         <tbody>{rows}</tbody></table></div></om-pager>\
          <p class=\"empty\" data-filter-none=\"{id}\" hidden>No {noun} match that search.</p>"
     )
 }
@@ -1063,9 +1063,10 @@ pub fn render(
          <a class=\"button\" href=\"/admin/instruments\">Instruments</a>\
          <a class=\"button\" href=\"/admin/data-sources\">Data sources</a></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
-         <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}</script>",
+         <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}{}</script>",
         sections.concat(),
         picker::SCRIPT,
+        super::data_sources::PAGER_SCRIPT,
     )
 }
 

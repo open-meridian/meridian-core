@@ -43,7 +43,7 @@ pub static SPECS: &[Spec] = &[
     Spec {
         name: "list_instruments_to_complete",
         title: "List the records to complete",
-        description: "the deployment's instrument records the book cannot use first (no asset class or no currency), then those lacking a description, a symbol or a money market fund's attributes; each with what it lacks, its identifiers and who reported them, the values offered, and its version; the conflicts for a merge; the counts and the licensed identifiers per scheme. Paged by cursor.",
+        description: "the deployment's instrument records the book cannot use first (no asset class or no currency), then those lacking a description, a symbol, a money market fund's attributes or a binary event contract's payout and close; each with what it lacks, its identifiers with their windows (one that left the record kept, valid_until_ns set) and who reported them, the values offered, and its version; the conflicts for a merge, each with its reason (MISS_REASON_AMBIGUOUS where a plugin's resolve met several records); the counts and the licensed identifiers per scheme. Paged by cursor.",
         reads: true,
         open_world: false,
         area: Area::Instruments,
@@ -157,7 +157,29 @@ fn value_schema() -> Value {
         "description": "exactly one value, with its source",
         "properties": {
             "asset_class": enum_names(&classes()),
-            "instrument_type": enum_names(&[InstrumentType::MoneyMarketFund.as_str_name()]),
+            "instrument_type": enum_names(&[
+                InstrumentType::MoneyMarketFund.as_str_name(),
+                InstrumentType::BinaryEventContract.as_str_name(),
+            ]),
+            "binary_event_contract": {
+                "type": "object",
+                "description": "a binary event contract's terms: what one contract pays if the event happens, and when trading closes (0 for none stated)",
+                "properties": {
+                    "payout": {
+                        "type": "object",
+                        "properties": {
+                            "amount": {"type": "string", "description": "a decimal, more than zero"},
+                            "currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
+                            "instrument_id": {"type": "string", "description": "its cash record, for an asset with no ISO 4217 code"},
+                        },
+                        "required": ["amount"],
+                        "additionalProperties": false,
+                    },
+                    "closes_at_ns": {"type": "integer", "minimum": 0},
+                },
+                "required": ["payout"],
+                "additionalProperties": false,
+            },
             "money_market_fund": {
                 "type": "object",
                 "properties": {
@@ -173,7 +195,7 @@ fn value_schema() -> Value {
             "description": {"type": "string"},
             "identifier": {
                 "type": "object",
-                "properties": {"scheme": {"type": "string"}, "value": {"type": "string"}, "source": {"type": "string", "description": "the namespace of a source-scoped symbol"}},
+                "properties": {"scheme": {"type": "string"}, "value": {"type": "string"}, "source": {"type": "string", "description": "the namespace of a source-scoped symbol"}, "valid_until_ns": {"type": "integer", "minimum": 0, "description": "an end the platform offered, accepted: the identifier's window on the record closes then, never deleted"}},
                 "required": ["scheme", "value"],
                 "additionalProperties": false,
             },
@@ -418,10 +440,11 @@ fn value(
     problems: &mut Problems,
 ) -> Option<InstrumentValue> {
     let object = object(said, path, problems)?;
-    const KINDS: [&str; 6] = [
+    const KINDS: [&str; 7] = [
         "asset_class",
         "instrument_type",
         "money_market_fund",
+        "binary_event_contract",
         "currency",
         "description",
         "identifier",
@@ -435,7 +458,7 @@ fn value(
         .filter(|kind| object.contains_key(*kind))
         .collect();
     if given.len() != 1 {
-        problems.add(path, "exactly one of asset_class, instrument_type, money_market_fund, currency, description and identifier");
+        problems.add(path, "exactly one of asset_class, instrument_type, money_market_fund, binary_event_contract, currency, description and identifier");
         return None;
     }
     let source = match object.get("source") {
@@ -502,6 +525,42 @@ fn value(
                 .map_or(0, |v| v as i32),
             })
         }
+        "binary_event_contract" => {
+            let terms = object_fields(held, &at, problems)?;
+            only(terms, &["payout", "closes_at_ns"], &at, problems);
+            let payout_at = join(&at, "payout");
+            let payout = match terms.get("payout") {
+                Some(said) => object_fields(said, &payout_at, problems)?,
+                None => {
+                    problems.add(&payout_at, "required");
+                    return None;
+                }
+            };
+            only(
+                payout,
+                &["amount", "currency_code", "instrument_id"],
+                &payout_at,
+                problems,
+            );
+            let amount_said = text(payout, "amount", &payout_at, true, problems);
+            let amount = match amount_said.parse::<meridian_domain::exact::Exact>() {
+                Ok(amount) => Some(amount.to_wire()),
+                Err(_) => {
+                    if !amount_said.is_empty() {
+                        problems.add(&join(&payout_at, "amount"), "a decimal, as text");
+                    }
+                    None
+                }
+            };
+            instrument_value::Value::BinaryEventContract(meridian_domain::v1::BinaryEventContract {
+                payout: Some(meridian_domain::v1::Money {
+                    amount,
+                    currency_code: text(payout, "currency_code", &payout_at, false, problems),
+                    instrument_id: text(payout, "instrument_id", &payout_at, false, problems),
+                }),
+                closes_at_ns: integer(terms, "closes_at_ns", &at, false, problems),
+            })
+        }
         "currency" => match held.as_str() {
             Some(code) => instrument_value::Value::Currency(code.trim().to_string()),
             None => {
@@ -520,12 +579,18 @@ fn value(
         },
         _ => {
             let id = object_fields(held, &at, problems)?;
-            only(id, &["scheme", "value", "source"], &at, problems);
+            only(
+                id,
+                &["scheme", "value", "source", "valid_until_ns"],
+                &at,
+                problems,
+            );
             instrument_value::Value::Identifier(Identifier {
                 scheme: text(id, "scheme", &at, true, problems).to_ascii_lowercase(),
                 value: text(id, "value", &at, true, problems),
                 source: text(id, "source", &at, false, problems),
-                ..Default::default()
+                valid_from_ns: 0,
+                valid_until_ns: integer(id, "valid_until_ns", &at, false, problems),
             })
         }
     };
@@ -630,8 +695,17 @@ fn enum_name<T: TryFrom<i32>>(value: i32, name: fn(&T) -> &'static str) -> Value
     }
 }
 
+/// An identifier, with its window on the record where it has one (contract
+/// v19): valid_until_ns set on one that left it, kept, never deleted.
 fn identifier_json(id: &Identifier) -> Value {
-    json!({"scheme": id.scheme, "value": id.value, "source": id.source})
+    let mut out = json!({"scheme": id.scheme, "value": id.value, "source": id.source});
+    if id.valid_from_ns != 0 {
+        out["valid_from_ns"] = id.valid_from_ns.into();
+    }
+    if id.valid_until_ns != 0 {
+        out["valid_until_ns"] = id.valid_until_ns.into();
+    }
+    out
 }
 
 fn value_json(value: &InstrumentValue) -> Value {
@@ -697,6 +771,7 @@ pub fn record_json(record: &InstrumentRecord) -> Value {
         "asset_class": enum_name::<AssetClass>(record.asset_class, |v| v.as_str_name()),
         "instrument_type": enum_name::<InstrumentType>(record.instrument_type, |v| v.as_str_name()),
         "money_market_fund": record.money_market_fund.as_ref().map(fund_json),
+        "binary_event_contract": record.binary_event_contract.as_ref().map(contract_json),
         "currency": record.currency,
         "description": record.description,
         "identifiers": record.identifiers.iter().map(identifier_json).collect::<Vec<_>>(),
@@ -926,6 +1001,7 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
                     "identifiers": c.identifiers.iter().map(identifier_json).collect::<Vec<_>>(),
                     "instrument_ids": c.instrument_ids,
                     "reported_by": c.reported_by,
+                    "reason": enum_name::<meridian_domain::v1::MissReason>(c.reason, |v| v.as_str_name()),
                 })).collect::<Vec<_>>(),
                 "incomplete_for_book": reply.incomplete_for_book,
                 "incomplete": reply.incomplete,
@@ -1366,5 +1442,46 @@ mod tests {
             answer["results"][1]["fields"][0]["path"],
             "completions[1].against_version"
         );
+    }
+
+    #[test]
+    fn a_binary_event_contract_and_an_accepted_end_are_read_by_the_tool() {
+        let request = completions(&json!({"completions": [{
+            "instrument_id": "LCL-1",
+            "against_version": 1,
+            "note": "the venue's terms",
+            "values": [
+                {"instrument_type": "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT", "source": "stated by kalshi-1"},
+                {"binary_event_contract": {"payout": {"amount": "1", "currency_code": "USD"}, "closes_at_ns": 5}, "source": "the venue's terms"},
+                {"identifier": {"scheme": "symbol", "value": "ZZ", "source": "kalshi", "valid_until_ns": 7}, "source": "the platform"},
+            ],
+        }]}))
+        .unwrap();
+        let values = &request.completions[0].values;
+        let Some(instrument_value::Value::BinaryEventContract(terms)) = &values[1].value else {
+            panic!("{values:?}");
+        };
+        assert_eq!(terms.closes_at_ns, 5);
+        assert_eq!(terms.payout.as_ref().unwrap().currency_code, "USD");
+        let Some(instrument_value::Value::Identifier(id)) = &values[2].value else {
+            panic!();
+        };
+        assert_eq!(id.valid_until_ns, 7);
+        let refusal = completions(&json!({"completions": [{
+            "instrument_id": "LCL-1", "against_version": 1, "note": "n",
+            "values": [{"binary_event_contract": {"payout": {"amount": "one"}}, "source": "s"}],
+        }]}))
+        .unwrap_err();
+        assert!(refusal.to_string().contains("payout.amount"), "{refusal}");
+        let record = record_json(&InstrumentRecord {
+            identifiers: vec![Identifier {
+                scheme: "symbol".into(),
+                value: "ZZ".into(),
+                valid_until_ns: 7,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(record["identifiers"][0]["valid_until_ns"], 7);
     }
 }
