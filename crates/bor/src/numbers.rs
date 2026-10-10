@@ -50,5 +50,6 @@ pub fn add_money(field: &str, a: &Money, b: &Money) -> Result<Money, StoreError>
     Ok(Money {
         amount: wire(add(field, amount(field, a)?, amount(field, b)?)?),
         currency_code: a.currency_code.clone(),
+        instrument_id: String::new(),
     })
 }

@@ -1,6 +1,7 @@
 // Numbers: every quantity, and every amount of currency.
 //
-// decisions/023, with spec/quantities-carry-their-own-scale. Reached from every
+// decisions/023, with spec/quantities-carry-their-own-scale, as amended at
+// contract v18 (a Money names its instrument). Reached from every
 // message that carries a quantity or an amount; W2's holdings are the first.
 //
 // One form everywhere, binary on the wire and never text or a float: an
@@ -23,7 +24,7 @@ package meridian.v1;
 // the revision this repository pins.
 import "meridian/v1/sidecar.proto";
 
-// An amount of currency: a Decimal and the currency it is in.
+// An amount of currency: a Decimal and the asset it is in.
 //
 // One message rather than an amount with its currency beside it, so a message
 // holding amounts in several currencies -- a USD price, a EUR commission --
@@ -31,9 +32,28 @@ import "meridian/v1/sidecar.proto";
 //
 // In the currency's major unit, whatever the venue counted in: a plugin that
 // read cents converts before anything reaches the bus (decisions/023).
+//
+// From contract v18 a Money always names an instrument (decisions/023 as
+// amended; the ruling of 2026-09-30): the cash instrument of the asset it is
+// in, fiat and tokens alike, in the deployment's instrument store. A plugin
+// may name a fiat currency by its ISO 4217 code alone, which core resolves,
+// dated, to its cash instrument; an asset with no ISO 4217 code (USDC, USDT, a
+// network's gas token) is named by its instrument alone, which the plugin
+// resolves as it resolves any instrument (W3.1). What is kept and read back
+// names the instrument.
 message Money {
   Decimal amount = 1;
 
-  // ISO 4217, e.g. "USD".
+  // ISO 4217, e.g. "USD": the currency's code, where the asset has one.
+  // Empty for an asset with no ISO 4217 code, which `instrument_id` alone
+  // names; a token's code here is refused. From v18 a plugin may send this
+  // alone and core fills `instrument_id`.
   string currency_code = 2;
+
+  // The cash instrument of the asset the amount is in, the deployment's own
+  // ID (contract v18). Empty from a plugin that named a fiat currency by
+  // `currency_code` alone, which core resolves; set by core on what it keeps
+  // and answers. Both set must name the same asset, or the amount is
+  // refused; neither set is refused.
+  string instrument_id = 3;
 }

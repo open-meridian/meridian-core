@@ -159,6 +159,7 @@ async fn a_connector_records_a_statement_and_a_dashboard_reads_the_position() {
                     scale: 2,
                 }),
                 currency_code: "USD".into(),
+                instrument_id: String::new(),
             }),
             external_account_id: "ext-1".into(),
             side: HoldingSide::Long as i32,
@@ -267,6 +268,7 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record
             market_value: Some(Money {
                 amount: Some(Decimal::default()),
                 currency_code: "USD".into(),
+                instrument_id: String::new(),
             }),
             external_account_id: "ext-1".into(),
             side: HoldingSide::Long as i32,

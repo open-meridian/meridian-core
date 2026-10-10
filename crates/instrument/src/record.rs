@@ -48,6 +48,9 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         offers,
         instrument_type: type_value(&instrument.instrument_type),
         money_market_fund: instrument_type::fund_from_text(&instrument.money_market_fund),
+        // The venue master's ID (contract v18): kept once the store holds
+        // venues (row 4).
+        listing_venue_id: String::new(),
     }
 }
 

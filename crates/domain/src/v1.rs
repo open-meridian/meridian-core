@@ -64,6 +64,9 @@ pub struct InstrumentRecord {
     #[prost(string, tag = "4")]
     pub currency: ::prost::alloc::string::String,
     /// ISO 10383 market identifier code. Empty where there is no listing venue.
+    /// Deprecated from contract v18 for `listing_venue_id`, the venue master's
+    /// ID, of which the MIC is one identifier; read until the platform's and
+    /// the deployments' records carry venue IDs.
     #[prost(string, tag = "5")]
     pub exchange_mic: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
@@ -102,6 +105,11 @@ pub struct InstrumentRecord {
     /// whose type is money market fund.
     #[prost(message, optional, tag = "15")]
     pub money_market_fund: ::core::option::Option<MoneyMarketFund>,
+    /// The venue it is listed on, the venue master's ID (contract v18): a
+    /// segment's venue where the listing is on one. Empty where it is listed
+    /// on no venue, or its venue is not yet known.
+    #[prost(string, tag = "16")]
+    pub listing_venue_id: ::prost::alloc::string::String,
 }
 /// One value for a deployment's record, set or offered, with where it came
 /// from (W3.10, W3.1, W3.3).
@@ -192,6 +200,185 @@ pub struct OfferedValue {
     #[prost(int64, tag = "3")]
     pub offered_at_ns: i64,
 }
+/// The venue master's record of one venue (W1.16). The platform mints its ID;
+/// a deployment keeps what it pulled (W3.5) and answers it (W3.14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VenueRecord {
+    /// The venue's ID for life, "VEN-...", minted by the platform.
+    #[prost(string, tag = "1")]
+    pub venue_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// ISO 3166-1 alpha-2: where the venue operates.
+    #[prost(string, tag = "3")]
+    pub country_code: ::prost::alloc::string::String,
+    #[prost(enumeration = "VenueKind", tag = "4")]
+    pub kind: i32,
+    /// Its identifiers: an ISO 10383 MIC under the scheme `iso10383`, operating
+    /// or segment, where it has one; a vendor's code as a `symbol` with its
+    /// source. In force from `valid_from_ns`. An amend replaces them.
+    #[prost(message, repeated, tag = "5")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// A segment's operating venue, the venue master's ID; empty for a venue
+    /// that is its own operating venue.
+    #[prost(string, tag = "6")]
+    pub operating_venue_id: ::prost::alloc::string::String,
+    /// An IANA time zone: the venue's local time, which its sessions and a
+    /// business date at it are in.
+    #[prost(string, tag = "7")]
+    pub time_zone: ::prost::alloc::string::String,
+    /// Monotonic, assigned by the platform, starting at 1.
+    #[prost(int64, tag = "8")]
+    pub version: i64,
+    /// When this version became true.
+    #[prost(int64, tag = "9")]
+    pub valid_from_ns: i64,
+    /// When the platform recorded it. Stamped by the platform, never accepted
+    /// from a caller.
+    #[prost(int64, tag = "10")]
+    pub record_time_ns: i64,
+    /// Active, or decommissioned: an expired MIC is a decommissioned venue,
+    /// which still resolves for a date it was in force. The security master's
+    /// lifecycle; a venue is never in its define state.
+    #[prost(enumeration = "InstrumentLifecycleState", tag = "11")]
+    pub lifecycle_state: i32,
+}
+/// W1.16: a curator, a person or the curator agent, records a venue it has
+/// vetted. Answered by the venue's record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefineVenueRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// ISO 3166-1 alpha-2.
+    #[prost(string, tag = "2")]
+    pub country_code: ::prost::alloc::string::String,
+    /// Required: a kind the enum defines.
+    #[prost(enumeration = "VenueKind", tag = "3")]
+    pub kind: i32,
+    #[prost(message, repeated, tag = "4")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(string, tag = "5")]
+    pub operating_venue_id: ::prost::alloc::string::String,
+    /// Required: an IANA time zone.
+    #[prost(string, tag = "6")]
+    pub time_zone: ::prost::alloc::string::String,
+    /// Zero means now.
+    #[prost(int64, tag = "7")]
+    pub valid_from_ns: i64,
+    /// Where the writer found what it wrote, and its change note, as an
+    /// instrument's define has them: required from an agent.
+    #[prost(string, tag = "8")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W1.17: an authoritative replace of a venue's values, as an instrument's
+/// amend is: an identifier absent here is removed as of `valid_from_ns`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AmendVenueRequest {
+    #[prost(string, tag = "1")]
+    pub venue_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub country_code: ::prost::alloc::string::String,
+    #[prost(enumeration = "VenueKind", tag = "4")]
+    pub kind: i32,
+    #[prost(message, repeated, tag = "5")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    #[prost(string, tag = "6")]
+    pub operating_venue_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub time_zone: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub valid_from_ns: i64,
+    #[prost(string, tag = "9")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub note: ::prost::alloc::string::String,
+    /// Active, or decommissioned as of `valid_from_ns`, when its MIC expired
+    /// or it closed. Unspecified leaves it as it was.
+    #[prost(enumeration = "InstrumentLifecycleState", tag = "11")]
+    pub lifecycle_state: i32,
+}
+/// W1.18: the venues the master holds, a page at a time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListVenuesRequest {
+    /// Unspecified lists every kind.
+    #[prost(enumeration = "VenueKind", tag = "1")]
+    pub kind: i32,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListVenuesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub venues: ::prost::alloc::vec::Vec<VenueRecord>,
+    /// Empty when the listing is exhausted.
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// W1.19: any identifier value, of any scheme, or a name; resolved as of a
+/// date. Answered as a listing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchVenuesRequest {
+    #[prost(string, tag = "1")]
+    pub query: ::prost::alloc::string::String,
+    /// Zero means now.
+    #[prost(int64, tag = "2")]
+    pub as_of_ns: i64,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+/// W3.14: which venue a set of identifiers names on a date, in the venues the
+/// deployment holds.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveVenueRequest {
+    /// At least one: a MIC under `iso10383`, or a vendor's code as a `symbol`
+    /// with its source.
+    #[prost(message, repeated, tag = "1")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// Reference time. Zero means now.
+    #[prost(int64, tag = "2")]
+    pub as_of_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveVenueReply {
+    #[prost(bool, tag = "1")]
+    pub found: bool,
+    #[prost(message, optional, tag = "2")]
+    pub venue: ::core::option::Option<VenueRecord>,
+    /// Set only when found is false.
+    #[prost(enumeration = "MissReason", tag = "3")]
+    pub miss_reason: i32,
+}
+/// W3.15: a venue a plugin's source named resolved to none the deployment
+/// holds. A fact, not a request: the plugin keeps the venue as reported and
+/// continues; the deployment asks the platform, and the plugin resolves again
+/// once the venue is held.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MissingVenueDetectedEvent {
+    /// The namespace the miss occurred in, e.g. a plugin's registry name.
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    /// Everything the publisher held of the venue.
+    #[prost(message, repeated, tag = "2")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// Reference time of the missed resolve.
+    #[prost(int64, tag = "3")]
+    pub as_of_ns: i64,
+    /// Stamped by the sidecar.
+    #[prost(string, tag = "4")]
+    pub publisher_instance_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MissReason", tag = "5")]
+    pub reason: i32,
+    #[prost(int64, tag = "6")]
+    pub observed_at_ns: i64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DefineInstrumentRequest {
     #[prost(message, repeated, tag = "1")]
@@ -202,6 +389,7 @@ pub struct DefineInstrumentRequest {
     pub asset_class: i32,
     #[prost(string, tag = "3")]
     pub currency: ::prost::alloc::string::String,
+    /// Deprecated from contract v18 for `listing_venue_id`.
     #[prost(string, tag = "4")]
     pub exchange_mic: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
@@ -217,6 +405,10 @@ pub struct DefineInstrumentRequest {
     pub source: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub note: ::prost::alloc::string::String,
+    /// The venue it is listed on, the venue master's ID (contract v18). A venue
+    /// the master does not hold is refused, naming it.
+    #[prost(string, tag = "10")]
+    pub listing_venue_id: ::prost::alloc::string::String,
 }
 /// Authoritative replace of the identifier set and attributes. Not a delta: an
 /// identifier absent here is removed, and its validity window closes as of
@@ -234,6 +426,7 @@ pub struct AmendInstrumentRequest {
     pub asset_class: i32,
     #[prost(string, tag = "4")]
     pub currency: ::prost::alloc::string::String,
+    /// Deprecated from contract v18 for `listing_venue_id`.
     #[prost(string, tag = "5")]
     pub exchange_mic: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
@@ -248,6 +441,10 @@ pub struct AmendInstrumentRequest {
     pub source: ::prost::alloc::string::String,
     #[prost(string, tag = "9")]
     pub note: ::prost::alloc::string::String,
+    /// The venue it is listed on, the venue master's ID (contract v18). A venue
+    /// the master does not hold is refused, naming it.
+    #[prost(string, tag = "11")]
+    pub listing_venue_id: ::prost::alloc::string::String,
 }
 /// The verb is the transition, so the request carries only the subject.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -677,6 +874,12 @@ pub struct PullInstrumentReply {
     pub found: bool,
     #[prost(message, optional, tag = "2")]
     pub instrument: ::core::option::Option<InstrumentRecord>,
+    /// The venues the platform's answer names (contract v18): the instrument's
+    /// listing venue and that venue's operating venue, each the venue master's
+    /// record, which the instrument store keeps (W3.5). A deployment holds every
+    /// venue a record it keeps names, and mints none.
+    #[prost(message, repeated, tag = "4")]
+    pub venues: ::prost::alloc::vec::Vec<VenueRecord>,
     /// On the instrument-pulled event: the deployment's record a person asked
     /// about (W3.3), on which the instrument store keeps this record's values
     /// as offers and adds its ID as an identifier, never replacing the
@@ -694,6 +897,14 @@ pub struct PullIdentifierReply {
     pub instrument: ::core::option::Option<InstrumentRecord>,
     #[prost(enumeration = "MissReason", tag = "3")]
     pub miss_reason: i32,
+    /// The venues the answer names (contract v18): an instrument's listing
+    /// venue and its operating venue; or, asked by a venue's identifiers (a MIC
+    /// under `iso10383`, a vendor's code as a `symbol` with its source, W3.15),
+    /// the venue they name, with no instrument. One venue at a time, on demand:
+    /// never the whole list, which ISO 10383's terms forbid reproducing for
+    /// third parties.
+    #[prost(message, repeated, tag = "4")]
+    pub venues: ::prost::alloc::vec::Vec<VenueRecord>,
 }
 /// The platform's surface for pairing a deployment's ID with an instrument
 /// (W3.4), which a deployment does not call from contract v10: one sharing an
@@ -1336,6 +1547,55 @@ impl InstrumentField {
             "INSTRUMENT_FIELD_IDENTIFIER" => Some(Self::Identifier),
             "INSTRUMENT_FIELD_INSTRUMENT_TYPE" => Some(Self::InstrumentType),
             "INSTRUMENT_FIELD_MONEY_MARKET_FUND" => Some(Self::MoneyMarketFund),
+            _ => None,
+        }
+    }
+}
+/// What kind of venue it is. A closed list, grown by revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum VenueKind {
+    Unspecified = 0,
+    /// A regulated exchange.
+    Exchange = 1,
+    /// An alternative trading system, or a multilateral trading facility.
+    AlternativeTradingSystem = 2,
+    /// An exchange of crypto assets.
+    CryptoExchange = 3,
+    /// A network of dealers quoting on request, over the counter or by
+    /// indication: RFQ, OTC and, for now, IOI networks.
+    DealerNetwork = 4,
+    /// A facility trades are reported to, not traded on: a trade reporting
+    /// facility, an alternative display facility, an approved publication
+    /// arrangement.
+    ReportingFacility = 5,
+}
+impl VenueKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "VENUE_KIND_UNSPECIFIED",
+            Self::Exchange => "VENUE_KIND_EXCHANGE",
+            Self::AlternativeTradingSystem => "VENUE_KIND_ALTERNATIVE_TRADING_SYSTEM",
+            Self::CryptoExchange => "VENUE_KIND_CRYPTO_EXCHANGE",
+            Self::DealerNetwork => "VENUE_KIND_DEALER_NETWORK",
+            Self::ReportingFacility => "VENUE_KIND_REPORTING_FACILITY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "VENUE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "VENUE_KIND_EXCHANGE" => Some(Self::Exchange),
+            "VENUE_KIND_ALTERNATIVE_TRADING_SYSTEM" => {
+                Some(Self::AlternativeTradingSystem)
+            }
+            "VENUE_KIND_CRYPTO_EXCHANGE" => Some(Self::CryptoExchange),
+            "VENUE_KIND_DEALER_NETWORK" => Some(Self::DealerNetwork),
+            "VENUE_KIND_REPORTING_FACILITY" => Some(Self::ReportingFacility),
             _ => None,
         }
     }
@@ -2510,7 +2770,7 @@ impl ClaimCodePurpose {
         }
     }
 }
-/// An amount of currency: a Decimal and the currency it is in.
+/// An amount of currency: a Decimal and the asset it is in.
 ///
 /// One message rather than an amount with its currency beside it, so a message
 /// holding amounts in several currencies -- a USD price, a EUR commission --
@@ -2518,13 +2778,32 @@ impl ClaimCodePurpose {
 ///
 /// In the currency's major unit, whatever the venue counted in: a plugin that
 /// read cents converts before anything reaches the bus (decisions/023).
+///
+/// From contract v18 a Money always names an instrument (decisions/023 as
+/// amended; the ruling of 2026-09-30): the cash instrument of the asset it is
+/// in, fiat and tokens alike, in the deployment's instrument store. A plugin
+/// may name a fiat currency by its ISO 4217 code alone, which core resolves,
+/// dated, to its cash instrument; an asset with no ISO 4217 code (USDC, USDT, a
+/// network's gas token) is named by its instrument alone, which the plugin
+/// resolves as it resolves any instrument (W3.1). What is kept and read back
+/// names the instrument.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Money {
     #[prost(message, optional, tag = "1")]
     pub amount: ::core::option::Option<::meridian_pb::v1::Decimal>,
-    /// ISO 4217, e.g. "USD".
+    /// ISO 4217, e.g. "USD": the currency's code, where the asset has one.
+    /// Empty for an asset with no ISO 4217 code, which `instrument_id` alone
+    /// names; a token's code here is refused. From v18 a plugin may send this
+    /// alone and core fills `instrument_id`.
     #[prost(string, tag = "2")]
     pub currency_code: ::prost::alloc::string::String,
+    /// The cash instrument of the asset the amount is in, the deployment's own
+    /// ID (contract v18). Empty from a plugin that named a fiat currency by
+    /// `currency_code` alone, which core resolves; set by core on what it keeps
+    /// and answers. Both set must name the same asset, or the amount is
+    /// refused; neither set is refused.
+    #[prost(string, tag = "3")]
+    pub instrument_id: ::prost::alloc::string::String,
 }
 /// Where a change sits in its store's record (spec/plugins-hear-and-read, Q1
 /// as clarified 2026-10-01).
@@ -5623,6 +5902,673 @@ impl PluginLaunchState {
         }
     }
 }
+/// The envelope every row of every data type carries, as its first field
+/// (spec/the-lake, requirement 4).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObservationMeta {
+    /// The `dgm`'s identity for this observation, made from its raw record, so
+    /// the same observation recorded again changes nothing and a changed value
+    /// under it is a restatement. 1 to 128 characters.
+    #[prost(string, tag = "1")]
+    pub row_key: ::prost::alloc::string::String,
+    /// The entities the row is about, each resolved through W3.1: 1 to 8.
+    #[prost(message, repeated, tag = "2")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// Where the row came from.
+    #[prost(message, optional, tag = "3")]
+    pub source: ::core::option::Option<Source>,
+    /// When the value became true, the event happened, or the period began.
+    #[prost(int64, tag = "4")]
+    pub valid_from_ns: i64,
+    /// The period's end, exclusive; 0 for an instant, or a value in force until
+    /// the next.
+    #[prost(int64, tag = "5")]
+    pub valid_until_ns: i64,
+    /// The business date a daily value is for, an ISO 8601 date (2026-10-09),
+    /// in the calendar its dataset declares (DatasetDeclaration.day_time_zone);
+    /// empty for a value that is not daily. A plain date, never a moment.
+    #[prost(string, tag = "6")]
+    pub business_date: ::prost::alloc::string::String,
+    /// The source's own timestamps, at most one of each kind: 0 to 6.
+    #[prost(message, repeated, tag = "7")]
+    pub source_times: ::prost::alloc::vec::Vec<SourceTime>,
+    /// When the `dgm`'s sidecar published it: the envelope's publication time,
+    /// which the sidecar stamps. A plugin's value is never read.
+    #[prost(int64, tag = "8")]
+    pub sent_at_ns: i64,
+    /// When the lake committed this version: the time a point-in-time read
+    /// cuts at. Decided by the lake.
+    #[prost(int64, tag = "9")]
+    pub recorded_at_ns: i64,
+    /// 1 for the first record of the row key, one more for each restatement.
+    /// Decided by the lake.
+    #[prost(uint64, tag = "10")]
+    pub version: u64,
+    /// Its place in its dataset's partition, from 1, with no holes. Decided by
+    /// the lake.
+    #[prost(uint64, tag = "11")]
+    pub sequence: u64,
+    /// The sequence of the previous row of the same subject, data type and
+    /// dataset; 0 for the first. Decided by the lake.
+    #[prost(uint64, tag = "12")]
+    pub previous_sequence: u64,
+    /// The raw record it was converted from, in the writing plugin's storage.
+    #[prost(message, optional, tag = "13")]
+    pub raw: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
+    /// Each vendor value that failed conversion, beside a field left not
+    /// known: 0 to 16.
+    #[prost(message, repeated, tag = "14")]
+    pub unconverted: ::prost::alloc::vec::Vec<::meridian_pb::v1::AsReported>,
+}
+/// One entity a row is about.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubjectRef {
+    /// The deployment's own ID for the entity: an instrument's in the lake's
+    /// 1a. 1 to 64 characters.
+    #[prost(string, tag = "1")]
+    pub entity_id: ::prost::alloc::string::String,
+}
+/// Where a row came from.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Source {
+    /// The instance that recorded it, stamped by its sidecar.
+    #[prost(string, tag = "1")]
+    pub instance: ::prost::alloc::string::String,
+    /// That plugin's version when it recorded it: decided by the lake from the
+    /// version the deployment launched the instance at, never the plugin's word.
+    #[prost(string, tag = "2")]
+    pub plugin_version: ::prost::alloc::string::String,
+    /// A dataset the instance's catalogue declares: the instance, a colon, and
+    /// the dataset's key (coinbase-1:daily). 1 to 96 characters.
+    #[prost(string, tag = "3")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The venue the observation originated on, the venue master's ID; empty
+    /// when it is not venue-specific, which is the consolidated view.
+    #[prost(string, tag = "4")]
+    pub venue_id: ::prost::alloc::string::String,
+}
+/// One of the source's own timestamps.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SourceTime {
+    #[prost(enumeration = "SourceTimeKind", tag = "1")]
+    pub kind: i32,
+    /// That clock's reading, in UTC, as the source gave it.
+    #[prost(int64, tag = "2")]
+    pub at_ns: i64,
+}
+/// What a dataset in an answer is, once per answer rather than on every row
+/// (spec/the-lake, requirement 6).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DatasetRef {
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The instance that serves it.
+    #[prost(string, tag = "2")]
+    pub instance: ::prost::alloc::string::String,
+    /// Who originated the data, and who carried it when an aggregator did, as
+    /// the catalogue declares them.
+    #[prost(string, tag = "3")]
+    pub vendor: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub aggregator: ::prost::alloc::string::String,
+    /// The dataset's catalogue entry, as its instance declared it: set in a
+    /// listing of datasets (W10.9) and on an entitlements change (W10.1),
+    /// unset in a read's answer.
+    #[prost(message, optional, tag = "5")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::DatasetDeclaration>,
+}
+/// A price of one kind for one subject. An FX rate is the price of one
+/// currency's cash instrument in another (spec/the-lake, Q3); the lake never
+/// inverts or crosses a rate.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Price {
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<ObservationMeta>,
+    #[prost(enumeration = "PriceKind", tag = "2")]
+    pub kind: i32,
+    /// The price of one unit of the subject, in the asset it was quoted in.
+    #[prost(message, optional, tag = "3")]
+    pub price: ::core::option::Option<Money>,
+    #[prost(enumeration = "PriceBasis", tag = "4")]
+    pub basis: i32,
+}
+/// Open, high, low and close over an interval, the envelope's valid time: a
+/// daily bar names its business date. Empty `source.venue_id` is the
+/// consolidated view across venues.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bar {
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<ObservationMeta>,
+    /// One asset for all four, and for the vwap, or the bar is refused.
+    #[prost(message, optional, tag = "2")]
+    pub open: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "3")]
+    pub high: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "4")]
+    pub low: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "5")]
+    pub close: ::core::option::Option<Money>,
+    /// Eligible quantity over the interval, in units of the instrument, never
+    /// negative.
+    #[prost(message, optional, tag = "6")]
+    pub volume: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Volume-weighted average price over the interval; unset when the source
+    /// gives none.
+    #[prost(message, optional, tag = "7")]
+    pub vwap: ::core::option::Option<Money>,
+    /// Trades counted in the bar; unset when the source gives none.
+    #[prost(uint64, optional, tag = "8")]
+    pub trade_count: ::core::option::Option<u64>,
+}
+/// A batch of prices, recorded whole or refused naming the item and field:
+/// 1 to 500.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordPricesRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub prices: ::prost::alloc::vec::Vec<Price>,
+    /// The want these answer (W10.7), as it was delivered; empty for rows
+    /// recorded unasked.
+    #[prost(string, tag = "2")]
+    pub want_id: ::prost::alloc::string::String,
+}
+/// A batch of bars, recorded whole or refused naming the item and field:
+/// 1 to 500.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordBarsRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub bars: ::prost::alloc::vec::Vec<Bar>,
+    /// The want these answer, as it was delivered; empty for rows recorded
+    /// unasked.
+    #[prost(string, tag = "2")]
+    pub want_id: ::prost::alloc::string::String,
+}
+/// What a batch did, once it committed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordObservationsReply {
+    /// Rows recorded for the first time.
+    #[prost(uint32, tag = "1")]
+    pub recorded: u32,
+    /// Rows recorded as a new version of a row key held.
+    #[prost(uint32, tag = "2")]
+    pub restated: u32,
+    /// Rows identical to the version in force, which changed nothing.
+    #[prost(uint32, tag = "3")]
+    pub unchanged: u32,
+    /// The dataset's sequence once the batch committed.
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+}
+/// A price the lake recorded, on its dataset's subject: one row, with its
+/// version and sequence. Delivered latest value first per subject, dataset,
+/// kind and venue (conflated).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PricesRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub price: ::core::option::Option<Price>,
+}
+/// A bar the lake recorded, on its dataset's subject. Delivered latest value
+/// first per subject, dataset, venue and interval start (conflated).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BarsRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub bar: ::core::option::Option<Bar>,
+}
+/// Which datasets a read is answered from (the intent's Q4): exactly one of
+/// the deployment's default, named datasets, or every entitled dataset side by
+/// side. None set is the default.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceChoice {
+    /// The deployment's priority for the data type and kind, with failover.
+    #[prost(bool, tag = "1")]
+    pub default: bool,
+    /// These datasets, in this order: 0 to 16.
+    #[prost(string, repeated, tag = "2")]
+    pub named: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Every dataset the reader is entitled to, each row naming its own.
+    #[prost(bool, tag = "3")]
+    pub side_by_side: bool,
+}
+/// A subject, dataset or field a read could not serve, and why; the rest still
+/// answer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Unanswered {
+    #[prost(message, optional, tag = "1")]
+    pub subject: ::core::option::Option<SubjectRef>,
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The field by its dictionary entry; empty for the whole row.
+    #[prost(string, tag = "3")]
+    pub field: ::prost::alloc::string::String,
+    #[prost(enumeration = "UnansweredReason", tag = "4")]
+    pub reason: i32,
+}
+/// Prices for subjects, at one of: the latest in force at a valid time
+/// (`at_ns`, 0 for now); a business date; or a valid-time range, from
+/// inclusive to exclusive. Exactly one is given; none is the latest now.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPricesRequest {
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "1")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// Which kinds; empty for every kind.
+    #[prost(enumeration = "PriceKind", repeated, tag = "2")]
+    pub kinds: ::prost::alloc::vec::Vec<i32>,
+    #[prost(message, optional, tag = "3")]
+    pub sources: ::core::option::Option<SourceChoice>,
+    #[prost(int64, tag = "4")]
+    pub at_ns: i64,
+    #[prost(string, tag = "5")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub valid_from_ns: i64,
+    #[prost(int64, tag = "7")]
+    pub valid_until_ns: i64,
+    /// The recorded-time cut-off, 0 for now: what the lake knew then.
+    #[prost(int64, tag = "8")]
+    pub as_of_ns: i64,
+    /// At most 500 rows, 100 when 0.
+    #[prost(uint32, tag = "9")]
+    pub page_size: u32,
+    #[prost(string, tag = "10")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPricesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub prices: ::prost::alloc::vec::Vec<Price>,
+    /// What could not be served, each with its reason; a default read's
+    /// fallback names why the datasets above it did not answer.
+    #[prost(message, repeated, tag = "2")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    /// Each dataset the answer includes.
+    #[prost(message, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    /// The sequence per dataset partition the read was answered at.
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+    /// Empty when the read is exhausted.
+    #[prost(string, tag = "5")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// Bars for subjects, at a valid time, a business date or a range, as a
+/// price's read.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBarsRequest {
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "1")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// The bars' length; 0 for every length.
+    #[prost(int64, tag = "2")]
+    pub interval_ns: i64,
+    #[prost(message, optional, tag = "3")]
+    pub sources: ::core::option::Option<SourceChoice>,
+    #[prost(int64, tag = "4")]
+    pub at_ns: i64,
+    #[prost(string, tag = "5")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub valid_from_ns: i64,
+    #[prost(int64, tag = "7")]
+    pub valid_until_ns: i64,
+    #[prost(int64, tag = "8")]
+    pub as_of_ns: i64,
+    /// At most 500 rows, 100 when 0.
+    #[prost(uint32, tag = "9")]
+    pub page_size: u32,
+    #[prost(string, tag = "10")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBarsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub bars: ::prost::alloc::vec::Vec<Bar>,
+    #[prost(message, repeated, tag = "2")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    #[prost(message, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+    #[prost(string, tag = "5")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// What the lake asks of the instance serving a dataset. Coalesced: readers'
+/// identical wants are one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObservationsWantedEvent {
+    /// The want's identifier, which the rows recorded for it name.
+    #[prost(string, tag = "1")]
+    pub want_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The data type, by its message's full name: meridian.v1.Price or
+    /// meridian.v1.Bar.
+    #[prost(string, tag = "3")]
+    pub data_type: ::prost::alloc::string::String,
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "4")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// For prices, which kinds; empty for every kind.
+    #[prost(enumeration = "PriceKind", repeated, tag = "5")]
+    pub kinds: ::prost::alloc::vec::Vec<i32>,
+    /// For bars, the bars' length.
+    #[prost(int64, tag = "6")]
+    pub interval_ns: i64,
+    /// The business date wanted, or the valid-time range; neither for the
+    /// latest.
+    #[prost(string, tag = "7")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub valid_from_ns: i64,
+    #[prost(int64, tag = "9")]
+    pub valid_until_ns: i64,
+    /// Keep the subjects current until the want is withdrawn (W10.7).
+    #[prost(bool, tag = "10")]
+    pub standing: bool,
+}
+/// A standing want no reader has asked within the dataset's cadence.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WantWithdrawnEvent {
+    #[prost(string, tag = "1")]
+    pub want_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+}
+/// What a `dgm` cannot serve of a want, per subject, with its reason.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeclineWantRequest {
+    #[prost(string, tag = "1")]
+    pub want_id: ::prost::alloc::string::String,
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "2")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// not_covered, source_silent or beyond_history.
+    #[prost(enumeration = "UnansweredReason", tag = "3")]
+    pub reason: i32,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DeclineWantReply {}
+/// A plugin instance's entitlement to a dataset, as the conductor keeps it
+/// (W10.1). Set by a deployment admin; never sent to the platform.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DatasetEntitlement {
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The plugin instance entitled.
+    #[prost(string, tag = "2")]
+    pub instance: ::prost::alloc::string::String,
+    /// Whether it may read the dataset; false withdraws it.
+    #[prost(bool, tag = "3")]
+    pub allowed: bool,
+    /// The fields it may read, by their dictionary entries; empty for every
+    /// field. At most 64.
+    #[prost(string, repeated, tag = "4")]
+    pub fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Who set it and when, the deployment-local subject the dashboard
+    /// stamped; the delegation and client a person acted through, empty in a
+    /// browser; and why. Each change is its own record (decisions/031).
+    #[prost(string, tag = "5")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub updated_at_ns: i64,
+    #[prost(string, tag = "7")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub client_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The deployment's priority for one data type and price kind: an ordered list
+/// of datasets a default read takes, with failover (W10.2). Journalled by the
+/// lake.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourcePriority {
+    /// By its message's full name: meridian.v1.Price or meridian.v1.Bar.
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    /// For prices, the kind; unspecified for bars.
+    #[prost(enumeration = "PriceKind", tag = "2")]
+    pub kind: i32,
+    /// First to last. At most 16.
+    #[prost(string, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub updated_at_ns: i64,
+    #[prost(string, tag = "6")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub client_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A deployment admin sets the priority for a data type and kind, replacing
+/// it whole.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetSourcePriorityRequest {
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    #[prost(enumeration = "PriceKind", tag = "2")]
+    pub kind: i32,
+    /// At most 16.
+    #[prost(string, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why, kept with the change's record (decisions/031). Through /mcp every
+    /// change carries one.
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+    /// The priority's `updated_at_ns` as it was read: refused when it has
+    /// changed since (contract v17's stale guard). 0 when none was set.
+    #[prost(int64, tag = "5")]
+    pub against_updated_at_ns: i64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListSourcePrioritiesRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSourcePrioritiesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub priorities: ::prost::alloc::vec::Vec<SourcePriority>,
+}
+/// The datasets a reader may read, with their catalogue entries; and, to the
+/// dashboard, every dataset with its licence and entitlements.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListDatasetsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDatasetsReply {
+    /// Each with its declaration.
+    #[prost(message, repeated, tag = "1")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    /// Each dataset's licence: to the dashboard; to a plugin, those of the
+    /// datasets it may read.
+    #[prost(message, repeated, tag = "2")]
+    pub licences: ::prost::alloc::vec::Vec<::meridian_pb::v1::DatasetLicence>,
+    /// To the dashboard every entitlement; to a plugin, its own.
+    #[prost(message, repeated, tag = "3")]
+    pub entitlements: ::prost::alloc::vec::Vec<DatasetEntitlement>,
+}
+/// Which of the source's clocks a timestamp is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SourceTimeKind {
+    /// Refused.
+    Unspecified = 0,
+    /// When it happened at its origin.
+    Event = 1,
+    /// When a consolidator published it.
+    Consolidated = 2,
+    /// When a reporting facility received it.
+    Reported = 3,
+    /// When the vendor received it.
+    VendorReceived = 4,
+    /// When the source released it: a close, a panel, a model.
+    Published = 5,
+}
+impl SourceTimeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SOURCE_TIME_KIND_UNSPECIFIED",
+            Self::Event => "SOURCE_TIME_KIND_EVENT",
+            Self::Consolidated => "SOURCE_TIME_KIND_CONSOLIDATED",
+            Self::Reported => "SOURCE_TIME_KIND_REPORTED",
+            Self::VendorReceived => "SOURCE_TIME_KIND_VENDOR_RECEIVED",
+            Self::Published => "SOURCE_TIME_KIND_PUBLISHED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SOURCE_TIME_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SOURCE_TIME_KIND_EVENT" => Some(Self::Event),
+            "SOURCE_TIME_KIND_CONSOLIDATED" => Some(Self::Consolidated),
+            "SOURCE_TIME_KIND_REPORTED" => Some(Self::Reported),
+            "SOURCE_TIME_KIND_VENDOR_RECEIVED" => Some(Self::VendorReceived),
+            "SOURCE_TIME_KIND_PUBLISHED" => Some(Self::Published),
+            _ => None,
+        }
+    }
+}
+/// Which price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PriceKind {
+    /// Refused.
+    Unspecified = 0,
+    /// The dataset's declared close for the business date: the official close
+    /// where the venue has one, otherwise the last price of the day the
+    /// dataset declares.
+    Close = 1,
+    /// The last eligible trade's price at the valid time.
+    Last = 2,
+    /// A fund's net asset value per share, for the business date.
+    Nav = 3,
+    /// A contract's settlement price, for the business date.
+    Settlement = 4,
+    /// The best bid at the valid time, or the business date's closing bid.
+    Bid = 5,
+    /// The best ask at the valid time, or the business date's closing ask.
+    Ask = 6,
+    /// The mid at the valid time, or the business date's closing mid.
+    Mid = 7,
+}
+impl PriceKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRICE_KIND_UNSPECIFIED",
+            Self::Close => "PRICE_KIND_CLOSE",
+            Self::Last => "PRICE_KIND_LAST",
+            Self::Nav => "PRICE_KIND_NAV",
+            Self::Settlement => "PRICE_KIND_SETTLEMENT",
+            Self::Bid => "PRICE_KIND_BID",
+            Self::Ask => "PRICE_KIND_ASK",
+            Self::Mid => "PRICE_KIND_MID",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRICE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRICE_KIND_CLOSE" => Some(Self::Close),
+            "PRICE_KIND_LAST" => Some(Self::Last),
+            "PRICE_KIND_NAV" => Some(Self::Nav),
+            "PRICE_KIND_SETTLEMENT" => Some(Self::Settlement),
+            "PRICE_KIND_BID" => Some(Self::Bid),
+            "PRICE_KIND_ASK" => Some(Self::Ask),
+            "PRICE_KIND_MID" => Some(Self::Mid),
+            _ => None,
+        }
+    }
+}
+/// What one unit of a price is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PriceBasis {
+    /// Refused.
+    Unspecified = 0,
+    /// Per unit of the subject.
+    PerUnit = 1,
+}
+impl PriceBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRICE_BASIS_UNSPECIFIED",
+            Self::PerUnit => "PRICE_BASIS_PER_UNIT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRICE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRICE_BASIS_PER_UNIT" => Some(Self::PerUnit),
+            _ => None,
+        }
+    }
+}
+/// Why a part of a read was not answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum UnansweredReason {
+    /// Refused.
+    Unspecified = 0,
+    /// The reader is not entitled to the dataset, or the field.
+    NotEntitled = 1,
+    /// No dataset covers the subject.
+    NotCovered = 2,
+    /// The lake asked the dataset's source for it (W10.7); the reader hears the
+    /// rows once recorded.
+    AskedSource = 3,
+    /// The dataset recorded nothing for the subject within its cadence.
+    SourceSilent = 4,
+    /// The subject is not one the deployment's entities resolve.
+    Unresolved = 5,
+    /// Older than the history the dataset reaches, or the lake keeps.
+    BeyondHistory = 6,
+    /// The dataset's licence forbids keeping it, and it was served, not kept.
+    NotKept = 7,
+}
+impl UnansweredReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "UNANSWERED_REASON_UNSPECIFIED",
+            Self::NotEntitled => "UNANSWERED_REASON_NOT_ENTITLED",
+            Self::NotCovered => "UNANSWERED_REASON_NOT_COVERED",
+            Self::AskedSource => "UNANSWERED_REASON_ASKED_SOURCE",
+            Self::SourceSilent => "UNANSWERED_REASON_SOURCE_SILENT",
+            Self::Unresolved => "UNANSWERED_REASON_UNRESOLVED",
+            Self::BeyondHistory => "UNANSWERED_REASON_BEYOND_HISTORY",
+            Self::NotKept => "UNANSWERED_REASON_NOT_KEPT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNANSWERED_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "UNANSWERED_REASON_NOT_ENTITLED" => Some(Self::NotEntitled),
+            "UNANSWERED_REASON_NOT_COVERED" => Some(Self::NotCovered),
+            "UNANSWERED_REASON_ASKED_SOURCE" => Some(Self::AskedSource),
+            "UNANSWERED_REASON_SOURCE_SILENT" => Some(Self::SourceSilent),
+            "UNANSWERED_REASON_UNRESOLVED" => Some(Self::Unresolved),
+            "UNANSWERED_REASON_BEYOND_HISTORY" => Some(Self::BeyondHistory),
+            "UNANSWERED_REASON_NOT_KEPT" => Some(Self::NotKept),
+            _ => None,
+        }
+    }
+}
 /// Published by the dashboard at each sign-in and kept by the conductor, for
 /// the access table (W4.10) and the per-plugin count. Only people who have
 /// signed in are in it, and it never leaves the deployment.
@@ -6172,6 +7118,57 @@ pub struct PluginConfigurationChangedEvent {
     #[prost(string, tag = "1")]
     pub plugin_instance_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "2")]
+    pub changed_at_ns: i64,
+}
+/// A deployment admin licenses a dataset: confirms or replaces the terms its
+/// catalogue declares (DatasetDeclaration.licence_default). Answered by the
+/// licence as recorded.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetDatasetLicenceRequest {
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The terms; its dataset and who set it are the request's and the
+    /// dashboard's, whatever it carries.
+    #[prost(message, optional, tag = "2")]
+    pub licence: ::core::option::Option<::meridian_pb::v1::DatasetLicence>,
+    /// Why, kept with the change's record (decisions/031). Through /mcp every
+    /// change carries one.
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A deployment admin entitles a plugin instance to a dataset, all fields or
+/// some, or withdraws it. Answered by the entitlement as recorded.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetDatasetEntitlementRequest {
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub instance: ::prost::alloc::string::String,
+    /// False withdraws the entitlement.
+    #[prost(bool, tag = "3")]
+    pub allowed: bool,
+    /// By their dictionary entries; empty for every field. At most 64.
+    #[prost(string, repeated, tag = "4")]
+    pub fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why, kept with the change's record. Through /mcp every change carries
+    /// one.
+    #[prost(string, tag = "5")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The deployment's data configuration changed: every launched dataset with
+/// its catalogue entry, every licence and every entitlement, whole. The lake
+/// answers and keeps by it; each sidecar keeps its own plugin's entitlements
+/// and strips what its plugin may not read. Published on every change and on
+/// the conductor's start.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EntitlementsChangedEvent {
+    #[prost(message, repeated, tag = "1")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    #[prost(message, repeated, tag = "2")]
+    pub licences: ::prost::alloc::vec::Vec<::meridian_pb::v1::DatasetLicence>,
+    #[prost(message, repeated, tag = "3")]
+    pub entitlements: ::prost::alloc::vec::Vec<DatasetEntitlement>,
+    #[prost(int64, tag = "4")]
     pub changed_at_ns: i64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

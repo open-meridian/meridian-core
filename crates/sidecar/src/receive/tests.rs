@@ -113,6 +113,7 @@ async fn a_change_in_the_scope_is_delivered_typed_with_what_is_known_of_it() {
     let mut stream = sidecar
         .receive(Request::new(plugin::ReceiveRequest {
             rows: vec!["CustodialPositionUpdated".into()],
+            subjects: Vec::new(),
         }))
         .await
         .unwrap()
@@ -200,6 +201,7 @@ async fn a_row_its_roles_do_not_hear_is_refused_naming_it() {
     let refused = sidecar
         .receive(Request::new(plugin::ReceiveRequest {
             rows: vec!["InstrumentApplied".into()],
+            subjects: Vec::new(),
         }))
         .await
         .err()
@@ -214,6 +216,7 @@ async fn a_row_its_roles_do_not_hear_is_refused_naming_it() {
     let refused = custody
         .receive(Request::new(plugin::ReceiveRequest {
             rows: vec!["StatementRecorded".into()],
+            subjects: Vec::new(),
         }))
         .await
         .err()

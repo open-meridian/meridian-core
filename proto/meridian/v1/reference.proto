@@ -4,6 +4,8 @@
 // Derived from workflows W1 (security master administration) and W3 (instrument
 // resolution and completion in a deployment; contract v10, decisions/030: a
 // deployment mints its own instrument IDs, and a person completes its records).
+// From contract v18 also the venue master: the platform's own record of each
+// venue, which deployments pull and never mint (W1.16 to W1.19, W3.14, W3.15).
 // Every message here traces to a matrix row; see matrix/matrix.tsv.
 //
 // The scope boundary is load-bearing: this is identity, mapping and structure.
@@ -191,6 +193,9 @@ message InstrumentRecord {
   string currency = 4;
 
   // ISO 10383 market identifier code. Empty where there is no listing venue.
+  // Deprecated from contract v18 for `listing_venue_id`, the venue master's
+  // ID, of which the MIC is one identifier; read until the platform's and
+  // the deployments' records carry venue IDs.
   string exchange_mic = 5;
 
   string description = 6;
@@ -228,6 +233,11 @@ message InstrumentRecord {
   // A money market fund's attributes (contract v11); set only on a record
   // whose type is money market fund.
   MoneyMarketFund money_market_fund = 15;
+
+  // The venue it is listed on, the venue master's ID (contract v18): a
+  // segment's venue where the listing is on one. Empty where it is listed
+  // on no venue, or its venue is not yet known.
+  string listing_venue_id = 16;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
@@ -323,6 +333,183 @@ message OfferedValue {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The venue master, contract v18
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// plans/the-lake-prices-the-book, "Refreshed 2026-10-09", ruling 2: the
+// platform keeps a venue master beside the security master, each venue under
+// its own ID, the ISO 10383 MIC one optional identifier among them and vendor
+// codes allowed. Deployments pull venues; a deployment or a plugin never mints
+// one. A new venue is a new record, never a schema change.
+
+// What kind of venue it is. A closed list, grown by revision.
+enum VenueKind {
+  VENUE_KIND_UNSPECIFIED = 0;
+
+  // A regulated exchange.
+  VENUE_KIND_EXCHANGE = 1;
+
+  // An alternative trading system, or a multilateral trading facility.
+  VENUE_KIND_ALTERNATIVE_TRADING_SYSTEM = 2;
+
+  // An exchange of crypto assets.
+  VENUE_KIND_CRYPTO_EXCHANGE = 3;
+
+  // A network of dealers quoting on request, over the counter or by
+  // indication: RFQ, OTC and, for now, IOI networks.
+  VENUE_KIND_DEALER_NETWORK = 4;
+
+  // A facility trades are reported to, not traded on: a trade reporting
+  // facility, an alternative display facility, an approved publication
+  // arrangement.
+  VENUE_KIND_REPORTING_FACILITY = 5;
+}
+
+// The venue master's record of one venue (W1.16). The platform mints its ID;
+// a deployment keeps what it pulled (W3.5) and answers it (W3.14).
+message VenueRecord {
+  // The venue's ID for life, "VEN-...", minted by the platform.
+  string venue_id = 1;
+
+  string name = 2;
+
+  // ISO 3166-1 alpha-2: where the venue operates.
+  string country_code = 3;
+
+  VenueKind kind = 4;
+
+  // Its identifiers: an ISO 10383 MIC under the scheme `iso10383`, operating
+  // or segment, where it has one; a vendor's code as a `symbol` with its
+  // source. In force from `valid_from_ns`. An amend replaces them.
+  repeated Identifier identifiers = 5;
+
+  // A segment's operating venue, the venue master's ID; empty for a venue
+  // that is its own operating venue.
+  string operating_venue_id = 6;
+
+  // An IANA time zone: the venue's local time, which its sessions and a
+  // business date at it are in.
+  string time_zone = 7;
+
+  // Monotonic, assigned by the platform, starting at 1.
+  int64 version = 8;
+
+  // When this version became true.
+  int64 valid_from_ns = 9;
+
+  // When the platform recorded it. Stamped by the platform, never accepted
+  // from a caller.
+  int64 record_time_ns = 10;
+
+  // Active, or decommissioned: an expired MIC is a decommissioned venue,
+  // which still resolves for a date it was in force. The security master's
+  // lifecycle; a venue is never in its define state.
+  InstrumentLifecycleState lifecycle_state = 11;
+}
+
+// W1.16: a curator, a person or the curator agent, records a venue it has
+// vetted. Answered by the venue's record.
+message DefineVenueRequest {
+  string name = 1;
+  // ISO 3166-1 alpha-2.
+  string country_code = 2;
+  // Required: a kind the enum defines.
+  VenueKind kind = 3;
+  repeated Identifier identifiers = 4;
+  string operating_venue_id = 5;
+  // Required: an IANA time zone.
+  string time_zone = 6;
+  // Zero means now.
+  int64 valid_from_ns = 7;
+  // Where the writer found what it wrote, and its change note, as an
+  // instrument's define has them: required from an agent.
+  string source = 8;
+  string note = 9;
+}
+
+// W1.17: an authoritative replace of a venue's values, as an instrument's
+// amend is: an identifier absent here is removed as of `valid_from_ns`.
+message AmendVenueRequest {
+  string venue_id = 1;
+  string name = 2;
+  string country_code = 3;
+  VenueKind kind = 4;
+  repeated Identifier identifiers = 5;
+  string operating_venue_id = 6;
+  string time_zone = 7;
+  int64 valid_from_ns = 8;
+  string source = 9;
+  string note = 10;
+
+  // Active, or decommissioned as of `valid_from_ns`, when its MIC expired
+  // or it closed. Unspecified leaves it as it was.
+  InstrumentLifecycleState lifecycle_state = 11;
+}
+
+// W1.18: the venues the master holds, a page at a time.
+message ListVenuesRequest {
+  // Unspecified lists every kind.
+  VenueKind kind = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message ListVenuesReply {
+  repeated VenueRecord venues = 1;
+  // Empty when the listing is exhausted.
+  string next_cursor = 2;
+}
+
+// W1.19: any identifier value, of any scheme, or a name; resolved as of a
+// date. Answered as a listing.
+message SearchVenuesRequest {
+  string query = 1;
+  // Zero means now.
+  int64 as_of_ns = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+// W3.14: which venue a set of identifiers names on a date, in the venues the
+// deployment holds.
+message ResolveVenueRequest {
+  // At least one: a MIC under `iso10383`, or a vendor's code as a `symbol`
+  // with its source.
+  repeated Identifier identifiers = 1;
+
+  // Reference time. Zero means now.
+  int64 as_of_ns = 2;
+}
+
+message ResolveVenueReply {
+  bool found = 1;
+  VenueRecord venue = 2;
+  // Set only when found is false.
+  MissReason miss_reason = 3;
+}
+
+// W3.15: a venue a plugin's source named resolved to none the deployment
+// holds. A fact, not a request: the plugin keeps the venue as reported and
+// continues; the deployment asks the platform, and the plugin resolves again
+// once the venue is held.
+message MissingVenueDetectedEvent {
+  // The namespace the miss occurred in, e.g. a plugin's registry name.
+  string source = 1;
+
+  // Everything the publisher held of the venue.
+  repeated Identifier identifiers = 2;
+
+  // Reference time of the missed resolve.
+  int64 as_of_ns = 3;
+
+  // Stamped by the sidecar.
+  string publisher_instance_id = 4;
+
+  MissReason reason = 5;
+  int64 observed_at_ns = 6;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W1 — administration
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -332,6 +519,7 @@ message DefineInstrumentRequest {
   // does not define, is refused.
   AssetClass asset_class = 9;
   string currency = 3;
+  // Deprecated from contract v18 for `listing_venue_id`.
   string exchange_mic = 4;
   string description = 5;
 
@@ -344,6 +532,10 @@ message DefineInstrumentRequest {
   // agents-keep-the-security-master, requirements 27 and 28.
   string source = 7;
   string note = 8;
+
+  // The venue it is listed on, the venue master's ID (contract v18). A venue
+  // the master does not hold is refused, naming it.
+  string listing_venue_id = 10;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
@@ -361,6 +553,7 @@ message AmendInstrumentRequest {
   // instrument is a stub that has none.
   AssetClass asset_class = 10;
   string currency = 4;
+  // Deprecated from contract v18 for `listing_venue_id`.
   string exchange_mic = 5;
   string description = 6;
   int64 valid_from_ns = 7;
@@ -371,6 +564,10 @@ message AmendInstrumentRequest {
   // agents-keep-the-security-master, requirements 27 and 28.
   string source = 8;
   string note = 9;
+
+  // The venue it is listed on, the venue master's ID (contract v18). A venue
+  // the master does not hold is refused, naming it.
+  string listing_venue_id = 11;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
@@ -744,6 +941,12 @@ message PullInstrumentReply {
   bool found = 1;
   InstrumentRecord instrument = 2;
 
+  // The venues the platform's answer names (contract v18): the instrument's
+  // listing venue and that venue's operating venue, each the venue master's
+  // record, which the instrument store keeps (W3.5). A deployment holds every
+  // venue a record it keeps names, and mints none.
+  repeated VenueRecord venues = 4;
+
   // On the instrument-pulled event: the deployment's record a person asked
   // about (W3.3), on which the instrument store keeps this record's values
   // as offers and adds its ID as an identifier, never replacing the
@@ -757,6 +960,14 @@ message PullIdentifierReply {
   bool found = 1;
   InstrumentRecord instrument = 2;
   MissReason miss_reason = 3;
+
+  // The venues the answer names (contract v18): an instrument's listing
+  // venue and its operating venue; or, asked by a venue's identifiers (a MIC
+  // under `iso10383`, a vendor's code as a `symbol` with its source, W3.15),
+  // the venue they name, with no instrument. One venue at a time, on demand:
+  // never the whole list, which ISO 10383's terms forbid reproducing for
+  // third parties.
+  repeated VenueRecord venues = 4;
 }
 
 // The platform's surface for pairing a deployment's ID with an instrument

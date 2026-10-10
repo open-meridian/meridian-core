@@ -180,6 +180,7 @@ fn holding(external: &str) -> RecordHoldingParams {
         market_value: Some(Money {
             amount: Some(wire("20000.00")),
             currency_code: "USD".into(),
+            instrument_id: String::new(),
         }),
         external_account_id: external.into(),
         side: HoldingSide::Long as i32,
@@ -282,6 +283,7 @@ async fn a_number_the_wire_does_not_carry_is_refused_naming_its_field() {
             scale: 0,
         }),
         currency_code: "USD".into(),
+        instrument_id: String::new(),
     });
     let refused = sidecar
         .record_holding(Request::new(too_wide))
@@ -1571,6 +1573,7 @@ fn statement(external: &str) -> RecordHoldingsStatementParams {
             buying_power: Some(Money {
                 amount: Some(wire("25000.00")),
                 currency_code: "USD".into(),
+                instrument_id: String::new(),
             }),
             ..Default::default()
         }],
@@ -1621,6 +1624,7 @@ async fn a_statement_from_a_plugin_before_v7_is_admitted_with_no_account() {
             buying_power: Some(Money {
                 amount: Some(wire("25000.00")),
                 currency_code: "USD".into(),
+                instrument_id: String::new(),
             }),
             ..Default::default()
         }))
@@ -1641,6 +1645,7 @@ async fn a_statements_figures_that_cannot_stand_are_refused_naming_the_field() {
     both.buying_power = Some(Money {
         amount: Some(wire("1")),
         currency_code: "USD".into(),
+        instrument_id: String::new(),
     });
     let refused = sidecar
         .record_holdings_statement(Request::new(both))

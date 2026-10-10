@@ -47,6 +47,7 @@ fn usd(text: &str) -> Option<Money> {
     Some(Money {
         amount: d(text),
         currency_code: "USD".into(),
+        instrument_id: String::new(),
     })
 }
 

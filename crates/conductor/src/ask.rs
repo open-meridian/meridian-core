@@ -129,6 +129,9 @@ impl Conductor {
                 found: true,
                 instrument: Some(record.clone()),
                 for_instrument_id: request.instrument_id.clone(),
+                // The venues the platform's answer names (contract v18,
+                // W3.5): carried once the conductor pulls them (row 4).
+                venues: Vec::new(),
             }
             .encode_to_vec(),
             Some(correlation).filter(|c| !c.is_empty()),

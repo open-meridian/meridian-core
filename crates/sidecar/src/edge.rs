@@ -643,6 +643,7 @@ mod tests {
                 retention_days: 2555,
                 ..Default::default()
             }),
+            catalogue: None,
         };
         assert_eq!(declaration_refused(&declaration, &settings, &custody), None);
         assert!(

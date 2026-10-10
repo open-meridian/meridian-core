@@ -150,6 +150,7 @@ fn opening(account: &str, instrument: &str) -> RecordOpeningBalanceRequest {
                     cost: Some(Money {
                         amount: d("2250.00"),
                         currency_code: "USD".into(),
+                        instrument_id: String::new(),
                     }),
                     acquired_date: "2025-03-14".into(),
                     ..Default::default()
@@ -360,6 +361,7 @@ async fn a_rebuild_reproduces_every_projection() {
                         cost: Some(Money {
                             amount: d("567.50"),
                             currency_code: "USD".into(),
+                            instrument_id: String::new(),
                         }),
                         acquired_date: "2026-09-09".into(),
                         ..Default::default()

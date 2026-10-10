@@ -380,6 +380,7 @@ fn version(name: &str, version: &str) -> PluginVersion {
                     retention_days: 2555,
                     ..Default::default()
                 }),
+                catalogue: None,
             }),
         }),
         image_digest: format!("sha256:{}", "a".repeat(64)),

@@ -104,6 +104,9 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 })
                 .collect(),
         }),
+        // A dgm's catalogue (W8.1, contract v18): read from the version's
+        // metadata once the lake is built (row 4).
+        catalogue: None,
     })
 }
 
@@ -249,6 +252,7 @@ mod tests {
                 retention_days: 30,
                 ..Default::default()
             }),
+            catalogue: None,
         };
         let seen = [NotCarriedSeen {
             scheme: "snaptrade:position".into(),

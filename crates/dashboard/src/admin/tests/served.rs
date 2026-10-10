@@ -431,6 +431,7 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
                     },
                 ],
             }),
+            catalogue: None,
         }),
         stored: vec![
             StoredSpan {

@@ -27,6 +27,10 @@ import "meridian/v1/sidecar.proto";
 // An instance's archive (W8.7, contract v16), which the moves' read carries.
 import "meridian/v1/plugins.proto";
 
+// A dataset's entitlements and its catalogue entry (W10.1, contract v18),
+// which an entitlements change carries.
+import "meridian/v1/lake.proto";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // W6.1 — who has signed in
 // ─────────────────────────────────────────────────────────────────────────────
@@ -537,4 +541,56 @@ message PluginConfiguration {
 message PluginConfigurationChangedEvent {
   string plugin_instance_id = 1;
   int64 changed_at_ns = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.1 — a dataset's licence and its entitlements, contract v18
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Kept by the conductor beside the plugins' configuration, set by a deployment
+// admin at the dashboard's Data sources page or through its tools, and never
+// sent to the platform (spec/the-lake, requirements 12 to 14).
+
+// A deployment admin licenses a dataset: confirms or replaces the terms its
+// catalogue declares (DatasetDeclaration.licence_default). Answered by the
+// licence as recorded.
+message SetDatasetLicenceRequest {
+  string dataset = 1;
+
+  // The terms; its dataset and who set it are the request's and the
+  // dashboard's, whatever it carries.
+  DatasetLicence licence = 2;
+
+  // Why, kept with the change's record (decisions/031). Through /mcp every
+  // change carries one.
+  string note = 3;
+}
+
+// A deployment admin entitles a plugin instance to a dataset, all fields or
+// some, or withdraws it. Answered by the entitlement as recorded.
+message SetDatasetEntitlementRequest {
+  string dataset = 1;
+  string instance = 2;
+
+  // False withdraws the entitlement.
+  bool allowed = 3;
+
+  // By their dictionary entries; empty for every field. At most 64.
+  repeated string fields = 4;
+
+  // Why, kept with the change's record. Through /mcp every change carries
+  // one.
+  string note = 5;
+}
+
+// The deployment's data configuration changed: every launched dataset with
+// its catalogue entry, every licence and every entitlement, whole. The lake
+// answers and keeps by it; each sidecar keeps its own plugin's entitlements
+// and strips what its plugin may not read. Published on every change and on
+// the conductor's start.
+message EntitlementsChangedEvent {
+  repeated DatasetRef datasets = 1;
+  repeated DatasetLicence licences = 2;
+  repeated DatasetEntitlement entitlements = 3;
+  int64 changed_at_ns = 4;
 }

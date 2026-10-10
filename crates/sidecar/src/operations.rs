@@ -479,6 +479,162 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-account-attributes", "meridian.v1.ListAccountAttributesRequest", message, account, None).await
     }
 
+    /// W3.14: `platform.reference.query.resolve-venue` (preview).
+    async fn resolve_venue(
+        &self,
+        request: Request<plugin::ResolveVenueParams>,
+    ) -> Result<Response<plugin::ResolveVenueResult>, Status> {
+        let message: domain::ResolveVenueRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.resolve-venue", "meridian.v1.ResolveVenueRequest", message, account, None).await
+    }
+
+    /// W3.15: `platform.reference.event.venue-missing` (preview).
+    async fn report_missing_venue(
+        &self,
+        request: Request<plugin::ReportMissingVenueParams>,
+    ) -> Result<Response<plugin::Published>, Status> {
+        let mut message: domain::MissingVenueDetectedEvent = self.as_domain(request.into_inner())?;
+        self.known("reason", message.reason, domain::MissReason::try_from(message.reason).is_ok())?;
+        message.publisher_instance_id = self.instance_id().to_string();
+        self.publish_typed("platform.reference.event.venue-missing", "meridian.v1.MissingVenueDetectedEvent", message).await
+    }
+
+    /// W10.4: `platform.lake.command.record-prices` (preview).
+    async fn record_prices(
+        &self,
+        request: Request<plugin::RecordPricesParams>,
+    ) -> Result<Response<plugin::RecordPricesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordPricesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_PRICES_REQUEST_PRICES_COUNT;
+        if !bound.admits(message.prices.len()) {
+            let refusal = format!(
+                "prices holds {} rows; a batch is {} to {}",
+                message.prices.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.prices.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("prices[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+            }
+            self.known(&format!("prices[{i0}].kind"), held0.kind, domain::PriceKind::try_from(held0.kind).is_ok())?;
+            self.exact_money(&format!("prices[{i0}].price"), held0.price.as_ref())?;
+            self.known(&format!("prices[{i0}].basis"), held0.basis, domain::PriceBasis::try_from(held0.basis).is_ok())?;
+        }
+        for stamped0 in message.prices.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.prices.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-prices", "meridian.v1.RecordPricesRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-bars` (preview).
+    async fn record_bars(
+        &self,
+        request: Request<plugin::RecordBarsParams>,
+    ) -> Result<Response<plugin::RecordBarsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordBarsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_BARS_REQUEST_BARS_COUNT;
+        if !bound.admits(message.bars.len()) {
+            let refusal = format!(
+                "bars holds {} rows; a batch is {} to {}",
+                message.bars.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.bars.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("bars[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+            }
+            self.exact_money(&format!("bars[{i0}].open"), held0.open.as_ref())?;
+            self.exact_money(&format!("bars[{i0}].high"), held0.high.as_ref())?;
+            self.exact_money(&format!("bars[{i0}].low"), held0.low.as_ref())?;
+            self.exact_money(&format!("bars[{i0}].close"), held0.close.as_ref())?;
+            self.exact(&format!("bars[{i0}].volume"), held0.volume.as_ref())?;
+            self.exact_money(&format!("bars[{i0}].vwap"), held0.vwap.as_ref())?;
+        }
+        for stamped0 in message.bars.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.bars.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-bars", "meridian.v1.RecordBarsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-prices` (preview).
+    async fn list_prices(
+        &self,
+        request: Request<plugin::ListPricesParams>,
+    ) -> Result<Response<plugin::ListPricesResult>, Status> {
+        let message: domain::ListPricesRequest = self.as_domain(request.into_inner())?;
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::PriceKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-prices", "meridian.v1.ListPricesRequest", message, account, None).await
+    }
+
+    /// W10.6: `platform.lake.query.list-bars` (preview).
+    async fn list_bars(
+        &self,
+        request: Request<plugin::ListBarsParams>,
+    ) -> Result<Response<plugin::ListBarsResult>, Status> {
+        let message: domain::ListBarsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-bars", "meridian.v1.ListBarsRequest", message, account, None).await
+    }
+
+    /// W10.7: `platform.lake.command.decline-want` (preview).
+    async fn decline_want(
+        &self,
+        request: Request<plugin::DeclineWantParams>,
+    ) -> Result<Response<plugin::DeclineWantResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::DeclineWantRequest = self.as_domain(params)?;
+        self.known("reason", message.reason, domain::UnansweredReason::try_from(message.reason).is_ok())?;
+        let account = None;
+        self.command_typed("platform.lake.command.decline-want", "meridian.v1.DeclineWantRequest", message, account, acting_for).await
+    }
+
+    /// W10.9: `platform.lake.query.list-datasets` (preview).
+    async fn list_datasets(
+        &self,
+        request: Request<plugin::ListDatasetsParams>,
+    ) -> Result<Response<plugin::ListDatasetsResult>, Status> {
+        let message: domain::ListDatasetsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-datasets", "meridian.v1.ListDatasetsRequest", message, account, None).await
+    }
+
     type ReceiveStream = crate::receive::Deliveries;
 
     /// W4.3: every row this plugin's roles hear, within its read scope.
@@ -556,6 +712,34 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.street.event.activity-re-resolved",
         payload_type: "meridian.v1.ActivityReResolvedEvent",
         read: activity_re_resolved,
+    },
+    crate::receive::Row {
+        name: "PricesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.prices-recorded",
+        payload_type: "meridian.v1.PricesRecordedEvent",
+        read: prices_recorded,
+    },
+    crate::receive::Row {
+        name: "BarsRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.bars-recorded",
+        payload_type: "meridian.v1.BarsRecordedEvent",
+        read: bars_recorded,
+    },
+    crate::receive::Row {
+        name: "ObservationsWanted",
+        step: "W10.7",
+        topic: "platform.lake.event.observations-wanted",
+        payload_type: "meridian.v1.ObservationsWantedEvent",
+        read: observations_wanted,
+    },
+    crate::receive::Row {
+        name: "WantWithdrawn",
+        step: "W10.7",
+        topic: "platform.lake.event.want-withdrawn",
+        payload_type: "meridian.v1.WantWithdrawnEvent",
+        read: want_withdrawn,
     },
 ];
 
@@ -655,5 +839,49 @@ fn activity_re_resolved(payload: &[u8]) -> Result<crate::receive::Read, prost::D
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::ActivityReResolved(message),
+    })
+}
+
+/// W10.5: a PricesRecordedEvent, conflated, unscoped.
+fn prices_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::PricesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::PricesRecorded(message),
+    })
+}
+
+/// W10.5: a BarsRecordedEvent, conflated, unscoped.
+fn bars_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::BarsRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::BarsRecorded(message),
+    })
+}
+
+/// W10.7: a ObservationsWantedEvent, conflated, unscoped.
+fn observations_wanted(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::ObservationsWantedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::ObservationsWanted(message),
+    })
+}
+
+/// W10.7: a WantWithdrawnEvent, conflated, unscoped.
+fn want_withdrawn(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::WantWithdrawnEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::WantWithdrawn(message),
     })
 }

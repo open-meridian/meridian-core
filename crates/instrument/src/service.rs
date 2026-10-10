@@ -692,6 +692,7 @@ mod tests {
                     found: true,
                     instrument: Some(record.clone()),
                     for_instrument_id: String::new(),
+                    venues: Vec::new(),
                 }))
                 .await,
             Handled::Ignored(_)
@@ -702,6 +703,7 @@ mod tests {
                     found: true,
                     instrument: Some(record),
                     for_instrument_id: minted.instrument_id.clone(),
+                    venues: Vec::new(),
                 }))
                 .await,
             Handled::Kept(true)

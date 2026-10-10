@@ -151,6 +151,7 @@ impl Money {
         Some(WireMoney {
             amount: Some(self.amount.to_wire()),
             currency_code: self.currency.clone(),
+            instrument_id: String::new(),
         })
     }
 }
@@ -262,6 +263,7 @@ mod tests {
                 scale: 0,
             }),
             currency_code: "USD".into(),
+            instrument_id: String::new(),
         };
         let refused = Money::from_wire("market_value", Some(&wide)).unwrap_err();
         assert_eq!(refused.why, OutOfRange::Digits);

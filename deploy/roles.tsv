@@ -14,6 +14,7 @@ dgm	role
 ems	role
 first-run	component
 instrument	component
+lake	component
 launcher	component
 match	role
 oms	role

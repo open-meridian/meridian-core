@@ -1,0 +1,547 @@
+// The lake: what sources say about entities, one shape per data type, under
+// one envelope.
+//
+// Derived from workflow W10 (the lake; spec/the-lake, accepted 2026-10-02,
+// and plans/the-lake-prices-the-book, accepted 2026-10-03 and refreshed
+// 2026-10-09), contract v18, the lake's 1a: prices and bars, the catalogue,
+// licences and entitlements, source priority, and wants. Every message here
+// traces to a matrix row; see matrix/matrix.tsv.
+//
+// The lake is append-only and bitemporal. A `dgm` records rows in batches; the
+// lake records, sequences and publishes each on its dataset's subject; a
+// reader seeds by a read and hears what follows. A row's subjects are the
+// deployment's own entities, resolved before the row is sent (W3.1); a
+// vendor's identifier is never a key. Licensed data never leaves the
+// deployment: nothing here reaches the platform.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// The Decimal, a value as reported and a raw record's reference, and the
+// catalogue a plugin declares at registration: plugin-facing, imported from
+// there at the revision this repository pins.
+import "meridian/v1/sidecar.proto";
+// Money.
+import "meridian/v1/amounts.proto";
+// A point in a store's record.
+import "meridian/v1/journal.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The envelope
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The envelope every row of every data type carries, as its first field
+// (spec/the-lake, requirement 4).
+message ObservationMeta {
+  // The `dgm`'s identity for this observation, made from its raw record, so
+  // the same observation recorded again changes nothing and a changed value
+  // under it is a restatement. 1 to 128 characters.
+  string row_key = 1;
+
+  // The entities the row is about, each resolved through W3.1: 1 to 8.
+  repeated SubjectRef subjects = 2;
+
+  // Where the row came from.
+  Source source = 3;
+
+  // When the value became true, the event happened, or the period began.
+  int64 valid_from_ns = 4;
+
+  // The period's end, exclusive; 0 for an instant, or a value in force until
+  // the next.
+  int64 valid_until_ns = 5;
+
+  // The business date a daily value is for, an ISO 8601 date (2026-10-09),
+  // in the calendar its dataset declares (DatasetDeclaration.day_time_zone);
+  // empty for a value that is not daily. A plain date, never a moment.
+  string business_date = 6;
+
+  // The source's own timestamps, at most one of each kind: 0 to 6.
+  repeated SourceTime source_times = 7;
+
+  // When the `dgm`'s sidecar published it: the envelope's publication time,
+  // which the sidecar stamps. A plugin's value is never read.
+  int64 sent_at_ns = 8;
+
+  // When the lake committed this version: the time a point-in-time read
+  // cuts at. Decided by the lake.
+  int64 recorded_at_ns = 9;
+
+  // 1 for the first record of the row key, one more for each restatement.
+  // Decided by the lake.
+  uint64 version = 10;
+
+  // Its place in its dataset's partition, from 1, with no holes. Decided by
+  // the lake.
+  uint64 sequence = 11;
+
+  // The sequence of the previous row of the same subject, data type and
+  // dataset; 0 for the first. Decided by the lake.
+  uint64 previous_sequence = 12;
+
+  // The raw record it was converted from, in the writing plugin's storage.
+  RawRecordRef raw = 13;
+
+  // Each vendor value that failed conversion, beside a field left not
+  // known: 0 to 16.
+  repeated AsReported unconverted = 14;
+}
+
+// One entity a row is about.
+message SubjectRef {
+  // The deployment's own ID for the entity: an instrument's in the lake's
+  // 1a. 1 to 64 characters.
+  string entity_id = 1;
+}
+
+// Where a row came from.
+message Source {
+  // The instance that recorded it, stamped by its sidecar.
+  string instance = 1;
+
+  // That plugin's version when it recorded it: decided by the lake from the
+  // version the deployment launched the instance at, never the plugin's word.
+  string plugin_version = 2;
+
+  // A dataset the instance's catalogue declares: the instance, a colon, and
+  // the dataset's key (coinbase-1:daily). 1 to 96 characters.
+  string dataset = 3;
+
+  // The venue the observation originated on, the venue master's ID; empty
+  // when it is not venue-specific, which is the consolidated view.
+  string venue_id = 4;
+}
+
+// One of the source's own timestamps.
+message SourceTime {
+  SourceTimeKind kind = 1;
+
+  // That clock's reading, in UTC, as the source gave it.
+  int64 at_ns = 2;
+}
+
+// Which of the source's clocks a timestamp is.
+enum SourceTimeKind {
+  // Refused.
+  SOURCE_TIME_KIND_UNSPECIFIED = 0;
+  // When it happened at its origin.
+  SOURCE_TIME_KIND_EVENT = 1;
+  // When a consolidator published it.
+  SOURCE_TIME_KIND_CONSOLIDATED = 2;
+  // When a reporting facility received it.
+  SOURCE_TIME_KIND_REPORTED = 3;
+  // When the vendor received it.
+  SOURCE_TIME_KIND_VENDOR_RECEIVED = 4;
+  // When the source released it: a close, a panel, a model.
+  SOURCE_TIME_KIND_PUBLISHED = 5;
+}
+
+// What a dataset in an answer is, once per answer rather than on every row
+// (spec/the-lake, requirement 6).
+message DatasetRef {
+  string dataset = 1;
+
+  // The instance that serves it.
+  string instance = 2;
+
+  // Who originated the data, and who carried it when an aggregator did, as
+  // the catalogue declares them.
+  string vendor = 3;
+  string aggregator = 4;
+
+  // The dataset's catalogue entry, as its instance declared it: set in a
+  // listing of datasets (W10.9) and on an entitlements change (W10.1),
+  // unset in a read's answer.
+  DatasetDeclaration declaration = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The data types of the lake's 1a
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A price of one kind for one subject. An FX rate is the price of one
+// currency's cash instrument in another (spec/the-lake, Q3); the lake never
+// inverts or crosses a rate.
+message Price {
+  ObservationMeta meta = 1;
+
+  PriceKind kind = 2;
+
+  // The price of one unit of the subject, in the asset it was quoted in.
+  Money price = 3;
+
+  PriceBasis basis = 4;
+}
+
+// Which price.
+enum PriceKind {
+  // Refused.
+  PRICE_KIND_UNSPECIFIED = 0;
+  // The dataset's declared close for the business date: the official close
+  // where the venue has one, otherwise the last price of the day the
+  // dataset declares.
+  PRICE_KIND_CLOSE = 1;
+  // The last eligible trade's price at the valid time.
+  PRICE_KIND_LAST = 2;
+  // A fund's net asset value per share, for the business date.
+  PRICE_KIND_NAV = 3;
+  // A contract's settlement price, for the business date.
+  PRICE_KIND_SETTLEMENT = 4;
+  // The best bid at the valid time, or the business date's closing bid.
+  PRICE_KIND_BID = 5;
+  // The best ask at the valid time, or the business date's closing ask.
+  PRICE_KIND_ASK = 6;
+  // The mid at the valid time, or the business date's closing mid.
+  PRICE_KIND_MID = 7;
+}
+
+// What one unit of a price is.
+enum PriceBasis {
+  // Refused.
+  PRICE_BASIS_UNSPECIFIED = 0;
+  // Per unit of the subject.
+  PRICE_BASIS_PER_UNIT = 1;
+}
+
+// Open, high, low and close over an interval, the envelope's valid time: a
+// daily bar names its business date. Empty `source.venue_id` is the
+// consolidated view across venues.
+message Bar {
+  ObservationMeta meta = 1;
+
+  // One asset for all four, and for the vwap, or the bar is refused.
+  Money open = 2;
+  Money high = 3;
+  Money low = 4;
+  Money close = 5;
+
+  // Eligible quantity over the interval, in units of the instrument, never
+  // negative.
+  Decimal volume = 6;
+
+  // Volume-weighted average price over the interval; unset when the source
+  // gives none.
+  optional Money vwap = 7;
+
+  // Trades counted in the bar; unset when the source gives none.
+  optional uint64 trade_count = 8;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.4, W10.5 — a `dgm` records; the lake records and publishes
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A batch of prices, recorded whole or refused naming the item and field:
+// 1 to 500.
+message RecordPricesRequest {
+  repeated Price prices = 1;
+
+  // The want these answer (W10.7), as it was delivered; empty for rows
+  // recorded unasked.
+  string want_id = 2;
+}
+
+// A batch of bars, recorded whole or refused naming the item and field:
+// 1 to 500.
+message RecordBarsRequest {
+  repeated Bar bars = 1;
+
+  // The want these answer, as it was delivered; empty for rows recorded
+  // unasked.
+  string want_id = 2;
+}
+
+// What a batch did, once it committed.
+message RecordObservationsReply {
+  // Rows recorded for the first time.
+  uint32 recorded = 1;
+
+  // Rows recorded as a new version of a row key held.
+  uint32 restated = 2;
+
+  // Rows identical to the version in force, which changed nothing.
+  uint32 unchanged = 3;
+
+  // The dataset's sequence once the batch committed.
+  Watermark watermark = 4;
+}
+
+// A price the lake recorded, on its dataset's subject: one row, with its
+// version and sequence. Delivered latest value first per subject, dataset,
+// kind and venue (conflated).
+message PricesRecordedEvent {
+  Price price = 1;
+}
+
+// A bar the lake recorded, on its dataset's subject. Delivered latest value
+// first per subject, dataset, venue and interval start (conflated).
+message BarsRecordedEvent {
+  Bar bar = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.6 — a reader reads, point in time, by source
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Which datasets a read is answered from (the intent's Q4): exactly one of
+// the deployment's default, named datasets, or every entitled dataset side by
+// side. None set is the default.
+message SourceChoice {
+  // The deployment's priority for the data type and kind, with failover.
+  bool default = 1;
+
+  // These datasets, in this order: 0 to 16.
+  repeated string named = 2;
+
+  // Every dataset the reader is entitled to, each row naming its own.
+  bool side_by_side = 3;
+}
+
+// A subject, dataset or field a read could not serve, and why; the rest still
+// answer.
+message Unanswered {
+  SubjectRef subject = 1;
+  string dataset = 2;
+
+  // The field by its dictionary entry; empty for the whole row.
+  string field = 3;
+
+  UnansweredReason reason = 4;
+}
+
+// Why a part of a read was not answered.
+enum UnansweredReason {
+  // Refused.
+  UNANSWERED_REASON_UNSPECIFIED = 0;
+  // The reader is not entitled to the dataset, or the field.
+  UNANSWERED_REASON_NOT_ENTITLED = 1;
+  // No dataset covers the subject.
+  UNANSWERED_REASON_NOT_COVERED = 2;
+  // The lake asked the dataset's source for it (W10.7); the reader hears the
+  // rows once recorded.
+  UNANSWERED_REASON_ASKED_SOURCE = 3;
+  // The dataset recorded nothing for the subject within its cadence.
+  UNANSWERED_REASON_SOURCE_SILENT = 4;
+  // The subject is not one the deployment's entities resolve.
+  UNANSWERED_REASON_UNRESOLVED = 5;
+  // Older than the history the dataset reaches, or the lake keeps.
+  UNANSWERED_REASON_BEYOND_HISTORY = 6;
+  // The dataset's licence forbids keeping it, and it was served, not kept.
+  UNANSWERED_REASON_NOT_KEPT = 7;
+}
+
+// Prices for subjects, at one of: the latest in force at a valid time
+// (`at_ns`, 0 for now); a business date; or a valid-time range, from
+// inclusive to exclusive. Exactly one is given; none is the latest now.
+message ListPricesRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+
+  // Which kinds; empty for every kind.
+  repeated PriceKind kinds = 2;
+
+  SourceChoice sources = 3;
+
+  int64 at_ns = 4;
+  string business_date = 5;
+  int64 valid_from_ns = 6;
+  int64 valid_until_ns = 7;
+
+  // The recorded-time cut-off, 0 for now: what the lake knew then.
+  int64 as_of_ns = 8;
+
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 9;
+  string cursor = 10;
+}
+
+message ListPricesReply {
+  repeated Price prices = 1;
+
+  // What could not be served, each with its reason; a default read's
+  // fallback names why the datasets above it did not answer.
+  repeated Unanswered unanswered = 2;
+
+  // Each dataset the answer includes.
+  repeated DatasetRef datasets = 3;
+
+  // The sequence per dataset partition the read was answered at.
+  Watermark watermark = 4;
+
+  // Empty when the read is exhausted.
+  string next_cursor = 5;
+}
+
+// Bars for subjects, at a valid time, a business date or a range, as a
+// price's read.
+message ListBarsRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+
+  // The bars' length; 0 for every length.
+  int64 interval_ns = 2;
+
+  SourceChoice sources = 3;
+
+  int64 at_ns = 4;
+  string business_date = 5;
+  int64 valid_from_ns = 6;
+  int64 valid_until_ns = 7;
+  int64 as_of_ns = 8;
+
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 9;
+  string cursor = 10;
+}
+
+message ListBarsReply {
+  repeated Bar bars = 1;
+  repeated Unanswered unanswered = 2;
+  repeated DatasetRef datasets = 3;
+  Watermark watermark = 4;
+  string next_cursor = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.7 — a read the lake cannot answer is wanted of the `dgm`
+// ─────────────────────────────────────────────────────────────────────────────
+
+// What the lake asks of the instance serving a dataset. Coalesced: readers'
+// identical wants are one.
+message ObservationsWantedEvent {
+  // The want's identifier, which the rows recorded for it name.
+  string want_id = 1;
+
+  string dataset = 2;
+
+  // The data type, by its message's full name: meridian.v1.Price or
+  // meridian.v1.Bar.
+  string data_type = 3;
+
+  // 1 to 500.
+  repeated SubjectRef subjects = 4;
+
+  // For prices, which kinds; empty for every kind.
+  repeated PriceKind kinds = 5;
+
+  // For bars, the bars' length.
+  int64 interval_ns = 6;
+
+  // The business date wanted, or the valid-time range; neither for the
+  // latest.
+  string business_date = 7;
+  int64 valid_from_ns = 8;
+  int64 valid_until_ns = 9;
+
+  // Keep the subjects current until the want is withdrawn (W10.7).
+  bool standing = 10;
+}
+
+// A standing want no reader has asked within the dataset's cadence.
+message WantWithdrawnEvent {
+  string want_id = 1;
+  string dataset = 2;
+}
+
+// What a `dgm` cannot serve of a want, per subject, with its reason.
+message DeclineWantRequest {
+  string want_id = 1;
+
+  // 1 to 500.
+  repeated SubjectRef subjects = 2;
+
+  // not_covered, source_silent or beyond_history.
+  UnansweredReason reason = 3;
+}
+
+message DeclineWantReply {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.1, W10.2, W10.9 — entitlements, priority and the datasets
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A plugin instance's entitlement to a dataset, as the conductor keeps it
+// (W10.1). Set by a deployment admin; never sent to the platform.
+message DatasetEntitlement {
+  string dataset = 1;
+
+  // The plugin instance entitled.
+  string instance = 2;
+
+  // Whether it may read the dataset; false withdraws it.
+  bool allowed = 3;
+
+  // The fields it may read, by their dictionary entries; empty for every
+  // field. At most 64.
+  repeated string fields = 4;
+
+  // Who set it and when, the deployment-local subject the dashboard
+  // stamped; the delegation and client a person acted through, empty in a
+  // browser; and why. Each change is its own record (decisions/031).
+  string updated_by = 5;
+  int64 updated_at_ns = 6;
+  string acting_through_delegation = 7;
+  string client_name = 8;
+  string note = 9;
+}
+
+// The deployment's priority for one data type and price kind: an ordered list
+// of datasets a default read takes, with failover (W10.2). Journalled by the
+// lake.
+message SourcePriority {
+  // By its message's full name: meridian.v1.Price or meridian.v1.Bar.
+  string data_type = 1;
+
+  // For prices, the kind; unspecified for bars.
+  PriceKind kind = 2;
+
+  // First to last. At most 16.
+  repeated string datasets = 3;
+
+  string updated_by = 4;
+  int64 updated_at_ns = 5;
+  string acting_through_delegation = 6;
+  string client_name = 7;
+  string note = 8;
+}
+
+// A deployment admin sets the priority for a data type and kind, replacing
+// it whole.
+message SetSourcePriorityRequest {
+  string data_type = 1;
+  PriceKind kind = 2;
+
+  // At most 16.
+  repeated string datasets = 3;
+
+  // Why, kept with the change's record (decisions/031). Through /mcp every
+  // change carries one.
+  string note = 4;
+
+  // The priority's `updated_at_ns` as it was read: refused when it has
+  // changed since (contract v17's stale guard). 0 when none was set.
+  int64 against_updated_at_ns = 5;
+}
+
+message ListSourcePrioritiesRequest {}
+
+message ListSourcePrioritiesReply {
+  repeated SourcePriority priorities = 1;
+}
+
+// The datasets a reader may read, with their catalogue entries; and, to the
+// dashboard, every dataset with its licence and entitlements.
+message ListDatasetsRequest {}
+
+message ListDatasetsReply {
+  // Each with its declaration.
+  repeated DatasetRef datasets = 1;
+
+  // Each dataset's licence: to the dashboard; to a plugin, those of the
+  // datasets it may read.
+  repeated DatasetLicence licences = 2;
+
+  // To the dashboard every entitlement; to a plugin, its own.
+  repeated DatasetEntitlement entitlements = 3;
+}
