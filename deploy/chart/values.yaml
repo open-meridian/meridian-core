@@ -143,6 +143,10 @@ migrate:
   borSecret: ""
   borKey: ""
 
+  # The lake's, likewise.
+  lakeSecret: ""
+  lakeKey: ""
+
   # A failed migration should stop the release rather than retry into it.
   backoffLimit: 0
 
@@ -193,6 +197,19 @@ street:
 # may share a schema with the others; its own database is supported and
 # kept apart from the street's by the credential.
 bor:
+  replicaCount: 1
+  image:
+    tag: ""
+  database:
+    existingSecret: ""
+    key: ""
+
+# The lake (W10, contract v18). One replica: every batch takes its dataset's
+# head in Postgres, so a second would wait rather than help, and the rollout
+# never surges. Its tables are prefixed lake_, so it may share a schema with
+# the others; its own database is supported, and kept apart by the
+# credential.
+lake:
   replicaCount: 1
   image:
     tag: ""
@@ -296,6 +313,7 @@ broker:
   conductorKey: conductor
   streetKey: street
   borKey: bor
+  lakeKey: lake
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so

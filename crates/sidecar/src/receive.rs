@@ -48,6 +48,15 @@ pub(crate) const QUEUE: usize = meridian_pb::bounds::SIDECAR_RECEIVE_LIMIT_RANGE
 /// so a loss at the end of a stream is told without a later delivery.
 const DROPS_READ_EVERY: Duration = Duration::from_millis(250);
 
+/// How long after a dataset is entitled its subject is subscribed again
+/// (contract v18): the broker admits the subject only once the launcher has
+/// written the plugin's datasets and the bundled broker has reconciled, every
+/// 5 seconds, and a subscription made before that is refused by the broker
+/// and never asked again. The second replaces the first; a row heard on both
+/// in the moment they overlap waits under one key, so it is handed on once
+/// unless the plugin took it in between.
+const ENTITLED_SETTLES: Duration = Duration::from_secs(20);
+
 /// One row a plugin's roles may hear: its topic, and how its message is read.
 pub(crate) struct Row {
     pub name: &'static str,
@@ -273,6 +282,7 @@ impl Sidecar {
                 self.instance_id().to_string(),
                 lake.clone(),
                 closed.clone(),
+                None,
             ));
         }
 
@@ -324,17 +334,42 @@ async fn per_dataset(
     loop {
         for dataset in lake.entitled.datasets() {
             if heard.insert(dataset.clone()) {
-                let subscription =
-                    bus.subscribe(&row.topic.replace(crate::lake::DATASET, &dataset));
+                let topic = row.topic.replace(crate::lake::DATASET, &dataset);
+                let (first_stops, stopped) = watch::channel(());
                 tokio::spawn(forward(
                     row,
-                    subscription,
+                    bus.subscribe(&topic),
                     Arc::clone(&waiting),
                     configuration.clone(),
                     instance.clone(),
                     lake.clone(),
                     closed.clone(),
+                    Some(stopped),
                 ));
+                let (bus, waiting, configuration, instance, lake, closed) = (
+                    Arc::clone(&bus),
+                    Arc::clone(&waiting),
+                    configuration.clone(),
+                    instance.clone(),
+                    lake.clone(),
+                    closed.clone(),
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(ENTITLED_SETTLES).await;
+                    let again = bus.subscribe(&topic);
+                    drop(first_stops);
+                    forward(
+                        row,
+                        again,
+                        waiting,
+                        configuration,
+                        instance,
+                        lake,
+                        closed,
+                        None,
+                    )
+                    .await;
+                });
             }
         }
         tokio::select! {
@@ -345,7 +380,9 @@ async fn per_dataset(
 }
 
 /// One row's subscription, read, filtered by the read scope and queued for
-/// the plugin, its losses said; until the stream ends or the bus does.
+/// the plugin, its losses said; until the stream ends or the bus does, or
+/// `replaced` is dropped by the subscription replacing it.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     row: &'static Row,
     mut subscription: meridian_bus::Subscription,
@@ -354,6 +391,7 @@ async fn forward(
     instance: String,
     lake: Lake,
     mut closed: watch::Receiver<()>,
+    mut replaced: Option<watch::Receiver<()>>,
 ) {
     let drops = subscription.drop_count();
     let mut seen = drops.get();
@@ -366,6 +404,12 @@ async fn forward(
             },
             _ = every.tick() => None,
             _ = closed.changed() => return,
+            _ = async {
+                match replaced.as_mut() {
+                    Some(stops) => { let _ = stops.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => return,
         };
         // Before what arrives after it: the drop happened first.
         let now = drops.get();

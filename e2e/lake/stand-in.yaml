@@ -1,0 +1,24 @@
+# Core's lake stand-ins for `make e2e-lake` and `make e2e-recorded` (contract
+# v18; e2e/lake/stand_in.py): a dgm serving the lake from an exchange file,
+# and two reading plugins, one entitled and one never.
+services:
+  coin:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/lake, absolute}:/stand-in:ro
+      - ${STAND_IN_EXCHANGES:?set STAND_IN_EXCHANGES to the exchanges replayed, absolute}:/exchanges:ro
+    environment:
+      STAND_IN_LAKE: dgm
+      STAND_IN_EXCHANGES: /exchanges
+  book:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_LAKE: reader
+  other:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_LAKE: reader

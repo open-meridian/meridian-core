@@ -188,6 +188,29 @@ the same image with the list on stdin:
       per line: the ticket's ID, a tab, the change's kind (W6.24). With
       --expect, fails unless there are N.
 
+  licence DATASET kept=true|false retention_days=N derived_use=true|false
+          display=true|false personal_use=true|false [default_fields=A,B] [note=TEXT]
+          [--expect-refused TEXT]
+      Sets a dataset's licence on the Data sources page, as a deployment
+      admin does (W10.1, contract v18), replacing it whole; a boolean left out
+      is false. --expect-refused TEXT fails unless it is refused saying TEXT.
+
+  entitle DATASET [--fields A,B] [--withdraw] [note=TEXT] [--seconds N]
+      Entitles the plugin to a dataset on the Data sources page, every field
+      or those named, or withdraws it (W10.1, contract v18); and writes the
+      broker's configuration again with each plugin's datasets, its subjects
+      on the broker, waiting until the broker has reloaded with them: before
+      the entitlement is recorded, so the plugin's sidecar subscribes to a
+      subject the broker admits, and after a withdrawal.
+
+  priority DATA_TYPE [--kind KIND] DATASET ... [note=TEXT] [--against N]
+           [--expect-refused TEXT]
+      Sets the deployment's priority for meridian.v1.Price, one kind of it --
+      close, last, nav or settlement -- or meridian.v1.Bar, on the Data
+      sources page (W10.2, contract v18): the datasets first to last, replaced
+      whole, against the priority as the page shows it, or --against the
+      updated_at_ns given, which a priority changed since is refused.
+
 Every command acts as the harness's admin, or, given --as NAME, as one of
 the people `keys` drew a password for (MERIDIAN_HARNESS_PEOPLE, `name=Display
 Name` comma separated), whose account the `people` service made: a run that
@@ -906,7 +929,7 @@ ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # Names the deployment already holds: compose.yaml's services, and the broker
 # users that are not plugins. A sidecar is the service `sidecar-<instance>`.
 TAKEN = {"keys", "postgres", "broker-config", "nats", "migrate", "street", "bor",
-         "instrument", "conductor", "dashboard", "runner", "store", "storage",
+         "lake", "instrument", "conductor", "dashboard", "runner", "store", "storage",
          "runtime", "first-run", "dashboard-1"}
 RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image of the harness's commit}"
 # The roles whose plugins own storage for their raw external records
@@ -1584,11 +1607,161 @@ def mcp(args):
     verbs[args.pop(0)](args)
 
 
+# ── The Data sources page (W10.1, W10.2, contract v18) ──────────────────────
+
+DATA_SOURCES = "/admin/data-sources"
+BROKER = os.environ.get("MERIDIAN_HARNESS_BROKER", "/broker")
+
+
+def truth(args, name):
+    """A NAME=true|false pair taken out of `args`, false when left out."""
+    for at, arg in enumerate(args):
+        if arg.startswith(name + "="):
+            del args[at]
+            said = arg.split("=", 1)[1]
+            if said not in ("true", "false"):
+                raise Failed(f"{name} is true or false, not {said!r}")
+            return said == "true"
+    return False
+
+
+def said_pair(args, name, default=""):
+    for at, arg in enumerate(args):
+        if arg.startswith(name + "="):
+            del args[at]
+            return arg.split("=", 1)[1]
+    return default
+
+
+def refused_or_done(done, refusal, what):
+    """A change posted: done, or refused saying `refusal` when one is
+    expected."""
+    if refusal is not None:
+        if done.status == 303:
+            raise Failed(f"{what} was done, and was to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(done)):
+            raise Failed(f"{what} was refused, not saying {refusal!r}: {sentence(done)}")
+        return f"refused: {html.unescape(sentence(done))}"
+    if done.status != 303:
+        raise Failed(f"{what} was not done: {done.status} {sentence(done)}")
+    return None
+
+
+def licence(args):
+    refusal = option(args, "--expect-refused", None)
+    fields = {"retention_days": said_pair(args, "retention_days", "0"),
+              "default_fields": said_pair(args, "default_fields"),
+              "note": said_pair(args, "note")}
+    for name in ("kept", "derived_use", "display", "personal_use"):
+        if truth(args, name):
+            fields[name] = "1"
+    if len(args) != 1:
+        raise Failed("licence takes a dataset, then its terms as NAME=VALUE")
+    fields["dataset"] = args[0]
+    admin = signed_in()
+    fields["form_token"] = form_token(admin.get(DATA_SOURCES))
+    said = refused_or_done(admin.post(DATA_SOURCES + "/licence", fields), refusal,
+                           f"{args[0]}'s licence")
+    print(f"licence: {said}" if said else
+          f"licence: {args[0]} {'kept' if 'kept' in fields else 'served, not kept'}"
+          f", {fields['retention_days']} days")
+
+
+def entitlements(admin):
+    """Every dataset each plugin is entitled to, as the Data sources page
+    lists them."""
+    page = admin.get(DATA_SOURCES)
+    if page.status != 200:
+        raise Failed(f"the Data sources page did not open: {page.status} {sentence(page)}")
+    table = re.search(r'<table class="list one-line entitlements"[^>]*>(.*?)</table>', page.body, re.S)
+    held = {}
+    for dataset, instance in re.findall(r'<tr data-id="([^" ]+) ([^"]+)">',
+                                        table.group(1) if table else ""):
+        held.setdefault(html.unescape(instance), []).append(html.unescape(dataset))
+    return held
+
+
+def broker_reloaded(held, seconds):
+    """The broker's configuration written again with `held`, each plugin's
+    datasets, and the broker reloaded with it."""
+    token = secrets.token_hex(8)
+    with open(os.path.join(BROKER, "datasets.json.next"), "w", encoding="utf-8") as kept:
+        json.dump({instance: sorted(set(datasets)) for instance, datasets in held.items()}, kept)
+    os.replace(os.path.join(BROKER, "datasets.json.next"), os.path.join(BROKER, "datasets.json"))
+    with open(os.path.join(BROKER, "asked"), "w", encoding="utf-8") as kept:
+        kept.write(token)
+
+    def reloaded():
+        try:
+            with open(os.path.join(BROKER, "reloaded"), encoding="utf-8") as said:
+                if said.read().strip() == token:
+                    return True
+        except OSError:
+            pass
+        raise Failed("the broker has not reloaded with the plugins' datasets")
+    until(seconds, reloaded, "the broker did not reload")
+
+
+def entitle(args):
+    seconds = number(args, "--seconds", 60)
+    named = option(args, "--fields", "")
+    withdraw = "--withdraw" in args
+    if withdraw:
+        args.remove("--withdraw")
+    note = said_pair(args, "note")
+    if len(args) != 1:
+        raise Failed("entitle takes a dataset")
+    dataset = args[0]
+    admin = signed_in()
+    held = entitlements(admin)
+    if not withdraw:
+        held.setdefault(INSTANCE, []).append(dataset)
+        broker_reloaded(held, seconds)
+    fields = {"form_token": form_token(admin.get(DATA_SOURCES)), "dataset": dataset,
+              "instance": INSTANCE, "fields": named, "note": note}
+    if not withdraw:
+        fields["allowed"] = "1"
+    refused_or_done(admin.post(DATA_SOURCES + "/entitlement", fields), None,
+                    f"{INSTANCE}'s entitlement to {dataset}")
+    if withdraw:
+        held[INSTANCE] = [d for d in held.get(INSTANCE, []) if d != dataset]
+        broker_reloaded(held, seconds)
+    print(f"entitle: {INSTANCE} {'withdrawn from' if withdraw else 'entitled to'} {dataset}"
+          + (f" ({named})" if named and not withdraw else ""))
+
+
+def priority(args):
+    refusal = option(args, "--expect-refused", None)
+    kind = option(args, "--kind", "")
+    against = option(args, "--against", None)
+    note = said_pair(args, "note")
+    if len(args) < 2:
+        raise Failed("priority takes a data type, then its datasets first to last")
+    data_type, datasets = args[0], args[1:]
+    admin = signed_in()
+    page = admin.get(DATA_SOURCES)
+    if against is None:
+        against = "0"
+        for fill in re.findall(r'data-dialog-open="priority-dialog" data-title="Change the priority" '
+                               r'data-fill="([^"]+)"', page.body):
+            said = json.loads(html.unescape(fill))["fields"]
+            if said["data_type"] == data_type and said["kind"] == kind:
+                against = said["against_updated_at_ns"]
+                break
+    fields = {"form_token": form_token(page), "data_type": data_type, "kind": kind,
+              "datasets": "\n".join(datasets), "against_updated_at_ns": against, "note": note}
+    said = refused_or_done(admin.post(DATA_SOURCES + "/priority", fields), refusal,
+                           f"the priority for {data_type} {kind}".strip())
+    print(f"priority: {said}" if said else
+          f"priority: {data_type}{' ' + kind if kind else ''}: {' then '.join(datasets)}")
+
+
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
             "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
             "instruments": instruments, "instrument": instrument, "mcp": mcp,
-            "ticket": ticket, "inbox": inbox}
+            "ticket": ticket, "inbox": inbox, "licence": licence, "entitle": entitle,
+            "priority": priority}
 
 
 def main(argv):

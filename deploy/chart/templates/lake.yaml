@@ -1,0 +1,82 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The lake (W10, contract v18): what sources say about entities -- prices
+  and bars a `dgm` records, read by the reading roles under the deployment's
+  licences, entitlements and priority. Its own Deployment, tag and store
+  beside the street's and the book's, sharing no key, join or transaction
+  with either (decisions/012, decisions/032).
+
+  One writer per partition. Every batch takes its dataset's head in
+  Postgres, and the rollout never surges, as the book's does, so an upgrade
+  never runs an old writer beside a new one over the same partition.
+
+  No key and no platform address: licensed data never leaves the deployment
+  (spec/the-lake, requirement 14).
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-lake
+  labels:
+    meridian.dev/component: lake
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.lake.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      meridian.dev/component: lake
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+        meridian.dev/component: lake
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: lake
+          image: "{{ .Values.image.repository }}:{{ .Values.lake.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-lake"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-lake
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: MERIDIAN_LAKE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.lake.database.key | default .Values.database.key }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
+                  key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.lakeKey) }}
+            {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
+          volumeMounts:
+            {{- include "meridian-runtime.readyMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- include "meridian-runtime.readyVolume" . | nindent 8 }}

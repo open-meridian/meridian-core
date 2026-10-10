@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-lake e2e-recorded \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -29,6 +29,8 @@ help:
 	@echo "  make harness-check  the plugin harness image runs three plugins, end to end"
 	@echo "  make e2e-archive    an edge plugin's records archived, restored and returned, a hold refusing on the harness"
 	@echo "  make e2e-plugin-area  core's plugin area worked through /mcp alone, at each role and level, on the harness"
+	@echo "  make e2e-lake       the lake's 1a on the harness: recorded, heard, restated, read as of, entitled, wanted"
+	@echo "  make e2e-recorded   the same on the recorded exchanges RECORDED names, a developer's, never committed"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
@@ -38,7 +40,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -884,7 +886,7 @@ e2e-settings-page:
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty.
 HARNESS_IMAGE := meridian-harness:local
-HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py moves.sql street.sql tickets.sql
+HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
@@ -1092,6 +1094,50 @@ e2e-plugin-area:
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/plugin-area/plugins.json >.harness/plugins.yaml
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/plugin-area/run.py
+
+# The lake's 1a (contract v18, W10), end to end on the plugin harness:
+# core's stand-ins on the SDK, a dgm serving three datasets from an exchange
+# file and two reading plugins, one entitled and one never, worked at the
+# Data sources page, through its five tools and by the runner's `licence`,
+# `entitle` and `priority` -- closes and an FX rate recorded and heard, a
+# restatement read as version 2 and as of before it, a reader not entitled
+# refused, an invalid date refused, a want coalesced and answered and a
+# standing want withdrawn, a price on a venue ID and one in USDC on its
+# instrument, the stale guard on priority, and `store lake` (e2e/lake/run.py
+# says each step). Its own compose project. The exchanges are the synthetic
+# ones committed in e2e/lake/exchanges.
+E2E_LAKE_SETUP = \
+	DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null && \
+	DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null && \
+	$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 && \
+	rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+	&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null && \
+	$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/lake/plugins.json >.harness/plugins.yaml
+
+e2e-lake:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(E2E_LAKE_SETUP) || { echo "e2e-lake FAILED: the images or the harness did not build" >&2; exit 1; }
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/lake/run.py
+
+# The same run on recorded exchanges (plans/the-lake-prices-the-book, Q11):
+# real responses a developer recorded under personal use into a directory
+# never committed, shaped as e2e/lake/exchanges/exchange.json is, replayed by
+# the same tests locally. RECORDED names it; a run naming none replays the
+# synthetic exchanges, and says so. Not in ci-local: what is recorded is a
+# developer's, never CI's.
+RECORDED ?=
+
+e2e-recorded:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@if [ -n "$(RECORDED)" ]; then test -f "$(RECORDED)/exchange.json" \
+		|| { echo "e2e-recorded FAILED: no exchange.json in $(RECORDED)" >&2; exit 1; }; \
+	else echo "e2e-recorded: RECORDED names no recorded exchanges; replaying the synthetic ones in e2e/lake/exchanges"; fi
+	@$(E2E_LAKE_SETUP) || { echo "e2e-recorded FAILED: the images or the harness did not build" >&2; exit 1; }
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) E2E_LAKE_NAME=e2e-recorded \
+		STAND_IN_EXCHANGES="$(or $(RECORDED),e2e/lake/exchanges)" $(PY) e2e/lake/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
@@ -1311,7 +1357,7 @@ chart-check:
 	echo "$$unset" | awk '/name: check-meridian-runtime-database$$/{f=1} f&&/^data:/{print "has data"} /^---/{f=0}' | grep -q . \
 		&& { echo "chart-check FAILED: the database secret the chart makes is not empty" >&2; exit 1; }; true
 	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
-	for store in meridian-conductor meridian-street meridian-bor meridian-instrument meridian-dashboard; do \
+	for store in meridian-conductor meridian-street meridian-bor meridian-lake meridian-instrument meridian-dashboard; do \
 		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
 			|| { echo "chart-check FAILED: the chart renders no migration for $$store" >&2; \
 			     echo "  each store verifies its schema and refuses to serve without one" >&2; exit 1; }; \
@@ -1668,6 +1714,7 @@ migrate: network
 	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
 	@$(COMPOSE) run --rm --build -T street meridian-street migrate
 	@$(COMPOSE) run --rm --build -T bor meridian-bor migrate
+	@$(COMPOSE) run --rm --build -T lake meridian-lake migrate
 	@$(COMPOSE) run --rm --build -T conductor meridian-conductor migrate
 
 up: migrate

@@ -26,12 +26,13 @@ same tag. The runtime image carries none of it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles; the stores migrated; street, the book (`bor`), instrument, conductor and a development dashboard; the `runner`; and `store` |
-| `harness.py` | The runner, standard library only: `ready`, `settings`, `hold`, `archive`, `summary`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`; and `compose`, which writes the plugins' half of the deployment |
+| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles, and from contract v18 their datasets, written again on `entitle`; the stores migrated; street, the book (`bor`), the lake, instrument, conductor and a development dashboard; the `runner`; and `store` |
+| `harness.py` | The runner, standard library only: `ready`, `settings`, `hold`, `archive`, `summary`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`, `licence`, `entitle`, `priority`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |
 | `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
 | `activity.sql` | The custodian's activity and each connection's latest sync status, as the street keeps them, as stable, sorted lines (contract v14), which `store activity` prints |
+| `lake.sql` | The lake's rows, priorities, wants, servings of a dataset not kept, removals, misses and aliases, as stable, sorted lines (contract v18), which `store lake` prints; never a value |
 | `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), and from contract v17 each setting change and the delegation, client and note of each change, which `store moves` prints; never a record's content, nor a setting's value |
 
 ## Taking it out of the image
@@ -171,6 +172,9 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `ticket note ID TEXT` | Adds a note on the ticket's page. |
 | `ticket work ID act=ACT [owner=NAME] [due=DATE] [resolution=R] [cites=C] [release=ticket\|N] [--expect-status N]` | Takes one act on the ticket's page: assign, due, resolve, close, reopen or release. |
 | `inbox [--expect N] [--expect-kind KIND ...]` | Prints the person's notices new since their pages last read them: the ticket and the change's kind. |
+| `licence DATASET kept=true\|false retention_days=N derived_use=... display=... personal_use=... [default_fields=A,B] [note=TEXT] [--expect-refused TEXT]` | From contract v18: sets a dataset's licence on the Data sources page, as a deployment admin does, replacing it whole; a boolean left out is false. |
+| `entitle DATASET [--fields A,B] [--withdraw] [note=TEXT] [--seconds N]` | From contract v18: entitles the plugin to a dataset on the Data sources page, every field or those named, or withdraws it; and has the broker's configuration written again with each plugin's datasets, its subjects on the broker, waiting until the broker reloaded: before the entitlement is recorded, so the sidecar subscribes to a subject the broker admits, and after a withdrawal. |
+| `priority DATA_TYPE [--kind KIND] DATASET ... [note=TEXT] [--against N] [--expect-refused TEXT]` | From contract v18: sets the priority for `meridian.v1.Price` (one kind: `close`, `last`, `nav`, `settlement`) or `meridian.v1.Bar` on the Data sources page, the datasets first to last, replaced whole against the priority as the page shows it, or `--against` the `updated_at_ns` given, which a priority changed since is refused. |
 
 Every command acts on the first plugin listed, or on another with `--instance
 <instance>`; as the admin, or with `--as NAME` as one of the run's people.
@@ -186,6 +190,7 @@ proof that the page links.
     $H run --rm -T store tickets
     $H run --rm -T store activity
     $H run --rm -T store moves
+    $H run --rm -T store lake
 
 `store moves` (contract v16) prints each move of raw records the conductor
 recorded, and each hold and archive change, and from contract v17 each
@@ -205,6 +210,22 @@ and the records each names and its notes, sorted, and never a text:
     reference|<ID>|<position>|<kind>|<value>|<account>|<found in its text>
     note|<ID>|<number>|<kind>|<author provenance>|<author person>|<author client>|<suspect>
 
+
+`store lake` (contract v18) prints what the lake kept, one line each, sorted,
+never a value -- a row's price or bar is read through a reading role, under
+its entitlement -- nor a time a run cannot state:
+
+    row|<dataset>|<price or bar>|<sequence>|<row key>|<version>|<subject>|<kind, or a bar's interval ns>|<venue>|<business date>|<previous sequence>|<unconverted>
+    priority|<data type>|<kind>|<changes>
+    want|<dataset>|<asked, answered, declined or withdrawn>|<subjects>|<reason>
+    served|<dataset>|<first sequence>|<last sequence>|<subjects>|<fields>|<readers>
+    removal|<dataset>|<rows removed>|<why>
+    miss|<instance>|<misses>
+    alias|<replaced>|<stays>
+
+A restatement is the next `<version>` of its row key, the first kept; each
+dataset's `<sequence>` runs from 1 with no holes. `<kind>` is PriceKind's
+number. A subject is the record's ID, minted per run in the harness.
 
 prints that store as stable, sorted lines, so a file from one run compares
 with the next. Whoever reads a store needs no database user, password, file or

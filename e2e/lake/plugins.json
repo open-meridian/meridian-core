@@ -1,0 +1,5 @@
+[
+  {"instance": "coin", "image": "meridian-python-interop", "roles": ["dgm"]},
+  {"instance": "book", "image": "meridian-python-interop", "roles": ["reporting"]},
+  {"instance": "other", "image": "meridian-python-interop", "roles": ["reporting"]}
+]

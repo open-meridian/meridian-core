@@ -309,10 +309,31 @@ fn instance(item: &serde_json::Value) -> Result<Instance, String> {
     Ok(Instance::plugin(instance_id, &roles).with_datasets(datasets))
 }
 
+/// Each plugin instance's datasets as `path` names them, written into the
+/// instance list in place of its own; a file not there names none.
+fn entitled(instances: &mut serde_json::Value, path: &str) -> Result<(), String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let named: std::collections::BTreeMap<String, Vec<String>> = serde_json::from_str(&text)
+        .map_err(|failed| {
+            format!("{path} is not a JSON object of instances and their datasets: {failed}")
+        })?;
+    for item in instances["instances"].as_array_mut().into_iter().flatten() {
+        if item.get("component").is_some() {
+            continue;
+        }
+        let id = item["instance_id"].as_str().unwrap_or_default().to_string();
+        item["datasets"] = serde_json::json!(named.get(&id).cloned().unwrap_or_default());
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut instances = "deploy/instances.example.json".to_string();
     let mut out = String::new();
     let mut dev_users = String::new();
+    let mut datasets = String::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -326,6 +347,11 @@ fn run() -> Result<(), String> {
             // Development identities, merged only when asked for. What they
             // produce is not what a chart ships.
             "--dev-users" => dev_users = value()?,
+            // The datasets each plugin instance is entitled to (contract
+            // v18), `{"<instance>": ["<dataset>", ...]}`, in place of what the
+            // instance list says: what the harness's runner writes on
+            // `entitle`. A file not there yet names none.
+            "--datasets" => datasets = value()?,
             other => return Err(format!("{other} is not an argument this takes")),
         }
     }
@@ -335,11 +361,14 @@ fn run() -> Result<(), String> {
             .map_err(|failed| format!("{path} could not be read: {failed}"))
     };
 
-    let instances: serde_json::Value = match std::fs::read_to_string(&instances) {
+    let mut instances: serde_json::Value = match std::fs::read_to_string(&instances) {
         Ok(text) => serde_json::from_str(&text)
             .map_err(|failed| format!("the instance list is not JSON: {failed}"))?,
         Err(_) => serde_json::json!({"instances": []}),
     };
+    if !datasets.is_empty() {
+        entitled(&mut instances, &datasets)?;
+    }
     let launched = instances["instances"]
         .as_array()
         .into_iter()

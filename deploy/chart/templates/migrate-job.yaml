@@ -159,6 +159,31 @@ spec:
               value: {{ .Values.logLevel | quote }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        - name: lake
+          image: "{{ .Values.image.repository }}:{{ .Values.lake.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-lake", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_LAKE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.lakeSecret | default .Values.migrate.existingSecret | default .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.migrate.lakeKey | default .Values.lake.database.key | default (include "meridian-runtime.migrateKey" $) }}
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.lake.database.key | default .Values.database.key }}
+                  optional: true
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.dashboard.enabled }}
         {{/*
           The dashboard's own tables: terminal sessions, kept so a restart

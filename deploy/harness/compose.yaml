@@ -119,18 +119,43 @@ services:
   # generates its own (decisions/020). The instances are plugins.yaml's,
   # which `harness.py compose` writes. A role the contract does not know
   # stops the run here, naming it.
+  #
+  # And written again whenever the runner's `entitle` asks (contract v18):
+  # the datasets each plugin is entitled to are its subjects on the broker,
+  # which the runner writes to `datasets.json` with a token in `asked`; this
+  # writes the configuration with them and the token to `generated`, and the
+  # broker reloads, saying so in `reloaded`. At start it writes what an
+  # earlier `entitle` of the run left.
   broker-config:
     <<: *runtime
     command:
       - |
         set -e
         printf '%s\n' "$${MERIDIAN_HARNESS_INSTANCES:?generate plugins.yaml with harness.py compose}" > /nats/instances.json
-        meridian-broker-config --instances /nats/instances.json --out /nats/harness.conf
+        write() {
+          meridian-broker-config --instances /nats/instances.json --datasets /nats/datasets.json \
+            --out /nats/harness.conf.next
+          mv /nats/harness.conf.next /nats/harness.conf
+        }
+        write
+        seen=$$(cat /nats/asked 2>/dev/null || true)
+        while sleep 1; do
+          asked=$$(cat /nats/asked 2>/dev/null || true)
+          [ "$$asked" = "$$seen" ] && continue
+          write && printf %s "$$asked" > /nats/generated
+          seen=$$asked
+        done
+    healthcheck:
+      test: ["CMD", "test", "-s", "/nats/harness.conf"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
     volumes:
       - broker:/nats
 
   # The configuration names a variable for each user's password, and holds
-  # none: MERIDIAN_NATS_<USER>, upper case, `-` as `_`.
+  # none: MERIDIAN_NATS_<USER>, upper case, `-` as `_`. Reloaded in place when
+  # broker-config writes it again for `entitle`.
   nats:
     image: nats:2.10-alpine
     entrypoint: ["sh", "-c"]
@@ -141,14 +166,25 @@ services:
           user=$$(basename "$$drawn" | tr a-z A-Z | tr - _)
           export "MERIDIAN_NATS_$$user=$$(cat "$$drawn")"
         done
-        exec nats-server -c /etc/nats/harness.conf
+        nats-server -c /etc/nats/harness.conf &
+        broker=$$!
+        trap 'kill -TERM $$broker; wait $$broker; exit 0' TERM INT
+        seen=$$(cat /etc/nats/generated 2>/dev/null || true)
+        while kill -0 $$broker 2>/dev/null; do
+          sleep 1 & wait $$!
+          generated=$$(cat /etc/nats/generated 2>/dev/null || true)
+          [ "$$generated" = "$$seen" ] && continue
+          nats-server --signal reload=$$broker && printf %s "$$generated" > /etc/nats/reloaded
+          seen=$$generated
+        done
+        wait $$broker
     depends_on:
       broker-config:
-        condition: service_completed_successfully
+        condition: service_healthy
       keys:
         condition: service_completed_successfully
     volumes:
-      - broker:/etc/nats:ro
+      - broker:/etc/nats
       - secrets:/secrets:ro
     networks: [harness]
 
@@ -161,9 +197,10 @@ services:
         set -e
         db=postgres://meridian:$$(cat /secrets/postgres)@postgres:5432/meridian
         export MERIDIAN_DATABASE_URL=$$db MERIDIAN_STREET_DATABASE_URL=$$db MERIDIAN_BOR_DATABASE_URL=$$db \
-          MERIDIAN_CONFIG_DATABASE_URL=$$db MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=$$db
+          MERIDIAN_CONFIG_DATABASE_URL=$$db MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL=$$db \
+          MERIDIAN_LAKE_DATABASE_URL=$$db
         meridian-instrument migrate && meridian-street migrate && meridian-bor migrate \
-          && meridian-conductor migrate && meridian-dashboard migrate
+          && meridian-lake migrate && meridian-conductor migrate && meridian-dashboard migrate
     depends_on:
       postgres:
         condition: service_healthy
@@ -203,6 +240,23 @@ services:
     depends_on: *serving
     environment:
       MERIDIAN_INSTANCE_ID: bor-1
+    volumes:
+      - secrets:/secrets:ro
+
+  # The lake (W10, contract v18): what a dgm records, read by the reading
+  # roles under the deployment's licences, entitlements and priority.
+  lake:
+    <<: *runtime
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        export MERIDIAN_LAKE_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
+        exec meridian-lake
+    depends_on: *serving
+    environment:
+      MERIDIAN_INSTANCE_ID: lake-1
     volumes:
       - secrets:/secrets:ro
 
@@ -330,10 +384,14 @@ services:
       # What an MCP client keeps between commands (`mcp connect`): its token
       # pair and what a call saved, for the run alone.
       - runner-state:/state
+      # Where `entitle` writes each plugin's datasets for the broker, and
+      # reads that the broker reloaded with them (contract v18).
+      - broker:/broker
     networks: [harness]
 
   # A store, printed by name as stable, sorted lines: `run --rm -T store
-  # street`, `store book`, `store tickets`, `store activity` or `store moves`
+  # street`, `store book`, `store tickets`, `store activity`, `store moves`
+  # or `store lake`
   # (README.md has their formats). Whoever reads a
   # store here needs no database user, file or query of their own.
   store:
@@ -345,8 +403,8 @@ services:
       - |
         set -e
         case "$${1:-}" in
-          street|book|tickets|activity|moves) ;;
-          *) echo "store takes the name of a store: street, book, tickets, activity or moves" >&2; exit 2 ;;
+          street|book|tickets|activity|moves|lake) ;;
+          *) echo "store takes the name of a store: street, book, tickets, activity, moves or lake" >&2; exit 2 ;;
         esac
         PGPASSWORD=$$(cat /secrets/postgres)
         export PGPASSWORD
@@ -358,6 +416,7 @@ services:
       - ./tickets.sql:/harness/tickets.sql:ro
       - ./activity.sql:/harness/activity.sql:ro
       - ./moves.sql:/harness/moves.sql:ro
+      - ./lake.sql:/harness/lake.sql:ro
       - secrets:/secrets:ro
     networks: [harness]
 

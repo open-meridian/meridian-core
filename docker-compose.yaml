@@ -107,6 +107,27 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
+  # The lake (W10, contract v18): prices and bars a dgm records, read under
+  # the deployment's licences, entitlements and priority. Its own process and
+  # store beside the street's and the book's (decisions/032); here in the
+  # same database, its tables prefixed lake_. No key and no platform address.
+  lake:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-lake"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_LAKE_DATABASE_URL: ${MERIDIAN_LAKE_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
+      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: lake-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
   # The instrument store. A store and a bus, and nothing else: no key, no platform
   # address, no network beyond the broker. Decision 011 moved all three to the
   # conductor below.
