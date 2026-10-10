@@ -457,6 +457,11 @@ def settings(args):
 
     form = until(seconds, declared, "the settings form never offered them")
     fields = {"form_token": form_token(form)}
+    # Against the settings as the form was drawn (contract v17's guard, which
+    # from v18 refuses a change naming none once any are saved).
+    drawn = re.search(r'name="against_updated_at_ns" value="(-?\d+)"', form.body)
+    if drawn:
+        fields["against_updated_at_ns"] = drawn.group(1)
     for name, value in asked:
         if "[" in name:
             fields[f"table.{base(name)}"] = "1"

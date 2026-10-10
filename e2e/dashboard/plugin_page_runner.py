@@ -93,6 +93,14 @@ REPORT_TOPICS = ("platform.deployment.event.plugin-report",
 PAGES = []
 
 
+def against(page):
+    """The settings' version as the form was drawn (contract v17's guard,
+    which from v18 refuses a change naming none once any are saved); 0 for
+    a form drawn before any were."""
+    found = re.search(r'name="against_updated_at_ns" value="(-?\d+)"', page.body)
+    return found.group(1) if found else "0"
+
+
 def kept(send):
     def sending(self, method, url, fields=None):
         reply = send(self, method, url, fields)
@@ -418,7 +426,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     # was still starting says healthy, having nothing to say otherwise.
     mark = reports.mark()
     done = ada.post(dash(f"/admin/plugins/{INSTANCE}/settings"),
-                    {"form_token": form_token(form), "secret.api_key": SECRET,
+                    {"form_token": form_token(form), "against_updated_at_ns": against(form), "secret.api_key": SECRET,
                      "value.poll_minutes": "15"})
     check(done.status == 303, f"saved: {done.status} {sentence(done)}")
     after = ada.get(dash(f"{VIEW}?tab=settings&saved=1"))
@@ -844,7 +852,7 @@ def main():
     check(tabs_page.status == 200 and 'data-setting="poll_minutes"' in tabs_page.body,
           f"its Settings tab is: {tabs_page.status} {sentence(tabs_page)}")
     saved = bea.post(dash(f"/admin/plugins/{INSTANCE}/settings"),
-                     {"form_token": form_token(tabs_page), "value.poll_minutes": "20"})
+                     {"form_token": form_token(tabs_page), "against_updated_at_ns": against(tabs_page), "value.poll_minutes": "20"})
     check(saved.status == 303, f"and she sets them: {saved.status} {sentence(saved)}")
     beas, why = session_at(bea, "admin")
     check(beas is not None, f"a Manage session: {why}")
@@ -892,7 +900,7 @@ def main():
     settings = ada.get(dash(f"{VIEW}?tab=settings"))
     check('data-setting="api_key"' not in settings.body, "the Settings tab is gone for her")
     posted = ada.post(dash(f"/admin/plugins/{INSTANCE}/settings"),
-                      {"form_token": form_token(settings), "value.poll_minutes": "30"})
+                      {"form_token": form_token(settings), "against_updated_at_ns": against(settings), "value.poll_minutes": "30"})
     check(posted.status == 403, f"and setting them refused: {posted.status}")
 
     say("L: the secret is in no page and no report")
