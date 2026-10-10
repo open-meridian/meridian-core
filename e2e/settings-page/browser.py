@@ -521,6 +521,8 @@ def the_data_sources_page(browser, prefix):
             check(not spilled, f"at {size} nothing in the {dialog} dialog reaches past it"
                   f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
             page.screenshot(path=os.path.join(OUT, f"{prefix}-data-sources-{dialog}-{size}.png"))
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
         if size == "desktop" and PASS != "fit":
             page.goto(f"{DATA_SOURCES}#datasets")
             settled(page)

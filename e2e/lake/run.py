@@ -14,9 +14,10 @@ harness's admin, Ben, who holds read on `book`.
    written again with them and reloaded (the runner's `entitle`).
 3. Recorded and heard: `book` follows BTC and EUR's cash instrument; `coin`
    records two daily closes and a bar, a BTC price in USDC on the token's
-   own instrument and an FX rate; `book` hears the closes and the rate, and
-   reads the second close on its venue ID in dollars' cash instrument, and
-   the USDC price on USDC's.
+   own instrument and an FX rate; `book` hears the latest close (heard
+   latest value first per key, the second standing for the first) and the
+   rate, reads the first close, and the second on its venue ID in dollars'
+   cash instrument, and the USDC price on USDC's.
 4. Restated: `coin` records the second day again, changed; `book` hears
    version 2, reads it, and reads version 1 as of before it.
 5. Refused: `other`, not entitled, is answered not entitled; a read naming
@@ -181,8 +182,12 @@ def run():
         heard = page("book", "read", "/heard")["heard"]
         days = {h["business_date"] for h in heard if h["dataset"] == "coin:daily" and h["kind"] == "PRICE_KIND_CLOSE"}
         fx = [h for h in heard if h["dataset"] == "coin:fx"]
-        return heard if {DAY_1, DAY_2} <= days and fx else None
-    heard = until(60, heard_closes, "step 3, book did not hear the closes and the rate")
+        return heard if DAY_2 in days and fx else None
+    # Heard latest value first per key -- dataset, subjects, venue and kind --
+    # so the second close stands for the first, which is read.
+    heard = until(60, heard_closes, "step 3, book did not hear the latest close and the rate")
+    first = page("book", "read", f"/prices?subject={btc}&date={DAY_1}&kind=close")["prices"]
+    must(len(first) == 1 and first[0]["amount"] == "62431.27", f"step 3, the first close: {first}")
     rate = [h for h in heard if h["dataset"] == "coin:fx"][0]
     must(rate["amount"] == "1.0912", f"step 3, the rate as stated: {rate}")
     second = page("book", "read", f"/prices?subject={btc}&date={DAY_2}&kind=close")
@@ -220,11 +225,15 @@ def run():
          f"step 5, an invalid date refused naming business_date: {invalid}")
 
     # 6. Wants: asked once for two reads, answered; a standing want withdrawn.
-    for _ in range(2):
-        asked = page("book", "read", f"/prices?subject={btc}&date={DAY_0}&kind=close&dataset=coin:daily")
-        must(not asked["prices"] and any(u["reason"] == "UNANSWERED_REASON_ASKED_SOURCE"
-                                         for u in asked["unanswered"]),
-             f"step 6, a day not recorded is asked of its source: {asked}")
+    asked = page("book", "read", f"/prices?subject={btc}&date={DAY_0}&kind=close&dataset=coin:daily")
+    must(not asked["prices"] and any(u["reason"] == "UNANSWERED_REASON_ASKED_SOURCE"
+                                     for u in asked["unanswered"]),
+         f"step 6, a day not recorded is asked of its source: {asked}")
+    # Read again at once: coalesced into the open want, or answered by it.
+    again = page("book", "read", f"/prices?subject={btc}&date={DAY_0}&kind=close&dataset=coin:daily")
+    must(again["prices"] or any(u["reason"] == "UNANSWERED_REASON_ASKED_SOURCE"
+                                for u in again["unanswered"]),
+         f"step 6, read again, asked or answered: {again}")
     until(60, lambda: page("book", "read",
                            f"/prices?subject={btc}&date={DAY_0}&kind=close&dataset=coin:daily")["prices"],
           "step 6, coin did not record the day wanted")
@@ -254,17 +263,18 @@ def run():
     # 8. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
-    daily_rows = [line.split("|") for line in lines if line.startswith("row|coin:daily|price|")]
+    daily_rows = [line.split("|") for line in lines if line.startswith("row|coin:daily|")]
     sequences = sorted(int(row[3]) for row in daily_rows)
-    must(sequences == list(range(1, len(sequences) + 1)) and len(sequences) >= 5,
-         f"step 8, daily's prices numbered with no holes: {sequences}")
+    must(sequences == list(range(1, len(sequences) + 1)) and len(sequences) >= 6,
+         f"step 8, daily's prices and bars numbered from its head with no holes: {sequences}")
+    daily_rows = [row for row in daily_rows if row[2] == "price"]
     second_close = [row for row in daily_rows if row[4] == "BTC-USD:1d:1791504000"]
     must(sorted(row[5] for row in second_close) == ["1", "2"],
          f"step 8, the second close kept as versions 1 and 2: {second_close}")
     wants = [line for line in lines if line.startswith("want|coin:daily|") and f"|{btc}|" in line]
-    asked_for = [w for w in wants if "|asked|" in w]
-    must(len([w for w in wants if "|answered|" in w]) == 1, f"step 8, the want answered: {wants}")
-    must(asked_for, f"step 8, the want asked: {wants}")
+    must(wants.count(f"want|coin:daily|asked|{btc}|0") == 1,
+         f"step 8, two reads of the day not recorded asked once: {wants}")
+    must(f"want|coin:daily|answered|{btc}|0" in wants, f"step 8, the want answered: {wants}")
     must(any(line.startswith("want|coin:ticks|withdrawn|") for line in lines),
          f"step 8, the standing want withdrawn: {lines}")
     must("priority|meridian.v1.Price|1|2" in lines, f"step 8, the priority's two changes: {lines}")

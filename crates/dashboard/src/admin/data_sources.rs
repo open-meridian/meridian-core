@@ -26,7 +26,7 @@
 //! tool ([`crate::mcp::data_sources`]), and a tool's answer is what this
 //! page shows the same person (Q30): both read [`rows`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use meridian_access::person_access;
@@ -143,18 +143,33 @@ impl Row {
     }
 }
 
-/// Who holds read on `instance`, by subject, as the records say now.
+/// Who holds read on `instance`, by subject, as the records say now: each
+/// person who signed in, and each login a user group names, signed in yet
+/// or not, whose data level on it is read or write, whatever accounts it
+/// reaches. A directory group's members are known only once each has
+/// signed in.
 fn readers_of(records: &AccessRecords, instance: &str) -> BTreeSet<String> {
-    records
+    let signed_in = records
         .people
         .iter()
-        .filter(|person| {
-            person_access(records, &person.subject, &person.directory_groups)
+        .map(|person| (person.subject.clone(), person.directory_groups.clone()));
+    let named = records
+        .user_groups
+        .iter()
+        .flat_map(|group| group.logins.iter().map(|login| (login.clone(), Vec::new())));
+    let mut candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (subject, groups) in named.chain(signed_in) {
+        candidates.insert(subject, groups);
+    }
+    candidates
+        .into_iter()
+        .filter(|(subject, groups)| {
+            person_access(records, subject, groups)
                 .plugins
                 .get(instance)
-                .is_some_and(|held| !held.union().accounts.is_empty())
+                .is_some_and(|held| held.union().data.is_some())
         })
-        .map(|person| person.subject.clone())
+        .map(|(subject, _)| subject)
         .collect()
 }
 
@@ -316,7 +331,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                  <td class=\"wide\" title=\"{carried}\">{carried}</td>\
                  <td class=\"wide\" title=\"{serves}; {modes}\">{serves}</td>\
                  <td title=\"{licence_said}, {source}\">{licence_said}{badge}</td>\
-                 <td title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
+                 <td class=\"wide\" title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
                  <td class=\"wide num\" data-unconverted>{unconverted}</td>\
                  <td class=\"wide num\" data-misses>{misses}</td>\
                  <td class=\"actions\"><button type=\"button\" class=\"wide\" data-dialog-open=\"licence\" \
@@ -350,7 +365,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
         format!(
             "<om-pager><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
              <th>Dataset</th><th class=\"wide\">Vendor</th><th class=\"wide\">Serves</th>\
-             <th>Licence</th><th title=\"Plugins entitled\">Entitled</th>\
+             <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
              <th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
@@ -531,6 +546,18 @@ fn priority_tab(
     (body, dialog)
 }
 
+/// A tab shown measures its pager again, as on a resize: a pager measured
+/// while its tab was hidden pages nothing.
+const PAGER_SCRIPT: &str = r#"
+(function () {
+  function measure() { window.setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 0); }
+  window.addEventListener("hashchange", measure);
+  document.addEventListener("click", function (event) {
+    if (event.target.closest("nav.tabs a")) measure();
+  });
+  measure();
+})();"#;
+
 fn section(id: &str, title: &str, about: &str, action: &str, body: &str) -> String {
     format!(
         "<section class=\"admin-section\" id=\"{id}\">\
@@ -584,7 +611,7 @@ pub fn page(
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Data sources</h1></div>{notice}\
          <nav class=\"tabs\">{tabs}</nav>{}{}{}{datasets_dialogs}{priority_dialog}</div>\
-         <script>{}{}</script>",
+         <script>{}{}{PAGER_SCRIPT}</script>",
         section(
             "datasets",
             "Datasets",

@@ -98,7 +98,8 @@ fn run() -> Result<(), String> {
         // Each currency's cash instrument (contract v18): the codes held
         // before resolved once and said to be filled in, then any the
         // instrument store did not answer for.
-        meridian_street::cash::load(store.as_ref());
+        // Read from the store, which blocks: off the runtime's own threads.
+        tokio::task::block_in_place(|| meridian_street::cash::load(store.as_ref()));
         tokio::spawn(meridian_street::cash::sweep_forever(
             bus.clone(),
             Arc::clone(&store),

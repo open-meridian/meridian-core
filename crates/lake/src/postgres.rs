@@ -290,7 +290,7 @@ impl Store for PostgresStore {
                 "SELECT body FROM lake_row
                   WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
                     AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
-                    AND ($5 = 0 OR interval_ns = $5)
+                    AND ($5::bigint = 0 OR interval_ns = $5)
                     AND recorded_at_ns <= $6
                     AND ($7::text IS NULL OR business_date = $7::text::date)
                     AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10

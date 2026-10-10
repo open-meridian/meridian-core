@@ -106,7 +106,8 @@ fn run() -> Result<(), String> {
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // Each currency's cash instrument (contract v18): the codes held
         // before resolved once and said to be filled in.
-        meridian_bor::cash::load(store.as_ref());
+        // Read from the store, which blocks: off the runtime's own threads.
+        tokio::task::block_in_place(|| meridian_bor::cash::load(store.as_ref()));
         tokio::spawn(meridian_bor::cash::sweep_forever(
             bus.clone(),
             Arc::clone(&store),

@@ -1233,7 +1233,9 @@ fn serve_on<Req, Rep, F>(
 /// Register every handler, and subscribe to every event the lake hears,
 /// before returning; the loops consuming them are spawned.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc<Lake> {
-    let lake = Lake::new(Arc::clone(&bus), store, clock);
+    // Lake::new reads the configuration last heard from the store, which
+    // blocks: off the runtime's own threads.
+    let lake = tokio::task::block_in_place(|| Lake::new(Arc::clone(&bus), store, clock));
     serve_on(
         &bus,
         &lake,
