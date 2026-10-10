@@ -1,7 +1,7 @@
 //! Each amount the book answers names its cash instrument (contract v18;
 //! decisions/023 as amended, ruling 1 of 2026-10-09).
 //!
-//! An operations plugin states a fiat amount by its ISO 4217 code; the street keeps it
+//! An operations plugin states a fiat amount by its ISO 4217 code; the book keeps it
 //! so, and resolves each code once through the instrument store (W3.1, by
 //! `iso4217`) to the currency's cash instrument, keeping the resolution as
 //! its own record. A command naming a code not yet resolved has it resolved
