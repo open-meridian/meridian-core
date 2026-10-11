@@ -277,7 +277,11 @@ def main():
     s.check(done.returncode == 0, f"meridian backup key: exit {done.returncode}")
     recipient = next((w for w in done.stdout.split() if w.startswith("age1")), "")
     s.check(bool(recipient), "and it printed the public half")
-    os.chmod(os.path.join(workdir, "identity.txt"), 0o644)  # for the container's user
+    # For the container's user, where this machine owns what the container wrote (a Mac's
+    # shared folder). On Linux the container's user owns it already, and reads it back.
+    identity = os.path.join(workdir, "identity.txt")
+    if os.path.exists(identity) and os.stat(identity).st_uid == os.getuid():
+        os.chmod(identity, 0o644)
     again = cli(workdir, "backup", "key", "--to", "identity.txt")
     s.check(again.returncode != 0 and "never written over" in again.stderr,
             "a second one is never written over the first")
