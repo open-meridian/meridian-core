@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
-        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
+        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-lake e2e-recorded \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
@@ -464,6 +464,10 @@ E2E_CLUSTER_TARGET ?= e2e-cluster
 E2E_K3D_KEEP ?=
 E2E_K3D_READY_SECONDS ?= 300
 E2E_K3D_SYSTEM ?= coredns local-path-provisioner metrics-server traefik
+# This machine's port the cluster's port 80 is published on. 80 for the runs
+# that arrive through the Ingress; e2e-cluster-backup needs none, and on a
+# laptop whose own cluster holds 80 it is run with another.
+E2E_K3D_HTTP ?= 80
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -492,7 +496,7 @@ e2e-cluster-k3d:
 	@: >.e2e-k3d.log; made=; for attempt in 1 2; do \
 	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
-		--api-port $(E2E_K3D_API) -p "80:80@loadbalancer" \
+		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--wait --timeout $(E2E_K3D_READY_SECONDS)s >>.e2e-k3d.log 2>&1; then made=yes; break; fi; \
 	  echo "e2e-cluster-k3d: making the cluster failed, attempt $$attempt of 2; the tail of .e2e-k3d.log:" >&2; \
 	  tail -20 .e2e-k3d.log >&2; \
@@ -532,6 +536,49 @@ e2e-cluster-k3d:
 	    $(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1; \
 	    rm -f $(E2E_K3D_KUBECONFIG); \
 	  fi; \
+	  exit $$held
+
+# Backup and restore, proved (task kernel/a-deployment-is-backed-up-and-
+# restored): a deployment with people, access, settings with a secret sealed,
+# and a book, backed up by the chart's CronJob on its schedule and by
+# `meridian backup --to`, wiped as a reset of the cluster wipes it, restored by
+# `meridian restore`, and held to what it was (e2e/backup/run.py). The real
+# CLI, built from meridian-cli beside this checkout; the backup image from
+# deploy/backup. No platform and no Ingress.
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup E2E_K3D_HTTP=18080
+#
+# It refuses any kube context that is not a k3d or kind cluster's: it
+# installs, wipes and restores, and a cluster somebody uses is never where
+# that happens. E2E_BACKUP_RUNTIME names a runtime image already built (a
+# published one, for a change to the chart alone) instead of building it.
+CLI ?= ../meridian-cli
+E2E_BACKUP_NAMESPACE ?= meridian-backup-e2e
+E2E_BACKUP_IMAGE ?= meridian-backup:local
+E2E_BACKUP_RUNTIME ?=
+E2E_BACKUP_CLI_IMAGE ?= meridian-cli-e2e:local
+e2e-cluster-backup:
+	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
+	case "$$ctx" in k3d-*|kind-*) ;; \
+	*) echo "e2e-cluster-backup: the kube context is '$$ctx', which is not a k3d or kind cluster's. It installs, wipes and restores: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup" >&2; exit 1;; esac
+	@test -f "$(CLI)/Dockerfile.rust" || { echo "e2e-cluster-backup: no meridian-cli at $(CLI); set CLI=<path>" >&2; exit 1; }
+	@echo "e2e-cluster-backup: building the backup image, the CLI$(if $(E2E_BACKUP_RUNTIME),, and the runtime)"
+	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
+	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
+	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
+	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
+	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
+		$(PY) e2e/backup/run.py; \
+	  held=$$?; \
+	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
+	    echo "e2e-cluster-backup: the namespace is left for reading. Remove it with:" >&2; \
+	    echo "  kubectl delete namespace $(E2E_BACKUP_NAMESPACE)" >&2; \
+	  else \
+	    kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --wait >/dev/null 2>&1; \
+	  fi; \
+	  rm -rf "$(CURDIR)"/meridian-backup-e2e-*; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
@@ -1711,7 +1758,39 @@ chart-check:
 	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
 	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup\|initContainers' \
 		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, and nothing an upgrade leaves behind"
+	@# Backups (task kernel/a-deployment-is-backed-up-and-restored): nothing
+	@# until a recipient and a place are both given; a schedule with no
+	@# recipient, or nowhere to write, refused, since there is no unencrypted
+	@# backup; with both, a CronJob in backup.image, suspended with no schedule,
+	@# mounting the settings key and the deployment's key, and the values it
+	@# keeps holding no enrolment code.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'meridian.dev/component: backup' \
+		|| { echo "chart-check FAILED: a backup renders though no recipient and no place were given" >&2; exit 1; }; \
+	refused="$$($(HELM) template check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.path=/b 2>&1)"; \
+	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'backup.recipient' \
+		|| { echo "chart-check FAILED: a schedule with no recipient rendered, or was refused without naming backup.recipient" >&2; exit 1; }; \
+	refused="$$($(HELM) template check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.recipient=age1check 2>&1)"; \
+	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'backup.path' \
+		|| { echo "chart-check FAILED: a schedule with nowhere to write rendered, or was refused without naming backup.path" >&2; exit 1; }; \
+	asked="$$($(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render with a recipient and a path" >&2; exit 1; }; \
+	job="$$(echo "$$asked" | awk '/^---/{p=0} /^kind: CronJob$$/{p=1} p')"; \
+	echo "$$job" | grep -q '^  suspend: true$$' \
+		|| { echo "chart-check FAILED: with no schedule the backup's CronJob is not suspended" >&2; exit 1; }; \
+	echo "$$job" | grep -q 'image: "ghcr.io/open-meridian/meridian-backup:' \
+		|| { echo "chart-check FAILED: the backup does not run in backup.image" >&2; exit 1; }; \
+	echo "$$job" | grep -q 'mountPath: /in/secrets/check-meridian-runtime-settings-key$$' \
+		&& echo "$$job" | grep -q 'claimName: check-meridian-runtime-key$$' \
+		|| { echo "chart-check FAILED: the backup does not read the settings key and the deployment's key" >&2; exit 1; }; \
+	echo "$$job" | grep -q 'ttlSecondsAfterFinished: ' \
+		|| { echo "chart-check FAILED: the backup's Jobs have no ttlSecondsAfterFinished" >&2; exit 1; }; \
+	! echo "$$asked" | awk '/^---/{p=0} /^  name: check-meridian-runtime-backup-values$$/{p=1} p' | grep -q 'ENR-check' \
+		|| { echo "chart-check FAILED: the values a backup keeps hold the enrolment code" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.schedule='0 2 * * *' 2>/dev/null \
+		| awk '/^---/{p=0} /^kind: CronJob$$/{p=1} p' | grep -q '^  suspend: false$$' \
+		|| { echo "chart-check FAILED: with a schedule the backup's CronJob is still suspended" >&2; exit 1; }
+	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \

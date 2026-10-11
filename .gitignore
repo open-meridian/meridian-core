@@ -44,3 +44,6 @@ deploy/nats/dev.conf
 # accident in c6b35b8 and removed from tracking on 2026-09-26; removing it
 # un-leaks nothing, so the key it held is revoked on the platform instead.
 .live/
+
+# Written by `make e2e-cluster-backup` while it runs: an identity and a backup.
+meridian-backup-e2e-*/

@@ -1,0 +1,290 @@
+{{- include "meridian-runtime.require" . -}}
+{{- $b := .Values.backup | default dict }}
+{{- if and $b.schedule (not $b.recipient) }}
+{{- fail "backup.schedule is set and backup.recipient is not. Every backup is sealed to an administrator's age public key, and there is no unencrypted one: make a pair with `meridian backup key` and set backup.recipient to the public half." }}
+{{- end }}
+{{- if and $b.schedule (not (or $b.path $b.existingClaim)) }}
+{{- fail "backup.schedule is set with nowhere to write: set backup.path (a directory on the node) or backup.existingClaim (a claim on storage that outlives the cluster)." }}
+{{- end }}
+{{- if and $b.path $b.existingClaim }}
+{{- fail "backup.path and backup.existingClaim are both set; name one place for backups." }}
+{{- end }}
+{{- if and $b.recipient (or $b.path $b.existingClaim) }}
+{{/*
+  Backups of this deployment (task kernel/a-deployment-is-backed-up-and-
+  restored; values.yaml's backup). A CronJob, suspended when no schedule is
+  set so `meridian backup` can still run it once, writing one sealed file per
+  run to a volume of its own. What it writes, and why each piece, is in
+  files/backup.sh, which runs in backup.image: pg_dump and age, nothing of
+  the runtime's (the product owner, 2026-10-11: no third-party dependency in
+  the kernel).
+
+  It holds no RBAC and changes nothing in the cluster. What it reads it is
+  given as volumes: every Secret the chart keeps and every one the values
+  name, the dashboard's public keys, the deployment's key, and these values.
+  Restoring is a person's act, with their own cluster rights, never this
+  Job's (decisions/016).
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-backup" $full }}
+{{- $claim := $b.existingClaim | default $name }}
+{{- $generated := include "meridian-runtime.generatedKey" . }}
+{{- $chart := list (printf "%s-settings-key" $full) }}
+{{- if .Values.dashboard.enabled }}
+{{- $chart = append $chart (printf "%s-dashboard-signing" $full) }}
+{{- end }}
+{{- if .Values.database.brought.enabled }}
+{{- $chart = append $chart (printf "%s-database-passwords" $full) }}
+{{- end }}
+{{- if not .Values.database.existingSecret }}
+{{- $chart = append $chart (printf "%s-database" $full) }}
+{{- end }}
+{{- if .Values.dashboard.enabled }}
+{{- $chart = append $chart .Values.firstRun.addressesSecretName }}
+{{- $chart = append $chart (printf "%s-dashboard-oidc" $full) }}
+{{- if not .Values.firstRun.directorySecretName }}
+{{- $chart = append $chart (printf "%s-ldap-bind" $full) }}
+{{- end }}
+{{- end }}
+{{- if not .Values.broker.existingSecret }}
+{{- $chart = concat $chart (list (printf "%s-broker" $full) (printf "%s-broker-passwords" $full) (printf "%s-broker-launched" $full)) }}
+{{- end }}
+{{/* The administrator's own, named in these values: theirs to have made, and
+     a restore needs them as much as the chart's. */}}
+{{- $operator := list .Values.database.existingSecret .Values.migrate.existingSecret .Values.migrate.streetSecret .Values.migrate.configSecret .Values.migrate.borSecret .Values.migrate.lakeSecret .Values.conductor.database.existingSecret .Values.street.database.existingSecret .Values.bor.database.existingSecret .Values.lake.database.existingSecret .Values.broker.existingSecret .Values.firstRun.directorySecretName .Values.dashboard.oidc.existingSecret .Values.key.existingSecret .Values.ingress.tls.secretName .Values.ingress.tls.pluginsSecretName }}
+{{- range .Values.sidecars }}
+{{- with .plugin }}
+{{- $operator = append $operator (.existingSecret | default "") }}
+{{- $operator = append $operator (.imagePullSecret | default "") }}
+{{- end }}
+{{- end }}
+{{- $operator = without (uniq $operator) "" }}
+{{- range $chart }}{{ $operator = without $operator . }}{{ end }}
+{{- $maps := list }}
+{{- if .Values.dashboard.enabled }}
+{{- $maps = append $maps (printf "%s-dashboard-keys" $full) }}
+{{- end }}
+{{- $values := deepCopy .Values }}
+{{- $_ := unset $values.deployment "enrolmentCode" }}
+---
+# What restore installs again: these values without the enrolment code (spent
+# once used, and the one secret value the chart takes). Restore gives Helm
+# only those that differ from the chart's own defaults, which it reads from
+# the chart it installs, so a default that changed still applies.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-values
+  labels:
+    meridian.dev/component: backup
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  values.yaml: |
+    {{- toYaml $values | nindent 4 }}
+{{- if $b.path }}
+---
+# A directory on the node, as pluginArchive.path is: kept on uninstall and
+# never deleted by the deployment. On a cluster of several nodes, name a claim
+# on shared storage instead (existingClaim).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ printf "%s-%s" .Release.Namespace $claim }}
+  labels:
+    meridian.dev/component: backup
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity:
+    storage: {{ $b.size | quote }}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ $claim }}
+  hostPath:
+    path: {{ $b.path | quote }}
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $claim }}
+  labels:
+    meridian.dev/component: backup
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: {{ printf "%s-%s" .Release.Namespace $claim }}
+  resources:
+    requests:
+      storage: {{ $b.size | quote }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/component: backup
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  # With none set, a time that is never reached and the CronJob suspended:
+  # Kubernetes needs a schedule, and a suspended CronJob runs only when
+  # somebody makes a Job from it, which is what `meridian backup` does.
+  schedule: {{ $b.schedule | default "0 0 1 1 *" | quote }}
+  suspend: {{ not $b.schedule }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        meridian.dev/component: backup
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+    spec:
+      backoffLimit: 0
+      # Gone a day after it finishes, as every Job in this chart.
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            meridian.dev/component: backup
+            {{- include "meridian-runtime.labels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $generated }}
+          # The deployment's key is on a claim the conductor mounts, which may
+          # be ReadWriteOnce: read beside it, on its node.
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/instance: {{ .Release.Name }}
+                      meridian.dev/component: conductor
+          {{- end }}
+          containers:
+            - name: backup
+              image: {{ $b.image | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["sh", "-c", {{ .Files.Get "files/backup.sh" | quote }}]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+                  # To read the key the conductor wrote as its own user.
+                  add: [DAC_READ_SEARCH]
+              env:
+                - name: MERIDIAN_BACKUP_RELEASE
+                  value: {{ .Release.Name | quote }}
+                - name: MERIDIAN_BACKUP_NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                - name: MERIDIAN_BACKUP_CHART_VERSION
+                  value: {{ .Chart.Version | quote }}
+                - name: MERIDIAN_BACKUP_APP_VERSION
+                  value: {{ .Chart.AppVersion | quote }}
+                - name: MERIDIAN_BACKUP_DEPLOYMENT_ID
+                  value: {{ .Values.deployment.id | quote }}
+                - name: MERIDIAN_BACKUP_RECIPIENT
+                  value: {{ $b.recipient | quote }}
+                - name: MERIDIAN_BACKUP_KEEP
+                  value: {{ $b.keep | default 14 | quote }}
+                # Included with the database this chart brings, not with one
+                # somebody else runs.
+                - name: MERIDIAN_BACKUP_DATABASE
+                  value: auto
+                - name: MERIDIAN_BACKUP_DATABASE_SECRET
+                  value: {{ include "meridian-runtime.databaseSecret" . | quote }}
+                {{- if .Values.database.brought.enabled }}
+                - name: MERIDIAN_BACKUP_BROUGHT_HOST
+                  value: {{ printf "%s-database" $full | quote }}
+                - name: MERIDIAN_BACKUP_BROUGHT_PASSWORDS
+                  value: {{ printf "%s-database-passwords" $full | quote }}
+                {{- end }}
+                - name: MERIDIAN_BACKUP_CHART_SECRETS
+                  value: {{ join " " $chart | quote }}
+                - name: MERIDIAN_BACKUP_OPERATOR_SECRETS
+                  value: {{ join " " $operator | quote }}
+                - name: MERIDIAN_BACKUP_CONFIG_MAPS
+                  value: {{ join " " $maps | quote }}
+                - name: MERIDIAN_BACKUP_KEY
+                  value: {{ ternary "generated" "secret" (not (empty $generated)) }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: work
+                  mountPath: /work
+                - name: tmp
+                  mountPath: /tmp
+                - name: values
+                  mountPath: /in/values
+                  readOnly: true
+                {{- if $generated }}
+                - name: key
+                  mountPath: /in/key
+                  readOnly: true
+                {{- end }}
+                {{- range $i, $secret := concat $chart $operator }}
+                - name: secret-{{ $i }}
+                  mountPath: /in/secrets/{{ $secret }}
+                  readOnly: true
+                {{- end }}
+                {{- range $i, $map := $maps }}
+                - name: config-map-{{ $i }}
+                  mountPath: /in/configmaps/{{ $map }}
+                  readOnly: true
+                {{- end }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ $claim }}
+            # Plain text until sealed, removed by the script on any exit and
+            # with the pod.
+            - name: work
+              emptyDir: {}
+            - name: tmp
+              emptyDir:
+                medium: Memory
+                sizeLimit: 1Mi
+            - name: values
+              configMap:
+                name: {{ $name }}-values
+            {{- if $generated }}
+            - name: key
+              persistentVolumeClaim:
+                claimName: {{ $full }}-key
+                readOnly: true
+            {{- end }}
+            {{- range $i, $secret := concat $chart $operator }}
+            # Optional: one first run has not filled, or a branch it did not take.
+            - name: secret-{{ $i }}
+              secret:
+                secretName: {{ $secret | quote }}
+                optional: true
+            {{- end }}
+            {{- range $i, $map := $maps }}
+            - name: config-map-{{ $i }}
+              configMap:
+                name: {{ $map | quote }}
+                optional: true
+            {{- end }}
+{{- end }}

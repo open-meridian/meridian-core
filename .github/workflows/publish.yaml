@@ -220,6 +220,51 @@ jobs:
           echo "expected: $expected"
           [ -n "$expected" ] && [ "$held" = "$expected" ]
 
+  # The backup image (task kernel/a-deployment-is-backed-up-and-restored):
+  # pg_dump and age, nothing of the runtime's, which the chart's backup
+  # CronJob runs in. Tagged with the same commit as the runtime, and pinned
+  # by the chart below the same way, so a chart names the backup image it
+  # was published beside. Both architectures: it runs on a person's laptop.
+  backup-image:
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      BACKUP: ghcr.io/open-meridian/meridian-backup
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/backup
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.BACKUP }}:${{ steps.tag.outputs.sha }}
+            ${{ env.BACKUP }}:latest
+          push: true
+
+      # Run as the CronJob runs it, rather than trusting a push that exited 0.
+      - name: Check it holds pg_dump and age
+        env:
+          TAG: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$BACKUP:$TAG" sh -c 'pg_dump --version && age --version'
+
   # The chart, pushed beside the image it names.
   #
   # Until this existed, a customer reached the chart by having the repository,
@@ -231,7 +276,7 @@ jobs:
   # After `publish` rather than beside it: a chart whose image tag names a
   # manifest that does not exist yet is a chart that installs and cannot pull.
   chart:
-    needs: publish
+    needs: [publish, backup-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -263,6 +308,9 @@ jobs:
           set -euo pipefail
           sed -i "s|^  tag: latest$|  tag: \"$SHA\"|" deploy/chart/values.yaml
           grep -qx "  tag: \"$SHA\"" deploy/chart/values.yaml
+          # And the backup image, published beside it by backup-image.
+          sed -i "s|^  image: ghcr.io/open-meridian/meridian-backup:latest$|  image: \"ghcr.io/open-meridian/meridian-backup:$SHA\"|" deploy/chart/values.yaml
+          grep -qx "  image: \"ghcr.io/open-meridian/meridian-backup:$SHA\"" deploy/chart/values.yaml
 
       # Asserted by rendering rather than by trusting the edit above: a sed
       # that matches nothing exits 0, and the failure would be a published

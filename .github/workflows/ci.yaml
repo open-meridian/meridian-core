@@ -109,7 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc, e2e-cluster-upgrade]
+        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc, e2e-cluster-upgrade, e2e-cluster-backup]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,6 +146,16 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
           path: workspace/meridian-platform
+
+      # The CLI, public, at its main, for the backup run's `meridian backup`
+      # and `meridian restore` (task kernel/a-deployment-is-backed-up-and-
+      # restored): the commands a person restores with, not a stand-in.
+      - uses: actions/checkout@v4
+        if: matrix.target == 'e2e-cluster-backup'
+        with:
+          repository: ${{ github.repository_owner }}/meridian-cli
+          persist-credentials: false
+          path: workspace/meridian-cli
 
       # Pinned, and checked against the release's own checksum, rather than
       # piping an install script from a branch into a shell.

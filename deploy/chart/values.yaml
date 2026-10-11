@@ -442,6 +442,42 @@ pluginArchive:
   serviceAccount: ""
   objectLock: false
 
+# Backups of this deployment (task kernel/a-deployment-is-backed-up-and-restored):
+# a CronJob that writes one file per run, `<release>-<UTC time>.meridian-backup`,
+# holding everything a restore needs that is not the cluster's own -- the
+# keys the deployment's secrets are sealed with and its components trust,
+# every credential the chart keeps, the deployment's key, these values
+# (without the enrolment code), and the database this chart brings, dumped
+# with every table's row count. A database somebody else runs is left to
+# its provider's own backups and is not dumped.
+#
+# Sealed with age to `recipient`, whose private half is the administrator's
+# and never in the cluster: the cluster cannot read its own backups, and a
+# copied backup reveals nothing. `meridian backup key` makes a pair; restore
+# with `meridian restore <file> --identity <file>`, into a namespace holding
+# no deployment. Nothing renders until `recipient` and a place to write are
+# both set; there is no unencrypted backup.
+#
+# On a local cluster, `path` is a directory on the node: on Rancher Desktop,
+# one under your Mac's home folder, which the VM mounts and a reset of
+# Rancher Desktop keeps (a path inside the VM is wiped with it). Or name a
+# claim already made on storage that outlives the cluster (`existingClaim`).
+backup:
+  # Cron, in the cluster's time zone. Empty: none scheduled, and `meridian
+  # backup` still takes one when asked.
+  schedule: ""
+  # The age public key (`age1...`) each backup is sealed to.
+  recipient: ""
+  path: ""
+  existingClaim: ""
+  # The volume made from `path`, requested once.
+  size: 20Gi
+  # How many of this release's backups to keep; the oldest beyond it are
+  # removed once a new one is written, and never after a failure.
+  keep: 14
+  # pg_dump at the brought database's major version, and age.
+  image: ghcr.io/open-meridian/meridian-backup:latest
+
 
 resources:
   requests:
