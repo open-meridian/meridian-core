@@ -71,6 +71,9 @@ pub struct Actor {
     pub person: String,
     pub delegation: String,
     pub client: String,
+    /// The prepared change the person made it from (W6.27, contract v20),
+    /// as the envelope carried it beside them; empty otherwise.
+    pub prepared_call_id: String,
 }
 
 impl Actor {
@@ -130,6 +133,7 @@ fn complete_one(
     actor: &Actor,
     now_ns: i64,
 ) -> Result<(InstrumentCompletionResult, Option<Instrument>)> {
+    let prepared = actor.prepared_call_id.as_str();
     let (person, delegation, client) = (
         actor.person.as_str(),
         actor.delegation.as_str(),
@@ -346,6 +350,7 @@ fn complete_one(
                     record.set_source(Source {
                         acting_through_delegation: delegation.to_string(),
                         client_name: client.to_string(),
+                        prepared_call_id: prepared.to_string(),
                         field: Field::Identifier,
                         identifier: Some(asked.clone()),
                         source: source.to_string(),
@@ -393,6 +398,7 @@ fn complete_one(
             record.set_source(Source {
                 acting_through_delegation: delegation.to_string(),
                 client_name: client.to_string(),
+                prepared_call_id: prepared.to_string(),
                 field: Field::Identifier,
                 identifier: Some(asked.clone()),
                 source: source.to_string(),
@@ -416,6 +422,7 @@ fn complete_one(
         record.set_source(Source {
             acting_through_delegation: delegation.to_string(),
             client_name: client.to_string(),
+            prepared_call_id: prepared.to_string(),
             field,
             identifier: None,
             source: source.to_string(),
@@ -569,6 +576,7 @@ fn complete_one(
     let entry = Version {
         acting_through_delegation: delegation.to_string(),
         client_name: client.to_string(),
+        prepared_call_id: prepared.to_string(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: "complete".into(),
@@ -642,6 +650,7 @@ pub fn merge_as(
     actor: &Actor,
     now_ns: i64,
 ) -> Result<std::result::Result<Merged, Refused>> {
+    let prepared = actor.prepared_call_id.as_str();
     let (person, delegation, client) = (
         actor.person.as_str(),
         actor.delegation.as_str(),
@@ -713,6 +722,7 @@ pub fn merge_as(
             .unwrap_or(Source {
                 acting_through_delegation: delegation.to_string(),
                 client_name: client.to_string(),
+                prepared_call_id: prepared.to_string(),
                 field: Field::Identifier,
                 identifier: Some(asked.clone()),
                 source: format!("merged from {merged_id}"),
@@ -743,6 +753,7 @@ pub fn merge_as(
         let carried = merged.source_of(field, None).cloned().unwrap_or(Source {
             acting_through_delegation: delegation.to_string(),
             client_name: client.to_string(),
+            prepared_call_id: prepared.to_string(),
             field,
             identifier: None,
             source: format!("merged from {merged_id}"),
@@ -768,6 +779,7 @@ pub fn merge_as(
     let stays_entry = Version {
         acting_through_delegation: delegation.to_string(),
         client_name: client.to_string(),
+        prepared_call_id: prepared.to_string(),
         instrument_id: stays.instrument_id.clone(),
         version: stays.version,
         operation: "merge".into(),
@@ -807,6 +819,7 @@ pub fn merge_as(
     let gone_entry = Version {
         acting_through_delegation: delegation.to_string(),
         client_name: client.to_string(),
+        prepared_call_id: prepared.to_string(),
         instrument_id: gone.instrument_id.clone(),
         version: gone.version,
         operation: "merged-into".into(),
@@ -872,6 +885,7 @@ pub fn keep_platform_answer(
             record.set_source(Source {
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
+                prepared_call_id: String::new(),
                 field: Field::Identifier,
                 identifier: Some(global.clone()),
                 source: words.clone(),
@@ -975,6 +989,7 @@ pub fn keep_platform_answer(
     let entry = Version {
         acting_through_delegation: String::new(),
         client_name: String::new(),
+        prepared_call_id: String::new(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: "platform".into(),
@@ -1190,6 +1205,7 @@ mod tests {
         let store = MemoryStore::new();
         let id = minted(&store, "symbol", "SNAP1", "snaptrade");
         let actor = Actor {
+            prepared_call_id: Default::default(),
             person: ADA.into(),
             delegation: "del-01J9AAAA".into(),
             client: "Claude".into(),

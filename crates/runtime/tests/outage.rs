@@ -31,7 +31,7 @@ fn now_ns() -> i64 {
 #[test]
 fn the_store_keeps_answering_while_the_platform_is_away() {
     let store = PostgresStore::connect(&required("MERIDIAN_TEST_DATABASE_URL"), 4).unwrap();
-    store.migrate().unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
 
     // A record the deployment holds: its own, minted for what a plugin
     // reported (decisions/030), before anything is asked of the platform.
@@ -91,7 +91,7 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_record_minted_while_the_platf
     // platform -- the deployment's own, for life (decisions/030).
     let url = required("MERIDIAN_TEST_DATABASE_URL");
     let instruments = PostgresStore::connect(&url, 4).unwrap();
-    instruments.migrate().unwrap();
+    instruments.migrate(&meridian_clock::SystemClock).unwrap();
 
     let stamp = now_ns();
     let resolution = resolve_identifier(

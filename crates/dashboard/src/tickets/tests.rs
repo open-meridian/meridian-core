@@ -165,6 +165,7 @@ fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
         kit: None,
         bounds: Arc::default(),
         tickets,
+        prepared: Arc::default(),
     });
     plugin::serve(Arc::clone(&app));
     app
@@ -207,6 +208,7 @@ fn through(subject: &str, covers: &Covers) -> Actor {
 
 fn covering(instance: &str, level: &str, groups: &[&str]) -> Covers {
     Covers {
+        prepare_only: Default::default(),
         everything: false,
         deployment_admin: false,
         plugins: [(instance.to_string(), String::new(), level.to_string())].into(),

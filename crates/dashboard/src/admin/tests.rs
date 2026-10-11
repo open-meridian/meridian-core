@@ -177,6 +177,7 @@ fn harness_holding(
         kit: None,
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     });
     Harness {
         app,
@@ -483,44 +484,54 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
         "a search box narrowing the accounts' table, on the generic filter"
     );
     let accounts = table(&body, "accounts");
-    assert!(
-        accounts
-            .contains("<th>Name</th><th>Custodian</th><th>Type</th><th>Owner</th><th>State</th>"),
-        "{accounts}"
-    );
+    // One line an account (the product owner, 2026-10-10, the Books tab
+    // folded in): its name, custodian and type, and in the book its base
+    // currency and lot relief; the owner and note behind Edit, the owner
+    // still in the row for the search.
     assert!(
         accounts.contains(
-            "<span class=\"hint note\" id=\"account-note-0\">Rollover, 2026.</span></td>\
-             <td>Fidelity</td><td>Roth IRA</td><td>Fund &lt;I&gt;</td>"
+            "<th>Name</th><th>Custodian</th><th>Type</th><th>Base currency</th><th>Lot relief</th>"
         ),
-        "the note under the name, then its custodian, type and owner, escaped: {accounts}"
+        "{accounts}"
+    );
+    assert!(!body.contains("data-tab=\"books\"") && !body.contains("id=\"books\""));
+    assert!(
+        accounts.contains(
+            "<span class=\"hint note\" id=\"account-note-0\">Rollover, 2026.</span>\
+             <span hidden>Fund &lt;I&gt;</span></td><td>Fidelity</td><td>Roth IRA</td>"
+        ),
+        "the note under the name, the owner hidden for the search, then its custodian and type, escaped: {accounts}"
     );
     let income = accounts.split("data-id=\"ACC-2\"").nth(1).unwrap();
     assert!(
-        income.contains("<td></td><td></td><td></td>")
-            && !income.split("</tr>").next().unwrap().contains("hint"),
-        "an account with none shows none: {income}"
+        income.contains("<td></td><td></td><td></td><td></td>")
+            && !income.split("</tr>").next().unwrap().contains("hint note"),
+        "an account with none shows none, the book not answering here: {income}"
     );
+    assert!(between(&body, "id=\"accounts\">", "</section>")
+        .contains("The book of record is not answering"));
 
     // One dialog for a new account and for each edit, holding all four,
     // bounded as the conductor bounds them; an Edit fills it with what the
-    // account holds.
-    assert_eq!(
-        body.matches("<dialog id=\"account\" aria-labelledby=\"account-title\">")
-            .count(),
-        1
-    );
-    let dialog = body
-        .split("<dialog id=\"account\" aria-labelledby=\"account-title\">")
-        .nth(1)
-        .unwrap();
+    // account holds. Its "In the book" is a form of its own, posted to the
+    // book with a reason, shown for an Edit alone.
+    let opening = "<dialog id=\"account\" class=\"parts\" aria-labelledby=\"account-title\">";
+    assert_eq!(body.matches(opening).count(), 1);
+    let dialog = body.split(opening).nth(1).unwrap();
+    assert!(dialog.contains("<h3>Account</h3>") && dialog.contains("<h3>In the book "));
+    assert!(dialog.contains("action=\"/admin/accounts#accounts\""));
+    assert!(dialog.contains(
+        "action=\"/admin/accounts/book#accounts\" class=\"dialog-part\" data-edit-only>"
+    ));
     let dialog = dialog.split("</dialog>").next().unwrap();
     for field in [
         "name=\"account_id\" value=\"\" data-record-id",
         "name=\"custodian\" value=\"\" maxlength=\"200\"",
         "name=\"account_type\" value=\"\" maxlength=\"200\"",
         "name=\"owner\" value=\"\" maxlength=\"200\"",
-        "name=\"note\" rows=\"3\" maxlength=\"2000\"></textarea>",
+        "name=\"note\" rows=\"2\" maxlength=\"2000\"></textarea>",
+        "name=\"base_currency_code\" maxlength=\"3\"",
+        "name=\"reason\" required",
     ] {
         assert!(dialog.contains(field), "{field} is not in {dialog}");
     }
@@ -530,6 +541,8 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
     assert_eq!(fill["fields"]["account_type"], "Roth IRA");
     assert_eq!(fill["fields"]["owner"], "Fund <I>");
     assert_eq!(fill["fields"]["note"], "Rollover, 2026.");
+    assert_eq!(fill["fields"]["lot_relief_default"], "0");
+    assert_eq!(fill["fields"]["since"], "not yet");
     assert!(body.contains("data-dialog-open=\"account\" data-title=\"Edit Growth\""));
 }
 
@@ -944,9 +957,10 @@ fn the_form_says_what_to_fill_in() {
     let client = setting(&form, "snaptrade_client_id");
     assert!(client.contains("Client ID") && client.contains("Required"));
     assert!(client.contains("type=\"password\" name=\"secret.snaptrade_client_id\" value=\"\""));
-    assert!(client.contains(">set<") && client.contains("name=\"clear.snaptrade_client_id\""));
+    // Set or not, said in the field itself; a required secret has no Remove.
+    assert!(client.contains("placeholder=\"Set\"") && !client.contains("clear."));
     let consumer = setting(&form, "snaptrade_consumer_key");
-    assert!(consumer.contains(">not set<") && !consumer.contains("clear."));
+    assert!(consumer.contains("placeholder=\"Not set\"") && !consumer.contains("clear."));
 
     // Applies only to a commercial key: said, and marked for the script.
     let user = setting(&form, "user_secret");
@@ -1146,19 +1160,19 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
          <button type=\"button\" class=\"note-mark\" aria-label=\"About Client ID\" \
          aria-describedby=\"setting-snaptrade_client_id-about\"></button>"
     ));
+    // The field says where the secret stands, and nothing else does.
     assert!(client.contains(
         "id=\"setting-snaptrade_client_id\" autocomplete=\"new-password\" \
-         placeholder=\"Type a new value to replace it\" aria-describedby=\"setting-snaptrade_client_id-about\">"
+         placeholder=\"Set\" title=\"Set\" aria-describedby=\"setting-snaptrade_client_id-about\">"
     ));
     assert!(client.contains(
         "<p class=\"hint about\" id=\"setting-snaptrade_client_id-about\">What snaptrade_client_id is \
          &lt;for&gt;.\nA secret: never shown again once set.</p>"
     ));
-    // Clearing a secret sits beside its field.
-    assert!(client.contains(
-        "aria-describedby=\"setting-snaptrade_client_id-about\"><label class=\"check\">\
-         <input type=\"checkbox\" name=\"clear.snaptrade_client_id\"> Clear it</label></span>"
-    ));
+    // A required secret is only ever replaced: no Remove, no badge, no box.
+    assert!(client.contains("aria-describedby=\"setting-snaptrade_client_id-about\"></span>"));
+    assert!(!form.contains("data-remove") && !form.contains("Clear it"));
+    assert!(!client.contains(">set</span>") && !client.contains("type=\"checkbox\""));
     let paragraphs = form.matches("<p").count();
     assert_eq!(paragraphs, form.matches("<p class=\"hint about\"").count());
     assert_eq!(paragraphs, 7, "a hint for each field, each described");
@@ -1166,9 +1180,10 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
     // applies stay in view, small.
     let user = setting(&form, "user_secret");
     assert!(user.contains(
-        "<span class=\"badge warn need\">Required</span> <span class=\"badge\">not set</span> \
+        "<span class=\"badge warn need\">Required</span> \
          <span class=\"badge info applies\">Only when Key is Commercial key</span>"
     ));
+    assert!(user.contains("placeholder=\"Not set\""));
     let stale = setting(&form, "stale_after_hours");
     assert!(stale.contains("<span class=\"badge need\">Optional</span>"));
     assert!(stale.contains(">default 24 hours</span>"));
@@ -1241,8 +1256,8 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
     assert!(script.contains("section.hidden = id !== want;"));
     // Save last, kept in view.
     assert!(form.contains(
-        "</section><div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button>\
-         </div></form>"
+        "</section><div class=\"form-foot\"><button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\" data-save>Save settings</button></div></form>"
     ));
 
     // A developer's setting required and missing is said on its tab.
@@ -1431,10 +1446,16 @@ async fn each_section_adds_with_a_short_button_and_its_dialog_says_what_is_made(
             )),
             "{section}"
         );
-        // The dialog is named by its heading, which says it in full.
+        // The dialog is named by its heading, which says it in full; the
+        // account's is of two parts.
+        let parts = if dialog == "account" {
+            " class=\"parts\""
+        } else {
+            ""
+        };
         assert!(
             part.contains(&format!(
-                "<dialog id=\"{dialog}\" aria-labelledby=\"{dialog}-title\">"
+                "<dialog id=\"{dialog}\"{parts} aria-labelledby=\"{dialog}-title\">"
             )),
             "{section}"
         );
@@ -1505,7 +1526,7 @@ async fn a_plugins_admin_view_is_for_admins_alone_and_holds_its_settings_form() 
     // Tabs, each a link of its own; the view opens on the first.
     let (tabs, here) = tabs_of(&body);
     let names: Vec<&str> = tabs.iter().map(|(_, name)| name.as_str()).collect();
-    assert_eq!(names, ["Overview", "Settings", "Access"]);
+    assert_eq!(names, ["Overview", "Settings", "Access", "Accounts"]);
     assert_eq!(here, "Overview");
     assert_eq!(tabs[0].0, VIEW);
     assert!(body.contains("id=\"health\""));
@@ -1729,6 +1750,7 @@ async fn the_view_keeps_the_tabs_every_plugin_has_and_links_to_the_plugins_area(
             (VIEW.to_string(), "Overview".to_string()),
             (format!("{VIEW}?tab=settings"), "Settings".into()),
             (format!("{VIEW}?tab=access"), "Access".into()),
+            (format!("{VIEW}?tab=accounts"), "Accounts".into()),
         ]
     );
     assert_eq!(here, "Overview");
@@ -1783,7 +1805,11 @@ async fn a_plugin_admin_reaches_its_tabs_and_settings_and_nothing_else_of_the_po
     let h = harness(plugin_admin_alone(), None);
     let (status, body) = send(&h, get(&h, VIEW, true)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(tabs_of(&body).0.len(), 3, "Overview, Settings and Access");
+    assert_eq!(
+        tabs_of(&body).0.len(),
+        4,
+        "Overview, Settings, Access and Accounts"
+    );
     let (status, settings) = send(&h, get(&h, &format!("{VIEW}?tab=settings"), true)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -1833,7 +1859,7 @@ async fn a_deployment_admin_whose_link_is_withdrawn_reaches_no_plugins_settings(
     let (status, body) = send(&h, get(&h, VIEW, true)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let names: Vec<String> = tabs_of(&body).0.into_iter().map(|(_, name)| name).collect();
-    assert_eq!(names, ["Overview", "Access"]);
+    assert_eq!(names, ["Overview", "Access", "Accounts"]);
     assert!(!body.contains("data-area"), "no pages of its to open");
     let (_, access) = send(&h, get(&h, &format!("{VIEW}?tab=access"), true)).await;
     assert!(access.contains("href=\"/admin#permissions\""));
@@ -2249,9 +2275,14 @@ async fn every_option_is_in_the_page_once_however_many_records_there_are() {
     assert_eq!(status, StatusCode::OK);
     // One dialog per kind of record, whatever the number of records.
     for kind in ["user-group", "account-group", "access-group", "account"] {
+        let parts = if kind == "account" {
+            " class=\"parts\""
+        } else {
+            ""
+        };
         assert_eq!(
             body.matches(&format!(
-                "<dialog id=\"{kind}\" aria-labelledby=\"{kind}-title\">"
+                "<dialog id=\"{kind}\"{parts} aria-labelledby=\"{kind}-title\">"
             ))
             .count(),
             1,
@@ -2835,7 +2866,8 @@ async fn a_tables_tab_is_in_the_admin_view_and_its_save_comes_back_to_it() {
             "Settings",
             "Plan-code links",
             "Cash links",
-            "Access"
+            "Access",
+            "Accounts"
         ]
     );
     assert_eq!(here, "Settings");
@@ -3083,8 +3115,8 @@ fn a_setting_serving_a_role_not_administered_is_shown_read_only() {
     assert!(!all.contains("data-read-only"));
 }
 
-/// Contract v17: beside a secret's "set", who set it, when and through
-/// which client, never its value; and the record's version as drawn, which
+/// Contract v17: in a secret's field, who set it, when and through which
+/// client, never its value; and the record's version as drawn, which
 /// a change names.
 #[test]
 fn a_secrets_set_says_by_whom_and_when_and_the_form_carries_its_version() {
@@ -3105,8 +3137,60 @@ fn a_secrets_set_says_by_whom_and_when_and_the_form_carries_its_version() {
             subject.to_string()
         }
     });
-    assert!(form.contains("data-set-by"), "{form}");
-    assert!(form.contains("Set by Ada, 2026-09-26"), "{form}");
+    assert!(
+        form.contains("placeholder=\"Set by Ada, 2026-09-26"),
+        "{form}"
+    );
     assert!(form.contains("through Claude"));
     assert!(form.contains("name=\"against_updated_at_ns\" value=\"1790380800000000000\""));
+}
+
+/// The product owner, 2026-10-10: an optional secret that is set is removed
+/// by a small Remove beside its field, which asks first and posts the clear
+/// alone; empty keeps it, typing replaces it.
+#[test]
+fn an_optional_secret_is_removed_by_its_own_small_form_and_nothing_else_is_sent() {
+    let mut record = snaptrade();
+    record.declared_settings.push(SettingDeclaration {
+        label: "Webhook token".into(),
+        ..declared("webhook_token", SettingType::String, false, true)
+    });
+    record.secrets_set.push("webhook_token".into());
+    record.updated_at_ns = 7;
+    let form = settings::form(
+        &record,
+        "<input type=\"hidden\" name=\"csrf\" value=\"t\">",
+        false,
+    );
+    let token = setting(&form, "webhook_token");
+    assert!(token.contains(
+        "<button type=\"submit\" class=\"link remove\" form=\"remove-webhook_token\" data-remove>Remove</button>"
+    ));
+    assert_eq!(
+        form.matches("data-remove>").count(),
+        1,
+        "a required secret has none"
+    );
+    let removing = between(&form, "<form id=\"remove-webhook_token\"", "</form>");
+    assert!(removing.contains("data-confirm=\"Remove Webhook token?"));
+    assert!(removing.contains("name=\"csrf\" value=\"t\""));
+    assert!(removing.contains("name=\"against_updated_at_ns\" value=\"7\""));
+    assert!(removing.contains("<input type=\"hidden\" name=\"clear.webhook_token\" value=\"on\">"));
+    // What it posts clears that secret alone.
+    let posted: Fields = [
+        ("csrf".to_string(), "t".to_string()),
+        ("against_updated_at_ns".to_string(), "7".to_string()),
+        ("clear.webhook_token".to_string(), "on".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let cleared = settings::request(&record, &posted, false).unwrap();
+    assert_eq!(cleared.cleared, ["webhook_token"]);
+    assert!(cleared.values.is_empty());
+    assert_eq!(cleared.against_updated_at_ns, 7);
+    // The settings form posted as it stands, its secrets empty, sends nothing.
+    let main = between(&form, "data-settings>", "</form>");
+    assert_eq!(settings::request(&record, &submitted(main), false), None);
+    // The script asks before a Remove posts.
+    assert!(form.contains("indexOf(\"remove-\") === 0 && !window.confirm(asking)"));
 }

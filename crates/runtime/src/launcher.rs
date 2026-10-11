@@ -113,7 +113,11 @@ pub struct Chosen<'a> {
 /// Whether a plugin holding `roles` is an edge plugin, which alone may own
 /// storage (decisions/028, ruled point 1, and its amendment for `reporting`).
 pub fn at_the_edge(roles: &[String], edge_roles: &[String]) -> bool {
-    roles.iter().any(|role| edge_roles.contains(role))
+    // Either side may name a role renamed at contract v20 by its old name.
+    let edge_roles = meridian_domain::roles_now(edge_roles);
+    meridian_domain::roles_now(roles)
+        .iter()
+        .any(|role| edge_roles.contains(role))
 }
 
 /// Which of the chart's templates a request is made from: the plugin shape,

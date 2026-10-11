@@ -1,7 +1,7 @@
 """`make e2e-lake` and `make e2e-recorded`: the lake's 1a end to end on the
 plugin harness (contract v18, W10; plans/the-lake-prices-the-book, "Done
 when"), core's stand-ins on the Python SDK (e2e/lake/stand_in.py): `coin`, a
-dgm serving `daily`, `ticks` and `fx` from an exchange file; `book`, a
+a data plugin serving `daily`, `ticks` and `fx` from an exchange file; `book`, a
 reading plugin; and `other`, a reading plugin never entitled. Beside the
 harness's admin, Ben, who holds read on `book`.
 
@@ -46,6 +46,10 @@ harness's admin, Ben, who holds read on `book`.
 11. `store lake` prints each row version kept, numbered with no holes, the
    restatement as version 2, the want asked once and answered, the standing
    want withdrawn, the priority's changes, and the trades and quotes.
+12. Contract v20: a restarted data plugin's last trades and its datasets'
+   licences; a currency the deployment does not hold pulled from the
+   harness's master, never minted; a master slower than a resolve waits, or
+   stopped, mints nothing, and a later resolve finds the pulled record.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -346,7 +350,7 @@ def run():
     must(then["instrument_id"] == old["instrument_id"],
          f"step 9, as of a date before, the record that held it: {then}")
 
-    # 10. A restarted dgm streams again: the lake delivers its standing want
+    # 10. A restarted data plugin streams again: the lake delivers its standing want
     # again, the same want, and nothing new is asked.
     def streaming():
         wants = page("coin", "admin", "/wants")
@@ -370,6 +374,75 @@ def run():
     starts = {t["row_key"].split("-")[1] for t in caught if t["row_key"].startswith("STREAM-")}
     must({str(before["started"]), str(after["started"])} <= starts,
          f"step 10, both streams caught up by watermark: {sorted(starts)}")
+
+    # 12. Contract v20. A restarted data plugin reads the last trade its own
+    # instance recorded of a subject, per dataset and venue, to backfill
+    # the gap from the venue's history; a reader is refused it (W10.6).
+    latest = page("coin", "admin", f"/latest?subject={usdc}")
+    must(latest["trades"] and all(t["dataset"] == "coin:live" for t in latest["trades"]),
+         f"step 12, its own last trades: {latest}")
+    venues = [t["venue_id"] for t in latest["trades"]]
+    must(len(venues) == len(set(venues)), f"step 12, one per dataset and venue: {latest}")
+    for last in latest["trades"]:
+        latest_at = max(t["valid_from_ns"] for t in caught if t["venue_id"] == last["venue_id"])
+        # The stream records on, so it is at least the last one caught up.
+        must(last["valid_from_ns"] >= latest_at,
+             f"step 12, the last recorded at its venue: {last} against {latest_at}")
+    again = page("desk", "read", f"/catch-up?subject={usdc}&after=0")["trades"]
+    for last in latest["trades"]:
+        later = [t for t in again if t["venue_id"] == last["venue_id"]
+                 and t["valid_from_ns"] > last["valid_from_ns"]]
+        recorded_after = [t for t in later if t["sequence"] < last["sequence"]]
+        must(not recorded_after, f"step 12, nothing recorded before it is later: {recorded_after}")
+    must(latest["watermark"], f"step 12, with the watermark it was read at: {latest}")
+    refused = page("desk", "read", f"/latest?subject={usdc}")["refused"]
+    must("declares no dataset" in refused, f"step 12, a reader is refused its own read: {refused}")
+    # A data plugin learns its own datasets' licences (W10.9).
+    licences = page("coin", "admin", "/licences")
+    must({"coin:daily", "coin:live"} <= set(licences["datasets"])
+         and {l["dataset"] for l in licences["licences"]} >= {"coin:daily", "coin:live"},
+         f"step 12, its own datasets' licences: {licences}")
+    # A currency the deployment does not hold is pulled from the master,
+    # found and never minted (W3.1).
+    franc = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=CHF")
+    must(franc["found"] and not franc["minted"],
+         f"step 12, the franc found, not minted: {franc}")
+    record = call("dashboard__read_instrument", {"instrument_id": franc["instrument_id"]},
+                  "unchanged")["data"]
+    must(record["description"] == "Swiss franc" and record["currency"] == "CHF"
+         and any(i["value"] == "INS-01JCHF00000000000000000001" for i in record["identifiers"]),
+         f"step 12, the master's record kept as the deployment's: {record}")
+    # A master slower than a resolve waits mints nothing (the 2026-10-11
+    # ruling): the resolve is a miss, and once the pull brings the record a
+    # later resolve finds it. JPY is answered seven seconds late, past the
+    # sidecar's five-second call; a stopped master is a name that resolves nowhere.
+    started_at = time.time()
+    yen = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=JPY")
+    must(not yen["found"] and not yen["minted"] and not yen["instrument_id"],
+         f"step 12, a slow master: a miss, nothing minted: {yen}")
+    must(time.time() - started_at < 4.5, f"step 12, the resolve did not wait on the master: "
+         f"{time.time() - started_at:.1f}s")
+    yen = {}
+    for _ in range(20):
+        time.sleep(1)
+        yen = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=JPY")
+        if yen["found"]:
+            break
+    must(yen.get("found") and not yen.get("minted"),
+         f"step 12, the pulled yen found by a later resolve, not minted: {yen}")
+    # An absent master mints nothing either; back, the next pull finds it.
+    compose("stop", "platform")
+    krona = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=SEK")
+    must(not krona["found"] and not krona["minted"],
+         f"step 12, an absent master: a miss, nothing minted: {krona}")
+    compose("start", "platform")
+    for _ in range(60):
+        time.sleep(2)
+        krona = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=SEK")
+        if krona["found"]:
+            break
+    must(krona.get("found") and not krona.get("minted"),
+         f"step 12, the master back, the krona pulled, not minted: {krona}")
 
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
@@ -395,7 +468,7 @@ def run():
          f"step 10, live's trades and quotes numbered from its head with no holes: {live_sequences}")
 
     took = int(time.time() - started)
-    print(f"{NAME} OK in {took}s: on the plugin harness, a dgm's three datasets listed by the "
+    print(f"{NAME} OK in {took}s: on the plugin harness, a data plugin's three datasets listed by the "
           "deployment admin's tool, licensed at the Data sources page and through the tool with a "
           "note, the one-person warning given for two readers; a reader entitled and the broker "
           "reloaded with its datasets; closes, a bar and an FX rate recorded and heard, a price on "
@@ -407,8 +480,10 @@ def run():
           "one by an ems plugin and a loss caught up by watermark, a late print included, the "
           "latest quote per asset and a standing want of a streamed dataset; an ambiguous resolve "
           "listed with its reason and nothing minted, a symbol ended on its record answering each "
-          "record for its own dates; a restarted dgm streaming again on its standing want, "
-          "delivered again by the lake; and `store lake` printing each version numbered with no "
+          "record for its own dates; a restarted data plugin streaming again on its standing want, "
+          "delivered again by the lake, reading its own last trade per venue for the backfill, "
+          "a reader refused it, and its own datasets' licences; a currency the deployment did not "
+          "hold pulled from the master and kept, found and not minted; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 

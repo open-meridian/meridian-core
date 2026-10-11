@@ -563,8 +563,9 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
         .expect("could not reach the test broker as the runtime");
     let listening = backend().await;
 
-    // The registry says reference publishes this one.
-    let its_own = "platform.reference.event.instrument-applied";
+    // The registry says the street publishes this one. (Not one of the
+    // instrument store's, which holds its own credential from contract v20.)
+    let its_own = "platform.street.event.activity-recorded";
     let mut allowed = listening.subscribe(its_own);
 
     // And says only custody publishes this one. A component is not a
@@ -586,6 +587,53 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
     assert!(
         !arrived(&mut refused, &theirs).await,
         "a component published a topic the registry says a plugin publishes"
+    );
+}
+
+#[tokio::test]
+async fn the_instrument_store_asks_for_the_plugin_catalogue_with_its_own_credential() {
+    // Contract v20 (the product owner, 2026-10-11): the instrument store reads
+    // the launch records by its own column in the contract, with a credential
+    // of its own; the runtime's shared one no longer carries its topics.
+    let url = std::env::var("MERIDIAN_TEST_BROKER_URL_INSTRUMENT")
+        .expect("MERIDIAN_TEST_BROKER_URL_INSTRUMENT is not set; run `make test-broker`.");
+    let instrument = NatsBackend::connect(&url)
+        .await
+        .expect("could not reach the test broker as the instrument store");
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let listening = backend().await;
+
+    let catalogue = "platform.config.query.plugin-catalogue";
+    let mut asked = listening.subscribe(catalogue);
+    let applied = "platform.reference.event.instrument-applied";
+    let mut heard = listening.subscribe(applied);
+    // A street topic, which is not the instrument store's.
+    let street = "platform.street.event.activity-recorded";
+    let mut refused = listening.subscribe(street);
+    settle().await;
+
+    let ask = mark("instrument-asks-the-catalogue");
+    instrument.publish(catalogue, envelope(&ask)).unwrap();
+    assert!(
+        arrived(&mut asked, &ask).await,
+        "the instrument store was refused the plugin catalogue with its own credential"
+    );
+    let not_runtime = mark("runtime-as-instrument");
+    runtime.publish(applied, envelope(&not_runtime)).unwrap();
+    assert!(
+        !arrived(&mut heard, &not_runtime).await,
+        "the runtime's shared credential published the instrument store's topic"
+    );
+    let not_street = mark("instrument-as-street");
+    instrument.publish(street, envelope(&not_street)).unwrap();
+    assert!(
+        !arrived(&mut refused, &not_street).await,
+        "the instrument store published a topic the registry gives the street"
     );
 }
 

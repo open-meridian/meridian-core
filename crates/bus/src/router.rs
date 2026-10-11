@@ -43,6 +43,12 @@ pub struct Stamp {
     /// second read. Empty whenever the delegation is.
     pub acting_through_client: String,
 
+    /// The prepared change the person made the command from (W4.9, W6.27,
+    /// contract v20): its `PC-` ID as the assertion named it, so the store
+    /// records what prepared the change. Empty otherwise, and always beside
+    /// a person.
+    pub prepared_call_id: String,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -359,6 +365,7 @@ impl Bus {
             acting_for_subject: stamp.acting_for_subject.clone(),
             acting_through_delegation: stamp.acting_through_delegation.clone(),
             acting_through_client: stamp.acting_through_client.clone(),
+            prepared_call_id: stamp.prepared_call_id.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

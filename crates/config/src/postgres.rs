@@ -15,9 +15,9 @@ use postgres::{IsolationLevel, NoTls};
 use r2d2_postgres::PostgresConnectionManager;
 
 use meridian_domain::v1::{
-    AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord,
-    Permission, PluginArchive, PluginLaunch, PluginMetadata, PluginVersion, SettingLastChange,
-    SignInRecord, UserGroup,
+    AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
+    LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginMetadata,
+    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
@@ -27,8 +27,9 @@ use crate::migrations;
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
     AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, LaunchAct,
-    LaunchNote, RecordedMove, Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot,
-    Store, StoreError, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    LaunchNote, LinkableAccountsChange, RecordedMove, Result, SettingChange, SettingChangeRecord,
+    SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
+    REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -336,7 +337,8 @@ impl Store for PostgresStore {
         for row in tx
             .query(
                 "SELECT DISTINCT ON (plugin_instance_id, name) plugin_instance_id, name,
-                        changed_by, changed_at_ns, through_delegation, client_name, note
+                        changed_by, changed_at_ns, through_delegation, client_name, note,
+                        prepared_call_id, hint
                    FROM config_plugin_setting_change
                   WHERE action IN (1, 2)
                   ORDER BY plugin_instance_id, name, change_id DESC",
@@ -355,6 +357,8 @@ impl Store for PostgresStore {
                     acting_through_delegation: row.get(4),
                     client_name: row.get(5),
                     note: row.get(6),
+                    prepared_call_id: row.get(7),
+                    hint: row.get(8),
                 });
         }
 
@@ -470,6 +474,51 @@ impl Store for PostgresStore {
             snapshot.entitlements.push(
                 meridian_domain::v1::DatasetEntitlement::decode(&bytes[..]).map_err(unavailable)?,
             );
+        }
+
+        // Each instance's linkable accounts and its latest change (W6.30,
+        // contract v20).
+        for row in tx
+            .query(
+                "SELECT DISTINCT ON (plugin_instance_id) plugin_instance_id, changed_by,
+                        changed_at_ns, through_delegation, client_name
+                   FROM config_linkable_accounts_change
+                  ORDER BY plugin_instance_id, change_id DESC",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let instance: String = row.get(0);
+            snapshot.linkable.insert(
+                instance.clone(),
+                LinkableAccounts {
+                    plugin_instance_id: instance,
+                    account_ids: Vec::new(),
+                    updated_by: row.get(1),
+                    updated_at_ns: row.get(2),
+                    acting_through_delegation: row.get(3),
+                    client_name: row.get(4),
+                },
+            );
+        }
+        for row in tx
+            .query(
+                "SELECT plugin_instance_id, account_id FROM config_linkable_account
+                  ORDER BY plugin_instance_id, account_id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let instance: String = row.get(0);
+            snapshot
+                .linkable
+                .entry(instance.clone())
+                .or_insert_with(|| LinkableAccounts {
+                    plugin_instance_id: instance,
+                    ..LinkableAccounts::default()
+                })
+                .account_ids
+                .push(row.get(1));
         }
 
         tx.commit().map_err(unavailable)?;
@@ -960,8 +1009,9 @@ impl Store for PostgresStore {
             tx.execute(
                 "INSERT INTO config_plugin_setting_change
                         (plugin_instance_id, name, action, changed_by, changed_at_ns,
-                         value, secret, through_delegation, client_name, note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                         value, secret, through_delegation, client_name, note,
+                         prepared_call_id, hint)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 &[
                     &plugin_instance_id,
                     &change.name,
@@ -973,6 +1023,9 @@ impl Store for PostgresStore {
                     &author.delegation,
                     &author.client,
                     &author.note,
+                    &author.prepared_call_id,
+                    // A secret's hint, only where one was set.
+                    &if secret { change.hint.as_str() } else { "" },
                 ],
             )
             .map_err(unavailable)?;
@@ -994,7 +1047,7 @@ impl Store for PostgresStore {
             .conn()?
             .query(
                 "SELECT name, action, value, secret, changed_by, through_delegation,
-                        changed_at_ns, backfilled, note, client_name
+                        changed_at_ns, backfilled, note, client_name, prepared_call_id, hint
                    FROM config_plugin_setting_change
                   WHERE plugin_instance_id = $1
                   ORDER BY change_id",
@@ -1020,6 +1073,8 @@ impl Store for PostgresStore {
                     at_ns: row.get(6),
                     backfilled: row.get(7),
                     note: row.get(8),
+                    prepared_call_id: row.get(10),
+                    hint: row.get(11),
                 })
             })
             .collect()
@@ -1058,8 +1113,8 @@ impl Store for PostgresStore {
                 "INSERT INTO config_plugin_launch
                         (instance_id, name, version, image_digest, roles, launched_by,
                          launched_at_ns, state, live, launched_through_delegation,
-                         launched_client_name, launch_note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11)
+                         launched_client_name, launch_note, prepared_call_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -1073,6 +1128,7 @@ impl Store for PostgresStore {
                     &launch.acting_through_delegation,
                     &launch.client_name,
                     &note,
+                    &launch.prepared_call_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -1088,7 +1144,7 @@ impl Store for PostgresStore {
                     "UPDATE config_plugin_launch
                         SET state = $2, stopped_by = $3, stopped_at_ns = $4, failure = $5,
                             stopped_through_delegation = $6, stopped_client_name = $7,
-                            stop_note = $8
+                            stop_note = $8, stopped_prepared_call_id = $9
                       WHERE instance_id = $1 AND state = 1
                   RETURNING {LAUNCH_COLUMNS}"
                 ),
@@ -1101,6 +1157,7 @@ impl Store for PostgresStore {
                     &ending.delegation,
                     &ending.client,
                     &ending.note,
+                    &ending.prepared_call_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -1153,8 +1210,8 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_hold_change
                         (role, days, write_once, changed_by, through_delegation, changed_at_ns,
-                         client_name, note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                         client_name, note, prepared_call_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &hold.role,
                     &days,
@@ -1164,6 +1221,7 @@ impl Store for PostgresStore {
                     &hold.updated_at_ns,
                     &hold.client_name,
                     &note,
+                    &hold.prepared_call_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -1210,8 +1268,8 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_archive_change
                         (instance_id, allowed, most_bytes, changed_by, through_delegation,
-                         changed_at_ns, client_name, note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                         changed_at_ns, client_name, note, prepared_call_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &archive.instance_id,
                     &archive.allowed,
@@ -1221,6 +1279,7 @@ impl Store for PostgresStore {
                     &archive.updated_at_ns,
                     &archive.client_name,
                     &note,
+                    &archive.prepared_call_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -1429,6 +1488,124 @@ impl Store for PostgresStore {
         }
         Ok((licences, entitlements))
     }
+
+    fn set_linkable_accounts(
+        &self,
+        plugin_instance_id: &str,
+        grant: &[String],
+        withdraw: &[String],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<LinkableAccounts> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // One instance's grants in turn, so two changes never interleave.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('config_linkable_account:' || $1))",
+            &[&plugin_instance_id],
+        )
+        .map_err(unavailable)?;
+        let mut granted = Vec::new();
+        for account in grant {
+            let added = tx
+                .execute(
+                    "INSERT INTO config_linkable_account (plugin_instance_id, account_id)
+                     VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    &[&plugin_instance_id, account],
+                )
+                .map_err(unavailable)?;
+            if added == 1 {
+                granted.push(account.clone());
+            }
+        }
+        let mut withdrawn = Vec::new();
+        for account in withdraw {
+            let removed = tx
+                .execute(
+                    "DELETE FROM config_linkable_account
+                      WHERE plugin_instance_id = $1 AND account_id = $2",
+                    &[&plugin_instance_id, account],
+                )
+                .map_err(unavailable)?;
+            if removed == 1 {
+                withdrawn.push(account.clone());
+            }
+        }
+        if !granted.is_empty() || !withdrawn.is_empty() {
+            tx.execute(
+                "INSERT INTO config_linkable_accounts_change
+                        (plugin_instance_id, granted, withdrawn, changed_by, through_delegation,
+                         client_name, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &plugin_instance_id,
+                    &granted,
+                    &withdrawn,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        let account_ids: Vec<String> = tx
+            .query(
+                "SELECT account_id FROM config_linkable_account WHERE plugin_instance_id = $1
+                  ORDER BY account_id",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let latest = tx
+            .query_opt(
+                "SELECT changed_by, changed_at_ns, through_delegation, client_name
+                   FROM config_linkable_accounts_change WHERE plugin_instance_id = $1
+                  ORDER BY change_id DESC LIMIT 1",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(LinkableAccounts {
+            plugin_instance_id: plugin_instance_id.to_string(),
+            account_ids,
+            updated_by: latest.as_ref().map(|r| r.get(0)).unwrap_or_default(),
+            updated_at_ns: latest.as_ref().map(|r| r.get(1)).unwrap_or_default(),
+            acting_through_delegation: latest.as_ref().map(|r| r.get(2)).unwrap_or_default(),
+            client_name: latest.as_ref().map(|r| r.get(3)).unwrap_or_default(),
+        })
+    }
+
+    fn linkable_accounts_changes(
+        &self,
+        plugin_instance_id: &str,
+    ) -> Result<Vec<LinkableAccountsChange>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT granted, withdrawn, changed_by, through_delegation, client_name,
+                        changed_at_ns, note
+                   FROM config_linkable_accounts_change WHERE plugin_instance_id = $1
+                  ORDER BY change_id",
+                &[&plugin_instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| LinkableAccountsChange {
+                plugin_instance_id: plugin_instance_id.to_string(),
+                granted: row.get(0),
+                withdrawn: row.get(1),
+                by: row.get(2),
+                delegation: row.get(3),
+                client: row.get(4),
+                at_ns: row.get(5),
+                note: row.get(6),
+            })
+            .collect())
+    }
 }
 
 /// An account's optional text as its column holds it: NULL for none, so an
@@ -1440,11 +1617,11 @@ fn unless_empty(value: &str) -> Option<&str> {
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
-     stopped_client_name, launch_note, stop_note";
+     stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
-     through_delegation, client_name, note";
+     through_delegation, client_name, note, prepared_call_id";
 
 /// A hold, its change's note on it (contract v17), and the note.
 fn hold_from(row: &postgres::Row) -> (Hold, String) {
@@ -1458,6 +1635,7 @@ fn hold_from(row: &postgres::Row) -> (Hold, String) {
             acting_through_delegation: row.get(5),
             client_name: row.get(6),
             note: row.get(7),
+            prepared_call_id: row.get(8),
         },
         row.get(7),
     )
@@ -1465,7 +1643,7 @@ fn hold_from(row: &postgres::Row) -> (Hold, String) {
 
 /// An archive change's columns, in the order [`archive_from`] reads them.
 const ARCHIVE_COLUMNS: &str = "instance_id, allowed, most_bytes, changed_by, changed_at_ns, \
-     through_delegation, client_name, note";
+     through_delegation, client_name, note, prepared_call_id";
 
 /// An archive, its change's note on it (contract v17), and the note.
 fn archive_from(row: &postgres::Row) -> (PluginArchive, String) {
@@ -1479,6 +1657,7 @@ fn archive_from(row: &postgres::Row) -> (PluginArchive, String) {
             acting_through_delegation: row.get(5),
             client_name: row.get(6),
             note: row.get(7),
+            prepared_call_id: row.get(8),
         },
         row.get(7),
     )
@@ -1504,12 +1683,14 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_client_name: row.get(15),
         note: row.get(16),
         stopped_note: row.get(17),
+        prepared_call_id: row.get(18),
+        stopped_prepared_call_id: row.get(19),
     }
 }
 
 /// One access group as it stands, its entries in order; None when there is
 /// none by that identifier.
-fn read_access_group(
+pub(crate) fn read_access_group(
     client: &mut impl postgres::GenericClient,
     access_group_id: &str,
 ) -> Result<Option<AccessGroup>> {

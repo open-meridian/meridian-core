@@ -21,7 +21,7 @@
 //! make the form short enough to display in one page"; 2026-10-04: "target
 //! our display to one page without scrolling (use pagination or tab
 //! instead)"): each field's label on one line with small tags for required
-//! or optional, its default, "set" or "not set", and when it applies; short
+//! or optional, its default, and when it applies; short
 //! fields, numbers, on/offs and a choice nothing hangs on, two to a row on a
 //! wide screen and one on a phone, and long ones, secrets and text, across; a
 //! choice's options on one line; a field's hint one small line without
@@ -33,9 +33,13 @@
 //!
 //! **A secret is write-only here.** The record names which secrets are set
 //! and never holds a value, so there is nothing to show: a secret's field is
-//! always empty, says "set" or "not set", and replaces the value when typed
-//! into. A setting held sealed is treated as secret whatever the plugin
-//! declares of it now. The fields' names carry the setting's name and nothing
+//! always empty, and says in its placeholder where the secret stands -- "Set
+//! by Ada, 2026-10-09 14:02 UTC", or "Not set" (the product owner,
+//! 2026-10-10). Left empty it keeps the secret; typed into, it replaces it.
+//! An optional secret that is set has a small Remove beside it, which asks
+//! first and posts the clear alone; a required one is only ever replaced. A
+//! setting held sealed is treated as secret whatever the plugin declares of
+//! it now. The fields' names carry the setting's name and nothing
 //! else, and nothing here logs a field.
 //!
 //! **A table setting** (contract v14; W4.8, W6.11) is an editable typed table
@@ -63,7 +67,7 @@ use crate::html::escape;
 pub const SECRET_FIELD: &str = "secret.";
 /// A setting that is not secret, shown as it stands.
 pub const VALUE_FIELD: &str = "value.";
-/// Ticked, clears a secret that is set.
+/// Posted by a secret's Remove (and the settings tool), clears it when set.
 pub const CLEAR_FIELD: &str = "clear.";
 /// A table setting's cells: `table.<setting>[<row>].<column>`.
 pub const TABLE_FIELD: &str = "table.";
@@ -459,40 +463,99 @@ fn secret_field(
 ) -> String {
     let name = escape(&declaration.name);
     let set = record.secrets_set.contains(&declaration.name);
-    // Beside "set", who set it and when, on hover (contract v17): what the
-    // settings tool says, the form says.
-    let set_badge = match last_change_said(record, &declaration.name, named) {
-        Some(said) => format!(
-            " <span class=\"badge good\" title=\"{said}\" data-set-by>set</span>",
-            said = escape(&said)
-        ),
-        None => " <span class=\"badge good\">set</span>".to_string(),
+    // The field itself says where the secret stands (the product owner,
+    // 2026-10-10): who set it and when, as the settings tool says it
+    // (contract v17), or that it is not set. Empty keeps it; typing replaces.
+    // And, for a secret of sixteen characters or more set since contract
+    // v20, its last four (`hint`): "Ends in a9F2 · set by Ada, ...".
+    let hint_said = record
+        .changes
+        .iter()
+        .find(|change| change.name == declaration.name)
+        .map(|change| change.hint.clone())
+        .filter(|hint| !hint.is_empty());
+    let state = if set {
+        let said =
+            last_change_said(record, &declaration.name, named).unwrap_or_else(|| "Set".into());
+        match hint_said {
+            Some(hint) => {
+                let mut rest = said.chars();
+                let said = match rest.next() {
+                    Some(first) => first.to_lowercase().collect::<String>() + rest.as_str(),
+                    None => said,
+                };
+                format!("Ends in {hint} \u{b7} {said}")
+            }
+            None => said,
+        }
+    } else {
+        "Not set".to_string()
     };
-    let (state, placeholder, clear) = if set {
-        (
-            set_badge.as_str(),
-            "Type a new value to replace it",
-            format!(
-                "<label class=\"check\"><input type=\"checkbox\" name=\"{CLEAR_FIELD}{name}\"> Clear it</label>"
-            ),
+    // Removing is a small action beside the field, for an optional secret
+    // alone: a required one is only ever replaced. It posts its own form
+    // (`remove_forms`), which asks first.
+    let remove = if set && !declaration.required {
+        format!(
+            "<button type=\"submit\" class=\"link remove\" form=\"{}\" data-remove>Remove</button>",
+            remove_id(declaration)
         )
     } else {
-        (
-            " <span class=\"badge\">not set</span>",
-            "Not set",
-            String::new(),
-        )
+        String::new()
     };
     // Never a value: the record holds none, and a password field keeps
     // what was typed off the screen and out of the browser's history.
     format!(
         "{head}<span class=\"secret-row\"><input type=\"password\" name=\"{SECRET_FIELD}{name}\" value=\"\" \
-         id=\"{id}\" autocomplete=\"new-password\" placeholder=\"{placeholder}\"{described}>{clear}</span>{hint}",
-        head = heading(declaration, declared, true, state, about),
+         id=\"{id}\" autocomplete=\"new-password\" placeholder=\"{state}\" title=\"{state}\"{described}>{remove}</span>{hint}",
+        head = heading(declaration, declared, true, "", about),
         id = control_id(declaration),
+        state = escape(&state),
         described = described(declaration, about),
         hint = hint(declaration, about),
     )
+}
+
+/// A secret's Remove: a small text action beside its field, on this form's
+/// page alone (every page carries the shared style).
+const REMOVE_STYLE: &str = ".secret-row button.remove{flex-shrink:0;margin:0;padding:.2rem .15rem;\
+border:0;background:none;box-shadow:none;color:var(--accent);font-size:.86rem;font-weight:500;\
+white-space:nowrap;cursor:pointer}.secret-row button.remove:hover{text-decoration:underline}";
+
+/// The `id` of the form a secret's Remove posts.
+fn remove_id(declaration: &SettingDeclaration) -> String {
+    format!("remove-{}", escape(&declaration.name))
+}
+
+/// One small form per optional secret that is set, outside the settings form
+/// (forms do not nest), which its Remove posts: the clear alone, against the
+/// record as drawn, after the person confirms. Nothing else is sent, so a
+/// value typed elsewhere and not saved is neither saved nor lost by it.
+fn remove_forms(
+    record: &PluginSettingsRecord,
+    settings: &[&SettingDeclaration],
+    token: &str,
+    action: &str,
+) -> String {
+    settings
+        .iter()
+        .filter(|declaration| {
+            is_secret(record, declaration)
+                && !declaration.required
+                && record.secrets_set.contains(&declaration.name)
+        })
+        .map(|declaration| {
+            format!(
+                "<form id=\"{id}\" method=\"post\" action=\"{action}\" hidden \
+                 data-confirm=\"Remove {label}? The plugin no longer has it until it is set again.\">\
+                 {token}{against}<input type=\"hidden\" name=\"{CLEAR_FIELD}{name}\" value=\"on\"></form>",
+                id = remove_id(declaration),
+                action = escape(action),
+                label = escape(label(declaration)),
+                against = against(record),
+                name = escape(&declaration.name),
+            )
+        })
+        .collect()
 }
 
 fn choice_field(
@@ -820,10 +883,14 @@ pub fn form_with(
             )
         })
         .collect();
+    // A secret's Remove posts one of these, which only a person who may set
+    // the secret is offered: one shown read-only has its button disabled.
+    let removes = remove_forms(record, &settings, token, action);
     format!(
         "<form method=\"post\" action=\"{action}\" class=\"settings\" autocomplete=\"off\" data-settings>{token}{against}\
-         {nav}{sections}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">Save settings</button></div>\
-         </form><div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>\
+         {nav}{sections}<div class=\"form-foot\"><button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\" data-save>Save settings</button></div>\
+         </form>{removes}<style>{REMOVE_STYLE}</style><div class=\"note-bubble hints\" id=\"settings-hint-bubble\" aria-hidden=\"true\" hidden></div>\
          <script>{SCRIPT}</script>",
         action = escape(action),
         against = against(record),
@@ -848,8 +915,9 @@ pub fn table_form(
     let about = about(declaration, false);
     format!(
         "<form method=\"post\" action=\"{action}\" class=\"table-setting\" autocomplete=\"off\" \
-         data-table-setting>{token}{against}{grid}<div class=\"form-foot\"><button type=\"submit\" class=\"primary\">\
-         Save</button></div></form>",
+         data-table-setting>{token}{against}{grid}<div class=\"form-foot\">\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\" data-save>Save</button></div></form>",
         action = escape(action),
         against = against(record),
         grid = table_field(declaration, record, &about, choices, named),
@@ -876,6 +944,10 @@ const SCRIPT: &str = r#"(function () {
   var form = document.querySelector("form[data-settings]");
   if (!form) return;
   form.classList.add("js");
+  document.addEventListener("submit", function (event) {
+    var asking = event.target.getAttribute && event.target.getAttribute("data-confirm");
+    if (asking && event.target.id.indexOf("remove-") === 0 && !window.confirm(asking)) event.preventDefault();
+  });
   var bubble = document.getElementById("settings-hint-bubble");
   var shown = null;
   var nav = form.querySelector("nav[data-sections]");
@@ -971,7 +1043,7 @@ const SCRIPT: &str = r#"(function () {
 /// The change a submitted form asks for, or `None` when it asks for none.
 ///
 /// A secret left empty is left as it is; one typed into is replaced; one
-/// ticked to clear, and not typed into, is cleared. A setting that is not
+/// whose clear is posted (its Remove), and not typed into, is cleared. A setting that is not
 /// secret is sent when it differs from what the record holds, and cleared
 /// when emptied; one the form did not post is left as it is. Only settings
 /// the plugin declared, and this deployment shows, are read from the form.
@@ -1332,7 +1404,12 @@ fn grid_column(column: &SettingColumn, choices: &Choices) -> serde_json::Value {
                 ),
             );
         }
-        kind @ (SettingColumnType::ExternalAccount | SettingColumnType::Instrument) => {
+        // Found on the server as it is typed (kit 0.12.0): never a list of
+        // every record, the grid's `src` asked a few at a time.
+        SettingColumnType::Instrument => {
+            out.insert("type".into(), "instrument".into());
+        }
+        kind @ SettingColumnType::ExternalAccount => {
             out.insert("type".into(), "choice".into());
             out.insert(
                 "options".into(),
@@ -1342,6 +1419,19 @@ fn grid_column(column: &SettingColumn, choices: &Choices) -> serde_json::Value {
         SettingColumnType::Text | SettingColumnType::Unspecified => {
             out.insert("max_length".into(), setting_table::MOST_TEXT.into());
         }
+    }
+    // A choice with nothing to choose -- no external account reported yet --
+    // is shown as it stands: the kit's grid refuses a choice offering none,
+    // and would leave the whole table without its search (kit 0.12.0).
+    let offers_none = out.get("type").and_then(|kind| kind.as_str()) == Some("choice")
+        && out
+            .get("options")
+            .and_then(|options| options.as_array())
+            .is_some_and(|options| options.is_empty());
+    if offers_none {
+        out.insert("type".into(), "readonly".into());
+        out.remove("options");
+        out.remove("required");
     }
     serde_json::Value::Object(out)
 }
@@ -1397,9 +1487,14 @@ fn cell_input(
                 })
                 .collect(),
         ),
-        kind @ (SettingColumnType::ExternalAccount | SettingColumnType::Instrument) => {
+        kind @ SettingColumnType::ExternalAccount => {
             select(choices.of(kind).unwrap_or_default().to_vec())
         }
+        // Its ID, as the grid posts it; the grid finds and names it.
+        SettingColumnType::Instrument => format!(
+            r#"<input name="{field}" value="{}" aria-label="{aria}" autocomplete="off" placeholder="Instrument ID">"#,
+            escape(value)
+        ),
         kind => format!(
             r#"<input name="{field}" value="{}" aria-label="{aria}" autocomplete="off"{}>"#,
             escape(value),
@@ -1506,10 +1601,44 @@ fn table_field(
         "<div class=\"table-head\"><h2>{caption}</h2>{count}{who}</div>{about}{unread}\
          <input type=\"hidden\" name=\"{TABLE_FIELD}{field}\" value=\"1\">\
          <om-entry-grid name=\"{TABLE_FIELD}{field}\" caption=\"{caption}\" max-rows=\"{most}\" \
-         search=\"Search {caption}\">\
+         search=\"Search {caption}\"{src}>\
          <script type=\"application/json\">{json}</script>\
          <div class=\"table-wrap\"><table class=\"one-line\"><caption>{caption}</caption>\
          <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>",
         field = escape(name),
+        // Core's own search, for an instrument column (kit 0.12.0).
+        src = if declaration
+            .columns
+            .iter()
+            .any(|column| column_kind(column) == SettingColumnType::Instrument)
+        {
+            " src=\"/admin/instruments/search\""
+        } else {
+            ""
+        },
     )
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    #[test]
+    fn an_account_column_with_no_account_yet_is_shown_as_it_stands_not_a_choice_of_none() {
+        let column = SettingColumn {
+            name: "account".into(),
+            label: "Account".into(),
+            r#type: SettingColumnType::ExternalAccount as i32,
+            ..Default::default()
+        };
+        let none = grid_column(&column, &Choices::default());
+        assert_eq!(none["type"], "readonly", "{none}");
+        assert!(none.get("options").is_none(), "{none}");
+        let choices = Choices {
+            external_accounts: vec![("ext-1".into(), "Brokerage ...1".into())],
+            ..Default::default()
+        };
+        let some = grid_column(&column, &choices);
+        assert_eq!(some["type"], "choice", "{some}");
+    }
 }

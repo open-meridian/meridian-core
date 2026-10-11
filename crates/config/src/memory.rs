@@ -5,9 +5,9 @@
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, MoveRecord, Permission,
-    PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord,
-    UserGroup,
+    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, LinkableAccounts,
+    MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion,
+    SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_pb::v1::{SettingDeclaration, StoredSpan};
@@ -15,8 +15,9 @@ use meridian_pb::v1::{SettingDeclaration, StoredSpan};
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redaction_note, redeclared,
     AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, LaunchAct,
-    LaunchNote, RecordedMove, Result, SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot,
-    Store, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
+    LaunchNote, LinkableAccountsChange, RecordedMove, Result, SettingChange, SettingChangeRecord,
+    SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION,
+    REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -38,6 +39,8 @@ pub struct MemoryStore {
     /// Each licence and entitlement change, in order (contract v18).
     licences: Mutex<Vec<meridian_pb::v1::DatasetLicence>>,
     entitlements: Mutex<Vec<meridian_domain::v1::DatasetEntitlement>>,
+    /// Each linkable-accounts change, in order (contract v20).
+    linkable_changes: Mutex<Vec<LinkableAccountsChange>>,
 }
 
 impl MemoryStore {
@@ -63,6 +66,7 @@ impl MemoryStore {
             moves: Mutex::new(Vec::new()),
             licences: Mutex::new(Vec::new()),
             entitlements: Mutex::new(Vec::new()),
+            linkable_changes: Mutex::new(Vec::new()),
         }
     }
 
@@ -129,6 +133,8 @@ fn unauthored(
         at_ns,
         backfilled: false,
         note,
+        prepared_call_id: String::new(),
+        hint: String::new(),
     }
 }
 
@@ -236,6 +242,8 @@ impl Store for MemoryStore {
                     acting_through_delegation: change.delegation.clone(),
                     client_name: change.client.clone(),
                     note: change.note.clone(),
+                    prepared_call_id: change.prepared_call_id.clone(),
+                    hint: change.hint.clone(),
                 });
                 changes.sort_by(|a, b| a.name.cmp(&b.name));
             }
@@ -498,6 +506,12 @@ impl Store for MemoryStore {
                 delegation: author.delegation.clone(),
                 client: author.client.clone(),
                 at_ns,
+                prepared_call_id: author.prepared_call_id.clone(),
+                hint: if matches!(change.held, Some(Held::Sealed(_))) {
+                    change.hint.clone()
+                } else {
+                    String::new()
+                },
                 backfilled: false,
                 note: author.note.clone(),
             });
@@ -755,5 +769,76 @@ impl Store for MemoryStore {
                 .cloned()
                 .collect(),
         ))
+    }
+
+    fn set_linkable_accounts(
+        &self,
+        plugin_instance_id: &str,
+        grant: &[String],
+        withdraw: &[String],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<LinkableAccounts> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let held = state
+            .linkable
+            .entry(plugin_instance_id.to_string())
+            .or_insert_with(|| LinkableAccounts {
+                plugin_instance_id: plugin_instance_id.to_string(),
+                ..LinkableAccounts::default()
+            });
+        let mut granted = Vec::new();
+        for account in grant {
+            if !held.account_ids.contains(account) && !granted.contains(account) {
+                held.account_ids.push(account.clone());
+                granted.push(account.clone());
+            }
+        }
+        let mut withdrawn = Vec::new();
+        for account in withdraw {
+            if let Some(at) = held.account_ids.iter().position(|a| a == account) {
+                held.account_ids.remove(at);
+                withdrawn.push(account.clone());
+            }
+        }
+        held.account_ids.sort();
+        if !granted.is_empty() || !withdrawn.is_empty() {
+            held.updated_by = author.by.clone();
+            held.updated_at_ns = at_ns;
+            held.acting_through_delegation = author.delegation.clone();
+            held.client_name = author.client.clone();
+            self.linkable_changes
+                .lock()
+                .expect("store lock poisoned")
+                .push(LinkableAccountsChange {
+                    plugin_instance_id: plugin_instance_id.to_string(),
+                    granted,
+                    withdrawn,
+                    by: author.by.clone(),
+                    delegation: author.delegation.clone(),
+                    client: author.client.clone(),
+                    at_ns,
+                    note: author.note.clone(),
+                });
+        }
+        let now = held.clone();
+        if now.account_ids.is_empty() && now.updated_at_ns == 0 {
+            state.linkable.remove(plugin_instance_id);
+        }
+        Ok(now)
+    }
+
+    fn linkable_accounts_changes(
+        &self,
+        plugin_instance_id: &str,
+    ) -> Result<Vec<LinkableAccountsChange>> {
+        Ok(self
+            .linkable_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.plugin_instance_id == plugin_instance_id)
+            .cloned()
+            .collect())
     }
 }

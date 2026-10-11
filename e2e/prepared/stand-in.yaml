@@ -1,0 +1,17 @@
+# Core's stand-in as one plugin at the edge holding custody and operations,
+# for `make e2e-prepared` (contract v20; plans/an-agents-prepared-change-
+# waits-for-the-person, "What the tests prove"), as for `make
+# e2e-plugin-area`: a secret, the window settings serving custody, a table
+# setting, and a setting serving both roles (e2e/plugin-page/archiving.py's
+# area_registration).
+services:
+  area:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+    environment:
+      STAND_IN_ARCHIVE: "1"
+      STAND_IN_AREA: "1"
+      STAND_IN_REPORTS_AT_START: "1"
+      # Acts on the custody side, one preparable (contract v20).
+      STAND_IN_ACTS: "1"

@@ -32,14 +32,43 @@ pub mod zones;
 /// the chart says them for the launcher). Read by the sidecar and the
 /// conductor, each refusing a declaration asking for storage without one.
 pub const EDGE_ROLES: [&str; 7] = [
-    "ccm",
+    "confirmation",
+    "connectivity",
     "custody",
-    "dgm",
-    "match",
+    "data",
     "reporting",
     "servicing",
     "settlement",
 ];
+
+/// The three roles renamed at contract v20 (the product owner, 2026-10-10:
+/// plans/an-agents-prepared-change-waits-for-the-person, "Three roles
+/// renamed"), each old code name and the name it became. A plugin built
+/// before v20 still declares the old one, and deployment data written
+/// before v20 names it: each is read as the new name for one revision, and
+/// the configuration store's one-time rewrite renames what it keeps, each
+/// rename its own record (decisions/031).
+pub const RENAMED_ROLES: [(&str, &str); 3] = [
+    ("ccm", "connectivity"),
+    ("dgm", "data"),
+    ("match", "confirmation"),
+];
+
+/// A role's name now: the new name of one renamed at v20, any other as given.
+pub fn role_now(role: &str) -> &str {
+    RENAMED_ROLES
+        .iter()
+        .find(|(old, _)| *old == role)
+        .map_or(role, |(_, new)| new)
+}
+
+/// Each of `roles` by its name now ([`role_now`]), in the same order.
+pub fn roles_now(roles: &[String]) -> Vec<String> {
+    roles
+        .iter()
+        .map(|role| role_now(role).to_string())
+        .collect()
+}
 
 /// A count as a sentence says it, "2,190": a hold's days and a span's
 /// records (contract v16), which the sidecar's refusal, the conductor's and
@@ -58,6 +87,24 @@ pub fn thousands(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_renamed_role_reads_as_its_new_name_and_any_other_as_given() {
+        assert_eq!(super::role_now("dgm"), "data");
+        assert_eq!(super::role_now("ccm"), "connectivity");
+        assert_eq!(super::role_now("match"), "confirmation");
+        for kept in ["data", "custody", "reporting", ""] {
+            assert_eq!(super::role_now(kept), kept);
+        }
+        assert_eq!(
+            super::roles_now(&["custody".into(), "dgm".into()]),
+            vec!["custody".to_string(), "data".to_string()]
+        );
+        // Every edge role is a role now, none an old name.
+        for role in super::EDGE_ROLES {
+            assert_eq!(super::role_now(role), role);
+        }
+    }
+
     #[test]
     fn a_count_is_grouped_by_thousands() {
         assert_eq!(super::thousands(0), "0");

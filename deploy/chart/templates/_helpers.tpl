@@ -169,7 +169,7 @@ readinessProbe:
   it, so the chart says it once.
 */}}
 {{- define "meridian-runtime.edgeRoles" -}}
-ccm,custody,dgm,match,reporting,servicing,settlement
+confirmation,connectivity,custody,data,reporting,servicing,settlement
 {{- end -}}
 
 {{/*

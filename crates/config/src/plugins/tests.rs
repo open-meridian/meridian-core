@@ -539,6 +539,7 @@ async fn ask_through<Q: Message, A: Message + Default>(
     request: Q,
 ) -> Result<A, String> {
     let stamp = meridian_bus::Stamp {
+        prepared_call_id: Default::default(),
         acting_for_subject: ADA.into(),
         acting_through_delegation: "DLG-1".into(),
         acting_through_client: "meridian on ada-laptop".into(),

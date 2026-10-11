@@ -43,13 +43,14 @@ the same image with the list on stdin:
       unless the dashboard refuses the settings saying TEXT -- a window below
       the hold, naming the setting (contract v16).
 
-  hold DAYS [--role ROLE] [--write-once] [--expect-refused TEXT]
+  hold DAYS [--role ROLE] [--write-once] [--expect-refused TEXT] [--prepare WHY]
       Sets the hold on raw records on the deployment's Settings, as a
       deployment admin does (W6.25, contract v16): for ROLE, an edge role, or
       every one without it; 0 days clears it. --expect-refused TEXT fails
-      unless it is refused saying TEXT.
+      unless it is refused saying TEXT. With --prepare, the dialog's Prepare
+      (contract v20): prepared, nothing changed, its PC- ID printed.
 
-  archive allow [--bound-gib N] | archive withdraw
+  archive allow [--bound-gib N] | archive withdraw   [--prepare WHY]
       Allows the plugin an archive, with a bound in GiB or none, or withdraws
       it, on its Manage page's Summary, as a deployment admin does (W8.7,
       contract v16). The harness has no launcher: the plugin listed with
@@ -119,7 +120,7 @@ the same image with the list on stdin:
       value goes with the source given, and the dashboard stamps the admin.
 
   mcp connect [--covers everything | --covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...]
-              [--client NAME] [--check-consent]
+              [--client NAME] [--check-consent] [--consent-says TEXT ...]
       Connects an MCP client as the admin, as an agent's client does (W6.17,
       W6.20): registers it (named "harness agent" unless --client says), sends
       her through the dashboard's authorisation for the `/mcp` resource with
@@ -131,7 +132,13 @@ the same image with the list on stdin:
       pair, kept for the run in the runner's state. Prints the delegation and
       how many tools it reaches. With --check-consent, fails unless the tools
       the consent page listed under what she allowed are exactly the tools
-      tools/list then lists (contract v17).
+      tools/list then lists (contract v17). With --consent-says, fails unless
+      the consent page's HTML says each TEXT (contract v20: the admins' level
+      beside each act).
+
+  core-page PATH [--expect TEXT ...]
+      One of core's own pages as the person signed in, its status and body
+      printed; fails unless it says each TEXT.
 
   mcp list [--expect NAME ...]
       Prints the tools the connected delegation reaches, one name per line,
@@ -190,10 +197,11 @@ the same image with the list on stdin:
 
   licence DATASET kept=true|false retention_days=N derived_use=true|false
           display=true|false personal_use=true|false [default_fields=A,B] [note=TEXT]
-          [--expect-refused TEXT]
+          [--expect-refused TEXT] [--prepare]
       Sets a dataset's licence on the Data sources page, as a deployment
       admin does (W10.1, contract v18), replacing it whole; a boolean left out
       is false. --expect-refused TEXT fails unless it is refused saying TEXT.
+      With --prepare, the dialog's Prepare: its PC- ID printed.
 
   entitle DATASET [--fields A,B] [--withdraw] [note=TEXT] [--seconds N]
       Entitles the plugin to a dataset on the Data sources page, every field
@@ -488,8 +496,20 @@ def settings(args):
         print(f"settings: {said.group(1) if said else wanted}")
 
 
+def prepared_by_dialog(done, what):
+    """A dialog's Prepare (contract v20): the post answered with the prepared
+    change's page; its ID printed, nothing changed."""
+    where = done.location or ""
+    if done.status != 303 or "/prepared/PC-" not in where:
+        raise Failed(f"{what} was not prepared: {done.status} {where} {sentence(done)}")
+    ident = where.rsplit("/", 1)[-1]
+    print(ident)
+    return ident
+
+
 def hold(args):
     role = option(args, "--role", "")
+    prepare = option(args, "--prepare", None)
     write_once = "--write-once" in args
     if write_once:
         args.remove("--write-once")
@@ -501,8 +521,13 @@ def hold(args):
     fields = {"form_token": form_token(page), "role": role, "days": args[0]}
     if write_once:
         fields["write_once"] = "1"
+    if prepare is not None:
+        fields.update({"prepare": "1", "note": prepare})
     done = admin.post("/admin/holds", fields)
     covers = role or "every edge role"
+    if prepare is not None and refusal is None:
+        prepared_by_dialog(done, "the hold")
+        return
     if refusal is not None:
         if done.status == 303:
             raise Failed(f"the hold was set, and was to be refused saying {refusal!r}")
@@ -520,6 +545,7 @@ def archive(args):
         raise Failed("archive takes allow or withdraw")
     verb = args.pop(0)
     bound = option(args, "--bound-gib", "")
+    prepare = option(args, "--prepare", None)
     if args:
         raise Failed(f"archive {verb} takes no {args[0]!r}")
     admin = signed_in()
@@ -533,6 +559,10 @@ def archive(args):
         fields["most_gib"] = bound
     else:
         path += "/withdraw"
+    if prepare is not None:
+        fields.update({"prepare": "1", "note": prepare})
+        prepared_by_dialog(admin.post(path, fields), f"archive {verb}")
+        return
     done = admin.post(path, fields)
     if done.status != 303:
         raise Failed(f"the archive was not {verb}ed: {done.status} {sentence(done)}")
@@ -580,6 +610,11 @@ def view(args):
 
 def account(args):
     seconds = number(args, "--seconds", 60)
+    # Granted the plugin the command acts on, which it may then link to
+    # (W6.30, contract v20), unless --no-grant: nothing is by default.
+    granting = "--no-grant" not in args
+    if not granting:
+        args.remove("--no-grant")
     if len(args) != 1:
         raise Failed("account takes a name")
     name = args[0]
@@ -597,7 +632,15 @@ def account(args):
             raise Failed(f"{name} is not listed yet")
         return found.group(1)
 
-    print(until(seconds, listed, f"{name} was never listed"))
+    found = until(seconds, listed, f"{name} was never listed")
+    if granting:
+        accounts = admin.get(f"{VIEW}?tab=accounts")
+        granted = admin.post(f"{VIEW}/accounts", {"form_token": form_token(accounts),
+                                                  "grant": found, "withdraw": "",
+                                                  "note": "granted by the harness"})
+        if granted.status != 303:
+            raise Failed(f"{name} was not granted {INSTANCE}: {granted.status} {sentence(granted)}")
+    print(found)
 
 
 def session_at(admin, level):
@@ -646,6 +689,22 @@ def page(args):
         return reply
 
     reply = until(seconds if text is not None else 0, answered, f"{path} never said {text!r}")
+    print(reply.status)
+    print(reply.body)
+
+
+def core_page(args):
+    """`core-page PATH [--expect TEXT]...`: one of core's own pages, as the
+    person signed in; its status and body printed, failing unless it says
+    each TEXT."""
+    expected = options(args, "--expect")
+    if len(args) != 1:
+        raise Failed("core-page takes one path")
+    person = signed_in()
+    reply = person.get(args[0])
+    for wanted in expected:
+        if wanted not in reply.body:
+            raise Failed(f"{args[0]} answered {reply.status} without {wanted!r}")
     print(reply.status)
     print(reply.body)
 
@@ -941,7 +1000,7 @@ RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the run
 # (decisions/028), as the chart's `meridian-runtime.edgeRoles` says them; a
 # plugin holding any is given a volume of its own, where the chart gives it a
 # claim of its own, at the same path.
-EDGE_ROLES = ("ccm", "custody", "dgm", "match", "reporting", "servicing", "settlement")
+EDGE_ROLES = ("confirmation", "connectivity", "custody", "data", "reporting", "servicing", "settlement")
 STORAGE_DIR = "/var/lib/meridian/storage"
 # Where an edge plugin allowed an archive finds it (contract v16), as the
 # chart's archive shape mounts an allowed instance's directory.
@@ -1178,6 +1237,7 @@ def mcp_connect(args):
     check_consent = "--check-consent" in args
     if check_consent:
         args.remove("--check-consent")
+    consent_says = options(args, "--consent-says")
     if args:
         raise Failed(f"mcp connect takes no {args[0]!r}")
     status, said, _ = send_json("POST", "/oauth/register",
@@ -1203,6 +1263,9 @@ def mcp_connect(args):
     confirm = re.search(r'name="confirm" value="([^"]+)"', consent.body)
     if consent.status != 200 or not request or not confirm:
         raise Failed(f"she was not shown the consent page: {consent.status} {sentence(consent)}")
+    for wanted in consent_says:
+        if wanted not in consent.body:
+            raise Failed(f"the consent page does not say {wanted!r}")
     everything = "everything" in covers
     if everything and len(covers) > 1:
         raise Failed("--covers everything is the whole of what she holds, alone")
@@ -1271,9 +1334,17 @@ def rpc(method, params=None):
 
 def mcp_list(args):
     wanted = options(args, "--expect")
+    describe = option(args, "--describe", None)
     if args:
         raise Failed(f"mcp list takes no {args[0]!r}")
-    names = [tool["name"] for tool in rpc("tools/list")["tools"]]
+    listed = rpc("tools/list")["tools"]
+    if describe is not None:
+        found = [tool for tool in listed if tool["name"] == describe]
+        if not found:
+            raise Failed(f"the delegation is not listed {describe}")
+        print(found[0].get("description", ""))
+        return
+    names = [tool["name"] for tool in listed]
     missing = [name for name in wanted if name not in names]
     for name in names:
         print(name)
@@ -1654,6 +1725,9 @@ def refused_or_done(done, refusal, what):
 
 def licence(args):
     refusal = option(args, "--expect-refused", None)
+    prepare = "--prepare" in args
+    if prepare:
+        args.remove("--prepare")
     fields = {"retention_days": said_pair(args, "retention_days", "0"),
               "default_fields": said_pair(args, "default_fields"),
               "note": said_pair(args, "note")}
@@ -1665,6 +1739,10 @@ def licence(args):
     fields["dataset"] = args[0]
     admin = signed_in()
     fields["form_token"] = form_token(admin.get(DATA_SOURCES))
+    if prepare:
+        fields["prepare"] = "1"
+        prepared_by_dialog(admin.post(DATA_SOURCES + "/licence", fields), f"{args[0]}'s licence")
+        return
     said = refused_or_done(admin.post(DATA_SOURCES + "/licence", fields), refusal,
                            f"{args[0]}'s licence")
     print(f"licence: {said}" if said else
@@ -1761,12 +1839,212 @@ def priority(args):
           f"priority: {data_type}{' ' + kind if kind else ''}: {' then '.join(datasets)}")
 
 
+# ── Contract v20: prepared changes, the admins' levels, account grants ──────
+
+
+def form_fields(body, action_has):
+    """Every field a page's form posts, the one whose action names
+    `action_has`: inputs by value (a checkbox only when checked), a select by
+    its selected option, a textarea by its text."""
+    forms = re.findall(r'<form[^>]*action="([^"]*)"[^>]*>(.*?)</form>', body, re.S)
+    chosen = [inner for action, inner in forms if action_has in html.unescape(action)]
+    if not chosen:
+        raise Failed(f"no form posts to {action_has}")
+    inner = chosen[0]
+    fields = []
+    for tag in re.findall(r"<input[^>]*>", inner):
+        name = re.search(r'name="([^"]+)"', tag)
+        if not name:
+            continue
+        kind = re.search(r'type="([^"]+)"', tag)
+        kind = kind.group(1) if kind else "text"
+        if kind in ("checkbox", "radio") and "checked" not in tag:
+            continue
+        if kind in ("submit", "button"):
+            continue
+        value = re.search(r'value="([^"]*)"', tag)
+        fields.append((html.unescape(name.group(1)), html.unescape(value.group(1)) if value else ""))
+    for name, options in re.findall(r'<select[^>]*name="([^"]+)"[^>]*>(.*?)</select>', inner, re.S):
+        picked = re.search(r'<option value="([^"]*)"[^>]*selected', options)
+        fields.append((html.unescape(name), html.unescape(picked.group(1)) if picked else ""))
+    return fields
+
+
+def prepared(args):
+    """`prepared [--expect N] [--until ID]`: the prepared changes waiting for
+    whoever signs in, from the Inbox, each its ID on a line."""
+    seconds = number(args, "--seconds", 30)
+    expect = option(args, "--expect", None)
+    wanted = option(args, "--until", None)
+    if args:
+        raise Failed(f"prepared takes no {args[0]!r}")
+    person = signed_in()
+
+    def listed():
+        page = person.get("/inbox/prepared")
+        if page.status != 200:
+            raise Failed(f"the Inbox: {page.status} {sentence(page)}")
+        ids = re.findall(r'<tr data-prepared="(PC-[^"]+)"', page.body)
+        if expect is not None and len(ids) != int(expect):
+            raise Failed(f"{len(ids)} waiting, not {expect}: {ids}")
+        if wanted is not None and wanted not in ids:
+            raise Failed(f"{wanted} is not waiting: {ids}")
+        return ids
+
+    for found in until(seconds, listed, "the prepared changes"):
+        print(found)
+
+
+def prepared_act(args):
+    """`prepared-act make|discard|share|withdraw ID [--note TEXT]
+    [--expect-refused WORDS]`: the button on the prepared change's page."""
+    if len(args) < 2 or args[0] not in ("make", "discard", "share", "withdraw"):
+        raise Failed("prepared-act takes make, discard, share or withdraw and an ID")
+    verb, ident = args.pop(0), args.pop(0)
+    note = option(args, "--note", "")
+    refusal = option(args, "--expect-refused", None)
+    if args:
+        raise Failed(f"prepared-act takes no {args[0]!r}")
+    person = signed_in()
+    page = person.get(f"/prepared/{ident}")
+    if page.status != 200:
+        raise Failed(f"{ident}: {page.status} {sentence(page)}")
+    done = person.post(f"/prepared/{ident}/{verb}", {"form_token": form_token(page), "note": note})
+    if refusal is not None:
+        if done.status == 303:
+            raise Failed(f"{ident} was {verb}d, and was to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(done)):
+            raise Failed(f"{verb} was refused, not saying {refusal!r}: {sentence(done)}")
+        print(f"prepared-act: refused: {html.unescape(sentence(done))}")
+        return
+    if done.status != 303:
+        raise Failed(f"{ident} was not {verb}d: {done.status} {sentence(done)}")
+    shown = person.get(f"/prepared/{ident}")
+    state = re.search(r"<code>" + re.escape(ident) + r"</code> &middot; ([A-Za-z, ]+)", shown.body)
+    print(f"prepared-act: {verb}: {state.group(1) if state else 'done'}")
+
+
+def prepared_form(args):
+    """`prepared-form ID [--expect WORDS]`: the plugin's Settings form opened
+    from a prepared change -- "Prepared by" and its reason shown -- saved as
+    it was started, by whoever signs in."""
+    if not args:
+        raise Failed("prepared-form takes an ID")
+    ident = args.pop(0)
+    wanted = option(args, "--expect", None)
+    refusal = option(args, "--expect-refused", None)
+    person = signed_in()
+    page = person.get(f"{VIEW}?tab=settings&prepared={urllib.parse.quote(ident)}")
+    if page.status != 200:
+        raise Failed(f"the form: {page.status} {sentence(page)}")
+    if f'data-prepared="{ident}"' not in page.body:
+        raise Failed(f"the form was not started from {ident}")
+    shown = html.unescape(page.body)
+    if wanted is not None and wanted not in shown:
+        raise Failed(f"the form opened from {ident} does not say {wanted!r}")
+    fields = form_fields(page.body, f"{VIEW}/settings")
+    done = person.post(f"{VIEW}/settings", dict(fields))
+    if refusal is not None:
+        if done.status == 303:
+            raise Failed(f"saved, and was to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(done)):
+            raise Failed(f"refused, not saying {refusal!r}: {sentence(done)}")
+        print(f"prepared-form: refused: {html.unescape(sentence(done))}")
+        return
+    if done.status != 303:
+        raise Failed(f"not saved: {done.status} {sentence(done)}")
+    print(f"prepared-form: {ident} saved from the form")
+
+
+def prepare_settings(args):
+    """`prepare-settings NAME=VALUE ... --note TEXT`: the Settings form's
+    Prepare, a person preparing a change for someone else to make; prints
+    the prepared change's ID."""
+    note = option(args, "--note", "")
+    asked = pairs(args)
+    if args or not asked:
+        raise Failed("prepare-settings takes NAME=VALUE, at least one")
+    person = signed_in()
+    page = person.get(f"{VIEW}?tab=settings")
+    if page.status != 200:
+        raise Failed(f"the form: {page.status} {sentence(page)}")
+    fields = dict(form_fields(page.body, f"{VIEW}/settings"))
+    for name, value in asked:
+        fields[f"value.{name}"] = value
+    fields["prepare"] = "1"
+    fields["note"] = note
+    done = person.post(f"{VIEW}/settings", fields)
+    if done.status != 303 or not (done.location or "").startswith("/prepared/PC-"):
+        raise Failed(f"not prepared: {done.status} {done.location} {sentence(done)}")
+    print(done.location.rsplit("/", 1)[1])
+
+
+def agents(args):
+    """`agents ACT --level may_make|prepare_only|may_not [--scope act|ceiling|
+    group:ID] [--eyes] [--note TEXT] [--plugin]`: what agents may do with an
+    act, at the deployment's Agents tab, or with --plugin at the plugin's
+    Access tab, as its admin."""
+    if not args:
+        raise Failed("agents takes an act")
+    act = args.pop(0)
+    level = option(args, "--level", "may_make")
+    scope = option(args, "--scope", "act")
+    note = option(args, "--note", "")
+    eyes = "--eyes" in args
+    if eyes:
+        args.remove("--eyes")
+    on_plugin = "--plugin" in args
+    if on_plugin:
+        args.remove("--plugin")
+    refusal = option(args, "--expect-refused", None)
+    if args:
+        raise Failed(f"agents takes no {args[0]!r}")
+    person = signed_in()
+    page = person.get(VIEW + "?tab=access" if on_plugin else "/admin")
+    fields = {"form_token": form_token(page), "act": act, "scope": scope, "level": level, "note": note}
+    if eyes:
+        fields["second_pair_of_eyes"] = "1"
+    done = person.post(f"{VIEW}/agents" if on_plugin else "/admin/agents", fields)
+    if refusal is not None:
+        if done.status == 303:
+            raise Failed(f"set, and was to be refused saying {refusal!r}")
+        if refusal not in html.unescape(sentence(done)):
+            raise Failed(f"refused, not saying {refusal!r}: {sentence(done)}")
+        print(f"agents: refused: {html.unescape(sentence(done))}")
+        return
+    if done.status != 303:
+        raise Failed(f"not set: {done.status} {sentence(done)}")
+    print(f"agents: {act} at {scope}: {level}{', second pair of eyes' if eyes else ''}")
+
+
+def linkable(args):
+    """`linkable --grant ACCOUNT | --withdraw ACCOUNT [--note TEXT]`: the
+    plugin's Accounts tab, a deployment admin's grant."""
+    grant = option(args, "--grant", "")
+    withdraw = option(args, "--withdraw", "")
+    note = option(args, "--note", "")
+    if args or not (grant or withdraw):
+        raise Failed("linkable takes --grant or --withdraw and an account")
+    person = signed_in()
+    page = person.get(VIEW + "?tab=accounts")
+    if page.status != 200:
+        raise Failed(f"its Accounts tab: {page.status} {sentence(page)}")
+    done = person.post(f"{VIEW}/accounts", {"form_token": form_token(page), "grant": grant,
+                                            "withdraw": withdraw, "note": note})
+    if done.status != 303:
+        raise Failed(f"not changed: {done.status} {sentence(done)}")
+    shown = person.get(VIEW + "?tab=accounts")
+    print(f"linkable: {len(re.findall(r'<tr data-id=', shown.body))} granted")
+
+
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
             "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
             "instruments": instruments, "instrument": instrument, "mcp": mcp,
             "ticket": ticket, "inbox": inbox, "licence": licence, "entitle": entitle,
-            "priority": priority}
+            "priority": priority, "prepared": prepared, "prepared-act": prepared_act,
+            "prepared-form": prepared_form, "prepare-settings": prepare_settings,
+            "agents": agents, "linkable": linkable, "core-page": core_page}
 
 
 def main(argv):

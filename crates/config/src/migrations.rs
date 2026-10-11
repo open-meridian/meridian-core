@@ -123,7 +123,176 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0016_the_lake_prices_the_book.sql"),
         then: None,
     },
+    Migration {
+        version: 17,
+        name: "an_agents_prepared_change",
+        sql: include_str!("../migrations/0017_an_agents_prepared_change.sql"),
+        then: Some(contract_v20),
+    },
 ];
+
+/// The note on each grant the upgrade made (W6.30, decisions/031).
+pub const GRANTED_AT_THE_UPGRADE: &str = "granted at the upgrade to contract v20, for no person:      the accounts this instance's links named then, so no link standing before v20 is refused";
+
+/// The note on each access group the role rename rewrote.
+pub const RENAMED_AT_V20: &str = "the one-time rename at the upgrade to contract v20, for no      person: dgm became data, ccm connectivity and match confirmation";
+
+/// Migration 17 (contract v20): each instance granted the accounts its links
+/// name, and the three renamed roles rewritten wherever the store keeps a
+/// role, each its own record, all at `at_ns`, the moment it ran.
+fn contract_v20(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    grant_what_links_name(tx, at_ns)?;
+    rename_roles(tx, at_ns)?;
+    Ok(())
+}
+
+/// W6.30's backfill: every account a standing link names granted to the
+/// link's instance, one record per instance naming the accounts. An instance
+/// already granted any is left as it is, so it runs once.
+fn grant_what_links_name(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    let linked = tx
+        .query(
+            "SELECT plugin_instance_id, array_agg(DISTINCT account_id ORDER BY account_id)
+               FROM config_external_account_link
+              WHERE plugin_instance_id NOT IN
+                    (SELECT plugin_instance_id FROM config_linkable_accounts_change)
+              GROUP BY plugin_instance_id ORDER BY plugin_instance_id",
+            &[],
+        )
+        .map_err(unavailable)?;
+    for row in linked {
+        let (instance, accounts): (String, Vec<String>) = (row.get(0), row.get(1));
+        for account in &accounts {
+            tx.execute(
+                "INSERT INTO config_linkable_account (plugin_instance_id, account_id)
+                 VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                &[&instance, account],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.execute(
+            "INSERT INTO config_linkable_accounts_change
+                    (plugin_instance_id, granted, changed_at_ns, note)
+             VALUES ($1, $2, $3, $4)",
+            &[&instance, &accounts, &at_ns, &GRANTED_AT_THE_UPGRADE],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+/// The one-time rename (contract v20): each launch, version and plugin's
+/// report naming a renamed role, each access group with an entry naming one,
+/// and each standing hold on one, rewritten to the new name, each its own
+/// record ([`RENAMED_AT_V20`]). Only the old names are read, so it is
+/// idempotent.
+pub fn rename_roles(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    for (old, new) in meridian_domain::RENAMED_ROLES {
+        for (what, table, key) in [
+            ("launch", "config_plugin_launch", "launch_id::text"),
+            ("version", "config_plugin_version", "name || ' ' || version"),
+            ("known plugin", "config_known_plugin", "plugin_instance_id"),
+        ] {
+            let renamed = tx
+                .query(
+                    &format!(
+                        "UPDATE {table} SET roles = array_replace(roles, $1, $2)
+                          WHERE $1 = ANY(roles) RETURNING {key}"
+                    ),
+                    &[&old, &new],
+                )
+                .map_err(unavailable)?;
+            for row in renamed {
+                let which: String = row.get(0);
+                tx.execute(
+                    "INSERT INTO config_role_rename (what, which, from_role, to_role, renamed_at_ns)
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[&what, &which, &old, &new, &at_ns],
+                )
+                .map_err(unavailable)?;
+            }
+        }
+
+        // Each access group with an entry on the old name: one record, what
+        // it was and what it became.
+        let groups: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT access_group_id FROM config_access_entry WHERE role = $1
+                  ORDER BY access_group_id",
+                &[&old],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        for group in groups {
+            let was = crate::postgres::read_access_group(tx, &group)?;
+            tx.execute(
+                "UPDATE config_access_entry SET role = $2 WHERE access_group_id = $3 AND role = $1",
+                &[&old, &new, &group],
+            )
+            .map_err(unavailable)?;
+            let became = crate::postgres::read_access_group(tx, &group)?;
+            let record = crate::store::AccessChangeRecord {
+                access_group_id: group.clone(),
+                kind: crate::store::AccessChangeKind::Rewritten,
+                was: was
+                    .as_ref()
+                    .map(crate::store::described_group)
+                    .unwrap_or_default(),
+                became: became
+                    .as_ref()
+                    .map(crate::store::described_group)
+                    .unwrap_or_default(),
+                permission_id: String::new(),
+                by: String::new(),
+                delegation: String::new(),
+                at_ns,
+                note: RENAMED_AT_V20.to_string(),
+            };
+            crate::postgres::insert_access_change(tx, &record)?;
+            tx.execute(
+                "INSERT INTO config_role_rename (what, which, from_role, to_role, renamed_at_ns)
+                 VALUES ('access group', $1, $2, $3, $4)",
+                &[&group, &old, &new, &at_ns],
+            )
+            .map_err(unavailable)?;
+        }
+
+        // A standing hold on the old name: cleared there and set on the new,
+        // two records, the days and write-once as they stood.
+        let standing = tx
+            .query_opt(
+                "SELECT days, write_once FROM config_hold_change WHERE role = $1
+                  ORDER BY change_id DESC LIMIT 1",
+                &[&old],
+            )
+            .map_err(unavailable)?;
+        if let Some(row) = standing {
+            let (days, write_once): (i32, bool) = (row.get(0), row.get(1));
+            if days > 0 {
+                for (role, days) in [(old, 0), (new, days)] {
+                    tx.execute(
+                        "INSERT INTO config_hold_change
+                                (role, days, write_once, changed_at_ns, note)
+                         VALUES ($1, $2, $3, $4, $5)",
+                        &[&role, &days, &write_once, &at_ns, &RENAMED_AT_V20],
+                    )
+                    .map_err(unavailable)?;
+                }
+                tx.execute(
+                    "INSERT INTO config_role_rename (what, which, from_role, to_role, renamed_at_ns)
+                     VALUES ('hold', $1, $1, $2, $3)",
+                    &[&old, &new, &at_ns],
+                )
+                .map_err(unavailable)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Migration 15's gap records (contract v17, decisions/031 point 4): for
 /// every launch, and every stop by a person, recorded before it, the

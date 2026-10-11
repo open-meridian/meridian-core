@@ -141,7 +141,7 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// plugin built before declares no kinds and moves nothing. v17 numbered a
 /// revision of core's alone, which no plugin declares (its Q9). v18 is the
 /// lake's 1a (spec/the-lake; sdk-contract/the-lake-prices-the-book-contract):
-/// a `dgm`'s catalogue in the declaration, held to W4.1's rules at
+/// a data plugin's catalogue in the declaration, held to W4.1's rules at
 /// registration; its prices and bars recorded in batches of 1 to 500, the
 /// wants it hears and declines, resolving securities and venues and
 /// reporting both missing; the reading roles' reads of prices, bars and the
@@ -152,14 +152,28 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// a plugin may still name by its ISO 4217 code alone (decisions/023 as
 /// amended). A plugin built before declares no catalogue and hears no lake
 /// row. v19 is the lake's 1b (sdk-contract/the-lake-trades-and-quotes-
-/// contract): a `dgm`'s trades and quotes recorded in batches, their reads
+/// contract): a data plugin's trades and quotes recorded in batches, their reads
 /// and deliveries to `signal` and `ems` -- quotes conflated per subject,
 /// dataset, venue and asset, trades never, every one delivered and a loss
 /// caught up after the watermark last seen -- the binary event contract on a
 /// record a plugin reads, an identifier's window, stamped empty on what a
 /// plugin sends, `reporting` resolving an identifier, and `ems` reading the
-/// datasets. A plugin built before records and hears neither.
-pub const CONTRACT_CURRENT: u32 = 19;
+/// datasets. A plugin built before records and hears neither. v20 is a
+/// prepared change waiting for the person (sdk-contract/an-agents-prepared-
+/// change-contract): an act's check tool, the accounts it touches and the
+/// page it is made on in its declaration (`checked_by`, `accounts`,
+/// `made_on`), held at registration; `SidecarService.ReadPreparedCall`, the
+/// prepared change a page was opened from, and the claims' and the
+/// envelope's `prepared_call_id`; a person's own settings, declared
+/// `per_person`, saved with `SidecarService.SetOwnSettings` and handed back
+/// in the claims (`own_settings`); the deployment admin's grant of the
+/// accounts an instance may link to (`REFUSAL_REASON_ACCOUNT_NOT_LINKABLE`);
+/// a data plugin reading its own last recorded trades (`latest_recorded`)
+/// and its datasets' licences; and three roles renamed -- `dgm` to `data`,
+/// `ccm` to `connectivity`, `match` to `confirmation` -- a plugin built
+/// before still declaring the old names, read as the new. A plugin built
+/// before v20 declares no check tool and is handed neither.
+pub const CONTRACT_CURRENT: u32 = 20;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -407,7 +421,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v19); rebuild it against v2 or later"
+                 (v2 through v20); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -416,11 +430,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v20"),
+            admit("v21"),
             Err(
-                "the plugin was built against contract v20, newer than this sidecar \
-                 (v2 through v19); upgrade the runtime, or rebuild the plugin against \
-                 v19 or earlier"
+                "the plugin was built against contract v21, newer than this sidecar \
+                 (v2 through v20); upgrade the runtime, or rebuild the plugin against \
+                 v20 or earlier"
                     .into()
             )
         );
@@ -431,7 +445,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v19"
+                "the plugin declared no contract version; this sidecar accepts v2 through v20"
                     .into()
             )
         );

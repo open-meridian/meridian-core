@@ -161,6 +161,56 @@ async fn ask<R: Message + Default>(
     R::decode(&bytes[..]).map_err(|failed| format!("the answer did not read: {failed}"))
 }
 
+/// The records a picker's words find (W3.11, contract v20): by an
+/// identifier, a symbol, the description or the ID, complete ones included,
+/// at most `limit`.
+pub async fn search(
+    bus: &meridian_bus::Bus,
+    words: &str,
+    limit: usize,
+) -> Result<ListInstrumentsToCompleteReply, String> {
+    ask(
+        bus,
+        LIST_INSTRUMENTS_TO_COMPLETE,
+        "meridian.v1.ListInstrumentsToCompleteRequest",
+        ListInstrumentsToCompleteRequest {
+            include_complete: true,
+            instrument_id: String::new(),
+            page_size: limit.clamp(1, 50) as i32,
+            cursor: String::new(),
+            search: words.chars().take(100).collect(),
+        },
+        None,
+        WAIT,
+    )
+    .await
+}
+
+/// A found record as the kit's instrument picker reads one (meridian-ui
+/// 0.12.0, om-instrument-picker): the record's fields by their proto names.
+pub fn found_json(record: &meridian_domain::v1::InstrumentRecord) -> serde_json::Value {
+    let class = meridian_domain::v1::AssetClass::try_from(record.asset_class)
+        .map(|class| {
+            class
+                .as_str_name()
+                .trim_start_matches("ASSET_CLASS_")
+                .to_lowercase()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "instrument_id": record.instrument_id,
+        "description": record.description,
+        "asset_class": if class == "unspecified" { String::new() } else { class },
+        "currency": record.currency,
+        "exchange_mic": record.exchange_mic,
+        "identifiers": record.identifiers.iter().map(|identifier| serde_json::json!({
+            "scheme": identifier.scheme,
+            "value": identifier.value,
+            "source": identifier.source,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// W3.11: the records to complete, or one record (`instrument_id`).
 pub async fn list(
     bus: &meridian_bus::Bus,
@@ -175,6 +225,7 @@ pub async fn list(
             instrument_id: instrument_id.to_string(),
             page_size: 1000,
             cursor: String::new(),
+            search: String::new(),
         },
         None,
         WAIT,
@@ -207,6 +258,7 @@ pub async fn every_record(bus: &meridian_bus::Bus) -> Result<Vec<(String, String
             instrument_id: String::new(),
             page_size: 1000,
             cursor: String::new(),
+            search: String::new(),
         },
         None,
         WAIT,

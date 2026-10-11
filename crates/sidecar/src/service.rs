@@ -93,10 +93,12 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// A role renamed at contract v20 is read by its new name, so a launch
+    /// recorded before the rename still holds its grants (decisions/020).
     pub fn new(instance_id: impl Into<String>, roles: Vec<String>) -> Self {
         Self {
             instance_id: instance_id.into(),
-            roles,
+            roles: meridian_domain::roles_now(&roles),
         }
     }
 }
@@ -364,6 +366,23 @@ impl SidecarService for Sidecar {
                 }
             }
         }
+        // A setting each person sets for themselves (contract v20, W6.31)
+        // is never a secret: refused naming it.
+        if let Some(both) = req
+            .settings
+            .iter()
+            .find(|setting| setting.per_person && setting.secret)
+        {
+            return Ok(Response::new(RegisterReply {
+                admitted: false,
+                refusal_reason: format!(
+                    "the setting {} is declared both per_person and secret; a secret is never \
+                     a person's own",
+                    both.name
+                ),
+                ..Default::default()
+            }));
+        }
         let mut settings = req.settings.clone();
         for setting in &mut settings {
             match crate::roles::served(&setting.roles, launched, built_at) {
@@ -398,8 +417,8 @@ impl SidecarService for Sidecar {
         // secret, a reason for what it does not carry, and storage only at
         // the edge (decisions/028). Refused at the door, naming the field.
         if let Some(declaration) = &req.declaration {
-            // And a dgm's catalogue (contract v18, W4.1): on a version holding
-            // dgm alone, each key once, its data types and fields the lake's,
+            // And a data plugin's catalogue (contract v18, W4.1): on a version holding
+            // data alone, each key once, its data types and fields the lake's,
             // its time zone one the tz database names.
             let refused =
                 crate::edge::declaration_refused(declaration, &req.settings, &self.identity.roles)
@@ -423,12 +442,31 @@ impl SidecarService for Sidecar {
         // Its tools (contract v12), each checked and refused alone: a tool
         // that fails names itself in the report and never stops the plugin
         // registering (W4.1).
+        let pages: Vec<String> = req
+            .interface
+            .as_ref()
+            .map(|interface| {
+                interface
+                    .pages
+                    .iter()
+                    .map(|page| page.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let (tools, tool_refusals) = crate::tools::checked(
             &req.tools,
             &self.identity.instance_id,
             &self.identity.roles,
             built_at,
         );
+        // And what makes an act preparable (contract v20): its check tool,
+        // the accounts it touches and the page it is made on, each refused
+        // by name with the plugin admitted.
+        let (tools, preparable_refusals) = crate::tools::preparable(tools, &pages);
+        let tool_refusals: Vec<String> = tool_refusals
+            .into_iter()
+            .chain(preparable_refusals)
+            .collect();
         for refusal in &tool_refusals {
             tracing::warn!(instance = self.identity.instance_id, "{refusal}");
         }
@@ -656,6 +694,24 @@ impl SidecarService for Sidecar {
     ) -> Result<Response<RecordMoveReply>, Status> {
         self.record_move_reported(request).await
     }
+
+    /// W4.14, contract v20: the prepared change a page was opened from, for
+    /// the person whose page it is ([`crate::prepared`]).
+    async fn read_prepared_call(
+        &self,
+        request: Request<meridian_pb::v1::ReadPreparedCallRequest>,
+    ) -> Result<Response<meridian_pb::v1::ReadPreparedCallReply>, Status> {
+        self.read_prepared_for_person(request).await
+    }
+
+    /// W6.31, contract v20: the person's own values of the settings the
+    /// plugin declares `per_person`, saved for them ([`crate::prepared`]).
+    async fn set_own_settings(
+        &self,
+        request: Request<meridian_pb::v1::SetOwnSettingsRequest>,
+    ) -> Result<Response<meridian_pb::v1::SetOwnSettingsReply>, Status> {
+        self.set_own_settings_for_person(request).await
+    }
 }
 
 #[cfg(test)]
@@ -831,11 +887,11 @@ mod tests {
         }
     }
 
-    /// Contract v18, W4.1: a catalogue on a version not holding dgm, or one
-    /// breaking the rules, refuses the registration naming it; a dgm's
+    /// Contract v18, W4.1: a catalogue on a version not holding data, or one
+    /// breaking the rules, refuses the registration naming it; a data plugin's
     /// catalogue within them registers.
     #[tokio::test]
-    async fn a_catalogue_is_a_dgms_and_held_to_its_rules_at_registration() {
+    async fn a_catalogue_is_a_data_plugins_and_held_to_its_rules_at_registration() {
         use meridian_pb::v1::{Catalogue, DatasetDeclaration, PluginDeclaration};
         let catalogue = |zone: &str| PluginDeclaration {
             catalogue: Some(Catalogue {
@@ -874,23 +930,23 @@ mod tests {
         };
         let custody = register(&["custody"], catalogue("Etc/UTC")).await;
         assert!(
-            !custody.admitted && custody.refusal_reason.contains("not dgm"),
+            !custody.admitted && custody.refusal_reason.contains("not data"),
             "{}",
             custody.refusal_reason
         );
-        let zone = register(&["dgm"], catalogue("Mars/Base")).await;
+        let zone = register(&["data"], catalogue("Mars/Base")).await;
         assert!(
             !zone.admitted && zone.refusal_reason.contains("day_time_zone"),
             "{}",
             zone.refusal_reason
         );
-        let dgm = register(&["dgm"], catalogue("Etc/UTC")).await;
-        assert!(dgm.admitted, "{}", dgm.refusal_reason);
+        let data = register(&["data"], catalogue("Etc/UTC")).await;
+        assert!(data.admitted, "{}", data.refusal_reason);
     }
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v20"] {
+        for declared in ["v1", "v21"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -899,7 +955,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v19"));
+            assert!(reply.refusal_reason.contains("v2 through v20"));
             assert!(sc.registration().is_none());
         }
     }

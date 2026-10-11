@@ -332,6 +332,15 @@ fn run() -> Result<(), String> {
         )),
         None => Arc::new(meridian_dashboard::tickets::InMemory::default()),
     };
+    // Prepared changes, the admins' levels and each person's own settings
+    // beside them (contract v20); in memory without one.
+    let prepared_store: Arc<dyn meridian_dashboard::prepared::store::PreparedStore> =
+        match &database {
+            Some(database) => Arc::new(meridian_dashboard::prepared::store::InPostgres::on(
+                database.clone(),
+            )),
+            None => Arc::new(meridian_dashboard::prepared::store::InMemory::default()),
+        };
     let accounts = match (&accounts_url, &database) {
         (Some(_), Some(database)) => {
             let store = InPostgres::on(database.clone());
@@ -381,6 +390,9 @@ fn run() -> Result<(), String> {
         let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
         let tickets = Arc::new(meridian_dashboard::tickets::Tickets::keeping(
             ticket_store.clone(),
+        ));
+        let prepared = Arc::new(meridian_dashboard::prepared::Prepared::keeping(
+            prepared_store.clone(),
         ));
         let clock = clock();
 
@@ -501,11 +513,26 @@ fn run() -> Result<(), String> {
             kit,
             bounds: Arc::default(),
             tickets,
+            prepared,
         });
         // A plugin's filing and its read-back, answered on the bus for the
         // instance its sidecar names (W4.12): the first topics the
         // dashboard answers.
         meridian_dashboard::tickets::plugin::serve(Arc::clone(&app));
+        // The prepared change a page was opened from, and a person's own
+        // settings (W4.14, W6.31, contract v20).
+        meridian_dashboard::prepared::serve(Arc::clone(&app));
+        // The lapse sweep (W6.28): every minute, what is past the lapse
+        // period, prepared through a delegation that ended, or naming an act
+        // set to may not, lapses, each its own record.
+        let lapsing = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                every.tick().await;
+                lapsing.prepared.sweep(&lapsing, now_ns()).await;
+            }
+        });
         let app = router(app);
         let listener = tokio::net::TcpListener::bind(listen)
             .await

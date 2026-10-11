@@ -22,6 +22,19 @@ use crate::store::{Asked, Field, Instrument, Result, Store};
 const PAGE: usize = 200;
 const MOST: usize = 1000;
 
+/// The longest search the list takes (W3.11, contract v20).
+pub const MOST_SEARCH: usize = 100;
+
+/// Whether a record answers a search: its ID, an identifier's value held
+/// now (a symbol is one), or its description containing it.
+fn matches(record: &Instrument, search: &str) -> bool {
+    record.instrument_id.to_lowercase().contains(search)
+        || record.description.to_lowercase().contains(search)
+        || record
+            .held_now()
+            .any(|identifier| identifier.value.to_lowercase().contains(search))
+}
+
 /// W3.11. Those the book cannot use first, then the rest lacking something,
 /// then (when asked) the complete; each by ID within its group.
 pub fn list_to_complete(
@@ -53,7 +66,34 @@ pub fn list_to_complete(
         })
         .collect();
 
-    let mut chosen: Vec<&Instrument> = if request.instrument_id.is_empty() {
+    // Contract v20 (W3.11): the picker's search, complete records included,
+    // by an identifier's value, a symbol or the description, case aside.
+    let search: String = request
+        .search
+        .trim()
+        .chars()
+        .take(MOST_SEARCH)
+        .collect::<String>()
+        .to_lowercase();
+    let mut chosen: Vec<&Instrument> = if !search.is_empty() {
+        let mut found: Vec<&Instrument> = live
+            .iter()
+            .filter(|record| matches(record, &search))
+            .collect();
+        // The exact first: an ID or an identifier's value as typed.
+        found.sort_by_key(|record| {
+            let exact = record.instrument_id.to_lowercase() == search
+                || record
+                    .held_now()
+                    .any(|id| id.value.to_lowercase() == search);
+            (
+                !exact,
+                record.description.to_lowercase(),
+                record.instrument_id.clone(),
+            )
+        });
+        found
+    } else if request.instrument_id.is_empty() {
         live.iter()
             .filter(|record| request.include_complete || !complete(record))
             .collect()
@@ -62,13 +102,15 @@ pub fn list_to_complete(
             .filter(|record| record.instrument_id == request.instrument_id)
             .collect()
     };
-    chosen.sort_by_key(|record| {
-        (
-            complete_for_book(record),
-            complete(record),
-            record.instrument_id.clone(),
-        )
-    });
+    if search.is_empty() {
+        chosen.sort_by_key(|record| {
+            (
+                complete_for_book(record),
+                complete(record),
+                record.instrument_id.clone(),
+            )
+        });
+    }
 
     let start: usize = request.cursor.parse().unwrap_or(0);
     let size = match request.page_size {
@@ -178,6 +220,7 @@ pub fn history(
             // through.
             acting_through_delegation: version.acting_through_delegation.clone(),
             client_name: version.client_name.clone(),
+            prepared_call_id: version.prepared_call_id.clone(),
             note: version.note.clone(),
             record_time_ns: version.record_time_ns,
             merged_instrument_id: version.merged_instrument_id.clone(),
@@ -227,6 +270,30 @@ mod tests {
     }
 
     #[test]
+    fn a_search_finds_records_by_an_identifier_or_the_description_complete_ones_included() {
+        let store = MemoryStore::new();
+        let apple = mint(&store, "ticker", "AAPL");
+        let _other = mint(&store, "ticker", "MSFT");
+        let asked = |search: &str| {
+            list_to_complete(
+                &store,
+                &ListInstrumentsToCompleteRequest {
+                    search: search.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .instruments
+            .iter()
+            .map(|found| found.instrument.as_ref().unwrap().instrument_id.clone())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(asked("aap"), vec![apple.clone()]);
+        assert_eq!(asked(&apple), vec![apple.clone()], "an exact ID answers");
+        assert!(asked("nothing-like-it").is_empty());
+    }
+
+    #[test]
     fn those_the_book_cannot_use_come_first_and_licensed_identifiers_are_counted() {
         let store = MemoryStore::new();
         let cusip = mint(&store, "cusip", "037833100");
@@ -242,6 +309,7 @@ mod tests {
                 crate::store::Version {
                     acting_through_delegation: String::new(),
                     client_name: String::new(),
+                    prepared_call_id: String::new(),
                     instrument_id: cusip.clone(),
                     version: 2,
                     operation: "complete".into(),

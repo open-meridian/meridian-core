@@ -44,6 +44,8 @@ pub fn path(instance: &str) -> String {
 pub const OVERVIEW: &str = "overview";
 pub const SETTINGS: &str = "settings";
 pub const ACCESS: &str = "access";
+/// The accounts a deployment admin granted the instance to link to (W6.30).
+pub const ACCOUNTS: &str = "accounts";
 
 /// One tab: what the query names it by, and what it is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,7 @@ pub fn tabs(may_set: bool, record: Option<&PluginSettingsRecord>, development: b
         }
     }
     tabs.push(tab(ACCESS, "Access"));
+    tabs.push(tab(ACCOUNTS, "Accounts"));
     tabs
 }
 
@@ -512,6 +515,11 @@ pub struct View<'a> {
     /// What the viewer holds on each of the plugin's roles: which settings
     /// they may set, and which they see read-only (W6.11, contract v15).
     pub held: &'a meridian_access::PluginHeld,
+    /// What agents may do with each of its acts, below who has access
+    /// (W6.29, contract v20).
+    pub agents: String,
+    /// Its Accounts tab (W6.30, contract v20).
+    pub accounts: String,
 }
 
 fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
@@ -563,10 +571,30 @@ pub fn render(view: &View) -> String {
             view.choices,
             view.notice,
         ),
-        (ACCESS, _) => format!(
-            "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
-            access(view.records, &line.instance, view.may_grant)
+        // Who holds the plugin by hand and what agents may do with its acts
+        // (contract v20, Q9), each a part of its own so each fits the screen.
+        (ACCESS, _) => super::parts_shown(
+            "Access",
+            &[
+                (
+                    "access",
+                    "Who has access",
+                    format!(
+                        "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
+                        access(view.records, &line.instance, view.may_grant)
+                    ),
+                ),
+                (
+                    "agents",
+                    "What agents may do",
+                    format!(
+                        "<section class=\"panel padded\" id=\"agents-acts\">{}</section>",
+                        view.agents
+                    ),
+                ),
+            ],
         ),
+        (ACCOUNTS, _) => view.accounts.clone(),
         _ => format!(
             "<div class=\"stack\">{}{}</div>",
             health_panel(line, view.report, view.area.as_deref()),

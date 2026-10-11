@@ -58,6 +58,10 @@ message PersonActor {
   // every act recorded before v10. The person stays the actor.
   string delegation_id = 2;
   string client_name = 3;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 4;
 }
 
 message SystemActor {

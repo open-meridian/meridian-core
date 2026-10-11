@@ -2380,23 +2380,23 @@ async fn a_v18_plugins_money_names_its_asset_and_a_tokens_code_is_refused() {
         .unwrap();
 }
 
-// ── Contract v18: a dgm reads an instrument's record (W3.6) ─────────────────
+// ── Contract v18: a data plugin reads an instrument's record (W3.6) ─────────────────
 
-/// Ruled 2026-10-10: a `dgm` reads the record of an instrument another
+/// Ruled 2026-10-10: a data plugin reads the record of an instrument another
 /// source resolved -- the book's, from a custodian's CUSIP and symbol -- to
 /// find among its identifiers one its vendor takes. Against the contract
-/// this runtime was built with, so a revision taking the row from `dgm`
+/// this runtime was built with, so a revision taking the row from `data`
 /// fails here; a role the row does not name is still refused, before
 /// anything leaves.
 #[tokio::test]
-async fn a_dgm_resolves_an_instrument_and_a_role_without_the_row_is_still_refused() {
+async fn a_data_plugin_resolves_an_instrument_and_a_role_without_the_row_is_still_refused() {
     use meridian_domain::v1::{
         Identifier as Named, InstrumentRecord, ResolveInstrumentReply, ResolveInstrumentRequest,
     };
     use meridian_pb::plugin::v1::ResolveInstrumentParams;
 
     const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
-    for (held, granted) in [("dgm", true), ("custody", false), ("signal", false)] {
+    for (held, granted) in [("data", true), ("custody", false), ("signal", false)] {
         let bus = Arc::new(Bus::single(
             "alpaca-1",
             Arc::new(MemoryBackend::new()),
@@ -2473,7 +2473,7 @@ async fn a_dgm_resolves_an_instrument_and_a_role_without_the_row_is_still_refuse
             }))
             .await;
         if granted {
-            let record = answer.expect("a dgm reads the record").into_inner();
+            let record = answer.expect("a data plugin reads the record").into_inner();
             assert!(record.found);
             let symbols: Vec<_> = record
                 .instrument

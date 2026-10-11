@@ -158,6 +158,7 @@ mod tests {
         Version {
             acting_through_delegation: String::new(),
             client_name: String::new(),
+            prepared_call_id: String::new(),
             instrument_id: instrument_id.into(),
             version,
             operation: operation.into(),

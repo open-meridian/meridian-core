@@ -159,6 +159,7 @@ pub fn set_licence(
         acting_through_delegation: author.delegation.clone(),
         client_name: author.client.clone(),
         note: request.note.clone(),
+        prepared_call_id: author.prepared_call_id.clone(),
         ..terms
     };
     store
@@ -236,6 +237,7 @@ pub fn set_entitlement(
         acting_through_delegation: author.delegation.clone(),
         client_name: author.client.clone(),
         note: request.note.clone(),
+        prepared_call_id: author.prepared_call_id.clone(),
     };
     store
         .set_dataset_entitlement(&entitlement)

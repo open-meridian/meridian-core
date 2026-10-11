@@ -517,8 +517,10 @@ fn allow_controls(instance: &str, allowed: Option<&PluginArchive>, token: &str) 
          if the archive is withdrawn.</p>\
          <label>Bound, in GiB <input name=\"most_gib\" type=\"number\" min=\"1\" step=\"1\" \
          inputmode=\"numeric\" value=\"{bound}\" placeholder=\"No bound\"></label>\
-         <p class=\"hint\">Empty for no bound: it may then grow without limit.</p></div>\
+         <p class=\"hint\">Empty for no bound: it may then grow without limit.</p>\
+         <label>Why <input name=\"note\" maxlength=\"2000\" placeholder=\"Kept with the change; needed to prepare it\"></label></div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
          <button type=\"submit\" class=\"primary\">{submit}</button></div></form></dialog>\
          <script>{DIALOG}</script>"
     )
@@ -622,6 +624,19 @@ pub async fn allow(
     if let Err(response) = form_token_matches(&session, &fields) {
         return *response;
     }
+    let summary = format!("/plugins/{instance}?level=admin&tab=summary");
+    let posted =
+        crate::admin::prepare_or_gate(&app, &session, &fields, "dashboard__allow_archive", || {
+            Ok(serde_json::json!({
+                "instance_id": instance,
+                "most_bytes": bound_posted(&fields)?,
+                "note": note_posted(&fields),
+            }))
+        })
+        .await;
+    if let Some(response) = crate::admin::posted_to(posted, &summary) {
+        return response;
+    }
     let outcome = match bound_posted(&fields) {
         Ok(most_bytes) => {
             command(
@@ -656,6 +671,18 @@ pub async fn withdraw(
     };
     if let Err(response) = form_token_matches(&session, &fields) {
         return *response;
+    }
+    let summary = format!("/plugins/{instance}?level=admin&tab=summary");
+    let posted = crate::admin::prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        "dashboard__withdraw_archive",
+        || Ok(serde_json::json!({"instance_id": instance, "note": note_posted(&fields)})),
+    )
+    .await;
+    if let Some(response) = crate::admin::posted_to(posted, &summary) {
+        return response;
     }
     let outcome = command(
         &app,

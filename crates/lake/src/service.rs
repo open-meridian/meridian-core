@@ -1,7 +1,7 @@
 //! Where the lake meets the bus (W10).
 //!
 //! Five commands and six queries in; three events heard and one more kept
-//! from; three queries asked; six events out. A `dgm` records prices, bars,
+//! from; three queries asked; six events out. A data plugin records prices, bars,
 //! and from contract v19 trades and quotes, in batches, and declines what it
 //! cannot serve of a want; the reading roles read prices, bars and the
 //! datasets, and `signal` and `ems` trades and quotes; the dashboard sets and
@@ -98,7 +98,7 @@ const ASKING: Duration = Duration::from_secs(3);
 const ASK_AGAIN_NS: i64 = 60 * 1_000_000_000;
 
 /// How often a standing want is delivered again, the same want under the
-/// same ID: a `dgm` restarted -- relaunched, upgraded -- holds nothing it
+/// same ID: a data plugin restarted -- relaunched, upgraded -- holds nothing it
 /// cannot lose, and the lake hears no registration, so a stream it kept
 /// current resumes on the next delivery, within this.
 pub const REDELIVER_STANDING_NS: i64 = ASK_AGAIN_NS;
@@ -825,7 +825,7 @@ impl Lake {
         {
             let mut wants = self.wants.lock().expect("wants poisoned");
             // Standing wants still asked for, delivered again as they were
-            // first delivered: a dgm that already holds one hears the same
+            // first delivered: a data plugin that already holds one hears the same
             // want ID, and one that restarted resumes keeping it current. Not
             // a change to the want, so no record of it.
             for open in wants.open.values_mut() {
@@ -1197,6 +1197,126 @@ impl Lake {
         })
     }
 
+    /// W10.6, contract v20: the last trade a data plugin's own instance
+    /// recorded of each subject asked, per dataset and venue, with the watermark it was read at, so the
+    /// plugin backfills a restart's gap from the venue's history. Its own
+    /// rows alone, by no entitlement; refused from any other reader.
+    pub(crate) fn latest_recorded(
+        &self,
+        request: &ListTradesRequest,
+        envelope: &Envelope,
+    ) -> Result<ListTradesReply, String> {
+        let Reader::Plugin(instance) = reader_of(envelope) else {
+            return Err(
+                "latest_recorded: a data plugin's own read, and this is no plugin's".into(),
+            );
+        };
+        if request.valid_from_ns != 0
+            || request.valid_until_ns != 0
+            || request
+                .after_watermark
+                .as_ref()
+                .is_some_and(|w| !w.partitions.is_empty())
+        {
+            return Err(
+                "latest_recorded: the range and after_watermark are left empty, as it reads the last \
+                 trade recorded"
+                    .into(),
+            );
+        }
+        if !bounds::LIST_PRICES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 500",
+                request.subjects.len()
+            ));
+        }
+        let config = self.config();
+        let own: Vec<String> = config
+            .datasets
+            .iter()
+            .filter(|(dataset, held)| {
+                held.instance == instance && config.serves(dataset, DataType::Trade)
+            })
+            .map(|(dataset, _)| dataset.clone())
+            .collect();
+        if own.is_empty() {
+            return Err(format!(
+                "latest_recorded: {instance} declares no dataset of trades, and reads only its own rows"
+            ));
+        }
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        let now = self.clock.now_ns();
+        let subjects: Vec<String> = request
+            .subjects
+            .iter()
+            .map(|s| s.entity_id.clone())
+            .collect();
+        let mut latest: BTreeMap<(String, String, String), meridian_domain::v1::Trade> =
+            BTreeMap::new();
+        for subject in &subjects {
+            for dataset in &own {
+                // The last day first, then wider, so a quiet subject's last
+                // trade is found without reading all its history.
+                for days in [1_i64, 7, 30, 365] {
+                    let rows = self
+                        .store
+                        .read(&crate::store::Query {
+                            datasets: vec![dataset.clone()],
+                            subjects: vec![subject.clone()],
+                            data_type: DataType::Trade,
+                            kinds: Vec::new(),
+                            interval_ns: 0,
+                            when: When::Range {
+                                from_ns: now - days * 86_400 * 1_000_000_000,
+                                // A venue's clock ahead of the deployment's
+                                // is still its last trade.
+                                until_ns: i64::MAX,
+                            },
+                            as_of_ns: now,
+                        })
+                        .map_err(|failed| failed.to_string())?;
+                    let mut found = false;
+                    for row in rows {
+                        let Observation::Trade(trade) = row else {
+                            continue;
+                        };
+                        let Some(meta) = trade.meta.as_ref() else {
+                            continue;
+                        };
+                        let venue = meta
+                            .source
+                            .as_ref()
+                            .map(|source| source.venue_id.clone())
+                            .unwrap_or_default();
+                        let key = (subject.clone(), dataset.clone(), venue);
+                        let later = latest.get(&key).is_none_or(|held| {
+                            let held_at = held.meta.as_ref().map_or(0, |m| m.valid_from_ns);
+                            (meta.valid_from_ns, trade.source_sequence)
+                                > (held_at, held.source_sequence)
+                        });
+                        if later {
+                            latest.insert(key, trade.clone());
+                        }
+                        found = true;
+                    }
+                    if found {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ListTradesReply {
+            trades: latest.into_values().collect(),
+            unanswered: Vec::new(),
+            datasets: own
+                .iter()
+                .filter_map(|dataset| config.datasets.get(dataset).cloned())
+                .collect(),
+            watermark: Some(watermark(&heads, &own.iter().cloned().collect())),
+            next_cursor: String::new(),
+        })
+    }
+
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
         let reader = reader_of(envelope);
         let config = self.config();
@@ -1207,7 +1327,11 @@ impl Lake {
             .map_err(|failed| failed.to_string())?;
         let mut reply = ListDatasetsReply::default();
         for (dataset, held) in &config.datasets {
-            if config.fields_for(dataset, &reader).is_none() {
+            // A data plugin learns its own datasets' licences (contract v20,
+            // W10.9): the datasets its catalogue declares, beside those it
+            // may read.
+            let own = matches!(&reader, Reader::Plugin(instance) if &held.instance == instance);
+            if config.fields_for(dataset, &reader).is_none() && !own {
                 continue;
             }
             reply.datasets.push(DatasetRef {
@@ -1303,6 +1427,12 @@ impl Lake {
             },
             acting_through_delegation: delegation,
             note: request.note.clone(),
+            // Contract v20: the prepared change the person made it from.
+            prepared_call_id: if meta.acting_for_subject.is_empty() {
+                String::new()
+            } else {
+                meta.prepared_call_id.clone()
+            },
         };
         match self
             .store
@@ -1653,6 +1783,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListTradesReply",
         ),
         |lake, request: ListTradesRequest, envelope| {
+            // Contract v20 (W10.6): a data plugin's own last trades, for the
+            // restart's backfill.
+            if request.latest_recorded {
+                return lake.latest_recorded(&request, envelope);
+            }
             let answer = lake.read(
                 ReadRequest {
                     data_type: DataType::Trade,

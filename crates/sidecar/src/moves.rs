@@ -370,6 +370,7 @@ impl Sidecar {
                 } else {
                     claims.client_name.clone()
                 },
+                prepared_call_id: claims.prepared_call_id.clone(),
                 account_scope: None,
             },
         };

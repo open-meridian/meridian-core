@@ -40,7 +40,9 @@ fn store() -> PostgresStore {
     );
 
     let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
-    store.migrate().expect("could not create the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
     store
 }
 
@@ -68,6 +70,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
         sources: identifiers
             .iter()
             .map(|held| Source {
+                prepared_call_id: Default::default(),
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
                 field: Field::Identifier,
@@ -106,6 +109,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
 
 fn entry(instrument_id: &str, version: i64, operation: &str) -> Version {
     Version {
+        prepared_call_id: Default::default(),
         acting_through_delegation: String::new(),
         client_name: String::new(),
         instrument_id: instrument_id.into(),
@@ -191,6 +195,7 @@ fn a_write_against_a_version_since_moved_on_is_refused_and_writes_nothing() {
     next.version = 2;
     next.offers.clear();
     next.sources.push(Source {
+        prepared_call_id: Default::default(),
         acting_through_delegation: String::new(),
         client_name: String::new(),
         field: Field::AssetClass,
@@ -344,6 +349,11 @@ fn what_a_release_before_v10_held_is_sourced_once() {
                   VALUES ('INS-USD', 'ASSET_CLASS_CASH', 'USD', 'US dollar', 3, 0, 50);
              INSERT INTO instrument_identifier (instrument_id, scheme, value, source, valid_from_ns)
                   VALUES ('INS-USD', 'iso4217', 'USD', '', 0);
+             INSERT INTO instrument (instrument_id, asset_class, currency, description, version,
+                                     valid_from_ns, record_time_ns)
+                  VALUES ('INS-TCH4', 'ASSET_CLASS_FUND', 'USD', 'A plan option', 1, 0, 50);
+             INSERT INTO instrument_identifier (instrument_id, scheme, value, source, valid_from_ns)
+                  VALUES ('INS-TCH4', 'symbol', 'TCH4', 'snaptrade', 1790640000000000000);
              INSERT INTO instrument_placeholder (placeholder_id, identifier_key, source, asset_class,
                                                  as_of_ns, minted_at_ns)
                   VALUES ('LCL-OPEN', 'k-open', 'snaptrade', 'ASSET_CLASS_FUND', 1, 60),
@@ -359,8 +369,10 @@ fn what_a_release_before_v10_held_is_sourced_once() {
         .unwrap();
 
     let store = PostgresStore::connect(&scoped, 1).unwrap();
-    store.migrate().unwrap();
-    store.migrate().expect("a second run finds nothing to do");
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("a second run finds nothing to do");
 
     let usd = store.by_id("INS-USD").unwrap().unwrap();
     assert_eq!(usd.version, 3, "its key and version stay");
@@ -368,6 +380,26 @@ fn what_a_release_before_v10_held_is_sourced_once() {
     assert_eq!(class.source, "the platform, record version 3");
     assert!(class.person.is_empty());
     assert_eq!(store.history("INS-USD").unwrap()[0].operation, "migrate");
+
+    // A window kept from the date the platform learnt the identifier opens
+    // from the start, once, as a version of its own naming the date.
+    let tch4 = store.by_id("INS-TCH4").unwrap().unwrap();
+    assert_eq!(tch4.identifiers[0].valid_from_ns, 0);
+    assert_eq!(tch4.version, 2);
+    let history = store.history("INS-TCH4").unwrap();
+    assert_eq!(
+        history.len(),
+        2,
+        "sourced, then opened; the second run wrote nothing"
+    );
+    assert!(history.iter().any(|v| v
+        .changes
+        .iter()
+        .any(|c| c.source.contains("recorded from 2026-09-29 00:00 UTC"))));
+    let earlier = store
+        .matching("symbol", "TCH4", "snaptrade", 1_790_000_000_000_000_000)
+        .unwrap();
+    assert_eq!(earlier.len(), 1, "an earlier date finds the record held");
 
     let open = store
         .by_id("LCL-OPEN")
@@ -419,7 +451,9 @@ fn a_start_against_a_database_with_no_schema_refuses_and_names_the_fix() {
         "the refusal has to name the fix: {said}"
     );
 
-    store.migrate().expect("could not apply the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not apply the schema");
     store.verify().expect("a migrated database must verify");
 
     admin
@@ -440,7 +474,7 @@ fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleare
         .unwrap();
     let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
     let store = PostgresStore::connect(&scoped, 1).unwrap();
-    store.migrate().unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
 
     for (id, class) in [
         ("INS-A", "EQUITY"),
@@ -460,8 +494,10 @@ fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleare
             .unwrap();
     }
 
-    store.migrate().unwrap();
-    store.migrate().expect("a second run finds nothing to do");
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("a second run finds nothing to do");
 
     let class = |id: &str| store.by_id(id).unwrap().unwrap().asset_class;
     assert_eq!(class("INS-A"), "ASSET_CLASS_EQUITY");

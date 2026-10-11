@@ -82,7 +82,9 @@ fn platform() -> Platform {
 fn store() -> PostgresStore {
     let store = PostgresStore::connect(&required("MERIDIAN_TEST_DATABASE_URL"), 4)
         .expect("could not reach the instrument store's database");
-    store.migrate().expect("could not create the schema");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
     store
 }
 

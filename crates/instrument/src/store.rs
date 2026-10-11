@@ -130,6 +130,10 @@ pub struct Source {
     pub acting_through_delegation: String,
     pub client_name: String,
 
+    /// The prepared change the person made it from (W6.27, contract v20),
+    /// stamped from the envelope; empty otherwise, and before v20.
+    pub prepared_call_id: String,
+
     /// The plugin instance whose resolve joined an identifier.
     pub instance_id: String,
 
@@ -418,6 +422,8 @@ pub struct Version {
     /// empty otherwise.
     pub acting_through_delegation: String,
     pub client_name: String,
+    /// The prepared change the person made it from (contract v20).
+    pub prepared_call_id: String,
     pub instance_id: String,
     pub note: String,
 

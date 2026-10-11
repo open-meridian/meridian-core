@@ -195,6 +195,9 @@ struct Entered {
     came: Came,
     instance: String,
     level: AccessLevel,
+    /// The prepared change the page was opened from (W6.27, contract v20):
+    /// named in the claims of each request while it waits.
+    prepared: String,
 }
 
 struct Code {
@@ -202,6 +205,7 @@ struct Code {
     instance: String,
     level: AccessLevel,
     expires_at_ns: i64,
+    prepared: String,
 }
 
 pub struct Plugins {
@@ -442,6 +446,18 @@ impl Plugins {
     }
 
     fn mint(&self, came: Came, instance: &str, level: AccessLevel, now_ns: i64) -> String {
+        self.mint_from(came, instance, level, now_ns, "")
+    }
+
+    /// [`Plugins::mint`], for a page opened from a prepared change.
+    fn mint_from(
+        &self,
+        came: Came,
+        instance: &str,
+        level: AccessLevel,
+        now_ns: i64,
+        prepared: &str,
+    ) -> String {
         let code = token();
         self.codes.lock().expect("code lock poisoned").insert(
             code.clone(),
@@ -450,6 +466,7 @@ impl Plugins {
                 instance: instance.to_string(),
                 level,
                 expires_at_ns: now_ns + CODE_NS,
+                prepared: prepared.to_string(),
             },
         );
         code
@@ -458,17 +475,37 @@ impl Plugins {
     /// The session a code was minted for, and its level, if it is being
     /// presented on its own instance's host, in time. Gone once presented,
     /// whatever the answer: a code is tried once.
+    #[cfg(test)]
     fn redeem(&self, code: &str, instance: &str, now_ns: i64) -> Option<(Came, AccessLevel)> {
+        self.redeem_from(code, instance, now_ns)
+            .map(|(came, level, _)| (came, level))
+    }
+
+    fn redeem_from(
+        &self,
+        code: &str,
+        instance: &str,
+        now_ns: i64,
+    ) -> Option<(Came, AccessLevel, String)> {
         let held = self
             .codes
             .lock()
             .expect("code lock poisoned")
             .remove(code)?;
-        (held.instance == instance && now_ns <= held.expires_at_ns)
-            .then_some((held.came, held.level))
+        (held.instance == instance && now_ns <= held.expires_at_ns).then_some((
+            held.came,
+            held.level,
+            held.prepared,
+        ))
     }
 
-    fn enter(&self, came: Came, instance: &str, level: AccessLevel) -> String {
+    fn enter_from(
+        &self,
+        came: Came,
+        instance: &str,
+        level: AccessLevel,
+        prepared: String,
+    ) -> String {
         let key = token();
         self.entered.lock().expect("entered lock poisoned").insert(
             key.clone(),
@@ -476,9 +513,32 @@ impl Plugins {
                 came,
                 instance: instance.to_string(),
                 level,
+                prepared,
             },
         );
         key
+    }
+
+    /// The prepared change a plugin-host session was opened from, if any.
+    fn prepared_of(&self, key: &str) -> String {
+        self.entered
+            .lock()
+            .expect("entered lock poisoned")
+            .get(key)
+            .map(|held| held.prepared.clone())
+            .unwrap_or_default()
+    }
+
+    /// The prepared change settled or gone: later requests name it no more.
+    pub(crate) fn forget_prepared(&self, key: &str) {
+        if let Some(held) = self
+            .entered
+            .lock()
+            .expect("entered lock poisoned")
+            .get_mut(key)
+        {
+            held.prepared.clear();
+        }
     }
 
     fn entered(&self, key: &str, instance: &str) -> Option<(Came, AccessLevel)> {
@@ -593,12 +653,23 @@ impl Theme {
 /// Where the frame enters an instance's page, at `path` on its host, at a
 /// level, with the person's theme: the dashboard's own route, which mints the
 /// code only once the frame asks for it.
-pub(crate) fn entrance(instance: &str, path: &str, level: AccessLevel, theme: &Theme) -> String {
+/// [`entrance`], for a page opened from the prepared change `prepared`
+/// (W6.27, contract v20).
+pub(crate) fn entrance_from(
+    instance: &str,
+    path: &str,
+    level: AccessLevel,
+    theme: &Theme,
+    prepared: &str,
+) -> String {
     let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("a fixed address");
     url.set_path(&format!("/plugins/{instance}/enter"));
     url.query_pairs_mut()
         .append_pair("path", path)
         .append_pair("level", level_name(level));
+    if !prepared.is_empty() {
+        url.query_pairs_mut().append_pair("prepared", prepared);
+    }
     theme.append_to(&mut url);
     match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
@@ -772,10 +843,17 @@ pub(crate) async fn frame(
             .or(current.map(|tab| tab.path.as_str()))
             .map(str::to_string)
     };
+    // A page opened from a prepared change (W6.27, contract v20).
+    let prepared = asked
+        .get("prepared")
+        .map(String::as_str)
+        .filter(|id| crate::prepared::is_prepared_call_id(id))
+        .unwrap_or_default()
+        .to_string();
     // Where no frame can hold the page's session, its window is its own.
     if !plugins.frames() {
         if let Some(path) = &path {
-            return redirect(&entrance(&instance, path, level, &theme));
+            return redirect(&entrance_from(&instance, path, level, &theme, &prepared));
         }
     }
     let launches = crate::catalogue::launches(&app).await;
@@ -785,7 +863,7 @@ pub(crate) async fn frame(
     let name = launch.map_or(instance.as_str(), |launch| launch.name.as_str());
     let shown = match &path {
         Some(path) => crate::area::Shown::Framed {
-            src: entrance(&instance, path, level, &theme.clone().seamless()),
+            src: entrance_from(&instance, path, level, &theme.clone().seamless(), &prepared),
             origin: plugins.origin(&instance),
         },
         // The dashboard's Summary or Settings, under Manage alone: may_open
@@ -833,6 +911,30 @@ pub(crate) async fn frame(
                 now,
                 moves: moves.as_ref(),
                 moves_cursor,
+                setting_up: if on_summary {
+                    crate::admin::setting_up_steps(
+                        &app,
+                        &instance,
+                        &records,
+                        &session.subject,
+                        access.deployment_admin,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                },
+                eyes: crate::prepared::applies(
+                    &app,
+                    &crate::prepared::person_caller(
+                        &session.subject,
+                        &session.display_name,
+                        &session.directory_groups,
+                    ),
+                    "dashboard__set_plugin_settings",
+                    true,
+                )
+                .await
+                .second_pair_of_eyes,
             };
             crate::area::Shown::Drawn(match current.map(|tab| tab.key.as_str()) {
                 Some(crate::area::SETTINGS) => crate::admin::settings_tab(&manage),
@@ -855,6 +957,7 @@ pub(crate) async fn frame(
         current,
         shown,
         health: (level == AccessLevel::Admin).then_some(&health),
+        opens_data_sources: access.deployment_admin,
     });
     let crumbs = format!(
         "{}{}",
@@ -957,7 +1060,18 @@ pub(crate) async fn open(
     if let Err(why) = page_path(&path) {
         return said(StatusCode::BAD_REQUEST, "Not a page", &why);
     }
-    let code = plugins.mint(Came::Browser(key), &instance, level, app.clock.now_ns());
+    let prepared = asked
+        .get("prepared")
+        .map(String::as_str)
+        .filter(|id| crate::prepared::is_prepared_call_id(id))
+        .unwrap_or_default();
+    let code = plugins.mint_from(
+        Came::Browser(key),
+        &instance,
+        level,
+        app.clock.now_ns(),
+        prepared,
+    );
     let mut url = match enter_url(plugins, &instance, &code, &path) {
         Ok(url) => url,
         Err(why) => return refused(&why),
@@ -1050,6 +1164,11 @@ impl Opening {
                     )
                 })
                 .collect(),
+            // Set by the caller where it applies: the prepared change a page
+            // was opened from, and the person's own values (contract v20).
+            prepared_call_id: String::new(),
+            own_settings: Vec::new(),
+            second_pair_of_eyes: Vec::new(),
         }
     }
 }
@@ -1089,6 +1208,14 @@ pub(crate) struct ToolCaller<'a> {
     pub display_name: &'a str,
     pub delegation_id: &'a str,
     pub client_name: &'a str,
+    /// The prepared change the call makes, where it makes one (contract
+    /// v20): named in the assertion, so the sidecar stamps it.
+    pub prepared_call_id: &'a str,
+    /// The person's own values (W6.31), handed under Open and View.
+    pub own_settings: Vec<meridian_pb::v1::SettingValue>,
+    /// The plugin's acts whose second pair of eyes is on for the person
+    /// (W6.29, contract v20).
+    pub second_pair_of_eyes: Vec<String>,
 }
 
 impl Plugins {
@@ -1123,8 +1250,14 @@ impl Plugins {
                 client_name: caller.client_name.to_string(),
             }),
         };
+        let level = opened.level;
         let mut claims = opened.claims(&who, instance, now);
         claims.tool_name = tool.name.clone();
+        claims.prepared_call_id = caller.prepared_call_id.to_string();
+        claims.second_pair_of_eyes = caller.second_pair_of_eyes.clone();
+        if matches!(level, AccessLevel::Write | AccessLevel::Read) {
+            claims.own_settings = caller.own_settings.clone();
+        }
         let assertion = match self.signer.sign(&claims) {
             Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
             Err(failed) => {
@@ -1552,7 +1685,59 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
             ),
         );
     };
-    let claims = opened.claims(&session, instance, now);
+    let opened_level = opened.level;
+    let mut claims = opened.claims(&session, instance, now);
+    // The person's own values (W6.31), under Open and View, never Manage.
+    if matches!(opened_level, AccessLevel::Write | AccessLevel::Read) {
+        claims.own_settings =
+            crate::prepared::own::for_claims(app, instance, &session.subject).await;
+    }
+    let key = key.unwrap_or_default();
+    let caller = crate::prepared::person_caller(
+        &session.subject,
+        &session.display_name,
+        &session.directory_groups,
+    );
+    let caller = crate::mcp::Caller {
+        delegation_id: session
+            .delegation
+            .as_ref()
+            .map(|d| d.id.clone())
+            .unwrap_or_default(),
+        client_name: session
+            .delegation
+            .as_ref()
+            .map(|d| d.client_name.clone())
+            .unwrap_or_default(),
+        ..caller
+    };
+    // A person preparing on the page (W6.26, the plan's Q20): the page's own
+    // form posted with the reserved field `prepare`, read here in place of
+    // forwarding it; the act's route is never called.
+    let request =
+        match crate::prepared::handoff::prepare_on_page(app, &caller, instance, request).await {
+            Ok(request) => request,
+            Err(answered) => return answered,
+        };
+    // The prepared change the page was opened from, named while it waits.
+    let prepared = plugins.prepared_of(&key);
+    let prepared = if prepared.is_empty() {
+        None
+    } else {
+        match app.prepared.get(&prepared).await {
+            Ok(Some(kept)) if crate::prepared::store::PENDING.contains(&kept.state) => Some(kept),
+            _ => {
+                plugins.forget_prepared(&key);
+                None
+            }
+        }
+    };
+    if let Some(kept) = &prepared {
+        claims.prepared_call_id = kept.prepared_call_id.clone();
+    }
+    // The acts whose second pair of eyes is on for the person (W6.29,
+    // contract v20), on every request the page sends.
+    claims.second_pair_of_eyes = crate::prepared::eyes_for_claims(app, instance, &caller).await;
     let assertion = match plugins.signer.sign(&claims) {
         Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),
         Err(failed) => {
@@ -1562,7 +1747,17 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
             ));
         }
     };
-    forward(plugins, instance, request, assertion).await
+    match prepared {
+        // The person's request to the act's own route from the page opened
+        // from it settles it on the plugin's answer (W6.27).
+        Some(kept) => {
+            crate::prepared::handoff::forward_settling(
+                app, plugins, instance, request, assertion, &caller, &kept, &key,
+            )
+            .await
+        }
+        None => forward(plugins, instance, request, assertion).await,
+    }
 }
 
 /// Somebody on a plugin's host with no session there, or one whose dashboard
@@ -1625,15 +1820,17 @@ async fn enter(
         .map(|Query(asked)| asked)
         .unwrap_or_default();
     let code = asked.get("code").map(String::as_str).unwrap_or_default();
-    let came = match plugins.redeem(code, instance, now) {
-        Some((came, level)) => match came.is_live(&app.sessions, &app.delegations, now).await {
-            Ok(true) => Some((came, level)),
-            Ok(false) => None,
-            Err(unavailable) => return refused(&unavailable.to_string()),
-        },
+    let came = match plugins.redeem_from(code, instance, now) {
+        Some((came, level, prepared)) => {
+            match came.is_live(&app.sessions, &app.delegations, now).await {
+                Ok(true) => Some((came, level, prepared)),
+                Ok(false) => None,
+                Err(unavailable) => return refused(&unavailable.to_string()),
+            }
+        }
         None => None,
     };
-    let Some((came, level)) = came else {
+    let Some((came, level, prepared)) = came else {
         return said(
             StatusCode::UNAUTHORIZED,
             "This link has been used",
@@ -1643,7 +1840,7 @@ async fn enter(
     };
     // One session per plugin host in a browser: entering again, at any
     // level, replaces the last.
-    let key = plugins.enter(came, instance, level);
+    let key = plugins.enter_from(came, instance, level, prepared);
     let mut response = redirect(&landing(&asked));
     response.headers_mut().insert(
         SET_COOKIE,
@@ -1690,7 +1887,7 @@ const HOP_BY_HOP: [&str; 8] = [
 /// told only by the assertion; and the host, which the sidecar's is.
 const CLAIMED: [&str; 4] = ["cookie", "authorization", CALLER, "host"];
 
-async fn forward(
+pub(crate) async fn forward(
     plugins: &Plugins,
     instance: &str,
     request: Request,

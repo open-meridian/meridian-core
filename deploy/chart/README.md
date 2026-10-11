@@ -103,7 +103,7 @@ everything else the wizard writes into Secrets this chart names.
 
 ## Storage for plugins at the edge
 
-A plugin holding an edge role -- `ccm`, `custody`, `dgm`, `match`,
+A plugin holding an edge role -- `confirmation`, `connectivity`, `custody`, `data`,
 `reporting`, `servicing` or `settlement` -- keeps an outside party's raw
 records and its working state, and rebuilds from them after a restart
 (decisions/028). Each such instance is given a volume of its own, a

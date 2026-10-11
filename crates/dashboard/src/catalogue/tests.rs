@@ -240,6 +240,7 @@ async fn harness() -> Harness {
         kit: None,
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     });
     Harness {
         app,

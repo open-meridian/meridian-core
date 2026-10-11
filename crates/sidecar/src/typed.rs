@@ -291,6 +291,7 @@ impl Sidecar {
             acting_for_subject: subject,
             acting_through_delegation: delegation,
             acting_through_client: client,
+            prepared_call_id: String::new(),
             account_scope: Some(scope),
         };
         let (_, payload) = self
@@ -408,6 +409,13 @@ impl Sidecar {
                 String::new()
             } else {
                 claims.client_name.clone()
+            },
+            // The prepared change the person made this from (W4.9, contract
+            // v20), as the dashboard's assertion named it; never alone.
+            prepared_call_id: if claims.subject.is_empty() {
+                String::new()
+            } else {
+                claims.prepared_call_id.clone()
             },
             account_scope: None,
         };

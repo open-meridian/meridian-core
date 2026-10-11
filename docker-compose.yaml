@@ -44,6 +44,7 @@ services:
       # Development passwords, and obviously so. A deployment's come from a
       # secret, one per identity, mounted into that container alone.
       MERIDIAN_NATS_RUNTIME: runtime-dev-only
+      MERIDIAN_NATS_INSTRUMENT: instrument-dev-only
       MERIDIAN_NATS_REFERENCE_1: reference-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_1: custody-test-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_2: custody-test-2-dev-only
@@ -107,7 +108,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 
-  # The lake (W10, contract v18): prices and bars a dgm records, read under
+  # The lake (W10, contract v18): prices and bars a data plugin records, read under
   # the deployment's licences, entitlements and priority. Its own process and
   # store beside the street's and the book's (decisions/032); here in the
   # same database, its tables prefixed lake_. No key and no platform address.
@@ -143,7 +144,9 @@ services:
         condition: service_started
     environment:
       MERIDIAN_DATABASE_URL: postgres://meridian:meridian@core-postgres:5432/meridian
-      MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
+      # Its own credential (contract v20): the plugin catalogue is read by
+      # the instrument store's own column, not the runtime's.
+      MERIDIAN_BROKER_URL: nats://instrument:instrument-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: instrument-1
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
@@ -475,6 +478,8 @@ services:
       # The runtime's own identity, narrowed to what the registry says its
       # components publish and subscribe to.
       MERIDIAN_TEST_BROKER_URL_RUNTIME: nats://runtime:runtime-dev-only@nats:4222
+      # The instrument store's own (contract v20).
+      MERIDIAN_TEST_BROKER_URL_INSTRUMENT: nats://instrument:instrument-dev-only@nats:4222
       # A plugin's sidecar, with only what the custody role may do. The tests
       # that matter most use this one and expect to be refused.
       MERIDIAN_TEST_BROKER_URL_CUSTODY: nats://custody-test-1:custody-test-1-dev-only@nats:4222
@@ -545,6 +550,17 @@ services:
   e2e-registry:
     profiles: [e2e]
     image: registry:2.8.3
+    networks: [meridian]
+
+  # The platform's master as the plugin harness stands it in, holding a
+  # handful of currencies (contract v20; the 2026-10-11 ruling): for `make
+  # interop`, a currency is pulled from it, never minted.
+  master:
+    profiles: [interop]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/harness/platform.py"]
+    volumes:
+      - ./deploy/harness/platform.py:/harness/platform.py:ro
     networks: [meridian]
 
   fake-platform:

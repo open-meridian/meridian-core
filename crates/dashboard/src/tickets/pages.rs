@@ -1316,10 +1316,16 @@ async fn inbox_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
                 .collect::<String>()
         )
     };
+    // Beside the notices, the prepared changes waiting for the person
+    // (W6.24, widened at v20).
+    let waiting = crate::prepared::waiting_for(&app, &session.subject)
+        .await
+        .len();
     let body = format!(
         "<div class=\"inbox\"><div class=\"page-head\"><div><h1>Inbox</h1>\
          <p>What changed on the tickets you filed, own, noted or may work, for 90 days. A notice \
-         names a ticket and never quotes it.</p></div><div class=\"actions\">{mark_all}</div></div>{list}</div>",
+         names a ticket and never quotes it.</p></div><div class=\"actions\">{mark_all}</div></div>{tabs}{list}</div>",
+        tabs = crate::prepared::pages::inbox_tabs("notices", waiting),
         list = if notices.is_empty() {
             "<div class=\"panel empty-state\"><strong>Nothing yet</strong><p>When a ticket you may \
              act on changes, it is listed here.</p></div>"

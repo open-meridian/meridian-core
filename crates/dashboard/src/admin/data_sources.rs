@@ -4,7 +4,7 @@
 //! Three tabs, each a table of one-line rows on the kit's pager, so the page
 //! fits one screen at a desk and on a phone (the one-screen rule):
 //!
-//! - **Datasets**: each dataset a launched `dgm`'s catalogue declares, with
+//! - **Datasets**: each dataset a launched data plugin's catalogue declares, with
 //!   who originated and carried it, what it serves, the licence enforced --
 //!   the deployment's, or the catalogue's default until one is set -- the
 //!   plugins entitled to it, and the lake's counts of values left
@@ -359,7 +359,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
         .collect();
     let body = if lines.is_empty() {
         "<p class=\"empty\" data-datasets=\"0\">No dataset yet: a launched plugin holding \
-         <code>dgm</code> declares its datasets in its catalogue, and each is listed here.</p>"
+         <code>data</code> declares its datasets in its catalogue, and each is listed here.</p>"
             .to_string()
     } else {
         format!(
@@ -391,7 +391,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <p class=\"hint\">0 days keeps rows with no limit set. This records what you enter; it \
          does not say the deployment meets the vendor's terms.</p></div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\" data-label-new=\"Save\">Save</button></div></form></dialog>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button><button type=\"submit\" class=\"primary\" data-label-new=\"Save\">Save</button></div></form></dialog>\
          <dialog id=\"entitle\" aria-labelledby=\"entitle-title\"><form method=\"post\" \
          action=\"/admin/data-sources/entitlement\">{token}\
          <div class=\"dialog-head\"><h2 id=\"entitle-title\" data-title-new=\"Entitle a plugin\">Entitle a plugin</h2></div>\
@@ -402,7 +402,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <label>Fields <input name=\"fields\" placeholder=\"Every field; or meridian.v1.Price.price, ...\"></label>\
          <label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label></div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\" data-label-new=\"Save\">Save</button></div></form></dialog>",
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button><button type=\"submit\" class=\"primary\" data-label-new=\"Save\">Save</button></div></form></dialog>",
         instances = records
             .known_plugins
             .iter()
@@ -541,7 +541,7 @@ fn priority_tab(
          <p class=\"hint\">At most 16, each declared for the data type{known}. Replaced whole; \
          refused if it changed since you read it.</p></div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\" data-label-new=\"Set\">Set</button></div></form></dialog>",
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button><button type=\"submit\" class=\"primary\" data-label-new=\"Set\">Set</button></div></form></dialog>",
         price = lake::PRICE,
         bar = lake::BAR,
         trade = lake::TRADE,

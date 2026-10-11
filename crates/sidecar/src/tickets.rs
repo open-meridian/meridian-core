@@ -127,7 +127,7 @@ pub(crate) fn carried(metadata: &MetadataMap) -> Result<Option<CallerAssertion>,
 
 /// A dashboard's refusal of what the sidecar sent, as the status it names
 /// (`permission_denied: ...`), or the bus's own failure.
-fn answered(failed: BusError) -> Status {
+pub(crate) fn answered(failed: BusError) -> Status {
     if let BusError::HandlerFailed { detail, .. } = &failed {
         for (word, code) in [
             ("invalid_argument", Code::InvalidArgument),
@@ -370,6 +370,7 @@ impl Sidecar {
             } else {
                 claims.client_name.clone()
             },
+            prepared_call_id: String::new(),
             account_scope: None,
         }
     }

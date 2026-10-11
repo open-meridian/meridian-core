@@ -436,6 +436,7 @@ fn one_live_launch_per_instance_and_it_ends_once() {
     );
 
     let stop = Ending {
+        prepared_call_id: Default::default(),
         state: PluginLaunchState::Stopped,
         by: "local|ada".into(),
         delegation: "DLG-9".into(),
@@ -690,10 +691,12 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
             "snaptrade-1",
             &[
                 SettingChange {
+                    hint: Default::default(),
                     name: "api_key".into(),
                     held: Some(Held::Sealed(sealed.clone())),
                 },
                 SettingChange {
+                    hint: Default::default(),
                     name: "poll_minutes".into(),
                     held: Some(Held::Plain("15".into())),
                 },
@@ -752,10 +755,12 @@ fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_va
         .put_plugin_settings(
             "snaptrade-1",
             &[SettingChange {
+                hint: Default::default(),
                 name: "api_key".into(),
                 held: None,
             }],
             &SettingsAuthor {
+                prepared_call_id: Default::default(),
                 by: "local|grace".into(),
                 delegation: "DLG-7".into(),
                 client: "Claude".into(),
@@ -1379,6 +1384,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
         .put_plugin_settings(
             "snaptrade-1",
             &[SettingChange {
+                hint: Default::default(),
                 name: "poll_minutes".into(),
                 held: Some(Held::Plain("45".into())),
             }],
@@ -1411,6 +1417,7 @@ fn a_redeclared_settings_value_is_cleared_and_a_secrets_earlier_values_redacted(
         .unwrap()
         .is_empty());
     let plain = |name: &str, value: &str| SettingChange {
+        hint: Default::default(),
         name: name.into(),
         held: Some(Held::Plain(value.into())),
     };
@@ -1533,6 +1540,7 @@ fn a_redeclared_settings_value_is_cleared_and_a_secrets_earlier_values_redacted(
         .put_plugin_settings(
             "snaptrade-1",
             &[SettingChange {
+                hint: Default::default(),
                 name: "poll_minutes".into(),
                 held: Some(Held::Sealed(
                     key.seal("snaptrade-1", "poll_minutes", "25").unwrap(),
@@ -1816,6 +1824,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
 
     let (store, url) = store_at("archive");
     let hold = |role: &str, days: u32, at: i64| Hold {
+        prepared_call_id: Default::default(),
         role: role.into(),
         days,
         write_once: false,
@@ -1858,6 +1867,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
     assert_eq!(store.snapshot().unwrap().holds[0].note, "Six years.");
 
     let archive = PluginArchive {
+        prepared_call_id: Default::default(),
         instance_id: "snaptrade-1".into(),
         allowed: true,
         most_bytes: 53_687_091_200,

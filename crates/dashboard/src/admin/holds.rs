@@ -89,9 +89,10 @@ pub fn section(records: &AccessRecords, token: &str) -> (String, String) {
          step=\"1\" inputmode=\"numeric\" required></label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"write_once\" value=\"1\"> Records \
          that cannot be altered (object lock, for the hold's length)</label>\
+         <label>Why <input name=\"note\" maxlength=\"2000\" placeholder=\"Kept with the change; needed to prepare it\"></label>\
          <p class=\"hint\">The longest hold over a plugin is what holds it. 0 days clears it.</p></div>\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\" data-label-new=\"Set\">Set</button></div></form></dialog>"
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button><button type=\"submit\" class=\"primary\" data-label-new=\"Set\">Set</button></div></form></dialog>"
     );
     (body, dialog)
 }

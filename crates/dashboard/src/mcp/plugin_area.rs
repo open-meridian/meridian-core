@@ -221,7 +221,15 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_access",
         "Read who holds access to a plugin",
-        "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join. No tool changes who holds access.",
+        "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join; and, for each of its acts, what agents may do with it (agents_may: may_make, prepare_only or may_not; the ceiling where it caps; each access group's stricter level) and whether it needs a second pair of eyes (contract v20). No tool changes who holds access, nor sets a level.",
+        true,
+        Gate::AdminOrDeployment,
+        instance_schema,
+    ),
+    spec(
+        "read_linkable_accounts",
+        "Read the accounts a plugin may link to",
+        "the admin portal's Accounts tab, read only (contract v20): the accounts a deployment admin granted the instance to link its external accounts to -- nothing by default -- with who last changed the grant and when. A grant lets its admins link; it gives nobody anything to read or write. No tool sets it.",
         true,
         Gate::AdminOrDeployment,
         instance_schema,
@@ -387,6 +395,8 @@ fn hold_json(hold: &Hold) -> Value {
         "acting_through_delegation": hold.acting_through_delegation,
         "client_name": hold.client_name,
         "note": others_words(&hold.note),
+        // The prepared change it was made from (contract v20).
+        "prepared_call_id": hold.prepared_call_id,
     })
 }
 
@@ -505,6 +515,10 @@ fn last_change_json(change: &SettingLastChange) -> Value {
         "acting_through_delegation": change.acting_through_delegation,
         "client_name": change.client_name,
         "note": others_words(&change.note),
+        // Contract v20: a long secret's last four, never its value; and the
+        // prepared change it was made from.
+        "hint": change.hint,
+        "prepared_call_id": change.prepared_call_id,
     })
 }
 
@@ -653,6 +667,21 @@ fn admin_level(instance: &str, roles: &[String]) -> String {
     format!("admin on {}", on.join(" and "))
 }
 
+/// Whether one of these tools' gate is held on `instance` (contract v20):
+/// who may make a prepared change of it there.
+pub fn gate_holds(spec: &Spec, access: &Access, instance: &str) -> bool {
+    let admin = !admin_roles(access, instance).is_empty();
+    match spec.area {
+        Area::Plugins(Gate::Admin) => admin,
+        Area::Plugins(Gate::AdminOrDeployment) => access.deployment_admin || admin,
+        Area::Plugins(Gate::Anyone) => {
+            access.deployment_admin || access.plugin(instance).holds_any()
+        }
+        Area::Plugins(Gate::DeploymentAdmin) => access.deployment_admin,
+        _ => true,
+    }
+}
+
 /// The instances a gate reaches for this caller.
 fn reached(gate: Gate, access: &Access, known: &BTreeSet<String>) -> Vec<String> {
     let admin = |instance: &String| !admin_roles(access, instance).is_empty();
@@ -768,7 +797,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "read_plugin_catalogue" => at.read_plugin_catalogue(&arguments).await,
         "launch_plugin" => at.launch_plugin(&arguments).await,
         "stop_plugin" => at.stop_plugin(&arguments).await,
-        "read_plugin_access" => at.read_plugin_access(&arguments),
+        "read_plugin_access" => at.read_plugin_access(&arguments).await,
+        "read_linkable_accounts" => at.read_linkable_accounts(&arguments),
         other => (
             refused("not_listed", &format!("no tool {other}"), Vec::new()),
             String::new(),
@@ -945,8 +975,20 @@ impl Context<'_> {
                 })
             })
             .collect();
+        // "Setting up" (contract v20, W6.9), under its key.
+        let setting_up = crate::admin::setting_up::as_json(
+            &crate::admin::setting_up_steps(
+                self.app,
+                &instance,
+                self.records,
+                &self.caller.subject,
+                self.access.deployment_admin,
+            )
+            .await,
+        );
         let mut data = json!({
             "plugin_instance_id": instance,
+            "setting-up": setting_up,
             "roles": report.map(|r| r.roles.clone()).unwrap_or_else(|| self.access.known_roles.get(&instance).cloned().unwrap_or_default()),
             "registered": report.is_some_and(|r| r.registered),
             "healthy": report.is_some_and(|r| r.healthy),
@@ -1621,7 +1663,50 @@ impl Context<'_> {
 
     /// The Access tab, read only: the records naming the instance, by their
     /// own fields (AccessRecords). Nothing here changes any of it.
-    fn read_plugin_access(&self, arguments: &Value) -> (Value, String) {
+    fn read_linkable_accounts(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["plugin_instance_id"], &mut problems) else {
+            return (problems.refusal(), String::new());
+        };
+        let Some((instance, level)) = self.instance(top, "plugin_instance_id", &mut problems)
+        else {
+            return (problems.refusal(), String::new());
+        };
+        let granted = self
+            .records
+            .linkable_accounts
+            .iter()
+            .find(|linkable| linkable.plugin_instance_id == instance)
+            .cloned()
+            .unwrap_or_default();
+        let accounts: Vec<Value> = granted
+            .account_ids
+            .iter()
+            .map(|id| {
+                let name = self
+                    .records
+                    .accounts
+                    .iter()
+                    .find(|a| &a.account_id == id)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default();
+                json!({"account_id": id, "name": name})
+            })
+            .collect();
+        (
+            json!({"outcome": "unchanged", "data": {
+                "plugin_instance_id": instance,
+                "accounts": accounts,
+                "updated_by": granted.updated_by,
+                "updated_at_ns": granted.updated_at_ns,
+                "acting_through_delegation": granted.acting_through_delegation,
+                "client_name": granted.client_name,
+            }}),
+            level,
+        )
+    }
+
+    async fn read_plugin_access(&self, arguments: &Value) -> (Value, String) {
         let mut problems = Problems::default();
         let Some(top) = top(arguments, &["plugin_instance_id"], &mut problems) else {
             return (problems.refusal(), String::new());
@@ -1664,8 +1749,39 @@ impl Context<'_> {
             .iter()
             .map(|p| p.account_group_id.as_str())
             .collect();
+        // What agents may do with each of its acts (W6.29, contract v20),
+        // beside who may make it by hand.
+        let levels = self.app.prepared.levels().await.unwrap_or_default();
+        let acts: Vec<Value> = crate::admin::agents::acts(self.app)
+            .into_iter()
+            .filter(|line| line.instance == instance)
+            .map(|line| {
+                let (chosen, standing, capped) = levels.capped(&line.act);
+                let (_, eyes) = levels.own(&line.act);
+                let ceiling = levels.ceiling(&line.act);
+                json!({
+                    "tool": line.act,
+                    "roles": line.roles,
+                    "preparable": line.preparable,
+                    "agents_may": standing.value(),
+                    "chosen": chosen.value(),
+                    "capped": capped,
+                    "ceiling": ceiling.map(|(level, _)| level.value()),
+                    "second_pair_of_eyes": eyes || ceiling.is_some_and(|(_, on)| on),
+                    "access_groups": levels.rows.iter()
+                        .filter(|row| row.act == line.act && row.scope.starts_with(crate::prepared::levels::GROUP))
+                        .map(|row| json!({
+                            "access_group_id": &row.scope[crate::prepared::levels::GROUP.len()..],
+                            "agents_may": crate::prepared::levels::Level::from_code(row.level).value(),
+                            "second_pair_of_eyes": row.second_pair_of_eyes,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
         let data = json!({
             "plugin_instance_id": instance,
+            "acts": acts,
             "roles": self.access.known_roles.get(&instance).cloned().unwrap_or_default(),
             "access_groups": groups,
             "permissions": permissions.iter().map(|p| json!({
@@ -1707,6 +1823,7 @@ pub const PARITY: &[(&str, &str)] = &[
     ("tab settings", "read_plugin_settings set_plugin_settings"),
     ("tab setting-*", "read_plugin_settings set_plugin_settings"),
     ("part status", "read_plugin_summary"),
+    ("part setting-up", "read_plugin_summary"),
     ("part records", "read_plugin_summary"),
     ("part moves", "read_moves"),
     ("part declared", "read_plugin_summary"),
@@ -1716,6 +1833,7 @@ pub const PARITY: &[(&str, &str)] = &[
     ("view settings", "read_plugin_settings set_plugin_settings"),
     ("view setting-*", "read_plugin_settings set_plugin_settings"),
     ("view access", "read_plugin_access"),
+    ("view accounts", "read_linkable_accounts"),
     // The routes.
     ("/plugins/{instance}", "read_plugin_summary"),
     ("/plugins/{instance}/settings", "set_plugin_settings"),
@@ -1734,6 +1852,14 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_plugin_settings set_plugin_settings",
     ),
     ("/admin/holds", "read_holds set_hold"),
+    (
+        "/admin/plugins/{instance}/agents",
+        "read_plugin_access; exception: a level and a gate are set at the page only (ruled 2026-10-10)",
+    ),
+    (
+        "/admin/plugins/{instance}/accounts",
+        "read_linkable_accounts; exception: a grant is set at the page only (W6.30)",
+    ),
     (
         "/terminal/plugins",
         "read_plugin_catalogue; exception: upload stays the CLI's (the plan's Q2)",

@@ -634,6 +634,9 @@ fn a_tool(name: &str, method: &str, path: &str) -> meridian_pb::v1::ToolDeclarat
         input_schema: r#"{"type":"object"}"#.into(),
         output_schema: String::new(),
         roles: vec![],
+        checked_by: String::new(),
+        accounts: vec![],
+        made_on: String::new(),
     }
 }
 

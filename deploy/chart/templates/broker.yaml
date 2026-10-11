@@ -26,9 +26,11 @@
 {{/*
   One credential per instance, never per role: two plugins sharing a role
   could otherwise publish as each other. The list is the components, the
-  dashboard where it runs, first run where it runs, and every sidecar.
+  dashboard where it runs, first run where it runs, and every sidecar. The
+  instrument store holds its own (contract v20): it reads the plugin
+  catalogue by its own column in the contract, not the runtime's.
 */}}
-{{- $users := list "runtime" }}
+{{- $users := list "runtime" "instrument" }}
 {{- if .Values.dashboard.enabled }}
 {{- $users = append $users (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) }}
 {{- $users = append $users .Values.firstRun.brokerKey }}

@@ -37,6 +37,7 @@ pub mod kit;
 pub mod mcp;
 pub mod oidc;
 pub mod plugins;
+pub mod prepared;
 pub mod records;
 pub mod session;
 pub mod signing;

@@ -174,6 +174,7 @@ fn app_with(
         kit: None,
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     })
 }
 

@@ -43,7 +43,11 @@ fn run() -> Result<(), String> {
             "the instrument store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| store.migrate().map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .migrate(&*clock())
+                    .map_err(|failed| failed.to_string())
+            },
         )
         .map(|()| tracing::info!("the instrument store's schema is applied"))
         .map_err(|failed| {

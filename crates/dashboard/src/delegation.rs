@@ -192,6 +192,11 @@ pub struct Covers {
     /// and for one narrowed before v18 until it is first evaluated, when it
     /// is filled with what it reached then ([`Delegations::backfill_acting`]).
     pub acting: Option<BTreeSet<String>>,
+    /// The acts the person set to Prepare only at consent (W6.17,
+    /// `covers_prepare_only`, contract v20): only ever stricter than the
+    /// admins' level, never looser. None on a delegation consented before
+    /// v20, which is Make on every row, what its consent covered.
+    pub prepare_only: BTreeSet<String>,
 }
 
 impl Covers {

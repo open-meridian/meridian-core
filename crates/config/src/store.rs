@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use meridian_domain::v1::DatasetEntitlement;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
-    KnownPluginRoles, MoveRecord, Permission, PluginArchive, PluginCatalogue, PluginLaunch,
-    PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
+    KnownPluginRoles, LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginCatalogue,
+    PluginLaunch, PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 use meridian_pb::v1::{Catalogue, DatasetLicence, MoveOutcome, SettingDeclaration, StoredSpan};
 
@@ -78,11 +78,29 @@ pub struct StoredSetting {
     pub set_at_ns: i64,
 }
 
-/// A change to one setting: a value to hold, or `None` to clear it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A change to one setting: a value to hold, or `None` to clear it; and for
+/// a secret of sixteen characters or more, its last four (`hint`, W6.11,
+/// contract v20), taken before it was sealed and kept apart from it. Empty
+/// otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingChange {
     pub name: String,
     pub held: Option<Held>,
+    pub hint: String,
+}
+
+/// The least length of a secret whose last four characters are kept as its
+/// hint (W6.11, contract v20; approved 2026-10-11).
+pub const HINT_FROM: usize = 16;
+
+/// A secret's hint: its last four characters, for one of [`HINT_FROM`] or
+/// more; empty for a shorter one, which four characters would give away.
+pub fn hint_of(secret: &str) -> String {
+    let count = secret.chars().count();
+    if count < HINT_FROM {
+        return String::new();
+    }
+    secret.chars().skip(count - 4).collect()
 }
 
 /// Who made a change: the person the dashboard stamped, and the delegation
@@ -99,6 +117,9 @@ pub struct Author {
     pub delegation: String,
     pub client: String,
     pub note: String,
+    /// The prepared change the person made it from (W4.9, W6.27, contract
+    /// v20), as the dashboard stamped it beside them; empty otherwise.
+    pub prepared_call_id: String,
 }
 
 /// The longest a change's note may be, as a note on an instrument record.
@@ -319,6 +340,10 @@ pub struct SettingChangeRecord {
     pub at_ns: i64,
     pub backfilled: bool,
     pub note: String,
+    /// The prepared change it was made from (contract v20); empty otherwise.
+    pub prepared_call_id: String,
+    /// A secret's hint where this change set one (contract v20).
+    pub hint: String,
 }
 
 /// Set or replaced, cleared, a gap (nothing known before this record), or a
@@ -395,6 +420,26 @@ pub struct Snapshot {
     /// Each entitlement as its latest record says it, by dataset and
     /// instance, a withdrawn one (`allowed` false) included.
     pub entitlements: Vec<DatasetEntitlement>,
+    /// Each instance's linkable accounts (W6.30, contract v20), by instance:
+    /// the accounts granted now, with who last changed them. An instance
+    /// never granted any has none.
+    pub linkable: BTreeMap<String, LinkableAccounts>,
+}
+
+/// One grant or withdrawal of an instance's linkable accounts, its own
+/// record (`LinkableAccountsChange`, W6.30, decisions/031): the accounts
+/// added and withdrawn, who, through which delegation and client, when and
+/// why; the upgrade's own grant names no person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkableAccountsChange {
+    pub plugin_instance_id: String,
+    pub granted: Vec<String>,
+    pub withdrawn: Vec<String>,
+    pub by: String,
+    pub delegation: String,
+    pub client: String,
+    pub at_ns: i64,
+    pub note: String,
 }
 
 /// One move of raw records as the store keeps it (W4.13, contract v16): its
@@ -578,6 +623,8 @@ pub struct Ending {
     pub note: String,
     pub at_ns: i64,
     pub failure: String,
+    /// The prepared change the stop was made from (contract v20).
+    pub prepared_call_id: String,
 }
 
 impl Ending {
@@ -591,6 +638,7 @@ impl Ending {
             note: String::new(),
             at_ns,
             failure,
+            prepared_call_id: String::new(),
         }
     }
 
@@ -604,6 +652,7 @@ impl Ending {
             stopped_through_delegation: self.delegation.clone(),
             stopped_client_name: self.client.clone(),
             stopped_note: self.note.clone(),
+            stopped_prepared_call_id: self.prepared_call_id.clone(),
             ..launch.clone()
         }
     }
@@ -793,4 +842,23 @@ pub trait Store: Send + Sync {
         &self,
         dataset: &str,
     ) -> Result<(Vec<DatasetLicence>, Vec<DatasetEntitlement>)>;
+
+    /// Grant an instance accounts and withdraw others, in one step, the
+    /// change its own record (W6.30): nothing recorded when nothing changes.
+    /// Returns the instance's linkable accounts as they now stand.
+    fn set_linkable_accounts(
+        &self,
+        plugin_instance_id: &str,
+        grant: &[String],
+        withdraw: &[String],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<LinkableAccounts>;
+
+    /// Every grant and withdrawal of one instance's linkable accounts, the
+    /// upgrade's included, in the order recorded.
+    fn linkable_accounts_changes(
+        &self,
+        plugin_instance_id: &str,
+    ) -> Result<Vec<LinkableAccountsChange>>;
 }

@@ -24,7 +24,7 @@ pub struct Declared {
     pub not_carried: Vec<DeclaredNotCarried>,
     #[serde(default)]
     pub storage: Option<DeclaredStorage>,
-    /// A dgm's catalogue (W8.1, contract v18): absent from a version
+    /// A data plugin's catalogue (W8.1, contract v18): absent from a version
     /// declaring none, as the SDK uploads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogue: Option<DeclaredCatalogue>,
@@ -179,7 +179,7 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 })
                 .collect(),
         }),
-        // A dgm's catalogue (W8.1, contract v18), which the conductor holds
+        // A data plugin's catalogue (W8.1, contract v18), which the conductor holds
         // to the dictionary's bounds when it records the version.
         catalogue: match &declared.catalogue {
             None => None,

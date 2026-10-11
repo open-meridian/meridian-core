@@ -362,6 +362,10 @@ message InstrumentValueSource {
   // The client's registered name, beside acting_through_delegation, as the
   // envelope carried it; empty whenever it is.
   string client_name = 9;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 10;
 }
 
 // A value offered for a deployment's record (W3.1, W3.3), shown beside its
@@ -1158,6 +1162,12 @@ message ListInstrumentsToCompleteRequest {
 
   int32 page_size = 2;
   string cursor = 3;
+
+  // Contract v20 (W3.11): the records whose identifier values, symbols or
+  // description contain it, case-insensitive, complete ones included, as
+  // the instrument picker searches; empty for the list. At most 100
+  // characters.
+  string search = 5;
 }
 
 // A record and what it lacks (W3.11).
@@ -1276,6 +1286,10 @@ message InstrumentVersion {
   // the dashboard, a plugin's report and a migration.
   string acting_through_delegation = 10;
   string client_name = 11;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 12;
 }
 
 message ReadInstrumentHistoryReply {
@@ -1310,7 +1324,9 @@ message MergeInstrumentsReply {
 // W3.3. For a person at the dashboard; the conductor alone reaches the
 // platform (decisions/011).
 message AskPlatformForInstrumentRequest {
-  // The deployment's record asked about.
+  // The deployment's record asked about; empty when the instrument store
+  // asks for a currency it does not hold yet, by its ISO 4217 code alone
+  // (W3.1, W3.3, contract v20).
   string instrument_id = 1;
 
   // The record's identifiers. The conductor sends the platform only the

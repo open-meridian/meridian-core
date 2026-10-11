@@ -32,6 +32,16 @@ needed?" So, in headless Chromium:
   priority sent against what was read before refused as changed -- each tab
   and open dialog fitting one screen at both sizes.
 
+- the Accounts tab (2026-10-10, the Books tab folded in): one line an
+  account, its base currency and lot relief beside its custodian and type,
+  searched; its Edit of two parts, "Account" and "In the book", each its own
+  form, the second only for an account that exists and saving to the book;
+  the old #books address opening it -- the tab and the dialog in one screen
+  at both sizes;
+- a secret's field (2026-10-10): who set it and when, or "Not set", in the
+  field itself; no badge and no box; a Remove beside an optional secret
+  alone, which asks first, declined sending nothing and confirmed removing it.
+
 PASS=fit checks the fit alone (the development deployment's run, whose
 Developer group and banner the ordinary run has not). Prints one line per
 check, writes a screenshot of each page and size to /out, and exits non-zero
@@ -148,9 +158,12 @@ def the_grid_adds_rows_past_four_and_posts_them(browser):
         row = page.locator("table.om-entry > tbody > tr[data-row]:not(.om-entry-paged)").last
         row.locator("select").nth(0).select_option("FID-IRA-2" if n % 2 else "SCHW-BRK-3")
         row.locator("input").first.fill(f"PLAN{n}")
-        row.locator("select").nth(1).select_option(f"INS-{n:04d}")
+        # An instrument cell searches core as it is typed (kit 0.12.0), and
+        # answers an exact ID: the match is chosen from the list.
+        row.locator("input[data-key=instrument]").fill(f"INS-{n:04d}")
+        page.locator("ul.om-picker-list:not([hidden]) [data-index='0']").click()
     check(grid_rows(page) == 6, f"six rows typed, past the four the page once offered: {grid_rows(page)}")
-    page.click("form[data-table-setting] .form-foot button[type=submit]")
+    page.click("form[data-table-setting] .form-foot button[data-save]")
     settled(page)
     check("tab=" + PLAN in page.url and "saved=1" in page.url, f"saved, back on its tab: {page.url}")
     check(held_badge(page).startswith("6 of at most 200"), f"the six are held: {held_badge(page)}")
@@ -178,7 +191,7 @@ def two_hundred_are_accepted_and_two_hundred_and_one_refused(browser):
     page.wait_for_timeout(300)
     check(grid_rows(page) == 200, f"201 rows pasted fill the grid to its most, 200: {grid_rows(page)}")
     check(page.locator("button.om-entry-add").is_disabled(), "Add a row offers no 201st: it is disabled")
-    page.click("form[data-table-setting] .form-foot button[type=submit]")
+    page.click("form[data-table-setting] .form-foot button[data-save]")
     settled(page)
     check(held_badge(page).startswith("200 of at most 200"), f"200 rows are accepted and held: {held_badge(page)}")
 
@@ -219,8 +232,8 @@ def without_script_the_plain_table_posts(browser):
     blank = rows.nth(count)
     blank.locator("select").nth(0).select_option("FID-401K-1")
     blank.locator("input").first.fill("NOSCRIPT")
-    blank.locator("select").nth(1).select_option("INS-0042")
-    page.click("form[data-table-setting] .form-foot button[type=submit]")
+    blank.locator("input").nth(1).fill("INS-0042")
+    page.click("form[data-table-setting] .form-foot button[data-save]")
     page.wait_for_load_state("load")
     check(
         "tab=" + PLAN in page.url and page.inner_text("[data-rows]").startswith(f"{count + 1} of"),
@@ -379,8 +392,9 @@ def the_raw_records_and_the_holds(browser, prefix):
         page.goto(SUMMARY)
         settled(page)
         parts = page.eval_on_selector_all("nav.summary-parts a", "links => links.map(a => a.getAttribute('href'))")
-        check(parts[:3] == ["#part-status", "#part-records", "#part-moves"],
-              f"at {size} the Summary's parts: its status, then the raw records and their moves: {parts}")
+        check(parts[:4] == ["#part-status", "#part-setting-up", "#part-records", "#part-moves"],
+              f"at {size} the Summary's parts: its status, Setting up (contract v20), then the raw "
+              f"records and their moves: {parts}")
         for part in parts:
             page.evaluate("h => { location.hash = h; }", part)
             page.wait_for_timeout(300)
@@ -437,7 +451,7 @@ def the_raw_records_and_the_holds(browser, prefix):
             page.screenshot(path=os.path.join(OUT, f"{prefix}-allow-archive-{size}.png"))
             if size == "desktop" and PASS != "fit":
                 page.fill("dialog#allow-archive input[name=most_gib]", "50")
-                page.click("dialog#allow-archive button[type=submit]")
+                page.click("dialog#allow-archive button.primary[type=submit]")
                 settled(page)
                 said = page.inner_text("#records .archive-state")
                 check("saved=1" in page.url and page.locator("#records").is_visible()
@@ -475,11 +489,136 @@ def the_raw_records_and_the_holds(browser, prefix):
         if size == "desktop" and PASS != "fit":
             page.select_option("dialog#hold select[name=role]", "settlement")
             page.fill("dialog#hold input[name=days]", "3650")
-            page.click("dialog#hold button[type=submit]")
+            page.click("dialog#hold button.primary[type=submit]")
             settled(page)
             listed = page.text_content("#holds")
             check("settlement" in listed and "3,650 days" in listed, f"a hold set from the dialog is held: {listed[:200]!r}")
         check(not errors, f"the raw records and holds at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
+def the_accounts_tab_holds_the_book(browser, prefix):
+    """The product owner, 2026-10-10: one book per deployment, so the Books
+    tab is folded into Accounts. One line an account -- its name, custodian
+    and type, and in the book its base currency and lot relief -- searched;
+    one Edit of two parts, "Account" and "In the book", each its own form,
+    the second only for an account that exists; the old #books address
+    opening Accounts; at both sizes, the tab and the open dialog in one
+    screen."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#books")
+        settled(page)
+        check(page.locator("#accounts").is_visible() and not page.locator("#books").count(),
+              f"at {size} the old Books address opens Accounts, and no Books tab is left")
+        heads = page.eval_on_selector_all("#accounts-table thead th", "hs => hs.map(h => h.textContent)")
+        check(heads[:5] == ["Name", "Custodian", "Type", "Base currency", "Lot relief"],
+              f"at {size} each account's row says its name, custodian, type, base currency and lot relief: {heads}")
+        rows = page.eval_on_selector_all("#accounts-table tbody tr", "rows => rows.map(r => r.dataset.name)")
+        check(len(rows) == 6, f"at {size} every account is listed: {rows}")
+        tall = page.evaluate("""() => [...document.querySelectorAll('#accounts-table tbody tr')]
+          .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).map((r) => r.dataset.name)""")
+        check(not tall, f"at {size} each account is one line: {tall}")
+        roth = page.inner_text("#accounts-table tr[data-name='Brokerage']")
+        check("USD" in roth and "Highest cost" in roth, f"at {size} the book's attributes on the row: {roth!r}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"the Accounts tab at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-accounts-{size}.png"))
+        page.fill("input[data-filter='accounts-table']", "vanguard")
+        page.wait_for_timeout(200)
+        shown = page.eval_on_selector_all("#accounts-table tbody tr",
+                                          "rows => rows.filter(r => r.offsetParent !== null).map(r => r.dataset.name)")
+        check(shown == ["Roth IRA"], f"at {size} the search finds an account by its custodian: {shown}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-accounts-search-{size}.png"))
+        page.fill("input[data-filter='accounts-table']", "")
+        page.wait_for_timeout(200)
+        page.click("#accounts-table tr[data-name='Credit Suisse 401(k)'] button[data-dialog-open=account]")
+        page.wait_for_timeout(300)
+        parts = page.eval_on_selector_all("dialog#account form:not([hidden]) h3",
+                                          "hs => hs.map(h => h.firstChild.textContent.trim())")
+        check(parts == ["Account", "In the book"], f"at {size} the Edit holds both parts: {parts}")
+        filled = page.evaluate("""() => { const d = document.querySelector('dialog#account');
+          return [d.querySelector('[name=name]').value, d.querySelector('[name=owner]').value,
+                  d.querySelector('[name=base_currency_code]').value, d.querySelector('output[name=since]').value]; }""")
+        # Its currency USD, or EUR once the desktop's run saved it so.
+        check(filled[:2] == ["Credit Suisse 401(k)", "Vincent"] and filled[2] in ("USD", "EUR")
+              and filled[3] == "2026-09-08",
+              f"at {size} the Edit is filled with the account and its book: {filled}")
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the account's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        spilled = page.evaluate(INSIDE)
+        check(not spilled, f"at {size} nothing in the account's dialog reaches past it"
+              f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-account-edit-{size}.png"))
+        if size == "desktop" and PASS != "fit":
+            page.fill("dialog#account [name=base_currency_code]", "EUR")
+            page.fill("dialog#account [name=reason]", "The plan reports in euros")
+            page.click("dialog#account form[data-edit-only] button[type=submit]")
+            settled(page)
+            row = page.inner_text("#accounts-table tr[data-name='Credit Suisse 401(k)']")
+            check("EUR" in row and page.locator("#accounts").is_visible(),
+                  f"saved in the book from the Edit, back on Accounts: {row!r}")
+        else:
+            page.click("dialog#account [data-dialog-close]")
+            page.wait_for_timeout(200)
+        page.click("#accounts button[data-dialog-open=account][aria-label]")
+        page.wait_for_timeout(300)
+        hidden = page.evaluate("() => document.querySelector('dialog#account form[data-edit-only]').hidden")
+        check(hidden, f"at {size} a new account's dialog has no In the book")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-account-new-{size}.png"))
+        check(not errors, f"the Accounts tab at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
+def a_secret_says_where_it_stands(browser, prefix):
+    """The product owner, 2026-10-10: a secret's field says in its
+    placeholder who set it and when, or that it is not set; no badge and no
+    box; an optional secret has a small Remove that asks first; a required
+    one has none."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(PORTAL + "settings")
+        settled(page)
+        client = page.get_attribute("[data-setting=client_id] input[type=password]", "placeholder")
+        check(client.startswith("Set by Ada Admin, "), f"at {size} a set secret says who set it and when: {client!r}")
+        check(not page.locator("[data-setting=client_id] [data-remove]").count()
+              and not page.locator("form.settings input[type=checkbox][name^='clear.']").count(),
+              f"at {size} a required secret has no Remove, and no secret a box")
+        consumer = page.get_attribute("[data-setting=consumer_key] input[type=password]", "placeholder")
+        check(consumer == "Not set", f"at {size} one not set says so: {consumer!r}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-secret-required-{size}.png"))
+        group = page.evaluate("() => document.querySelector('[data-setting=webhook_token]').closest('section').id")
+        page.evaluate("h => { location.hash = h; }", "#" + group)
+        page.wait_for_timeout(200)
+        row = page.locator("[data-setting=webhook_token] .secret-row")
+        box = row.bounding_box()
+        check(box is not None and box["height"] < 48, f"at {size} the field and its Remove on one line: {box}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"the secret's group at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-secret-optional-{size}.png"))
+        if size == "desktop" and PASS != "fit":
+            asked = []
+            page.once("dialog", lambda d: (asked.append(d.message), d.dismiss()))
+            page.click("[data-setting=webhook_token] [data-remove]")
+            page.wait_for_timeout(400)
+            check(asked and asked[0].startswith("Remove Webhook token?")
+                  and page.locator("[data-setting=webhook_token] [data-remove]").count() == 1,
+                  f"Remove asks first, and declined, nothing is sent: {asked}")
+            page.once("dialog", lambda d: d.accept())
+            page.click("[data-setting=webhook_token] [data-remove]")
+            settled(page)
+            after = page.get_attribute("[data-setting=webhook_token] input[type=password]", "placeholder")
+            check(after == "Not set" and not page.locator("[data-setting=webhook_token] [data-remove]").count(),
+                  f"confirmed, the secret is removed and says so: {after!r}")
+        check(not errors, f"the secret fields at {size} ran without a script error: {errors}")
         ctx.close()
 
 
@@ -548,7 +687,7 @@ def the_data_sources_page(browser, prefix):
                   "the licence's Kept for shows once kept is ticked")
             page.fill("dialog#licence input[name=retention_days]", "3650")
             page.fill("dialog#licence input[name=note]", "Ten years, as the firm now keeps them.")
-            page.click("dialog#licence button[type=submit]")
+            page.click("dialog#licence button.primary[type=submit]")
             settled(page)
             listed = page.text_content("#datasets")
             check("kept 3,650 days" in listed, f"a licence set from its dialog is held: {listed[:300]!r}")
@@ -557,7 +696,7 @@ def the_data_sources_page(browser, prefix):
             page.click("#priority table.priorities tbody tr:first-child td.actions button")
             page.wait_for_timeout(300)
             page.fill("dialog#priority-dialog textarea[name=datasets]", "kraken-1:daily\ncoinbase-1:daily")
-            page.click("dialog#priority-dialog button[type=submit]")
+            page.click("dialog#priority-dialog button.primary[type=submit]")
             settled(page)
             listed = page.text_content("#priority")
             check("kraken-1:daily then coinbase-1:daily" in listed,
@@ -618,6 +757,7 @@ with sync_playwright() as playwright:
     the_access_editor_has_a_row_per_role(browser, prefix)
     the_raw_records_and_the_holds(browser, prefix)
     the_data_sources_page(browser, prefix)
+    the_accounts_tab_holds_the_book(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),
@@ -627,6 +767,7 @@ with sync_playwright() as playwright:
         ("portal-cash-links", PORTAL + CASH),
     ]:
         fits(browser, name, url, prefix)
+    a_secret_says_where_it_stands(browser, prefix)
     browser.close()
 
 if failures:

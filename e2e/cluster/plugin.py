@@ -436,6 +436,10 @@ with sync_playwright() as playwright:
     # Acting-for, on the copy that holds the step: her access decides.
     admin = administer(context, "/admin/accounts", {"account_id": "", "name": "Custody copy account"})
     account = row_id(admin, "Accounts", "Custody copy account")
+    # Granted the custody copy to link to (W6.30, contract v20): nothing is
+    # by default, and a link to an account not granted is refused.
+    administer(context, f"/admin/plugins/{CUSTODY}/accounts",
+               {"grant": account or "", "note": "The custody copy links this one."})
 
     # Link, then record: the custody copy reported the external account its
     # connection reaches when it started, and its admin links it to that

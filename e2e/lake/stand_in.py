@@ -1,9 +1,9 @@
-"""Core's stand-ins for `make e2e-lake` (contract v18, W10): a `dgm` that
+"""Core's stand-ins for `make e2e-lake` (contract v18, W10): a data plugin that
 serves the lake from an exchange file, and a reading plugin, each on the
 Python SDK, each answering its page as JSON so the harness's runner can drive
 it (`page --level ... PATH`).
 
-STAND_IN_LAKE=dgm declares a catalogue of three datasets -- `daily` (prices
+STAND_IN_LAKE=data declares a catalogue of three datasets -- `daily` (prices
 and bars, pull and push, on a venue), `ticks` (prices, streamed, a 30-second
 cadence) and `fx` (prices, pushed) -- and serves at its page:
 
@@ -45,10 +45,13 @@ receive of TradesRecorded and QuotesRecorded) and serving:
   /quotes?subject=ID         ListQuotes, the latest in force;
   /quotes-wanted?subject=ID  ListQuotes of a subject nothing recorded.
 
-Until SDK 0.23.0 carries the 1b's typed operations (the plan's row 18), the
-plugin's wire for v19 is meridian-schema's own generated module at the
-revision core pins (e2e/lake/wire, copied unchanged), in place of the SDK's
-v18 copy: a superset, so the SDK's own operations run on it unchanged.
+And from contract v20 (W10.6, W10.9, W3.1):
+
+  /latest?subject=ID         ListTrades latest_recorded: its own last trade
+                             per dataset and venue, for a restart's backfill;
+  /licences                  ListDatasets: its own datasets' licences.
+
+The wire is the SDK's own (SDK 0.24.0 carries v20's typed operations).
 
 STAND_IN_LAKE=reader serves:
 
@@ -72,8 +75,6 @@ developer's recorded exchanges, never committed.
 """
 import asyncio
 import http.server
-import importlib.abc
-import importlib.util
 import json
 import os
 import sys
@@ -84,22 +85,6 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 
-class _Wire(importlib.abc.MetaPathFinder):
-    """The v19 wire from meridian-schema, under the SDK's own module names,
-    until SDK 0.23.0 carries it (the plan's row 18)."""
-
-    HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire")
-    NAMES = {"meridian.plugin.v1.operations_pb2": "operations_pb2.py",
-             "meridian.plugin.v1.operations_pb2_grpc": "operations_pb2_grpc.py"}
-
-    def find_spec(self, name, path=None, target=None):
-        file = self.NAMES.get(name)
-        if not file:
-            return None
-        return importlib.util.spec_from_file_location(name, os.path.join(self.HERE, file))
-
-
-sys.meta_path.insert(0, _Wire())
 
 import meridian  # noqa: E402
 from meridian import (  # noqa: E402
@@ -118,7 +103,7 @@ from meridian import (  # noqa: E402
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
 
-KIND = os.environ.get("STAND_IN_LAKE", "dgm")
+KIND = os.environ.get("STAND_IN_LAKE", "data")
 PORT = 8088
 DAY_NS = 86_400 * 10**9
 VENUE = "VEN-01JA0000000000000CBEXC"
@@ -139,7 +124,7 @@ def day_of(seconds):
     return datetime.fromtimestamp(seconds, tz=timezone.utc).date()
 
 
-# ── The dgm ─────────────────────────────────────────────────────────────
+# ── The data plugin ─────────────────────────────────────────────────────────────
 
 
 def _v19_types(declaration, data_types):
@@ -424,7 +409,27 @@ class Dgm:
         log(identity=said)
         return said
 
+    async def latest(self, query):
+        """Contract v20 (W10.6): the last trade this instance recorded of
+        each subject asked, for a restart's backfill."""
+        refs = [ops.SubjectRef(entity_id=s) for s in query.get("subject", [])]
+        answer = await self.plugin._operations().ListTrades(
+            ops.ListTradesParams(subjects=refs, latest_recorded=True))
+        return {"trades": [trade_json(t) for t in answer.trades],
+                "watermark": [[p.partition, p.sequence] for p in answer.watermark.partitions]}
+
+    async def licences(self):
+        """Contract v20 (W10.9): its own datasets' licences."""
+        answer = await self.plugin._operations().ListDatasets(ops.ListDatasetsParams())
+        return {"datasets": [d.dataset for d in answer.datasets],
+                "licences": [{"dataset": l.dataset, "kept": l.kept, "updated_by": l.updated_by}
+                             for l in answer.licences]}
+
     async def answer(self, path, query):
+        if path == "/latest":
+            return await self.latest(query)
+        if path == "/licences":
+            return await self.licences()
         if path == "/trades":
             return await self.trades()
         if path == "/late":
@@ -442,7 +447,7 @@ class Dgm:
         if path == "/wants":
             return {"wants": self.wants, "withdrawn": self.withdrawn, "streaming": sorted(self.streams),
                     "streamed": self.streamed, "started": self.started}
-        return {"page": "the lake's dgm stand-in"}
+        return {"page": "the lake's data plugin stand-in"}
 
 
 # ── The reader ──────────────────────────────────────────────────────────
@@ -599,6 +604,14 @@ class Desk:
                     partitions=[ops.PartitionSequence(partition=dataset, sequence=after)])))
             return {"trades": [trade_json(t) for t in answer.trades],
                     "unanswered": [ops.UnansweredReason.Name(u.reason) for u in answer.unanswered]}
+        if path == "/latest":
+            # Not a data plugin's: refused (contract v20, W10.6).
+            try:
+                await self.plugin._operations().ListTrades(
+                    ops.ListTradesParams(subjects=refs, latest_recorded=True))
+                return {"refused": ""}
+            except Exception as refused:  # the sidecar's answer, said back
+                return {"refused": str(refused)[:300]}
         if path in ("/quotes", "/quotes-wanted"):
             answer = await self.plugin._operations().ListQuotes(ops.ListQuotesParams(subjects=refs))
             return {"quotes": [quote_json(q) for q in answer.quotes],
@@ -633,7 +646,7 @@ def serve(served):
 
 
 async def main():
-    if KIND == "dgm":
+    if KIND == "data":
         plugin = await meridian.connect(
             interface=Interface(PORT, "Lake stand-in", pages=[Page("/", "Datasets", levels=["admin"])]),
             declaration=Declaration(catalogue=CATALOGUE),

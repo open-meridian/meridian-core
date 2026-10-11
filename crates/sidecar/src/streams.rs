@@ -99,6 +99,14 @@ pub(crate) fn settings(
     declared: &[SettingDeclaration],
     configuration: &PluginConfiguration,
 ) -> SettingsDelivery {
+    // A setting each person sets for themselves is handed to the plugin in
+    // their claims, never delivered here, and never required (contract v20).
+    let declared: Vec<SettingDeclaration> = declared
+        .iter()
+        .filter(|declaration| !declaration.per_person)
+        .cloned()
+        .collect();
+    let declared = declared.as_slice();
     let values: Vec<SettingValue> = declared
         .iter()
         .filter_map(|declaration| {
@@ -187,7 +195,11 @@ impl Sidecar {
         let Some(registration) = self.registration().filter(|r| !r.departed) else {
             return Vec::new();
         };
-        if !registration.settings.iter().any(|s| s.required) {
+        if !registration
+            .settings
+            .iter()
+            .any(|s| s.required && !s.per_person)
+        {
             return Vec::new();
         }
         match self.configuration(self.clock.now_ns()).await {

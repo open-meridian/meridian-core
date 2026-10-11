@@ -128,7 +128,32 @@ def area_registration(port):
                        type=sidecar_pb2.SETTING_COLUMN_TYPE_INSTRUMENT),
             ]),
     ])
+    if os.environ.get("STAND_IN_ACTS"):
+        request.tools.extend(area_acts())
     return request.SerializeToString()
+
+
+# Contract v20, for `make e2e-prepared` (STAND_IN_ACTS): acts on the custody
+# side for the admins' levels to stand at -- one an agent may prepare,
+# checked by its read tool and made on the plugin's own page, and one it may
+# not, naming no check -- shown on the plugin's Access tab and the Agents tab.
+ACT_ROUTES = {
+    "/tool/check-note": ("check_note", "Check a note on the custody books", True, "", ""),
+    "/tool/record-note": ("record_note", "Record a note on the custody books", False,
+                          "check_note", "/"),
+    "/tool/close-books": ("close_books", "Close the custody books", False, "", ""),
+}
+
+
+def area_acts():
+    write = sidecar_pb2.ACCESS_LEVEL_WRITE
+    schema = json.dumps({"type": "object", "properties": {
+        "account": {"type": "string"}, "note": {"type": "string"}}})
+    return [sidecar_pb2.ToolDeclaration(
+        name=name, title=title, description=f"{title}, for the person the call is made for.",
+        method="POST", path=path, levels=[write], input_schema=schema, roles=["custody"],
+        reads=reads, checked_by=checked_by, made_on=made_on)
+        for path, (name, title, reads, checked_by, made_on) in ACT_ROUTES.items()]
 
 
 def file_of(base, unit):

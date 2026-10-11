@@ -258,6 +258,10 @@ pub struct InstrumentValueSource {
     /// envelope carried it; empty whenever it is.
     #[prost(string, tag = "9")]
     pub client_name: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "10")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 /// A value offered for a deployment's record (W3.1, W3.3), shown beside its
 /// field and in force only when a person accepts it (W3.10).
@@ -1128,6 +1132,12 @@ pub struct ListInstrumentsToCompleteRequest {
     pub page_size: i32,
     #[prost(string, tag = "3")]
     pub cursor: ::prost::alloc::string::String,
+    /// Contract v20 (W3.11): the records whose identifier values, symbols or
+    /// description contain it, case-insensitive, complete ones included, as
+    /// the instrument picker searches; empty for the list. At most 100
+    /// characters.
+    #[prost(string, tag = "5")]
+    pub search: ::prost::alloc::string::String,
 }
 /// A record and what it lacks (W3.11).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1264,6 +1274,10 @@ pub struct InstrumentVersion {
     pub acting_through_delegation: ::prost::alloc::string::String,
     #[prost(string, tag = "11")]
     pub client_name: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "12")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadInstrumentHistoryReply {
@@ -1304,7 +1318,9 @@ pub struct MergeInstrumentsReply {
 /// platform (decisions/011).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AskPlatformForInstrumentRequest {
-    /// The deployment's record asked about.
+    /// The deployment's record asked about; empty when the instrument store
+    /// asks for a currency it does not hold yet, by its ISO 4217 code alone
+    /// (W3.1, W3.3, contract v20).
     #[prost(string, tag = "1")]
     pub instrument_id: ::prost::alloc::string::String,
     /// The record's identifiers. The conductor sends the platform only the
@@ -4345,6 +4361,10 @@ pub struct PersonActor {
     pub delegation_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub client_name: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "4")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SystemActor {
@@ -5833,6 +5853,13 @@ pub struct PluginLaunch {
     /// every stop before v17.
     #[prost(string, tag = "19")]
     pub stopped_note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "20")]
+    pub prepared_call_id: ::prost::alloc::string::String,
+    /// The same for the stop.
+    #[prost(string, tag = "21")]
+    pub stopped_prepared_call_id: ::prost::alloc::string::String,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -5927,6 +5954,10 @@ pub struct PluginArchive {
     /// change before v17.
     #[prost(string, tag = "8")]
     pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "9")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StopPluginRequest {
@@ -5989,7 +6020,7 @@ impl PluginLaunchState {
 /// (spec/the-lake, requirement 4).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ObservationMeta {
-    /// The `dgm`'s identity for this observation, made from its raw record, so
+    /// The data plugin's identity for this observation, made from its raw record, so
     /// the same observation recorded again changes nothing and a changed value
     /// under it is a restatement. 1 to 128 characters.
     #[prost(string, tag = "1")]
@@ -6015,7 +6046,7 @@ pub struct ObservationMeta {
     /// The source's own timestamps, at most one of each kind: 0 to 6.
     #[prost(message, repeated, tag = "7")]
     pub source_times: ::prost::alloc::vec::Vec<SourceTime>,
-    /// When the `dgm`'s sidecar published it: the envelope's publication time,
+    /// When the data plugin's sidecar published it: the envelope's publication time,
     /// which the sidecar stamps. A plugin's value is never read.
     #[prost(int64, tag = "8")]
     pub sent_at_ns: i64,
@@ -6475,6 +6506,14 @@ pub struct ListTradesRequest {
     pub page_size: u32,
     #[prost(string, tag = "8")]
     pub cursor: ::prost::alloc::string::String,
+    /// Contract v20 (W10.6): for a data plugin only, the last trade its own instance
+    /// recorded of each subject asked, per dataset and venue, with the
+    /// watermark the answer was read at, so it backfills a restart's gap from
+    /// the venue's history. The range and watermark are then left empty. A
+    /// data plugin reads only its own instance's rows, by no entitlement; refused
+    /// from any other reader, naming it.
+    #[prost(bool, tag = "9")]
+    pub latest_recorded: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListTradesReply {
@@ -6572,7 +6611,7 @@ pub struct WantWithdrawnEvent {
     #[prost(string, tag = "2")]
     pub dataset: ::prost::alloc::string::String,
 }
-/// What a `dgm` cannot serve of a want, per subject, with its reason. It
+/// What a data plugin cannot serve of a want, per subject, with its reason. It
 /// stands for the date or range the want asked, or for the latest where it
 /// asked the latest, and for nothing else (contract v19): a later want of
 /// another date is asked again.
@@ -6618,6 +6657,10 @@ pub struct DatasetEntitlement {
     pub client_name: ::prost::alloc::string::String,
     #[prost(string, tag = "9")]
     pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "10")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 /// The deployment's priority for one data type and price kind: an ordered list
 /// of datasets a default read takes, with failover (W10.2). Journalled by the
@@ -6644,6 +6687,10 @@ pub struct SourcePriority {
     pub client_name: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "9")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 /// A deployment admin sets the priority for a data type and kind, replacing
 /// it whole.
@@ -6682,7 +6729,8 @@ pub struct ListDatasetsReply {
     #[prost(message, repeated, tag = "1")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     /// Each dataset's licence: to the dashboard; to a plugin, those of the
-    /// datasets it may read.
+    /// datasets it may read; to a data plugin, from contract v20, those of the
+    /// datasets its own catalogue declares (W10.9).
     #[prost(message, repeated, tag = "2")]
     pub licences: ::prost::alloc::vec::Vec<::meridian_pb::v1::DatasetLicence>,
     /// To the dashboard every entitlement; to a plugin, its own.
@@ -6822,7 +6870,7 @@ impl PriceBasis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Eligible {
-    /// Not known: a code the `dgm` could not convert. A reader computing a bar
+    /// Not known: a code the data plugin could not convert. A reader computing a bar
     /// reads it as not eligible, and says so.
     Unspecified = 0,
     Eligible = 1,
@@ -7116,6 +7164,10 @@ pub struct AccessRecords {
     /// and each edge plugin's Summary. Empty while none is set.
     #[prost(message, repeated, tag = "11")]
     pub holds: ::prost::alloc::vec::Vec<Hold>,
+    /// Each plugin instance's linkable accounts (W6.30, contract v20), for the
+    /// dashboard's Accounts tab, the "Setting up" step and its read tool.
+    #[prost(message, repeated, tag = "12")]
+    pub linkable_accounts: ::prost::alloc::vec::Vec<LinkableAccounts>,
 }
 /// One known plugin and the roles it was launched with (contract v15).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7206,6 +7258,46 @@ pub struct LinkExternalAccountRequest {
     #[prost(string, tag = "8")]
     pub new_account_note: ::prost::alloc::string::String,
 }
+/// W6.30, contract v20. A deployment admin grants a plugin instance that reads
+/// external accounts the accounts its admins may link to, or withdraws some.
+/// The dashboard stamps who, through which delegation and client, and when.
+/// Each grant and withdrawal is its own record in the conductor
+/// (LinkableAccountsChange, decisions/031). A withdrawal removes no link.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetLinkableAccountsRequest {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    /// Accounts to grant, each an existing account; one already granted is
+    /// unchanged. At most 1,000.
+    #[prost(string, repeated, tag = "2")]
+    pub grant_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Accounts to withdraw; one not granted is unchanged. At most 1,000.
+    #[prost(string, repeated, tag = "3")]
+    pub withdraw_account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why, at most 4,000 characters; required through a delegation.
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The accounts one plugin instance's admins may link its external accounts
+/// to (W6.4, W6.30, contract v20). Nothing by default.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkableAccounts {
+    #[prost(string, tag = "1")]
+    pub plugin_instance_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Who last changed it and when, the delegation and client a person acted
+    /// through, as the dashboard stamped them; empty before any grant. The
+    /// upgrade's own grant names no person.
+    #[prost(string, tag = "3")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub updated_at_ns: i64,
+    #[prost(string, tag = "5")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub client_name: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExternalAccountLink {
     #[prost(string, tag = "1")]
@@ -7217,8 +7309,9 @@ pub struct ExternalAccountLink {
 }
 /// The deployment's accounts, read by a plugin acting for its admin
 /// in a session opened by Manage, to offer the accounts an external account
-/// can be linked to (W4.9, W6.4): every account, since a plugin admin is
-/// account agnostic, and its identity alone.
+/// can be linked to (W4.9, W6.4): from contract v20 every account the
+/// deployment admin granted the asking instance (W6.30), the instance the
+/// envelope's; every account before v20. Its identity alone.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct AccountsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7464,6 +7557,17 @@ pub struct SettingLastChange {
     /// where it backfilled the record. Empty where none was given.
     #[prost(string, tag = "6")]
     pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "7")]
+    pub prepared_call_id: ::prost::alloc::string::String,
+    /// For a secret of sixteen characters or more, its last four, kept
+    /// apart from the secret when it was set and never derived from it again
+    /// (W6.11, contract v20; the name approved 2026-10-11): empty for a
+    /// setting that is not secret, a shorter secret, and every secret set
+    /// before v20. Not the value, which is never read back.
+    #[prost(string, tag = "8")]
+    pub hint: ::prost::alloc::string::String,
 }
 /// Sets or clears a hold, for a deployment admin, from the deployment's
 /// Settings (spec/an-edge-plugins-older-records-move-to-the-archive,
@@ -7516,6 +7620,10 @@ pub struct Hold {
     /// change before v17.
     #[prost(string, tag = "8")]
     pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "9")]
+    pub prepared_call_id: ::prost::alloc::string::String,
 }
 /// The dashboard reads an edge plugin's moves for its Summary, newest first.
 #[derive(Clone, PartialEq, ::prost::Message)]

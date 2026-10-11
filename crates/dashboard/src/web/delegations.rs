@@ -245,6 +245,65 @@ async fn calls(app: &App, subject: &str) -> String {
     )
 }
 
+/// How many prepared changes Connected clients shows for each client.
+const PREPARED_SHOWN: usize = 20;
+
+/// What each client prepared and what became of it (contract v20, W6.28; the
+/// plan's table, "Connected clients, the delegation's row"): one line each,
+/// newest first, the act, why, its state and when it settled, its page a
+/// click away. The same store `dashboard__list_prepared` answers from.
+async fn prepared(app: &App, theirs: &[Delegation]) -> String {
+    let mut lines: Vec<(Delegation, crate::prepared::store::Kept)> = Vec::new();
+    for delegation in theirs {
+        let id = delegation.id.clone();
+        match app
+            .prepared
+            .blocking(move |store| store.by_delegation(&id, PREPARED_SHOWN))
+            .await
+        {
+            Ok(kept) => lines.extend(kept.into_iter().map(|k| (delegation.clone(), k))),
+            Err(why) => {
+                return format!(
+                    "<h2>Prepared through these clients</h2><p class=\"refused\">{}</p>",
+                    escape(&why)
+                )
+            }
+        }
+    }
+    if lines.is_empty() {
+        return "<h2>Prepared through these clients</h2>\
+                <p class=\"empty\" data-prepared-by-clients=\"0\">No client has prepared a change here.</p>"
+            .into();
+    }
+    lines.sort_by_key(|(_, kept)| std::cmp::Reverse(kept.prepared_at_ns));
+    let rows: String = lines
+        .iter()
+        .map(|(delegation, kept)| {
+            format!(
+                "<tr data-prepared=\"{id}\" data-delegation=\"{delegation_id}\"><td>{when}</td><td>{client}</td>\
+                 <td title=\"{tool}\"><a href=\"/prepared/{id}\">{act}</a></td>\
+                 <td title=\"{reason}\">{reason}</td><td>{state}</td><td>{settled}</td></tr>",
+                id = escape(&kept.prepared_call_id),
+                delegation_id = escape(&delegation.id),
+                when = minute(kept.prepared_at_ns),
+                client = escape(&delegation.client_name),
+                tool = escape(&kept.tool_name),
+                act = escape(&crate::prepared::act_title(app, kept)),
+                reason = escape(&crate::prepared::pages::reason_shown(kept)),
+                state = crate::prepared::state_words(kept.state),
+                settled = kept.settled_at_ns.map(minute).unwrap_or_else(|| "--".into()),
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Prepared through these clients</h2>\
+         <p class=\"hint\">What each prepared, for a person to make, and what became of it.</p>\
+         <om-pager search=\"Search the prepared changes\"><table class=\"list one-line prepared-by-clients\">\
+         <thead><tr><th>Prepared</th><th>Client</th><th>Act</th><th>Why</th><th>State</th><th>Settled</th></tr></thead>\
+         <tbody>{rows}</tbody></table></om-pager>"
+    )
+}
+
 /// GET /delegations: ListOwnDelegations, the person's Connected clients.
 async fn own(
     State(app): State<Arc<App>>,
@@ -277,12 +336,23 @@ async fn own(
          computer you connected, and anything else you allowed. What each does is recorded as \
          yours, through it.</p><p class=\"hint\">To change what one covers, or renew it, \
          connect it again from that client: the page you allow it on offers the same choices, \
-         starting from what it covers now.</p></div></div>{notice}{table}{calls}",
-        table = table(&theirs, &group_names(&records), now, &token, &|d| Some((
-            format!("/delegations/{}/revoke", d.id),
-            String::new()
-        ))),
-        calls = calls(&app, &session.subject).await,
+         starting from what it covers now.</p></div></div>{notice}{parts}",
+        // Its clients, what they prepared and their calls, a part each, so
+        // each fits the screen (contract v20).
+        parts = crate::admin::parts_shown(
+            "Connected clients",
+            &[
+                (
+                    "clients",
+                    "Clients",
+                    table(&theirs, &group_names(&records), now, &token, &|d| {
+                        Some((format!("/delegations/{}/revoke", d.id), String::new()))
+                    }),
+                ),
+                ("prepared", "Prepared", prepared(&app, &theirs).await),
+                ("calls", "Calls", calls(&app, &session.subject).await),
+            ],
+        ),
     );
     Html(page_with(
         "Connected clients",
@@ -395,10 +465,17 @@ async fn persons(
     });
     let body = format!(
         "<div class=\"page-head\"><div><h1>{name}'s connected clients</h1>\
-         <p class=\"hint\">{login}</p></div>{all}</div>{notice}{rows}{calls}",
+         <p class=\"hint\">{login}</p></div>{all}</div>{notice}{parts}",
         name = escape(&called),
         login = escape(&subject),
-        calls = calls(&app, &subject).await,
+        parts = crate::admin::parts_shown(
+            "Connected clients",
+            &[
+                ("clients", "Clients", rows),
+                ("prepared", "Prepared", prepared(&app, &theirs).await),
+                ("calls", "Calls", calls(&app, &subject).await),
+            ],
+        ),
     );
     let mut chrome = admin_chrome(&session);
     chrome.crumbs = format!(

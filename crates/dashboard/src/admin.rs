@@ -58,6 +58,13 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/permissions", post(grant))
         .route("/admin/permissions/withdraw", post(withdraw))
         .route("/admin/holds", post(set_hold))
+        .route("/admin/agents", post(set_agents_may))
+        .route("/admin/agents/lapse", post(set_lapse))
+        .route(
+            "/admin/plugins/{instance}/agents",
+            post(set_plugin_agents_may),
+        )
+        .route("/admin/plugins/{instance}/accounts", post(set_linkable))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -69,6 +76,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/complete", post(complete_instruments))
         .route("/admin/instruments/accept", post(accept_offers))
         .route("/admin/instruments/merge", post(merge_instruments))
+        .route("/admin/instruments/search", get(search_instruments))
         .route("/admin/instruments/{instrument}", get(instrument_page))
         .route(
             "/admin/instruments/{instrument}/ask",
@@ -231,6 +239,74 @@ async fn command<Rep: Message + Default>(
 
 fn after(outcome: Result<(), String>) -> Response {
     after_to(outcome, "/admin", "/admin")
+}
+
+/// What a dialog of core's posted asks for (contract v20): its act prepared
+/// for someone to make (W6.26, the plan's Q20), or done -- where the act's
+/// second pair of eyes lets the person do it alone (W6.29).
+pub(crate) enum Posted {
+    /// Prepared: the change's page is where the person goes.
+    Prepared(String),
+    /// Not prepared, or not to be done alone: the sentence says why.
+    Refused(String),
+    /// Done as the dialog always did it.
+    Go,
+}
+
+/// A dialog's fields as `tool`'s arguments, prepared where it posted the
+/// reserved field `prepare`, checked by the act's own code and kept with
+/// nothing changed; otherwise whether the act's second pair of eyes refuses
+/// the person doing it alone.
+pub(crate) async fn prepare_or_gate(
+    app: &App,
+    session: &Session,
+    fields: &Fields,
+    tool: &str,
+    arguments: impl FnOnce() -> Result<serde_json::Value, String>,
+) -> Posted {
+    let caller = crate::prepared::person_caller(
+        &session.subject,
+        &session.display_name,
+        &session.directory_groups,
+    );
+    if !field(fields, crate::prepared::handoff::PREPARE_FIELD).is_empty() {
+        let args = match arguments() {
+            Ok(args) => args,
+            Err(why) => return Posted::Refused(why),
+        };
+        return match crate::prepared::prepare(app, &caller, tool, args, field(fields, "note")).await
+        {
+            Ok(kept) => Posted::Prepared(kept.prepared_call_id),
+            Err(refusal) => Posted::Refused(
+                refusal
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("not prepared")
+                    .to_string(),
+            ),
+        };
+    }
+    if crate::prepared::applies(app, &caller, tool, true)
+        .await
+        .second_pair_of_eyes
+    {
+        return Posted::Refused(
+            "this change needs a second pair of eyes: prepare it, and someone other than you \
+             makes it"
+                .into(),
+        );
+    }
+    Posted::Go
+}
+
+/// The way a dialog's post goes on from [`prepare_or_gate`]: to the
+/// prepared change's page, or the sentence saying why not.
+pub(crate) fn posted_to(posted: Posted, back: &str) -> Option<Response> {
+    match posted {
+        Posted::Prepared(id) => Some(after_to(Ok(()), &format!("/prepared/{id}"), back)),
+        Posted::Refused(why) => Some(after_to(Err(why), back, back)),
+        Posted::Go => None,
+    }
 }
 
 /// The page saying a change was not done, in the store's sentence, with a
@@ -433,12 +509,21 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     let lines = plugin_lines(&app, &records, &custody).await;
     let people = people_known(&app, &records, &delegating).await;
     let books = books::read(&app.bus).await;
+    let levels = app.prepared.levels().await.unwrap_or_default();
+    let agents = agents::deployment_section(
+        &agents::acts(&app),
+        &levels,
+        app.prepared.lapse_days().await,
+        &records,
+        &token_input(&session),
+    );
     let body = overview::render(
         &records,
         &delegating,
         &lines,
         &people,
         &books,
+        agents,
         &token_input(&session),
         "",
     );
@@ -501,6 +586,55 @@ async fn plugin_view(
         crate::html::is_development(),
     );
     let current = view::chosen(&tabs, field(&query, "tab"));
+    // The Settings form started from a prepared change (W6.27): its values
+    // as prepared, "prepared by" and the reason shown, posted with its ID.
+    let caller = crate::prepared::person_caller(
+        &session.subject,
+        &session.display_name,
+        &session.directory_groups,
+    );
+    let mut prepared: Option<crate::prepared::store::Kept> = None;
+    if current.key == view::SETTINGS {
+        if let Some(id) =
+            Some(field(&query, "prepared")).filter(|id| crate::prepared::is_prepared_call_id(id))
+        {
+            if let Ok(Some(kept)) = app.prepared.get(id).await {
+                if kept.tool_name == "dashboard__set_plugin_settings"
+                    && crate::prepared::instance_named(&kept).as_deref() == Some(instance.as_str())
+                {
+                    if let Some(act) = crate::prepared::resolve_kept(&app, &kept, &records).await {
+                        let eyes = app.prepared.eyes(&app, &act, &kept).await;
+                        if crate::prepared::Prepared::may_make(
+                            &app,
+                            &records,
+                            &act,
+                            &kept,
+                            eyes,
+                            &session.subject,
+                        )
+                        .is_ok()
+                        {
+                            prepared = Some(kept);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let eyes = crate::prepared::applies(&app, &caller, "dashboard__set_plugin_settings", true)
+        .await
+        .second_pair_of_eyes;
+    let started: Option<PluginSettingsRecord> = prepared
+        .as_ref()
+        .and_then(|kept| settings_of(&records, &instance).map(|record| started_from(record, kept)));
+    let token = match &prepared {
+        Some(kept) => format!(
+            "{}<input type=\"hidden\" name=\"prepared_call_id\" value=\"{}\">",
+            token_input(&session),
+            escape(&kept.prepared_call_id)
+        ),
+        None => token_input(&session),
+    };
     let choices = match settings_of(&records, &instance) {
         Some(record) => choices(&app, &instance, record, &records).await,
         None => settings::Choices::default(),
@@ -508,11 +642,11 @@ async fn plugin_view(
     let body = view::render(&view::View {
         line,
         choices: &choices,
-        record: settings_of(&records, &instance),
+        record: started.as_ref().or(settings_of(&records, &instance)),
         report,
         records: &records,
         custody: &custody,
-        token: &token_input(&session),
+        token: &token,
         notice,
         development: crate::html::is_development(),
         tabs: &tabs,
@@ -520,7 +654,40 @@ async fn plugin_view(
         area: administers.then(|| view::area_at_admin(&instance)),
         may_grant: access.deployment_admin,
         held: &access.plugin(&instance),
+        agents: {
+            let held = access.plugin(&instance);
+            agents::plugin_section(
+                &instance,
+                &agents::acts(&app),
+                &app.prepared.levels().await.unwrap_or_default(),
+                &records,
+                &|line: &agents::ActLine| held.administers_every(&line.roles),
+                &token_input(&session),
+            )
+        },
+        accounts: agents::accounts_section(
+            &instance,
+            &records,
+            access.deployment_admin,
+            &token_input(&session),
+        ),
     });
+    let mut body = body;
+    if let Some(kept) = &prepared {
+        body = body.replacen(
+            "<section class=\"panel padded settings-page\"",
+            &format!(
+                "{}<section class=\"panel padded settings-page\"",
+                crate::prepared::pages::band(kept)
+            ),
+            1,
+        );
+    }
+    // Under a second pair of eyes nobody saves alone: the form offers only
+    // Prepare, unless it was opened from someone else's prepared change.
+    if eyes && prepared.is_none() {
+        body = body.replace(SAVE_SETTINGS, "").replace(SAVE_TABLE, "");
+    }
     // The way back is the breadcrumb: for a deployment admin the settings
     // home, its plugins, then this one by its name, its instance ID on
     // hover; for a plugin's admin, Home, then this one.
@@ -639,6 +806,86 @@ async fn save_settings(
     let Some(record) = settings_of(&records, instance) else {
         return no_such_plugin(instance);
     };
+    let caller = crate::prepared::person_caller(
+        &session.subject,
+        &session.display_name,
+        &session.directory_groups,
+    );
+    // Prepare (W6.26, the plan's Q20): the form as the settings tool's
+    // arguments, checked by the same code, kept for someone to make.
+    if !field(fields, "prepare").is_empty() {
+        let outcome = match settings_args(instance, fields) {
+            Err(why) => Err(why),
+            Ok(args) => crate::prepared::prepare(
+                app,
+                &caller,
+                "dashboard__set_plugin_settings",
+                args,
+                field(fields, "note"),
+            )
+            .await
+            .map(|kept| kept.prepared_call_id)
+            .map_err(|refusal| {
+                refusal
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("not prepared")
+                    .to_string()
+            }),
+        };
+        return match outcome {
+            Ok(id) => after_to(Ok(()), &format!("/prepared/{id}"), back),
+            Err(why) => after_to(Err(why), back, back),
+        };
+    }
+    // Made from a prepared change the page was opened from, where the person
+    // may make it (W6.27); and the act's second pair of eyes, which refuses
+    // a save made alone (W6.29).
+    let made_from = match fields.get("prepared_call_id").filter(|id| !id.is_empty()) {
+        None => None,
+        Some(id) => {
+            let kept = app.prepared.get(id).await.ok().flatten();
+            let Some(kept) = kept.filter(|kept| kept.tool_name == "dashboard__set_plugin_settings")
+            else {
+                return after_to(
+                    Err(format!("no prepared change {id} of these settings waits")),
+                    back,
+                    back,
+                );
+            };
+            let act = crate::prepared::resolve_kept(app, &kept, &records).await;
+            let Some(act) = act else {
+                return after_to(
+                    Err(format!("{id} names an act no longer offered")),
+                    back,
+                    back,
+                );
+            };
+            let eyes = app.prepared.eyes(app, &act, &kept).await;
+            if let Err(why) = crate::prepared::Prepared::may_make(
+                app,
+                &records,
+                &act,
+                &kept,
+                eyes,
+                &session.subject,
+            ) {
+                return after_to(Err(why), back, back);
+            }
+            Some(kept)
+        }
+    };
+    if made_from.is_none()
+        && crate::prepared::applies(app, &caller, "dashboard__set_plugin_settings", true)
+            .await
+            .second_pair_of_eyes
+    {
+        return after_to(
+            Err("these settings need a second pair of eyes: prepare the change, and someone other than you makes it".into()),
+            back,
+            back,
+        );
+    }
     let mut request = match settings_change(app, record, &records, &access, fields).await {
         Err(SettingsRefused::Cells(_, said) | SettingsRefused::NotAdministered(_, said)) => {
             return after_to(Err(said), back, back)
@@ -648,16 +895,202 @@ async fn save_settings(
     };
     // Optional at the page (contract v17, the plan's Q8).
     request.note = field(fields, "note").trim().to_string();
-    let outcome = command::<PluginSettingsRecord>(
-        app,
-        &session,
-        "platform.config.command.set-plugin-settings",
-        "meridian.v1.SetPluginSettingsRequest",
-        request,
-    )
-    .await
+    let outcome = match &made_from {
+        // Made from a prepared change: stamped with it (W4.9, W6.27).
+        Some(kept) => {
+            crate::mcp::Acting::making(
+                &kept.prepared_call_id,
+                command_stamped::<PluginSettingsRecord>(
+                    app,
+                    &session,
+                    "platform.config.command.set-plugin-settings",
+                    "meridian.v1.SetPluginSettingsRequest",
+                    request,
+                ),
+            )
+            .await
+        }
+        None => {
+            command::<PluginSettingsRecord>(
+                app,
+                &session,
+                "platform.config.command.set-plugin-settings",
+                "meridian.v1.SetPluginSettingsRequest",
+                request,
+            )
+            .await
+        }
+    }
     .map(|_| ());
+    if let (Ok(()), Some(kept)) = (&outcome, &made_from) {
+        if let Ok(made) = settings_args(instance, fields) {
+            crate::prepared::settle_from_page(app, &caller, &kept.prepared_call_id, &made).await;
+        }
+    }
     after_to(outcome, &format!("{back}&saved=1"), back)
+}
+
+/// The settings record as a prepared change would leave it: each value it
+/// names as prepared, each table's rows as prepared (W6.27).
+fn started_from(
+    record: &PluginSettingsRecord,
+    kept: &crate::prepared::store::Kept,
+) -> PluginSettingsRecord {
+    let args: serde_json::Value = serde_json::from_str(&kept.arguments_json).unwrap_or_default();
+    let mut started = record.clone();
+    let mut set = |name: &str, value: String| {
+        started.values.retain(|held| held.name != name);
+        started
+            .values
+            .push(meridian_domain::v1::PluginSettingValue {
+                name: name.to_string(),
+                value,
+            });
+    };
+    if let Some(values) = args.get("value").and_then(serde_json::Value::as_object) {
+        for (name, value) in values {
+            set(
+                name,
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()),
+            );
+        }
+    }
+    if let Some(tables) = args.get("table").and_then(serde_json::Value::as_object) {
+        for (name, rows) in tables {
+            let rows: Vec<meridian_domain::setting_table::Cells> = rows
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row.as_object())
+                .map(|row| {
+                    row.iter()
+                        .map(|(column, cell)| {
+                            (
+                                column.clone(),
+                                cell.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| cell.to_string()),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            set(name, meridian_domain::setting_table::cells_written(&rows));
+        }
+    }
+    started
+}
+
+/// A settings form's fields as the settings tool's arguments (contract
+/// v20): the form's own grammar as JSON, one record from the form and the
+/// tool, so a prepared change compares with the made one. A secret's value
+/// is never prepared: refused by name.
+pub(crate) fn settings_args(instance: &str, fields: &Fields) -> Result<serde_json::Value, String> {
+    use serde_json::{json, Map, Value};
+    let mut value = Map::new();
+    let mut table: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<usize, Map<String, Value>>,
+    > = Default::default();
+    let mut clear = Map::new();
+    for (name, said) in fields {
+        if let Some(setting) = name.strip_prefix(settings::VALUE_FIELD) {
+            value.insert(setting.to_string(), Value::String(said.clone()));
+        } else if let Some(setting) = name.strip_prefix(settings::CLEAR_FIELD) {
+            clear.insert(setting.to_string(), Value::Bool(true));
+        } else if let Some(setting) = name.strip_prefix(settings::SECRET_FIELD) {
+            if !said.is_empty() {
+                return Err(format!(
+                    "secret.{setting}: a secret's value is never prepared; a person enters it at \
+                     the Settings form and saves it"
+                ));
+            }
+        } else if let Some(rest) = name.strip_prefix(settings::TABLE_FIELD) {
+            match rest.split_once('[') {
+                None => {
+                    table.entry(rest.to_string()).or_default();
+                }
+                Some((setting, cell)) => {
+                    let Some((row, column)) = cell.split_once("].") else {
+                        continue;
+                    };
+                    let Ok(row) = row.parse::<usize>() else {
+                        continue;
+                    };
+                    table
+                        .entry(setting.to_string())
+                        .or_default()
+                        .entry(row)
+                        .or_default()
+                        .insert(column.to_string(), Value::String(said.clone()));
+                }
+            }
+        }
+    }
+    let against: i64 = field(fields, settings::AGAINST_FIELD).parse().unwrap_or(0);
+    let mut args = json!({
+        "plugin_instance_id": instance,
+        "against_updated_at_ns": against,
+        "note": field(fields, "note"),
+    });
+    if !value.is_empty() {
+        args["value"] = Value::Object(value);
+    }
+    if !clear.is_empty() {
+        args["clear"] = Value::Object(clear);
+    }
+    if !table.is_empty() {
+        args["table"] = Value::Object(
+            table
+                .into_iter()
+                .map(|(name, rows)| {
+                    (
+                        name,
+                        Value::Array(rows.into_values().map(Value::Object).collect()),
+                    )
+                })
+                .collect(),
+        );
+    }
+    Ok(args)
+}
+
+/// [`command`], stamped with the prepared change the code making it runs
+/// from ([`crate::mcp::Acting`], contract v20).
+async fn command_stamped<Rep: Message + Default>(
+    app: &App,
+    session: &Session,
+    topic: &str,
+    request_type: &str,
+    request: impl Message,
+) -> Result<Rep, String> {
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: session.subject.clone(),
+        prepared_call_id: crate::mcp::Acting::now().prepared_call_id,
+        ..meridian_bus::Stamp::default()
+    };
+    let answered = app
+        .bus
+        .call_stamped(
+            topic,
+            request_type,
+            request.encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &stamp,
+        )
+        .await;
+    let (_, bytes) = answered.map_err(|failed| match failed {
+        BusError::HandlerFailed { detail, .. } => detail,
+        other => other.to_string(),
+    })?;
+    if let Err(failed) = records::refresh(&app.bus, &app.records, app.clock.as_ref()).await {
+        tracing::warn!("the records could not be re-read after a change: {failed}");
+    }
+    Rep::decode(&bytes[..]).map_err(|failed| format!("an undecodable reply: {failed}"))
 }
 
 /// Why a settings change was not sent (W6.11): cells that do not read, each
@@ -734,6 +1167,97 @@ pub(crate) struct Manage<'a> {
     /// keeping raw records (W6.9, contract v16); and the page of moves asked.
     pub moves: Option<&'a Result<meridian_domain::v1::ReadMovesReply, String>>,
     pub moves_cursor: &'a str,
+    /// Its role's first-use steps (contract v20), judged from core's records.
+    pub setting_up: Vec<setting_up::Step>,
+    /// Whether the settings act's second pair of eyes is on for the person:
+    /// the form then offers only Prepare (contract v20, Q21).
+    pub eyes: bool,
+}
+
+pub mod setting_up;
+
+/// The first-use steps of an instance's role, judged from core's own
+/// records now (W6.9, contract v20): its settings, its health, the custody
+/// connector's accounts and links, the account grants, and the lake's
+/// licences and entitlements where its role needs them.
+pub(crate) async fn setting_up_steps(
+    app: &App,
+    instance: &str,
+    records: &AccessRecords,
+    subject: &str,
+    deployment_admin: bool,
+) -> Vec<setting_up::Step> {
+    let reports = app.health.view();
+    let report = reports.get(instance);
+    let roles: Vec<String> = report
+        .map(|r| r.roles.clone())
+        .filter(|roles| !roles.is_empty())
+        .or_else(|| meridian_access::known_roles(records, instance).map(<[String]>::to_vec))
+        .unwrap_or_default();
+    let roles = meridian_domain::roles_now(&roles);
+    let custody = app.custody.view();
+    let connected = custody.sync.keys().any(|(held_by, _)| held_by == instance);
+    let unlinked = custody
+        .reported
+        .get(instance)
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter(|account| {
+                    !records.links.iter().any(|link| {
+                        link.plugin_instance_id == instance
+                            && link.external_account_id == account.external_account_id
+                    })
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let reads_data = roles
+        .iter()
+        .any(|role| role == "data" || role == "reporting");
+    let (datasets_ready, entitled) = if reads_data {
+        match data_sources::datasets(&app.bus, subject).await {
+            Ok(listed) => {
+                let mine: Vec<&String> = listed
+                    .datasets
+                    .iter()
+                    .filter(|d| d.instance == instance)
+                    .map(|d| &d.dataset)
+                    .collect();
+                let ready = !mine.is_empty()
+                    && mine.iter().all(|dataset| {
+                        listed
+                            .licences
+                            .iter()
+                            .any(|l| &&l.dataset == dataset && l.updated_at_ns > 0)
+                            && listed
+                                .entitlements
+                                .iter()
+                                .any(|e| &&e.dataset == dataset && e.allowed)
+                    });
+                let entitled = listed
+                    .entitlements
+                    .iter()
+                    .any(|e| e.instance == instance && e.allowed);
+                (Some(ready), Some(entitled))
+            }
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    setting_up::steps(&setting_up::Facts {
+        instance,
+        roles,
+        record: settings_of(records, instance),
+        records: Some(records),
+        healthy: report.is_some_and(|r| r.healthy),
+        deployment_admin,
+        connected,
+        unlinked,
+        datasets_ready,
+        entitled,
+    })
 }
 
 /// The dashboard's Summary tab in a plugin's area under Manage, where Manage
@@ -797,6 +1321,12 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
+    let deployment_admin = person_access(
+        manage.records,
+        &manage.session.subject,
+        &manage.session.directory_groups,
+    )
+    .deployment_admin;
     format!(
         "{notice}{parts}",
         notice = notice_line(manage.notice),
@@ -805,6 +1335,11 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
                 .iter()
                 .zip([
                     status,
+                    if manage.setting_up.is_empty() {
+                        String::new()
+                    } else {
+                        setting_up::section(&manage.setting_up, deployment_admin)
+                    },
                     records,
                     moves,
                     declared,
@@ -819,8 +1354,9 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
 /// The Summary's parts, by key and title, in the order drawn: each has a
 /// plugin-area tool reaching it (W6.20, contract v17; the parity check in
 /// [`crate::mcp::plugin_area`]).
-pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 5] = [
+pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 6] = [
     ("status", "Status"),
+    ("setting-up", "Setting up"),
     ("records", "Raw records"),
     ("moves", "Moves"),
     ("declared", "What it declares"),
@@ -834,6 +1370,14 @@ pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 5] = [
 /// address names or else the first, its status. Without script every part
 /// shows, under its own heading.
 fn summary_parts(parts: &[(&str, &str, String)]) -> String {
+    parts_shown("The Summary's parts", parts)
+}
+
+/// Parts of a page as tabs of their own, one shown at a time, the one the
+/// address names or else the first ([`summary_parts`]; a plugin's Access tab,
+/// who holds it and what agents may do, contract v20). Without script every
+/// part shows.
+pub(crate) fn parts_shown(label: &str, parts: &[(&str, &str, String)]) -> String {
     let shown: Vec<&(&str, &str, String)> = parts
         .iter()
         .filter(|(_, _, html)| !html.is_empty())
@@ -850,8 +1394,9 @@ fn summary_parts(parts: &[(&str, &str, String)]) -> String {
         .map(|(id, _, html)| format!("<div class=\"summary-part\" id=\"part-{id}\">{html}</div>"))
         .collect();
     format!(
-        "<nav class=\"tabs summary-parts\" data-summary-parts aria-label=\"The Summary's parts\">{links}</nav>\
-         {sections}<script>{SUMMARY_PARTS}</script>"
+        "<nav class=\"tabs summary-parts\" data-summary-parts aria-label=\"{label}\">{links}</nav>\
+         {sections}<script>{SUMMARY_PARTS}</script>",
+        label = escape(label)
     )
 }
 
@@ -934,7 +1479,7 @@ pub(crate) fn settings_tab(manage: &Manage) -> String {
         &manage.session.directory_groups,
     )
     .plugin(manage.instance);
-    settings_section(
+    let section = settings_section(
         manage.records,
         settings_of(manage.records, manage.instance),
         &token_input(manage.session),
@@ -942,8 +1487,18 @@ pub(crate) fn settings_tab(manage: &Manage) -> String {
         &crate::area::settings_path(manage.instance),
         manage.notice,
         Some(&held),
-    )
+    );
+    if manage.eyes {
+        section.replace(SAVE_SETTINGS, "")
+    } else {
+        section
+    }
 }
+
+/// The settings form's Save, left out where a second pair of eyes is on.
+const SAVE_TABLE: &str = "<button type=\"submit\" class=\"primary\" data-save>Save</button>";
+const SAVE_SETTINGS: &str =
+    "<button type=\"submit\" class=\"primary\" data-save>Save settings</button>";
 
 /// The dashboard's tab for one of the plugin's table settings, in its area
 /// under Manage (the product owner, 2026-10-05: each table setting a tab of
@@ -954,15 +1509,22 @@ pub(crate) fn table_tab(manage: &Manage, key: &str) -> String {
     match settings_of(manage.records, manage.instance)
         .and_then(|record| Some((record, settings::table_named(record, key, development)?)))
     {
-        Some((record, table)) => table_section(
-            manage.records,
-            record,
-            table,
-            &token_input(manage.session),
-            &with_tab(&crate::area::settings_path(manage.instance), key),
-            manage.choices,
-            manage.notice,
-        ),
+        Some((record, table)) => {
+            let section = table_section(
+                manage.records,
+                record,
+                table,
+                &token_input(manage.session),
+                &with_tab(&crate::area::settings_path(manage.instance), key),
+                manage.choices,
+                manage.notice,
+            );
+            if manage.eyes {
+                section.replace(SAVE_TABLE, "")
+            } else {
+                section
+            }
+        }
         None => not_known_yet(manage.notice),
     }
 }
@@ -1937,7 +2499,29 @@ async fn set_hold(
     headers: HeaderMap,
     Form(fields): Form<Fields>,
 ) -> Response {
-    admin_form!(app, headers, fields, session, {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let posted = prepare_or_gate(&app, &session, &fields, "dashboard__set_hold", || {
+        let days: u32 = field(&fields, "days")
+            .parse()
+            .map_err(|_| format!("{:?} is not a number of days", field(&fields, "days")))?;
+        Ok(serde_json::json!({
+            "role": field(&fields, "role"),
+            "days": days,
+            "write_once": !field(&fields, "write_once").is_empty(),
+            "note": field(&fields, "note").trim(),
+        }))
+    })
+    .await;
+    if let Some(response) = posted_to(posted, "/admin#holds") {
+        return response;
+    }
+    after({
         match field(&fields, "days").parse::<u32>() {
             Err(_) => Err(format!(
                 "{:?} is not a number of days",
@@ -1960,6 +2544,278 @@ async fn set_hold(
             .map(|_| ()),
         }
     })
+}
+
+// ── The instrument picker's search (contract v20) ──────────────────────────
+
+/// `GET /admin/instruments/search?q=&limit=`: the records the words find,
+/// for the kit's instrument column on core's own pages (meridian-ui 0.12.0),
+/// as its picker reads them; an exact ID answers too, so a table's IDs show
+/// by name. For whoever reaches core's settings: a deployment admin or a
+/// plugin's admin. It never lists every record.
+async fn search_instruments(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, false) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let access = person_access(&records, &session.subject, &session.directory_groups);
+    if !(access.deployment_admin || access.administers_any()) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "a deployment admin's or a plugin admin's"})),
+        )
+            .into_response();
+    }
+    let words = field(&query, "q");
+    let limit: usize = field(&query, "limit").parse().unwrap_or(8).clamp(1, 50);
+    if words.is_empty() {
+        return axum::Json(serde_json::json!({"results": []})).into_response();
+    }
+    match instruments::search(&app.bus, words, limit).await {
+        Ok(found) => axum::Json(serde_json::json!({
+            "results": found
+                .instruments
+                .iter()
+                .filter_map(|each| each.instrument.as_ref())
+                .take(limit)
+                .map(instruments::found_json)
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(why) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": why})),
+        )
+            .into_response(),
+    }
+}
+
+// ── What agents may do (W6.29) and the accounts a plugin may link (W6.30) ──
+
+pub mod agents;
+
+/// The level, the gate and the note a level's form posts, held to the act's
+/// rules; or why not.
+fn level_posted(
+    fields: &Fields,
+    line: &agents::ActLine,
+) -> Result<(crate::prepared::levels::Level, bool, String), String> {
+    let level = crate::prepared::levels::Level::parse(field(fields, "level")).ok_or_else(|| {
+        format!(
+            "{:?} is not may_make, prepare_only or may_not",
+            field(fields, "level")
+        )
+    })?;
+    let eyes = !field(fields, "second_pair_of_eyes").is_empty();
+    if let Some(why) = crate::prepared::levels::refused(level, eyes, line.preparable) {
+        return Err(why);
+    }
+    let note = field(fields, "note").to_string();
+    if note.chars().count() > 2_000 {
+        return Err("note: at most 2,000 characters".into());
+    }
+    Ok((level, eyes, note))
+}
+
+/// A scope a form names: `act`, `ceiling` or an access group's.
+fn scope_posted(
+    fields: &Fields,
+    records: &AccessRecords,
+    allowed: &[&str],
+) -> Result<String, String> {
+    let scope = field(fields, "scope");
+    if allowed.contains(&scope) {
+        return Ok(scope.to_string());
+    }
+    if let Some(group) = scope.strip_prefix(crate::prepared::levels::GROUP) {
+        if records
+            .access_groups
+            .iter()
+            .any(|g| g.access_group_id == group && !g.built_in)
+        {
+            return Ok(scope.to_string());
+        }
+    }
+    Err(format!("{scope:?} is not a place this page sets a level"))
+}
+
+/// The Agents tab's change (W6.29): a deployment admin's, for core's acts
+/// and the ceiling on a plugin's, each also per access group.
+async fn set_agents_may(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let outcome = async {
+        let acts = agents::acts(&app);
+        let line = acts
+            .iter()
+            .find(|line| line.act == field(&fields, "act"))
+            .ok_or_else(|| {
+                format!(
+                    "{:?} is no act this deployment offers",
+                    field(&fields, "act")
+                )
+            })?;
+        let allowed: &[&str] = if line.instance.is_empty() {
+            &["act"]
+        } else {
+            &["ceiling"]
+        };
+        let scope = scope_posted(&fields, &records, allowed)?;
+        let (level, eyes, note) = level_posted(&fields, line)?;
+        let by = crate::prepared::person_caller(
+            &session.subject,
+            &session.display_name,
+            &session.directory_groups,
+        );
+        app.prepared
+            .set_level(
+                &line.act,
+                &scope,
+                Some((level, eyes)),
+                &by,
+                &note,
+                app.clock.now_ns(),
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+    after_to(outcome, "/admin#agents", "/admin#agents")
+}
+
+/// The lapse period (W6.28), a deployment admin's, its own record.
+async fn set_lapse(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    admin_form!(app, headers, fields, session, {
+        match field(&fields, "days").parse::<u32>() {
+            Ok(days) if (1..=crate::prepared::levels::LAPSE_MOST).contains(&days) => {
+                let by = crate::prepared::person_caller(
+                    &session.subject,
+                    &session.display_name,
+                    &session.directory_groups,
+                );
+                app.prepared
+                    .set_lapse_days(days, &by, field(&fields, "note"), app.clock.now_ns())
+                    .await
+                    .map(|_| ())
+            }
+            _ => Err(format!(
+                "days: a whole number of days, 1 to {}",
+                crate::prepared::levels::LAPSE_MOST
+            )),
+        }
+    })
+}
+
+/// A plugin's act's level and gate, set by an admin of every role it
+/// serves, within the ceiling (W6.29).
+async fn set_plugin_agents_may(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, records, access) = match gate_plugin(&app, &headers, &instance, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let back = view::tab_href(&instance, view::ACCESS);
+    let outcome = async {
+        let acts = agents::acts(&app);
+        let line = acts
+            .iter()
+            .find(|line| line.act == field(&fields, "act") && line.instance == instance)
+            .ok_or_else(|| format!("{:?} is no act of {instance}'s", field(&fields, "act")))?;
+        if !access.plugin(&instance).administers_every(&line.roles) {
+            return Err(format!(
+                "{} serves {}, and its level is set by an admin of every one",
+                line.act,
+                line.roles.join(" and ")
+            ));
+        }
+        let scope = scope_posted(&fields, &records, &["act"])?;
+        let (level, eyes, note) = level_posted(&fields, line)?;
+        let by = crate::prepared::person_caller(
+            &session.subject,
+            &session.display_name,
+            &session.directory_groups,
+        );
+        app.prepared
+            .set_level(
+                &line.act,
+                &scope,
+                Some((level, eyes)),
+                &by,
+                &note,
+                app.clock.now_ns(),
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+    after_to(outcome, &back, &back)
+}
+
+/// The plugin's Accounts tab (W6.30): a deployment admin grants or
+/// withdraws an account, each its own record in the conductor.
+async fn set_linkable(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = view::tab_href(&instance, view::ACCOUNTS);
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let grant: Vec<String> = Some(field(&fields, "grant"))
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .into_iter()
+        .collect();
+    let withdraw: Vec<String> = Some(field(&fields, "withdraw"))
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .into_iter()
+        .collect();
+    let outcome = command::<meridian_domain::v1::LinkableAccounts>(
+        &app,
+        &session,
+        "platform.config.command.set-linkable-accounts",
+        "meridian.v1.SetLinkableAccountsRequest",
+        meridian_domain::v1::SetLinkableAccountsRequest {
+            plugin_instance_id: instance.clone(),
+            grant_account_ids: grant,
+            withdraw_account_ids: withdraw,
+            note: field(&fields, "note").to_string(),
+        },
+    )
+    .await
+    .map(|_| ());
+    after_to(outcome, &back, &back)
 }
 
 // ── The Data sources page ───────────────────────────────────────────────────
@@ -2034,6 +2890,38 @@ async fn set_dataset_licence(
     // "Kept for" is gated on "kept" (kit 0.11.0): read only with it, and a
     // licence serving rows unkept keeps nothing for any time.
     let kept = !field(&fields, "kept").is_empty();
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        "dashboard__set_dataset_licence",
+        || {
+            let retention_days: u32 = if kept {
+                field(&fields, "retention_days").parse().map_err(|_| {
+                    format!(
+                        "{:?} is not a number of days",
+                        field(&fields, "retention_days")
+                    )
+                })?
+            } else {
+                0
+            };
+            Ok(serde_json::json!({
+                "dataset": field(&fields, "dataset"),
+                "kept": kept,
+                "retention_days": retention_days,
+                "derived_use": !field(&fields, "derived_use").is_empty(),
+                "display": !field(&fields, "display").is_empty(),
+                "default_fields": words(&fields, "default_fields"),
+                "personal_use": !field(&fields, "personal_use").is_empty(),
+                "note": field(&fields, "note"),
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, DATA_SOURCES) {
+        return response;
+    }
     let retention = if kept {
         field(&fields, "retention_days")
     } else {
@@ -2086,6 +2974,25 @@ async fn set_dataset_entitlement(
     if let Err(response) = form_token_matches(&session, &fields) {
         return *response;
     }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        "dashboard__set_dataset_entitlement",
+        || {
+            Ok(serde_json::json!({
+                "dataset": field(&fields, "dataset"),
+                "instance": field(&fields, "instance"),
+                "allowed": !field(&fields, "allowed").is_empty(),
+                "fields": words(&fields, "fields"),
+                "note": field(&fields, "note"),
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, DATA_SOURCES) {
+        return response;
+    }
     let outcome = command::<meridian_domain::v1::DatasetEntitlement>(
         &app,
         &session,
@@ -2126,6 +3033,33 @@ async fn set_source_priority(
     } else {
         ""
     };
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        "dashboard__set_source_priority",
+        || {
+            let against: i64 = field(&fields, "against_updated_at_ns")
+                .parse()
+                .map_err(|_| {
+                    "the priority as it was read is not said; read it again".to_string()
+                })?;
+            let mut args = serde_json::json!({
+                "data_type": field(&fields, "data_type"),
+                "datasets": lines(&fields, "datasets"),
+                "against_updated_at_ns": against,
+                "note": field(&fields, "note"),
+            });
+            if !kind.is_empty() {
+                args["kind"] = kind.into();
+            }
+            Ok(args)
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, DATA_SOURCES) {
+        return response;
+    }
     let outcome = match (
         field(&fields, "against_updated_at_ns").parse::<i64>(),
         kind.is_empty()

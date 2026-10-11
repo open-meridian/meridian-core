@@ -3,7 +3,7 @@
 //! a venue's zone (`VenueRecord.time_zone`) are checked against, so an invalid
 //! zone refuses a registration (W4.1). Data, not a dependency: the kernel holds
 //! no time zone library, and nothing here converts a time -- which day a candle
-//! counts for is the `dgm`'s to say (plans/the-lake-prices-the-book, Q28).
+//! counts for is the data plugin's to say (plans/the-lake-prices-the-book, Q28).
 //!
 //! 598 names, from the tz database as Python's zoneinfo lists them;
 //! regenerate with `python3 -c 'import zoneinfo; print(sorted(zoneinfo.available_timezones()))'`

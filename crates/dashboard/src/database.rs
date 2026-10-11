@@ -25,10 +25,16 @@ pub(crate) type Connection =
 /// a deployment migrating them together does not have one wait on another.
 const SCHEMA_LOCK: i64 = 0x6461_7368_626f_6172_u64 as i64;
 
+/// A migration's record it owes the past, written at the moment it ran.
+type Then = fn(&mut postgres::Transaction<'_>, i64) -> Result<(), String>;
+
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
+    /// What it writes that needs the deployment's time (decisions/024): a
+    /// record it owes the past, at the moment it ran, in its transaction.
+    then: Option<Then>,
 }
 
 /// In order, and never reordered or edited after release: the record of what
@@ -43,38 +49,69 @@ const MIGRATIONS: &[Migration] = &[
         version: 1,
         name: "local_account",
         sql: include_str!("../migrations/0001_local_account.sql"),
+        then: None,
     },
     Migration {
         version: 2,
         name: "terminal_session",
         sql: include_str!("../migrations/0002_terminal_session.sql"),
+        then: None,
     },
     Migration {
         version: 3,
         name: "delegation",
         sql: include_str!("../migrations/0003_delegation.sql"),
+        then: None,
     },
     Migration {
         version: 4,
         name: "tool_call",
         sql: include_str!("../migrations/0004_tool_call.sql"),
+        then: None,
     },
     Migration {
         version: 5,
         name: "ticket",
         sql: include_str!("../migrations/0005_ticket.sql"),
+        then: None,
     },
     Migration {
         version: 6,
         name: "terminal_sessions_retired",
         sql: include_str!("../migrations/0006_terminal_sessions_retired.sql"),
+        then: None,
     },
     Migration {
         version: 7,
         name: "a_new_tool_asks_again",
         sql: include_str!("../migrations/0007_a_new_tool_asks_again.sql"),
+        then: None,
+    },
+    Migration {
+        version: 8,
+        name: "an_agents_prepared_change",
+        sql: include_str!("../migrations/0008_an_agents_prepared_change.sql"),
+        then: Some(levels_at_the_upgrade),
     },
 ];
+
+/// Migration 8's record (W6.29, decisions/031): every act at may make and
+/// every gate off at the upgrade to contract v20, which is what the
+/// deployment allowed before, said once, at the moment it ran.
+fn levels_at_the_upgrade(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO dashboard_agents_may_change (act, scope, from_said, to_said, changed_at_ns, note)
+         SELECT '*', 'deployment', '', $1, $2, $3
+          WHERE NOT EXISTS (SELECT 1 FROM dashboard_agents_may_change WHERE act = '*')",
+        &[
+            &crate::prepared::levels::AT_THE_UPGRADE_SAID,
+            &at_ns,
+            &crate::prepared::levels::AT_THE_UPGRADE_NOTE,
+        ],
+    )
+    .map_err(said)?;
+    Ok(())
+}
 
 const HISTORY: &str = "\
 CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
@@ -186,6 +223,9 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
         }
         let mut tx = conn.transaction().map_err(said)?;
         tx.batch_execute(migration.sql).map_err(said)?;
+        if let Some(then) = migration.then {
+            then(&mut tx, clock.now_ns())?;
+        }
         tx.execute(
             "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
              VALUES ($1, $2, $3)",

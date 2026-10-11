@@ -45,7 +45,9 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
-                  key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.instrumentKey) }}
+                  # Its own credential, not the runtime's (contract v20): it reads
+                  # the plugin catalogue by its own column in the contract.
+                  key: {{ if .Values.broker.existingSecret }}{{ .Values.broker.instrumentKey }}{{ else }}instrument{{ end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_DATABASE_URL

@@ -154,6 +154,16 @@ fn declared() -> Vec<SettingDeclaration> {
                 "That user's secret, returned when the user was registered.",
             )
         },
+        // An optional secret, set: the one a person may Remove.
+        SettingDeclaration {
+            secret: true,
+            ..setting(
+                "webhook_token",
+                SettingType::String,
+                "Webhook token",
+                "Signs the notices SnapTrade sends when a connection changes.",
+            )
+        },
         number(
             "poll_seconds",
             "Read every",
@@ -290,7 +300,7 @@ fn per_role(records: &mut AccessRecords) {
     for n in 0..20 {
         records.known_plugins.push(known(
             &format!("plugin-{n:02}"),
-            &[["custody", "operations", "dgm", "reporting"][n % 4]],
+            &[["custody", "operations", "data", "reporting"][n % 4]],
         ));
     }
     let entry = |plugin: &str, role: &str, level: AccessLevel| AccessEntry {
@@ -314,8 +324,8 @@ fn per_role(records: &mut AccessRecords) {
             entries: vec![
                 entry(TWO_ROLES, "custody", AccessLevel::Admin),
                 entry(INSTANCE, "custody", AccessLevel::Admin),
-                // Kept as written: ops-1 was relaunched without ccm.
-                entry(TWO_ROLES, "ccm", AccessLevel::Admin),
+                // Kept as written: ops-1 was relaunched without connectivity.
+                entry(TWO_ROLES, "connectivity", AccessLevel::Admin),
             ],
             built_in: false,
         },
@@ -357,9 +367,72 @@ fn per_role(records: &mut AccessRecords) {
     }
 }
 
+/// The firm's accounts, which the Accounts tab lists one line each with
+/// what the book holds of them, the rest behind Edit.
+fn accounts() -> Vec<meridian_domain::v1::AccountRecord> {
+    let named = [
+        (
+            "Credit Suisse 401(k)",
+            "Fidelity",
+            "401(k)",
+            "Vincent",
+            "Rolled over in 2026, pending the plan's letter.",
+        ),
+        (
+            "Traditional IRA",
+            "Fidelity",
+            "Traditional IRA",
+            "Vincent",
+            "",
+        ),
+        (
+            "Brokerage",
+            "Charles Schwab",
+            "Individual brokerage",
+            "Household",
+            "",
+        ),
+        (
+            "Roth IRA",
+            "Vanguard",
+            "Roth IRA",
+            "Vincent",
+            "Contributions only; no conversions.",
+        ),
+        (
+            "Joint taxable",
+            "Fidelity",
+            "Joint brokerage",
+            "Household",
+            "",
+        ),
+        ("Kalshi", "Kalshi", "Event contracts", "Vincent", ""),
+    ];
+    named
+        .iter()
+        .enumerate()
+        .map(
+            |(n, (name, custodian, kind, owner, note))| meridian_domain::v1::AccountRecord {
+                account_id: ACCOUNTS
+                    .get(n)
+                    .map(|account| format!("ACC-{account}"))
+                    .unwrap_or_else(|| format!("ACC-{n}")),
+                name: (*name).into(),
+                state: meridian_domain::v1::AccountState::Open as i32,
+                created_at_ns: 1_790_380_800_000_000_000,
+                custodian: (*custodian).into(),
+                account_type: (*kind).into(),
+                owner: (*owner).into(),
+                note: (*note).into(),
+            },
+        )
+        .collect()
+}
+
 fn records() -> AccessRecords {
     let mut records = settings_records();
     per_role(&mut records);
+    records.accounts = accounts();
     // The holds a deployment admin set (contract v16, W6.25).
     records.holds = vec![
         meridian_domain::v1::Hold {
@@ -551,7 +624,17 @@ fn settings_records() -> AccessRecords {
                     }]),
                 },
             ],
-            secrets_set: vec!["client_id".into()],
+            secrets_set: vec!["client_id".into(), "webhook_token".into()],
+            // Who set each secret, and when, as the conductor's records say.
+            changes: ["client_id", "webhook_token"]
+                .iter()
+                .map(|name| meridian_domain::v1::SettingLastChange {
+                    name: (*name).into(),
+                    changed_by: ADMIN.into(),
+                    changed_at_ns: 1_791_331_200_000_000_000,
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         }],
         ..Default::default()
@@ -720,12 +803,26 @@ fn set(
         record.values.retain(|held| &held.name != name);
         record.secrets_set.retain(|held| held != name);
     }
+    for name in asked
+        .values
+        .iter()
+        .map(|value| &value.name)
+        .chain(&asked.cleared)
+    {
+        record.changes.retain(|change| &change.name != name);
+        record.changes.push(meridian_domain::v1::SettingLastChange {
+            name: name.clone(),
+            changed_by: by.into(),
+            changed_at_ns: now,
+            ..Default::default()
+        });
+    }
     record.updated_by = by.into();
     record.updated_at_ns = now;
     Ok(())
 }
 
-/// The datasets the Data sources page lists (contract v18): eight `dgm`
+/// The datasets the Data sources page lists (contract v18): eight `data`
 /// instances of three datasets each, long names among them, the first two
 /// entitled to three readers each, one licence set and one person's terms.
 fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
@@ -871,16 +968,97 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             },
         );
     }
+    {
+        // The book's attributes of each account (W9.13): held as set, each
+        // change answered as the book answers it.
+        use meridian_domain::v1::{
+            set_account_attribute_request::Attribute, AccountAttributeReply, AccountAttributes,
+            ListAccountAttributesReply, LotReliefMethod, OpeningBalance,
+            SetAccountAttributeRequest,
+        };
+        let book: Arc<Mutex<Vec<AccountAttributes>>> = Arc::new(Mutex::new(
+            accounts()
+                .iter()
+                .take(4)
+                .enumerate()
+                .map(|(n, account)| AccountAttributes {
+                    account_id: account.account_id.clone(),
+                    base_currency_code: "USD".into(),
+                    lot_relief_default: if n == 2 {
+                        LotReliefMethod::HighestCost as i32
+                    } else {
+                        LotReliefMethod::FirstInFirstOut as i32
+                    },
+                    opening_balance: (n < 2).then(|| OpeningBalance {
+                        as_of_date: "2026-09-08".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+        ));
+        {
+            let book = Arc::clone(&book);
+            bus.serve(crate::admin::books::LIST_ACCOUNT_ATTRIBUTES, move |_| {
+                Ok((
+                    "".into(),
+                    ListAccountAttributesReply {
+                        attributes: book.lock().unwrap().clone(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ))
+            });
+        }
+        bus.serve(
+            crate::admin::books::SET_ACCOUNT_ATTRIBUTE,
+            move |envelope| {
+                let asked = SetAccountAttributeRequest::decode(&envelope.payload[..])
+                    .map_err(|e| e.to_string())?;
+                let mut held = book.lock().unwrap();
+                if !held.iter().any(|a| a.account_id == asked.account_id) {
+                    held.push(AccountAttributes {
+                        account_id: asked.account_id.clone(),
+                        ..Default::default()
+                    });
+                }
+                let attributes = held
+                    .iter_mut()
+                    .find(|a| a.account_id == asked.account_id)
+                    .unwrap();
+                match asked.attribute {
+                    Some(Attribute::BaseCurrencyCode(code)) => attributes.base_currency_code = code,
+                    Some(Attribute::LotReliefDefault(method)) => {
+                        attributes.lot_relief_default = method
+                    }
+                    _ => {}
+                }
+                Ok((
+                    "".into(),
+                    AccountAttributeReply {
+                        attributes: Some(attributes.clone()),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ))
+            },
+        );
+    }
     bus.serve(
         crate::admin::instruments::LIST_INSTRUMENTS_TO_COMPLETE,
         |envelope| {
             let asked = ListInstrumentsToCompleteRequest::decode(&envelope.payload[..])
                 .map_err(|e| e.to_string())?;
+            // The picker's search (contract v20, W3.11): by the record's ID,
+            // complete ones included, as the store answers it.
+            let search = asked.search.trim().to_lowercase();
             let wanted = |id: &String| {
-                if asked.instrument_id.is_empty() {
-                    asked.include_complete || incomplete(id)
-                } else {
+                if !asked.instrument_id.is_empty() {
                     *id == asked.instrument_id
+                } else if !search.is_empty() {
+                    id.to_lowercase().contains(&search)
+                } else {
+                    asked.include_complete || incomplete(id)
                 }
             };
             let instruments = (1..=250)
@@ -1194,6 +1372,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         kit: Some(Arc::new(kit)),
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     });
     tokio::spawn(crate::records::refresh_forever(
         bus,

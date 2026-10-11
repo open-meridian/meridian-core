@@ -843,10 +843,20 @@ pub(super) async fn ask<R: Message + Default>(
     request: impl Message,
     wait: Duration,
 ) -> Result<R, (String, String, Vec<String>)> {
+    let acting = super::Acting::now();
+    // A check runs every step but the act's own row (contract v20).
+    if acting.checking && super::is_act_row(topic) {
+        return Err((
+            super::CHECKED.into(),
+            "every check passed; nothing was sent, as this was a check".into(),
+            Vec::new(),
+        ));
+    }
     let stamp = Stamp {
         acting_for_subject: caller.subject.clone(),
         acting_through_delegation: caller.delegation_id.clone(),
         acting_through_client: caller.client_name.clone(),
+        prepared_call_id: acting.prepared_call_id,
         account_scope: None,
     };
     let answered = app
@@ -933,6 +943,7 @@ async fn list_one(
             instrument_id: instrument_id.to_string(),
             page_size: 1,
             cursor: String::new(),
+            search: String::new(),
         },
         WAIT,
     )
@@ -978,6 +989,7 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
         page::LIST_INSTRUMENTS_TO_COMPLETE,
         "meridian.v1.ListInstrumentsToCompleteRequest",
         ListInstrumentsToCompleteRequest {
+            search: Default::default(),
             include_complete,
             instrument_id: String::new(),
             page_size: if page_size == 0 {

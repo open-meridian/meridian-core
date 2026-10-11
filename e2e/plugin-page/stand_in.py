@@ -1066,6 +1066,13 @@ class Page(http.server.BaseHTTPRequestHandler):
         elif self.path == "/ticket":
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             done = file_ticket(callers, form)
+        elif ARCHIVING and self.path in archiving.ACT_ROUTES:
+            # Contract v20: the check answers what it would do, changing
+            # nothing; the acts answer as made.
+            asked = json.loads(sent or b"{}")
+            name = archiving.ACT_ROUTES[self.path][0]
+            done = ({"outcome": "unchanged", "detail": f"a note of {len(asked.get('note', ''))} characters would be kept"}
+                    if name == "check_note" else {"outcome": "made"})
         elif self.path in TOOL_ROUTES:
             asked = json.loads(sent or b"{}")
             if not callers:

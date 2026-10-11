@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-lake e2e-recorded \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-lake e2e-recorded \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -40,7 +40,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -858,7 +858,7 @@ e2e-settings-page:
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,
@@ -886,7 +886,7 @@ e2e-settings-page:
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty.
 HARNESS_IMAGE := meridian-harness:local
-HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql street.sql tickets.sql
+HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql platform.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
@@ -944,10 +944,10 @@ harness-check:
 	done; \
 	diff -u e2e/harness/expected.street .harness/street >&2 \
 		|| fail "the street store is not e2e/harness/expected.street"; \
-	waiting="$$($(HARNESS_RUN) instruments --expect 4)" || fail "the Instruments page did not list the four records the book cannot use"; \
+	waiting="$$($(HARNESS_RUN) instruments --expect 3)" || fail "the Instruments page did not list the three records the book cannot use (the dollar is the master's, pulled complete)"; \
 	$(HARNESS_RUN) instrument --identifier 'symbol (stand-in): HRN' asset_class=equity currency=USD \
 		source='the stand-in statement' >/dev/null || fail "the admin did not complete a record at the Instruments page"; \
-	$(HARNESS_RUN) instruments --expect 3 >/dev/null || fail "a completed record is still listed as one the book cannot use"; \
+	$(HARNESS_RUN) instruments --expect 2 >/dev/null || fail "a completed record is still listed as one the book cannot use"; \
 	$(HARNESS_RUN) mcp connect --covers deployment_admin >/dev/null || fail "an MCP client was not connected on a delegation for the /mcp resource"; \
 	$(HARNESS_RUN) mcp list --expect dashboard__complete_instruments >.harness/tools 2>>.e2e-harness.log \
 		|| fail "the delegation does not reach dashboard__complete_instruments"; \
@@ -958,7 +958,7 @@ harness-check:
 		source='the stand-in statement' note='Completed by the harness agent from the statement.')" \
 		|| fail "the agent did not complete a record through /mcp"; \
 	through="$$(printf '%s' "$$completed" | sed -n 's/^mcp complete: \([^ ]*\) completed.*/\1/p')"; \
-	$(HARNESS_RUN) instruments --expect 2 >/dev/null || fail "the record completed through /mcp is still listed as one the book cannot use"; \
+	$(HARNESS_RUN) instruments --expect 1 >/dev/null || fail "the record completed through /mcp is still listed as one the book cannot use"; \
 	$(HARNESS_RUN) mcp call dashboard__read_instrument_history "{\"instrument_id\": \"$$through\"}" \
 		--expect '"client_name": "harness agent"' --expect '"person": "local|harness"' >/dev/null \
 		|| fail "the record's history does not name the person and the client it was completed through"; \
@@ -990,7 +990,7 @@ harness-check:
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the four records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin
 # harness: core's stand-in as custody, operations and a plugin holding no
@@ -1095,8 +1095,27 @@ e2e-plugin-area:
 		<e2e/plugin-area/plugins.json >.harness/plugins.yaml
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/plugin-area/run.py
 
+# A prepared change waits for the person, and the admins keep a human in the
+# loop (contract v20, W6.26 to W6.29), end to end on the plugin harness: an
+# agent's change prepared and made by the person in the Inbox and at the
+# Settings form, the levels and the second pair of eyes holding a direct
+# call back (e2e/prepared/run.py says each step). Its own compose project.
+e2e-prepared:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "e2e-prepared FAILED: the harness image did not build" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-prepared FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/prepared/plugins.json >.harness/plugins.yaml
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/prepared/run.py
+
 # The lake's 1a (contract v18, W10), end to end on the plugin harness:
-# core's stand-ins on the SDK, a dgm serving three datasets from an exchange
+# core's stand-ins on the SDK, a data plugin serving three datasets from an exchange
 # file and two reading plugins, one entitled and one never, worked at the
 # Data sources page, through its five tools and by the runner's `licence`,
 # `entitle` and `priority` -- closes and an FX rate recorded and heard, a
@@ -1299,7 +1318,7 @@ chart-check:
 		&& { echo "chart-check FAILED: a plugin holding no edge role was given storage" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '^  claim.json: ' && echo "$$rendered" | grep -q '^  plugin-storage.json: ' \
 		|| { echo "chart-check FAILED: the launcher holds no edge shape or no claim to make" >&2; exit 1; }; \
-	echo "$$rendered" | grep -A1 'name: MERIDIAN_LAUNCHER_EDGE_ROLES$$' | grep -q 'value: "ccm,custody,dgm,match,reporting,servicing,settlement"$$' \
+	echo "$$rendered" | grep -A1 'name: MERIDIAN_LAUNCHER_EDGE_ROLES$$' | grep -q 'value: "confirmation,connectivity,custody,data,reporting,servicing,settlement"$$' \
 		|| { echo "chart-check FAILED: the launcher is not told decisions/028's seven edge roles" >&2; exit 1; }; \
 	off="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge --set pluginStorage.enabled=false 2>/dev/null)"; \
 	echo "$$off" | grep -q 'storage-edge-1\|claim.json\|MERIDIAN_STORAGE_DIR\|persistentvolumeclaims' \
@@ -1307,7 +1326,7 @@ chart-check:
 	held="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy --show-only templates/plugin-storage.yaml 2>/dev/null)"; \
 	echo "$$held" | grep -q "'check-meridian-runtime-storage-' +" \
-		&& echo "$$held" | grep -q '(ccm|custody|dgm|match|reporting|servicing|settlement)' \
+		&& echo "$$held" | grep -q '(confirmation|connectivity|custody|data|reporting|servicing|settlement)' \
 		&& echo "$$held" | grep -q 'meridian.dev/component: sidecar' \
 		|| { echo "chart-check FAILED: the admission policy on plugin pods does not render with their claim, the edge roles and its selector" >&2; exit 1; }
 	@# An archive for edge plugins' older records (contract v16): none by
@@ -1463,6 +1482,17 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker does not generate its permissions from the contract" >&2; exit 1; }; \
 	$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
 		&& { echo "chart-check FAILED: a deployment with its own broker got one from the chart as well" >&2; exit 1; }; true
+	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
+	@# a broker credential of its own, made by the bundled broker and read by
+	@# its pod, not the runtime's shared one.
+	@bundled="$$($(HELM) template check deploy/chart --set deployment.id=D --set key.existingSecret=k 2>/dev/null)"; \
+	echo "$$bundled" | grep -q '^  instrument-password: ' \
+		|| { echo "chart-check FAILED: the bundled broker makes no credential of the instrument store's own" >&2; exit 1; }; \
+	echo "$$bundled" | grep -q '^  MERIDIAN_NATS_INSTRUMENT: ' \
+		|| { echo "chart-check FAILED: the bundled broker reads no password for the instrument store" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart --set deployment.id=D --set key.existingSecret=k \
+		--show-only templates/instrument.yaml 2>/dev/null | grep -A8 'name: MERIDIAN_BROKER_URL' | grep -q 'key: instrument$$' \
+		|| { echo "chart-check FAILED: the instrument store reads the runtime's broker credential, not its own" >&2; exit 1; }
 	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| grep -q '"meridian-dashboard"' \
@@ -1789,8 +1819,19 @@ interop: network
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop up -d --build street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
+	@# The conductor's platform the master's stand-in (contract v20): a currency
+	@# is pulled from it, never minted.
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop MERIDIAN_PLATFORM_ADDRESS=http://master:8000 $(COMPOSE) --profile interop up -d --build master street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
+	@# The master answering, and the conductor connected, before the suite
+	@# resolves a currency (contract v20): one asked before either listens is
+	@# not reached, and the resolve is a miss, nothing minted.
+	@for i in $$(seq 1 60); do \
+		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop exec -T master \
+			wget -q -O /dev/null "http://127.0.0.1:8000/api/v1/reference/identifiers/resolve?scheme=iso4217&value=USD" 2>/dev/null \
+		&& MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop logs conductor 2>/dev/null | grep -q "the conductor is connected" \
+		&& exit 0; sleep 1; done; \
+		echo "interop FAILED: the master's stand-in or the conductor did not come up" >&2; exit 1
 	@# --no-deps: everything the suite reaches is up already, and the three
 	@# sidecars share the custody one's network namespace. A run that started
 	@# its dependencies could recreate that sidecar -- Compose 2.37.1 to 2.38.x

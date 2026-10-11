@@ -95,10 +95,18 @@ pub fn upload(
     contract: &Contract,
     request: &RecordPluginUploadRequest,
 ) -> Result<PluginMetadata, String> {
-    let metadata = request
+    let mut metadata = request
         .metadata
         .clone()
         .ok_or("an upload carries no metadata")?;
+    // A version built before contract v20 names a renamed role by its old
+    // name; it is kept by the new one (decisions/020).
+    metadata.roles = meridian_domain::roles_now(&metadata.roles);
+    if let Some(declaration) = metadata.declaration.as_mut() {
+        for held in &mut declaration.not_carried {
+            held.role = meridian_domain::role_now(&held.role).to_string();
+        }
+    }
     if !is_name(&metadata.name) {
         return Err(format!(
             "`{}` is not a plugin's name: lowercase letters, digits and single hyphens, \
@@ -196,7 +204,7 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             ));
         }
     }
-    // A dgm's catalogue (W8.1, contract v18), as `meridian plugin check`
+    // A data plugin's catalogue (W8.1, contract v18), as `meridian plugin check`
     // says first and the sidecar again at registration.
     if let Some(catalogue) = &declaration.catalogue {
         if let Some(refused) = meridian_domain::lake::catalogue_refused(catalogue, roles) {
@@ -411,6 +419,7 @@ impl Plugins {
             acting_through_delegation: by.delegation,
             client_name: by.client,
             note: request.note.clone(),
+            prepared_call_id: by.prepared_call_id,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
@@ -552,6 +561,7 @@ impl Plugins {
             acting_through_delegation: by.delegation,
             client_name: by.client,
             note: request.note.clone(),
+            prepared_call_id: by.prepared_call_id,
         };
         self.store
             .put_archive(&archive, &request.note)
@@ -604,6 +614,7 @@ impl Plugins {
             acting_through_delegation: by.delegation,
             client_name: by.client,
             note: request.note.clone(),
+            prepared_call_id: by.prepared_call_id,
             ..standing
         };
         self.store
@@ -727,6 +738,7 @@ impl Plugins {
             note: request.note.clone(),
             at_ns: self.clock.now_ns(),
             failure: String::new(),
+            prepared_call_id: by.prepared_call_id,
         };
         let stopped = self
             .store

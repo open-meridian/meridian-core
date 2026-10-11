@@ -197,6 +197,18 @@ table.datasets th:first-child{width:18%}table.datasets th.num{width:7rem}table.d
 table.entitlements th.actions{width:11.5rem}table.priorities th:first-child{width:12rem}table.priorities th.actions{width:5rem}\
 table.datasets td.actions,table.entitlements td.actions,table.priorities td.actions{text-align:right}\
 table.entitlements form.inline{display:inline}\
+form.lapse,form.grant{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.6rem 0}\
+form.lapse label,form.grant label{display:flex;align-items:center;gap:.45rem;margin:0;font-weight:550}\
+form.lapse button,form.grant button{margin:0}form.lapse input[type=number]{width:5.5rem}form.grant select{width:auto;min-width:10rem;max-width:100%}form.lapse input[name=note],form.grant input[name=note]{flex:1 1 12rem;min-width:0}\
+form.prepared-act{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:0;flex:1 1 20rem}\
+form.prepared-act input[name=note]{flex:1 1 12rem;min-width:0}form.prepared-act button{margin:0}\
+.prepared-change .actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:0 0 1rem}\
+.prepared-change .notice{margin:.6rem 0}.notice[data-prepared]{margin:0 0 .75rem}\
+@media (min-width:900px){.prepared-change .stack{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1rem;align-items:start}\
+.prepared-change .stack>.panel{margin:0}}\
+@media (max-width:640px){table.delegations :is(th,td):is(:nth-child(3),:nth-child(5),:nth-child(6)),table.calls :is(th,td):is(:nth-child(1),:nth-child(4),:nth-child(6)),table.prepared-by-clients :is(th,td):is(:nth-child(1),:nth-child(2),:nth-child(6)){display:none}table.calls code{overflow-wrap:anywhere}}\
+table.linkable th.actions{width:7rem}table.linkable td.actions{text-align:right}\
+@media (max-width:640px){table.agents .wide,table.linkable .wide{display:none}}\
 @media (max-width:640px){table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
 table.priorities .dates,table.priorities .actions{display:none}table.datasets th:first-child{width:42%}\
 table.datasets th.actions{width:5.5rem}table.entitlements th.actions{width:6.5rem}table.priorities th:first-child{width:36%}}\
@@ -374,7 +386,6 @@ form.settings:not(.js) button.note-mark{display:none}\
 form.settings input:not([type=checkbox]):not([type=radio]):not([type=hidden]),form.settings select{padding:.4rem .6rem}\
 form.settings .setting>select{display:block;width:100%}\
 .secret-row{display:flex;align-items:center;gap:.75rem}.secret-row input{flex:1 1 auto;min-width:0}\
-.secret-row label.check{margin:0;flex-shrink:0;white-space:nowrap}\
 form.settings .setting>input{display:block;width:100%}\
 form.settings .hint.about{margin:.2rem 0 0;font-size:.8rem;line-height:1.4}form.settings.js .hint.about{display:none}\
 .note-bubble.hints{pointer-events:none}\
@@ -403,7 +414,7 @@ form.settings.js .setting-group:not([id^=settings-developer]) .setting-head .nee
 form.settings .setting-head .id{display:none}\
 section.settings-page{padding:.85rem .9rem}form.settings .fields{gap:.5rem 1.25rem}}\
 .table-setting .about-line{margin:0 0 .5rem;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
-.form-foot{position:sticky;bottom:0;z-index:5;display:flex;justify-content:flex-end;margin-top:.7rem;padding:.5rem 0;\
+.form-foot{position:sticky;bottom:0;z-index:5;display:flex;justify-content:flex-end;gap:.5rem;margin-top:.7rem;padding:.5rem 0;\
 border-top:1px solid var(--line-soft);background:var(--card)}\
 .form-foot button{margin:0}\
 form.consent fieldset.covers>legend{margin-bottom:.4rem;font-size:.84rem;font-weight:550}\
@@ -748,6 +759,32 @@ const CHROME_SCRIPT: &str = r#"(function () {
       if (!data || data.type !== "meridian:actions" || data.version !== 1) return;
       var list = offered(data.actions);
       if (list) draw(frame, list);
+    });
+  });
+  // A next step, by meridian:open (kit 0.12.0; meridian-ui's README, the
+  // host's step 10): a link on the page marked data-om-opens asks the host
+  // to open one of its own tabs for this plugin -- summary, settings, a
+  // table setting's key -- when the person may open it, and Data sources
+  // only for a deployment admin; anything else is ignored, saying nothing.
+  // Taken under the size's guards, and opening a tab is the host's own
+  // navigation, as a click on its tab row is.
+  var PLACE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    frames.forEach(function (frame) {
+      if (!frame.contentWindow) return;
+      if (event.source !== frame.contentWindow || event.origin !== frame.dataset.origin) return;
+      if (!data || data.type !== "meridian:open" || data.version !== 1) return;
+      if (typeof data.id !== "string" || !PLACE.test(data.id)) return;
+      if (data.id === "data-sources") {
+        if (frame.hasAttribute("data-opens-data-sources")) window.location.assign("/admin/data-sources");
+        return;
+      }
+      var tabs = document.querySelectorAll("nav a[data-tab]");
+      for (var i = 0; i < tabs.length; i++) {
+        var key = tabs[i].getAttribute("data-tab");
+        if (key === data.id || key === "setting-" + data.id) { window.location.assign(tabs[i].getAttribute("href")); return; }
+      }
     });
   });
   // A seamless frame's header status, by meridian:status (kit 0.7.0;
@@ -1579,7 +1616,8 @@ mod tests {
     fn a_seamless_frames_status_is_taken_only_from_its_own_page_and_drawn_beside_the_name() {
         let listener = CHROME_SCRIPT
             .split("window.addEventListener(\"message\"")
-            .nth(2)
+            .skip(1)
+            .find(|part| part.contains("data.type !== \"meridian:status\""))
             .expect("the status listener")
             .split("\n  });\n")
             .next()

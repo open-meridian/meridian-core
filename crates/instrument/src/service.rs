@@ -36,7 +36,7 @@ use crate::complete::{complete_as, keep_platform_answer, merge_as};
 use crate::list::{history, list_to_complete};
 use crate::record::to_wire;
 use crate::replace::replaced;
-use crate::resolve::{conflict_reported, resolve_identifier, resolve_instrument};
+use crate::resolve::{conflict_reported, resolve_instrument};
 use crate::store::{Instrument, Store};
 
 /// W3.1. A connector asking what a set of identifiers meant.
@@ -96,6 +96,7 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             writing.clone(),
             Arc::clone(bus),
         );
+        let asking = Arc::new(Asking::new(Arc::clone(bus)));
         bus.serve(RESOLVE_IDENTIFIER, move |envelope| {
             let request: ResolveIdentifierRequest =
                 decode(&envelope, "meridian.v1.ResolveIdentifierRequest")?;
@@ -105,10 +106,62 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
                 .map(|meta| meta.publisher_instance_id.clone())
                 .unwrap_or_default();
             let now_ns = clock.now_ns();
+            // Read-only for an instance none of whose launched roles may mint
+            // (contract v20, W3.1): `reporting`, by the launch records, never
+            // by anything the plugin sends.
+            if asking.reads_only(&instance, now_ns) {
+                let resolution =
+                    crate::resolve::resolve_identifier_read_only(store.as_ref(), &request, now_ns)
+                        .map_err(|failed| failed.to_string())?;
+                return Ok((
+                    "meridian.v1.ResolveIdentifierReply".to_string(),
+                    resolution.reply.encode_to_vec(),
+                ));
+            }
+            // A currency the deployment does not hold, pulled from the
+            // platform's master before anything is minted (contract v20);
+            // while the master is slow or not reached, a miss and nothing
+            // minted (the 2026-10-11 ruling), the next resolve finding what
+            // the pull brought.
+            let pulled = match crate::resolve::currency_code(&request) {
+                Some(code)
+                    if crate::resolve::resolve_identifier_read_only(
+                        store.as_ref(),
+                        &request,
+                        now_ns,
+                    )
+                    .map(|found| found.reply.instrument_id.is_empty())
+                    .unwrap_or(false) =>
+                {
+                    match asking.currency(&code, now_ns) {
+                        Pull::Found(record) => Some(*record),
+                        Pull::NotHeld => None,
+                        Pull::NotYet => {
+                            let resolution = crate::resolve::resolve_identifier_read_only(
+                                store.as_ref(),
+                                &request,
+                                now_ns,
+                            )
+                            .map_err(|failed| failed.to_string())?;
+                            return Ok((
+                                "meridian.v1.ResolveIdentifierReply".to_string(),
+                                resolution.reply.encode_to_vec(),
+                            ));
+                        }
+                    }
+                }
+                _ => None,
+            };
             let resolution = {
                 let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
-                resolve_identifier(store.as_ref(), &request, &instance, now_ns)
-                    .map_err(|failed| failed.to_string())?
+                crate::resolve::resolve_identifier_pulled(
+                    store.as_ref(),
+                    &request,
+                    &instance,
+                    now_ns,
+                    pulled.as_ref(),
+                )
+                .map_err(|failed| failed.to_string())?
             };
             if let Some(changed) = &resolution.changed {
                 announce(&announcing, changed, &envelope, now_ns);
@@ -285,6 +338,272 @@ fn announce(bus: &Bus, record: &Instrument, caused_by: &Envelope, now_ns: i64) {
     }
 }
 
+/// The conductor's catalogue, the launch records (W8.2).
+pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
+/// W3.3, asked by the store itself for a currency (contract v20).
+pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
+    "platform.reference.query.ask-platform-for-instrument";
+
+/// The roles that may mint a record by resolving (W3.1, W3.7): `custody`
+/// and `data`. Any other asks read-only.
+pub const MINTING_ROLES: [&str; 2] = ["custody", "data"];
+
+const LAUNCHES_FOR_NS: i64 = 300 * 1_000_000_000;
+const UNKNOWN_AGAIN_NS: i64 = 30 * 1_000_000_000;
+const NOT_HELD_AGAIN_NS: i64 = 600 * 1_000_000_000;
+/// How long a resolve waits on the master for a currency: well under the
+/// five seconds a sidecar gives a resolve (the coordinator, 2026-10-11).
+pub const CURRENCY_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// How long the pull itself may take in the background.
+const CURRENCY_PULL_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+/// After the master could not be reached, a currency is asked again no
+/// sooner than this.
+const UNREACHED_AGAIN_NS: i64 = 10 * 1_000_000_000;
+/// A pull still in flight after this is asked again.
+const IN_FLIGHT_FOR_NS: i64 = 60 * 1_000_000_000;
+
+/// What the master said of a currency the deployment does not hold
+/// (contract v20; the 2026-10-11 ruling: never mint a stub when the master
+/// holds it).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pull {
+    /// The master's record, kept as the deployment's.
+    Found(Box<meridian_domain::v1::InstrumentRecord>),
+    /// The master answered and holds none: minted as before.
+    NotHeld,
+    /// Not known yet -- the master slow or not reached: nothing minted, the
+    /// resolve answered as a miss, the pull finishing in the background so
+    /// a later resolve finds the record.
+    NotYet,
+}
+
+#[derive(Debug, Clone)]
+enum Pulling {
+    InFlight(i64),
+    Found(Box<meridian_domain::v1::InstrumentRecord>),
+    Unreached(i64),
+}
+
+/// What the store asks others, from a resolve's handler on the blocking
+/// pool: each launched instance's roles, from the catalogue, read again
+/// every five minutes or for an instance not seen; and the master, for a
+/// currency not held, each code it does not hold not asked again for ten
+/// minutes.
+pub struct Asking {
+    bus: Arc<Bus>,
+    launched: Mutex<(std::collections::BTreeMap<String, Vec<String>>, i64)>,
+    not_held: Mutex<std::collections::BTreeMap<String, i64>>,
+    pulling: Arc<Mutex<std::collections::BTreeMap<String, Pulling>>>,
+    wait: std::time::Duration,
+}
+
+impl Asking {
+    pub fn new(bus: Arc<Bus>) -> Self {
+        Self {
+            bus,
+            launched: Mutex::new((Default::default(), i64::MIN / 2)),
+            not_held: Mutex::new(Default::default()),
+            pulling: Arc::default(),
+            wait: CURRENCY_WAIT,
+        }
+    }
+
+    /// The same, waiting `wait` on the master (for the tests).
+    pub fn waiting(bus: Arc<Bus>, wait: std::time::Duration) -> Self {
+        Self {
+            wait,
+            ..Self::new(bus)
+        }
+    }
+
+    fn ask<R: Message + Default>(
+        &self,
+        topic: &str,
+        request_type: &str,
+        request: impl Message,
+    ) -> Result<R, String> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| "no runtime".to_string())?;
+        let (_, bytes) = handle
+            .block_on(self.bus.call(
+                topic,
+                request_type,
+                request.encode_to_vec(),
+                None,
+                Some(std::time::Duration::from_secs(10)),
+            ))
+            .map_err(|failed| failed.to_string())?;
+        R::decode(&bytes[..]).map_err(|failed| failed.to_string())
+    }
+
+    /// Whether `instance` resolves read-only: launched with roles, none of
+    /// them minting. An instance the launch records do not name -- one run
+    /// outside the catalogue, or a catalogue not read -- resolves as before.
+    pub fn reads_only(&self, instance: &str, now_ns: i64) -> bool {
+        match self.roles_of(instance, now_ns) {
+            Some(roles) => {
+                !roles.is_empty()
+                    && !roles
+                        .iter()
+                        .any(|role| MINTING_ROLES.contains(&role.as_str()))
+            }
+            None => false,
+        }
+    }
+
+    fn roles_of(&self, instance: &str, now_ns: i64) -> Option<Vec<String>> {
+        {
+            let held = self.launched.lock().ok()?;
+            let known = held.0.contains_key(instance);
+            let fresh = now_ns - held.1 < LAUNCHES_FOR_NS;
+            if fresh && (known || now_ns - held.1 < UNKNOWN_AGAIN_NS) {
+                return held.0.get(instance).cloned();
+            }
+        }
+        let read: Result<meridian_domain::v1::PluginCatalogue, String> = self.ask(
+            PLUGIN_CATALOGUE,
+            "meridian.v1.PluginCatalogueRequest",
+            meridian_domain::v1::PluginCatalogueRequest {},
+        );
+        let mut held = self.launched.lock().ok()?;
+        if let Ok(catalogue) = read {
+            held.0 = catalogue
+                .launches
+                .into_iter()
+                .filter(|launch| {
+                    launch.state == meridian_domain::v1::PluginLaunchState::Launched as i32
+                })
+                .map(|launch| {
+                    (
+                        launch.instance_id,
+                        meridian_domain::roles_now(&launch.roles),
+                    )
+                })
+                .collect();
+        }
+        held.1 = now_ns;
+        held.0.get(instance).cloned()
+    }
+
+    /// What the master says of a currency the deployment does not hold,
+    /// waiting no longer than [`CURRENCY_WAIT`]: its record, that it holds
+    /// none, or not yet -- the pull left to finish in the background, its
+    /// record kept for the next resolve.
+    pub fn currency(&self, code: &str, now_ns: i64) -> Pull {
+        if let Ok(not_held) = self.not_held.lock() {
+            if not_held
+                .get(code)
+                .is_some_and(|at| now_ns - at < NOT_HELD_AGAIN_NS)
+            {
+                return Pull::NotHeld;
+            }
+        }
+        let Ok(mut pulling) = self.pulling.lock() else {
+            return Pull::NotYet;
+        };
+        match pulling.get(code).cloned() {
+            Some(Pulling::Found(record)) => {
+                pulling.remove(code);
+                return Pull::Found(record);
+            }
+            Some(Pulling::InFlight(at)) if now_ns - at < IN_FLIGHT_FOR_NS => return Pull::NotYet,
+            Some(Pulling::Unreached(at)) if now_ns - at < UNREACHED_AGAIN_NS => {
+                return Pull::NotYet
+            }
+            _ => {}
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return Pull::NotYet;
+        };
+        pulling.insert(code.to_string(), Pulling::InFlight(now_ns));
+        drop(pulling);
+        let (done, heard) = std::sync::mpsc::channel::<Option<bool>>();
+        let (bus, kept, code_owned) = (
+            Arc::clone(&self.bus),
+            Arc::clone(&self.pulling),
+            code.to_string(),
+        );
+        let request = meridian_domain::v1::AskPlatformForInstrumentRequest {
+            instrument_id: String::new(),
+            identifiers: vec![meridian_domain::v1::Identifier {
+                scheme: "iso4217".into(),
+                value: code.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        handle.spawn(async move {
+            let asked = bus
+                .call(
+                    ASK_PLATFORM_FOR_INSTRUMENT,
+                    "meridian.v1.AskPlatformForInstrumentRequest",
+                    request.encode_to_vec(),
+                    None,
+                    Some(CURRENCY_PULL_WITHIN),
+                )
+                .await
+                .map_err(|failed| failed.to_string())
+                .and_then(|(_, bytes)| {
+                    meridian_domain::v1::AskPlatformForInstrumentReply::decode(&bytes[..])
+                        .map_err(|failed| failed.to_string())
+                });
+            // Some(true): found; Some(false): the master holds none; None:
+            // not reached.
+            let said = match asked {
+                Ok(reply) if reply.found && reply.instrument.is_some() => {
+                    tracing::info!(
+                        code = code_owned,
+                        "a currency the deployment did not hold, pulled from the master"
+                    );
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.insert(
+                            code_owned.clone(),
+                            Pulling::Found(Box::new(reply.instrument.expect("found"))),
+                        );
+                    }
+                    Some(true)
+                }
+                Ok(reply) if reply.reachable => {
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.remove(&code_owned);
+                    }
+                    Some(false)
+                }
+                Ok(reply) => {
+                    tracing::info!(code = code_owned, detail = reply.detail, "the master could not be asked for a currency; nothing minted, asked again later");
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.insert(code_owned.clone(), Pulling::Unreached(now_ns));
+                    }
+                    None
+                }
+                Err(failed) => {
+                    tracing::info!(code = code_owned, %failed, "the master could not be asked for a currency; nothing minted, asked again later");
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.insert(code_owned.clone(), Pulling::Unreached(now_ns));
+                    }
+                    None
+                }
+            };
+            let _ = done.send(said);
+        });
+        match heard.recv_timeout(self.wait) {
+            Ok(Some(true)) => match self.pulling.lock() {
+                Ok(mut pulling) => match pulling.remove(code) {
+                    Some(Pulling::Found(record)) => Pull::Found(record),
+                    _ => Pull::NotYet,
+                },
+                Err(_) => Pull::NotYet,
+            },
+            Ok(Some(false)) => {
+                if let Ok(mut not_held) = self.not_held.lock() {
+                    not_held.insert(code.to_string(), now_ns);
+                }
+                Pull::NotHeld
+            }
+            Ok(None) | Err(_) => Pull::NotYet,
+        }
+    }
+}
+
 /// Who a command was sent for, as the dashboard stamped them: the person,
 /// and the delegation and client they acted through, if any (W4.9).
 fn actor_of(envelope: &Envelope) -> crate::complete::Actor {
@@ -305,6 +624,11 @@ fn actor_of(envelope: &Envelope) -> crate::complete::Actor {
                 String::new()
             } else {
                 meta.acting_through_client.clone()
+            },
+            prepared_call_id: if meta.acting_for_subject.is_empty() {
+                String::new()
+            } else {
+                meta.prepared_call_id.clone()
             },
         })
         .unwrap_or_default()
@@ -526,6 +850,261 @@ mod tests {
             .await
             .map_err(|failed| failed.to_string())?;
         Ok(R::decode(&bytes[..]).unwrap())
+    }
+
+    /// A store's bus and a plugin instance's beside it, one backend.
+    /// One in-memory bus, asking as `instance` (its handlers its own).
+    fn two(instance: &str) -> (Arc<Bus>, Arc<Bus>) {
+        let clock: Arc<dyn meridian_clock::Clock> = Arc::new(meridian_clock::ManualClock::at(NOW));
+        let bus = Arc::new(Bus::single(instance, Arc::new(MemoryBackend::new()), clock));
+        (bus.clone(), bus)
+    }
+
+    fn launched(bus: &Bus, launches: &[(&str, &[&str])]) {
+        let launches: Vec<meridian_domain::v1::PluginLaunch> = launches
+            .iter()
+            .map(|(instance, roles)| meridian_domain::v1::PluginLaunch {
+                instance_id: instance.to_string(),
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
+            })
+            .collect();
+        bus.serve(PLUGIN_CATALOGUE, move |_| {
+            Ok((
+                "meridian.v1.PluginCatalogue".to_string(),
+                meridian_domain::v1::PluginCatalogue {
+                    launches: launches.clone(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
+
+    fn currency(code: &str) -> ResolveIdentifierRequest {
+        ResolveIdentifierRequest {
+            identifiers: vec![PbIdentifier {
+                scheme: "iso4217".into(),
+                value: code.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reporting_resolves_read_only_by_its_launched_roles_and_custody_mints() {
+        // Contract v20 (W3.1): by the launch records, never by what is sent.
+        for (instance, roles, mints) in [
+            ("rep-1", &["reporting"][..], false),
+            ("cust-1", &["custody"][..], true),
+            ("both-1", &["reporting", "custody"][..], true),
+            ("data-1", &["dgm"][..], true),
+            ("unlaunched-1", &[][..], true),
+        ] {
+            let (store_bus, plugin_bus) = two(instance);
+            let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+            launched(&store_bus, &[(instance, roles)]);
+            serve_queries(
+                &store_bus,
+                store.clone(),
+                Arc::new(meridian_clock::ManualClock::at(NOW)),
+            );
+            let reply: ResolveIdentifierReply = ask(
+                &plugin_bus,
+                RESOLVE_IDENTIFIER,
+                "meridian.v1.ResolveIdentifierRequest",
+                snap(),
+                "",
+            )
+            .await
+            .unwrap();
+            assert_eq!(!reply.instrument_id.is_empty(), mints, "{instance}");
+            assert_eq!(store.count().unwrap(), usize::from(mints), "{instance}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_currency_not_held_is_pulled_from_the_master_never_minted_while_it_holds_it() {
+        let (store_bus, plugin_bus) = two("cust-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        launched(&store_bus, &[("cust-1", &["custody"])]);
+        let asked = Arc::new(Mutex::new(0));
+        let counting = asked.clone();
+        store_bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, move |envelope| {
+            *counting.lock().unwrap() += 1;
+            let request =
+                meridian_domain::v1::AskPlatformForInstrumentRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            assert!(
+                request.instrument_id.is_empty(),
+                "asked for a record not held"
+            );
+            let code = request.identifiers[0].value.clone();
+            let found = code == "CHF";
+            Ok((
+                "meridian.v1.AskPlatformForInstrumentReply".to_string(),
+                meridian_domain::v1::AskPlatformForInstrumentReply {
+                    reachable: true,
+                    found,
+                    instrument: found.then(|| PbInstrument {
+                        instrument_id: "INS-CHF0000000000000000000001".into(),
+                        asset_class: AssetClass::Cash as i32,
+                        currency: "CHF".into(),
+                        description: "Swiss franc".into(),
+                        identifiers: vec![PbIdentifier {
+                            scheme: "iso4217".into(),
+                            value: "CHF".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    detail: String::new(),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let reply: ResolveIdentifierReply = ask(
+            &plugin_bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            currency("CHF"),
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(!reply.minted, "found, not minted");
+        let record = store.by_id(&reply.instrument_id).unwrap().unwrap();
+        assert_eq!(record.asset_class, "ASSET_CLASS_CASH");
+        assert_eq!(record.currency, "CHF");
+        assert_eq!(record.description, "Swiss franc");
+        assert!(record
+            .identifiers
+            .iter()
+            .any(|i| i.scheme == meridian_symbology::GLOBAL_ID));
+        // Held now: asked no more.
+        let again: ResolveIdentifierReply = ask(
+            &plugin_bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            currency("CHF"),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.instrument_id, reply.instrument_id);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        // One the master does not hold is minted, as before.
+        let stub: ResolveIdentifierReply = ask(
+            &plugin_bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            currency("XQQ"),
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(stub.minted);
+    }
+
+    /// The 2026-10-11 ruling: a master slow past the wait, or not reached,
+    /// mints nothing -- the resolve is a miss -- and once the pull brings the
+    /// record, a later resolve finds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_or_absent_master_mints_no_currency_and_a_later_resolve_finds_the_pulled_one() {
+        let (store_bus, plugin_bus) = two("cust-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        launched(&store_bus, &[("cust-1", &["custody"])]);
+        store_bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, move |envelope| {
+            let request =
+                meridian_domain::v1::AskPlatformForInstrumentRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            let code = request.identifiers[0].value.clone();
+            if code == "XNR" {
+                // Not reached.
+                return Ok((
+                    "meridian.v1.AskPlatformForInstrumentReply".to_string(),
+                    meridian_domain::v1::AskPlatformForInstrumentReply {
+                        reachable: false,
+                        detail: "the platform did not answer in time".into(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ));
+            }
+            // Slow: longer than a resolve waits.
+            std::thread::sleep(std::time::Duration::from_millis(3500));
+            Ok((
+                "meridian.v1.AskPlatformForInstrumentReply".to_string(),
+                meridian_domain::v1::AskPlatformForInstrumentReply {
+                    reachable: true,
+                    found: true,
+                    instrument: Some(PbInstrument {
+                        instrument_id: "INS-USD0000000000000000000001".into(),
+                        asset_class: AssetClass::Cash as i32,
+                        currency: "USD".into(),
+                        description: "US dollar".into(),
+                        identifiers: vec![PbIdentifier {
+                            scheme: "iso4217".into(),
+                            value: "USD".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    detail: String::new(),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let resolve = |code: &'static str| {
+            let plugin_bus = plugin_bus.clone();
+            async move {
+                ask::<ResolveIdentifierReply>(
+                    &plugin_bus,
+                    RESOLVE_IDENTIFIER,
+                    "meridian.v1.ResolveIdentifierRequest",
+                    currency(code),
+                    "",
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let started = std::time::Instant::now();
+        let first = resolve("USD").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3200),
+            "a resolve waits on the master no longer than {CURRENCY_WAIT:?}: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            first.instrument_id.is_empty() && !first.minted,
+            "a miss: {first:?}"
+        );
+        assert_eq!(store.count().unwrap(), 0, "nothing minted behind it");
+        // The pull finishes in the background; the next resolve finds it.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let later = resolve("USD").await;
+        assert!(!later.minted, "found, not minted: {later:?}");
+        let record = store.by_id(&later.instrument_id).unwrap().unwrap();
+        assert_eq!(record.description, "US dollar");
+        // A master not reached: a miss, nothing minted, asked again later.
+        let unreached = resolve("XNR").await;
+        assert!(unreached.instrument_id.is_empty() && !unreached.minted);
+        let again = resolve("XNR").await;
+        assert!(again.instrument_id.is_empty() && !again.minted);
+        assert_eq!(store.count().unwrap(), 1, "only the pulled record");
     }
 
     fn snap() -> ResolveIdentifierRequest {

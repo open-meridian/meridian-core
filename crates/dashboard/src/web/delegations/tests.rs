@@ -224,3 +224,55 @@ async fn the_home_says_a_week_ahead_that_a_delegation_lapses() {
     assert!(home.contains("data-delegation="), "{home}");
     assert!(home.contains("lapses in 5 days"), "{home}");
 }
+
+/// Contract v20 (W6.28): Connected clients lists what each client prepared
+/// and what became of it, from the store `dashboard__list_prepared` reads.
+#[tokio::test]
+async fn connected_clients_lists_what_each_client_prepared_and_what_became_of_it() {
+    use crate::prepared::store::{Kept, Step, StepKind};
+    use meridian_pb::v1::PreparedCallState;
+    let (app, _) = app();
+    let (_, said) = connected(&app, "covers=everything&days=30").await;
+    let id = said["delegation_id"].as_str().unwrap().to_string();
+    let (cookie, _) = browser(&app, "local|ada");
+
+    let empty = body_of(get_as(&app, "/delegations", &cookie).await).await;
+    assert!(empty.contains("data-prepared-by-clients=\"0\""), "{empty}");
+
+    let kept = Kept {
+        prepared_call_id: "PC-01JAC2Q4M7K000000000000009".into(),
+        tool_name: "dashboard__set_hold".into(),
+        preparer_subject: "local|ada".into(),
+        through_delegation: id.clone(),
+        client_name: "meridian on ada-laptop".into(),
+        reason: "The records rule: six years.".into(),
+        state: PreparedCallState::Made as i32,
+        prepared_at_ns: T0,
+        settled_at_ns: Some(T0 + 60_000_000_000),
+        ..Kept::default()
+    };
+    let step = Step {
+        prepared_call_id: kept.prepared_call_id.clone(),
+        kind: StepKind::Prepared,
+        by_subject: "local|ada".into(),
+        through_delegation: id.clone(),
+        client_name: kept.client_name.clone(),
+        at_ns: T0,
+        note: String::new(),
+    };
+    app.prepared.store().insert(&kept, &step, &[]).unwrap();
+
+    let page = body_of(get_as(&app, "/delegations", &cookie).await).await;
+    let row = page
+        .split("data-prepared=\"PC-01JAC2Q4M7K000000000000009\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</tr>").next())
+        .unwrap_or_else(|| panic!("no row: {page}"));
+    assert!(row.contains(&format!("data-delegation=\"{id}\"")), "{row}");
+    assert!(row.contains("Set a hold"), "{row}");
+    assert!(row.contains("The records rule: six years."), "{row}");
+    assert!(
+        row.contains(crate::prepared::state_words(PreparedCallState::Made as i32)),
+        "{row}"
+    );
+}

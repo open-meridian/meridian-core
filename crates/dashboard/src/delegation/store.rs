@@ -458,7 +458,7 @@ const DELEGATION_COLUMNS: &str = "d.delegation_id, d.subject, d.display_name, d.
      d.covers_account_groups, d.made_at_ns, d.renewed_at_ns, d.expires_at_ns, \
      d.revoked_at_ns, d.revoked_by, d.revoked_why, d.last_used_at_ns, \
      d.last_refused_at_ns, d.last_refusal, d.directory_groups, d.groups_read_at_ns, \
-     d.covers_acting, d.acting_backfilled_at_ns";
+     d.covers_acting, d.acting_backfilled_at_ns, d.covers_prepare_only";
 
 fn delegation_of(row: &postgres::Row) -> Delegation {
     let plugins: Vec<String> = row.get(7);
@@ -479,6 +479,7 @@ fn delegation_of(row: &postgres::Row) -> Delegation {
             acting: row
                 .get::<_, Option<Vec<String>>>(20)
                 .map(|acting| acting.into_iter().collect()),
+            prepare_only: row.get::<_, Vec<String>>(22).into_iter().collect(),
         },
         made_at_ns: row.get(9),
         renewed_at_ns: row.get(10),
@@ -530,6 +531,8 @@ pub(crate) fn rows_of(kept: &[String]) -> Rows {
         let parts: Vec<&str> = entry.split(':').collect();
         match parts[..] {
             [instance, role, level] => {
+                // A role renamed at v20 read by its new name (one revision).
+                let role = meridian_domain::role_now(role);
                 rows.insert((instance.to_string(), role.to_string(), level.to_string()));
             }
             [instance, level] => {
@@ -669,6 +672,7 @@ impl DelegationStore for InPostgres {
             .acting
             .as_ref()
             .map(|acting| acting.iter().cloned().collect());
+        let prepare_only: Vec<String> = grant.covers.prepare_only.iter().cloned().collect();
         // The standing one renewed, or a new one: the partial unique index
         // makes the two one statement, whichever replica asks first.
         let id: String = tx
@@ -677,8 +681,9 @@ impl DelegationStore for InPostgres {
                      (delegation_id, subject, display_name, client_id, covers_everything,
                       covers_deployment_admin, covers_plugins, covers_account_groups,
                       made_at_ns, renewed_at_ns, expires_at_ns, directory_groups,
-                      groups_read_at_ns, covers_acting, acting_backfilled_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $9, $12, NULL)
+                      groups_read_at_ns, covers_acting, acting_backfilled_at_ns,
+                      covers_prepare_only)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $9, $12, NULL, $13)
                  ON CONFLICT (subject, client_id) WHERE revoked_at_ns IS NULL DO UPDATE
                     SET display_name = excluded.display_name,
                         covers_everything = excluded.covers_everything,
@@ -690,7 +695,8 @@ impl DelegationStore for InPostgres {
                         directory_groups = excluded.directory_groups,
                         groups_read_at_ns = excluded.groups_read_at_ns,
                         covers_acting = excluded.covers_acting,
-                        acting_backfilled_at_ns = NULL
+                        acting_backfilled_at_ns = NULL,
+                        covers_prepare_only = excluded.covers_prepare_only
                  RETURNING delegation_id",
                 &[
                     &token(),
@@ -705,6 +711,7 @@ impl DelegationStore for InPostgres {
                     &grant.expires_at_ns,
                     &grant.directory_groups,
                     &acting,
+                    &prepare_only,
                 ],
             )
             .map_err(said)?

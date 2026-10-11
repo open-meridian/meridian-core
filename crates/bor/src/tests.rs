@@ -61,6 +61,7 @@ async fn send<M: Message>(
 ) -> Result<Vec<u8>, String> {
     let stamp = Stamp {
         acting_for_subject: person.unwrap_or_default().to_string(),
+        prepared_call_id: String::new(),
         account_scope: None,
         ..Default::default()
     };
@@ -588,6 +589,7 @@ async fn a_person_acting_through_a_client_is_recorded_with_the_delegation_and_th
         acting_for_subject: PERSON.into(),
         acting_through_delegation: "DLG-1".into(),
         acting_through_client: "meridian on ada-laptop".into(),
+        prepared_call_id: String::new(),
         account_scope: None,
     };
     let (_, payload) = bus
@@ -609,6 +611,7 @@ async fn a_person_acting_through_a_client_is_recorded_with_the_delegation_and_th
             subject: PERSON.into(),
             delegation_id: "DLG-1".into(),
             client_name: "meridian on ada-laptop".into(),
+            prepared_call_id: String::new(),
         }))
     );
 }

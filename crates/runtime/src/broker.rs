@@ -27,7 +27,7 @@ use meridian_sidecar::Contract;
 const INBOX: &str = "_INBOX.>";
 
 /// The components this deployment's runtime hosts, sharing one credential.
-const RUNTIME_COMPONENTS: [&str; 5] = ["instrument", "street", "bor", "lake", "conductor"];
+const RUNTIME_COMPONENTS: [&str; 4] = ["street", "bor", "lake", "conductor"];
 
 /// The segment a lake row's subject names its dataset by (W10.5; topics.md,
 /// "Pattern"): the lake publishes on every dataset's, and a plugin subscribes
@@ -40,7 +40,26 @@ const DATASET: &str = "{dataset}";
 /// the wizard seals every credential it sends to it: a shared credential would
 /// let any component receive those, and would give that Job every other
 /// component's rights (spec/installation-and-first-run, ruling 5).
-const OWN_CREDENTIAL: [&str; 1] = ["first-run"];
+///
+/// The instrument store holds one too (contract v20, approved by the product
+/// owner 2026-10-11): it reads the launch records, the plugin catalogue, to
+/// know which roles a plugin was launched with, and that read is granted to
+/// it by its own column in the contract, not borrowed from the runtime's.
+const OWN_CREDENTIAL: [&str; 2] = ["first-run", "instrument"];
+
+/// Why a component holds a credential of its own, as its user's note says.
+fn own_credential_note(component: &str) -> String {
+    match component {
+        "first-run" => format!(
+            "{component}, its own credential rather than the runtime's: \
+             what the wizard seals reaches it and nothing else."
+        ),
+        _ => format!(
+            "{component}, its own credential rather than the runtime's: \
+             its own column in the contract, and nothing the runtime's components share."
+        ),
+    }
+}
 
 /// Something the broker admits by instance: a plugin's sidecar, holding a
 /// set of roles, or a component with a credential of its own under an
@@ -250,10 +269,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             password: Password::Env(variable(component)),
             publish,
             subscribe,
-            note: format!(
-                "{component}, its own credential rather than the runtime's: \
-                 what the wizard seals reaches it and nothing else."
-            ),
+            note: own_credential_note(component),
         });
     }
 

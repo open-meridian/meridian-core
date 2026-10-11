@@ -54,6 +54,7 @@ fn permission(id: &str, user_group: &str, account_group: &str, access_group: &st
 /// Traders (by directory group) hold write on Growth and read on Income.
 fn records() -> AccessRecords {
     AccessRecords {
+        linkable_accounts: vec![],
         accounts: vec![
             account("ACC-GROWTH", AccountState::Open),
             account("ACC-INCOME", AccountState::Open),
@@ -632,12 +633,12 @@ fn all_plugins_admin_holds_every_role_those_gained_later_included() {
     let ada = person_access(&records, ADA, &[]).plugin(OPS);
     assert!(ada.administers("custody") && ada.administers("operations"));
     assert!(ada.administers_every(&["custody".into(), "operations".into()]));
-    records.known_plugins[0].roles.push("ccm".into());
+    records.known_plugins[0].roles.push("connectivity".into());
     let ada = person_access(&records, ADA, &[]).plugin(OPS);
-    assert!(ada.administers("ccm"), "a role gained later");
+    assert!(ada.administers("connectivity"), "a role gained later");
     // Nobody else holds a role the plugin gains (W8.3).
     let tam = person_access(&records, "someone", &["trading-desk".into()]).plugin(OPS);
-    assert!(!tam.roles.contains_key("ccm"));
+    assert!(!tam.roles.contains_key("connectivity"));
 }
 
 #[test]

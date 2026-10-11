@@ -842,7 +842,7 @@ impl TicketStore for InPostgres {
             .query(
                 &format!(
                     "SELECT {NOTICE_COLUMNS} FROM dashboard_notice
-                      WHERE subject = $1 AND notice_id > $2 ORDER BY notice_id LIMIT $3"
+                      WHERE subject = $1 AND ticket_id IS NOT NULL AND notice_id > $2 ORDER BY notice_id LIMIT $3"
                 ),
                 &[&subject, &after, &(limit as i64)],
             )
@@ -856,7 +856,7 @@ impl TicketStore for InPostgres {
             .query(
                 &format!(
                     "SELECT {NOTICE_COLUMNS} FROM dashboard_notice
-                      WHERE subject = $1 ORDER BY notice_id DESC LIMIT $2"
+                      WHERE subject = $1 AND ticket_id IS NOT NULL ORDER BY notice_id DESC LIMIT $2"
                 ),
                 &[&subject, &(limit as i64)],
             )
@@ -906,7 +906,7 @@ impl TicketStore for InPostgres {
             .query(
                 &format!(
                     "SELECT {NOTICE_COLUMNS} FROM dashboard_notice
-                      WHERE subject = $1 AND NOT read ORDER BY notice_id"
+                      WHERE subject = $1 AND ticket_id IS NOT NULL AND NOT read ORDER BY notice_id"
                 ),
                 &[&subject],
             )
@@ -933,7 +933,7 @@ impl TicketStore for InPostgres {
         let mut conn = self.database.conn()?;
         let swept = conn
             .execute(
-                "DELETE FROM dashboard_notice WHERE changed_ns < $1",
+                "DELETE FROM dashboard_notice WHERE changed_ns < $1 AND ticket_id IS NOT NULL",
                 &[&before_ns],
             )
             .map_err(said)?;

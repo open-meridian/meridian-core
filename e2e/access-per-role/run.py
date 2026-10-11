@@ -241,7 +241,7 @@ def run():
     # 5 and 6 on `tools`, built at v15: its external account linked to an
     # account of its own, the same grants, a row each.
     runner("ready", "--instance", "tools")
-    second = runner("account", "Tools Brokerage").strip()
+    second = runner("account", "Tools Brokerage", "--instance", "tools").strip()
     runner("form", "--level", "admin", "--page", "/admin/accounts", "--post", "/admin/accounts/link",
            "--from-page", "offered", "external_account_id=ext-e2e", f"account_id={second}",
            "--expect", f"Linked ext-e2e to {second}", "--instance", "tools")
@@ -288,6 +288,52 @@ def run():
     must("custody's" in sent and "Ada Park holds read on custody" in sent,
          f"step 6, the sidecar refuses the custody command an operations tool sends: {sent[-400:]}")
 
+    # 8. Contract v20: the accounts an instance may link to (W6.30). One
+    # defined and not granted is offered by none of its pages and refused
+    # by the conductor; granted, it links.
+    other = runner("account", "Not Granted Brokerage", "--no-grant", "--instance", "tools").strip()
+    offered = runner("page", "--level", "admin", "/admin/accounts", "--instance", "tools")
+    must("Tools Brokerage" in offered and "Not Granted Brokerage" not in offered,
+         f"step 8, its page offers the granted accounts alone: {offered[-500:]}")
+    refused = runner("form", "--level", "admin", "--page", "/admin/accounts",
+                     "--post", "/admin/accounts/link", "--from-page", "offered",
+                     "external_account_id=ext-e2e", f"account_id={other}", "--instance", "tools",
+                     check=False)
+    said = (refused.stdout + refused.stderr).replace("&#x27;", "'")
+    must(f"Linked ext-e2e to {other}" not in said and "not one a deployment admin granted" in said,
+         f"step 8, a link to an account not granted is refused by the conductor: {said[-500:]}")
+    runner("linkable", "--grant", other, "--note", "Its second account.", "--instance", "tools")
+    runner("form", "--level", "admin", "--page", "/admin/accounts", "--post", "/admin/accounts/link",
+           "--from-page", "offered", "external_account_id=ext-e2e", f"account_id={other}",
+           "--expect", f"Linked ext-e2e to {other}", "--instance", "tools")
+
+    # 9. What agents may do (W6.29): a plugin admin sets its act's level,
+    # within the deployment admin's ceiling; an act with no check tool takes
+    # no "prepare only"; an admin of another role sets nothing.
+    runner("grant", "--to", "dan", "--role", "operations", "--level", "admin", "--instance", "tools")
+    runner("agents", "tools__open_balance", "--level", "prepare_only", "--plugin",
+           "--expect-refused", "cannot be prepared", "--instance", "tools", person="dan")
+    runner("agents", "tools__open_balance", "--level", "may_not", "--plugin",
+           "--note", "Opening balances are made by hand.", "--instance", "tools", person="dan")
+    until("Ada's narrowed agent was still listed open_balance at may not",
+          lambda: "tools__open_balance" not in listed("ada", "narrowed"))
+    answer, _ = mcp("call", "tools__open_balance", "{}", person="ada", client="narrowed", check=False)
+    must("not_listed" in answer, f"step 9, refused by name at may not: {answer[-300:]}")
+    runner("agents", "tools__open_balance", "--level", "may_make", "--plugin",
+           "--expect-refused", "Not permitted", "--instance", "tools", person="cat")
+    runner("agents", "tools__open_balance", "--level", "may_not", "--scope", "ceiling",
+           "--note", "No agent, deployment-wide.", "--instance", "tools")
+    runner("agents", "tools__open_balance", "--level", "may_make", "--plugin",
+           "--note", "Agents may again.", "--instance", "tools", person="dan")
+    must("tools__open_balance" not in listed("ada", "narrowed"),
+         "step 9, the plugin admin's may make is capped by the ceiling")
+    access_tab = runner("view", "--tab", "access", "--instance", "tools", person="dan")
+    must("capped at the ceiling" in access_tab, "step 9, the Access tab says it is capped")
+    runner("agents", "tools__open_balance", "--level", "may_make", "--scope", "ceiling",
+           "--note", "Lifted.", "--instance", "tools")
+    until("raising the ceiling did not restore the plugin admin's level",
+          lambda: "tools__open_balance" in listed("ada", "narrowed"))
+
     took = int(time.time() - started)
     print(f"e2e-access-per-role OK in {took}s: on the plugin harness, a plugin holding custody and "
           "operations, built before v15, registers with its pages serving both; a person writing "
@@ -301,7 +347,11 @@ def run():
           "acts through that role's tool and is refused the other's, and one covering everything "
           "reaches a role granted after it; and a tool is listed by its role, refused by name "
           "otherwise, and the sidecar refuses a command a tool's route sends of a role not "
-          "written")
+          "written; an account not granted is offered by no page and its link refused, then "
+          "granted and linked; a plugin admin sets its act to may not and the act leaves the "
+          "agent's list, is refused prepare only for an act with no check, an admin of another "
+          "plugin sets nothing, and under the ceiling the plugin admin's level is capped and "
+          "restored when the ceiling is raised")
 
 
 def main():

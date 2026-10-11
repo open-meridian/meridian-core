@@ -130,6 +130,7 @@ async fn admin(app: &App, headers: &HeaderMap) -> Result<Admin, Box<Response>> {
         acting_for_subject: caller.person.subject.clone(),
         acting_through_delegation: id.clone(),
         acting_through_client: client_name.clone(),
+        prepared_call_id: String::new(),
         account_scope: None,
     };
     Ok(Admin {

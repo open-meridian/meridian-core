@@ -543,8 +543,10 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
 
     // Several roles hold the union; a role the contract gives nothing holds
     // nothing, and adds nothing to another.
-    let with_match = contract.grants_for(&roles(&["custody", "match"])).unwrap();
-    assert_eq!(with_match, custody);
+    let with_confirmation = contract
+        .grants_for(&roles(&["custody", "confirmation"]))
+        .unwrap();
+    assert_eq!(with_confirmation, custody);
 
     // The lake's 1b (contract v19): ems reads and hears trades and quotes,
     // and the datasets it may read; reporting hears neither (the plan's Q9
@@ -573,9 +575,9 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(reporting.may_publish("platform.reference.query.resolve-identifier"));
     assert!(!reporting.may_publish(meridian_lake::service::LIST_TRADES));
     assert!(!reporting.may_subscribe("platform.lake.{dataset}.event.trades-recorded"));
-    let dgm = contract.grants_for(&roles(&["dgm"])).unwrap();
-    assert!(dgm.may_publish(meridian_lake::service::RECORD_TRADES));
-    assert!(dgm.may_publish(meridian_lake::service::RECORD_QUOTES));
+    let data = contract.grants_for(&roles(&["data"])).unwrap();
+    assert!(data.may_publish(meridian_lake::service::RECORD_TRADES));
+    assert!(data.may_publish(meridian_lake::service::RECORD_QUOTES));
 
     // Denial is by refusal for a name that is not a role, never by granting it
     // nothing and letting it register.

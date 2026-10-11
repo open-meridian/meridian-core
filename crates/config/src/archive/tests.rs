@@ -41,6 +41,7 @@ fn hold(role: &str, days: u32) -> SetHoldRequest {
 /// Who made a change: the person, and the delegation where one was used.
 fn by(person: &str, delegation: &str) -> crate::store::Author {
     crate::store::Author {
+        prepared_call_id: Default::default(),
         by: person.into(),
         delegation: delegation.into(),
         client: if delegation.is_empty() {
@@ -63,6 +64,7 @@ fn allow(store: &MemoryStore) {
     store
         .put_archive(
             &PluginArchive {
+                prepared_call_id: Default::default(),
                 instance_id: INSTANCE.into(),
                 allowed: true,
                 most_bytes: 53_687_091_200,

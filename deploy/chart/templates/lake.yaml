@@ -1,7 +1,7 @@
 {{- include "meridian-runtime.require" . -}}
 {{/*
   The lake (W10, contract v18): what sources say about entities -- prices
-  and bars a `dgm` records, read by the reading roles under the deployment's
+  and bars a data plugin records, read by the reading roles under the deployment's
   licences, entitlements and priority. Its own Deployment, tag and store
   beside the street's and the book's, sharing no key, join or transaction
   with either (decisions/012, decisions/032).

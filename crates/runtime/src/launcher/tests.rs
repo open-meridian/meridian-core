@@ -122,10 +122,10 @@ fn shapes(storage: bool) -> Shapes {
             live: Some("live with storage".into()),
             claim: "claim".into(),
             edge_roles: [
-                "ccm",
+                "confirmation",
+                "connectivity",
                 "custody",
-                "dgm",
-                "match",
+                "data",
                 "reporting",
                 "servicing",
                 "settlement",

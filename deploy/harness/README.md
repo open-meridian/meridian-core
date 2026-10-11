@@ -9,8 +9,11 @@ it at every commit with three of core's stand-in plugins, so a change here
 that would break a plugin's e2e breaks core's gate first.
 
 **It is a development deployment, for a test, and never a way to run one.** It
-has no platform, and a deployment's records are its own (contract v10), so every
-row a plugin records names a record the deployment minted, completed by the
+has a stand-in for the platform's master holding a handful of currencies
+(`platform.py`, contract v20): a currency is pulled from it, never minted, and
+a slow or absent master mints nothing. Every other record is the deployment's
+own (contract v10), so every other row a plugin records names a record the
+deployment minted, completed by the
 runner as a deployment admin does at the dashboard's Instruments page; its dashboard runs with `MERIDIAN_DEVELOPMENT`,
 so developer settings are shown and accepted; and nothing outlives `down -v`.
 It publishes no port. To run a deployment, install the chart.
@@ -73,7 +76,7 @@ sidecar before the deployment serves is refused, exits, and finds it serving
 on its next start. It also configures the broker for every instance and its
 roles; a name that is not a role stops the run at `broker-config`, naming it.
 
-A plugin holding an edge role (`ccm`, `custody`, `dgm`, `match`, `reporting`,
+A plugin holding an edge role (`confirmation`, `connectivity`, `custody`, `data`, `reporting`,
 `servicing` or `settlement`) is also given its storage, as a deployment gives
 it (decisions/028): a volume of its own, `storage-<instance>`, at the path
 `MERIDIAN_STORAGE_DIR` names (`/var/lib/meridian/storage`), writable by

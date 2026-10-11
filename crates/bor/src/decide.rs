@@ -50,6 +50,9 @@ pub struct Context {
     /// a person at the dashboard and for a plugin acting as itself.
     pub acting_through_delegation: String,
     pub acting_through_client: String,
+    /// The prepared change the person made it from, as the sidecar stamped
+    /// it beside them (W4.9, W6.27, contract v20); empty otherwise.
+    pub prepared_call_id: String,
     pub correlation_id: String,
     pub event_time_ns: i64,
     pub received_at_ns: i64,
@@ -94,6 +97,7 @@ impl Context {
                     } else {
                         self.acting_through_client.clone()
                     },
+                    prepared_call_id: self.prepared_call_id.clone(),
                 })
             }),
         }

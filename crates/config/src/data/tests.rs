@@ -11,6 +11,7 @@ const NOW: i64 = 1_791_417_600_000_000_000;
 
 fn ada() -> Author {
     Author {
+        prepared_call_id: Default::default(),
         by: "local|ada".into(),
         delegation: "DLG-1".into(),
         client: "Claude".into(),
@@ -35,7 +36,7 @@ fn daily() -> Catalogue {
 /// coinbase-1 reported with its catalogue, and reporting-1 beside it.
 fn store() -> MemoryStore {
     let store = MemoryStore::new();
-    for (instance, roles) in [("coinbase-1", "dgm"), ("reporting-1", "reporting")] {
+    for (instance, roles) in [("coinbase-1", "data"), ("reporting-1", "reporting")] {
         store
             .record_plugin(&KnownPlugin {
                 plugin_instance_id: instance.into(),

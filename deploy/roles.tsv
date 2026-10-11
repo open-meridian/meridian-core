@@ -5,18 +5,18 @@
 # name it. Regenerate from meridian-design with `make component-topics`.
 name	kind
 bor	component
-ccm	role
 compliance	role
 conductor	component
+confirmation	role
+connectivity	role
 custody	role
 dashboard	component
-dgm	role
+data	role
 ems	role
 first-run	component
 instrument	component
 lake	component
 launcher	component
-match	role
 oms	role
 operations	role
 portfolio	role

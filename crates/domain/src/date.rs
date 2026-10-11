@@ -7,7 +7,7 @@
 //!
 //! A date is a day the records stand for, not a time anywhere: which instant
 //! a day starts at is the declaring dataset's zone and day end, and the
-//! `dgm`'s to apply. What this offers besides reading and writing one is the
+//! data plugin's to apply. What this offers besides reading and writing one is the
 //! proleptic Gregorian arithmetic a store needs to order and step dates.
 
 use std::fmt;

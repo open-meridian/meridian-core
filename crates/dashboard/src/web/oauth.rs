@@ -571,6 +571,10 @@ async fn consent_shown(
         Ok(holdable) => holdable,
         Err(why) => return refused(&why),
     };
+    // The admins' levels read now, which the rows' tools are cut to (W6.29).
+    if let Err(why) = app.prepared.levels().await {
+        return refused(&why);
+    }
     let theirs = match app.delegations.of_person(&person.subject, now).await {
         Ok(theirs) => theirs,
         Err(failed) => return refused(&failed.to_string()),
@@ -620,6 +624,11 @@ struct Granted {
     /// consent: named as new, and reached only once allowed again
     /// (contract v18).
     new: bool,
+    /// For an act, the admins' level for agents on it and its second pair of
+    /// eyes (W6.29, contract v20): shown beside it, read from the levels the
+    /// surface is cut to. An act at "may not" is shown, never listed.
+    level: Option<crate::prepared::levels::Level>,
+    eyes: bool,
 }
 
 /// The tools each row of access grants, for a client asking for `/mcp`
@@ -648,15 +657,47 @@ fn tool_rows(
         .map_err(|stale| stale.to_string())?;
     let access = person_access(&records, &person.subject, &person.directory_groups);
     let reports = app.health.view();
+    let levels = app.prepared.levels_now();
+    let groups = crate::prepared::access_groups_of(&records, &access);
     let granted = |covers: Covers| -> Vec<Granted> {
         let narrowed = crate::delegation::narrow(access.clone(), &covers, &records);
-        crate::mcp::listed_to(&narrowed, &reports, now)
+        let every = crate::mcp::listed_to(&narrowed, &reports, now);
+        let listed: BTreeSet<String> =
+            crate::mcp::within_levels(every.clone(), &levels, &groups, &Default::default())
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect();
+        every
             .iter()
-            .map(|tool| Granted {
-                name: tool.name.clone(),
-                title: tool.title().to_string(),
-                reads: tool.reads(),
-                new: !tool.reads() && consented.is_some_and(|c| !c.contains(&tool.name)),
+            // Listed, or an act the admins left at "may not", shown as such;
+            // core's tools on a prepared change, "may not" by default, are
+            // shown only once loosened.
+            .filter(|tool| {
+                listed.contains(&tool.name)
+                    || (!tool.reads()
+                        && !crate::prepared::levels::ON_A_PREPARED_CHANGE
+                            .contains(&tool.name.as_str()))
+            })
+            .map(|tool| {
+                let (level, eyes) =
+                    if tool.reads() || crate::prepared::OWN_TOOLS.contains(&tool.name.as_str()) {
+                        (None, false)
+                    } else if !listed.contains(&tool.name) {
+                        (Some(crate::prepared::levels::Level::MayNot), false)
+                    } else {
+                        let applies = levels.applies(&tool.name, &groups, tool.preparable(), false);
+                        (Some(applies.level), applies.second_pair_of_eyes)
+                    };
+                Granted {
+                    name: tool.name.clone(),
+                    title: tool.title().to_string(),
+                    reads: tool.reads(),
+                    new: !tool.reads()
+                        && listed.contains(&tool.name)
+                        && consented.is_some_and(|c| !c.contains(&tool.name)),
+                    level,
+                    eyes,
+                }
             })
             .collect()
     };
@@ -689,6 +730,46 @@ fn tool_rows(
     })
 }
 
+/// The acts of the rows a consent ticked Prepare only, among `acting`: a
+/// plugin row's acts serving its role, the deployment admin's row core's
+/// acts.
+fn prepare_only_of(
+    app: &App,
+    fields: &[(String, String)],
+    acting: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let reports = app.health.view();
+    let mut out = BTreeSet::new();
+    for (_, row) in fields.iter().filter(|(key, _)| key == "prepare_only") {
+        if row == "deployment_admin" {
+            out.extend(
+                acting
+                    .iter()
+                    .filter(|tool| tool.starts_with("dashboard__"))
+                    .cloned(),
+            );
+            continue;
+        }
+        let Some((instance, role)) = row.split_once(':') else {
+            continue;
+        };
+        let Some(report) = reports.get(instance) else {
+            continue;
+        };
+        for tool in &report.declared_tools {
+            let name = format!("{instance}__{}", tool.name);
+            if acting.contains(&name)
+                && (role.is_empty()
+                    || tool.roles.is_empty()
+                    || tool.roles.iter().any(|r| r == role))
+            {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
 /// The tools that change something a delegation covering `covers` lists
 /// now: [`crate::mcp::listed_to`] over the person's access narrowed to it,
 /// the one source the consent page and `tools/list` answer from.
@@ -703,32 +784,60 @@ fn consented_acting(
         .current(now)
         .map_err(|stale| stale.to_string())?;
     let access = person_access(&records, &person.subject, &person.directory_groups);
+    let groups = crate::prepared::access_groups_of(&records, &access);
     let narrowed = crate::delegation::narrow(access, covers, &records);
-    Ok(crate::mcp::listed_to(&narrowed, &app.health.view(), now)
-        .iter()
-        .filter(|tool| !tool.reads())
-        .map(|tool| tool.name.clone())
-        .collect())
+    Ok(crate::mcp::within_levels(
+        crate::mcp::listed_to(&narrowed, &app.health.view(), now),
+        &app.prepared.levels_now(),
+        &groups,
+        &Default::default(),
+    )
+    .iter()
+    .filter(|tool| !tool.reads())
+    .map(|tool| tool.name.clone())
+    .collect())
 }
 
 /// A row's tools on the page: its line, `data-reach` naming the row as the
 /// form posts it and `data-tools` the names `tools/list` answers, so a check
 /// can hold the page to the surface; the titles, reads and acts apart.
 fn tools_said(reach: &str, lead: &str, tools: &[Granted]) -> String {
-    let said = |reads: bool| {
-        tools
-            .iter()
-            .filter(|tool| tool.reads == reads)
-            .map(|tool| {
-                if tool.new {
-                    format!("<mark class=\"new\">{} (new)</mark>", escape(&tool.title))
-                } else {
-                    escape(&tool.title)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    use crate::prepared::levels::Level;
+    let said =
+        |reads: bool| {
+            tools
+                .iter()
+                .filter(|tool| tool.reads == reads)
+                .map(|tool| {
+                    // The admins' level beside each act (W6.29, contract v20),
+                    // said where it is less than making it or a second person
+                    // makes it: an act an agent may make says nothing more.
+                    let level =
+                        match tool
+                            .level
+                            .filter(|level| tool.eyes || *level != Level::MayMake)
+                        {
+                            Some(level) => format!(
+                        " <span class=\"agents-may\" data-agents-may=\"{}\"{}>({}{})</span>",
+                        level.value(),
+                        if tool.eyes { " data-eyes" } else { "" },
+                        level.words().to_lowercase(),
+                        if tool.eyes { ", a second pair of eyes" } else { "" },
+                    ),
+                            None => String::new(),
+                        };
+                    let title = escape(&tool.title);
+                    if tool.new {
+                        format!("<mark class=\"new\">{title} (new)</mark>{level}")
+                    } else if tool.level == Some(Level::MayNot) {
+                        format!("<s class=\"may-not\">{title}</s>{level}")
+                    } else {
+                        format!("{title}{level}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
     let (reads, acts) = (said(true), said(false));
     let mut out = format!(
         "<p data-reach=\"{reach}\" data-tools=\"{names}\">{lead}<span class=\"hint tools\">",
@@ -736,6 +845,7 @@ fn tools_said(reach: &str, lead: &str, tools: &[Granted]) -> String {
         names = escape(
             &tools
                 .iter()
+                .filter(|tool| tool.level != Some(crate::prepared::levels::Level::MayNot))
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -809,9 +919,15 @@ fn level_select(
             on = selected(picked == Some(level)),
         ));
     }
+    // Make or Prepare only, per row (W6.17, contract v20): only ever
+    // stricter than the admins' level for agents.
     format!(
-        "<select name=\"level\" data-instance=\"{id}\" aria-label=\"Level on {id}\">{options}</select>",
-        id = escape(&crate::delegation::row_named(instance, role))
+        "<select name=\"level\" data-instance=\"{id}\" aria-label=\"Level on {id}\">{options}</select>\
+         <label class=\"check prepare-only\"><input type=\"checkbox\" name=\"prepare_only\" \
+         value=\"{instance}:{role}\"> Prepare only</label>",
+        id = escape(&crate::delegation::row_named(instance, role)),
+        instance = escape(instance),
+        role = escape(role),
     )
 }
 
@@ -993,7 +1109,8 @@ fn consent_page(consenting: &Consenting) -> String {
              <div class=\"picker-option\"><label class=\"check\"><input type=\"checkbox\" \
              name=\"deployment_admin\" value=\"1\"{on}> <span class=\"option-label\">Deployment \
              admin: its own settings, accounts and plugins, but never who holds access</span>\
-             </label></div></fieldset>",
+             </label><label class=\"check prepare-only\"><input type=\"checkbox\" name=\"prepare_only\" \
+             value=\"deployment_admin\"> Prepare only</label></div></fieldset>",
             on = checked(picked.deployment_admin),
         ));
     }
@@ -1086,6 +1203,7 @@ fn consent_page(consenting: &Consenting) -> String {
                 .iter()
                 .filter(|_| holdable.deployment_admin)
                 .chain(t.plugins.values().flatten())
+                .filter(|tool| tool.level != Some(crate::prepared::levels::Level::MayNot))
                 .map(|tool| tool.name.as_str())
                 .collect()
         })
@@ -1107,7 +1225,10 @@ fn consent_page(consenting: &Consenting) -> String {
                 "<section class=\"consent-tools\" id=\"consent-tools\" aria-labelledby=\"consent-tools-title\">\
                  <h2 id=\"consent-tools-title\">The tools each choice grants</h2>\
                  <p class=\"hint\">On this deployment's MCP surface, now: tick a row and its client \
-                 is listed these, reads and acts apart.</p>{}</section>",
+                 is listed these, reads and acts apart. Beside an act, where the deployment's \
+                 admins let an agent less than make it: prepare only, or not at all (struck \
+                 through); and where someone else must make it. A row's Prepare only is yours, \
+                 only ever stricter.</p>{}</section>",
                 if panel.is_empty() {
                     "<p class=\"empty\">No choice here reaches a tool yet.</p>".to_string()
                 } else {
@@ -1358,9 +1479,18 @@ async fn decide(
                 // listed, kept so one added later asks again (contract v18;
                 // the MCP spec, ruled 2026-10-09). One covering everything
                 // follows the person's grants and keeps none.
+                if let Err(why) = app.prepared.levels().await {
+                    return refused(&why);
+                }
                 if !consent.covers.everything {
                     match consented_acting(&app, &person, &consent.covers, now) {
-                        Ok(acting) => consent.covers.acting = Some(acting),
+                        Ok(acting) => {
+                            // The rows ticked Prepare only (W6.17, contract
+                            // v20): their acts, prepared and never made by
+                            // this client, whatever the admins' level.
+                            consent.covers.prepare_only = prepare_only_of(&app, &fields, &acting);
+                            consent.covers.acting = Some(acting);
+                        }
                         Err(why) => return refused(&why),
                     }
                 }

@@ -161,6 +161,12 @@ message PluginLaunch {
   // every stop before v17.
   string stopped_note = 19;
 
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 20;
+  // The same for the stop.
+  string stopped_prepared_call_id = 21;
+
   // Tags, retired with them (decisions/026).
   reserved 6;
   reserved "tags";
@@ -255,6 +261,10 @@ message PluginArchive {
   // /mcp, optional at the page; empty where none was given, and on every
   // change before v17.
   string note = 8;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 9;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

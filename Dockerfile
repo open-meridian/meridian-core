@@ -9,7 +9,7 @@ ARG RUST_VERSION=1.90
 ARG NODE_VERSION=22.23.3
 # The plugin UI kit, meridian-ui, at a pinned commit of its public repository.
 # Moving the kit is moving this.
-ARG MERIDIAN_UI_REV=cb21e590d4dfbba1e9fc15f6a65f39f876728ed1
+ARG MERIDIAN_UI_REV=bd7c7941323f9ea3c064ef8e05423f9c205aa627
 
 # The kit the dashboard serves at /.meridian/ui/<version>/ on every plugin host
 # and its own (spec/plugin-pages-share-one-kit.md, Q2), built from its source
@@ -75,7 +75,8 @@ LABEL org.opencontainers.image.source=https://github.com/open-meridian/meridian-
       org.opencontainers.image.description="The plugin harness: files to copy out, never to run"
 COPY deploy/harness/compose.yaml deploy/harness/harness.py deploy/harness/street.sql \
      deploy/harness/book.sql deploy/harness/tickets.sql deploy/harness/activity.sql \
-     deploy/harness/moves.sql deploy/harness/lake.sql deploy/harness/README.md /harness/
+     deploy/harness/moves.sql deploy/harness/lake.sql deploy/harness/platform.py \
+     deploy/harness/README.md /harness/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

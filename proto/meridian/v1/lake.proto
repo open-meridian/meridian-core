@@ -8,7 +8,7 @@
 // contract v19, the lake's 1b: trades and quotes. Every message here traces
 // to a matrix row; see matrix/matrix.tsv.
 //
-// The lake is append-only and bitemporal. A `dgm` records rows in batches; the
+// The lake is append-only and bitemporal. A data plugin records rows in batches; the
 // lake records, sequences and publishes each on its dataset's subject; a
 // reader seeds by a read and hears what follows. A row's subjects are the
 // deployment's own entities, resolved before the row is sent (W3.1); a
@@ -35,7 +35,7 @@ import "meridian/v1/journal.proto";
 // The envelope every row of every data type carries, as its first field
 // (spec/the-lake, requirement 4).
 message ObservationMeta {
-  // The `dgm`'s identity for this observation, made from its raw record, so
+  // The data plugin's identity for this observation, made from its raw record, so
   // the same observation recorded again changes nothing and a changed value
   // under it is a restatement. 1 to 128 characters.
   string row_key = 1;
@@ -61,7 +61,7 @@ message ObservationMeta {
   // The source's own timestamps, at most one of each kind: 0 to 6.
   repeated SourceTime source_times = 7;
 
-  // When the `dgm`'s sidecar published it: the envelope's publication time,
+  // When the data plugin's sidecar published it: the envelope's publication time,
   // which the sidecar stamps. A plugin's value is never read.
   int64 sent_at_ns = 8;
 
@@ -297,7 +297,7 @@ message Eligibility {
 
 // Whether a trade may set a statistic.
 enum Eligible {
-  // Not known: a code the `dgm` could not convert. A reader computing a bar
+  // Not known: a code the data plugin could not convert. A reader computing a bar
   // reads it as not eligible, and says so.
   ELIGIBLE_UNSPECIFIED = 0;
   ELIGIBLE_ELIGIBLE = 1;
@@ -381,7 +381,7 @@ enum QuoteCharacteristic {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// W10.4, W10.5 — a `dgm` records; the lake records and publishes
+// W10.4, W10.5 — a data plugin records; the lake records and publishes
 // ─────────────────────────────────────────────────────────────────────────────
 
 // A batch of prices, recorded whole or refused naming the item and field:
@@ -616,6 +616,14 @@ message ListTradesRequest {
   // At most 500 rows, 100 when 0.
   uint32 page_size = 7;
   string cursor = 8;
+
+  // Contract v20 (W10.6): for a data plugin only, the last trade its own instance
+  // recorded of each subject asked, per dataset and venue, with the
+  // watermark the answer was read at, so it backfills a restart's gap from
+  // the venue's history. The range and watermark are then left empty. A
+  // data plugin reads only its own instance's rows, by no entitlement; refused
+  // from any other reader, naming it.
+  bool latest_recorded = 9;
 }
 
 message ListTradesReply {
@@ -657,7 +665,7 @@ message ListQuotesReply {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// W10.7 — a read the lake cannot answer is wanted of the `dgm`
+// W10.7 — a read the lake cannot answer is wanted of the data plugin
 // ─────────────────────────────────────────────────────────────────────────────
 
 // What the lake asks of the instance serving a dataset. Coalesced: readers'
@@ -699,7 +707,7 @@ message WantWithdrawnEvent {
   string dataset = 2;
 }
 
-// What a `dgm` cannot serve of a want, per subject, with its reason. It
+// What a data plugin cannot serve of a want, per subject, with its reason. It
 // stands for the date or range the want asked, or for the latest where it
 // asked the latest, and for nothing else (contract v19): a later want of
 // another date is asked again.
@@ -742,6 +750,10 @@ message DatasetEntitlement {
   string acting_through_delegation = 7;
   string client_name = 8;
   string note = 9;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 10;
 }
 
 // The deployment's priority for one data type and price kind: an ordered list
@@ -763,6 +775,10 @@ message SourcePriority {
   string acting_through_delegation = 6;
   string client_name = 7;
   string note = 8;
+
+  // The prepared change it was made from, where a person made it from one
+  // (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+  string prepared_call_id = 9;
 }
 
 // A deployment admin sets the priority for a data type and kind, replacing
@@ -798,7 +814,8 @@ message ListDatasetsReply {
   repeated DatasetRef datasets = 1;
 
   // Each dataset's licence: to the dashboard; to a plugin, those of the
-  // datasets it may read.
+  // datasets it may read; to a data plugin, from contract v20, those of the
+  // datasets its own catalogue declares (W10.9).
   repeated DatasetLicence licences = 2;
 
   // To the dashboard every entitlement; to a plugin, its own.

@@ -36,8 +36,8 @@ const TABS: [(&str, &str); 9] = [
     ("account-groups", "Account groups"),
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
-    ("books", "Books"),
     ("holds", "Holds"),
+    ("agents", "Agents"),
     ("connected-clients", "Connected clients"),
 ];
 
@@ -146,7 +146,14 @@ fn options(chosen: &str, items: &[(String, String)]) -> String {
 /// a search box narrowing it in the browser with a count of what is shown,
 /// headings that sort it, and what it says when a search matches none. The
 /// rows come sorted from here, so without script it is in that order, whole.
-fn listing(id: &str, class: &str, noun: &str, search: &str, head: &str, rows: &str) -> String {
+pub(super) fn listing(
+    id: &str,
+    class: &str,
+    noun: &str,
+    search: &str,
+    head: &str,
+    rows: &str,
+) -> String {
     format!(
         "<div class=\"filter-row\"><input class=\"filter\" type=\"search\" data-filter=\"{id}\" hidden \
          placeholder=\"{search}\" aria-label=\"Search {noun}\">\
@@ -190,6 +197,7 @@ pub fn render(
     plugins: &[Line],
     people: &[Person],
     books: &super::books::Books,
+    agents: (String, String),
     token: &str,
     notice: &str,
 ) -> String {
@@ -833,25 +841,30 @@ pub fn render(
 
     // ── Accounts ────────────────────────────────────────────────────────────
     // W6.3: a name, and optionally a custodian, a type, an owner and a note,
-    // free text and all searchable. An edit sets all four as given.
+    // free text and all searchable. An edit sets all four as given. And each
+    // account's attributes in the book of record (W9.13, W9.14): one book per
+    // deployment (the product owner, 2026-10-10), so they sit on the account
+    // they belong to, in its Edit's "In the book", saved to the book with a
+    // reason, its own act, as the Books tab did before.
     let account_fields = format!(
         "<input type=\"hidden\" name=\"account_id\" value=\"\" data-record-id>\
          <label>Name<input name=\"name\" value=\"\" required></label>\
-         <label>Custodian<input name=\"custodian\" value=\"\" maxlength=\"{label}\" \
+         <div class=\"pair\"><label>Custodian<input name=\"custodian\" value=\"\" maxlength=\"{label}\" \
          placeholder=\"Where it is held, e.g. Fidelity\"></label>\
          <label>Type<input name=\"account_type\" value=\"\" maxlength=\"{label}\" \
-         placeholder=\"What it is, e.g. Roth IRA\"></label>\
+         placeholder=\"What it is, e.g. Roth IRA\"></label></div>\
          <label>Owner<input name=\"owner\" value=\"\" maxlength=\"{label}\" \
          placeholder=\"One ownership or grouping label, e.g. Fund I\"></label>\
-         <label>Note<textarea name=\"note\" rows=\"3\" maxlength=\"{note_most}\"></textarea></label>\
-         <p class=\"hint\">All but the name are optional and free text, and the search box \
-         finds an account by any of them. Leaving one empty clears it.</p>",
+         <label>Note<textarea name=\"note\" rows=\"2\" maxlength=\"{note_most}\"></textarea></label>\
+         <p class=\"hint\">All but the name are optional free text, found by the search; \
+         leaving one empty clears it.</p>",
         label = ACCOUNT_RECORD_CUSTODIAN_LENGTH.most,
         note_most = ACCOUNT_RECORD_NOTE_LENGTH.most,
     );
     let mut rows = String::new();
     for (row, a) in accounts_sorted.iter().enumerate() {
         let closed = a.state == AccountState::Closed as i32;
+        let (currency, method, since) = super::books::in_book(books, &a.account_id);
         let actions = if closed {
             String::new()
         } else {
@@ -862,6 +875,10 @@ pub fn render(
                 "account_type": a.account_type,
                 "owner": a.owner,
                 "note": a.note,
+                "base_currency_code": currency,
+                "lot_relief_default": method.to_string(),
+                "since": if since.is_empty() { "not yet".to_string() } else { since.clone() },
+                "reason": "",
             } });
             format!(
                 "{edit}<form method=\"post\" action=\"/admin/accounts/close#accounts\" \
@@ -891,31 +908,54 @@ pub fn render(
                 ),
             )
         };
+        // The owner, behind Edit, is still in the row, hidden, so the search
+        // finds an account by it.
         rows.push_str(&format!(
-            "<tr data-id=\"{id}\" data-name=\"{name}\"><td><span class=\"name\">{name}</span>{mark}\
-             <span class=\"id\">{id}</span>{note}</td>\
-             <td>{custodian}</td><td>{account_type}</td><td>{owner}</td><td>{state}</td>\
+            "<tr data-id=\"{id}\" data-name=\"{name}\"><td><span class=\"name\">{name}</span>{state}{mark}\
+             <span class=\"id\">{id}</span>{note}{owner}</td>\
+             <td>{custodian}</td><td>{account_type}</td><td>{currency}</td><td>{method}</td>\
              <td class=\"actions\">{actions}</td></tr>",
             id = escape(&a.account_id),
             name = escape(&a.name),
             custodian = escape(&a.custodian),
             account_type = escape(&a.account_type),
-            owner = escape(&a.owner),
-            state = if closed {
-                "<span class=\"pill\">closed</span>"
+            owner = if a.owner.is_empty() {
+                String::new()
             } else {
-                "<span class=\"pill good\">open</span>"
+                format!("<span hidden>{}</span>", escape(&a.owner))
+            },
+            currency = escape(&currency),
+            method = escape(super::books::method_named(method)),
+            state = if closed {
+                " <span class=\"pill\">closed</span>"
+            } else {
+                ""
             },
         ));
     }
-    let dialogs = dialog(
-        "account",
-        "New account",
-        "/admin/accounts#accounts",
-        token,
-        &account_fields,
-        "Create",
+    // One dialog, for a new account and for each Edit: "Account" posts the
+    // account (W6.3); "In the book", shown for an account that exists, posts
+    // its attributes to the book with a reason (W9.13). Each its own form,
+    // its own save and its own record, as before.
+    // Its look, on this page alone: every page carries the shared style,
+    // and a page as big as the consent page is held to its size.
+    let dialogs = format!(
+        "<style>{PARTS_STYLE}</style><dialog id=\"account\" class=\"parts\" aria-labelledby=\"account-title\">\
+         <div class=\"dialog-head\"><h2 id=\"account-title\" data-title-new=\"New account\">New account</h2></div>\
+         <form method=\"post\" action=\"/admin/accounts#accounts\" class=\"dialog-part\">{token}\
+         <div class=\"dialog-body\"><h3>Account</h3>{account_fields}\
+         <div class=\"save\"><button type=\"submit\" class=\"primary\" data-label-new=\"Create\">Create</button></div>\
+         </div></form>{book}\
+         <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button></div></dialog>",
+        book = super::books::book_form(token),
     );
+    let not_answering = match books {
+        super::books::Books::NotAnswering(why) => format!(
+            "<p class=\"refused\">The book of record is not answering: {}</p>",
+            escape(why)
+        ),
+        super::books::Books::Read(_) => String::new(),
+    };
     let table = if rows.is_empty() {
         "<p class=\"empty\">No accounts yet.</p>".to_string()
     } else {
@@ -924,7 +964,8 @@ pub fn render(
             " accounts",
             "accounts",
             "Search by name, custodian, type, owner or note",
-            "<th>Name</th><th>Custodian</th><th>Type</th><th>Owner</th><th>State</th><th></th>",
+            "<th>Name</th><th>Custodian</th><th>Type</th><th>Base currency</th>\
+             <th>Lot relief</th><th></th>",
             &rows,
         )
     };
@@ -936,32 +977,15 @@ pub fn render(
     } else {
         ""
     };
-    let table = format!("{table}{bubble}");
+    let table = format!("{not_answering}{table}{bubble}");
     sections.push(section(
         "accounts",
         "Accounts",
         "The firm's accounts, which permissions and plugins work on: where each is held, \
-         what it is and who owns it. Closed, never deleted.",
+         what it is, and in the book its base currency and the lots a sale relieves when it \
+         names none. Closed, never deleted; each change kept with who made it.",
         &add_button("account", "an account"),
         format!("{table}{dialogs}"),
-    ));
-
-    // ── Books ───────────────────────────────────────────────────────────────
-    // W9.13, W9.14: each open account's attributes in the book of record,
-    // set for a deployment admin with a reason; no account's data.
-    let open: Vec<AccountRecord> = records
-        .accounts
-        .iter()
-        .filter(|a| a.state != meridian_domain::v1::AccountState::Closed as i32)
-        .cloned()
-        .collect();
-    let (books_body, books_dialog) = super::books::section(&open, books, token);
-    sections.push(section(
-        "books",
-        "Books",
-        "Each account's base currency and the lots a sale relieves when it names none, in          the book of record, and the date its opening balance stands for. Each change is          journalled with its reason.",
-        "",
-        format!("{books_body}{books_dialog}"),
     ));
 
     // ── Holds ───────────────────────────────────────────────────────────────
@@ -976,6 +1000,20 @@ pub fn render(
          is deleted.",
         &add_button("hold", "a hold"),
         format!("{holds_body}{holds_dialog}"),
+    ));
+
+    // ── Agents ──────────────────────────────────────────────────────────────
+    // W6.29 (contract v20): what agents may do with each act, the ceiling on
+    // each plugin's, core's own, per access group, and the lapse period.
+    let (agents_body, agents_dialog) = agents;
+    sections.push(section(
+        "agents",
+        "Agents",
+        "What a person's agents may do with each act: make it, only prepare it for a person to \
+         make, or not reach it; and whether its change needs a second pair of eyes. A plugin's \
+         admin sets its acts within the ceiling set here.",
+        "",
+        format!("{agents_body}{agents_dialog}"),
     ));
 
     // ── Connected clients ───────────────────────────────────────────────────
@@ -1111,6 +1149,19 @@ fn roles_said(records: &AccessRecords, instance: &str) -> String {
 /// Tabs, dialogs, the pickers ([`picker::SCRIPT`], between the two halves),
 /// and a question before anything destructive. Without it the page is every
 /// section at once and every form posts as it did.
+/// The account's dialog of two parts, each its own form; and with script, an
+/// account's note behind its marker's bubble and its Edit, its row one line
+/// (the product owner, 2026-10-10).
+const PARTS_STYLE: &str = ".admin.js #accounts-table .hint.note{display:none}\
+#accounts-table :is(td,th){white-space:nowrap}\
+dialog.parts{width:min(40rem,calc(100vw - 2rem))}\
+dialog.parts .dialog-part+.dialog-part{border-top:1px solid var(--line-soft)}\
+dialog.parts h3{margin:.1rem 0 .4rem;font-size:.95rem}dialog.parts h3 .hint{display:inline;font-weight:400}\
+dialog.parts label{margin-bottom:.45rem}dialog.parts .hint{margin:.1rem 0 .3rem}\
+dialog.parts .pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 .75rem;align-items:end}\
+dialog.parts .save{display:flex;justify-content:flex-end;margin:.2rem 0 .4rem}dialog.parts .pair.save{display:grid}\
+dialog.parts .pair.save button{justify-self:end;margin:0 0 .45rem}";
+
 pub(super) const SCRIPT_START: &str = r##"(function () {
   var root = document.querySelector(".admin");
   if (!root) return;
@@ -1118,6 +1169,8 @@ pub(super) const SCRIPT_START: &str = r##"(function () {
   var sections = Array.prototype.slice.call(root.querySelectorAll("section.admin-section"));
   var tabs = Array.prototype.slice.call(root.querySelectorAll("nav.tabs a"));
   function show(id) {
+    // The Books tab is the Accounts tab's now (2026-10-10): its address still opens it.
+    if (id === "books") id = "accounts";
     if (!sections.some(function (s) { return s.id === id; })) id = sections[0].id;
     sections.forEach(function (s) { s.classList.toggle("current", s.id === id); });
     tabs.forEach(function (t) { t.classList.toggle("here", t.dataset.tab === id); });
@@ -1218,12 +1271,23 @@ pub(super) const SCRIPT_END: &str = r##"
   // from the record it was drawn with (data-fill: fields by name, and boxes
   // ticked by name), and its heading and button say which.
   function prepare(dialog, opener) {
-    var form = dialog.querySelector("form");
-    if (!form) return;
-    form.reset();
-    Array.prototype.forEach.call(form.querySelectorAll("[data-record-id]"), function (el) { el.value = ""; });
+    var forms = dialog.querySelectorAll("form");
+    if (!forms.length) return;
     var fill = null;
     try { fill = JSON.parse(opener.getAttribute("data-fill") || "null"); } catch (e) { fill = null; }
+    // A dialog of parts, each its own form: every one filled from the Edit,
+    // and a part that needs the record to exist shown only for an Edit.
+    Array.prototype.forEach.call(dialog.querySelectorAll("[data-edit-only]"), function (el) { el.hidden = !fill; });
+    Array.prototype.forEach.call(forms, function (form) { fillForm(form, fill); });
+    var head = dialog.querySelector("[data-title-new]");
+    if (head) head.textContent = fill ? opener.getAttribute("data-title") : head.getAttribute("data-title-new");
+    var submit = dialog.querySelector("[data-label-new]");
+    if (submit) submit.textContent = fill ? "Save" : submit.getAttribute("data-label-new");
+    Array.prototype.forEach.call(dialog.querySelectorAll("[data-picker]"), function (p) { if (p.refresh) p.refresh(); });
+  }
+  function fillForm(form, fill) {
+    form.reset();
+    Array.prototype.forEach.call(form.querySelectorAll("[data-record-id]"), function (el) { el.value = ""; });
     if (fill) {
       var fields = fill.fields || {};
       var checked = fill.checked || {};
@@ -1240,11 +1304,6 @@ pub(super) const SCRIPT_END: &str = r##"
         }
       });
     }
-    var head = dialog.querySelector("[data-title-new]");
-    if (head) head.textContent = fill ? opener.getAttribute("data-title") : head.getAttribute("data-title-new");
-    var submit = dialog.querySelector("[data-label-new]");
-    if (submit) submit.textContent = fill ? "Save" : submit.getAttribute("data-label-new");
-    Array.prototype.forEach.call(dialog.querySelectorAll("[data-picker]"), function (p) { if (p.refresh) p.refresh(); });
   }
   document.addEventListener("click", function (event) {
     var opener = event.target.closest("[data-dialog-open]");

@@ -417,7 +417,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     form = settings_form(ada)
     check(form.status == 200, f"the settings page: {form.status} {sentence(form)}")
     field = form.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
-    check('type="password"' in field and "not set" in field and "Required" in field,
+    check('type="password"' in field and 'placeholder="Not set"' in field and "Required" in field,
           f"the secret is a password field, not set, and says it is required: {field[:300]}")
     old = ada.get(dash(f"/admin/plugins/{INSTANCE}/settings"))
     check(old.status == 303 and (old.location or "").endswith(f"{VIEW}?tab=settings"),
@@ -431,8 +431,12 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     check(done.status == 303, f"saved: {done.status} {sentence(done)}")
     after = ada.get(dash(f"{VIEW}?tab=settings&saved=1"))
     field = after.body.split('data-setting="api_key"', 1)[-1].split("</div>", 1)[0]
-    check(">set<" in field and 'value=""' in field,
-          f"and then it is set, and its field is still empty: {field[:300]}")
+    # The field says where it stands (contract v20): who set it and when,
+    # and for a secret of sixteen characters or more, its last four.
+    stands = f'placeholder="Ends in {SECRET[-4:]} \u00b7 set by Ada Park' if len(SECRET) >= 16 \
+        else 'placeholder="Set by Ada Park'
+    check(stands in field and 'value=""' in field,
+          f"and then it is set, saying where it stands, and its field is still empty: {field[:300]}")
     check('name="value.poll_minutes" value="15"' in after.body, "the number is shown as it stands")
 
     healthy = reports.until(lambda r: r["registered"] and r["healthy"], since=mark)
@@ -465,7 +469,7 @@ def settings_reach_the_running_plugin(ada, plugin, reports):
     # W6.9: the tabs every plugin has, and a link to its area, where its own
     # pages are; it frames none of them.
     tabs = tabs_on(view)
-    check([name for _, name in tabs] == ["Overview", "Settings", "Access"],
+    check([name for _, name in tabs] == ["Overview", "Settings", "Access", "Accounts"],
           f"the view keeps the tabs every plugin has: {tabs}")
     check(f'href="/plugins/{INSTANCE}?level=admin" data-area' in view.body and "<iframe" not in view.body,
           "and links to the plugin's area under Manage, framing nothing")
@@ -599,10 +603,14 @@ def main():
                        "account_type": "Roth IRA", "owner": "Fund I", "note": "Made by the e2e."})
     account = row_id(page, "Accounts", "Plugin page account")
     check(account is not None, "the account is listed")
+    # Contract v20: the plugin links only to the accounts a deployment admin
+    # granted it, on its Accounts tab.
+    administer(ada, f"/admin/plugins/{INSTANCE}/accounts",
+               {"grant": account, "note": "The e2e's account, for the plugin to link."}, patience=45)
     row = account_row(page, account)
     noted = re.search(r'<span class="hint note" id="(account-note-\d+)">Made by the e2e\.</span>', row)
-    check(all(f"<td>{said}</td>" in row for said in ("Fidelity", "Roth IRA", "Fund I"))
-          and noted is not None,
+    check(all(f"<td>{said}</td>" in row for said in ("Fidelity", "Roth IRA"))
+          and "<span hidden>Fund I</span>" in row and noted is not None,
           f"with its custodian, type, owner and note (W6.3): {row[:400]}")
     check(noted is not None and f'class="note-mark" aria-label="Note" aria-describedby="{noted[1]}"' in row
           and 'id="accounts-note-bubble"' in page.body,

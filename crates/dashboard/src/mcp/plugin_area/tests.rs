@@ -153,7 +153,8 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
             spec.name
         );
     }
-    assert_eq!(SPECS.len(), 13, "the thirteen approved tools");
+    // v17's thirteen, and v20's read of the accounts an instance may link.
+    assert_eq!(SPECS.len(), 14, "the fourteen approved tools");
 }
 
 /// What changes who holds access: no tool's (the ruling of 2026-10-01).

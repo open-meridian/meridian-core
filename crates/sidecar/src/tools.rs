@@ -191,6 +191,98 @@ pub fn checked(
     (admitted, refusals)
 }
 
+/// The most input paths an act's `accounts` names (contract v20).
+pub const MOST_ACCOUNT_PATHS: usize = 8;
+
+/// Whether `path` -- the dictionary's grammar, `account_id` or
+/// `positions[].account_id` -- names a property the input schema has.
+pub fn schema_has(input_schema: &str, path: &str) -> bool {
+    let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(input_schema) else {
+        return false;
+    };
+    for part in path.split('.') {
+        let (name, each) = match part.strip_suffix("[]") {
+            Some(name) => (name, true),
+            None => (part, false),
+        };
+        if name.is_empty() {
+            return false;
+        }
+        let Some(next) = schema
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+            .cloned()
+        else {
+            return false;
+        };
+        schema = if each {
+            match next.get("items") {
+                Some(items) => items.clone(),
+                None => return false,
+            }
+        } else {
+            next
+        };
+    }
+    true
+}
+
+/// Contract v20 (W4.1, W6.26): what makes each admitted act preparable,
+/// held to its rules -- `checked_by` one of this plugin's read tools and set
+/// only on an act; `accounts` at most eight paths its input schema has;
+/// `made_on` one of the pages the plugin declares. A tool failing one is
+/// refused by name, the plugin admitted, as every tool's refusal is.
+pub fn preparable(
+    admitted: Vec<ToolDeclaration>,
+    pages: &[String],
+) -> (Vec<ToolDeclaration>, Vec<String>) {
+    let reads: Vec<String> = admitted
+        .iter()
+        .filter(|tool| tool.reads)
+        .map(|tool| tool.name.clone())
+        .collect();
+    let mut kept = Vec::new();
+    let mut refusals = Vec::new();
+    for tool in admitted {
+        let name = &tool.name;
+        let refusal = if !tool.checked_by.is_empty() && tool.reads {
+            Some(format!(
+                "the tool {name} is refused: checked_by names a check tool, and {name} is a read, which changes nothing to check"
+            ))
+        } else if !tool.checked_by.is_empty() && !reads.contains(&tool.checked_by) {
+            Some(format!(
+                "the tool {name} is refused: checked_by names {:?}, which is no read tool of this plugin",
+                tool.checked_by
+            ))
+        } else if tool.accounts.len() > MOST_ACCOUNT_PATHS {
+            Some(format!(
+                "the tool {name} is refused: accounts names {} paths; at most {MOST_ACCOUNT_PATHS}",
+                tool.accounts.len()
+            ))
+        } else if let Some(stranger) = tool
+            .accounts
+            .iter()
+            .find(|path| !schema_has(&tool.input_schema, path))
+        {
+            Some(format!(
+                "the tool {name} is refused: accounts names {stranger:?}, which its input schema does not have"
+            ))
+        } else if !tool.made_on.is_empty() && !pages.contains(&tool.made_on) {
+            Some(format!(
+                "the tool {name} is refused: made_on names {:?}, which is none of the pages this plugin declares",
+                tool.made_on
+            ))
+        } else {
+            None
+        };
+        match refusal {
+            Some(refusal) => refusals.push(refusal),
+            None => kept.push(tool),
+        }
+    }
+    (kept, refusals)
+}
+
 /// Whether a request naming the tool `name` may pass at `method` and
 /// `path` (its query aside): only at that tool's route (W4.9); or why not.
 pub fn admits(
@@ -228,7 +320,52 @@ mod tests {
             input_schema: r#"{"type":"object"}"#.into(),
             output_schema: String::new(),
             roles: vec![],
+            checked_by: String::new(),
+            accounts: vec![],
+            made_on: String::new(),
         }
+    }
+
+    #[test]
+    fn an_acts_check_tool_accounts_and_page_are_held_to_their_rules() {
+        let mut check = tool("check_draft", "POST", "/check");
+        check.reads = true;
+        check.input_schema = r#"{"type":"object","properties":{"account_id":{"type":"string"},"positions":{"type":"array","items":{"type":"object","properties":{"account_id":{"type":"string"}}}}}}"#.into();
+        let act = |checked_by: &str, accounts: &[&str], made_on: &str| ToolDeclaration {
+            checked_by: checked_by.into(),
+            accounts: accounts.iter().map(|path| path.to_string()).collect(),
+            made_on: made_on.into(),
+            input_schema: check.input_schema.clone(),
+            ..tool("confirm", "POST", "/confirm")
+        };
+        let pages = vec!["/opening".to_string()];
+        let good = act(
+            "check_draft",
+            &["account_id", "positions[].account_id"],
+            "/opening",
+        );
+        let (kept, refused) = preparable(vec![check.clone(), good], &pages);
+        assert_eq!(kept.len(), 2, "{refused:?}");
+        for (bad, says) in [
+            (act("nothing", &[], ""), "no read tool"),
+            (
+                act("check_draft", &["owner_id"], ""),
+                "input schema does not have",
+            ),
+            (
+                act("check_draft", &["positions.account_id"], ""),
+                "input schema does not have",
+            ),
+            (act("check_draft", &[], "/elsewhere"), "none of the pages"),
+        ] {
+            let (kept, refused) = preparable(vec![check.clone(), bad], &pages);
+            assert_eq!(kept.len(), 1);
+            assert!(refused[0].contains(says), "{refused:?}");
+        }
+        let mut read = check.clone();
+        read.checked_by = "check_draft".into();
+        let (_, refused) = preparable(vec![check.clone(), read], &pages);
+        assert!(refused[0].contains("is a read"), "{refused:?}");
     }
 
     #[test]

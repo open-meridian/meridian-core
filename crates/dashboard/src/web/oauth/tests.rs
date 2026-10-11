@@ -1137,7 +1137,8 @@ async fn forty_plugins_and_three_hundred_account_groups_make_one_short_page() {
     // One question, one choice per row: a page a person reads.
     let size = page.len();
     println!("the consent page at 40 plugins and 300 account groups: {size} bytes");
-    assert!(size < 150_000, "{size} bytes");
+    // Each row lists the prepared change's own tools too (contract v20).
+    assert!(size < 160_000, "{size} bytes");
     // And finishing it is a handful of fields: one search, one level, one
     // group.
     let decided = post_form(
@@ -1469,4 +1470,65 @@ async fn the_consent_page_lists_each_tool_tools_list_answers_for_each_kind_of_pe
         let listed = listed_through(&app, name, &everything_offered(&page)).await;
         assert_eq!(said, listed, "{name}: the page and tools/list agree");
     }
+}
+
+/// Contract v20 (W6.29): beside each act, the admins' level for agents and
+/// its second pair of eyes; an act at "may not" shown struck through and
+/// never among the names `tools/list` answers.
+#[test]
+fn the_consent_page_says_the_admins_level_beside_each_act() {
+    use crate::prepared::levels::Level;
+    let tool = |name: &str, title: &str, reads: bool, level: Option<Level>, eyes: bool| Granted {
+        name: name.into(),
+        title: title.into(),
+        reads,
+        new: false,
+        level,
+        eyes,
+    };
+    let said = tools_said(
+        "ops-1:operations:write",
+        "",
+        &[
+            tool("ops-1__read_drafts", "Read drafts", true, None, false),
+            tool(
+                "ops-1__confirm",
+                "Confirm a balance",
+                false,
+                Some(Level::PrepareOnly),
+                true,
+            ),
+            tool(
+                "ops-1__close",
+                "Close a book",
+                false,
+                Some(Level::MayNot),
+                false,
+            ),
+            tool(
+                "ops-1__note",
+                "Add a note",
+                false,
+                Some(Level::MayMake),
+                false,
+            ),
+        ],
+    );
+    assert!(
+        said.contains("data-tools=\"ops-1__read_drafts ops-1__confirm ops-1__note\""),
+        "{said}"
+    );
+    assert!(
+        said.contains("Confirm a balance <span class=\"agents-may\" data-agents-may=\"prepare_only\" data-eyes>(prepare only, a second pair of eyes)</span>"),
+        "{said}"
+    );
+    assert!(
+        said.contains("<s class=\"may-not\">Close a book</s>"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Add a note") && !said.contains("data-agents-may=\"may_make\""),
+        "{said}"
+    );
+    assert!(!said.contains("Read drafts <span"), "{said}");
 }

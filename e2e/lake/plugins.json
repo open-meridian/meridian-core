@@ -1,5 +1,5 @@
 [
-  {"instance": "coin", "image": "meridian-python-interop", "roles": ["dgm"]},
+  {"instance": "coin", "image": "meridian-python-interop", "roles": ["data"]},
   {"instance": "book", "image": "meridian-python-interop", "roles": ["reporting"]},
   {"instance": "other", "image": "meridian-python-interop", "roles": ["reporting"]},
   {"instance": "desk", "image": "meridian-python-interop", "roles": ["ems"]}

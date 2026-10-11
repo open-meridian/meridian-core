@@ -1152,6 +1152,74 @@ async fn trades_are_heard_every_one_and_a_loss_is_caught_up_by_watermark_late_pr
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_data_plugin_reads_its_own_last_trade_and_its_datasets_licences() {
+    // Contract v20 (W10.6, W10.9): its own rows, by no entitlement.
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    record_rows(
+        &h,
+        "trades",
+        vec![
+            Observation::Trade(trade("t1", NOW + 1_000, "62000")),
+            Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+        ],
+    )
+    .unwrap();
+    let asked = meridian_domain::v1::ListTradesRequest {
+        subjects: vec![SubjectRef {
+            entity_id: BTC.into(),
+        }],
+        latest_recorded: true,
+        ..Default::default()
+    };
+    let own = tokio::task::block_in_place(|| {
+        h.lake
+            .latest_recorded(&asked, &envelope("coinbase-1", true, ""))
+    })
+    .unwrap();
+    assert_eq!(
+        own.trades.len(),
+        1,
+        "the last one per subject, dataset and venue"
+    );
+    assert_eq!(own.trades[0].meta.as_ref().unwrap().row_key, "t2");
+    assert!(own.watermark.unwrap().partitions[0].sequence > 0);
+    let refused = tokio::task::block_in_place(|| {
+        h.lake
+            .latest_recorded(&asked, &envelope("signal-1", true, ""))
+    })
+    .unwrap_err();
+    assert!(
+        refused.contains("declares no dataset of trades"),
+        "{refused}"
+    );
+    let ranged = tokio::task::block_in_place(|| {
+        h.lake.latest_recorded(
+            &meridian_domain::v1::ListTradesRequest {
+                valid_from_ns: NOW,
+                ..asked.clone()
+            },
+            &envelope("coinbase-1", true, ""),
+        )
+    })
+    .unwrap_err();
+    assert!(ranged.contains("left empty"), "{ranged}");
+
+    let listed = h
+        .lake
+        .list_datasets(&envelope("coinbase-1", true, ""))
+        .unwrap();
+    assert!(listed
+        .datasets
+        .iter()
+        .any(|d| d.dataset == "coinbase-1:live"));
+    assert!(listed
+        .licences
+        .iter()
+        .any(|l| l.dataset == "coinbase-1:live"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_trade_or_quote_is_refused_naming_its_field() {
     let h = harness();
     h.lake.configured(&live_configuration());
@@ -1314,8 +1382,8 @@ async fn a_decline_stands_for_the_date_asked_only_and_a_streamed_latest_is_stand
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_standing_want_is_delivered_again_under_its_id_so_a_restarted_dgm_resumes() {
-    // A dgm holds nothing it cannot lose: one restarted hears its standing
+async fn a_standing_want_is_delivered_again_under_its_id_so_a_restarted_data_plugin_resumes() {
+    // A data plugin holds nothing it cannot lose: one restarted hears its standing
     // wants again, the same want and ID, within a minute; one that holds the
     // want already hears what it holds.
     let h = harness();

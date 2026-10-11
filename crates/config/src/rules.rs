@@ -161,7 +161,90 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
             request.account_id
         ));
     }
+    // Only an account the deployment admin granted this instance (W6.30,
+    // contract v20; the product owner, 2026-10-10). Linking it again to the
+    // account it is linked to already stands.
+    let granted = snapshot
+        .linkable
+        .get(&request.plugin_instance_id)
+        .is_some_and(|linkable| linkable.account_ids.contains(&request.account_id));
+    let standing = snapshot.links.iter().any(|link| {
+        link.plugin_instance_id == request.plugin_instance_id
+            && link.external_account_id == request.external_account_id
+            && link.account_id == request.account_id
+    });
+    if !granted && !standing {
+        return Err(meridian_bus::refusal(
+            meridian_pb::v1::RefusalReason::AccountNotLinkable as i32,
+            format!(
+                "account {} is not one a deployment admin granted {} to link to; nothing is \
+                 linked: ask a deployment admin to grant it on the plugin's Accounts tab",
+                request.account_id, request.plugin_instance_id
+            ),
+        ));
+    }
     one_external_account(snapshot, request)
+}
+
+/// The most accounts one change grants or withdraws (W6.30).
+pub const MOST_LINKABLE_CHANGE: usize = 1_000;
+
+/// W6.30: a grant or withdrawal of an instance's linkable accounts, held to
+/// its rules: a plugin the deployment has heard report, never one holding
+/// only `connectivity` (which reaches accounts through its one `ems`), each
+/// account existing, at most 1,000 each way, and the note's bound.
+pub fn linkable(
+    snapshot: &Snapshot,
+    request: &meridian_domain::v1::SetLinkableAccountsRequest,
+    through_delegation: bool,
+) -> Verdict {
+    required(&request.plugin_instance_id, "the plugin")?;
+    let plugin = snapshot
+        .plugins
+        .iter()
+        .find(|p| p.plugin_instance_id == request.plugin_instance_id)
+        .ok_or_else(|| {
+            format!(
+                "plugin_instance_id: there is no plugin that has reported, named {}",
+                request.plugin_instance_id
+            )
+        })?;
+    let roles = meridian_domain::roles_now(&plugin.roles);
+    if !roles.is_empty() && roles.iter().all(|role| role == "connectivity") {
+        return Err(format!(
+            "plugin_instance_id: {} is a connectivity plugin, which links no accounts and takes no \
+             grant: it reaches accounts only through its one ems",
+            request.plugin_instance_id
+        ));
+    }
+    for (field, ids) in [
+        ("grant_account_ids", &request.grant_account_ids),
+        ("withdraw_account_ids", &request.withdraw_account_ids),
+    ] {
+        if ids.len() > MOST_LINKABLE_CHANGE {
+            return Err(format!(
+                "{field}: {} accounts; at most {MOST_LINKABLE_CHANGE}",
+                ids.len()
+            ));
+        }
+    }
+    for (i, id) in request.grant_account_ids.iter().enumerate() {
+        if !snapshot
+            .records
+            .accounts
+            .iter()
+            .any(|a| &a.account_id == id)
+        {
+            return Err(format!("grant_account_ids[{i}]: there is no account {id}"));
+        }
+    }
+    if request.note.chars().count() > 4_000 {
+        return Err("note: at most 4,000 characters".into());
+    }
+    if through_delegation && request.note.trim().is_empty() {
+        return Err("note: a change made through a client says why".into());
+    }
+    Ok(())
 }
 
 /// An account has one external account linked to it, through whichever

@@ -189,6 +189,9 @@ impl Contract {
     /// nothing, which would admit it quietly with no bus and nobody the wiser.
     /// No roles at all is a plugin admitted with no topics.
     pub fn grants_for(&self, roles: &[String]) -> Result<Grants, String> {
+        // A role renamed at contract v20 is read by its new name for one
+        // revision: a launch or a version recorded before the rename.
+        let roles = &meridian_domain::roles_now(roles);
         if let Some(stranger) = roles.iter().find(|role| !self.is_role(role)) {
             return Err(if self.is_component(stranger) {
                 format!("`{stranger}` is one of the deployment's own components, not a role a plugin may hold")

@@ -101,6 +101,9 @@ fn tool(
     reads: bool,
 ) -> ToolDeclaration {
     ToolDeclaration {
+        accounts: Default::default(),
+        checked_by: Default::default(),
+        made_on: Default::default(),
         name: name.into(),
         title: name.replace('_', " "),
         description: format!("{name}, for the test."),
@@ -174,7 +177,11 @@ async fn harness(deployment_admin: bool) -> Harness {
                 pages: vec![],
             }),
             tools: vec![
-                tool("confirm", "POST", "/confirm", &[AccessLevel::Write], false),
+                // Preparable (contract v20): its check is the plugin's read.
+                ToolDeclaration {
+                    checked_by: "read_things".into(),
+                    ..tool("confirm", "POST", "/confirm", &[AccessLevel::Write], false)
+                },
                 tool(
                     "read_things",
                     "GET",
@@ -271,6 +278,7 @@ async fn harness(deployment_admin: bool) -> Harness {
         kit: None,
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     });
     Harness {
         app,
@@ -335,6 +343,7 @@ async fn token(app: &App, covers: Covers, resource: Resource) -> String {
 
 fn covering(levels: &[&str], deployment_admin: bool) -> Covers {
     Covers {
+        prepare_only: Default::default(),
         everything: false,
         deployment_admin,
         plugins: levels
@@ -406,11 +415,12 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
         [
             TICKET_TOOLS.as_slice(),
             &["dashboard__list_plugins"],
+            PREPARED_TOOLS.as_slice(),
             &["ops-1__confirm", "ops-1__read_things"]
         ]
         .concat()
     );
-    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + 2];
+    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 2];
     assert_eq!(listed["annotations"]["readOnlyHint"], true);
     assert!(listed["description"]
         .as_str()
@@ -430,11 +440,21 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
         [
             TICKET_TOOLS.as_slice(),
             &["dashboard__list_plugins"],
+            PREPARED_TOOLS.as_slice(),
             &["ops-1__read_things"]
         ]
         .concat()
     );
 }
+
+/// A prepared change's own tools listed by default (contract v20): making,
+/// discarding and sharing one are at may not until an admin loosens them.
+const PREPARED_TOOLS: [&str; 4] = [
+    "dashboard__prepare_call",
+    "dashboard__list_prepared",
+    "dashboard__withdraw_prepared",
+    "dashboard__read_prepared",
+];
 
 /// Core's ticket and inbox tools, in the order they are listed.
 const TICKET_TOOLS: [&str; 7] = [
@@ -463,7 +483,12 @@ async fn a_deployment_admins_delegation_lists_cores_tools_first_when_it_covers_t
         .collect();
     assert_eq!(
         cores,
-        [TICKET_TOOLS.as_slice(), &["dashboard__list_plugins"]].concat(),
+        [
+            TICKET_TOOLS.as_slice(),
+            &["dashboard__list_plugins"],
+            PREPARED_TOOLS.as_slice()
+        ]
+        .concat(),
         "the Instruments tools are the deployment admin's alone; a writer lists the plugins"
     );
 }
@@ -997,6 +1022,8 @@ fn area_records(entries: &[(&str, AccessLevel)], deployment_admin: bool) -> Acce
         updated_at_ns: 5,
         updated_by: ADA.into(),
         changes: vec![SettingLastChange {
+            hint: Default::default(),
+            prepared_call_id: Default::default(),
             name: "api_key".into(),
             changed_by: ADA.into(),
             changed_at_ns: 4,
@@ -1232,6 +1259,7 @@ fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
         kit: None,
         bounds: Arc::default(),
         tickets: Arc::default(),
+        prepared: Arc::default(),
     });
     (app, heard)
 }
@@ -1240,6 +1268,7 @@ fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
 /// when said.
 fn covering_roles(rows: &[(&str, &str)], deployment_admin: bool) -> Covers {
     Covers {
+        prepare_only: Default::default(),
         everything: false,
         deployment_admin,
         plugins: rows
@@ -2261,4 +2290,266 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
     )
     .await;
     assert_eq!(structured(&said)["reason"], "not_listed", "{said}");
+}
+
+// ── Contract v20: a prepared change, and the admins' levels ─────────────
+
+#[tokio::test]
+async fn an_agent_prepares_a_hold_its_person_makes_it_and_the_levels_hold_a_direct_call_back() {
+    let (app, heard) = area_app(area_records(&[], true));
+    let token = token(&app, covering_roles(&[], true), Resource::Mcp).await;
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    let listed = names(&said);
+    assert!(listed.contains(&"dashboard__prepare_call".to_string()));
+    assert!(
+        !listed.contains(&"dashboard__make_prepared".to_string()),
+        "making through a tool is may not by default"
+    );
+
+    // Prepared: checked by the act's own code, its row held back.
+    let hold = json!({"role": "custody", "days": 3650, "note": "Seven years."});
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__prepare_call",
+            json!({"tool": "dashboard__set_hold", "arguments": hold, "reason": "The firm keeps seven years."}),
+        ),
+    )
+    .await;
+    let prepared = structured(&said);
+    assert_eq!(prepared["outcome"], "made", "{said}");
+    let id = prepared["data"]["prepared_call_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(crate::prepared::is_prepared_call_id(&id), "{id}");
+    assert!(
+        heard
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(t, _, _)| t != super::plugin_area::SET_HOLD),
+        "nothing changed"
+    );
+    // A check the act's code refuses keeps nothing.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__prepare_call",
+            json!({"tool": "dashboard__set_hold", "arguments": {"role": "custody"}, "reason": "no days"}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "refused", "{said}");
+
+    // What this delegation prepared, and the levels of what it reaches.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call("dashboard__list_prepared", json!({})),
+    )
+    .await;
+    let data = &structured(&said)["data"];
+    assert_eq!(
+        data["prepared"][0]["prepared_call_id"],
+        id.as_str(),
+        "{said}"
+    );
+    assert!(data["prepared"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("seven years"));
+    assert_eq!(data["prepared_lapse_days"], 30);
+    assert!(data["acts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|act| act["tool"] == "dashboard__set_hold" && act["agents_may"] == "may_make"));
+
+    // At prepare only, a direct call is refused naming the level; still
+    // preparable. At may not, it is listed to none.
+    let ada = crate::prepared::person_caller(ADA, "Ada", &[]);
+    let now = app.clock.now_ns();
+    app.prepared
+        .set_level(
+            "dashboard__set_hold",
+            "act",
+            Some((crate::prepared::levels::Level::PrepareOnly, false)),
+            &ada,
+            "agents prepare holds",
+            now,
+        )
+        .await
+        .unwrap();
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call("dashboard__set_hold", hold.clone()),
+    )
+    .await;
+    assert_eq!(structured(&said)["reason"], "prepare_only", "{said}");
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    let described = said["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "dashboard__set_hold")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(described.contains("may only prepare it"), "{described}");
+    app.prepared
+        .set_level(
+            "dashboard__set_hold",
+            "act",
+            Some((crate::prepared::levels::Level::MayNot, false)),
+            &ada,
+            "no agent",
+            now,
+        )
+        .await
+        .unwrap();
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    assert!(!names(&said).contains(&"dashboard__set_hold".to_string()));
+    let changes = app
+        .prepared
+        .blocking(|store| store.level_changes("dashboard__set_hold"))
+        .await
+        .unwrap();
+    assert_eq!(changes.len(), 2, "each change its own record");
+    assert_eq!(changes[1].from, "prepare_only, second pair of eyes off");
+    assert_eq!(changes[1].to, "may_not, second pair of eyes off");
+
+    // The person makes what their agent prepared, from the Inbox: the hold
+    // sent stamped with the prepared change, and it settles made. With the
+    // gate on, the person behind the agent may not make it.
+    app.prepared
+        .set_level(
+            "dashboard__set_hold",
+            "act",
+            Some((crate::prepared::levels::Level::MayMake, true)),
+            &ada,
+            "two people",
+            now,
+        )
+        .await
+        .unwrap();
+    let refused = crate::prepared::make(&app, &ada, &id, None, "")
+        .await
+        .unwrap_err();
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap()
+            .contains("second pair of eyes"),
+        "{refused}"
+    );
+    app.prepared
+        .set_level(
+            "dashboard__set_hold",
+            "act",
+            Some((crate::prepared::levels::Level::MayMake, false)),
+            &ada,
+            "one person",
+            now,
+        )
+        .await
+        .unwrap();
+    heard.lock().unwrap().clear();
+    crate::prepared::make(&app, &ada, &id, None, "")
+        .await
+        .unwrap();
+    let sent = heard.lock().unwrap().clone();
+    let (_, meta, _) = sent
+        .iter()
+        .find(|(t, _, _)| t == super::plugin_area::SET_HOLD)
+        .expect("the hold sent");
+    assert_eq!(meta.acting_for_subject, ADA);
+    assert_eq!(meta.prepared_call_id, id);
+    assert!(
+        meta.acting_through_delegation.is_empty(),
+        "the person's own act"
+    );
+    let kept = app.prepared.get(&id).await.unwrap().unwrap();
+    assert_eq!(kept.state, meridian_pb::v1::PreparedCallState::Made as i32);
+    // Settled once: the agent cannot withdraw it now.
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__withdraw_prepared",
+            json!({"prepared_call_id": id, "note": "late"}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "refused", "{said}");
+}
+
+/// Contract v20 (W6.29; CallerClaims.second_pair_of_eyes): every assertion
+/// the dashboard mints for a plugin names its acts whose second pair of eyes
+/// is on for the person, and the plugin receives it through its sidecar.
+#[tokio::test]
+async fn the_claims_name_the_plugins_acts_under_a_second_pair_of_eyes() {
+    let h = harness(false).await;
+    let ada = crate::prepared::person_caller(ADA, "Ada", &[]);
+    let now = h.app.clock.now_ns();
+    let read_once = |h: &Harness| {
+        let reached = h.reached.lock().unwrap().clone();
+        let (headers, _, _, _) = reached
+            .last()
+            .expect("a request reached the plugin")
+            .clone();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(headers["meridian-caller"].to_str().unwrap())
+            .unwrap();
+        let assertion = meridian_pb::v1::CallerAssertion::decode(bytes.as_slice()).unwrap();
+        meridian_pb::v1::CallerClaims::decode(assertion.claims.as_slice()).unwrap()
+    };
+    let token = token(&h.app, covering(&["write", "read"], false), Resource::Mcp).await;
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&token),
+        &[],
+        call("ops-1__read_things", json!({})),
+    )
+    .await;
+    assert_eq!(said["result"]["isError"], false, "{said}");
+    assert!(
+        read_once(&h).second_pair_of_eyes.is_empty(),
+        "no gate is on yet"
+    );
+
+    h.app
+        .prepared
+        .set_level(
+            "ops-1__confirm",
+            crate::prepared::levels::CEILING,
+            Some((crate::prepared::levels::Level::MayMake, true)),
+            &ada,
+            "two people confirm",
+            now,
+        )
+        .await
+        .unwrap();
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&token),
+        &[],
+        call("ops-1__read_things", json!({})),
+    )
+    .await;
+    assert_eq!(said["result"]["isError"], false, "{said}");
+    assert_eq!(
+        read_once(&h).second_pair_of_eyes,
+        vec!["confirm".to_string()]
+    );
 }

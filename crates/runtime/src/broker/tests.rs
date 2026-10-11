@@ -4,6 +4,7 @@ const TOPICS: &str = "\
 topic\tkind\tpublisher\tsubscriber
 platform.config.command.apply-first-run-configuration\tcommand\tdashboard\tfirst-run
 platform.config.query.enrolment\tquery\tdashboard\tconductor
+platform.config.query.plugin-catalogue\tquery\tdashboard,instrument\tconductor
 platform.config.query.plugin-configuration\tquery\tsidecar\tconductor
 platform.custody.*.event.sync-status\tevent\tcustody\tdashboard
 platform.reference.event.instrument-applied\tevent\tinstrument\tdashboard,custody
@@ -174,14 +175,53 @@ fn first_run_holds_its_own_credential() {
     );
 }
 
+/// Contract v20 (the product owner, 2026-10-11): the instrument store asks
+/// for the plugin catalogue with its own credential, from its own column, and
+/// the runtime's shared credential carries none of the instrument store's.
+#[test]
+fn the_instrument_store_reads_the_plugin_catalogue_with_its_own_credential() {
+    let users = users(&contract(), &[]).expect("generates");
+    let instrument = user(&users, "instrument");
+    assert!(
+        instrument
+            .publish
+            .contains(&"platform.config.query.plugin-catalogue".to_string()),
+        "{:?}",
+        instrument.publish
+    );
+    assert!(instrument
+        .publish
+        .contains(&"platform.reference.event.instrument-applied".to_string()));
+    assert!(
+        !instrument
+            .publish
+            .contains(&"platform.street.command.record-holding".to_string())
+            && !instrument
+                .subscribe
+                .contains(&"platform.street.command.record-holding".to_string()),
+        "the instrument store holds nothing of the street's"
+    );
+    let runtime = user(&users, "runtime");
+    assert!(
+        !runtime
+            .publish
+            .iter()
+            .any(|s| s == "platform.config.query.plugin-catalogue"
+                || s == "platform.reference.event.instrument-applied"),
+        "the runtime's shared credential carries the instrument store's topics: {:?}",
+        runtime.publish
+    );
+    assert_eq!(
+        instrument.password,
+        Password::Env("MERIDIAN_NATS_INSTRUMENT".into())
+    );
+}
+
 #[test]
 fn the_runtime_takes_the_contracts_own_columns() {
     let users = users(&contract(), &[]).expect("generates");
     let runtime = user(&users, "runtime");
 
-    assert!(runtime
-        .publish
-        .contains(&"platform.reference.event.instrument-applied".to_string()));
     assert!(runtime
         .subscribe
         .contains(&"platform.config.query.enrolment".to_string()));

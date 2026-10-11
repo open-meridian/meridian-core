@@ -387,7 +387,7 @@ pub fn licence_refused(
     None
 }
 
-/// A catalogue held to W4.1's rules: refused on a version not holding `dgm`,
+/// A catalogue held to W4.1's rules: refused on a version not holding `data`,
 /// a key repeated or not of its form, a data type the lake does not have, a
 /// field not an entry of its data type, an invalid time zone, or a value past
 /// the dictionary's bounds; each naming where.
@@ -395,10 +395,10 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
     if catalogue.datasets.is_empty() {
         return None;
     }
-    if !roles.iter().any(|role| role == "dgm") {
+    if !roles.iter().any(|role| role == "data") {
         return Some(format!(
-            "declaration.catalogue declares datasets on a version holding {}, not dgm: the \
-             catalogue is a dgm's",
+            "declaration.catalogue declares datasets on a version holding {}, not data: the \
+             catalogue is a data plugin's",
             if roles.is_empty() {
                 "no role".to_string()
             } else {
@@ -537,11 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn a_catalogue_is_a_dgms_and_held_to_its_rules() {
-        assert_eq!(refused(daily(), &["dgm"]), None);
+    fn a_catalogue_is_a_data_plugins_and_held_to_its_rules() {
+        assert_eq!(refused(daily(), &["data"]), None);
         assert!(refused(daily(), &["reporting"])
             .unwrap()
-            .contains("not dgm"));
+            .contains("not data"));
         for (wrong, words) in [
             (
                 DatasetDeclaration {
@@ -600,14 +600,14 @@ mod tests {
                 "venue_id",
             ),
         ] {
-            let said = refused(wrong, &["dgm"]).expect(words);
+            let said = refused(wrong, &["data"]).expect(words);
             assert!(said.contains(words), "{words}: {said}");
         }
         let twice = catalogue_refused(
             &Catalogue {
                 datasets: vec![daily(), daily()],
             },
-            &["dgm".to_string()],
+            &["data".to_string()],
         )
         .unwrap();
         assert!(twice.contains("twice"), "{twice}");
@@ -625,7 +625,7 @@ mod tests {
         };
         assert!(is_field_of(&streamed, "meridian.v1.Trade.price"));
         assert!(is_field_of(&streamed, "meridian.v1.Quote.bid"));
-        assert_eq!(refused(streamed, &["dgm"]), None);
+        assert_eq!(refused(streamed, &["data"]), None);
         assert_eq!(instance_of("coinbase-1:daily"), Some("coinbase-1"));
         assert_eq!(dataset_id("coinbase-1", "daily"), "coinbase-1:daily");
     }

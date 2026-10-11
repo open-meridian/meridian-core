@@ -68,7 +68,7 @@ services:
         [ -s /keys/settings/key ] || openssl rand -out /keys/settings/key 32
         drawn() { printf 'h%s' "$$(openssl rand -hex 24)"; }
         [ -s /secrets/postgres ] || drawn > /secrets/postgres
-        for user in runtime first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
+        for user in runtime instrument first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
           [ -s "/secrets/nats/$$user" ] || drawn > "/secrets/nats/$$user"
         done
         b64() { xxd -r -p | base64 | tr -d '=\n'; }
@@ -243,7 +243,7 @@ services:
     volumes:
       - secrets:/secrets:ro
 
-  # The lake (W10, contract v18): what a dgm records, read by the reading
+  # The lake (W10, contract v18): what a data plugin records, read by the reading
   # roles under the deployment's licences, entitlements and priority.
   lake:
     <<: *runtime
@@ -265,8 +265,8 @@ services:
     command:
       - |
         set -e
-        broker=$$(cat /secrets/nats/runtime); db=$$(cat /secrets/postgres)
-        export MERIDIAN_BROKER_URL=nats://runtime:$$broker@nats:4222
+        broker=$$(cat /secrets/nats/instrument); db=$$(cat /secrets/postgres)
+        export MERIDIAN_BROKER_URL=nats://instrument:$$broker@nats:4222
         export MERIDIAN_DATABASE_URL=postgres://meridian:$$db@postgres:5432/meridian
         exec meridian-instrument
     depends_on: *serving
@@ -275,11 +275,22 @@ services:
     volumes:
       - secrets:/secrets:ro
 
-  # No platform: its address resolves nowhere, which a conductor tolerates,
-  # and a deployment's records are its own (contract v10), so every row a
-  # plugin records names a record the deployment minted.
-  # The deployment's admin is named here, as first run names one (W7.6): the
-  # dashboard's local account below, made at its start.
+  # The platform's master, a stand-in holding a handful of currencies
+  # (contract v20, W3.1; the 2026-10-11 ruling): a currency the deployment
+  # does not hold is pulled from it, never minted. Every other record a
+  # plugin names is the deployment's own (contract v10).
+  platform:
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/harness/platform.py"]
+    environment:
+      HARNESS_PLATFORM_SLOW: ${HARNESS_PLATFORM_SLOW:-}
+    volumes:
+      - ./platform.py:/harness/platform.py:ro
+    networks: [harness]
+
+  # The conductor, its platform the stand-in above. The deployment's admin
+  # is named here, as first run names one (W7.6): the dashboard's local
+  # account below, made at its start.
   conductor:
     <<: *runtime
     command:
@@ -291,7 +302,7 @@ services:
         exec meridian-conductor
     depends_on: *serving
     environment:
-      MERIDIAN_PLATFORM_ADDRESS: http://no-platform.invalid
+      MERIDIAN_PLATFORM_ADDRESS: http://platform:8000
       MERIDIAN_DEPLOYMENT_ID: DEP-harness
       MERIDIAN_INSTANCE_ID: conductor-1
       MERIDIAN_ADMINISTRATOR_LOGIN: local|harness

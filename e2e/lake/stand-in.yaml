@@ -1,5 +1,5 @@
 # Core's lake stand-ins for `make e2e-lake` and `make e2e-recorded` (contract
-# v18; e2e/lake/stand_in.py): a dgm serving the lake from an exchange file,
+# v18; e2e/lake/stand_in.py): a data plugin serving the lake from an exchange file,
 # and two reading plugins, one entitled and one never; and from contract v19
 # an ems desk hearing trades and quotes.
 services:
@@ -9,7 +9,7 @@ services:
       - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/lake, absolute}:/stand-in:ro
       - ${STAND_IN_EXCHANGES:?set STAND_IN_EXCHANGES to the exchanges replayed, absolute}:/exchanges:ro
     environment:
-      STAND_IN_LAKE: dgm
+      STAND_IN_LAKE: data
       STAND_IN_EXCHANGES: /exchanges
   book:
     entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
@@ -29,3 +29,8 @@ services:
       - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
     environment:
       STAND_IN_LAKE: desk
+  # The harness's master answers JPY seven seconds late, past a sidecar's five-second call (contract v20; the 2026-10-11
+  # ruling): a slow master mints nothing, and a later resolve finds it.
+  platform:
+    environment:
+      HARNESS_PLATFORM_SLOW: JPY=7

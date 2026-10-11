@@ -43,6 +43,7 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0005_delegation.sql"),
     include_str!("../migrations/0006_the_venue_master.sql"),
     include_str!("../migrations/0007_identity_never_reused.sql"),
+    include_str!("../migrations/0008_prepared_call.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
@@ -50,9 +51,10 @@ const SCHEMA: &[&str] = &[
 /// migrated, rather than failing later on the first record.
 const NEWEST_TABLE: &str = "instrument_venue";
 
-/// And the column the newest file adds (0007, contract v19: a conflict's
-/// reason), with its table, which a table check cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument_conflict", "reason");
+/// And the column the newest file adds (0008, contract v20: the prepared
+/// change a version was made from), with its table, which a table check
+/// cannot see.
+const NEWEST_COLUMN: (&str, &str) = ("instrument_version", "prepared_call_id");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -60,7 +62,7 @@ const SCHEMA_LOCK: i64 = 0x6d65_7269_6469_616e_u64 as i64;
 
 /// What a value applied from the platform before v10 is sourced as (Q8).
 fn from_the_platform(version: i64) -> String {
-    format!("the platform, record version {version}")
+    format!("{}{version}", crate::resolve::FROM_THE_PLATFORM_BEFORE_V10)
 }
 
 /// What an identifier a placeholder carried before v10 is sourced as (Q8).
@@ -127,7 +129,7 @@ impl PostgresStore {
     /// file is additions under `IF NOT EXISTS`, and what is sourced is sourced
     /// once, for a record with no history yet. Under an advisory lock, because
     /// `IF NOT EXISTS` is not the concurrency answer it reads as.
-    pub fn migrate(&self) -> Result<()> {
+    pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
         let mut conn = self.conn()?;
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
@@ -142,8 +144,23 @@ impl PostgresStore {
         // Released whether or not the schema went in, so a failure does not
         // leave every other instance waiting on a lock nobody holds usefully.
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
+        drop(conn);
+        created?;
 
-        created
+        // Windows kept from before v10 at the date the platform learnt each
+        // identifier, opened from the start (crate::resolve::open_the_starts).
+        // Outside the lock, through the store's own versioned writes: an
+        // instance racing another finds its write stale and leaves it.
+        let now_ns = clock.now_ns();
+        let corrected = crate::resolve::open_the_starts(self, now_ns)?;
+        if corrected > 0 {
+            tracing::info!(
+                corrected,
+                "records whose identifiers were kept from the platform's date now name the \
+                 security from the start; each says so in its history"
+            );
+        }
+        Ok(())
     }
 
     /// The asset class was free text until the enum
@@ -250,6 +267,7 @@ impl PostgresStore {
                 record.set_source(Source {
                     acting_through_delegation: String::new(),
                     client_name: String::new(),
+                    prepared_call_id: String::new(),
                     field,
                     identifier: None,
                     source: words.clone(),
@@ -276,6 +294,7 @@ impl PostgresStore {
                 record.set_source(Source {
                     acting_through_delegation: String::new(),
                     client_name: String::new(),
+                    prepared_call_id: String::new(),
                     field: Field::Identifier,
                     identifier: Some(asked.clone()),
                     source: words.clone(),
@@ -300,6 +319,7 @@ impl PostgresStore {
             let entry = Version {
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
+                prepared_call_id: String::new(),
                 instrument_id: record.instrument_id.clone(),
                 version: record.version,
                 operation: "migrate".into(),
@@ -399,7 +419,8 @@ impl PostgresStore {
         for row in conn
             .query(
                 "SELECT instrument_id, field, scheme, namespace, value, source, person,
-                        instance_id, recorded_at_ns, note, acting_through_delegation, client_name
+                        instance_id, recorded_at_ns, note, acting_through_delegation, client_name,
+                        prepared_call_id
                    FROM instrument_value_source
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id, field, scheme, namespace, value",
@@ -415,6 +436,7 @@ impl PostgresStore {
                 instruments[at].sources.push(Source {
                     acting_through_delegation: row.get(10),
                     client_name: row.get(11),
+                    prepared_call_id: row.get(12),
                     field,
                     identifier: identifier_of(field, row.get(2), row.get(3), row.get(4)),
                     source: row.get(5),
@@ -496,8 +518,8 @@ impl PostgresStore {
                 "INSERT INTO instrument_value_source
                         (instrument_id, field, scheme, namespace, value, source, person,
                          instance_id, recorded_at_ns, note, acting_through_delegation,
-                         client_name)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                         client_name, prepared_call_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT DO NOTHING",
                 &[
                     id,
@@ -512,6 +534,7 @@ impl PostgresStore {
                     &source.note,
                     &source.acting_through_delegation,
                     &source.client_name,
+                    &source.prepared_call_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -548,8 +571,8 @@ impl PostgresStore {
             "INSERT INTO instrument_version
                     (instrument_id, version, operation, changes, person, instance_id, note,
                      merged_instrument_id, record_time_ns, acting_through_delegation,
-                     client_name)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     client_name, prepared_call_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT DO NOTHING",
             &[
                 &entry.instrument_id,
@@ -563,6 +586,7 @@ impl PostgresStore {
                 &entry.record_time_ns,
                 &entry.acting_through_delegation,
                 &entry.client_name,
+                &entry.prepared_call_id,
             ],
         )
         .map_err(unavailable)?;
@@ -807,7 +831,7 @@ impl Store for PostgresStore {
             .query(
                 "SELECT version, operation, changes, person, instance_id, note,
                         merged_instrument_id, record_time_ns, acting_through_delegation,
-                        client_name
+                        client_name, prepared_call_id
                    FROM instrument_version
                   WHERE instrument_id = $1
                   ORDER BY version DESC",
@@ -819,6 +843,7 @@ impl Store for PostgresStore {
             .map(|row| Version {
                 acting_through_delegation: row.get(8),
                 client_name: row.get(9),
+                prepared_call_id: row.get(10),
                 instrument_id: instrument_id.to_string(),
                 version: row.get(0),
                 operation: row.get(1),

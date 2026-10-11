@@ -269,6 +269,9 @@ pub struct Area<'a> {
     /// where no page tells its own: given under Manage, so every tab there
     /// has a dot; `None` at Open and View, where the dot is the page's alone.
     pub health: Option<&'a State>,
+    /// Whether a next step may open Data sources (kit 0.12.0's
+    /// `meridian:open`): a deployment admin's alone.
+    pub opens_data_sources: bool,
 }
 
 /// The plugin's health as a status dot, drawn as the chrome's script draws a
@@ -400,7 +403,8 @@ pub fn render(area: &Area) -> String {
             format!(
                 "<iframe class=\"plugin-frame\" id=\"plugin-page\" data-page=\"{path}\" src=\"{src}\" \
                  title=\"{name} &middot; {title}\" data-plugin-frame data-seamless data-origin=\"{origin}\" \
-                 data-actions=\"{PAGE_ACTIONS}\" data-status=\"{PAGE_STATUS}\"></iframe>",
+                 data-actions=\"{PAGE_ACTIONS}\" data-status=\"{PAGE_STATUS}\"{opens}></iframe>",
+                opens = if area.opens_data_sources { " data-opens-data-sources" } else { "" },
                 path = escape(&tab.path),
                 src = escape(src),
                 name = escape(area.name),
@@ -671,6 +675,7 @@ mod tests {
                 origin: "https://snaptrade-1.plugins.meridian.example".into(),
             },
             health: None,
+            opens_data_sources: false,
         });
         assert!(page.contains("data-seamless"));
         assert!(page.contains(&format!("data-actions=\"{PAGE_ACTIONS}\"")));
@@ -716,6 +721,7 @@ mod tests {
                 origin: "https://snaptrade.plugins.meridian.example".into(),
             },
             health: None,
+            opens_data_sources: false,
         });
         let head = page.split("<nav class=\"tabs").next().expect("the heading");
         assert_eq!(
@@ -817,6 +823,7 @@ mod tests {
             current: Some(&manage[0]),
             shown: Shown::Drawn("<section id=\"status\">the status</section>".into()),
             health: None,
+            opens_data_sources: false,
         });
         let nav = page
             .split("<nav class=\"tabs view-tabs\"")
@@ -878,6 +885,7 @@ mod tests {
         };
         let at = |tab: &Tab| {
             render(&Area {
+                opens_data_sources: Default::default(),
                 instance: "snaptrade",
                 name: "SnapTrade",
                 held: &held,
@@ -956,6 +964,7 @@ mod tests {
             detail: String::new(),
         };
         let page = render(&Area {
+            opens_data_sources: Default::default(),
             instance: "snaptrade",
             name: "SnapTrade",
             held: &held,

@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use meridian_domain::v1::{
-    set_account_attribute_request, AccountAttributeReply, AccountAttributes, AccountRecord,
+    set_account_attribute_request, AccountAttributeReply, AccountAttributes,
     ListAccountAttributesReply, ListAccountAttributesRequest, LotReliefMethod,
     SetAccountAttributeRequest,
 };
@@ -76,7 +76,7 @@ pub async fn read(bus: &meridian_bus::Bus) -> Books {
     }
 }
 
-fn method_named(method: i32) -> &'static str {
+pub(super) fn method_named(method: i32) -> &'static str {
     METHODS
         .iter()
         .find(|(held, _)| *held as i32 == method)
@@ -84,62 +84,41 @@ fn method_named(method: i32) -> &'static str {
         .unwrap_or("")
 }
 
-/// The Books tab: one row per open account, its attributes, and an Edit.
-pub fn section(accounts: &[AccountRecord], books: &Books, token: &str) -> (String, String) {
-    let body = match books {
-        Books::NotAnswering(why) => format!(
-            "<p class=\"refused\">The book of record is not answering: {}</p>",
-            escape(why)
-        ),
-        Books::Read(held) => {
-            let mut sorted: Vec<&AccountRecord> = accounts.iter().collect();
-            sorted.sort_by(|a, b| a.name.cmp(&b.name).then(a.account_id.cmp(&b.account_id)));
-            let mut rows = String::new();
-            for account in sorted {
-                let attributes = held.iter().find(|a| a.account_id == account.account_id);
-                let currency = attributes
-                    .map(|a| a.base_currency_code.clone())
-                    .unwrap_or_default();
-                let method = attributes.map(|a| a.lot_relief_default).unwrap_or_default();
-                let since = attributes
-                    .and_then(|a| a.opening_balance.as_ref())
-                    .map(|opening| opening.as_of_date.clone())
-                    .unwrap_or_default();
-                let fill = serde_json::json!({ "fields": {
-                    "account_id": account.account_id,
-                    "base_currency_code": currency,
-                    "lot_relief_default": method.to_string(),
-                    "reason": "",
-                } });
-                rows.push_str(&format!(
-                    "<tr data-id=\"{id}\" data-name=\"{name}\"><td><span class=\"name\">{name}</span>\
-                     <span class=\"id\">{id}</span></td><td>{currency}</td><td>{method}</td>\
-                     <td>{since}</td><td class=\"actions\"><button type=\"button\" \
-                     data-dialog-open=\"book\" data-title=\"{title}\" data-fill=\"{fill}\">Edit</button></td></tr>",
-                    id = escape(&account.account_id),
-                    name = escape(&account.name),
-                    currency = escape(&currency),
-                    method = escape(method_named(method)),
-                    since = if since.is_empty() {
-                        "<span class=\"hint\">Not yet</span>".to_string()
-                    } else {
-                        escape(&since)
-                    },
-                    title = escape(&format!("{}'s book", account.name)),
-                    fill = escape(&fill.to_string()),
-                ));
-            }
-            if rows.is_empty() {
-                "<p class=\"empty\">No accounts yet.</p>".to_string()
-            } else {
-                format!(
-                    "<table class=\"list books\" id=\"books-table\"><thead><tr><th>Account</th>\
-                     <th>Base currency</th><th>Lot relief</th><th>In the book since</th><th></th>\
-                     </tr></thead><tbody>{rows}</tbody></table>"
-                )
-            }
+impl Books {
+    /// An account's attributes in the book, where it answered and holds any.
+    pub fn of(&self, account_id: &str) -> Option<&AccountAttributes> {
+        match self {
+            Books::Read(held) => held.iter().find(|a| a.account_id == account_id),
+            Books::NotAnswering(_) => None,
         }
-    };
+    }
+}
+
+/// What an account's row and its Edit say of it in the book: its base
+/// currency, its lot relief by name and as the form's value, and the date
+/// its opening balance stands for, empty where none.
+pub(super) fn in_book(books: &Books, account_id: &str) -> (String, i32, String) {
+    let attributes = books.of(account_id);
+    (
+        attributes
+            .map(|a| a.base_currency_code.clone())
+            .unwrap_or_default(),
+        attributes.map(|a| a.lot_relief_default).unwrap_or_default(),
+        attributes
+            .and_then(|a| a.opening_balance.as_ref())
+            .map(|opening| opening.as_of_date.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// The Accounts tab's Edit, its "In the book" section (W9.13; the product
+/// owner, 2026-10-10: one book per deployment, so its attributes sit with the
+/// account they belong to): a form of its own, posted to the book with a
+/// reason, each attribute that changed its own act, as the Books tab's was.
+/// Shown only for an account that exists, by the dialog's script
+/// (`data-edit-only`); the date the opening balance stands for is the book's
+/// own (W9.1), shown and never posted.
+pub fn book_form(token: &str) -> String {
     let methods: String = std::iter::once("<option value=\"0\">Not set</option>".to_string())
         .chain(METHODS.iter().map(|(method, name)| {
             format!(
@@ -149,19 +128,17 @@ pub fn section(accounts: &[AccountRecord], books: &Books, token: &str) -> (Strin
             )
         }))
         .collect();
-    let dialog = format!(
-        "<dialog id=\"book\" aria-labelledby=\"book-title\"><form method=\"post\" \
-         action=\"/admin/accounts/book#books\">{token}\
-         <div class=\"dialog-head\"><h2 id=\"book-title\" data-title-new=\"Book\">Book</h2></div>\
-         <div class=\"dialog-body\"><input type=\"hidden\" name=\"account_id\">\
-         <label>Base currency <input name=\"base_currency_code\" maxlength=\"3\" \
+    format!(
+        "<form method=\"post\" action=\"/admin/accounts/book#accounts\" class=\"dialog-part\" \
+         data-edit-only>{token}<div class=\"dialog-body\"><h3>In the book \
+         <span class=\"hint\">since <output name=\"since\"></output></span></h3>\
+         <input type=\"hidden\" name=\"account_id\" data-record-id>\
+         <div class=\"pair\"><label>Base currency <input name=\"base_currency_code\" maxlength=\"3\" \
          pattern=\"[A-Z]{{3}}\" placeholder=\"USD\"></label>\
-         <label>Lot relief, when a sale names none <select name=\"lot_relief_default\">{methods}</select></label>\
-         <label>Reason <input name=\"reason\" required></label></div>\
-         <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-         <button type=\"submit\" class=\"primary\" data-label-new=\"Save\">Save</button></div></form></dialog>"
-    );
-    (body, dialog)
+         <label>Lot relief, when a sale names none <select name=\"lot_relief_default\">{methods}</select></label></div>\
+         <div class=\"pair save\"><label>Reason <input name=\"reason\" required></label>\
+         <button type=\"submit\" class=\"primary\">Save</button></div></div></form>"
+    )
 }
 
 /// What the form asks the book to set: each attribute that differs from what
@@ -278,22 +255,30 @@ mod tests {
     }
 
     #[test]
-    fn a_book_not_answering_is_said_and_no_account_data_is_shown() {
-        let accounts = vec![AccountRecord {
-            account_id: "ACC-1".into(),
-            name: "Main".into(),
-            ..Default::default()
-        }];
-        let (body, _) = section(&accounts, &Books::NotAnswering("no handler".into()), "");
-        assert!(body.contains("not answering"));
+    fn an_accounts_book_is_read_by_its_id_and_its_form_posts_with_a_reason() {
         let mut attributes = held("USD", LotReliefMethod::HighestCost);
         attributes.opening_balance = Some(meridian_domain::v1::OpeningBalance {
             as_of_date: "2026-09-08".into(),
             ..Default::default()
         });
-        let (body, dialog) = section(&accounts, &Books::Read(vec![attributes]), "");
-        assert!(body.contains("<td>USD</td>") && body.contains("Highest cost"));
-        assert!(body.contains("2026-09-08"));
-        assert!(dialog.contains("name=\"reason\" required"));
+        let books = Books::Read(vec![attributes]);
+        assert_eq!(
+            in_book(&books, "ACC-1"),
+            (
+                "USD".into(),
+                LotReliefMethod::HighestCost as i32,
+                "2026-09-08".into()
+            )
+        );
+        assert_eq!(in_book(&books, "ACC-2"), (String::new(), 0, String::new()));
+        let silent = Books::NotAnswering("no handler".into());
+        assert!(silent.of("ACC-1").is_none());
+        let form = book_form("");
+        assert!(form.contains("action=\"/admin/accounts/book#accounts\""));
+        assert!(form.contains("name=\"reason\" required") && form.contains("data-edit-only"));
+        assert!(
+            form.contains("<output name=\"since\">"),
+            "shown, never posted"
+        );
     }
 }

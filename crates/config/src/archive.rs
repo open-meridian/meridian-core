@@ -437,6 +437,7 @@ pub fn set_hold(
         acting_through_delegation: author.delegation.clone(),
         client_name: author.client.clone(),
         note: request.note.clone(),
+        prepared_call_id: author.prepared_call_id.clone(),
     };
     store
         .set_hold(&hold, &request.note)

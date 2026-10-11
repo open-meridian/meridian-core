@@ -21,6 +21,8 @@ pub const ROLES_FROM: u32 = 15;
 /// The roles a declaration serves, filled where it names none and may; or
 /// the end of a sentence saying why it is refused ("serves oms, which ...").
 pub fn served(named: &[String], launched: &[String], built_at: u32) -> Result<Vec<String>, String> {
+    // A plugin built before contract v20 names a renamed role by its old name.
+    let named = &meridian_domain::roles_now(named);
     let holds = if launched.is_empty() {
         "it holds no role".to_string()
     } else {

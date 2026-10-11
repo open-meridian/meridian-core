@@ -102,6 +102,9 @@ pub struct App {
     /// Tickets, their notes, notices and each reader's place in an inbox
     /// (W6.21 to W6.24, contract v13), kept in the dashboard's own tables.
     pub tickets: Arc<crate::tickets::Tickets>,
+    /// Prepared changes, the admins' levels and each person's own settings
+    /// (W6.26 to W6.31, contract v20), kept in the dashboard's own tables.
+    pub prepared: Arc<crate::prepared::Prepared>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -120,6 +123,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(oauth::routes())
         .merge(crate::mcp::routes())
         .merge(crate::tickets::pages::routes())
+        .merge(crate::prepared::pages::routes())
         .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())

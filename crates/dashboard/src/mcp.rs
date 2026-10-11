@@ -62,6 +62,7 @@ pub mod bounds;
 pub mod data_sources;
 pub mod instruments;
 pub mod plugin_area;
+pub mod prepared;
 pub mod tickets;
 
 /// Where the surface is.
@@ -359,10 +360,25 @@ async fn handle(app: &Arc<App>, caller: &Caller, message: &Value) -> Option<Valu
         }
         "ping" => rpc_result(&id, json!({})),
         "tools/list" => match catalogue(app, caller).await {
-            Ok(tools) => rpc_result(
-                &id,
-                json!({"tools": tools.iter().map(Tool::listed).collect::<Vec<_>>()}),
-            ),
+            Ok(tools) => {
+                let mut listed = Vec::new();
+                for tool in &tools {
+                    let mut said = tool.listed();
+                    // An act agents may only prepare here says so (W6.20,
+                    // W6.29), naming the tool that prepares it.
+                    if !tool.reads() && tool.preparable() {
+                        let applies = crate::prepared::applies(app, caller, &tool.name, true).await;
+                        if applies.level == crate::prepared::levels::Level::PrepareOnly {
+                            let described = said["description"].as_str().unwrap_or_default();
+                            said["description"] = Value::String(format!(
+                                "{described} In this deployment agents may only prepare it: call dashboard__prepare_call naming it, and a person makes it."
+                            ));
+                        }
+                    }
+                    listed.push(said);
+                }
+                rpc_result(&id, json!({"tools": listed}))
+            }
             Err(why) => rpc_error(&id, -32603, &why),
         },
         "tools/call" => {
@@ -403,6 +419,9 @@ pub enum Area {
     /// The Data sources page's (contract v18): the deployment admin's
     /// capabilities.
     DataSources,
+    /// A prepared change's own tools (contract v20): any delegation that
+    /// reaches anything, each call checked against the act it names.
+    Prepared,
 }
 
 impl Area {
@@ -412,6 +431,7 @@ impl Area {
             Area::Tickets => "Tickets",
             Area::Plugins(_) => "Plugins",
             Area::DataSources => "Data sources",
+            Area::Prepared => "Prepared changes",
         }
     }
 
@@ -426,6 +446,11 @@ impl Area {
             }
             Area::Plugins(gate) => gate.open_to(access),
             Area::DataSources => access.deployment_admin,
+            Area::Prepared => {
+                access.deployment_admin
+                    || access.all_plugins_admin
+                    || access.plugins.values().any(|held| held.holds_any())
+            }
         }
     }
 }
@@ -481,6 +506,15 @@ impl Tool {
         }
     }
 
+    /// Whether it can be prepared: one of core's thirteen, or a plugin's
+    /// act naming its check tool (contract v20).
+    pub fn preparable(&self) -> bool {
+        match &self.owner {
+            Owner::Dashboard(_) => crate::prepared::CORE_PREPARABLE.contains(&self.name.as_str()),
+            Owner::Plugin { declared, .. } => !declared.reads && !declared.checked_by.is_empty(),
+        }
+    }
+
     fn owner_name(&self) -> &str {
         match &self.owner {
             Owner::Dashboard(_) => DASHBOARD,
@@ -507,6 +541,7 @@ impl Tool {
                             Area::Tickets => tickets::described(spec),
                             Area::Plugins(_) => plugin_area::described(spec),
                             Area::DataSources => data_sources::described(spec),
+                            Area::Prepared => spec.description.to_string(),
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -583,8 +618,55 @@ pub fn level_by_role(
 }
 
 /// Every tool this caller may call now, core's first, then each plugin's in
-/// its instance's order and the plugin's own.
+/// its instance's order and the plugin's own: what they reach and consented
+/// to, less each act the admins set to may not (W6.29, contract v20). An act
+/// at prepare only is listed, saying so, and refused if called directly.
 pub async fn catalogue(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> {
+    let reached = reachable(app, caller).await?;
+    let levels = app.prepared.levels().await.unwrap_or_default();
+    let groups = app
+        .records
+        .current(app.clock.now_ns())
+        .map(|records| crate::prepared::access_groups_of(&records, &caller.access(&records)))
+        .unwrap_or_default();
+    Ok(within_levels(
+        reached,
+        &levels,
+        &groups,
+        &caller.covers.prepare_only,
+    ))
+}
+
+/// `tools` less each act agents may not reach at the levels that apply
+/// (W6.29): what `tools/list` and the consent page both answer.
+pub fn within_levels(
+    tools: Vec<Tool>,
+    levels: &crate::prepared::levels::Levels,
+    groups: &std::collections::BTreeSet<String>,
+    prepare_only: &std::collections::BTreeSet<String>,
+) -> Vec<Tool> {
+    use crate::prepared::levels::{Level, ON_A_PREPARED_CHANGE};
+    tools
+        .into_iter()
+        .filter(|tool| {
+            let name = tool.name.as_str();
+            if ON_A_PREPARED_CHANGE.contains(&name) {
+                return levels.applies(name, groups, false, false).level != Level::MayNot;
+            }
+            if tool.reads() || crate::prepared::OWN_TOOLS.contains(&name) {
+                return true;
+            }
+            levels
+                .applies(name, groups, tool.preparable(), prepare_only.contains(name))
+                .level
+                != Level::MayNot
+        })
+        .collect()
+}
+
+/// [`catalogue`] before the admins' levels: what the person reaches through
+/// the delegation and consented to.
+pub async fn reachable(app: &App, caller: &Caller) -> Result<Vec<Tool>, String> {
     let now = app.clock.now_ns();
     let records = app
         .records
@@ -648,6 +730,7 @@ pub fn listed_to(
         .chain(tickets::SPECS)
         .chain(plugin_area::SPECS)
         .chain(data_sources::SPECS)
+        .chain(prepared::SPECS)
     {
         if spec.area.open_to(access) {
             tools.push(Tool {
@@ -690,6 +773,92 @@ pub fn listed_to(
         }
     }
     tools
+}
+
+/// The reason a core act's code answers with when it ran only as a check
+/// ([`Acting::checking`]): every check passed, and its row was held back.
+pub const CHECKED: &str = "checked";
+
+/// How one of core's acts runs (contract v20): as a check, its own code to
+/// the last step and its bus row held back (W6.26, the plan's Q14); or made
+/// from a prepared change, its row stamped with the change's ID (W6.27).
+#[derive(Clone, Debug, Default)]
+pub struct Acting {
+    pub checking: bool,
+    pub prepared_call_id: String,
+}
+
+tokio::task_local! {
+    static ACTING: Acting;
+}
+
+impl Acting {
+    /// Run `work` as a check.
+    pub async fn checking<F: std::future::Future>(work: F) -> F::Output {
+        ACTING
+            .scope(
+                Acting {
+                    checking: true,
+                    prepared_call_id: String::new(),
+                },
+                work,
+            )
+            .await
+    }
+
+    /// Run `work` as made from the prepared change `id`.
+    pub async fn making<F: std::future::Future>(id: &str, work: F) -> F::Output {
+        ACTING
+            .scope(
+                Acting {
+                    checking: false,
+                    prepared_call_id: id.to_string(),
+                },
+                work,
+            )
+            .await
+    }
+
+    /// How the code running now acts.
+    pub fn now() -> Acting {
+        ACTING.try_with(Acting::clone).unwrap_or_default()
+    }
+}
+
+/// Whether a topic is an act's row, which a check holds back: a command, or
+/// asking the platform for an instrument.
+pub fn is_act_row(topic: &str) -> bool {
+    topic.contains(".command.") || topic == "platform.reference.query.ask-platform-for-instrument"
+}
+
+/// One of core's tools by its name on the surface.
+pub fn core_spec(name: &str) -> Option<&'static Spec> {
+    let (_, bare) = name.split_once("__")?;
+    instruments::SPECS
+        .iter()
+        .chain(tickets::SPECS)
+        .chain(plugin_area::SPECS)
+        .chain(data_sources::SPECS)
+        .chain(prepared::SPECS)
+        .find(|spec| spec.name == bare)
+}
+
+/// One of core's tools, run for `caller`, as `tools/call` runs it, with no
+/// bound and no record of its own: what preparing checks, and making from a
+/// prepared change makes.
+pub async fn run_core(app: &App, caller: &Caller, spec: &'static Spec, arguments: Value) -> Value {
+    match spec.area {
+        Area::Instruments => instruments::call(app, caller, spec, arguments).await,
+        Area::Tickets => tickets::call(app, caller, spec, arguments).await,
+        Area::Plugins(_) => plugin_area::call(app, caller, spec, arguments).await.0,
+        Area::DataSources => data_sources::call(app, caller, spec, arguments).await,
+        // Boxed: making a prepared change runs a core act through here.
+        Area::Prepared => {
+            Box::pin(prepared::call(app, caller, spec, arguments))
+                .await
+                .0
+        }
+    }
 }
 
 /// A tool's answer: its outcome, its typed content, and whether it is an
@@ -780,7 +949,36 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
         }
         return tool_answer(refused("not_listed", &said, Vec::new()));
     };
+    // The admins' level and gate on a direct call (W6.29): prepare only, or
+    // a second pair of eyes, refuses making it here; it may be prepared.
+    let held_back = if !tool.reads() && !crate::prepared::OWN_TOOLS.contains(&tool.name.as_str()) {
+        let applies = crate::prepared::applies(app, caller, &tool.name, tool.preparable()).await;
+        if applies.level == crate::prepared::levels::Level::PrepareOnly {
+            Some(refused(
+                "prepare_only",
+                &format!(
+                    "{} is at Prepare only for agents in this deployment (set by {}): call dashboard__prepare_call naming it, with its arguments and a reason, and a person makes it",
+                    tool.name, applies.from
+                ),
+                Vec::new(),
+            ))
+        } else if applies.second_pair_of_eyes {
+            Some(refused(
+                "second_pair_of_eyes",
+                &format!(
+                    "{} needs a second pair of eyes in this deployment: nobody makes it directly; prepare it with dashboard__prepare_call, and someone other than whoever prepared it, and other than the person behind the agent that did, makes it",
+                    tool.name
+                ),
+                Vec::new(),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let (structured, level) = match &tool.owner {
+        _ if held_back.is_some() => (held_back.unwrap_or_default(), String::new()),
         Owner::Dashboard(spec) => match spec.area {
             Area::Instruments => (
                 instruments::call(app, caller, spec, arguments).await,
@@ -799,6 +997,7 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
                 data_sources::call(app, caller, spec, arguments).await,
                 "deployment admin".to_string(),
             ),
+            Area::Prepared => prepared::call(app, caller, spec, arguments).await,
         },
         Owner::Plugin {
             instance,
@@ -897,10 +1096,15 @@ fn not_listed(app: &App, caller: &Caller, name: &str) -> String {
     // Reached, and changing something, but added since the person consented
     // row by row (contract v18): it waits for fresh consent.
     if let Ok(records) = app.records.current(app.clock.now_ns()) {
-        let reached = listed_to(
-            &caller.access(&records),
-            &app.health.view(),
-            app.clock.now_ns(),
+        let reached = within_levels(
+            listed_to(
+                &caller.access(&records),
+                &app.health.view(),
+                app.clock.now_ns(),
+            ),
+            &app.prepared.levels_now(),
+            &crate::prepared::access_groups_of(&records, &caller.access(&records)),
+            &caller.covers.prepare_only,
         );
         if !caller.covers.everything
             && reached
@@ -962,6 +1166,21 @@ async fn plugin_call(
     level: AccessLevel,
     arguments: Value,
 ) -> Value {
+    plugin_call_as(app, caller, instance, declared, level, arguments, "").await
+}
+
+/// [`plugin_call`], naming the prepared change the call makes, where it
+/// makes one (contract v20): the assertion carries its ID, and the sidecar
+/// stamps it on what the request sends.
+pub async fn plugin_call_as(
+    app: &App,
+    caller: &Caller,
+    instance: &str,
+    declared: &ToolDeclaration,
+    level: AccessLevel,
+    arguments: Value,
+    prepared_call_id: &str,
+) -> Value {
     let Some(plugins) = app.plugins.as_deref() else {
         return refused(
             "unavailable",
@@ -993,6 +1212,10 @@ async fn plugin_call(
                 display_name: &caller.display_name,
                 delegation_id: &caller.delegation_id,
                 client_name: &caller.client_name,
+                prepared_call_id,
+                own_settings: crate::prepared::own::for_claims(app, instance, &caller.subject)
+                    .await,
+                second_pair_of_eyes: crate::prepared::eyes_for_claims(app, instance, caller).await,
             },
             opened,
             declared,

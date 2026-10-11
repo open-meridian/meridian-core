@@ -97,6 +97,7 @@ pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
 pub const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
 pub const ACCOUNTS: &str = "platform.config.query.accounts";
+pub const SET_LINKABLE_ACCOUNTS: &str = "platform.config.command.set-linkable-accounts";
 pub const DEFINE_USER_GROUP: &str = "platform.config.command.define-user-group";
 pub const DEFINE_ACCOUNT_GROUP: &str = "platform.config.command.define-account-group";
 pub const DEFINE_ACCESS_GROUP: &str = "platform.config.command.define-access-group";
@@ -634,7 +635,20 @@ pub(crate) fn author(envelope: &Envelope) -> Author {
         delegation: delegation(envelope),
         client: client(envelope),
         note: String::new(),
+        prepared_call_id: prepared_call_id(envelope),
     }
+}
+
+/// The prepared change the person made the change from, as the dashboard
+/// stamped it beside them (W4.9, W6.27, contract v20); empty otherwise, and
+/// never without a person.
+pub(crate) fn prepared_call_id(envelope: &Envelope) -> String {
+    envelope
+        .meta
+        .as_ref()
+        .filter(|meta| !meta.acting_for_subject.is_empty())
+        .map(|meta| meta.prepared_call_id.clone())
+        .unwrap_or_default()
 }
 
 /// The client's name the dashboard stamped beside the delegation (W4.9,
@@ -820,6 +834,8 @@ pub fn serve_with(
             // The holds standing, for the deployment's Settings and each
             // edge plugin's Summary (W6.25, contract v16).
             records.holds = snapshot.holds;
+            // Each instance's linkable accounts (W6.30, contract v20).
+            records.linkable_accounts = snapshot.linkable.into_values().collect();
             Ok(records)
         },
     );
@@ -1019,6 +1035,12 @@ pub fn serve_with(
                          clear it, then set it"
                     ));
                 }
+                // A secret's last four, for one long enough, taken before it
+                // is sealed and kept apart from it (W6.11, contract v20).
+                let hint = match &value {
+                    Some(value) if declaration.secret => crate::store::hint_of(value),
+                    _ => String::new(),
+                };
                 let held = match value {
                     None => None,
                     // A table's rows, each added or changed stamped with who
@@ -1049,7 +1071,7 @@ pub fn serve_with(
                     )),
                     Some(value) => Some(Held::Plain(value)),
                 };
-                changes.push(SettingChange { name, held });
+                changes.push(SettingChange { name, held, hint });
             }
             if !changes.is_empty() {
                 let author = SettingsAuthor {
@@ -1185,6 +1207,8 @@ pub fn serve_with(
             if request.new_account_name.is_empty() {
                 cx.store.put_link(&link).map_err(|f| f.to_string())?;
             } else {
+                // A new account named by a deployment admin through a link is
+                // granted the instance with it, its own record (W6.30).
                 // Created and linked in one step, so nothing is left half-done.
                 let now = cx.clock.now_ns();
                 let account = AccountRecord {
@@ -1200,6 +1224,19 @@ pub fn serve_with(
                 link.account_id = account.account_id.clone();
                 cx.store
                     .put_account_and_link(&account, &link)
+                    .map_err(|f| f.to_string())?;
+                cx.store
+                    .set_linkable_accounts(
+                        &link.plugin_instance_id,
+                        std::slice::from_ref(&account.account_id),
+                        &[],
+                        &Author {
+                            note: "granted with the new account a deployment admin named in a link"
+                                .into(),
+                            ..author(envelope)
+                        },
+                        now,
+                    )
                     .map_err(|f| f.to_string())?;
                 tracing::info!(
                     account = account.account_id,
@@ -1228,10 +1265,66 @@ pub fn serve_with(
             admin_acting(envelope, "the deployment's accounts")?;
             // Each account as the configuration holds it, its custodian,
             // type, owner and note with it: nothing of who may read them,
-            // and no holdings, which are not the configuration's.
+            // and no holdings, which are not the configuration's. From
+            // contract v20 only those a deployment admin granted the asking
+            // instance (W6.30), nothing by default.
+            let snapshot = cx.snapshot()?;
+            let instance = publisher(envelope);
+            let granted = snapshot
+                .linkable
+                .get(&instance)
+                .map(|linkable| linkable.account_ids.clone())
+                .unwrap_or_default();
             Ok(Accounts {
-                accounts: cx.snapshot()?.records.accounts,
+                accounts: snapshot
+                    .records
+                    .accounts
+                    .into_iter()
+                    .filter(|account| granted.contains(&account.account_id))
+                    .collect(),
             })
+        },
+    );
+
+    answer(
+        &context,
+        SET_LINKABLE_ACCOUNTS,
+        (
+            "meridian.v1.SetLinkableAccountsRequest",
+            "meridian.v1.LinkableAccounts",
+        ),
+        |cx, request: meridian_domain::v1::SetLinkableAccountsRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "a grant of linkable accounts is a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            let before = cx.snapshot()?;
+            rules::linkable(&before, &request, !delegation(envelope).is_empty())?;
+            let linkable = cx
+                .store
+                .set_linkable_accounts(
+                    &request.plugin_instance_id,
+                    &request.grant_account_ids,
+                    &request.withdraw_account_ids,
+                    &Author {
+                        note: request.note.clone(),
+                        ..author(envelope)
+                    },
+                    cx.clock.now_ns(),
+                )
+                .map_err(|f| f.to_string())?;
+            tracing::info!(
+                plugin = request.plugin_instance_id,
+                granted = request.grant_account_ids.len(),
+                withdrawn = request.withdraw_account_ids.len(),
+                by,
+                "linkable accounts changed"
+            );
+            cx.announce(&before)?;
+            Ok(linkable)
         },
     );
 

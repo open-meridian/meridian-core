@@ -1,6 +1,6 @@
 //! The lake, as its own process (W10, contract v18).
 //!
-//! What sources say about entities: prices and bars recorded by `dgm`
+//! What sources say about entities: prices and bars recorded by a data plugin
 //! plugins, read by the reading roles, under the deployment's licences,
 //! entitlements and priority. It talks to the bus and to its database and to
 //! nothing else, and holds no deployment key: licensed data never leaves the

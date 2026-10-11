@@ -150,7 +150,7 @@ async fn ask<Req: Message, Rep: Message + Default>(
 }
 
 async fn account(h: &Harness, name: &str) -> AccountRecord {
-    ask(
+    let account: AccountRecord = ask(
         h,
         DEFINE_ACCOUNT,
         "meridian.v1.DefineAccountRequest",
@@ -160,7 +160,119 @@ async fn account(h: &Harness, name: &str) -> AccountRecord {
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    // Granted the instance the harness speaks as, so its links stand (W6.30,
+    // contract v20); what a grant refuses is tested on its own.
+    h.store
+        .set_linkable_accounts(
+            h.bus.instance_id(),
+            std::slice::from_ref(&account.account_id),
+            &[],
+            &crate::store::Author::default(),
+            1,
+        )
+        .unwrap();
+    account
+}
+
+#[tokio::test]
+async fn a_link_names_only_an_account_granted_its_instance_and_the_accounts_read_are_those() {
+    // W6.30, contract v20 (the product owner, 2026-10-10): nothing by default.
+    let h = harness("oms-1");
+    reported(&h, true, declared(), 1).await;
+    let granted = account(&h, "Growth").await;
+    let other: AccountRecord = ask(
+        &h,
+        DEFINE_ACCOUNT,
+        "meridian.v1.DefineAccountRequest",
+        DefineAccountRequest {
+            name: "Not granted".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let refused = link_for(&h, link_request("oms-1", &other.account_id, ""), ADA)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("not one a deployment admin granted"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!(
+            "[refusal-reason {}]",
+            meridian_pb::v1::RefusalReason::AccountNotLinkable as i32
+        )),
+        "{refused}"
+    );
+    link_for(&h, link_request("oms-1", &granted.account_id, ""), ADA)
+        .await
+        .expect("a granted account links");
+    let read: Accounts = ask(
+        &h,
+        ACCOUNTS,
+        "meridian.v1.AccountsRequest",
+        AccountsRequest {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read.accounts
+            .iter()
+            .map(|a| a.account_id.as_str())
+            .collect::<Vec<_>>(),
+        [granted.account_id.as_str()]
+    );
+
+    // The deployment admin grants the other through the dashboard's row; a
+    // withdrawal removes no link; each its own record.
+    let after: meridian_domain::v1::LinkableAccounts = ask(
+        &h,
+        SET_LINKABLE_ACCOUNTS,
+        "meridian.v1.SetLinkableAccountsRequest",
+        meridian_domain::v1::SetLinkableAccountsRequest {
+            plugin_instance_id: "oms-1".into(),
+            grant_account_ids: vec![other.account_id.clone()],
+            withdraw_account_ids: vec![granted.account_id.clone()],
+            note: "the income account moves here".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.account_ids, std::slice::from_ref(&other.account_id));
+    assert_eq!(after.updated_by, ADA);
+    assert!(records(&h)
+        .await
+        .links
+        .iter()
+        .any(|l| l.account_id == granted.account_id));
+    let changes = h.store.linkable_accounts_changes("oms-1").unwrap();
+    assert_eq!(
+        changes.last().unwrap().granted,
+        std::slice::from_ref(&other.account_id)
+    );
+    assert_eq!(
+        changes.last().unwrap().withdrawn,
+        std::slice::from_ref(&granted.account_id)
+    );
+    assert_eq!(
+        changes.last().unwrap().note,
+        "the income account moves here"
+    );
+    let missing = ask::<_, meridian_domain::v1::LinkableAccounts>(
+        &h,
+        SET_LINKABLE_ACCOUNTS,
+        "meridian.v1.SetLinkableAccountsRequest",
+        meridian_domain::v1::SetLinkableAccountsRequest {
+            plugin_instance_id: "oms-1".into(),
+            grant_account_ids: vec!["ACC-NOPE".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(missing.contains("grant_account_ids[0]"), "{missing}");
 }
 
 async fn user_group(h: &Harness) -> UserGroup {
@@ -1118,6 +1230,15 @@ async fn the_deployments_accounts_are_read_for_a_deployment_admin_with_what_desc
     )
     .await
     .unwrap();
+    h.store
+        .set_linkable_accounts(
+            h.bus.instance_id(),
+            std::slice::from_ref(&growth.account_id),
+            &[],
+            &crate::store::Author::default(),
+            1,
+        )
+        .unwrap();
     let old = account(&h, "Old income").await;
     let _: AccountRecord = ask(
         &h,
@@ -1660,6 +1781,7 @@ async fn the_plugins_own_sidecar_is_told_its_secret_opened() {
             .put_plugin_settings(
                 "oms-1",
                 &[crate::store::SettingChange {
+                    hint: Default::default(),
                     name: name.into(),
                     held,
                 }],
@@ -1740,6 +1862,7 @@ async fn a_secret_that_no_longer_opens_is_withheld_rather_than_sent_sealed() {
         .put_plugin_settings(
             "oms-1",
             &[crate::store::SettingChange {
+                hint: Default::default(),
                 name: "api_key".into(),
                 held: Some(Held::Sealed(
                     other.seal("oms-1", "api_key", SECRET).unwrap(),
@@ -2020,6 +2143,7 @@ async fn an_unchanged_row_keeps_who_changed_it_and_when() {
         .put_plugin_settings(
             "oms-1",
             &[crate::store::SettingChange {
+                hint: Default::default(),
                 name: "plan_code_links".into(),
                 held: Some(Held::Plain(meridian_domain::setting_table::written(
                     std::slice::from_ref(&ben),
@@ -2201,6 +2325,7 @@ async fn a_value_held_from_an_earlier_declaration_that_does_not_read_is_withheld
             .put_plugin_settings(
                 "oms-1",
                 &[crate::store::SettingChange {
+                    hint: Default::default(),
                     name: "plan_code_links".into(),
                     held: Some(Held::Plain(unread.into())),
                 }],
@@ -2267,6 +2392,7 @@ async fn a_sealed_value_redeclared_as_a_table_is_cleared_and_no_table_is_stored_
         .put_plugin_settings(
             "oms-1",
             &[crate::store::SettingChange {
+                hint: Default::default(),
                 name: "plan_code_links".into(),
                 held: Some(Held::Sealed(
                     key.seal("oms-1", "plan_code_links", SECRET).unwrap(),
@@ -2381,6 +2507,7 @@ async fn a_setting_redeclared_secret_has_its_earlier_values_redacted() {
         .put_plugin_settings(
             "oms-1",
             &[crate::store::SettingChange {
+                hint: Default::default(),
                 name: "api_key".into(),
                 held: Some(Held::Plain("plain-before".into())),
             }],
@@ -3042,6 +3169,7 @@ async fn set_through(
         against_updated_at_ns,
     };
     let stamp = meridian_bus::Stamp {
+        prepared_call_id: Default::default(),
         acting_for_subject: ADA.into(),
         acting_through_delegation: "DLG-7".into(),
         acting_through_client: "Claude".into(),

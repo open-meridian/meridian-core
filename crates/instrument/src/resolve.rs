@@ -84,7 +84,32 @@ pub fn resolve_identifier(
     instance_id: &str,
     now_ns: i64,
 ) -> Result<Resolution> {
-    resolve(store, request, instance_id, now_ns, false)
+    resolve(store, request, instance_id, now_ns, false, None)
+}
+
+/// [`resolve_identifier`], with the master's record for a currency the
+/// deployment does not hold, where the store asked the platform for it
+/// (contract v20, W3.1): kept as the deployment's record and answered, found
+/// and not minted. `None` where the master was not asked or could not be
+/// reached: minted as before.
+pub fn resolve_identifier_pulled(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    instance_id: &str,
+    now_ns: i64,
+    pulled: Option<&meridian_domain::v1::InstrumentRecord>,
+) -> Result<Resolution> {
+    resolve(store, request, instance_id, now_ns, false, pulled)
+}
+
+/// The ISO 4217 code a resolve names a currency by, where it names one: the
+/// one miss the store asks the platform's master about itself (W3.1).
+pub fn currency_code(request: &ResolveIdentifierRequest) -> Option<String> {
+    request
+        .identifiers
+        .iter()
+        .find(|identifier| identifier.scheme == "iso4217" && !identifier.value.trim().is_empty())
+        .map(|identifier| identifier.value.trim().to_uppercase())
 }
 
 /// W3.1 asked read-only (contract v19, approved 2026-10-10): the record the
@@ -96,7 +121,7 @@ pub fn resolve_identifier_read_only(
     request: &ResolveIdentifierRequest,
     now_ns: i64,
 ) -> Result<Resolution> {
-    resolve(store, request, "", now_ns, true)
+    resolve(store, request, "", now_ns, true, None)
 }
 
 fn resolve(
@@ -105,6 +130,7 @@ fn resolve(
     instance_id: &str,
     now_ns: i64,
     read_only: bool,
+    pulled: Option<&meridian_domain::v1::InstrumentRecord>,
 ) -> Result<Resolution> {
     let asked: Vec<Asked> = IdentifierSet::new(
         request
@@ -179,7 +205,126 @@ fn resolve(
     if read_only {
         return Ok(unchanged(missed(MissReason::NotFound)));
     }
+    if let Some(master) = pulled {
+        return keep_the_masters(store, asked, master, now_ns);
+    }
     mint(store, request, asked, instance_id, now_ns)
+}
+
+/// A currency the master holds, kept as the deployment's record (contract
+/// v20, W3.1, W3.5): its identifiers, the asked ones and the master's open
+/// ones with its global ID, and its class, currency and description in
+/// force, each sourced to the platform's record -- curated reference data,
+/// with no person asked. Keyed by the asked set, so two racing resolves keep
+/// one record.
+fn keep_the_masters(
+    store: &dyn Store,
+    asked: Vec<Asked>,
+    master: &meridian_domain::v1::InstrumentRecord,
+    now_ns: i64,
+) -> Result<Resolution> {
+    use crate::record::{asked_from_wire, asset_class_name};
+    let words = format!(
+        "the platform, record {} version {}",
+        master.instrument_id, master.version
+    );
+    let set = IdentifierSet::new(asked.clone());
+    let mut identifiers: Vec<Asked> = asked.clone();
+    if master.instrument_id.starts_with("INS-") {
+        identifiers.push(Asked {
+            scheme: meridian_symbology::GLOBAL_ID.into(),
+            value: master.instrument_id.clone(),
+            source: String::new(),
+        });
+    }
+    for identifier in &master.identifiers {
+        let one = asked_from_wire(identifier);
+        if one.source.is_empty()
+            && identifier.valid_until_ns == 0
+            && meridian_symbology::OPEN.contains(&one.scheme.as_str())
+            && !identifiers.contains(&one)
+        {
+            identifiers.push(one);
+        }
+    }
+    let instrument_id = ids::local(now_ns);
+    let source = |field: Field, identifier: Option<Asked>| Source {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
+        prepared_call_id: String::new(),
+        field,
+        identifier,
+        source: words.clone(),
+        person: String::new(),
+        instance_id: String::new(),
+        recorded_at_ns: now_ns,
+        note: String::new(),
+    };
+    let class = asset_class_name(master.asset_class);
+    let mut sources: Vec<Source> = identifiers
+        .iter()
+        .map(|identifier| source(Field::Identifier, Some(identifier.clone())))
+        .collect();
+    for (field, value) in [
+        (Field::AssetClass, &class),
+        (Field::Currency, &master.currency),
+        (Field::Description, &master.description),
+    ] {
+        if !value.trim().is_empty() {
+            sources.push(source(field, None));
+        }
+    }
+    let candidate = Instrument {
+        instrument_id: instrument_id.clone(),
+        identifiers: identifiers
+            .iter()
+            .map(|identifier| window_for(store, identifier))
+            .collect::<Result<Vec<_>>>()?,
+        asset_class: class.clone(),
+        currency: master.currency.clone(),
+        exchange_mic: String::new(),
+        description: master.description.trim().to_string(),
+        lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
+        version: 1,
+        valid_from_ns: 0,
+        record_time_ns: now_ns,
+        instrument_type: String::new(),
+        money_market_fund: String::new(),
+        binary_event_contract: String::new(),
+        listing_venue_id: String::new(),
+        sources,
+        offers: Vec::new(),
+    };
+    let first = Version {
+        acting_through_delegation: String::new(),
+        client_name: String::new(),
+        prepared_call_id: String::new(),
+        instrument_id: instrument_id.clone(),
+        version: 1,
+        operation: "platform".into(),
+        changes: identifiers
+            .iter()
+            .map(|identifier| identifier_change(identifier, &words))
+            .collect(),
+        person: String::new(),
+        instance_id: String::new(),
+        note: "a currency the deployment did not hold, pulled from the platform's master \
+               with no person asking (contract v20)"
+            .into(),
+        merged_instrument_id: String::new(),
+        record_time_ns: now_ns,
+    };
+    let (record, stood) = store.mint(candidate, &set.key(), first)?;
+    match stood {
+        Stood::Minted => Ok(Resolution {
+            reply: resolved(record.instrument_id.clone(), false),
+            changed: Some(record),
+        }),
+        Stood::AlreadyHeld => {
+            let became = current(store, &record.instrument_id)?;
+            Ok(unchanged(resolved(became, false)))
+        }
+    }
 }
 
 /// An identifier joining a record (contract v19, W3.5): its window opens
@@ -201,6 +346,125 @@ pub(crate) fn window_for(store: &dyn Store, asked: &Asked) -> Result<Identifier>
         valid_from_ns: from,
         valid_to_ns: None,
     })
+}
+
+/// How a record applied from the platform before contract v10 sources what it
+/// held, followed by the platform's version: "the platform, record version 3".
+pub const FROM_THE_PLATFORM_BEFORE_V10: &str = "the platform, record version ";
+
+/// Windows that open where this store would never have opened them, reopened
+/// from the start: once per store, from its migration, and harmless again.
+///
+/// A record applied from the platform before contract v10 kept each
+/// identifier's window as the platform recorded it, from the day the master
+/// learnt the identifier rather than when it began to name the security. A
+/// report dated before that day -- a custodian's earlier activity, last
+/// month's exchange rate -- met no record, and a record was minted beside the
+/// one held (the product owner's deployment, 2026-10-05 and 2026-10-10:
+/// TCH4, ZZCSKM282, USD). This store opens a window from the start, or where
+/// another window of the identifier closed ([`window_for`]); a window that
+/// does neither, and that no window of the identifier on another security
+/// began before, opens from the start. Windows on one security -- a record
+/// and those merged into it -- are not another holder's.
+///
+/// Each record corrected is a new version, a `migrate` naming each window and
+/// the date it replaced (decisions/031): a correction recorded, not history
+/// rewritten. Answers how many records it corrected.
+pub fn open_the_starts(store: &dyn Store, now_ns: i64) -> Result<usize> {
+    // Only a window the platform's record gave: one this store opened is
+    // from the start or from a close already, and a record written whole
+    // by a test or a tool says nothing of where its dates came from.
+    let applied = |record: &Instrument, window: &Identifier| {
+        record
+            .source_of(Field::Identifier, Some(&window.asked()))
+            .is_some_and(|source| source.source.starts_with(FROM_THE_PLATFORM_BEFORE_V10))
+    };
+    let records = store.all()?;
+    let mut security = std::collections::HashMap::new();
+    for record in &records {
+        security.insert(
+            record.instrument_id.clone(),
+            current(store, &record.instrument_id)?,
+        );
+    }
+    let of = |id: &str| security.get(id).cloned().unwrap_or_else(|| id.to_string());
+    let windows: Vec<(String, &Identifier)> = records
+        .iter()
+        .flat_map(|record| {
+            record
+                .identifiers
+                .iter()
+                .map(move |window| (record.instrument_id.clone(), window))
+        })
+        .collect();
+
+    let mut corrected = 0;
+    for record in records.iter() {
+        let opens_late = |window: &Identifier| {
+            window.valid_from_ns > 0
+                && applied(record, window)
+                && !windows.iter().any(|(id, other)| {
+                    let same = other.scheme == window.scheme
+                        && other.value == window.value
+                        && other.source == window.source
+                        && !std::ptr::eq(*other, window);
+                    same && (other.valid_to_ns == Some(window.valid_from_ns)
+                        || (other.valid_from_ns <= window.valid_from_ns
+                            && of(id) != of(&record.instrument_id)))
+                })
+        };
+        let late: Vec<(usize, i64)> = record
+            .identifiers
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| opens_late(window))
+            .map(|(at, window)| (at, window.valid_from_ns))
+            .collect();
+        if late.is_empty() {
+            continue;
+        }
+
+        let mut fixed = record.clone();
+        let mut changes = Vec::new();
+        for (at, was) in &late {
+            let window = &mut fixed.identifiers[*at];
+            window.valid_from_ns = 0;
+            changes.push(identifier_change(
+                &window.asked(),
+                &format!(
+                    "on the record from the start; recorded from {}, the date the platform \
+                     learnt it",
+                    meridian_domain::instrument_type::utc_minute(*was)
+                ),
+            ));
+        }
+        fixed.version = record.version + 1;
+        fixed.record_time_ns = now_ns;
+        let entry = Version {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
+            prepared_call_id: String::new(),
+            instrument_id: record.instrument_id.clone(),
+            version: fixed.version,
+            operation: "migrate".into(),
+            changes,
+            person: String::new(),
+            instance_id: String::new(),
+            note: "Corrected, not rewritten: each identifier named here was kept from the \
+                   date the platform's record began, which said when the platform learnt it, \
+                   not when it began to name this security. It names it from the start now, \
+                   so a report dated earlier finds this record. No identifier was added or \
+                   removed."
+                .into(),
+            merged_instrument_id: String::new(),
+            record_time_ns: now_ns,
+        };
+        // Somebody wrote it in between: the next start corrects it.
+        if store.write(fixed, record.version, entry)? == Written::Stored {
+            corrected += 1;
+        }
+    }
+    Ok(corrected)
 }
 
 /// One record matched: join the set's other identifiers to it, unless one of
@@ -255,6 +519,7 @@ fn joined(
         record.set_source(Source {
             acting_through_delegation: String::new(),
             client_name: String::new(),
+            prepared_call_id: String::new(),
             field: Field::Identifier,
             identifier: Some(identifier.clone()),
             source: reported_by(instance_id),
@@ -275,6 +540,7 @@ fn joined(
     let entry = Version {
         acting_through_delegation: String::new(),
         client_name: String::new(),
+        prepared_call_id: String::new(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
         operation: if joining.is_empty() { "offer" } else { "join" }.into(),
@@ -330,6 +596,7 @@ fn mint(
             .map(|identifier| Source {
                 acting_through_delegation: String::new(),
                 client_name: String::new(),
+                prepared_call_id: String::new(),
                 field: Field::Identifier,
                 identifier: Some(identifier.clone()),
                 source: reported_by(instance_id),
@@ -345,6 +612,7 @@ fn mint(
     let first = Version {
         acting_through_delegation: String::new(),
         client_name: String::new(),
+        prepared_call_id: String::new(),
         instrument_id: instrument_id.clone(),
         version: 1,
         operation: "mint".into(),
@@ -735,6 +1003,7 @@ mod tests {
         let first = Version {
             acting_through_delegation: String::new(),
             client_name: String::new(),
+            prepared_call_id: String::new(),
             instrument_id: record.instrument_id.clone(),
             version: record.version,
             operation: "migrate".into(),
@@ -1184,5 +1453,170 @@ mod tests {
         assert_eq!(listed[0].reason, MissReason::Ambiguous as i32);
         let wire = to_wire(&store.by_id("INS-A").unwrap().unwrap());
         assert_eq!(wire.identifiers[0].valid_until_ns, 0, "on the record");
+    }
+
+    // ── Windows kept from the platform's date (the product owner's
+    // deployment, 2026-10-05 and 2026-10-10) ─────────────────────────────
+
+    /// The day the platform learnt the identifiers, after the report's date.
+    const LEARNT: i64 = AS_OF + 86_400_000_000_000;
+
+    /// A record applied from the platform before v10, each identifier
+    /// sourced as the migration sourced it.
+    fn applied(mut record: Instrument) -> Instrument {
+        for window in record.identifiers.clone() {
+            record.set_source(Source {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
+                prepared_call_id: String::new(),
+                field: Field::Identifier,
+                identifier: Some(window.asked()),
+                source: format!("{FROM_THE_PLATFORM_BEFORE_V10}{}", record.version),
+                person: String::new(),
+                instance_id: String::new(),
+                recorded_at_ns: 0,
+                note: String::new(),
+            });
+        }
+        record
+    }
+
+    #[test]
+    fn an_earlier_dated_report_minted_beside_a_record_kept_from_the_platforms_date() {
+        let store = MemoryStore::new();
+        hold(
+            &store,
+            platform_record("INS-TCH4", vec![("symbol", "TCH4", "snaptrade", LEARNT)]),
+        );
+        let reply = resolve(&store, &request(vec![asked("symbol", "TCH4", "snaptrade")]));
+        assert!(reply.minted, "the duplicate as it was seen");
+        assert_ne!(reply.instrument_id, "INS-TCH4");
+    }
+
+    #[test]
+    fn opened_from_the_start_an_earlier_dated_report_resolves_to_the_record_held() {
+        let store = MemoryStore::new();
+        hold(
+            &store,
+            applied(platform_record(
+                "INS-USD",
+                vec![
+                    ("iso4217", "USD", "", LEARNT),
+                    ("symbol", "USD", "fed-h10", LEARNT),
+                ],
+            )),
+        );
+        assert_eq!(open_the_starts(&store, NOW).unwrap(), 1);
+
+        let held = store.by_id("INS-USD").unwrap().unwrap();
+        assert!(held.identifiers.iter().all(|w| w.valid_from_ns == 0));
+        assert_eq!(held.version, 5);
+        let entry = &store.history("INS-USD").unwrap()[0];
+        assert_eq!(entry.operation, "migrate");
+        assert_eq!(entry.changes.len(), 2);
+        assert!(entry.changes[0]
+            .source
+            .contains("recorded from 2025-09-09 00:00 UTC"));
+
+        // As of the day before the platform learnt it, and as of the epoch,
+        // as a plugin that states no date asks.
+        for as_of_ns in [AS_OF, 0] {
+            let reply = resolve(
+                &store,
+                &ResolveIdentifierRequest {
+                    as_of_ns,
+                    ..request(vec![asked("iso4217", "USD", "")])
+                },
+            );
+            assert_eq!(reply.instrument_id, "INS-USD");
+            assert!(!reply.minted, "no record minted beside it");
+        }
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            open_the_starts(&store, NOW + 1).unwrap(),
+            0,
+            "run again, nothing"
+        );
+    }
+
+    #[test]
+    fn a_window_the_platform_did_not_give_is_left_as_it_is() {
+        let store = MemoryStore::new();
+        hold(
+            &store,
+            platform_record("INS-LATE", vec![("figi", "BBG000LATE01", "", LEARNT)]),
+        );
+        assert_eq!(open_the_starts(&store, NOW).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_window_opened_where_another_closed_stays() {
+        let store = MemoryStore::new();
+        let mut old = platform_record("INS-OLD", vec![("symbol", "ZZ", "snaptrade", 0)]);
+        old.identifiers[0].valid_to_ns = Some(LEARNT);
+        hold(&store, applied(old));
+        hold(
+            &store,
+            applied(platform_record(
+                "INS-NEW",
+                vec![("symbol", "ZZ", "snaptrade", LEARNT)],
+            )),
+        );
+        assert_eq!(open_the_starts(&store, NOW).unwrap(), 0);
+        let reply = resolve(&store, &request(vec![asked("symbol", "ZZ", "snaptrade")]));
+        assert_eq!(
+            reply.instrument_id, "INS-OLD",
+            "a reused symbol keeps its dates"
+        );
+    }
+
+    #[test]
+    fn a_stub_minted_beside_it_waits_for_a_merge_and_then_it_opens() {
+        let store = MemoryStore::new();
+        hold(
+            &store,
+            applied(platform_record(
+                "INS-ZZC",
+                vec![("symbol", "ZZCSKM282", "snaptrade", LEARNT)],
+            )),
+        );
+        let stub = resolve(
+            &store,
+            &request(vec![asked("symbol", "ZZCSKM282", "snaptrade")]),
+        );
+        assert!(stub.minted);
+        // Another security holds it from the start: widening would only
+        // widen the conflict a person settles by merging.
+        assert_eq!(open_the_starts(&store, NOW).unwrap(), 0);
+
+        let mut merged = store.by_id(&stub.instrument_id).unwrap().unwrap();
+        let version = merged.version;
+        merged.close(&merged.identifiers[0].asked(), NOW + 5);
+        merged.version += 1;
+        let entry = Version {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
+            prepared_call_id: String::new(),
+            instrument_id: merged.instrument_id.clone(),
+            version: merged.version,
+            operation: "merged-into".into(),
+            changes: Vec::new(),
+            person: "local|someone".into(),
+            instance_id: String::new(),
+            note: String::new(),
+            merged_instrument_id: "INS-ZZC".into(),
+            record_time_ns: NOW + 5,
+        };
+        assert_eq!(
+            store.write(merged, version, entry).unwrap(),
+            Written::Stored
+        );
+        store
+            .replace(&stub.instrument_id, "INS-ZZC", NOW + 5)
+            .unwrap();
+
+        assert_eq!(open_the_starts(&store, NOW + 6).unwrap(), 1);
+        let held = store.by_id("INS-ZZC").unwrap().unwrap();
+        assert_eq!(held.identifiers[0].valid_from_ns, 0);
     }
 }
