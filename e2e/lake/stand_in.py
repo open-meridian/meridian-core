@@ -31,6 +31,11 @@ quotes, streamed -- and serves:
   /resolve-as-of?scheme=S&value=V&source=N&as_of=NS
              one resolve as of a date, answering the record.
 
+On a standing want of `live` it streams: a trade on each subject the want
+names every two seconds, until the want is withdrawn, one stream per want
+however often the want is delivered. It holds nothing it cannot lose, so a
+restart ends the stream until the lake delivers the want again.
+
 STAND_IN_LAKE=desk is an `ems` plugin hearing trades and quotes (a raw
 receive of TradesRecorded and QuotesRecorded) and serving:
 
@@ -197,6 +202,9 @@ class Dgm:
         self.ids = {}
         self.wants = []
         self.withdrawn = []
+        self.streams = {}
+        self.streamed = 0
+        self.started = time.time_ns()
 
     def dataset(self, key):
         return f"{self.plugin.identity.instance_id}:{key}"
@@ -287,12 +295,40 @@ class Dgm:
         log(restated=said)
         return said
 
+    async def stream(self, want):
+        """Keep a standing want current, as a vendor's stream would: a trade
+        on each subject every two seconds."""
+        n = 0
+        while True:
+            n += 1
+            at = time.time_ns()
+            trades = [ops.Trade(
+                meta=ops.ObservationMeta(
+                    row_key=f"STREAM-{self.started}-{subject.entity_id}-{n}",
+                    subjects=[subject],
+                    source=ops.Source(dataset=want.dataset, venue_id=VENUE),
+                    valid_from_ns=at),
+                price=ops.Money(amount=_decimal("1.0001"), currency_code="USD"),
+                quantity=_decimal("10"),
+                attributes=ops.TradeAttributes(),
+            ) for subject in want.subjects]
+            try:
+                done = await self.plugin._operations().RecordTrades(
+                    ops.RecordTradesParams(trades=trades, want_id=want.want_id))
+                self.streamed += done.recorded
+            except Exception as failed:  # said, and the stream goes on
+                log(stream_failed=str(failed))
+            await asyncio.sleep(2)
+
     async def on_want(self, heard):
         want = heard.message
         self.wants.append({"want_id": want.want_id, "dataset": want.dataset,
                            "business_date": want.business_date, "standing": want.standing,
                            "subjects": [s.entity_id for s in want.subjects]})
         log(want=self.wants[-1])
+        # One stream per want, however often it is delivered.
+        if want.standing and want.dataset.endswith(":live") and want.want_id not in self.streams:
+            self.streams[want.want_id] = asyncio.ensure_future(self.stream(want))
         if want.standing or not want.business_date or not want.dataset.endswith(":daily"):
             return
         await self.resolve()
@@ -305,6 +341,9 @@ class Dgm:
                 return
 
     async def on_withdrawn(self, heard):
+        streaming = self.streams.pop(heard.message.want_id, None)
+        if streaming:
+            streaming.cancel()
         self.withdrawn.append({"want_id": heard.message.want_id, "dataset": heard.message.dataset})
         log(withdrawn=self.withdrawn[-1])
 
@@ -401,7 +440,8 @@ class Dgm:
         if path == "/restate":
             return await self.restate()
         if path == "/wants":
-            return {"wants": self.wants, "withdrawn": self.withdrawn}
+            return {"wants": self.wants, "withdrawn": self.withdrawn, "streaming": sorted(self.streams),
+                    "streamed": self.streamed, "started": self.started}
         return {"page": "the lake's dgm stand-in"}
 
 

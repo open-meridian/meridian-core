@@ -97,6 +97,12 @@ const ASKING: Duration = Duration::from_secs(3);
 /// How often a want asked and not answered is asked again.
 const ASK_AGAIN_NS: i64 = 60 * 1_000_000_000;
 
+/// How often a standing want is delivered again, the same want under the
+/// same ID: a `dgm` restarted -- relaunched, upgraded -- holds nothing it
+/// cannot lose, and the lake hears no registration, so a stream it kept
+/// current resumes on the next delivery, within this.
+pub const REDELIVER_STANDING_NS: i64 = ASK_AGAIN_NS;
+
 /// How often the standing wants are swept for withdrawal, and how often
 /// retention is applied.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15);
@@ -815,8 +821,23 @@ impl Lake {
     pub fn sweep_wants(&self) {
         let now = self.clock.now_ns();
         let mut withdrawn = Vec::new();
+        let mut again = Vec::new();
         {
             let mut wants = self.wants.lock().expect("wants poisoned");
+            // Standing wants still asked for, delivered again as they were
+            // first delivered: a dgm that already holds one hears the same
+            // want ID, and one that restarted resumes keeping it current. Not
+            // a change to the want, so no record of it.
+            for open in wants.open.values_mut() {
+                let window = open.cadence_ns.max(ASK_AGAIN_NS) * 2;
+                if open.event.standing
+                    && now - open.asked_at_ns <= window
+                    && now - open.published_at_ns >= REDELIVER_STANDING_NS
+                {
+                    open.published_at_ns = now;
+                    again.push(open.event.clone());
+                }
+            }
             let stale: Vec<String> = wants
                 .open
                 .iter()
@@ -831,6 +852,22 @@ impl Lake {
                     wants.by_key.retain(|_, held| held != &id);
                     withdrawn.push(open);
                 }
+            }
+        }
+        for event in again {
+            tracing::debug!(
+                want_id = event.want_id,
+                dataset = event.dataset,
+                "a standing want delivered again"
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a standing want was not delivered again");
             }
         }
         for open in withdrawn {

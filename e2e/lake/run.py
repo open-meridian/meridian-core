@@ -39,7 +39,11 @@ harness's admin, Ben, who holds read on `book`.
    both together are ambiguous -- nothing minted, the conflict listed with
    reason ambiguous; a symbol the admin ends on its record answers that
    record as of a date before, and a new record as of a date after.
-10. `store lake` prints each row version kept, numbered with no holes, the
+10. Restarted: `coin` streams the standing want of `live`; restarted, it
+   holds nothing, hears the same want again from the lake with no reader
+   asking anew, and streams again; `desk` catches up both streams by
+   watermark.
+11. `store lake` prints each row version kept, numbered with no holes, the
    restatement as version 2, the want asked once and answered, the standing
    want withdrawn, the priority's changes, and the trades and quotes.
 
@@ -342,7 +346,32 @@ def run():
     must(then["instrument_id"] == old["instrument_id"],
          f"step 9, as of a date before, the record that held it: {then}")
 
-    # 10. The store.
+    # 10. A restarted dgm streams again: the lake delivers its standing want
+    # again, the same want, and nothing new is asked.
+    def streaming():
+        wants = page("coin", "admin", "/wants")
+        live = [w for w in wants["wants"] if w["dataset"] == "coin:live" and w["standing"]]
+        return wants if live and wants["streamed"] > 0 else None
+    before = until(60, streaming, "step 10, coin did not stream the standing want")
+    want_id = [w for w in before["wants"] if w["dataset"] == "coin:live" and w["standing"]][0]["want_id"]
+    compose("restart", "coin")
+    runner("ready", "--instance", "coin")
+
+    def resumed():
+        # The reader keeps asking, as it would, which asks nothing new.
+        page("desk", "read", f"/quotes-wanted?subject={usdc}")
+        wants = page("coin", "admin", "/wants")
+        return wants if (wants["started"] != before["started"] and want_id in wants["streaming"]
+                         and wants["streamed"] > 0) else None
+    after = until(150, resumed, "step 10, the restarted coin did not hear its standing want again")
+    must(all(w["want_id"] == want_id for w in after["wants"] if w["dataset"] == "coin:live"),
+         f"step 10, the same want delivered again, none new: {after['wants']}")
+    caught = page("desk", "read", f"/catch-up?subject={usdc}&after=0")["trades"]
+    starts = {t["row_key"].split("-")[1] for t in caught if t["row_key"].startswith("STREAM-")}
+    must({str(before["started"]), str(after["started"])} <= starts,
+         f"step 10, both streams caught up by watermark: {sorted(starts)}")
+
+    # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
     daily_rows = [line.split("|") for line in lines if line.startswith("row|coin:daily|")]
@@ -362,7 +391,7 @@ def run():
     must("priority|meridian.v1.Price|1|2" in lines, f"step 8, the priority's two changes: {lines}")
     live_rows = [line.split("|") for line in lines if line.startswith("row|coin:live|")]
     live_sequences = sorted(int(row[3]) for row in live_rows)
-    must(live_sequences == list(range(1, len(live_sequences) + 1)) and len(live_sequences) == 8,
+    must(live_sequences == list(range(1, len(live_sequences) + 1)) and len(live_sequences) > 8,
          f"step 10, live's trades and quotes numbered from its head with no holes: {live_sequences}")
 
     took = int(time.time() - started)
@@ -378,7 +407,8 @@ def run():
           "one by an ems plugin and a loss caught up by watermark, a late print included, the "
           "latest quote per asset and a standing want of a streamed dataset; an ambiguous resolve "
           "listed with its reason and nothing minted, a symbol ended on its record answering each "
-          "record for its own dates; and `store lake` printing each version numbered with no "
+          "record for its own dates; a restarted dgm streaming again on its standing want, "
+          "delivered again by the lake; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 

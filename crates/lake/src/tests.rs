@@ -1312,3 +1312,39 @@ async fn a_decline_stands_for_the_date_asked_only_and_a_streamed_latest_is_stand
     assert_eq!(streamed.data_type, "meridian.v1.Quote");
     assert!(streamed.standing);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_standing_want_is_delivered_again_under_its_id_so_a_restarted_dgm_resumes() {
+    // A dgm holds nothing it cannot lose: one restarted hears its standing
+    // wants again, the same want and ID, within a minute; one that holds the
+    // want already hears what it holds.
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    live_read(&h, DataType::Quote, (0, 0), 0, None).unwrap();
+    let first = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert!(first.standing);
+    h.clock.advance(30 * 1_000_000_000);
+    h.lake.sweep_wants();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), wanted.recv())
+            .await
+            .is_err(),
+        "not again within the minute"
+    );
+    h.clock.advance(31 * 1_000_000_000);
+    live_read(&h, DataType::Quote, (0, 0), 0, None).unwrap();
+    h.lake.sweep_wants();
+    let again = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert_eq!(again, first, "the same want, under the same ID");
+    let asked = h
+        .store
+        .want_changes()
+        .unwrap()
+        .iter()
+        .filter(|c| c.want_id == first.want_id && c.kind == crate::store::WantChangeKind::Asked)
+        .count();
+    assert_eq!(asked, 1, "delivered again, not asked again");
+}
