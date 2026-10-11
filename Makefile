@@ -1763,7 +1763,8 @@ chart-check:
 	@# recipient, or nowhere to write, refused, since there is no unencrypted
 	@# backup; with both, a CronJob in backup.image, suspended with no schedule,
 	@# mounting the settings key and the deployment's key, and the values it
-	@# keeps holding no enrolment code.
+	@# keeps holding no enrolment code; backup.database read as the rule when
+	@# empty, as said when true or false, and anything else refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'meridian.dev/component: backup' \
 		|| { echo "chart-check FAILED: a backup renders though no recipient and no place were given" >&2; exit 1; }; \
@@ -1789,7 +1790,15 @@ chart-check:
 		|| { echo "chart-check FAILED: the values a backup keeps hold the enrolment code" >&2; exit 1; }; \
 	$(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.schedule='0 2 * * *' 2>/dev/null \
 		| awk '/^---/{p=0} /^kind: CronJob$$/{p=1} p' | grep -q '^  suspend: false$$' \
-		|| { echo "chart-check FAILED: with a schedule the backup's CronJob is still suspended" >&2; exit 1; }
+		|| { echo "chart-check FAILED: with a schedule the backup's CronJob is still suspended" >&2; exit 1; }; \
+	for said in "auto:" "true:--set backup.database=true" "false:--set backup.database=false"; do \
+		want="$${said%%:*}"; flag="$${said#*:}"; \
+		$(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b $$flag 2>/dev/null \
+			| grep -A1 'name: MERIDIAN_BACKUP_DATABASE$$' | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: backup.database $${flag:-unset} does not tell the backup $$want" >&2; exit 1; }; \
+	done; \
+	! $(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.database=maybe >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: backup.database=maybe rendered; it takes true, false or nothing" >&2; exit 1; }
 	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:

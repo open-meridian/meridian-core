@@ -475,6 +475,13 @@ backup:
   # How many of this release's backups to keep; the oldest beyond it are
   # removed once a new one is written, and never after a failure.
   keep: 14
+  # Whether the database is dumped. Empty: the database this chart brings
+  # is, and one somebody else runs is not, left to its provider's own
+  # backups and availability. `true` dumps either (an external one as its
+  # migrating role, with a pg_dump no older than its server: name an image
+  # that has one); `false` dumps none. The keys, the values and the
+  # manifest are backed up whichever.
+  database: ""
   # pg_dump at the brought database's major version, and age.
   image: ghcr.io/open-meridian/meridian-backup:latest
 

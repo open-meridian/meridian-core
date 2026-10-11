@@ -282,3 +282,17 @@ spec:
     requests:
       storage: {{ $top.Values.pluginStorage.size | quote }}
 {{- end -}}
+
+{{/*
+  Whether a backup dumps the database (backup.database; task
+  kernel/a-deployment-is-backed-up-and-restored, approved 2026-10-11): `auto`
+  when empty, which the backup's script reads as the database this chart
+  brings included and one somebody else runs left to its provider; `true` or
+  `false` for either. A boolean and its string spelling are one answer.
+*/}}
+{{- define "meridian-runtime.backupDatabase" -}}
+{{- $said := index (.Values.backup | default dict) "database" -}}
+{{- if kindIs "bool" $said -}}{{ ternary "true" "false" $said }}
+{{- else if or (kindIs "invalid" $said) (eq (toString $said) "") (eq (toString $said) "auto") -}}auto
+{{- else -}}{{ toString $said }}{{- end -}}
+{{- end -}}

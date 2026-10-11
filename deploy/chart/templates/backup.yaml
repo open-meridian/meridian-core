@@ -6,6 +6,9 @@
 {{- if and $b.schedule (not (or $b.path $b.existingClaim)) }}
 {{- fail "backup.schedule is set with nowhere to write: set backup.path (a directory on the node) or backup.existingClaim (a claim on storage that outlives the cluster)." }}
 {{- end }}
+{{- if not (has (include "meridian-runtime.backupDatabase" .) (list "auto" "true" "false")) }}
+{{- fail (printf "backup.database is %v; it takes true, false, or nothing for the rule: the database this chart brings backed up, one somebody else runs not." $b.database) }}
+{{- end }}
 {{- if and $b.path $b.existingClaim }}
 {{- fail "backup.path and backup.existingClaim are both set; name one place for backups." }}
 {{- end }}
@@ -202,10 +205,11 @@ spec:
                   value: {{ $b.recipient | quote }}
                 - name: MERIDIAN_BACKUP_KEEP
                   value: {{ $b.keep | default 14 | quote }}
-                # Included with the database this chart brings, not with one
-                # somebody else runs.
+                # backup.database: empty is the rule, the database this chart
+                # brings included and one somebody else runs not; true or
+                # false says so for either.
                 - name: MERIDIAN_BACKUP_DATABASE
-                  value: auto
+                  value: {{ include "meridian-runtime.backupDatabase" . | quote }}
                 - name: MERIDIAN_BACKUP_DATABASE_SECRET
                   value: {{ include "meridian-runtime.databaseSecret" . | quote }}
                 {{- if .Values.database.brought.enabled }}

@@ -103,9 +103,10 @@ else
 	if [ -n "$there" ]; then
 		case "$host" in "$there" | "$there".*) brought=true ;; esac
 	fi
-	# Included by default with the database this chart brings, and not with
-	# one somebody else runs, whose own backups and availability are its
-	# provider's (the product owner, 2026-10-11).
+	# backup.database: empty (auto) includes the database this chart brings
+	# and not one somebody else runs, whose own backups and availability are
+	# its provider's; true or false says so for either (the product owner,
+	# 2026-10-11).
 	case "${MERIDIAN_BACKUP_DATABASE:-auto}" in
 	auto) included=$brought ;;
 	true) included=true ;;
@@ -154,7 +155,11 @@ SQL
 	rows=$(awk -F'\t' '{ n += $2 } END { print n + 0 }' "$work/database/counts.tsv")
 	say "the database $database: $(wc -l <"$work/database/counts.tsv" | tr -d ' ') tables, $rows rows, dump $(wc -c <"$MERIDIAN_DUMP" | tr -d ' ') bytes"
 elif [ -n "$database" ]; then
-	say "the database $database is not included (one this chart does not bring is its provider's to back up)"
+	if [ "$brought" = true ]; then
+		say "the database $database is not included (backup.database is false)"
+	else
+		say "the database $database is not included: one this chart does not bring is its provider's to back up, unless backup.database is true"
+	fi
 fi
 
 list() { # space-separated names as a JSON array
