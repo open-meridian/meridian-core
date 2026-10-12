@@ -1910,7 +1910,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=44d484261262583a4fb58b4ccdc31859aed5c9af#44d484261262583a4fb58b4ccdc31859aed5c9af"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=47aa161776a2cf15dd3eebf2317d957fe6ef7d8a#47aa161776a2cf15dd3eebf2317d957fe6ef7d8a"
 dependencies = [
  "prost",
  "tonic",
