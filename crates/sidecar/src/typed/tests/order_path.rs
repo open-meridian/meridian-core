@@ -335,7 +335,7 @@ fn every_book_command_the_operations_send_with_no_account_is_one_named_by_id_alo
     // The generated half hands `account = None` to these; the list here is
     // what stamps their scope. A new one generated and not listed would go
     // unscoped.
-    let generated = include_str!("../operations.rs");
+    let generated = include_str!("../../operations.rs");
     let mut unlisted = Vec::new();
     for block in generated.split("async fn ").skip(1) {
         let Some(at) = block.find("self.command_typed(\"platform.book.command.") else {
@@ -346,7 +346,7 @@ fn every_book_command_the_operations_send_with_no_account_is_one_named_by_id_alo
         }
         let call = &block[at..];
         let payload = call.split('"').nth(3).unwrap_or_default();
-        if !super::BY_ID_ALONE.contains(&payload) {
+        if !crate::typed::BY_ID_ALONE.contains(&payload) {
             unlisted.push(payload.to_string());
         }
     }

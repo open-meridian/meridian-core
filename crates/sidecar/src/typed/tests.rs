@@ -2613,3 +2613,6 @@ async fn a_service_account_administers_nothing_whatever_it_holds() {
     assert!(heard.lock().unwrap().is_empty());
     assert!(readers.lock().unwrap().is_empty());
 }
+
+/// Contract v22's admission (W4.9, W4.11, W11.20 to W11.22).
+mod order_path;

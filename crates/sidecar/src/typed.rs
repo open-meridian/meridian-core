@@ -1175,6 +1175,4 @@ pub(crate) fn refused(failed: BusError) -> Status {
 }
 
 #[cfg(test)]
-mod order_path;
-#[cfg(test)]
 mod tests;
