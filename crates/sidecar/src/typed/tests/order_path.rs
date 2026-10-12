@@ -529,9 +529,27 @@ async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_
         acting_for,
         ..Default::default()
     };
-    let allowed = |p: &Plugin| p.heard.lock().unwrap().last().cloned().unwrap().0.connectivity_allowed;
+    let allowed = |p: &Plugin| {
+        p.heard
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap()
+            .0
+            .connectivity_allowed
+    };
     let ada = |routes: &[&str]| {
-        routed(&p.key, "ems-1", "ems", AccessLevel::Write, &["ACC-1"], None, "", routes)
+        routed(
+            &p.key,
+            "ems-1",
+            "ems",
+            AccessLevel::Write,
+            &["ACC-1"],
+            None,
+            "",
+            routes,
+        )
     };
     p.sidecar
         .create_placement(Request::new(place("fix-1", Some(ada(&["fix-1", "fix-3"])))))
@@ -547,13 +565,25 @@ async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_
         .create_placement(Request::new(place("fix-1", None)))
         .await
         .unwrap();
-    assert!(!allowed(&p), "the plugin as itself names nobody who may route");
+    assert!(
+        !allowed(&p),
+        "the plugin as itself names nobody who may route"
+    );
 
     // A connectivity plugin's own direct order: allowed where the claims
     // name its own instance.
     let c = plugin("fix-1", &["connectivity"], None).await;
     let own = |routes: &[&str]| {
-        routed(&c.key, "fix-1", "connectivity", AccessLevel::Write, &["ACC-1"], None, "", routes)
+        routed(
+            &c.key,
+            "fix-1",
+            "connectivity",
+            AccessLevel::Write,
+            &["ACC-1"],
+            None,
+            "",
+            routes,
+        )
     };
     c.sidecar
         .create_placement(Request::new(place("fix-1", Some(own(&["fix-1"])))))
