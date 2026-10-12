@@ -16,9 +16,10 @@
 //!    active;
 //! 3. the account holds `write` on the role, and the "runs as" level is
 //!    `write`;
-//! 4. the level that applies to the act for the account -- the strictest of
-//!    the ceiling, the plugin admin's level, each access group's reaching
-//!    the account (it joins user groups by its subject, as a person does) --
+//! 4. the arguments a JSON object (`arguments_json`); then the level that
+//!    applies to the act for the account -- the strictest of the ceiling,
+//!    the plugin admin's level, each access group's reaching the account
+//!    (it joins user groups by its subject, as a person does) --
 //!    and the act's second pair of eyes (W6.29), with the account's own
 //!    setting the strictest of them: at "may not" it is refused by name; an
 //!    act with no check tool cannot be prepared, so it is refused an account

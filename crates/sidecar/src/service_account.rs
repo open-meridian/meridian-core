@@ -16,12 +16,19 @@
 //! by the dashboard.
 //!
 //! **What is checked here first**, so a malformed call stops at the plugin's
-//! own sidecar (the dashboard checks everything again): the role is one the
+//! own sidecar and the dashboard is never asked: the role is one the
 //! instance was launched with, the tool's name is 1 to 61 characters and no
 //! core tool's (`dashboard__...`), the arguments are a JSON object of at most
 //! 1 MiB, and the reason is 1 to 4,000 characters of plain text. A refusal is
 //! `invalid_argument`, naming the field (`role`, `tool_name`,
 //! `arguments_json`, `reason`), with no refusal code of its own.
+//!
+//! The dashboard then checks what admits the call (its
+//! `service_accounts::admission`): the role, and the tool one of its acts;
+//! the service account the role runs as, its state and its grant; the level
+//! that applies and the gate; the reason; and that the arguments are a JSON
+//! object. The 1 MiB bound and the tool name's length are this sidecar's
+//! alone.
 
 use std::time::Duration;
 
