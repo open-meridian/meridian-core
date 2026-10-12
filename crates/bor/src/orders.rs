@@ -1331,6 +1331,25 @@ pub fn expires_at(held: &OrderHeld) -> Option<i64> {
     }
 }
 
+/// When an order comes due to expire by the deployment's clock (W11.13):
+/// a released order at the end of its time in force (row i4); one never
+/// released only where it is a day order, at its day's end (row i7, ruled
+/// 2026-10-12); none that is ending or ended.
+pub fn due_at(held: &OrderHeld) -> Option<i64> {
+    use meridian_domain::v1::TimeInForce;
+    if held.ending.is_some() || held.ended.is_some() {
+        return None;
+    }
+    let day = matches!(
+        TimeInForce::try_from(held.order.time_in_force),
+        Ok(TimeInForce::Day | TimeInForce::AtTheOpen | TimeInForce::AtTheClose)
+    );
+    if !held.released && !day {
+        return None;
+    }
+    expires_at(held)
+}
+
 /// The dedup key of a venue's execution: the instance that sent it and the
 /// venue's identifiers, with what it supersedes and its finality, so a
 /// finality move or a correction is a fact of its own and a repeat is not.

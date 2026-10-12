@@ -221,15 +221,13 @@ pub fn keyed_page<T>(
     })
 }
 
-/// Each live order of a book whose own time in force ended by `now_ns`.
+/// Each live order of a book come due to expire by `now_ns` (W11.13: rows
+/// i4 and i7).
 pub fn expiring_of(key: &str, book: &Book, now_ns: i64) -> Result<Vec<(String, String)>> {
     use meridian_domain::v1::OrderState;
     let mut out = Vec::new();
     for (id, held) in &book.ledger.orders {
-        if held.ended.is_some() || held.ending.is_some() {
-            continue;
-        }
-        let Some(at) = orders::expires_at(held) else {
+        let Some(at) = orders::due_at(held) else {
             continue;
         };
         if at > now_ns {
@@ -237,7 +235,7 @@ pub fn expiring_of(key: &str, book: &Book, now_ns: i64) -> Result<Vec<(String, S
         }
         if matches!(
             book.ledger.state(id)?,
-            OrderState::Released | OrderState::Working
+            OrderState::Proposed | OrderState::Released | OrderState::Working
         ) {
             out.push((key.to_string(), id.clone()));
         }

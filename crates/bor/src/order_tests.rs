@@ -1137,10 +1137,18 @@ async fn trading_instructions_are_journalled_in_their_partitions_and_read_with_t
     let w = wired();
     let mut heard = w.bus.subscribe(TRADING_INSTRUCTION_CHANGED);
     let set = |target: TradingInstructionTarget, value: TradingInstructionValue, reason: &str| {
+        // As the dashboard stamps it: here a plugin admin's names their
+        // plugin, and every other is a deployment admin's.
+        let setter_level = if target.instance_id.is_empty() {
+            SetterLevel::DeploymentAdmin
+        } else {
+            SetterLevel::PluginAdmin
+        } as i32;
         SetTradingInstructionRequest {
             target: Some(target),
             value: value as i32,
             reason: reason.into(),
+            setter_level,
         }
     };
     let admin = As {
@@ -1218,6 +1226,64 @@ async fn trading_instructions_are_journalled_in_their_partitions_and_read_with_t
         SetterLevel::PluginAdmin as i32
     );
 
+    // A deployment admin's on the same plugin stands apart, at its level.
+    let mut deployment_on_plugin = set(
+        TradingInstructionTarget {
+            instance_id: "snaptrade-1".into(),
+            ..Default::default()
+        },
+        TradingInstructionValue::Pause,
+        "pause the plugin, deployment-wide",
+    );
+    deployment_on_plugin.setter_level = SetterLevel::DeploymentAdmin as i32;
+    let deployment = send_from(
+        &w.bus,
+        SET_TRADING_INSTRUCTION,
+        "meridian.v1.SetTradingInstructionRequest",
+        &deployment_on_plugin,
+        &admin,
+    )
+    .await
+    .map(|reply| TradingInstructionReply::decode(&reply[..]).unwrap())
+    .unwrap();
+    assert_eq!(
+        deployment.instruction.unwrap().setter_level,
+        SetterLevel::DeploymentAdmin as i32
+    );
+    // Never entered: one the dashboard did not stamp is malformed.
+    let mut unstamped = deployment_on_plugin.clone();
+    unstamped.setter_level = SetterLevel::Unspecified as i32;
+    let refused = send_from(
+        &w.bus,
+        SET_TRADING_INSTRUCTION,
+        "meridian.v1.SetTradingInstructionRequest",
+        &unstamped,
+        &admin,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["setter_level"]);
+    // A plugin admin names their plugin; All accounts is not theirs.
+    let mut overreach = set(
+        TradingInstructionTarget {
+            all_accounts: true,
+            ..Default::default()
+        },
+        TradingInstructionValue::Active,
+        "lift it",
+    );
+    overreach.setter_level = SetterLevel::PluginAdmin as i32;
+    let refused = send_from(
+        &w.bus,
+        SET_TRADING_INSTRUCTION,
+        "meridian.v1.SetTradingInstructionRequest",
+        &overreach,
+        &admin,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["target"]);
+
     let no_reason = send_from(
         &w.bus,
         SET_TRADING_INSTRUCTION,
@@ -1249,7 +1315,7 @@ async fn trading_instructions_are_journalled_in_their_partitions_and_read_with_t
     .await
     .map(|reply| ListTradingInstructionsReply::decode(&reply[..]).unwrap())
     .unwrap();
-    assert_eq!(listed.instructions.len(), 3);
+    assert_eq!(listed.instructions.len(), 4);
     let control_head = listed
         .as_of
         .unwrap()
@@ -1290,6 +1356,14 @@ async fn a_day_order_expires_at_the_end_of_its_day_its_placements_asked_to_cance
         .unwrap()
         .placement
         .unwrap();
+    // A day order never released, waiting for compliance (row i7), and a
+    // good-till-cancelled one never released, which the clock never ends.
+    waits(&w, ACC, true).await;
+    let unreleased = propose(&w, &buy("2")).await.unwrap();
+    release(&w, &unreleased.order_id).await.unwrap();
+    let mut forever = buy("2");
+    forever.time_in_force = TimeInForce::GoodTillCancelled as i32;
+    let forever = propose(&w, &forever).await.unwrap();
     let store: Arc<dyn Store> = w.store.clone();
     assert_eq!(expire_due(&w.bus, &store).unwrap(), 0);
     w.clock.advance(12 * 3_600 * 1_000_000_000);
@@ -1299,8 +1373,15 @@ async fn a_day_order_expires_at_the_end_of_its_day_its_placements_asked_to_cance
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(acted, 2);
+    assert_eq!(acted, 3);
     assert_eq!(state(&order_now(&w, &idle.order_id)), OrderState::Expired);
+    let lapsed = order_now(&w, &unreleased.order_id);
+    assert_eq!(state(&lapsed), OrderState::Expired);
+    assert!(!holds(&lapsed, OrderCondition::AwaitingCheck));
+    assert_eq!(
+        state(&order_now(&w, &forever.order_id)),
+        OrderState::Proposed
+    );
     let waiting = order_now(&w, &worked.order_id);
     assert_eq!(state(&waiting), OrderState::Working);
     assert!(holds(&waiting, OrderCondition::ChangeRequested));

@@ -824,8 +824,7 @@ impl Book {
             let Some(held) = self.ledger.orders.get(id) else {
                 continue;
             };
-            let expiry = crate::orders::expires_at(held)
-                .filter(|_| held.ending.is_none() && held.ended.is_none());
+            let expiry = crate::orders::due_at(held);
             changes.order_expiries.insert(id.clone(), expiry);
             let after = self.ledger.order_record(id, true)?;
             let changed = crate::orders::order_changed(before_orders.get(id), &after);

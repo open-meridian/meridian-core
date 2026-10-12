@@ -653,11 +653,9 @@ fn all_changes(book: &Book) -> Result<Changes> {
         changes
             .orders
             .push((ledger.order_record(id, true)?, Vec::new()));
-        changes.order_expiries.insert(
-            id.clone(),
-            crate::orders::expires_at(held)
-                .filter(|_| held.ending.is_none() && held.ended.is_none()),
-        );
+        changes
+            .order_expiries
+            .insert(id.clone(), crate::orders::due_at(held));
     }
     for id in ledger.placements.keys() {
         changes
@@ -1383,6 +1381,7 @@ impl Store for PostgresStore {
                 &[
                     &now_ns,
                     &vec![
+                        meridian_domain::v1::OrderState::Proposed as i32,
                         meridian_domain::v1::OrderState::Released as i32,
                         meridian_domain::v1::OrderState::Working as i32,
                     ],

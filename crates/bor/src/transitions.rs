@@ -358,4 +358,12 @@ pub const TRANSITIONS: &[Transition] = &[
         to: &[To::State(OrderState::Cancelled)],
         refusal: &[RefusalReason::OrderState],
     },
+    Transition {
+        row: "i7",
+        from: &[From::State(OrderState::Proposed)],
+        cause: "a day order never released: its day ends, by the deployment's clock (actor the system), awaiting check or approval included",
+        caused_by: &["bor"],
+        to: &[To::State(OrderState::Expired)],
+        refusal: &[],
+    },
 ];

@@ -736,6 +736,7 @@ async fn instructions_stand_in_their_partitions_and_a_day_order_comes_due() {
         }),
         value: TradingInstructionValue::Pause as i32,
         reason: "pause the plugin".into(),
+        setter_level: SetterLevel::PluginAdmin as i32,
     };
     let reply = TradingInstructionReply::decode(
         &send_order(&bus, SET_TRADING_INSTRUCTION, &set, Some(PERSON), None)

@@ -2520,7 +2520,24 @@ pub fn expire(book: &Book, head: u64, ctx: &Context, order_id: &str) -> Result<O
         return Ok(None);
     };
     let state = state_of(book, order_id)?;
-    if !starts_from(row("i4"), Some(state)) || held.ending.is_some() {
+    if orders::due_at(held).is_none() {
+        return Ok(None);
+    }
+    // A day order never released expires at its day's end (row i7), its
+    // awaiting check or approval ending with it.
+    if state == OrderState::Proposed && starts_from(row("i7"), Some(state)) {
+        let plan = Plan::new(
+            "order-expired",
+            ctx.actor(),
+            vec![Act::Ended {
+                order_id: order_id.to_string(),
+                state: OrderState::Expired as i32,
+            }],
+        )
+        .reason("a day order never released: its day ended by the deployment's clock");
+        return Ok(Some(finish(book, head, ctx, plan)?));
+    }
+    if !starts_from(row("i4"), Some(state)) {
         return Ok(None);
     }
     let mut acts = Vec::new();
@@ -2598,15 +2615,28 @@ pub fn acknowledge_flag(
 
 // ── W11.15: a trading instruction ───────────────────────────────────────────
 
-/// The setter's level an instruction is recorded at (W11.15). A plugin
-/// admin's names their plugin, alone or beside a person, service account or
-/// account within it; every other target is a deployment admin's. See the
-/// handover's note: no contract field carries the level from the dashboard.
-pub fn setter_level(target: &TradingInstructionTarget) -> SetterLevel {
-    if target.instance_id.is_empty() || target.all_accounts || !target.user_group_id.is_empty() {
-        SetterLevel::DeploymentAdmin
-    } else {
-        SetterLevel::PluginAdmin
+/// The setter's level an instruction is recorded at (W11.15; approved
+/// 2026-10-12): stamped by the dashboard from the setter's claims, never
+/// entered. A plugin admin's names their plugin, alone or beside a person,
+/// service account or account within it; All accounts is a deployment
+/// admin's alone.
+pub fn setter_level(request: &SetTradingInstructionRequest) -> Result<SetterLevel> {
+    let level = SetterLevel::try_from(request.setter_level).unwrap_or(SetterLevel::Unspecified);
+    let target = request.target.clone().unwrap_or_default();
+    match level {
+        SetterLevel::Unspecified => Err(malformed(
+            &["setter_level"],
+            "an instruction is set at a level the dashboard stamps from the setter's claims, \
+             and this names none",
+        )),
+        SetterLevel::PluginAdmin if target.instance_id.is_empty() || target.all_accounts => {
+            Err(malformed(
+                &["target"],
+                "a plugin admin's instruction names their plugin, alone or beside a person, \
+                 service account or account within it",
+            ))
+        }
+        level => Ok(level),
     }
 }
 
@@ -2680,7 +2710,7 @@ pub fn set_trading_instruction(
             "an instruction is active, pause or stop",
         ));
     }
-    let level = setter_level(&target);
+    let level = setter_level(request)?;
     let key = instruction_key(&target, level);
     let instruction = TradingInstruction {
         target: Some(target),

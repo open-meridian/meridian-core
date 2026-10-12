@@ -7434,6 +7434,12 @@ pub struct SetTradingInstructionRequest {
     pub value: i32,
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
+    /// The level it is set at, stamped by the dashboard from the setter's
+    /// claims -- a deployment admin's or a plugin admin's -- never entered, so
+    /// the book records the instruction at the right level and lifts an entry
+    /// only at the level that set it (W11.15; approved 2026-10-12).
+    #[prost(enumeration = "SetterLevel", tag = "4")]
+    pub setter_level: i32,
 }
 /// W11.18. By the fund's connectivity plugin; the answer later on the same
 /// record as its own entry.
