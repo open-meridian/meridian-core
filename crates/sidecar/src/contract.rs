@@ -182,7 +182,7 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// service-account arm; and a service account's ticket filed and read back as
 /// a person's. A plugin built before calls nothing as a service account, and
 /// on an older sidecar the call is answered unimplemented.
-pub const CONTRACT_CURRENT: u32 = 21;
+pub const CONTRACT_CURRENT: u32 = 22;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does

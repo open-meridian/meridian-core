@@ -69,6 +69,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.provenance.iter().enumerate() {
             self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.date_basis.as_ref() {
+                if let Some(held2) = held1.rule.as_ref() {
+                    self.known(&format!("provenance[{i0}].date_basis.rule.kind"), held2.kind, meridian_pb::v1::DateRuleKind::try_from(held2.kind).is_ok())?;
+                }
+            }
         }
         message.account_id = self.linked_account("meridian.v1.RecordHoldingsStatementRequest", &message.external_account_id).await?;
         for stamped0 in message.figures.iter_mut() {
@@ -109,6 +114,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.provenance.iter().enumerate() {
             self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.date_basis.as_ref() {
+                if let Some(held2) = held1.rule.as_ref() {
+                    self.known(&format!("provenance[{i0}].date_basis.rule.kind"), held2.kind, meridian_pb::v1::DateRuleKind::try_from(held2.kind).is_ok())?;
+                }
+            }
         }
         for (i0, held0) in message.pending.iter().enumerate() {
             self.exact(&format!("pending[{i0}].quantity"), held0.quantity.as_ref())?;
@@ -159,6 +169,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact_money("activity.amount", held0.amount.as_ref())?;
             for (i1, held1) in held0.provenance.iter().enumerate() {
                 self.known(&format!("activity.provenance[{i1}].kind"), held1.kind, meridian_pb::v1::ProvenanceKind::try_from(held1.kind).is_ok())?;
+                if let Some(held2) = held1.date_basis.as_ref() {
+                    if let Some(held3) = held2.rule.as_ref() {
+                        self.known(&format!("activity.provenance[{i1}].date_basis.rule.kind"), held3.kind, meridian_pb::v1::DateRuleKind::try_from(held3.kind).is_ok())?;
+                    }
+                }
             }
         }
         message.account_id = self.linked_account("meridian.v1.RecordActivityRequest", &message.external_account_id).await?;
@@ -186,6 +201,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut message: domain::ReResolveActivityRequest = self.as_domain(params)?;
         if let Some(held0) = message.provenance.as_ref() {
             self.known("provenance.kind", held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.date_basis.as_ref() {
+                if let Some(held2) = held1.rule.as_ref() {
+                    self.known("provenance.date_basis.rule.kind", held2.kind, meridian_pb::v1::DateRuleKind::try_from(held2.kind).is_ok())?;
+                }
+            }
         }
         message.account_id = self.linked_account("meridian.v1.ReResolveActivityRequest", &message.external_account_id).await?;
         let account = Some(message.account_id.clone());
@@ -335,6 +355,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             if let Some(domain::break_cause::Item::PendingSettlement(held1)) = held0.item.as_ref() {
                 self.known(&format!("candidate_causes[{i0}].pending_settlement.side"), held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
             }
+            if let Some(domain::break_cause::Item::DateCheck(held1)) = held0.item.as_ref() {
+                self.known(&format!("candidate_causes[{i0}].date_check.reason"), held1.reason, domain::DateCheckReason::try_from(held1.reason).is_ok())?;
+            }
         }
         self.known("category", message.category, domain::BreakCategory::try_from(message.category).is_ok())?;
         let account = Some(message.account_id.clone());
@@ -415,6 +438,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known("confirmed_cause.category", held0.category, domain::BreakCauseCategory::try_from(held0.category).is_ok())?;
             if let Some(domain::break_cause::Item::PendingSettlement(held1)) = held0.item.as_ref() {
                 self.known("confirmed_cause.pending_settlement.side", held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+            }
+            if let Some(domain::break_cause::Item::DateCheck(held1)) = held0.item.as_ref() {
+                self.known("confirmed_cause.date_check.reason", held1.reason, domain::DateCheckReason::try_from(held1.reason).is_ok())?;
             }
         }
         let account = Some(message.account_id.clone());
@@ -508,6 +534,412 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-account-attributes", "meridian.v1.ListAccountAttributesRequest", message, account, None).await
     }
 
+    /// W11.1: `platform.book.command.propose-order` (preview).
+    async fn propose_order(
+        &self,
+        request: Request<plugin::ProposeOrderParams>,
+    ) -> Result<Response<plugin::ProposeOrderResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ProposeOrderRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("cash_quantity", message.cash_quantity.as_ref())?;
+        self.exact_money("limit_price", message.limit_price.as_ref())?;
+        for (i0, held0) in message.legs.iter().enumerate() {
+            self.known(&format!("legs[{i0}].side"), held0.side, domain::Side::try_from(held0.side).is_ok())?;
+            self.exact(&format!("legs[{i0}].ratio"), held0.ratio.as_ref())?;
+        }
+        if let Some(held0) = message.allocation_instruction.as_ref() {
+            for (i1, held1) in held0.lines.iter().enumerate() {
+                self.exact(&format!("allocation_instruction.lines[{i1}].quantity"), held1.quantity.as_ref())?;
+                self.exact(&format!("allocation_instruction.lines[{i1}].weight"), held1.weight.as_ref())?;
+            }
+        }
+        for (i0, held0) in message.parties.iter().enumerate() {
+            self.known(&format!("parties[{i0}].party_role"), held0.party_role, domain::PartyRole::try_from(held0.party_role).is_ok())?;
+        }
+        if let Some(held0) = message.quote_at_receipt.as_ref() {
+            self.exact_money("quote_at_receipt.bid", held0.bid.as_ref())?;
+            self.exact_money("quote_at_receipt.ask", held0.ask.as_ref())?;
+            self.known("quote_at_receipt.source_kind", held0.source_kind, domain::ReceiptQuoteSourceKind::try_from(held0.source_kind).is_ok())?;
+            self.exact("quote_at_receipt.bid_size", held0.bid_size.as_ref())?;
+            self.exact("quote_at_receipt.ask_size", held0.ask_size.as_ref())?;
+        }
+        if let Some(held0) = message.link.as_ref() {
+            self.known("link.kind", held0.kind, domain::OrderLinkKind::try_from(held0.kind).is_ok())?;
+        }
+        self.exact_money("stop_price", message.stop_price.as_ref())?;
+        self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
+        self.known("order_type", message.order_type, domain::OrderType::try_from(message.order_type).is_ok())?;
+        self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
+        self.known("lot_relief_method", message.lot_relief_method, domain::LotReliefMethod::try_from(message.lot_relief_method).is_ok())?;
+        self.known("capacity", message.capacity, domain::Capacity::try_from(message.capacity).is_ok())?;
+        self.known("direction", message.direction, domain::OrderDirection::try_from(message.direction).is_ok())?;
+        self.known("received_precision", message.received_precision, domain::TimePrecision::try_from(message.received_precision).is_ok())?;
+        for &value in &message.execution_instructions {
+            self.known("execution_instructions", value, domain::ExecutionInstruction::try_from(value).is_ok())?;
+        }
+        for stamped0 in message.parties.iter_mut() {
+            for stamped1 in stamped0.identifiers.iter_mut() {
+                stamped1.valid_from_ns = Default::default();
+                stamped1.valid_until_ns = Default::default();
+            }
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.propose-order", "meridian.v1.ProposeOrderRequest", message, account, acting_for).await
+    }
+
+    /// W11.2: `platform.book.command.record-order` (preview).
+    async fn record_order(
+        &self,
+        request: Request<plugin::RecordOrderParams>,
+    ) -> Result<Response<plugin::RecordOrderResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordOrderRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("limit_price", message.limit_price.as_ref())?;
+        self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
+        self.known("order_type", message.order_type, domain::OrderType::try_from(message.order_type).is_ok())?;
+        self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
+        self.known("origin", message.origin, domain::OrderOrigin::try_from(message.origin).is_ok())?;
+        message.account_id = self.venue_mapped_account("meridian.v1.RecordOrderRequest", &message.venue_account_code, &message.account_id).await?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-order", "meridian.v1.RecordOrderRequest", message, account, acting_for).await
+    }
+
+    /// W11.3: `platform.book.command.request-order-change` (preview).
+    async fn request_order_change(
+        &self,
+        request: Request<plugin::RequestOrderChangeParams>,
+    ) -> Result<Response<plugin::RequestOrderChangeResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RequestOrderChangeRequest = self.as_domain(params)?;
+        if let Some(held0) = message.change.as_ref() {
+            self.known("change.kind", held0.kind, domain::OrderChangeKind::try_from(held0.kind).is_ok())?;
+            self.exact("change.quantity", held0.quantity.as_ref())?;
+            self.exact_money("change.limit_price", held0.limit_price.as_ref())?;
+            self.known("change.time_in_force", held0.time_in_force, domain::TimeInForce::try_from(held0.time_in_force).is_ok())?;
+            if let Some(held1) = held0.allocation_instruction.as_ref() {
+                for (i2, held2) in held1.lines.iter().enumerate() {
+                    self.exact(&format!("change.allocation_instruction.lines[{i2}].quantity"), held2.quantity.as_ref())?;
+                    self.exact(&format!("change.allocation_instruction.lines[{i2}].weight"), held2.weight.as_ref())?;
+                }
+            }
+            for (i1, &value) in held0.execution_instructions.iter().enumerate() {
+                self.known(&format!("change.execution_instructions[{i1}]"), value, domain::ExecutionInstruction::try_from(value).is_ok())?;
+            }
+        }
+        let account = None;
+        self.command_typed("platform.book.command.request-order-change", "meridian.v1.RequestOrderChangeRequest", message, account, acting_for).await
+    }
+
+    /// W11.4: `platform.book.command.record-check` (preview).
+    async fn record_check(
+        &self,
+        request: Request<plugin::RecordCheckParams>,
+    ) -> Result<Response<plugin::RecordCheckResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordCheckRequest = self.as_domain(params)?;
+        self.known("verdict", message.verdict, domain::CheckVerdict::try_from(message.verdict).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.record-check", "meridian.v1.RecordCheckRequest", message, account, acting_for).await
+    }
+
+    /// W11.5: `platform.book.command.decide-approval` (preview).
+    async fn decide_approval(
+        &self,
+        request: Request<plugin::DecideApprovalParams>,
+    ) -> Result<Response<plugin::DecideApprovalResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::DecideApprovalRequest = self.as_domain(params)?;
+        self.known("decision", message.decision, domain::ApprovalDecision::try_from(message.decision).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.decide-approval", "meridian.v1.DecideApprovalRequest", message, account, acting_for).await
+    }
+
+    /// W11.6: `platform.book.command.release-order` (preview).
+    async fn release_order(
+        &self,
+        request: Request<plugin::ReleaseOrderParams>,
+    ) -> Result<Response<plugin::ReleaseOrderResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReleaseOrderRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.release-order", "meridian.v1.ReleaseOrderRequest", message, account, acting_for).await
+    }
+
+    /// W11.7: `platform.book.command.set-working-condition` (preview).
+    async fn set_working_condition(
+        &self,
+        request: Request<plugin::SetWorkingConditionParams>,
+    ) -> Result<Response<plugin::SetWorkingConditionResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::SetWorkingConditionRequest = self.as_domain(params)?;
+        self.known("condition", message.condition, domain::OrderCondition::try_from(message.condition).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.set-working-condition", "meridian.v1.SetWorkingConditionRequest", message, account, acting_for).await
+    }
+
+    /// W11.8: `platform.book.command.create-placement` (preview).
+    async fn create_placement(
+        &self,
+        request: Request<plugin::CreatePlacementParams>,
+    ) -> Result<Response<plugin::CreatePlacementResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::CreatePlacementRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("limit_price", message.limit_price.as_ref())?;
+        if let Some(held0) = message.strategy.as_ref() {
+            self.known("strategy.kind", held0.kind, domain::StrategyKind::try_from(held0.kind).is_ok())?;
+            self.exact("strategy.participation", held0.participation.as_ref())?;
+            self.known("strategy.urgency", held0.urgency, domain::Urgency::try_from(held0.urgency).is_ok())?;
+            self.exact("strategy.max_participation", held0.max_participation.as_ref())?;
+            self.exact_money("strategy.price_limit", held0.price_limit.as_ref())?;
+        }
+        self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
+        self.known("route_type", message.route_type, domain::RouteType::try_from(message.route_type).is_ok())?;
+        message.ems_instance_id = self.instance_id().to_string();
+        let account = None;
+        self.command_typed("platform.book.command.create-placement", "meridian.v1.CreatePlacementRequest", message, account, acting_for).await
+    }
+
+    /// W11.9: `platform.book.command.request-placement-change` (preview).
+    async fn request_placement_change(
+        &self,
+        request: Request<plugin::RequestPlacementChangeParams>,
+    ) -> Result<Response<plugin::RequestPlacementChangeResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RequestPlacementChangeRequest = self.as_domain(params)?;
+        if let Some(held0) = message.change.as_ref() {
+            self.known("change.kind", held0.kind, domain::PlacementChangeKind::try_from(held0.kind).is_ok())?;
+            self.exact("change.quantity", held0.quantity.as_ref())?;
+            self.exact_money("change.limit_price", held0.limit_price.as_ref())?;
+            self.known("change.time_in_force", held0.time_in_force, domain::TimeInForce::try_from(held0.time_in_force).is_ok())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.request-placement-change", "meridian.v1.RequestPlacementChangeRequest", message, account, acting_for).await
+    }
+
+    /// W11.10: `platform.book.command.report-placement` (preview).
+    async fn report_placement(
+        &self,
+        request: Request<plugin::ReportPlacementParams>,
+    ) -> Result<Response<plugin::ReportPlacementResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReportPlacementRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("limit_price", message.limit_price.as_ref())?;
+        self.known("event", message.event, domain::PlacementEvent::try_from(message.event).is_ok())?;
+        self.known("routed_precision", message.routed_precision, domain::TimePrecision::try_from(message.routed_precision).is_ok())?;
+        self.known("rejection_reason", message.rejection_reason, domain::RejectionReason::try_from(message.rejection_reason).is_ok())?;
+        self.known("unknown_reason", message.unknown_reason, domain::UnknownReason::try_from(message.unknown_reason).is_ok())?;
+        self.known("restatement_reason", message.restatement_reason, domain::RestatementReason::try_from(message.restatement_reason).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.report-placement", "meridian.v1.ReportPlacementRequest", message, account, acting_for).await
+    }
+
+    /// W11.11: `platform.book.command.report-execution` (preview).
+    async fn report_execution(
+        &self,
+        request: Request<plugin::ReportExecutionParams>,
+    ) -> Result<Response<plugin::ReportExecutionResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ReportExecutionRequest = self.as_domain(params)?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.exact_money("price", message.price.as_ref())?;
+        if let Some(held0) = message.finality.as_ref() {
+            self.known("finality.level", held0.level, domain::FinalityLevel::try_from(held0.level).is_ok())?;
+        }
+        if let Some(held0) = message.settlement_date_basis.as_ref() {
+            if let Some(held1) = held0.rule.as_ref() {
+                self.known("settlement_date_basis.rule.kind", held1.kind, meridian_pb::v1::DateRuleKind::try_from(held1.kind).is_ok())?;
+            }
+        }
+        for (i0, held0) in message.fees.iter().enumerate() {
+            self.known(&format!("fees[{i0}].kind"), held0.kind, domain::FeeKind::try_from(held0.kind).is_ok())?;
+            self.exact_money(&format!("fees[{i0}].amount"), held0.amount.as_ref())?;
+        }
+        if let Some(held0) = message.counterparty.as_ref() {
+            self.known("counterparty.party_role", held0.party_role, domain::PartyRole::try_from(held0.party_role).is_ok())?;
+        }
+        self.known("kind", message.kind, domain::ExecutionKind::try_from(message.kind).is_ok())?;
+        self.known("source", message.source, domain::ExecutionSource::try_from(message.source).is_ok())?;
+        self.known("liquidity_indicator", message.liquidity_indicator, domain::LiquidityIndicator::try_from(message.liquidity_indicator).is_ok())?;
+        message.account_id = self.venue_mapped_account("meridian.v1.ReportExecutionRequest", &message.venue_account_code, &message.account_id).await?;
+        let stamped0 = message.counterparty.get_or_insert_with(Default::default);
+        for stamped1 in stamped0.identifiers.iter_mut() {
+            stamped1.valid_from_ns = Default::default();
+            stamped1.valid_until_ns = Default::default();
+        }
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.report-execution", "meridian.v1.ReportExecutionRequest", message, account, acting_for).await
+    }
+
+    /// W11.12: `platform.book.command.report-charge` (preview).
+    async fn report_charge(
+        &self,
+        request: Request<plugin::ReportChargeParams>,
+    ) -> Result<Response<plugin::ReportChargeResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReportChargeRequest = self.as_domain(params)?;
+        if let Some(held0) = message.fee.as_ref() {
+            self.known("fee.kind", held0.kind, domain::FeeKind::try_from(held0.kind).is_ok())?;
+            self.exact_money("fee.amount", held0.amount.as_ref())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.report-charge", "meridian.v1.ReportChargeRequest", message, account, acting_for).await
+    }
+
+    /// W11.14: `platform.book.command.acknowledge-flag` (preview).
+    async fn acknowledge_flag(
+        &self,
+        request: Request<plugin::AcknowledgeFlagParams>,
+    ) -> Result<Response<plugin::AcknowledgeFlagResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::AcknowledgeFlagRequest = self.as_domain(params)?;
+        self.known("condition", message.condition, domain::OrderCondition::try_from(message.condition).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.acknowledge-flag", "meridian.v1.AcknowledgeFlagRequest", message, account, acting_for).await
+    }
+
+    /// W11.16: `platform.book.query.list-trading-instructions` (preview).
+    async fn list_trading_instructions(
+        &self,
+        request: Request<plugin::ListTradingInstructionsParams>,
+    ) -> Result<Response<plugin::ListTradingInstructionsResult>, Status> {
+        let message: domain::ListTradingInstructionsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.book.query.list-trading-instructions", "meridian.v1.ListTradingInstructionsRequest", message, account, None).await
+    }
+
+    /// W11.17: `platform.book.query.list-orders` (preview).
+    async fn list_orders(
+        &self,
+        request: Request<plugin::ListOrdersParams>,
+    ) -> Result<Response<plugin::ListOrdersResult>, Status> {
+        let message: domain::ListOrdersRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-orders", "meridian.v1.ListOrdersRequest", message, account, None).await
+    }
+
+    /// W11.17: `platform.book.query.order-history` (preview).
+    async fn read_order_history(
+        &self,
+        request: Request<plugin::ReadOrderHistoryParams>,
+    ) -> Result<Response<plugin::ReadOrderHistoryResult>, Status> {
+        let message: domain::OrderHistoryRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.order-history", "meridian.v1.OrderHistoryRequest", message, account, None).await
+    }
+
+    /// W11.18: `platform.book.command.record-locate` (preview).
+    async fn record_locate(
+        &self,
+        request: Request<plugin::RecordLocateParams>,
+    ) -> Result<Response<plugin::RecordLocateResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordLocateRequest = self.as_domain(params)?;
+        self.exact("quantity_requested", message.quantity_requested.as_ref())?;
+        if let Some(held0) = message.answer.as_ref() {
+            self.exact("answer.quantity_approved", held0.quantity_approved.as_ref())?;
+            self.exact("answer.rate", held0.rate.as_ref())?;
+        }
+        message.account_id = self.venue_mapped_account("meridian.v1.RecordLocateRequest", &message.venue_account_code, &message.account_id).await?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.record-locate", "meridian.v1.RecordLocateRequest", message, account, acting_for).await
+    }
+
+    /// W11.18: `platform.book.query.list-locates` (preview).
+    async fn list_locates(
+        &self,
+        request: Request<plugin::ListLocatesParams>,
+    ) -> Result<Response<plugin::ListLocatesResult>, Status> {
+        let message: domain::ListLocatesRequest = self.as_domain(request.into_inner())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-locates", "meridian.v1.ListLocatesRequest", message, account, None).await
+    }
+
+    /// W11.19: `platform.book.command.record-locate-use` (preview).
+    async fn record_locate_use(
+        &self,
+        request: Request<plugin::RecordLocateUseParams>,
+    ) -> Result<Response<plugin::RecordLocateUseResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordLocateUseRequest = self.as_domain(params)?;
+        if let Some(held0) = message.use.as_ref() {
+            self.known("use.kind", held0.kind, domain::LocateUseKind::try_from(held0.kind).is_ok())?;
+            self.exact("use.quantity", held0.quantity.as_ref())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.record-locate-use", "meridian.v1.RecordLocateUseRequest", message, account, acting_for).await
+    }
+
+    /// W11.20: `platform.config.event.venue-catalogue` (preview).
+    async fn report_venue_catalogue(
+        &self,
+        request: Request<plugin::ReportVenueCatalogueParams>,
+    ) -> Result<Response<plugin::Published>, Status> {
+        let mut message: domain::VenueCatalogueEvent = self.as_domain(request.into_inner())?;
+        if let Some(held0) = message.catalogue.as_ref() {
+            for (i1, held1) in held0.order_types.iter().enumerate() {
+                self.known(&format!("catalogue.order_types[{i1}].order_type"), held1.order_type, domain::OrderType::try_from(held1.order_type).is_ok())?;
+                for (i2, &value) in held1.times_in_force.iter().enumerate() {
+                    self.known(&format!("catalogue.order_types[{i1}].times_in_force[{i2}]"), value, domain::TimeInForce::try_from(value).is_ok())?;
+                }
+            }
+            for (i1, held1) in held0.strategies.iter().enumerate() {
+                self.known(&format!("catalogue.strategies[{i1}].kind"), held1.kind, domain::StrategyKind::try_from(held1.kind).is_ok())?;
+                for (i2, held2) in held1.parameters.iter().enumerate() {
+                    self.known(&format!("catalogue.strategies[{i1}].parameters[{i2}].type"), held2.type, domain::StrategyParameterType::try_from(held2.type).is_ok())?;
+                }
+            }
+            for (i1, held1) in held0.eligibility.iter().enumerate() {
+                self.known(&format!("catalogue.eligibility[{i1}].borrow_status"), held1.borrow_status, domain::BorrowStatus::try_from(held1.borrow_status).is_ok())?;
+            }
+        }
+        message.publisher_instance_id = self.instance_id().to_string();
+        self.publish_typed("platform.config.event.venue-catalogue", "meridian.v1.VenueCatalogueEvent", message).await
+    }
+
+    /// W11.20: `platform.config.query.venue-catalogue` (preview).
+    async fn read_venue_catalogue(
+        &self,
+        request: Request<plugin::ReadVenueCatalogueParams>,
+    ) -> Result<Response<plugin::ReadVenueCatalogueResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReadVenueCatalogueRequest = self.as_domain(params)?;
+        let account = None;
+        self.call_typed("platform.config.query.venue-catalogue", "meridian.v1.ReadVenueCatalogueRequest", message, account, acting_for).await
+    }
+
+    /// W11.22: `platform.config.command.map-venue-account` (preview).
+    async fn map_venue_account(
+        &self,
+        request: Request<plugin::MapVenueAccountParams>,
+    ) -> Result<Response<plugin::MapVenueAccountResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::MapVenueAccountRequest = self.as_domain(params)?;
+        message.ems_instance_id = self.instance_id().to_string();
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.config.command.map-venue-account", "meridian.v1.MapVenueAccountRequest", message, account, acting_for).await
+    }
+
     /// W3.14: `platform.reference.query.resolve-venue` (preview).
     async fn resolve_venue(
         &self,
@@ -535,6 +967,34 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             stamped0.valid_until_ns = Default::default();
         }
         self.publish_typed("platform.reference.event.venue-missing", "meridian.v1.MissingVenueDetectedEvent", message).await
+    }
+
+    /// W3.19: `platform.reference.query.read-calendar` (preview).
+    async fn read_calendar(
+        &self,
+        request: Request<plugin::ReadCalendarParams>,
+    ) -> Result<Response<plugin::ReadCalendarResult>, Status> {
+        let message: domain::ReadCalendarRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.read-calendar", "meridian.v1.ReadCalendarRequest", message, account, None).await
+    }
+
+    /// W3.20: `platform.reference.query.compute-date` (preview).
+    async fn compute_date(
+        &self,
+        request: Request<plugin::ComputeDateParams>,
+    ) -> Result<Response<plugin::ComputeDateResult>, Status> {
+        let message: domain::ComputeDateRequest = self.as_domain(request.into_inner())?;
+        if let Some(domain::compute_date_request::Inputs::Tenor(held0)) = message.inputs.as_ref() {
+            if let Some(held1) = held0.tenor.as_ref() {
+                self.known("tenor.tenor.unit", held1.unit, domain::TenorUnit::try_from(held1.unit).is_ok())?;
+            }
+        }
+        if let Some(domain::compute_date_request::Inputs::Roll(held0)) = message.inputs.as_ref() {
+            self.known("roll.convention", held0.convention, domain::BusinessDayConvention::try_from(held0.convention).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.reference.query.compute-date", "meridian.v1.ComputeDateRequest", message, account, None).await
     }
 
     /// W10.4: `platform.lake.command.record-prices` (preview).
@@ -811,8 +1271,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
 }
 
 /// The rows a plugin's roles may hear (W4.3), each with how its message is
-/// read: the account matrix/scoped.tsv names, its journal and cause, and
-/// its arm.
+/// read: the account matrix/scoped.tsv names, the instance a role hears it
+/// at where matrix/directed.tsv names one, its journal and cause, and its
+/// arm.
 pub(crate) const DELIVERED: &[crate::receive::Row] = &[
     crate::receive::Row {
         name: "StatementRecorded",
@@ -919,6 +1380,55 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.QuotesRecordedEvent",
         read: quotes_recorded,
     },
+    crate::receive::Row {
+        name: "OrderUpdated",
+        step: "W11.13",
+        topic: "platform.book.event.order-updated",
+        payload_type: "meridian.v1.OrderUpdatedEvent",
+        read: order_updated,
+    },
+    crate::receive::Row {
+        name: "PlacementUpdated",
+        step: "W11.13",
+        topic: "platform.book.event.placement-updated",
+        payload_type: "meridian.v1.PlacementUpdatedEvent",
+        read: placement_updated,
+    },
+    crate::receive::Row {
+        name: "ExecutionRecorded",
+        step: "W11.13",
+        topic: "platform.book.event.execution-recorded",
+        payload_type: "meridian.v1.ExecutionRecordedEvent",
+        read: execution_recorded,
+    },
+    crate::receive::Row {
+        name: "UnplacedFactRecorded",
+        step: "W11.13",
+        topic: "platform.book.event.unplaced-fact-recorded",
+        payload_type: "meridian.v1.UnplacedFactRecordedEvent",
+        read: unplaced_fact_recorded,
+    },
+    crate::receive::Row {
+        name: "TradingInstructionChanged",
+        step: "W11.16",
+        topic: "platform.book.event.trading-instruction-changed",
+        payload_type: "meridian.v1.TradingInstructionChangedEvent",
+        read: trading_instruction_changed,
+    },
+    crate::receive::Row {
+        name: "LocateUpdated",
+        step: "W11.18",
+        topic: "platform.book.event.locate-updated",
+        payload_type: "meridian.v1.LocateUpdatedEvent",
+        read: locate_updated,
+    },
+    crate::receive::Row {
+        name: "ReportVenueCatalogue",
+        step: "W11.20",
+        topic: "platform.config.event.venue-catalogue",
+        payload_type: "meridian.v1.VenueCatalogueEvent",
+        read: report_venue_catalogue,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -926,6 +1436,7 @@ fn statement_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Dec
     let message = plugin::StatementRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.account_id.clone()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::StatementRecorded(message),
@@ -937,6 +1448,7 @@ fn custodial_position_updated(payload: &[u8]) -> Result<crate::receive::Read, pr
     let message = plugin::CustodialPositionUpdatedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.position.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::CustodialPositionUpdated(message),
@@ -948,6 +1460,7 @@ fn position_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::Decod
     let message = plugin::PositionChangedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.position.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::PositionChanged(message),
@@ -959,6 +1472,7 @@ fn break_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeEr
     let message = plugin::BreakChangedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.break_record.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::BreakChanged(message),
@@ -970,6 +1484,7 @@ fn account_figures_recorded(payload: &[u8]) -> Result<crate::receive::Read, pros
     let message = plugin::AccountFiguresRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.figures.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::AccountFiguresRecorded(message),
@@ -981,6 +1496,7 @@ fn account_attribute_changed(payload: &[u8]) -> Result<crate::receive::Read, pro
     let message = plugin::AccountAttributeChangedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.attributes.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::AccountAttributeChanged(message),
@@ -992,6 +1508,7 @@ fn activity_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Deco
     let message = plugin::ActivityRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.account_id.clone()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::ActivityRecorded(message),
@@ -1003,6 +1520,7 @@ fn sync_status_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::D
     let message = plugin::SyncStatusRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.status.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::SyncStatusRecorded(message),
@@ -1014,6 +1532,7 @@ fn activity_re_resolved(payload: &[u8]) -> Result<crate::receive::Read, prost::D
     let message = plugin::ActivityReResolvedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.re_resolution.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::ActivityReResolved(message),
@@ -1025,6 +1544,7 @@ fn prices_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Decode
     let message = plugin::PricesRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::PricesRecorded(message),
@@ -1036,6 +1556,7 @@ fn bars_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeEr
     let message = plugin::BarsRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::BarsRecorded(message),
@@ -1047,6 +1568,7 @@ fn observations_wanted(payload: &[u8]) -> Result<crate::receive::Read, prost::De
     let message = plugin::ObservationsWantedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::ObservationsWanted(message),
@@ -1058,6 +1580,7 @@ fn want_withdrawn(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeE
     let message = plugin::WantWithdrawnEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::WantWithdrawn(message),
@@ -1069,6 +1592,7 @@ fn trades_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Decode
     let message = plugin::TradesRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::TradesRecorded(message),
@@ -1080,8 +1604,93 @@ fn quotes_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Decode
     let message = plugin::QuotesRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: None,
+        directed: Vec::new(),
         journal: None,
         cause: None,
         item: plugin::delivery::Item::QuotesRecorded(message),
+    })
+}
+
+/// W11.13: a OrderUpdatedEvent, its account at `order.account_id`.
+fn order_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::OrderUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.order.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::OrderUpdated(message),
+    })
+}
+
+/// W11.13: a PlacementUpdatedEvent, its account at `placement.account_id`.
+fn placement_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::PlacementUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.placement.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: vec![("connectivity", message.placement.as_ref().map(|held| held.connectivity_instance_id.clone()).unwrap_or_default())],
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::PlacementUpdated(message),
+    })
+}
+
+/// W11.13: a ExecutionRecordedEvent, its account at `execution.account_id`.
+fn execution_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::ExecutionRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.execution.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::ExecutionRecorded(message),
+    })
+}
+
+/// W11.13: a UnplacedFactRecordedEvent, its account at `unplaced.account_id`.
+fn unplaced_fact_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::UnplacedFactRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.unplaced.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::UnplacedFactRecorded(message),
+    })
+}
+
+/// W11.16: a TradingInstructionChangedEvent, unscoped.
+fn trading_instruction_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::TradingInstructionChangedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::TradingInstructionChanged(message),
+    })
+}
+
+/// W11.18: a LocateUpdatedEvent, its account at `locate.account_id`.
+fn locate_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::LocateUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.locate.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::LocateUpdated(message),
+    })
+}
+
+/// W11.20: a VenueCatalogueEvent, conflated, unscoped.
+fn report_venue_catalogue(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::VenueCatalogueEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::ReportVenueCatalogue(message),
     })
 }
