@@ -1453,8 +1453,9 @@ message Order {
   // (W11.18), which `compliance` checks at release by its own logic.
   string locate_id = 6;
 
-  // The ordered quantity; or, where the order is for an amount, the cash
-  // quantity beside it.
+  // The ordered quantity, or, where the order is for an amount, its cash
+  // quantity: exactly one is set, as FIX's OrderQty (38) and CashOrderQty
+  // (152) are alternatives (ruled 2026-10-12).
   Decimal quantity = 7;
   Money cash_quantity = 8;
 
@@ -2009,7 +2010,11 @@ message ProposeOrderRequest {
   string sleeve = 3;
   Side side = 4;
   string locate_id = 5;
-  // 0, a pass, is refused naming `quantity` until slice C defines it.
+  // Exactly one of quantity and cash_quantity is set, as FIX's OrderQty
+  // (38) and CashOrderQty (152) are alternatives (ruled 2026-10-12): an
+  // order naming both, or neither, is refused INVALID_ARGUMENT naming
+  // `quantity` and `cash_quantity`. 0, a pass, is refused naming `quantity`
+  // until slice C defines it.
   optional Decimal quantity = 6;
   optional Money cash_quantity = 7;
   OrderType order_type = 8;
