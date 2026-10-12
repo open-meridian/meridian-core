@@ -640,3 +640,59 @@ fn a_closed_window_an_ended_offer_a_contract_and_a_conflicts_reason_are_kept() {
     assert_eq!(listed[0].reason, 2);
     assert_eq!(listed[0].last_seen_ns, 20);
 }
+
+#[test]
+fn every_calendar_and_rule_version_is_kept_once_with_when_it_was_kept() {
+    // Contract v22 (W3.17): every version kept, the earlier ones readable.
+    use meridian_domain::v1::{
+        date_rule_version, CalendarRecord, DateRuleVersion, SettlementDateRule,
+    };
+    let store = store();
+    let id = format!("CAL-{}", unique("USSS"));
+    let calendar = |version: i64| CalendarRecord {
+        calendar_id: id.clone(),
+        name: "US securities settlement".into(),
+        version,
+        ..Default::default()
+    };
+    assert!(store.keep_calendar(&calendar(1), 10).unwrap());
+    assert!(
+        !store.keep_calendar(&calendar(1), 11).unwrap(),
+        "a version held changes nothing"
+    );
+    assert!(store.keep_calendar(&calendar(2), 12).unwrap());
+    let kept: Vec<(i64, i64)> = store
+        .calendar_versions()
+        .unwrap()
+        .into_iter()
+        .filter(|kept| kept.record.calendar_id == id)
+        .map(|kept| (kept.record.version, kept.kept_at_ns))
+        .collect();
+    assert_eq!(kept, vec![(1, 10), (2, 12)]);
+
+    let subject = unique("US/equity");
+    let rule = |version: i64, lag: i32| DateRuleVersion {
+        kind: meridian_pb::v1::DateRuleKind::Settlement as i32,
+        subject: subject.clone(),
+        version,
+        parameters: Some(date_rule_version::Parameters::Settlement(
+            SettlementDateRule {
+                country_code: "US".into(),
+                lag_days: lag,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    assert!(store.keep_date_rule(&rule(1, 2), 20).unwrap());
+    assert!(store.keep_date_rule(&rule(2, 1), 21).unwrap());
+    assert!(!store.keep_date_rule(&rule(2, 1), 22).unwrap());
+    let rules: Vec<i64> = store
+        .date_rule_versions()
+        .unwrap()
+        .into_iter()
+        .filter(|kept| kept.rule.subject == subject)
+        .map(|kept| kept.rule.version)
+        .collect();
+    assert_eq!(rules, vec![1, 2]);
+}

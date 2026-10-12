@@ -623,3 +623,343 @@ async fn a_components_report_reaches_the_one_holding_the_key() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// The dashboard's assertion for an `ems`'s admin on its page at Manage, the
+/// `ems` role's admin (W4.9, W11.22).
+fn ems_admin(key: &SigningKey, instance: &str) -> CallerAssertion {
+    let issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let claims = CallerClaims {
+        subject: "local|ada".into(),
+        display_name: "Ada".into(),
+        audience_instance_id: instance.into(),
+        issued_at_ns: issued,
+        expires_at_ns: issued + 60_000_000_000,
+        assertion_id: format!("a-map-{issued}"),
+        level: meridian_pb::v1::AccessLevel::Admin as i32,
+        roles: vec![meridian_pb::v1::RoleAccess {
+            role: "ems".into(),
+            level: meridian_pb::v1::AccessLevel::Admin as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    CallerAssertion {
+        signature: key.sign(&claims).to_bytes().to_vec(),
+        claims,
+        key_id: DASHBOARD_KEY.into(),
+    }
+}
+
+/// Contract v22 (W11.21, W11.22, W4.11): the conductor's configuration store
+/// as it runs. A deployment admin makes a connectivity plugin available and
+/// the ems's admin links it; the ems maps an account through its own
+/// operation, acting for its admin; the ems's scope stream carries its
+/// plugin and its map; and the connectivity plugin, started on the same
+/// store, has its link and the mapped account as its scope, and a venue's
+/// order it records takes that account from the map. No stand-in answers for
+/// the conductor.
+#[tokio::test]
+async fn a_connectivity_plugin_linked_to_its_ems_reaches_the_accounts_the_ems_mapped() {
+    let store = Arc::new(meridian_config::MemoryStore::new());
+    let serve = |instance: &str| {
+        let bus = Arc::new(Bus::single(
+            instance,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        meridian_config::serve(
+            Arc::clone(&bus),
+            store.clone(),
+            bus.clock(),
+            Arc::new(NoPlatform),
+            Arc::new(meridian_config::SettingsKey::holding(&[7u8; 32])),
+        );
+        bus
+    };
+    for (instance, role) in [("ems-1", "ems"), ("fix-1", "connectivity")] {
+        meridian_config::Store::record_plugin(
+            store.as_ref(),
+            &meridian_config::KnownPlugin {
+                plugin_instance_id: instance.into(),
+                roles: vec![role.into()],
+                last_reported_at_ns: NOW,
+            },
+        )
+        .unwrap();
+    }
+    let ems_bus = serve("ems-1");
+    // An account the deployment admin granted the ems (W6.30).
+    let (_, defined) = ems_bus
+        .call_for(
+            "platform.config.command.define-account",
+            "meridian.v1.DefineAccountRequest",
+            meridian_domain::v1::DefineAccountRequest {
+                name: "Desk one".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            None,
+            None,
+            "local|ada",
+        )
+        .await
+        .unwrap();
+    let account = meridian_domain::v1::AccountRecord::decode(&defined[..]).unwrap();
+    ems_bus
+        .call_for(
+            "platform.config.command.set-linkable-accounts",
+            "meridian.v1.SetLinkableAccountsRequest",
+            meridian_domain::v1::SetLinkableAccountsRequest {
+                plugin_instance_id: "ems-1".into(),
+                grant_account_ids: vec![account.account_id.clone()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            None,
+            None,
+            "local|ada",
+        )
+        .await
+        .unwrap();
+    // At the page: available, then linked with its users.
+    for (topic, kind, payload) in [
+        (
+            "platform.config.command.set-connectivity-available",
+            "meridian.v1.SetConnectivityAvailableRequest",
+            meridian_domain::v1::SetConnectivityAvailableRequest {
+                connectivity_instance_id: "fix-1".into(),
+                available: true,
+                note: String::new(),
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "platform.config.command.link-connectivity",
+            "meridian.v1.LinkConnectivityRequest",
+            meridian_domain::v1::LinkConnectivityRequest {
+                connectivity_instance_id: "fix-1".into(),
+                ems_instance_id: "ems-1".into(),
+                users: vec![meridian_pb::v1::ConnectivityUser {
+                    user: Some(meridian_pb::v1::connectivity_user::User::Subject(
+                        "local|ada".into(),
+                    )),
+                }],
+                note: String::new(),
+            }
+            .encode_to_vec(),
+        ),
+    ] {
+        ems_bus
+            .call_for(topic, kind, payload, None, None, "local|ada")
+            .await
+            .unwrap();
+    }
+
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let ems = Sidecar::new(
+        ems_bus,
+        "DEP-test",
+        Identity::new("ems-1", vec!["ems".to_string()]),
+    )
+    .with_verifier(Arc::new(Verifier::holding(
+        "ems-1",
+        DASHBOARD_KEY,
+        key.verifying_key(),
+    )));
+    admitted(&ems, "ems").await;
+    let mut scope = ems
+        .watch_account_scope(Request::new(WatchAccountScopeRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = next(&mut scope).await;
+    assert_eq!(first.connectivity_links.len(), 1);
+    assert_eq!(
+        first.connectivity_links[0].connectivity_instance_id,
+        "fix-1"
+    );
+
+    // The ems maps the account, acting for its admin.
+    ems.map_venue_account(Request::new(
+        meridian_pb::plugin::v1::MapVenueAccountParams {
+            connectivity_instance_id: "fix-1".into(),
+            venue_account_code: "ACCT-7".into(),
+            account_id: account.account_id.clone(),
+            acting_for: Some(ems_admin(&key, "ems-1")),
+        },
+    ))
+    .await
+    .expect("mapped by the conductor");
+    let changed = next(&mut scope).await;
+    let map = changed.venue_account_map.unwrap();
+    assert_eq!(map.mappings.len(), 1);
+    assert_eq!(map.mappings[0].account_id, account.account_id);
+
+    // The connectivity plugin, on the same store: its link, and the mapped
+    // account its scope.
+    let fix_bus = serve("fix-1");
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&recorded);
+    fix_bus.serve("platform.book.command.record-order", move |envelope| {
+        let order = meridian_domain::v1::RecordOrderRequest::decode(&envelope.payload[..]).unwrap();
+        keeping.lock().unwrap().push(order.account_id);
+        Ok((
+            "meridian.v1.OrderReply".into(),
+            meridian_domain::v1::OrderReply::default().encode_to_vec(),
+        ))
+    });
+    let fix = Sidecar::new(
+        fix_bus,
+        "DEP-test",
+        Identity::new("fix-1", vec!["connectivity".to_string()]),
+    );
+    admitted(&fix, "connectivity").await;
+    let mut scope = fix
+        .watch_account_scope(Request::new(WatchAccountScopeRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let told = next(&mut scope).await;
+    assert_eq!(told.connectivity_link.unwrap().ems_instance_id, "ems-1");
+    assert_eq!(told.read_account_ids, vec![account.account_id.clone()]);
+
+    fix.record_order(Request::new(meridian_pb::plugin::v1::RecordOrderParams {
+        venue_account_code: "ACCT-7".into(),
+        venue_order_id: "V-1".into(),
+        quantity: Some(Decimal {
+            high: 0,
+            low: 5,
+            scale: 0,
+        }),
+        ..Default::default()
+    }))
+    .await
+    .expect("the venue's order is sent");
+    assert_eq!(recorded.lock().unwrap().as_slice(), [account.account_id]);
+}
+
+/// Contract v22 (W3.16 to W3.20): a plugin works out a date through its
+/// sidecar from what the instrument store keeps -- nothing held, then the
+/// conductor's pull kept and announced, then the date with its basis.
+#[tokio::test]
+async fn a_plugin_asks_for_a_date_and_is_answered_from_the_calendars_pulled() {
+    use meridian_pb::plugin::v1::{BusinessDayInputs, ComputeDateParams, ReadCalendarParams};
+    let bus = Arc::new(Bus::single(
+        "portfolio-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let mut applied = bus.subscribe("platform.reference.event.calendar-applied");
+    let mut missing = bus.subscribe("platform.reference.event.calendar-missing");
+    tokio::spawn(
+        meridian_instrument::InstrumentService::new(
+            Arc::clone(&bus),
+            Arc::new(meridian_instrument::MemoryStore::new()),
+            bus.clock(),
+        )
+        .start(),
+    );
+    bus.serve("platform.config.query.plugin-configuration", |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    let sidecar = Sidecar::new(
+        Arc::clone(&bus),
+        "DEP-test",
+        Identity::new("portfolio-1", vec!["portfolio".to_string()]),
+    );
+    admitted(&sidecar, "portfolio").await;
+    const USD: &str = "CAL-01JAE000000000000000USD1";
+    let ask = || {
+        sidecar.compute_date(Request::new(ComputeDateParams {
+            inputs: Some(
+                meridian_pb::plugin::v1::compute_date_params::Inputs::BusinessDay(
+                    BusinessDayInputs {
+                        date: "2026-10-12".into(),
+                        calendars: vec![USD.into()],
+                    },
+                ),
+            ),
+            as_of_ns: 0,
+        }))
+    };
+    let first = ask().await.unwrap().into_inner();
+    assert_eq!(
+        first.outcome,
+        meridian_pb::plugin::v1::DateOutcome::CalendarNotHeld as i32
+    );
+    let reported = tokio::time::timeout(std::time::Duration::from_secs(5), missing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reported =
+        meridian_domain::v1::MissingCalendarDetectedEvent::decode(&reported.envelope.payload[..])
+            .unwrap();
+    assert_eq!(reported.subject.unwrap().calendar_id, USD);
+
+    // The conductor's pull, as it hands it on.
+    bus.publish(
+        "platform.reference.event.calendar-pulled",
+        "meridian.v1.PullCalendarReply",
+        meridian_domain::v1::PullCalendarReply {
+            calendars: vec![meridian_domain::v1::CalendarRecord {
+                calendar_id: USD.into(),
+                name: "US dollar".into(),
+                weekends: vec![meridian_domain::v1::CalendarWeekend {
+                    weekdays: vec![
+                        meridian_domain::v1::Weekday::Saturday as i32,
+                        meridian_domain::v1::Weekday::Sunday as i32,
+                    ],
+                    valid_from_date: "2026-01-01".into(),
+                }],
+                days: vec![meridian_domain::v1::CalendarDay {
+                    date: "2026-10-12".into(),
+                    kind: meridian_domain::v1::CalendarDayKind::Closed as i32,
+                    name: "Columbus Day".into(),
+                    source: "fed-holidays".into(),
+                }],
+                coverage: Some(meridian_domain::v1::CalendarCoverage {
+                    from_date: "2026-01-01".into(),
+                    to_date: "2027-12-31".into(),
+                }),
+                version: 1,
+                ..Default::default()
+            }],
+            rules: Vec::new(),
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), applied.recv())
+        .await
+        .expect("the version kept is announced")
+        .unwrap();
+
+    let answer = ask().await.unwrap().into_inner();
+    assert_eq!(
+        answer.outcome,
+        meridian_pb::plugin::v1::DateOutcome::Computed as i32
+    );
+    assert!(!answer.business_day, "Columbus Day is closed");
+    assert_eq!(answer.basis.unwrap().calendars[0].version, 1);
+    let read = sidecar
+        .read_calendar(Request::new(ReadCalendarParams {
+            calendar_id: USD.into(),
+            from_date: "2026-10-01".into(),
+            to_date: "2026-10-31".into(),
+            as_of_ns: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(read.found);
+    assert_eq!(read.days[0].name, "Columbus Day");
+}

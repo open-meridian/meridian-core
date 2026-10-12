@@ -72,6 +72,31 @@ pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
 /// W3.14 (contract v18). Which venue a set of identifiers names.
 pub const RESOLVE_VENUE: &str = "platform.reference.query.resolve-venue";
 
+/// W3.19 (contract v22). A calendar's days over a range.
+pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
+
+/// W3.20 (contract v22). A date, worked out one way.
+pub const COMPUTE_DATE: &str = "platform.reference.query.compute-date";
+
+/// W3.21 (contract v22). The calendars the deployment holds, for a
+/// deployment admin.
+pub const LIST_CALENDARS: &str = "platform.reference.query.list-calendars";
+
+/// W3.16 (contract v22). What the conductor pulled from the platform.
+pub const CALENDAR_PULLED: &str = "platform.reference.event.calendar-pulled";
+
+/// W3.17 (contract v22). A calendar's or a rule's version kept.
+pub const CALENDAR_APPLIED: &str = "platform.reference.event.calendar-applied";
+
+/// W3.18 (contract v22). A calendar or a rule not held, by its subject.
+pub const CALENDAR_MISSING: &str = "platform.reference.event.calendar-missing";
+
+/// How often the subjects held are named to the conductor to refresh
+/// (W3.16): daily, and once soon after a start, so a conductor that started
+/// since learns what the deployment holds.
+pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(86_400);
+pub const REFRESH_FIRST_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// W3.12. A record's history.
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
 
@@ -172,6 +197,7 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             ))
         });
     }
+    serve_calendars(bus, store.clone(), clock.clone());
     {
         let (store, clock) = (store.clone(), clock.clone());
         bus.serve(RESOLVE_VENUE, move |envelope| {
@@ -793,6 +819,274 @@ impl Reactor {
             other => Handled::Ignored(format!("payload type {other}")),
         }
     }
+}
+
+/// What a date read needs of an instrument the store holds: its asset class,
+/// and its market's country and venue from the venue it is listed on.
+fn market_of(store: &dyn Store, instrument_id: &str) -> Option<crate::calendars::Market> {
+    let instrument = store.by_id(instrument_id).ok().flatten()?;
+    let venue = (!instrument.listing_venue_id.is_empty())
+        .then(|| {
+            store
+                .venues()
+                .ok()?
+                .into_iter()
+                .find(|venue| venue.venue_id == instrument.listing_venue_id)
+        })
+        .flatten();
+    Some(crate::calendars::Market {
+        asset_class: crate::record::asset_class_value(&instrument.asset_class),
+        country_code: venue
+            .as_ref()
+            .map(|venue| venue.country_code.clone())
+            .unwrap_or_default(),
+        venue_id: instrument.listing_venue_id.clone(),
+    })
+}
+
+/// A calendar or a rule not held, reported by its subject for the
+/// conductor to pull (W3.18).
+fn report_missing(
+    bus: &Bus,
+    missing: &meridian_domain::v1::MissingCalendarDetectedEvent,
+    caused_by: &Envelope,
+) {
+    let meta = caused_by.meta.as_ref();
+    if let Err(failed) = bus.publish(
+        CALENDAR_MISSING,
+        "meridian.v1.MissingCalendarDetectedEvent",
+        missing.encode_to_vec(),
+        meta.map(|meta| meta.correlation_id.as_str()),
+        meta.map(|meta| meta.message_id.as_str()),
+    ) {
+        tracing::warn!(%failed, "a calendar not held could not be reported");
+    }
+}
+
+/// The calendar read, the date read and the list (W3.19 to W3.21, contract
+/// v22): reference reads, answered whatever the asker's scope, from the
+/// versions held as of the recorded time asked for.
+fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
+    let held = |store: &dyn Store, as_of_ns: i64| -> Result<crate::calendars::Held, String> {
+        let calendars = store
+            .calendar_versions()
+            .map_err(|failed| failed.to_string())?;
+        let rules = store
+            .date_rule_versions()
+            .map_err(|failed| failed.to_string())?;
+        Ok(crate::calendars::Held::as_of(&calendars, &rules, as_of_ns))
+    };
+    {
+        let (store, clock, reporting) = (store.clone(), clock.clone(), Arc::clone(bus));
+        bus.serve(READ_CALENDAR, move |envelope| {
+            let request: meridian_domain::v1::ReadCalendarRequest =
+                decode(&envelope, "meridian.v1.ReadCalendarRequest")?;
+            let now_ns = clock.now_ns();
+            let held = held(store.as_ref(), request.as_of_ns)?;
+            let (reply, missing) = crate::calendars::read(&held, &request, now_ns)?;
+            if let Some(missing) = &missing {
+                report_missing(&reporting, missing, &envelope);
+            }
+            Ok((
+                "meridian.v1.ReadCalendarReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (store, clock, reporting) = (store.clone(), clock.clone(), Arc::clone(bus));
+        bus.serve(COMPUTE_DATE, move |envelope| {
+            let request: meridian_domain::v1::ComputeDateRequest =
+                decode(&envelope, "meridian.v1.ComputeDateRequest")?;
+            let now_ns = clock.now_ns();
+            let held = held(store.as_ref(), request.as_of_ns)?;
+            let answered = crate::calendars::compute(
+                &held,
+                &request,
+                |instrument| market_of(store.as_ref(), instrument),
+                now_ns,
+            )?;
+            if let Some(missing) = &answered.missing {
+                report_missing(&reporting, missing, &envelope);
+            }
+            Ok((
+                "meridian.v1.ComputeDateReply".to_string(),
+                answered.reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let store = store.clone();
+        bus.serve(LIST_CALENDARS, move |envelope| {
+            let request: meridian_domain::v1::ListCalendarsRequest =
+                decode(&envelope, "meridian.v1.ListCalendarsRequest")?;
+            let calendars = store
+                .calendar_versions()
+                .map_err(|failed| failed.to_string())?;
+            let rules = store
+                .date_rule_versions()
+                .map_err(|failed| failed.to_string())?;
+            let reply = crate::calendars::list(&calendars, &rules, &request)?;
+            Ok((
+                "meridian.v1.ListCalendarsReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+}
+
+/// Keep each calendar and rule version the conductor pulled, announcing
+/// each one kept (W3.16, W3.17); and name the subjects held to the conductor
+/// soon after a start and daily, for it to ask the platform for versions
+/// after those held. Subscribed before this returns; the loop is what is
+/// left to await.
+pub fn keep_calendars(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+) -> impl std::future::Future<Output = ()> {
+    let mut pulled = bus.subscribe(CALENDAR_PULLED);
+    async move {
+        let refreshing = {
+            let (bus, store, clock) = (Arc::clone(&bus), store.clone(), clock.clone());
+            async move {
+                tokio::time::sleep(REFRESH_FIRST_AFTER).await;
+                let mut every = tokio::time::interval(REFRESH_EVERY);
+                loop {
+                    every.tick().await;
+                    let (store, now_ns) = (store.clone(), clock.now_ns());
+                    let subjects = tokio::task::spawn_blocking(move || {
+                        let calendars = store.calendar_versions()?;
+                        let rules = store.date_rule_versions()?;
+                        Ok::<_, crate::StoreError>(crate::calendars::held_subjects(
+                            &calendars, &rules, now_ns,
+                        ))
+                    })
+                    .await;
+                    match subjects {
+                        Ok(Ok(subjects)) => {
+                            for subject in subjects {
+                                if let Err(failed) = bus.publish(
+                                    CALENDAR_MISSING,
+                                    "meridian.v1.MissingCalendarDetectedEvent",
+                                    subject.encode_to_vec(),
+                                    None,
+                                    None,
+                                ) {
+                                    tracing::warn!(%failed, "a held calendar was not named for refreshing");
+                                }
+                            }
+                        }
+                        Ok(Err(failed)) => {
+                            tracing::warn!(%failed, "the calendars held were not read")
+                        }
+                        Err(failed) => tracing::warn!(%failed, "the calendars held were not read"),
+                    }
+                }
+            }
+        };
+        let keeping = async move {
+            while let Some(delivery) = pulled.recv().await {
+                let envelope = delivery.envelope;
+                let reply: meridian_domain::v1::PullCalendarReply =
+                    match decode(&envelope, "meridian.v1.PullCalendarReply") {
+                        Ok(reply) => reply,
+                        Err(failed) => {
+                            tracing::warn!(%failed, "a pulled calendar did not read");
+                            continue;
+                        }
+                    };
+                let (store, now_ns) = (store.clone(), clock.now_ns());
+                let kept = tokio::task::spawn_blocking(move || {
+                    keep_pulled(store.as_ref(), &reply, now_ns)
+                })
+                .await;
+                let applied = match kept {
+                    Ok(Ok(applied)) => applied,
+                    Ok(Err(failed)) => {
+                        tracing::warn!(%failed, "a pulled calendar was not kept");
+                        continue;
+                    }
+                    Err(failed) => {
+                        tracing::warn!(%failed, "a pulled calendar was not kept");
+                        continue;
+                    }
+                };
+                let meta = envelope.meta.as_ref();
+                for event in applied {
+                    if let Err(failed) = bus.publish(
+                        CALENDAR_APPLIED,
+                        "meridian.v1.CalendarAppliedEvent",
+                        event.encode_to_vec(),
+                        meta.map(|meta| meta.correlation_id.as_str()),
+                        meta.map(|meta| meta.message_id.as_str()),
+                    ) {
+                        tracing::warn!(%failed, "a calendar's version kept could not be announced");
+                    }
+                }
+            }
+        };
+        tokio::join!(refreshing, keeping);
+    }
+}
+
+/// Each version the platform's answer carried kept, a version already held
+/// changing nothing; the announcement of each one kept. A record that is not
+/// the platform's -- no `CAL-` ID, no version, a rule naming no kind or
+/// subject -- is left out and said.
+pub fn keep_pulled(
+    store: &dyn Store,
+    reply: &meridian_domain::v1::PullCalendarReply,
+    now_ns: i64,
+) -> crate::Result<Vec<meridian_domain::v1::CalendarAppliedEvent>> {
+    let mut applied = Vec::new();
+    for record in &reply.calendars {
+        if !record.calendar_id.starts_with("CAL-") || record.version < 1 {
+            tracing::warn!(
+                calendar = record.calendar_id,
+                version = record.version,
+                "a pulled calendar is not the platform's; not kept"
+            );
+            continue;
+        }
+        if store.keep_calendar(record, now_ns)? {
+            applied.push(meridian_domain::v1::CalendarAppliedEvent {
+                calendar_id: record.calendar_id.clone(),
+                version: record.version,
+                rule: None,
+                applied_at_ns: now_ns,
+            });
+        }
+    }
+    for rule in &reply.rules {
+        let kind = meridian_pb::v1::DateRuleKind::try_from(rule.kind)
+            .unwrap_or(meridian_pb::v1::DateRuleKind::Unspecified);
+        if kind == meridian_pb::v1::DateRuleKind::Unspecified
+            || rule.subject.is_empty()
+            || rule.version < 1
+            || rule.parameters.is_none()
+        {
+            tracing::warn!(
+                subject = rule.subject,
+                version = rule.version,
+                "a pulled rule is not the platform's; not kept"
+            );
+            continue;
+        }
+        if store.keep_date_rule(rule, now_ns)? {
+            applied.push(meridian_domain::v1::CalendarAppliedEvent {
+                calendar_id: String::new(),
+                version: rule.version,
+                rule: Some(meridian_pb::v1::DateRuleRef {
+                    kind: rule.kind,
+                    subject: rule.subject.clone(),
+                    version: rule.version,
+                }),
+                applied_at_ns: now_ns,
+            });
+        }
+    }
+    Ok(applied)
 }
 
 fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, String> {

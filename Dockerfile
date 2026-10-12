@@ -79,8 +79,11 @@ COPY deploy/harness/compose.yaml deploy/harness/harness.py deploy/harness/street
      deploy/harness/README.md /harness/
 
 FROM debian:bookworm-slim AS runtime
+# tzdata: the instrument store reads a spot-date rule's cut, 17:00
+# America/New_York for FX, in its zone from the tz database (contract v22,
+# W3.20); data, not a library.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 # The private key lives here, on a volume, and never leaves the container.

@@ -43,6 +43,7 @@
 //! reference data: what the platform answered can be asked again.
 
 pub mod assertions;
+pub mod calendars;
 pub mod platform;
 
 mod ask;
@@ -52,6 +53,7 @@ pub use ask::{
     VENUE_MISSING,
 };
 pub use assertions::{DeploymentKey, SigningError};
+pub use calendars::{CalendarAsker, CALENDAR_MISSING, CALENDAR_PULLED};
 pub use platform::{
     ComponentReport, Config, Enrolment, HttpTransport, Platform, PlatformError, Transport,
 };

@@ -326,6 +326,31 @@ impl Platform {
         reply.venues.into_iter().map(into_venue).collect()
     }
 
+    /// W3.16 (contract v22): calendars and date rules, by the one subject
+    /// the query names -- a calendar's ID, a currency's cash instrument, a
+    /// venue, a pair or a market -- and, on a refresh, only versions after
+    /// the highest held. Never the whole set. The platform's answer as JSON,
+    /// for [`crate::calendars`] to read; none where it holds nothing (404).
+    pub async fn pull_calendars(
+        &self,
+        query: &str,
+        now_ns: i64,
+    ) -> Result<Option<serde_json::Value>, PlatformError> {
+        let path = format!("/api/v1/reference/calendars?{query}");
+        let response = self.call(Method::Get, &path, None, now_ns).await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(PlatformError::Refused {
+                status: response.status,
+            });
+        }
+        serde_json::from_slice(&response.body)
+            .map(Some)
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))
+    }
+
     /// W3.3, by the master's own name for the instrument.
     pub async fn pull_instrument(
         &self,
@@ -1074,7 +1099,7 @@ fn downgrades(from: &str, to: &str) -> bool {
 ///
 /// Hand-rolled rather than pulled in: the alphabet an identifier uses is small
 /// and known, and this is the whole of what a query string here needs.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

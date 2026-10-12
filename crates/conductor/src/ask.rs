@@ -42,6 +42,9 @@ pub struct Conductor {
     bus: Arc<Bus>,
     platform: Arc<Platform>,
     clock: Arc<dyn Clock>,
+    /// What pulls a currency's calendar and a venue's with them (W3.16,
+    /// contract v22), where one is given.
+    calendars: Option<Arc<crate::calendars::CalendarAsker>>,
 }
 
 impl Conductor {
@@ -50,7 +53,15 @@ impl Conductor {
             bus,
             platform,
             clock,
+            calendars: None,
         }
+    }
+
+    /// The same, pulling with each answer the calendars of the cash
+    /// instrument and the venues it carries (W3.16, contract v22).
+    pub fn with_calendars(mut self, calendars: Arc<crate::calendars::CalendarAsker>) -> Self {
+        self.calendars = Some(calendars);
+        self
     }
 
     /// Register the ask on the bus. A handler runs on the bus's blocking pool,
@@ -105,7 +116,7 @@ impl Conductor {
                 .ask_with_venues(&request.identifiers, as_of_ns, now_ns),
         )
         .await;
-        let (record, venues) = match asked {
+        let (record, venues): (_, Vec<meridian_domain::v1::VenueRecord>) = match asked {
             Err(_) => {
                 return unreachable("the platform did not answer in time".into());
             }
@@ -132,7 +143,7 @@ impl Conductor {
                 for_instrument_id: request.instrument_id.clone(),
                 // The venues the platform's answer names (contract v18,
                 // W3.5): its listing venue and that venue's operating venue.
-                venues,
+                venues: venues.clone(),
             }
             .encode_to_vec(),
             Some(correlation).filter(|c| !c.is_empty()),
@@ -140,12 +151,47 @@ impl Conductor {
         ) {
             tracing::warn!(%failed, "the platform's answer could not be published; the person may ask again");
         }
+        if let Some(calendars) = &self.calendars {
+            pull_calendars_with(calendars, Some(&record), &venues, correlation, causation).await;
+        }
         AskPlatformForInstrumentReply {
             reachable: true,
             found: true,
             instrument: Some(record),
             detail: String::new(),
         }
+    }
+}
+
+/// The calendars that come with what was pulled (W3.16, contract v22): a
+/// cash instrument's currency calendar, and each venue's trading calendar.
+async fn pull_calendars_with(
+    calendars: &crate::calendars::CalendarAsker,
+    record: Option<&meridian_domain::v1::InstrumentRecord>,
+    venues: &[meridian_domain::v1::VenueRecord],
+    correlation: &str,
+    causation: &str,
+) {
+    use crate::calendars::Subject;
+    if let Some(record) =
+        record.filter(|record| record.asset_class == meridian_domain::v1::AssetClass::Cash as i32)
+    {
+        calendars
+            .pull(
+                Subject::Currency(record.instrument_id.clone()),
+                correlation,
+                causation,
+            )
+            .await;
+    }
+    for venue in venues {
+        calendars
+            .pull(
+                Subject::Venue(venue.venue_id.clone()),
+                correlation,
+                causation,
+            )
+            .await;
     }
 }
 
@@ -180,6 +226,7 @@ pub struct VenueAsker {
     bus: Arc<Bus>,
     platform: Arc<Platform>,
     clock: Arc<dyn Clock>,
+    calendars: Option<Arc<crate::calendars::CalendarAsker>>,
 }
 
 impl VenueAsker {
@@ -188,7 +235,15 @@ impl VenueAsker {
             bus,
             platform,
             clock,
+            calendars: None,
         }
+    }
+
+    /// The same, pulling each venue's trading calendar with it (W3.16,
+    /// contract v22).
+    pub fn with_calendars(mut self, calendars: Arc<crate::calendars::CalendarAsker>) -> Self {
+        self.calendars = Some(calendars);
+        self
     }
 
     /// Subscribe before returning; the loop that asks is what is left.
@@ -257,13 +312,23 @@ impl VenueAsker {
                             found: false,
                             instrument: None,
                             for_instrument_id: String::new(),
-                            venues,
+                            venues: venues.clone(),
                         }
                         .encode_to_vec(),
                         Some(meta.correlation_id.as_str()).filter(|c| !c.is_empty()),
                         Some(meta.message_id.as_str()).filter(|c| !c.is_empty()),
                     ) {
                         tracing::warn!(%failed, "a venue the platform answered was not published");
+                    }
+                    if let Some(calendars) = &self.calendars {
+                        pull_calendars_with(
+                            calendars,
+                            None,
+                            &venues,
+                            &meta.correlation_id,
+                            &meta.message_id,
+                        )
+                        .await;
                     }
                     break;
                 }

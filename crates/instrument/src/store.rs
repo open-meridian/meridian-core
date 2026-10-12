@@ -576,6 +576,46 @@ pub trait Store: Send + Sync {
 
     /// Every venue kept, ordered by ID.
     fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>>;
+
+    /// Keep a calendar version the platform answered (W3.17, contract v22),
+    /// every version kept and the earlier ones readable: true when it was
+    /// not held already.
+    fn keep_calendar(
+        &self,
+        record: &meridian_domain::v1::CalendarRecord,
+        now_ns: i64,
+    ) -> Result<bool>;
+
+    /// Keep a date rule version likewise (W3.17).
+    fn keep_date_rule(
+        &self,
+        rule: &meridian_domain::v1::DateRuleVersion,
+        now_ns: i64,
+    ) -> Result<bool>;
+
+    /// Every calendar version kept, with when it was kept, ordered by ID and
+    /// version.
+    fn calendar_versions(&self) -> Result<Vec<KeptCalendar>>;
+
+    /// Every date rule version kept, with when it was kept, ordered by kind,
+    /// subject and version.
+    fn date_rule_versions(&self) -> Result<Vec<KeptDateRule>>;
+}
+
+/// A calendar version as the deployment keeps it (W3.17, contract v22): the
+/// platform's record, and when this deployment kept it, which a read as of a
+/// recorded time is held to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptCalendar {
+    pub record: meridian_domain::v1::CalendarRecord,
+    pub kept_at_ns: i64,
+}
+
+/// A date rule version as the deployment keeps it (W3.17, contract v22).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptDateRule {
+    pub rule: meridian_domain::v1::DateRuleVersion,
+    pub kept_at_ns: i64,
 }
 
 /// A store's contents, for an implementation to reuse.
@@ -595,6 +635,11 @@ pub(crate) struct Held {
 
     /// The venues kept, by ID (contract v18).
     pub(crate) venues: std::collections::BTreeMap<String, meridian_domain::v1::VenueRecord>,
+
+    /// Every calendar and date rule version kept (contract v22), by ID or
+    /// kind and subject, and version.
+    pub(crate) calendars: std::collections::BTreeMap<(String, i64), KeptCalendar>,
+    pub(crate) date_rules: std::collections::BTreeMap<(i32, String, i64), KeptDateRule>,
 }
 
 impl Held {

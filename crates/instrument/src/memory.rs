@@ -120,6 +120,54 @@ impl Store for MemoryStore {
     fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>> {
         Ok(self.read()?.venues.values().cloned().collect())
     }
+
+    fn keep_calendar(
+        &self,
+        record: &meridian_domain::v1::CalendarRecord,
+        now_ns: i64,
+    ) -> Result<bool> {
+        let mut held = self.write_lock()?;
+        let key = (record.calendar_id.clone(), record.version);
+        if held.calendars.contains_key(&key) {
+            return Ok(false);
+        }
+        held.calendars.insert(
+            key,
+            crate::store::KeptCalendar {
+                record: record.clone(),
+                kept_at_ns: now_ns,
+            },
+        );
+        Ok(true)
+    }
+
+    fn keep_date_rule(
+        &self,
+        rule: &meridian_domain::v1::DateRuleVersion,
+        now_ns: i64,
+    ) -> Result<bool> {
+        let mut held = self.write_lock()?;
+        let key = (rule.kind, rule.subject.clone(), rule.version);
+        if held.date_rules.contains_key(&key) {
+            return Ok(false);
+        }
+        held.date_rules.insert(
+            key,
+            crate::store::KeptDateRule {
+                rule: rule.clone(),
+                kept_at_ns: now_ns,
+            },
+        );
+        Ok(true)
+    }
+
+    fn calendar_versions(&self) -> Result<Vec<crate::store::KeptCalendar>> {
+        Ok(self.read()?.calendars.values().cloned().collect())
+    }
+
+    fn date_rule_versions(&self) -> Result<Vec<crate::store::KeptDateRule>> {
+        Ok(self.read()?.date_rules.values().cloned().collect())
+    }
 }
 
 #[cfg(test)]

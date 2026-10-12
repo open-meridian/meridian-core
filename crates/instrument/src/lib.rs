@@ -23,6 +23,7 @@
 //! (decisions/011); the answer arrives on the bus and is kept as offers, its
 //! global ID added as an identifier, never adopted as the key.
 
+pub mod calendars;
 pub mod complete;
 pub mod ids;
 pub mod list;
@@ -33,6 +34,7 @@ pub mod resolve;
 pub mod service;
 pub mod store;
 pub mod venues;
+pub mod zone;
 
 mod memory;
 
@@ -75,6 +77,13 @@ impl InstrumentService {
     pub fn start(self) -> impl std::future::Future<Output = ()> {
         let pulled = self.bus.subscribe(service::INSTRUMENT_PULLED);
         let missing = self.bus.subscribe(service::INSTRUMENT_MISSING);
+        // The calendars and rules the conductor pulled (W3.16, contract v22),
+        // subscribed before anything else is in place, as the others are.
+        let calendars = service::keep_calendars(
+            Arc::clone(&self.bus),
+            self.store.clone(),
+            self.clock.clone(),
+        );
         let writing = Arc::new(Mutex::new(()));
         service::serve_all(
             &self.bus,
@@ -82,6 +91,10 @@ impl InstrumentService {
             self.clock.clone(),
             writing.clone(),
         );
-        Reactor::sharing(self.bus, self.store, self.clock, writing).consume(pulled, missing)
+        let reactor =
+            Reactor::sharing(self.bus, self.store, self.clock, writing).consume(pulled, missing);
+        async move {
+            tokio::join!(reactor, calendars);
+        }
     }
 }

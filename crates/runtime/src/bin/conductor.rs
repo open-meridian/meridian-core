@@ -225,12 +225,24 @@ fn run() -> Result<(), String> {
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing
         // here reacts to a miss any more (contract v10, decisions/030).
-        Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock()).serve();
+        // W3.16 (contract v22): the settlement calendars and date rules the
+        // deployment needs, pulled on a miss, with a currency or a venue,
+        // and refreshed as the instrument store names what it holds.
+        let calendars = meridian_conductor::CalendarAsker::new(
+            Arc::clone(&bus),
+            Arc::clone(&platform),
+            clock(),
+        );
+        tokio::spawn(Arc::clone(&calendars).start());
+        Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock())
+            .with_calendars(Arc::clone(&calendars))
+            .serve();
 
         // W3.15 (contract v18): a venue a plugin reported missing, asked of
         // the platform by its public codes and kept by the instrument store.
         tokio::spawn(
             meridian_conductor::VenueAsker::new(Arc::clone(&bus), Arc::clone(&platform), clock())
+                .with_calendars(calendars)
                 .start(),
         );
 

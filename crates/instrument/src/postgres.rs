@@ -44,12 +44,13 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0006_the_venue_master.sql"),
     include_str!("../migrations/0007_identity_never_reused.sql"),
     include_str!("../migrations/0008_prepared_call.sql"),
+    include_str!("../migrations/0009_settlement_calendars.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_venue";
+const NEWEST_TABLE: &str = "instrument_date_rule_version";
 
 /// And the column the newest file adds (0008, contract v20: the prepared
 /// change a version was made from), with its table, which a table check
@@ -999,6 +1000,101 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         Ok(kept > 0)
+    }
+
+    fn keep_calendar(
+        &self,
+        record: &meridian_domain::v1::CalendarRecord,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        let kept = self
+            .conn()?
+            .execute(
+                "INSERT INTO instrument_calendar_version (calendar_id, version, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                &[
+                    &record.calendar_id,
+                    &record.version,
+                    &record.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(kept > 0)
+    }
+
+    fn keep_date_rule(
+        &self,
+        rule: &meridian_domain::v1::DateRuleVersion,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        let kept = self
+            .conn()?
+            .execute(
+                "INSERT INTO instrument_date_rule_version (kind, subject, version, rule, kept_at_ns)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                &[
+                    &rule.kind,
+                    &rule.subject,
+                    &rule.version,
+                    &rule.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(kept > 0)
+    }
+
+    fn calendar_versions(&self) -> Result<Vec<crate::store::KeptCalendar>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT record, kept_at_ns FROM instrument_calendar_version
+                  ORDER BY calendar_id, version",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                Ok(crate::store::KeptCalendar {
+                    record: meridian_domain::v1::CalendarRecord::decode(&bytes[..]).map_err(
+                        |failed| {
+                            StoreError::Unavailable(format!(
+                                "a kept calendar did not read: {failed}"
+                            ))
+                        },
+                    )?,
+                    kept_at_ns: row.get(1),
+                })
+            })
+            .collect()
+    }
+
+    fn date_rule_versions(&self) -> Result<Vec<crate::store::KeptDateRule>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT rule, kept_at_ns FROM instrument_date_rule_version
+                  ORDER BY kind, subject, version",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                Ok(crate::store::KeptDateRule {
+                    rule: meridian_domain::v1::DateRuleVersion::decode(&bytes[..]).map_err(
+                        |failed| {
+                            StoreError::Unavailable(format!("a kept rule did not read: {failed}"))
+                        },
+                    )?,
+                    kept_at_ns: row.get(1),
+                })
+            })
+            .collect()
     }
 
     fn venues(&self) -> Result<Vec<meridian_domain::v1::VenueRecord>> {

@@ -14,8 +14,10 @@ ARG RUST_VERSION=1.90
 ARG RUNTIME_IMAGE=meridian-runtime:local
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS base
+# tzdata: the instrument store reads a spot-date rule's cut in its zone from
+# the host's tz database (contract v22, W3.20), and its tests do too.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /w
 COPY Cargo.toml Cargo.lock ./
