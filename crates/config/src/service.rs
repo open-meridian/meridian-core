@@ -841,6 +841,11 @@ pub fn serve_with(
         ),
         |cx, _: AccessRecordsRequest, _| {
             let snapshot = cx.snapshot()?;
+            // Each connectivity plugin's link and each ems's map (W11.21,
+            // W11.22, contract v22), for the dashboard's pages and its read
+            // tool.
+            let connectivity_links = snapshot.connectivity.values().cloned().collect();
+            let venue_account_maps = crate::connectivity::maps(&snapshot);
             // Each known plugin's settings form (W6.11): what it declared,
             // and which secrets are set, never what they are.
             let plugin_settings = snapshot
@@ -860,6 +865,8 @@ pub fn serve_with(
             records.holds = snapshot.holds;
             // Each instance's linkable accounts (W6.30, contract v20).
             records.linkable_accounts = snapshot.linkable.into_values().collect();
+            records.connectivity_links = connectivity_links;
+            records.venue_account_maps = venue_account_maps;
             Ok(records)
         },
     );

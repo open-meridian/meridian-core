@@ -54,6 +54,8 @@ fn permission(id: &str, user_group: &str, account_group: &str, access_group: &st
 /// Traders (by directory group) hold write on Growth and read on Income.
 fn records() -> AccessRecords {
     AccessRecords {
+        venue_account_maps: Default::default(),
+        connectivity_links: Default::default(),
         linkable_accounts: vec![],
         accounts: vec![
             account("ACC-GROWTH", AccountState::Open),

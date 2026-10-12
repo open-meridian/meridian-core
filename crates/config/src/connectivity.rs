@@ -166,6 +166,24 @@ pub fn told(snapshot: &Snapshot, instance: &str) -> Told {
     out
 }
 
+/// Each `ems`'s venue account map, the mappings that reach something, for
+/// the dashboard (AccessRecords.venue_account_maps, contract v22).
+pub fn maps(snapshot: &Snapshot) -> Vec<VenueAccountMap> {
+    let mut maps: std::collections::BTreeMap<&str, Vec<VenueAccountMapping>> =
+        std::collections::BTreeMap::new();
+    for held in standing(snapshot) {
+        maps.entry(held.ems_instance_id.as_str())
+            .or_default()
+            .push(held.mapping.clone());
+    }
+    maps.into_iter()
+        .map(|(ems, mappings)| VenueAccountMap {
+            ems_instance_id: ems.to_string(),
+            mappings,
+        })
+        .collect()
+}
+
 fn note_within(note: &str, most: usize) -> Result<(), String> {
     let length = note.chars().count();
     if length > most {

@@ -11012,6 +11012,21 @@ pub struct AccessRecords {
     /// dashboard's Accounts tab, the "Setting up" step and its read tool.
     #[prost(message, repeated, tag = "12")]
     pub linkable_accounts: ::prost::alloc::vec::Vec<LinkableAccounts>,
+    /// Each connectivity plugin's link as the conductor keeps it (W11.21,
+    /// contract v22; approved 2026-10-12): available, its one `ems`, its users,
+    /// for the dashboard's pages and dashboard__read_plugin_access. Filled for
+    /// the dashboard only; an instance never recorded is withdrawn and
+    /// unlinked, and absent.
+    #[prost(message, repeated, tag = "13")]
+    pub connectivity_links: ::prost::alloc::vec::Vec<
+        ::meridian_pb::v1::ConnectivityLink,
+    >,
+    /// Each `ems`'s venue account map (W11.22, contract v22; approved
+    /// 2026-10-12): the mappings that reach something, at connectivity plugins
+    /// linked to that `ems` now, for its Access tab and
+    /// dashboard__read_plugin_access. Filled for the dashboard only.
+    #[prost(message, repeated, tag = "14")]
+    pub venue_account_maps: ::prost::alloc::vec::Vec<::meridian_pb::v1::VenueAccountMap>,
 }
 /// One known plugin and the roles it was launched with (contract v15).
 #[derive(Clone, PartialEq, ::prost::Message)]

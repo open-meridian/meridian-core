@@ -481,3 +481,33 @@ async fn the_venue_catalogue_is_kept_latest_per_plugin_and_code_and_read_as_itse
     assert!(empty.order_types.is_empty());
     assert_eq!(empty.venue_account_code, "ACCT-9");
 }
+
+#[tokio::test]
+async fn the_dashboard_reads_each_link_and_each_ems_map_with_the_access_records() {
+    // AccessRecords.connectivity_links and venue_account_maps (contract v22,
+    // approved 2026-10-12): for the dashboard's pages and its read tool.
+    let h = harness();
+    let growth = granted_account(&h, "Growth", "ems-1").await;
+    available(&h, "fix-1", true).await.unwrap();
+    link(&h, "fix-1", "ems-1", vec![person(ADA)]).await.unwrap();
+    map(&h, "ems-1", "fix-1", "ACCT-7", &growth.account_id)
+        .await
+        .unwrap();
+    let records: meridian_domain::v1::AccessRecords = ask(
+        h.as_instance("dashboard"),
+        crate::service::ACCESS_RECORDS,
+        "meridian.v1.AccessRecordsRequest",
+        meridian_domain::v1::AccessRecordsRequest {},
+        ADA,
+    )
+    .await
+    .unwrap();
+    assert_eq!(records.connectivity_links.len(), 1);
+    assert_eq!(records.connectivity_links[0].ems_instance_id, "ems-1");
+    assert_eq!(records.venue_account_maps.len(), 1);
+    assert_eq!(records.venue_account_maps[0].ems_instance_id, "ems-1");
+    assert_eq!(
+        records.venue_account_maps[0].mappings[0].account_id,
+        growth.account_id
+    );
+}

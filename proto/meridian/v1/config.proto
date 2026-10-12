@@ -95,6 +95,19 @@ message AccessRecords {
   // Each plugin instance's linkable accounts (W6.30, contract v20), for the
   // dashboard's Accounts tab, the "Setting up" step and its read tool.
   repeated LinkableAccounts linkable_accounts = 12;
+
+  // Each connectivity plugin's link as the conductor keeps it (W11.21,
+  // contract v22; approved 2026-10-12): available, its one `ems`, its users,
+  // for the dashboard's pages and dashboard__read_plugin_access. Filled for
+  // the dashboard only; an instance never recorded is withdrawn and
+  // unlinked, and absent.
+  repeated ConnectivityLink connectivity_links = 13;
+
+  // Each `ems`'s venue account map (W11.22, contract v22; approved
+  // 2026-10-12): the mappings that reach something, at connectivity plugins
+  // linked to that `ems` now, for its Access tab and
+  // dashboard__read_plugin_access. Filled for the dashboard only.
+  repeated VenueAccountMap venue_account_maps = 14;
 }
 
 // One known plugin and the roles it was launched with (contract v15).
