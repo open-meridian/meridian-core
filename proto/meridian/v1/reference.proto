@@ -745,6 +745,10 @@ enum ProposalOperation {
   PROPOSAL_OPERATION_DECOMMISSION = 2;
   PROPOSAL_OPERATION_REACTIVATE = 3;
   PROPOSAL_OPERATION_MAP_STUB = 4;
+  // A calendar's or date rule's definition proposed for a person to decide
+  // (contract v22; approved 2026-10-12); an instrument proposal never uses
+  // it.
+  PROPOSAL_OPERATION_DEFINE = 5;
 }
 
 enum ProposalState {

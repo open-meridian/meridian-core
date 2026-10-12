@@ -2326,6 +2326,10 @@ pub enum ProposalOperation {
     Decommission = 2,
     Reactivate = 3,
     MapStub = 4,
+    /// A calendar's or date rule's definition proposed for a person to decide
+    /// (contract v22; approved 2026-10-12); an instrument proposal never uses
+    /// it.
+    Define = 5,
 }
 impl ProposalOperation {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2339,6 +2343,7 @@ impl ProposalOperation {
             Self::Decommission => "PROPOSAL_OPERATION_DECOMMISSION",
             Self::Reactivate => "PROPOSAL_OPERATION_REACTIVATE",
             Self::MapStub => "PROPOSAL_OPERATION_MAP_STUB",
+            Self::Define => "PROPOSAL_OPERATION_DEFINE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2349,6 +2354,7 @@ impl ProposalOperation {
             "PROPOSAL_OPERATION_DECOMMISSION" => Some(Self::Decommission),
             "PROPOSAL_OPERATION_REACTIVATE" => Some(Self::Reactivate),
             "PROPOSAL_OPERATION_MAP_STUB" => Some(Self::MapStub),
+            "PROPOSAL_OPERATION_DEFINE" => Some(Self::Define),
             _ => None,
         }
     }
