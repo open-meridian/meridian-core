@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -32,6 +32,7 @@ help:
 	@echo "  make e2e-service-account  a plugin's work as its role's service account: prepared, made, bound, stopped"
 	@echo "  make e2e-lake       the lake's 1a on the harness: recorded, heard, restated, read as of, entitled, wanted"
 	@echo "  make e2e-recorded   the same on the recorded exchanges RECORDED names, a developer's, never committed"
+	@echo "  make e2e-orders     the order path on the harness: proposed, released, placed, filled at a simulated venue, refused"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
@@ -41,7 +42,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -1241,6 +1242,27 @@ e2e-recorded:
 	@$(E2E_LAKE_SETUP) || { echo "e2e-recorded FAILED: the images or the harness did not build" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) E2E_LAKE_NAME=e2e-recorded \
 		STAND_IN_EXCHANGES="$(or $(RECORDED),e2e/lake/exchanges)" $(PY) e2e/lake/run.py
+
+# The order path's slice A on the harness (contract v22, W11;
+# plans/an-order-reaches-a-venue-through-the-book, "v22: core's make
+# e2e-orders"): core's stand-ins on the SDK -- portfolio, the oms and ems
+# desk, compliance -- and a simulated venue as a connectivity plugin. Nothing
+# reaches a broker, a brokerage or a trading API: the venue is a file of
+# this repository.
+E2E_ORDERS_SETUP = \
+	DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null && \
+	DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null && \
+	$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 && \
+	rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+	&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null && \
+	$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/orders/plugins.json >.harness/plugins.yaml
+
+e2e-orders:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(E2E_ORDERS_SETUP) || { echo "e2e-orders FAILED: the images or the harness did not build" >&2; exit 1; }
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/orders/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

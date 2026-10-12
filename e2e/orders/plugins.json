@@ -1,0 +1,7 @@
+[
+  {"instance": "pm", "image": "meridian-python-interop", "roles": ["portfolio"]},
+  {"instance": "desk", "image": "meridian-python-interop", "roles": ["oms", "ems"]},
+  {"instance": "comp", "image": "meridian-python-interop", "roles": ["compliance"]},
+  {"instance": "venue", "image": "meridian-python-interop", "roles": ["connectivity"]},
+  {"instance": "venue2", "image": "meridian-python-interop", "roles": ["connectivity"]}
+]

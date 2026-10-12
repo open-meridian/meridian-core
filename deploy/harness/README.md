@@ -175,6 +175,9 @@ exits non-zero saying why. Every wait is bounded by `--seconds`.
 | `ticket note ID TEXT` | Adds a note on the ticket's page. |
 | `ticket work ID act=ACT [owner=NAME] [due=DATE] [resolution=R] [cites=C] [release=ticket\|N] [--expect-status N]` | Takes one act on the ticket's page: assign, due, resolve, close, reopen or release. |
 | `inbox [--expect N] [--expect-kind KIND ...]` | Prints the person's notices new since their pages last read them: the ticket and the change's kind. |
+| `connectivity available [--withdraw]` / `connectivity link --ems EMS [--user person:SUBJECT ...]` | From contract v22: makes a connectivity plugin available, or withdraws it, as a deployment admin does; or links it to an ems and chooses who may route through it, as the ems's admin does (W11.21). |
+| `instruction active\|pause\|stop (--all \| --account ID \| --plugin ID \| --person SUBJECT \| --service-account SA) [--within PLUGIN] reason=TEXT [--expect-refused TEXT]` | From contract v22: sets a trading instruction at the Trading instructions page, as the person acting does (W11.15). |
+| `attribute ACCOUNT waits=true\|false reason=TEXT` | From contract v22: whether the account's releases wait for compliance, at the Accounts tab's book part (W9.13). |
 | `licence DATASET kept=true\|false retention_days=N derived_use=... display=... personal_use=... [default_fields=A,B] [note=TEXT] [--expect-refused TEXT]` | From contract v18: sets a dataset's licence on the Data sources page, as a deployment admin does, replacing it whole; a boolean left out is false. |
 | `entitle DATASET [--fields A,B] [--withdraw] [note=TEXT] [--seconds N]` | From contract v18: entitles the plugin to a dataset on the Data sources page, every field or those named, or withdraws it; and has the broker's configuration written again with each plugin's datasets, its subjects on the broker, waiting until the broker reloaded: before the entitlement is recorded, so the sidecar subscribes to a subject the broker admits, and after a withdrawal. |
 | `priority DATA_TYPE [--kind KIND] DATASET ... [note=TEXT] [--against N] [--expect-refused TEXT]` | From contract v18: sets the priority for `meridian.v1.Price` (one kind: `close`, `last`, `nav`, `settlement`) or `meridian.v1.Bar` on the Data sources page, the datasets first to last, replaced whole against the priority as the page shows it, or `--against` the `updated_at_ns` given, which a priority changed since is refused. |
@@ -317,7 +320,15 @@ line:
     break|<account>|<subject>|<category>|<state>|<first seen>|<last seen>|<recorded by>|<confirmed cause>|<resolved by>
     figures|<account>|<external account>/<segment>|<business date>
     entry|<account>|<kind>|<effective date>|<actor>
+    order|<account>|<instrument>|<sleeve>|<side>|<ordered>|<state>|<parent's instrument, or top>
+    placement|<account>|<instrument>|<connectivity instance>|<quantity>|<state>
+    execution|<account>|<instrument>|<sleeve>|<quantity>|<price>|<trade date>|<superseding or empty>
+    unplaced|<account, empty for none>|<fact kind>|<reason>|<instance>|<placed>
+    instruction|<partition>|<value>|<setter level>
 
+- From contract v22 the order path's records print too (W11): `<side>`,
+  `<state>`, `<reason>`, `<value>` and `<setter level>` are their enums'
+  numbers. A book holding no orders prints none of them.
 - `<account>` and `<instrument>` as the street store prints them. No identifier
   the book mints -- an entry's, a lot's, a break's -- and no number in a
   partition or time is printed, so a file from one run compares with the next.

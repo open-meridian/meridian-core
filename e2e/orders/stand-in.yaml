@@ -1,0 +1,36 @@
+# Core's order-path stand-ins for `make e2e-orders` (contract v22;
+# e2e/orders/stand_in.py): a portfolio plugin, an oms and ems desk, a
+# compliance plugin, and two connectivity plugins, the simulated venue and a
+# second one never linked. SIMULATED ONLY: no broker, no brokerage, no
+# trading API is reached.
+services:
+  pm:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/orders, absolute}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: pm
+  desk:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: desk
+  comp:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: comp
+  venue:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: venue
+  venue2:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: venue

@@ -237,6 +237,27 @@ the same image with the list on stdin:
       account's row, one per line: its ID, name, setting and state. With
       --expect-refused, fails unless the change is refused saying TEXT.
 
+  connectivity available [--withdraw] [--note TEXT]
+  connectivity link --ems EMS [--user person:SUBJECT ...] [--note TEXT]
+      From contract v22 (W11.21): makes the connectivity plugin available,
+      or withdraws it, as a deployment admin does; or links it to an ems and
+      chooses who may route through it -- people by subject, service
+      accounts (`account:SA-...`) and user groups (`group:...`) -- as the
+      ems's admin does, on its view's Overview.
+
+  instruction VALUE (--all | --account ID | --plugin ID | --person SUBJECT |
+                     --service-account SA) [--within PLUGIN] reason=TEXT
+                     [--expect-refused TEXT]
+      From contract v22 (W11.15): sets active, pause or stop at the Trading
+      instructions page, as the person acting does: a deployment admin on
+      any target, a plugin's admin within their plugin (--within, or the
+      plugin itself). Prints what the page then lists for it.
+
+  attribute ACCOUNT waits=true|false reason=TEXT [--expect-refused TEXT]
+      From contract v22 (W9.13): whether the account's releases wait for
+      compliance, at the Accounts tab's book part, as a deployment admin
+      sets it.
+
 Every command acts as the harness's admin, or, given --as NAME, as one of
 the people `keys` drew a password for (MERIDIAN_HARNESS_PEOPLE, `name=Display
 Name` comma separated), whose account the `people` service made: a run that
@@ -2206,6 +2227,103 @@ def service_account(args):
     raise Failed(f"service-account takes no {act!r}")
 
 
+def connectivity(args):
+    """`connectivity available|link ...`: the connectivity plugin's ems, on
+    its view's Overview (W11.21, contract v22)."""
+    if not args or args[0] not in ("available", "link"):
+        raise Failed("connectivity takes available or link")
+    what = args.pop(0)
+    note = option(args, "--note", "set by the harness")
+    person = signed_in()
+    page = person.get(VIEW)
+    if page.status != 200:
+        raise Failed(f"its view: {page.status} {sentence(page)}")
+    token = form_token(page)
+    if what == "available":
+        withdraw = "--withdraw" in args
+        if withdraw:
+            args.remove("--withdraw")
+        if args:
+            raise Failed(f"connectivity available takes no {args[0]!r}")
+        done = person.send("POST", f"{VIEW}/connectivity/available",
+                           [("form_token", token), ("available", "false" if withdraw else "true"),
+                            ("note", note)])
+    else:
+        ems = option(args, "--ems", "")
+        users = options(args, "--user")
+        if args:
+            raise Failed(f"connectivity link takes no {args[0]!r}")
+        done = person.send("POST", f"{VIEW}/connectivity/link",
+                           [("form_token", token), ("ems_instance_id", ems), ("note", note)]
+                           + [("user", user) for user in users])
+    if done.status != 303:
+        raise Failed(f"connectivity {what}: {done.status} {sentence(done)}")
+    shown = person.get(VIEW)
+    found = re.search(r'<table class="list one-line connectivity"[^>]*>(.*?)</table>', shown.body, re.S)
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", found.group(1), re.S) if found else []
+    print(f"connectivity: {INSTANCE}: " + " | ".join(
+        " ".join(re.sub(r"<[^>]+>", "", cell).split()) for cell in cells))
+
+
+def instruction(args):
+    """`instruction VALUE (--all|--account|--plugin|--person|--service-account
+    ID) [--within PLUGIN] reason=TEXT`: the Trading instructions page (W11.15,
+    contract v22)."""
+    refusal = option(args, "--expect-refused", None)
+    within = option(args, "--within", "")
+    targets = [("--account", "account"), ("--plugin", "plugin"), ("--person", "person"),
+               ("--service-account", "service_account")]
+    kind, named = None, ""
+    if "--all" in args:
+        args.remove("--all")
+        kind = "all"
+    for flag, said in targets:
+        given = option(args, flag, None)
+        if given is not None:
+            if kind is not None:
+                raise Failed("instruction names one target")
+            kind, named = said, given
+    reason = dict(pairs(args)).get("reason", "")
+    values = [a for a in args if "=" not in a]
+    if kind is None or len(values) != 1 or values[0] not in ("active", "pause", "stop"):
+        raise Failed("instruction takes active, pause or stop and one target")
+    instance = named if kind == "plugin" else within
+    person = signed_in()
+    page = person.get("/admin/trading-instructions")
+    if page.status != 200:
+        raise Failed(f"the Trading instructions page: {page.status} {sentence(page)}")
+    done = person.post("/admin/trading-instructions", {
+        "form_token": form_token(page), "kind": kind,
+        "id": "" if kind in ("all", "plugin") else named, "instance": instance,
+        "value": values[0], "reason": reason})
+    said = refused_or_done(done, refusal, f"the {values[0]} instruction")
+    if said:
+        print(f"instruction: {said}")
+        return
+    shown = person.get("/admin/trading-instructions")
+    lines = re.findall(r'<tr data-id="([^"]+)" data-name="([^"]+)" data-value="([^"]+)">', shown.body)
+    print("instruction: " + "; ".join(f"{html.unescape(name)} {value}" for _, name, value in lines))
+
+
+def attribute(args):
+    """`attribute ACCOUNT waits=true|false reason=TEXT`: the Accounts tab's book
+    part (W9.13, contract v22)."""
+    refusal = option(args, "--expect-refused", None)
+    given = dict(pairs(args))
+    rest = [a for a in args if "=" not in a]
+    if len(rest) != 1 or given.get("waits") not in ("true", "false"):
+        raise Failed("attribute takes an account and waits=true|false")
+    person = signed_in()
+    page = person.get("/admin")
+    done = person.post("/admin/accounts/book", {
+        "form_token": form_token(page), "account_id": rest[0], "base_currency_code": "",
+        "lot_relief_default": "0",
+        "waits_for_compliance": "wait" if given["waits"] == "true" else "no-wait",
+        "reason": given.get("reason", "")})
+    said = refused_or_done(done, refusal, "the attribute")
+    print(f"attribute: {said or rest[0] + ' waits ' + given['waits']}")
+
+
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
             "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
@@ -2214,7 +2332,8 @@ COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archi
             "priority": priority, "prepared": prepared, "prepared-act": prepared_act,
             "prepared-form": prepared_form, "prepare-settings": prepare_settings,
             "agents": agents, "linkable": linkable, "core-page": core_page,
-            "service-account": service_account}
+            "service-account": service_account, "connectivity": connectivity,
+            "instruction": instruction, "attribute": attribute}
 
 
 def main(argv):
