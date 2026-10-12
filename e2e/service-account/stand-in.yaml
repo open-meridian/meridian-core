@@ -1,0 +1,21 @@
+# Core's stand-in as a custody plugin and an operations plugin whose
+# autonomous work runs as its role's service account, for `make
+# e2e-service-account` (contract v21; plans/a-service-account-runs-a-
+# plugins-autonomous-work, "What the tests prove"): the custody side reports
+# the statement and the reinvestment the break is about, as for `make
+# e2e-activity`; the operations side registers at v21 with its acts
+# (e2e/plugin-page/service_account.py).
+x-stand-in: &stand-in
+  entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+  volumes:
+    - ${MERIDIAN_HARNESS_STAND_IN:?set MERIDIAN_HARNESS_STAND_IN to e2e/plugin-page, absolute}:/stand-in:ro
+
+services:
+  custody:
+    <<: *stand-in
+    environment:
+      STAND_IN_REPORTS_AT_START: "1"
+  operations:
+    <<: *stand-in
+    environment:
+      STAND_IN_SERVICE_ACCOUNT: "1"

@@ -31,6 +31,7 @@ mod receive;
 pub mod report;
 pub mod roles;
 mod service;
+mod service_account;
 mod streams;
 mod tickets;
 pub mod tools;

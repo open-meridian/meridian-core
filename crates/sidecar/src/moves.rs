@@ -322,6 +322,13 @@ impl Sidecar {
                 let claims = verifier
                     .vouched(assertion, now)
                     .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+                // Never administering (W4.9, contract v21): a move of raw
+                // records is the deployment's configuration.
+                if crate::typed::is_service_account(&claims) {
+                    return Err(self.refuse_move(Status::permission_denied(
+                        crate::typed::never_administering(RECORD_MOVE, &claims),
+                    )));
+                }
                 if !asked.rule.is_empty() {
                     return Err(self.refuse_move(at_path(
                         "rule",
@@ -362,17 +369,7 @@ impl Sidecar {
 
         let stamp = match &claims {
             None => Stamp::default(),
-            Some(claims) => Stamp {
-                acting_for_subject: claims.subject.clone(),
-                acting_through_delegation: claims.delegation_id.clone(),
-                acting_through_client: if claims.delegation_id.is_empty() {
-                    String::new()
-                } else {
-                    claims.client_name.clone()
-                },
-                prepared_call_id: claims.prepared_call_id.clone(),
-                account_scope: None,
-            },
+            Some(claims) => crate::typed::stamp_of(claims, true),
         };
         self.bus
             .call_stamped(

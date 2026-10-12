@@ -544,6 +544,7 @@ async fn ask_through<Q: Message, A: Message + Default>(
         acting_through_delegation: "DLG-1".into(),
         acting_through_client: "meridian on ada-laptop".into(),
         account_scope: None,
+        ..meridian_bus::Stamp::default()
     };
     let (_, bytes) = bus
         .call_stamped(topic, kind, request.encode_to_vec(), None, None, &stamp)

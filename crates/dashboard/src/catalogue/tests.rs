@@ -241,6 +241,7 @@ async fn harness() -> Harness {
         bounds: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
+        service_accounts: Arc::default(),
     });
     Harness {
         app,

@@ -105,6 +105,10 @@ pub struct App {
     /// Prepared changes, the admins' levels and each person's own settings
     /// (W6.26 to W6.31, contract v20), kept in the dashboard's own tables.
     pub prepared: Arc<crate::prepared::Prepared>,
+    /// Service accounts, each role's "runs as" and each change's record
+    /// (W6.32 to W6.34, W4.15, contract v21), kept in the dashboard's own
+    /// tables.
+    pub service_accounts: Arc<crate::service_accounts::ServiceAccounts>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -124,6 +128,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::mcp::routes())
         .merge(crate::tickets::pages::routes())
         .merge(crate::prepared::pages::routes())
+        .merge(crate::service_accounts::pages::routes())
         .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())
@@ -369,6 +374,28 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         );
     }
     body.push_str(&delegations::notices(&app, &session.subject).await);
+    // The service accounts the person answers for (W6.34, contract v21):
+    // the way to what each does, and to stopping one.
+    let owned = app
+        .service_accounts
+        .accounts()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|account| {
+            account.owner_subject == session.subject
+                && account.state != crate::service_accounts::store::State::Removed
+        })
+        .count();
+    if owned > 0 {
+        body.push_str(&format!(
+            "<p class=\"notice\" data-owned-service-accounts=\"{owned}\">You answer for {owned} \
+             service account{s}. <a href=\"/service-accounts\">See what {they} did</a>, and stop \
+             one at once.</p>",
+            s = if owned == 1 { "" } else { "s" },
+            they = if owned == 1 { "it" } else { "they" },
+        ));
+    }
     // W3.11: the records the book cannot use, a first-class number for the
     // deployment admin who completes them (ruled 2026-10-02).
     if access.deployment_admin {

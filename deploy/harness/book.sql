@@ -21,8 +21,9 @@
 -- (decisions/023); what is unknown is empty, never zero. <lot relief>,
 -- <category>, <state>, <confirmed cause> and <source> are the enum's number
 -- (0 is none). <recorded by> and <actor> are a person's subject, `instance
--- <id>` for a finding a plugin sent as itself, or `book` for the book's own
--- act. A position the book removed after a merged record's move is kept as a
+-- <id>` for a finding a plugin sent as itself, `service account <SA- ID>
+-- owned by <subject>` for a service account a plugin's work acted as
+-- (contract v21), or `book` for the book's own act. A position the book removed after a merged record's move is kept as a
 -- tombstone and not printed. Entries are printed in the order they were
 -- made in each account.
 --

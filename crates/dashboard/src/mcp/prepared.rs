@@ -300,7 +300,15 @@ async fn read_prepared(app: &App, caller: &Caller, arguments: &Value) -> Value {
         return not_found();
     }
     let steps = app.prepared.steps(&id).await.unwrap_or_default();
-    json!({"outcome": "unchanged", "data": prep::as_json(&kept, &steps)})
+    let mut data = prep::as_json(&kept, &steps);
+    // A service account's owner reads its contents only within their own
+    // read access (contract v21, the plan's Q18).
+    if let Ok(records) = app.records.current(app.clock.now_ns()) {
+        if prep::contents_withheld(app, &records, &kept, &caller.subject) {
+            data["arguments"] = Value::String(prep::WITHHELD_CONTENTS.into());
+        }
+    }
+    json!({"outcome": "unchanged", "data": data})
 }
 
 async fn make_prepared(app: &App, caller: &Caller, arguments: &Value) -> Value {

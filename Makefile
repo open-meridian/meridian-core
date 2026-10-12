@@ -7,7 +7,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-lake e2e-recorded \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -29,6 +29,7 @@ help:
 	@echo "  make harness-check  the plugin harness image runs three plugins, end to end"
 	@echo "  make e2e-archive    an edge plugin's records archived, restored and returned, a hold refusing on the harness"
 	@echo "  make e2e-plugin-area  core's plugin area worked through /mcp alone, at each role and level, on the harness"
+	@echo "  make e2e-service-account  a plugin's work as its role's service account: prepared, made, bound, stopped"
 	@echo "  make e2e-lake       the lake's 1a on the harness: recorded, heard, restated, read as of, entitled, wanted"
 	@echo "  make e2e-recorded   the same on the recorded exchanges RECORDED names, a developer's, never committed"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
@@ -40,7 +41,7 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
 	@echo
 	@echo "ci-local: GREEN"
 
@@ -910,7 +911,7 @@ e2e-settings-page:
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first; and the Service accounts tab, one line an account, one created from its dialog prepare only, and a role's Runs as on the Access tab, each dialog within the viewport"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,
@@ -1165,6 +1166,27 @@ e2e-prepared:
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/prepared/plugins.json >.harness/plugins.yaml
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/prepared/run.py
+
+# A service account runs a plugin's autonomous work (contract v21, W4.15,
+# W6.32 to W6.34), end to end on the plugin harness: core's stand-in as an
+# operations plugin calling its own acts as its role's service account -- a
+# cleared break's close prepared for the people who may make it and its
+# owner, then made in the book naming the account and its owner; the levels,
+# the gate and its setting binding it; its owner disabling it
+# (e2e/service-account/run.py says each step). Its own compose project.
+e2e-service-account:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "e2e-service-account FAILED: the harness image did not build" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "e2e-service-account FAILED: the SDK's image did not build" >&2; exit 1; }
+	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
+		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
+	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
+		<e2e/service-account/plugins.json >.harness/plugins.yaml
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/service-account/run.py
 
 # The lake's 1a (contract v18, W10), end to end on the plugin harness:
 # core's stand-ins on the SDK, a data plugin serving three datasets from an exchange

@@ -83,7 +83,8 @@ resolving, closing and reopening are a person's, at its page.",
         description: "the person's notices new since this client last read them -- each naming a \
 ticket, the kind of change, who made it and when, never quoting it -- and this client's place \
 moved past them, so each client sees every new notice once. Read a ticket's text with \
-read_ticket.",
+read_ticket. Beside them, for a service account's owner, its latest notices: disabled or removed \
+and by whom, and each of its prepared changes that lapsed with it.",
         reads: true,
         open_world: false,
         input_schema: empty_schema,
@@ -348,9 +349,20 @@ async fn answer(
         "read_inbox" => {
             only(arguments, &[])?;
             let notices = tickets::read_inbox(app, &reader, &caller.delegation_id).await?;
+            // A service account's owner's notices beside them (W6.24, W6.34;
+            // contract v21): it was disabled or removed, by whom, and each of
+            // its prepared changes that lapsed with it.
+            let owned = app
+                .service_accounts
+                .notices(&caller.subject)
+                .await
+                .unwrap_or_default();
             Ok(json!({
                 "outcome": "unchanged",
-                "data": {"notices": notices.iter().map(|(n, t)| tickets::notice_json(n, Some(t), true)).collect::<Vec<_>>()},
+                "data": {
+                    "notices": notices.iter().map(|(n, t)| tickets::notice_json(n, Some(t), true)).collect::<Vec<_>>(),
+                    "service_account_notices": owned.iter().map(crate::service_accounts::notice_json).collect::<Vec<_>>(),
+                },
             }))
         }
         "mark_notices_read" => {

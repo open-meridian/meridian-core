@@ -115,6 +115,10 @@ statement_from_operations, operations' at write, whose route sends that
 custody statement, which the sidecar refuses by role. Each answers typed,
 with an outcome.
 
+With STAND_IN_SERVICE_ACCOUNT set it is an operations plugin built at
+contract v21 whose autonomous work runs as its role's service account (`make
+e2e-service-account`): service_account.py beside this says how.
+
 Runs in the SDK's image, in the sidecar's network namespace, as a plugin runs
 in its sidecar's pod.
 """
@@ -246,6 +250,11 @@ ARCHIVING = bool(os.environ.get("STAND_IN_ARCHIVE"))
 AREA = bool(os.environ.get("STAND_IN_AREA"))
 if ARCHIVING:
     import archiving
+# ── Contract v21: its autonomous work as its role's service account
+# (STAND_IN_SERVICE_ACCOUNT; service_account.py says how) ──
+SERVICE_ACCOUNT = bool(os.environ.get("STAND_IN_SERVICE_ACCOUNT"))
+if SERVICE_ACCOUNT:
+    import service_account
 BOTH = ["custody", "operations"]
 TOOL_ROUTES = {
     "/tool/open": ("open_balance", "Record the fund's opening balance", ["operations"]),
@@ -290,7 +299,9 @@ def register():
         request_serializer=lambda raw: raw,
         response_deserializer=sidecar_pb2.RegisterReply.FromString,
     )
-    if ARCHIVING:
+    if SERVICE_ACCOUNT:
+        request = service_account.registration(PORT)
+    elif ARCHIVING:
         request = archiving.area_registration(PORT) if AREA else archiving.registration(PORT)
     else:
         request = v15_registration() if TOOLS else older_registration()
@@ -1048,6 +1059,11 @@ class Page(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         callers = self.headers.get_all("Meridian-Caller") or []
         sent = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if SERVICE_ACCOUNT:
+            said = service_account.post(self.path, sent, callers[0] if callers else None)
+            if said is not None:
+                self.answer_json(said)
+                return
         if ARCHIVING:
             form = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
             said = archiving.post(self.path, form, callers[0] if callers else None)

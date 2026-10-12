@@ -1373,6 +1373,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         bounds: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
+        service_accounts: Arc::new(service_accounts()),
     });
     tokio::spawn(crate::records::refresh_forever(
         bus,
@@ -1385,4 +1386,32 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     println!("SESSION={session}");
     println!("serving the settings pages on port {port}");
     axum::serve(listener, router(app)).await.unwrap();
+}
+
+/// One service account already on the Service accounts tab (contract v21),
+/// so each pass reads a row: the admin's, set to act, last refused once.
+fn service_accounts() -> crate::service_accounts::ServiceAccounts {
+    use crate::service_accounts::store::{
+        InMemory, ServiceAccount, ServiceAccountStore as _, Setting, State,
+    };
+    let store = InMemory::default();
+    store
+        .put(
+            &ServiceAccount {
+                service_account_id: "SA-01JAD000000000000000000001".into(),
+                name: "Reconciliation sweep".into(),
+                purpose: "Closes breaks whose difference has gone at the next statement".into(),
+                owner_subject: ADMIN.into(),
+                setting: Setting::Act,
+                state: State::Active,
+                created_at_ns: 1_790_380_800_000_000_000,
+                last_used_ns: Some(1_790_384_400_000_000_000),
+                last_refusal: "ops-1__close_books: at may not for Reconciliation sweep".into(),
+                last_refusal_ns: Some(1_790_384_400_000_000_000),
+            },
+            &[],
+            &[],
+        )
+        .expect("kept");
+    crate::service_accounts::ServiceAccounts::keeping(std::sync::Arc::new(store))
 }

@@ -221,7 +221,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_access",
         "Read who holds access to a plugin",
-        "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join; and, for each of its acts, what agents may do with it (agents_may: may_make, prepare_only or may_not; the ceiling where it caps; each access group's stricter level) and whether it needs a second pair of eyes (contract v20). No tool changes who holds access, nor sets a level.",
+        "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join; and, for each of its acts, what agents may do with it (agents_may: may_make, prepare_only or may_not; the ceiling where it caps; each access group's stricter level) and whether it needs a second pair of eyes (contract v20); and each role's runs_as, the service account its autonomous work runs as and the level, or none (contract v21). No tool changes who holds access, sets a level, or chooses what a role runs as.",
         true,
         Gate::AdminOrDeployment,
         instance_schema,
@@ -1779,9 +1779,53 @@ impl Context<'_> {
                 })
             })
             .collect();
+        // What each role runs as (W6.33, contract v21): the account, its
+        // name, state and the level, or none chosen.
+        let chosen = self
+            .app
+            .service_accounts
+            .runs_as()
+            .await
+            .unwrap_or_default();
+        let mut roles_held = self
+            .access
+            .known_roles
+            .get(&instance)
+            .cloned()
+            .unwrap_or_default();
+        if roles_held.is_empty() {
+            roles_held.push(String::new());
+        }
+        let mut runs_as = Vec::new();
+        for role in &roles_held {
+            let held = chosen
+                .iter()
+                .find(|held| held.instance == instance && &held.role == role);
+            let account = match held {
+                Some(held) => self
+                    .app
+                    .service_accounts
+                    .account(&held.service_account_id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            runs_as.push(json!({
+                "role": role,
+                "service_account_id": held.map(|h| h.service_account_id.clone()),
+                "name": account.as_ref().map(|a| crate::mcp::others_words(&a.name)),
+                "state": account.as_ref().map(|a| a.state.value()),
+                "level": held.map(|h| h.level.clone()),
+                "granted": held.and_then(|h| crate::service_accounts::granted_on(
+                    records, &h.service_account_id, &instance, role,
+                ).map(meridian_access::level_name)),
+            }));
+        }
         let data = json!({
             "plugin_instance_id": instance,
             "acts": acts,
+            "runs_as": runs_as,
             "roles": self.access.known_roles.get(&instance).cloned().unwrap_or_default(),
             "access_groups": groups,
             "permissions": permissions.iter().map(|p| json!({

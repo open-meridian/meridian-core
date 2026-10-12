@@ -5,7 +5,8 @@
 //!
 //! Answered for the instance the envelope names and no other, and only for
 //! the person the sidecar stamped on it, with the delegation and client
-//! beside them where it did: a filing with no person is the plugin as
+//! beside them where it did -- or, from contract v21, the role's service
+//! account, its owner named beside it (the plan's Q13): a filing with no person is the plugin as
 //! itself, which files nothing (ruled 2026-10-03). The sidecar checks first;
 //! everything is checked again here, as a page's and a client's filing is.
 //! A refusal's words begin with the status the sidecar answers its plugin
@@ -56,9 +57,28 @@ fn acting(app: &App, envelope: &Envelope) -> Result<(Actor, String), String> {
         .current(app.clock.now_ns())
         .map_err(|stale| format!("unavailable: {stale}"))?;
     let subject = meta.acting_for_subject;
+    // From contract v21 the plugin's role's service account, its owner named
+    // beside it (W4.12, the plan's Q13): the ticket's provenance is the
+    // instance for that service account.
+    let person = if meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
+        let name = app
+            .service_accounts
+            .held(&subject)
+            .map(|account| account.name)
+            .unwrap_or_else(|| subject.clone());
+        crate::service_accounts::admission::preparer_name(
+            &crate::service_accounts::store::ServiceAccount {
+                name,
+                ..Default::default()
+            },
+            &super::display_name(&records, &meta.owner_subject),
+        )
+    } else {
+        super::display_name(&records, &subject)
+    };
     let author = Author {
         provenance: Provenance::Plugin,
-        person: super::display_name(&records, &subject),
+        person,
         subject: subject.clone(),
         delegation_id: meta.acting_through_delegation,
         client_name: meta.acting_through_client,

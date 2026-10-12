@@ -858,6 +858,7 @@ pub(super) async fn ask<R: Message + Default>(
         acting_through_client: caller.client_name.clone(),
         prepared_call_id: acting.prepared_call_id,
         account_scope: None,
+        ..meridian_bus::Stamp::default()
     };
     let answered = app
         .bus

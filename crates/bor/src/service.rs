@@ -110,6 +110,8 @@ fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         acting_through_delegation: meta.acting_through_delegation,
         acting_through_client: meta.acting_through_client,
         prepared_call_id: meta.prepared_call_id,
+        acting_for_kind: meta.acting_for_kind,
+        owner_subject: meta.owner_subject,
         correlation_id: meta.correlation_id,
         event_time_ns: meta.published_at_ns,
         received_at_ns: now,

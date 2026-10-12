@@ -21,6 +21,7 @@ platform.book.query.list-breaks	query	operations,oms,compliance,portfolio,report
 platform.book.query.list-positions	query	portfolio,reporting,compliance,oms,operations	bor
 platform.config.command.allow-archive	command	dashboard	conductor
 platform.config.command.apply-first-run-configuration	command	dashboard	first-run
+platform.config.command.call-as-service-account	command	sidecar	dashboard
 platform.config.command.close-account	command	dashboard	conductor
 platform.config.command.define-access-group	command	dashboard	conductor
 platform.config.command.define-account	command	dashboard	conductor

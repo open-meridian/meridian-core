@@ -2495,3 +2495,121 @@ async fn a_data_plugin_resolves_an_instrument_and_a_role_without_the_row_is_stil
         }
     }
 }
+
+/// What the dashboard signs for a call it admitted for a service account
+/// (W4.15, contract v21): its SA- subject, marked a service account, naming
+/// its owner, at write, no delegation; at admin only where a test asks, to
+/// show that whatever it holds it administers nothing.
+fn service_account(key: &SigningKey, access: Held, level: AccessLevel) -> CallerAssertion {
+    let issued = now();
+    let claims = CallerClaims {
+        subject: "SA-01JAD000000000000000000001".into(),
+        display_name: "The sweep".into(),
+        audience_instance_id: "snaptrade-1".into(),
+        read_account_ids: access.read,
+        write_account_ids: access.write,
+        issued_at_ns: issued,
+        expires_at_ns: issued + 60_000_000_000,
+        assertion_id: "a-sa".into(),
+        level: level as i32,
+        deployment_admin: level == AccessLevel::Admin,
+        tool_name: "close_cleared_breaks".into(),
+        subject_kind: meridian_pb::v1::SubjectKind::ServiceAccount as i32,
+        owner_subject: "local|cat".into(),
+        ..CallerClaims::default()
+    }
+    .encode_to_vec();
+    CallerAssertion {
+        signature: key.sign(&claims).to_bytes().to_vec(),
+        claims,
+        key_id: KEY_ID.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_service_accounts_command_is_admitted_as_a_persons_and_stamped_with_its_kind_and_owner() {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier = Arc::new(Verifier::holding(
+        "snaptrade-1",
+        KEY_ID,
+        key.verifying_key(),
+    ));
+    let (sidecar, bus, _) = registered_with(&["custody"], Some(verifier)).await;
+    let stamped = Arc::new(Mutex::new(Vec::new()));
+    let keeping = Arc::clone(&stamped);
+    bus.serve(RECORD_HOLDING, move |envelope| {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        keeping.lock().unwrap().push((
+            meta.acting_for_subject,
+            meta.acting_for_kind,
+            meta.owner_subject,
+            meta.acting_through_delegation,
+        ));
+        Ok((
+            "meridian.v1.RecordHoldingReply".into(),
+            RecordHoldingReply {
+                holding_id: "H-1".into(),
+                resolved: true,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    sidecar
+        .record_holding(Request::new(for_person(
+            "ext-1",
+            service_account(&key, writing(&["ACC-1"]), AccessLevel::Write),
+        )))
+        .await
+        .expect("admitted as a person's under Open");
+    // An account outside its write set is refused as a person's would be.
+    let refused = sidecar
+        .record_holding(Request::new(for_person(
+            "ext-1",
+            service_account(&key, writing(&["ACC-3"]), AccessLevel::Write),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert_eq!(
+        *stamped.lock().unwrap(),
+        vec![(
+            "SA-01JAD000000000000000000001".to_string(),
+            meridian_pb::v1::SubjectKind::ServiceAccount as i32,
+            "local|cat".to_string(),
+            String::new(),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_service_account_administers_nothing_whatever_it_holds() {
+    let (sidecar, key, heard, readers) = linking(&["ext-new"]).await;
+    // Even claims at admin with the deployment admin's capabilities: refused
+    // the link and the accounts read, both the deployment's configuration.
+    for level in [AccessLevel::Admin, AccessLevel::Write] {
+        let refused = sidecar
+            .link_external_account(Request::new(link(
+                "ext-new",
+                "ACC-9",
+                "",
+                Some(service_account(&key, Held::default(), level)),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert!(
+            refused.message().contains("administers nothing"),
+            "{}",
+            refused.message()
+        );
+        let refused = sidecar
+            .read_accounts_for_linking(Request::new(ReadAccountsForLinkingParams {
+                acting_for: Some(service_account(&key, Held::default(), level)),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::PermissionDenied);
+    }
+    assert!(heard.lock().unwrap().is_empty());
+    assert!(readers.lock().unwrap().is_empty());
+}

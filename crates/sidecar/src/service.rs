@@ -712,6 +712,16 @@ impl SidecarService for Sidecar {
     ) -> Result<Response<meridian_pb::v1::SetOwnSettingsReply>, Status> {
         self.set_own_settings_for_person(request).await
     }
+
+    /// W4.15, contract v21: one of the plugin's own acts, called as the
+    /// service account its role runs as, from its autonomous work
+    /// ([`crate::service_account`]).
+    async fn call_as_service_account(
+        &self,
+        request: Request<meridian_pb::v1::CallAsServiceAccountRequest>,
+    ) -> Result<Response<meridian_pb::v1::CallAsServiceAccountReply>, Status> {
+        self.call_act_as_service_account(request).await
+    }
 }
 
 #[cfg(test)]
@@ -944,9 +954,140 @@ mod tests {
         assert!(data.admitted, "{}", data.refusal_reason);
     }
 
+    /// W4.15, contract v21: the call goes to the dashboard as the plugin
+    /// itself, nobody stamped, for this instance; its answer comes back as
+    /// the dashboard gave it, a refusal by the same fields; a malformed call
+    /// stops here.
+    #[tokio::test]
+    async fn an_act_called_as_the_roles_service_account_is_asked_of_the_dashboard_as_itself() {
+        use meridian_pb::v1::{CallAsServiceAccountReply, CallAsServiceAccountRequest};
+        use prost::Message as _;
+        let bus = Arc::new(Bus::single(
+            "custody-snaptrade-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keeping = Arc::clone(&heard);
+        bus.serve(
+            crate::service_account::CALL_AS_SERVICE_ACCOUNT,
+            move |envelope| {
+                let asked = CallAsServiceAccountRequest::decode(&envelope.payload[..]).unwrap();
+                let meta = envelope.meta.clone().unwrap_or_default();
+                keeping.lock().unwrap().push((
+                    asked.tool_name.clone(),
+                    meta.acting_for_subject,
+                    meta.publisher_instance_id,
+                ));
+                if asked.tool_name == "close_books" {
+                    return Err(
+                        "failed_precondition: [fields=tool_name] tool_name: close_books \
+                                names no check tool"
+                            .into(),
+                    );
+                }
+                Ok((
+                    "meridian.v1.CallAsServiceAccountReply".into(),
+                    CallAsServiceAccountReply {
+                        outcome: "prepared".into(),
+                        prepared_call_id: "PC-01JAD3R5N8M00000000000001".into(),
+                        answer_json: String::new(),
+                    }
+                    .encode_to_vec(),
+                ))
+            },
+        );
+        let sc = Sidecar::under(
+            &contract(),
+            Arc::clone(&bus),
+            "dep-local-1",
+            Identity::new("custody-snaptrade-1", roles(&["custody"])),
+        );
+        let reply = sc
+            .register(Request::new(RegisterRequest {
+                schema_version: "v21".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.admitted, "{}", reply.refusal_reason);
+        let call =
+            |tool: &str, role: &str, arguments: &str, reason: &str| CallAsServiceAccountRequest {
+                role: role.into(),
+                tool_name: tool.into(),
+                arguments_json: arguments.into(),
+                reason: reason.into(),
+            };
+        let answered = sc
+            .call_act_as_service_account(Request::new(call(
+                "record_note",
+                "custody",
+                "{}",
+                "a note",
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(answered.outcome, "prepared");
+        assert_eq!(answered.prepared_call_id, "PC-01JAD3R5N8M00000000000001");
+        let refused = sc
+            .call_act_as_service_account(Request::new(call(
+                "close_books",
+                "custody",
+                "{}",
+                "close",
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            refused.message(),
+            "tool_name: close_books names no check tool"
+        );
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![
+                (
+                    "record_note".to_string(),
+                    String::new(),
+                    "custody-snaptrade-1".to_string()
+                ),
+                (
+                    "close_books".to_string(),
+                    String::new(),
+                    "custody-snaptrade-1".to_string()
+                ),
+            ],
+            "asked as the plugin itself, nobody stamped"
+        );
+        // Stopped at the sidecar, naming the field.
+        for (asked, field) in [
+            (call("record_note", "operations", "{}", "x"), "role"),
+            (
+                call("dashboard__make_prepared", "custody", "{}", "x"),
+                "tool_name",
+            ),
+            (call("record_note", "custody", "[1]", "x"), "arguments_json"),
+            (call("record_note", "custody", "{}", ""), "reason"),
+        ] {
+            let refused = sc
+                .call_act_as_service_account(Request::new(asked))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+            assert!(
+                refused.message().starts_with(&format!("{field}: ")),
+                "{}",
+                refused.message()
+            );
+        }
+        assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v21"] {
+        for declared in ["v1", "v22"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -955,7 +1096,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v20"));
+            assert!(reply.refusal_reason.contains("v2 through v21"));
             assert!(sc.registration().is_none());
         }
     }

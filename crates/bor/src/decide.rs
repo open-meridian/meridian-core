@@ -8,11 +8,15 @@
 //! journal (W9.8).
 //!
 //! **Who answers for an act** (W9.1, W9.6, W9.7, W9.13): a justified act --
-//! an opening balance, handling, a resolution, an attribute -- is a person's,
+//! an opening balance, handling, a resolution, an attribute -- is a user's,
 //! refused without one (`REFUSAL_REASON_ACTOR_REQUIRED`) or without its reason
 //! (`REFUSAL_REASON_REASON_REQUIRED`). A finding -- a break, the figures -- may
-//! be the plugin's own, its actor the instance. Every resolution is a
-//! person's until service accounts exist (open point 3).
+//! be the plugin's own, its actor the instance. From contract v21 the user is
+//! a person or a service account (the plan's Q12): one whose call the
+//! dashboard admitted (W4.15), its actor the service-account arm, its subject
+//! and its owner when it acted, from the envelope's stamp (W4.9, W9.8).
+//! Whether a service account may is the admins' levels and its setting: the
+//! book records, and does not police.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,7 +29,7 @@ use meridian_domain::v1::{
     HandleBreakRequest, HoldingSide, LotReliefMethod, LotSource, MovementLine, OpeningBalance,
     OpeningPosition, PersonActor, PositionKey, RecordAccountFiguresRequest, RecordBreakRequest,
     RecordEncumbrancesRequest, RecordOpeningBalanceRequest, ReferenceVersion, ResolveBreakRequest,
-    SetAccountAttributeRequest, SettlementBucket, SystemActor,
+    ServiceAccountActor, SetAccountAttributeRequest, SettlementBucket, SystemActor,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -53,6 +57,12 @@ pub struct Context {
     /// The prepared change the person made it from, as the sidecar stamped
     /// it beside them (W4.9, W6.27, contract v20); empty otherwise.
     pub prepared_call_id: String,
+    /// The kind of user `acting_for` names, as the sidecar stamped it (W4.9,
+    /// contract v21): a service account where it says so, else a person.
+    pub acting_for_kind: i32,
+    /// A service account's owner when it acted, as the sidecar stamped it
+    /// beside it (W4.9, W9.8, contract v21); empty for a person.
+    pub owner_subject: String,
     pub correlation_id: String,
     pub event_time_ns: i64,
     pub received_at_ns: i64,
@@ -87,6 +97,14 @@ impl Context {
             kind: Some(if self.acting_for.is_empty() {
                 actor::Kind::System(SystemActor {
                     instance_id: self.instance_id.clone(),
+                })
+            } else if self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
+                // A service account a plugin's autonomous work acted as
+                // (contract v21, W9.8): never a person, nor the plugin's own
+                // finding.
+                actor::Kind::ServiceAccount(ServiceAccountActor {
+                    subject: self.acting_for.clone(),
+                    owner_subject: self.owner_subject.clone(),
                 })
             } else {
                 actor::Kind::Person(PersonActor {
@@ -150,12 +168,16 @@ impl Context {
         dates::date_of(self.received_at_ns)
     }
 
-    /// A justified act: a person, and a reason.
+    /// A justified act: a user -- a person, or from contract v21 a service
+    /// account -- and a reason.
     fn justified(&self, reason: &str, what: &str) -> Result<()> {
         if self.acting_for.is_empty() {
             return Err(StoreError::refused(
                 RefusalReason::ActorRequired,
-                format!("{what} is a person's act, and this was sent for no one"),
+                format!(
+                    "{what} is a user's act, a person's or a service account's, and this was \
+                     sent for no one"
+                ),
             ));
         }
         if reason.trim().is_empty() {
@@ -1234,8 +1256,9 @@ pub fn resolve_break(
 }
 
 /// W9.7: close breaks as cleared, citing the statement where the difference
-/// was gone; nothing moves (Q2 of the sample operations plugin). A person's
-/// until service accounts exist.
+/// was gone; nothing moves (Q2 of the sample operations plugin). A person's,
+/// or from contract v21 an opt-in automation's as its role's service
+/// account (W4.15).
 pub fn close_as_cleared(
     book: &Book,
     head: u64,

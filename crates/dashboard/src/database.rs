@@ -10,7 +10,11 @@
 //! - clients, the delegations people make to them, and their tokens by
 //!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
 //! - tickets, their references and notes, notices and each reader's place
-//!   in a person's inbox ([`crate::tickets`], contract v13).
+//!   in a person's inbox ([`crate::tickets`], contract v13);
+//! - prepared changes, the admins' levels and a person's own settings
+//!   ([`crate::prepared`], contract v20);
+//! - service accounts, each role's "runs as" and their records
+//!   ([`crate::service_accounts`], contract v21).
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -92,6 +96,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "an_agents_prepared_change",
         sql: include_str!("../migrations/0008_an_agents_prepared_change.sql"),
         then: Some(levels_at_the_upgrade),
+    },
+    Migration {
+        version: 9,
+        name: "a_service_account",
+        sql: include_str!("../migrations/0009_a_service_account.sql"),
+        then: None,
     },
 ];
 

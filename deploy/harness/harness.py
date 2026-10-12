@@ -219,6 +219,24 @@ the same image with the list on stdin:
       whole, against the priority as the page shows it, or --against the
       updated_at_ns given, which a priority changed since is refused.
 
+  service-account create NAME --owner PERSON [--setting prepare_only|act] [--purpose TEXT]
+  service-account set SA [--setting prepare_only|act] [--name NAME] [--owner PERSON]
+  service-account disable|enable|remove SA [--expect-refused TEXT]
+  service-account grant SA --role ROLE --level read|write
+  service-account runs-as (SA | none) --role ROLE [--level write|read] [--expect-refused TEXT]
+  service-account list
+      A service account (contract v21, W6.32 to W6.34), at the deployment's
+      Settings, its Service accounts tab, as a deployment admin does: created
+      with a name, an owner -- one of the run's people, or `harness` -- and a
+      setting, prepare only unless --setting says act, its SA- ID printed;
+      its setting, name or owner changed; disabled (by its owner too, with
+      --as), re-enabled or removed. `grant` grants it a level on one role of
+      the plugin, on All accounts, by its ID in a user group's logins, as
+      anyone is granted. `runs-as` chooses, on the plugin's Access tab, which
+      account the role's autonomous work runs as, or none. `list` prints each
+      account's row, one per line: its ID, name, setting and state. With
+      --expect-refused, fails unless the change is refused saying TEXT.
+
 Every command acts as the harness's admin, or, given --as NAME, as one of
 the people `keys` drew a password for (MERIDIAN_HARNESS_PEOPLE, `name=Display
 Name` comma separated), whose account the `people` service made: a run that
@@ -2037,6 +2055,157 @@ def linkable(args):
     print(f"linkable: {len(re.findall(r'<tr data-id=', shown.body))} granted")
 
 
+def service_account(args):
+    """`service-account ...`: the Service accounts tab and a role's runs-as
+    (contract v21; see the module's comment)."""
+    if not args:
+        raise Failed("service-account takes create, set, disable, enable, remove, grant, runs-as or list")
+    act = args.pop(0)
+    refusal = option(args, "--expect-refused", None)
+    person = signed_in()
+
+    def login_of(name):
+        return LOGIN if name in (None, ADMIN) else f"local|{name}"
+
+    def rows():
+        page = person.get("/admin")
+        if page.status != 200:
+            raise Failed(f"the Settings page: {page.status} {sentence(page)}")
+        return page, re.findall(
+            r'<tr data-id="(SA-[0-9A-Z]+)" data-name="([^"]*)">(.*?)</tr>', page.body, re.S)
+
+    def filled(row_html):
+        found = re.search(r'data-fill="([^"]+)"', row_html)
+        return json.loads(html.unescape(found.group(1)))["fields"] if found else {}
+
+    def done(reply, what):
+        if refusal is not None:
+            if reply.status == 303:
+                raise Failed(f"{what}, and was to be refused saying {refusal!r}")
+            said = html.unescape(sentence(reply))
+            if refusal not in said:
+                raise Failed(f"refused, not saying {refusal!r}: {said}")
+            print(f"service-account: refused: {said}")
+            return False
+        if reply.status != 303:
+            raise Failed(f"{what}: {reply.status} {html.unescape(sentence(reply))}")
+        return True
+
+    if act == "list":
+        _, found = rows()
+        for sa, name, row_html in found:
+            setting = re.search(r'data-setting="([a-z_]+)"', row_html)
+            state = re.search(r'data-state="([a-z]+)"', row_html)
+            print(f"{sa}\t{html.unescape(name)}\t{setting.group(1) if setting else ''}\t"
+                  f"{state.group(1) if state else ''}")
+        return
+    if act == "create":
+        if not args:
+            raise Failed("service-account create takes a name")
+        name = args.pop(0)
+        owner = option(args, "--owner", None)
+        setting = option(args, "--setting", "prepare_only")
+        purpose = option(args, "--purpose", "")
+        if args:
+            raise Failed(f"service-account create takes no {args[0]!r}")
+        page, _ = rows()
+        reply = person.post("/admin/service-accounts", {
+            "form_token": form_token(page), "service_account_id": "", "name": name,
+            "purpose": purpose, "owner_subject": login_of(owner), "setting": setting,
+            "note": "created by the harness"})
+        if not done(reply, "not created"):
+            return
+        _, found = rows()
+        minted = [sa for sa, listed, _ in found if html.unescape(listed) == name]
+        if not minted:
+            raise Failed(f"{name!r} is not listed once created")
+        print(minted[-1])
+        return
+    if not args:
+        raise Failed(f"service-account {act} takes a service account's SA- ID")
+    sa = args.pop(0)
+    if act == "set":
+        setting = option(args, "--setting", None)
+        name = option(args, "--name", None)
+        owner = option(args, "--owner", None)
+        if args:
+            raise Failed(f"service-account set takes no {args[0]!r}")
+        page, found = rows()
+        row = [row_html for listed, _, row_html in found if listed == sa]
+        if not row:
+            raise Failed(f"{sa} is not listed")
+        fields = filled(row[0])
+        reply = person.post("/admin/service-accounts", {
+            "form_token": form_token(page), "service_account_id": sa,
+            "name": name or fields.get("name", ""), "purpose": fields.get("purpose", ""),
+            "owner_subject": login_of(owner) if owner else fields.get("owner_subject", ""),
+            "setting": setting or fields.get("setting", ""), "note": "changed by the harness"})
+        if done(reply, "not changed"):
+            print(f"service-account: {sa} changed")
+        return
+    if act in ("disable", "enable", "remove"):
+        if args:
+            raise Failed(f"service-account {act} takes no {args[0]!r}")
+        page = person.get("/service-accounts")
+        to = {"disable": "disabled", "enable": "active", "remove": "removed"}[act]
+        reply = person.post("/admin/service-accounts/state", {
+            "form_token": form_token(page), "service_account_id": sa, "state": to,
+            "note": f"{act}d by the harness"})
+        if done(reply, f"not {to}"):
+            print(f"service-account: {sa} {to}")
+        return
+    if act == "grant":
+        role = option(args, "--role", None)
+        level = option(args, "--level", "write")
+        if args or level not in ("read", "write"):
+            raise Failed("service-account grant takes --role ROLE --level read|write")
+
+        def post(path, fields):
+            token = form_token(person.get("/admin"))
+            reply = person.send("POST", path, fields + [("form_token", token)])
+            if reply.status != 303:
+                raise Failed(f"{path}: {reply.status} {sentence(reply)}")
+
+        def defined(path, field, name, fields):
+            def minted():
+                found = re.search(r'<tr data-id="([^"]+)" data-name="'
+                                  + re.escape(html.escape(name)) + '"', person.get("/admin").body)
+                return found.group(1) if found else ""
+            held = minted()
+            post(path, ([(field, held)] if held else []) + [("name", name)] + fields)
+            held = minted()
+            if not held:
+                raise Failed(f"{path}: {name!r} is not listed once defined")
+            return held
+
+        user_group = defined("/admin/user-groups", "user_group_id", f"Harness {sa}", [("login", sa)])
+        access_group = defined("/admin/access-groups", "access_group_id",
+                               f"Harness {level} on {INSTANCE}" + (f" {role}" if role else ""),
+                               [(f"level.{INSTANCE}:{role}", level)] if role is not None
+                               else [("plugin", INSTANCE), (f"level.{INSTANCE}", level)])
+        post("/admin/permissions", [("user_group_id", user_group), ("account_group_id", ALL_ACCOUNTS),
+                                    ("access_group_id", access_group)])
+        print(f"service-account: {sa} holds {level} on {INSTANCE}" + (f" {role}" if role else ""))
+        return
+    if act == "runs-as":
+        role = option(args, "--role", "")
+        level = option(args, "--level", "write")
+        if args:
+            raise Failed(f"service-account runs-as takes no {args[0]!r}")
+        page = person.get(VIEW + "?tab=access")
+        if page.status != 200:
+            raise Failed(f"its Access tab: {page.status} {sentence(page)}")
+        reply = person.post(f"{VIEW}/runs-as", {
+            "form_token": form_token(page), "role": role,
+            "service_account_id": "" if sa == "none" else sa, "level": level,
+            "note": "chosen by the harness"})
+        if done(reply, "not chosen"):
+            print(f"service-account: {INSTANCE} {role or 'as a whole'} runs as "
+                  + ("nobody" if sa == "none" else f"{sa} at {level}"))
+        return
+    raise Failed(f"service-account takes no {act!r}")
+
+
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
             "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
@@ -2044,7 +2213,8 @@ COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archi
             "ticket": ticket, "inbox": inbox, "licence": licence, "entitle": entitle,
             "priority": priority, "prepared": prepared, "prepared-act": prepared_act,
             "prepared-form": prepared_form, "prepare-settings": prepare_settings,
-            "agents": agents, "linkable": linkable, "core-page": core_page}
+            "agents": agents, "linkable": linkable, "core-page": core_page,
+            "service-account": service_account}
 
 
 def main(argv):

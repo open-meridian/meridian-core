@@ -1169,6 +1169,10 @@ impl Opening {
             prepared_call_id: String::new(),
             own_settings: Vec::new(),
             second_pair_of_eyes: Vec::new(),
+            // A person's, unless the caller says a service account's
+            // (contract v21, W4.15).
+            subject_kind: meridian_pb::v1::SubjectKind::Unspecified as i32,
+            owner_subject: String::new(),
         }
     }
 }
@@ -1216,6 +1220,11 @@ pub(crate) struct ToolCaller<'a> {
     /// The plugin's acts whose second pair of eyes is on for the person
     /// (W6.29, contract v20).
     pub second_pair_of_eyes: Vec<String>,
+    /// For a service account (W4.15, contract v21), its owner: the claims
+    /// then say their subject is a service account and name the owner, and
+    /// carry no delegation, no client and no deployment admin's
+    /// capabilities. Empty for a person.
+    pub owner_subject: &'a str,
 }
 
 impl Plugins {
@@ -1257,6 +1266,14 @@ impl Plugins {
         claims.second_pair_of_eyes = caller.second_pair_of_eyes.clone();
         if matches!(level, AccessLevel::Write | AccessLevel::Read) {
             claims.own_settings = caller.own_settings.clone();
+        }
+        if !caller.owner_subject.is_empty() {
+            claims.subject_kind = meridian_pb::v1::SubjectKind::ServiceAccount as i32;
+            claims.owner_subject = caller.owner_subject.to_string();
+            claims.deployment_admin = false;
+            claims.delegation_id.clear();
+            claims.client_name.clear();
+            claims.own_settings.clear();
         }
         let assertion = match self.signer.sign(&claims) {
             Ok(assertion) => URL_SAFE_NO_PAD.encode(assertion.encode_to_vec()),

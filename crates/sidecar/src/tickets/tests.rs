@@ -565,3 +565,48 @@ async fn every_corpus_case_a_plugin_can_file_is_refused_here_or_passed_on_as_it_
     }
     assert!(replayed >= 10, "only {replayed} cases were replayed");
 }
+
+/// Contract v21 (the plan's Q13): a plugin files, and reads back what it
+/// filed, for its role's service account as for a person, carrying the
+/// assertion of a call the dashboard admitted for it; the envelope names the
+/// account, its kind and its owner, and no delegation.
+#[tokio::test]
+async fn a_service_account_files_a_ticket_stamped_with_its_kind_and_owner() {
+    let (sidecar, heard) = registered(&["operations"]).await;
+    let issued = now();
+    let claims = CallerClaims {
+        subject: "SA-01JAD000000000000000000001".into(),
+        display_name: "The sweep".into(),
+        audience_instance_id: INSTANCE.into(),
+        read_account_ids: vec!["ACC-GROWTH".into()],
+        write_account_ids: vec!["ACC-GROWTH".into()],
+        issued_at_ns: issued,
+        expires_at_ns: issued + 60_000_000_000,
+        assertion_id: "a-sa".into(),
+        level: AccessLevel::Write as i32,
+        tool_name: "close_cleared_breaks".into(),
+        subject_kind: meridian_pb::v1::SubjectKind::ServiceAccount as i32,
+        owner_subject: "local|cat".into(),
+        ..CallerClaims::default()
+    }
+    .encode_to_vec();
+    let header = URL_SAFE_NO_PAD.encode(
+        CallerAssertion {
+            signature: key().sign(&claims).to_bytes().to_vec(),
+            claims,
+            key_id: KEY_ID.into(),
+        }
+        .encode_to_vec(),
+    );
+    let reply = file(&sidecar, Some(&header), filing()).await.unwrap();
+    assert_eq!(reply.outcome, "made");
+    let heard = heard.lock().unwrap();
+    let meta = heard[0].1.meta.as_ref().unwrap();
+    assert_eq!(meta.acting_for_subject, "SA-01JAD000000000000000000001");
+    assert_eq!(
+        meta.acting_for_kind,
+        meridian_pb::v1::SubjectKind::ServiceAccount as i32
+    );
+    assert_eq!(meta.owner_subject, "local|cat");
+    assert_eq!(meta.acting_through_delegation, "");
+}

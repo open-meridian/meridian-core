@@ -360,19 +360,10 @@ impl Sidecar {
     }
 
     /// The person on the envelope: who the ticket is for, and the delegation
-    /// and client they acted through where the assertion names them (W4.9).
+    /// and client they acted through where the assertion names them (W4.9);
+    /// or the service account, its kind and its owner (contract v21).
     fn stamp_for(claims: &CallerClaims) -> Stamp {
-        Stamp {
-            acting_for_subject: claims.subject.clone(),
-            acting_through_delegation: claims.delegation_id.clone(),
-            acting_through_client: if claims.delegation_id.is_empty() {
-                String::new()
-            } else {
-                claims.client_name.clone()
-            },
-            prepared_call_id: String::new(),
-            account_scope: None,
-        }
+        crate::typed::stamp_of(claims, false)
     }
 
     /// `SidecarService.FileTicket` (SidecarFileTicket, W4.12).

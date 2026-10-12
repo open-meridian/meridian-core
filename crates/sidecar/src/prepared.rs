@@ -64,17 +64,7 @@ fn at_path(code: Code, path: &str, words: String) -> Status {
 
 /// The person on the envelope, and the delegation and client beside them.
 fn stamp_for(claims: &CallerClaims) -> Stamp {
-    Stamp {
-        acting_for_subject: claims.subject.clone(),
-        acting_through_delegation: claims.delegation_id.clone(),
-        acting_through_client: if claims.delegation_id.is_empty() {
-            String::new()
-        } else {
-            claims.client_name.clone()
-        },
-        prepared_call_id: String::new(),
-        account_scope: None,
-    }
+    crate::typed::stamp_of(claims, false)
 }
 
 impl Sidecar {
@@ -84,6 +74,7 @@ impl Sidecar {
     fn vouched_for_own(
         &self,
         request_metadata: &tonic::metadata::MetadataMap,
+        topic: &str,
         what: &str,
         now_ns: i64,
     ) -> Result<CallerClaims, Status> {
@@ -101,6 +92,13 @@ impl Sidecar {
         let claims = verifier
             .vouched(&assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        // Never administering (W4.9, contract v21): a prepared change's read
+        // and a person's own settings are the deployment's configuration.
+        if crate::typed::is_service_account(&claims) {
+            let refusal = crate::typed::never_administering(topic, &claims);
+            self.note_refusal(&refusal);
+            return Err(Status::permission_denied(refusal));
+        }
         if !matches!(
             AccessLevel::try_from(claims.level),
             Ok(AccessLevel::Admin | AccessLevel::Write | AccessLevel::Read)
@@ -122,7 +120,12 @@ impl Sidecar {
     ) -> Result<Response<ReadPreparedCallReply>, Status> {
         self.admitted()?;
         let now = self.clock.now_ns();
-        let claims = self.vouched_for_own(request.metadata(), "reads a prepared change", now)?;
+        let claims = self.vouched_for_own(
+            request.metadata(),
+            PREPARED_CALL,
+            "reads a prepared change",
+            now,
+        )?;
         let asked = request.into_inner();
         if !is_prepared_call_id(&asked.prepared_call_id) {
             return Err(at_path(
@@ -167,8 +170,12 @@ impl Sidecar {
     ) -> Result<Response<SetOwnSettingsReply>, Status> {
         let registration = self.admitted()?;
         let now = self.clock.now_ns();
-        let claims =
-            self.vouched_for_own(request.metadata(), "saves a person's own settings", now)?;
+        let claims = self.vouched_for_own(
+            request.metadata(),
+            SET_OWN_SETTINGS,
+            "saves a person's own settings",
+            now,
+        )?;
         if claims.level != AccessLevel::Write as i32 {
             let refusal = format!(
                 "a person's own settings are saved under Open, and {} opened this session at {}",

@@ -317,7 +317,7 @@ pub(crate) fn not_done(sentence: &str, back: &str) -> Response {
 
 /// To `done` when it was, and otherwise the store's sentence, with a way
 /// back to `back`.
-fn after_to(outcome: Result<(), String>, done: &str, back: &str) -> Response {
+pub(crate) fn after_to(outcome: Result<(), String>, done: &str, back: &str) -> Response {
     match outcome {
         Ok(()) => (
             StatusCode::SEE_OTHER,
@@ -441,6 +441,7 @@ pub mod data_sources;
 pub mod holds;
 pub mod instruments;
 mod overview;
+pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
 
@@ -517,6 +518,29 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         &records,
         &token_input(&session),
     );
+    // Service accounts (W6.32, contract v21): their tab, and each one a user
+    // group may list in its logins by its SA- ID, as a person is.
+    let accounts = app.service_accounts.accounts().await.unwrap_or_default();
+    let chosen = app.service_accounts.runs_as().await.unwrap_or_default();
+    let service_accounts = crate::service_accounts::pages::settings_section(
+        &crate::service_accounts::owner_names(&app, &records, &accounts).await,
+        &accounts,
+        &chosen,
+        &people,
+        &session.subject,
+        &token_input(&session),
+    );
+    let mut people = people;
+    people.extend(
+        accounts
+            .iter()
+            .filter(|account| account.state != crate::service_accounts::store::State::Removed)
+            .map(|account| people::Person {
+                login: account.service_account_id.clone(),
+                user_id: account.service_account_id.clone(),
+                name: format!("{} (service account)", account.name),
+            }),
+    );
     let body = overview::render(
         &records,
         &delegating,
@@ -524,6 +548,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         &people,
         &books,
         agents,
+        service_accounts,
         &token_input(&session),
         "",
     );
@@ -671,6 +696,19 @@ async fn plugin_view(
             access.deployment_admin,
             &token_input(&session),
         ),
+        runs_as: {
+            let held = access.plugin(&instance);
+            // The held view of the accounts, read afresh for the choices.
+            let _ = app.service_accounts.accounts().await;
+            crate::service_accounts::pages::runs_as_part(
+                &app,
+                &records,
+                &instance,
+                &app.service_accounts.runs_as().await.unwrap_or_default(),
+                &|role: &str| held.administers(role),
+                &token_input(&session),
+            )
+        },
     });
     let mut body = body;
     if let Some(kept) = &prepared {

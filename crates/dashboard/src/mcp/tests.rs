@@ -279,6 +279,7 @@ async fn harness(deployment_admin: bool) -> Harness {
         bounds: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
+        service_accounts: Arc::default(),
     });
     Harness {
         app,
@@ -416,11 +417,12 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             TICKET_TOOLS.as_slice(),
             &["dashboard__list_plugins"],
             PREPARED_TOOLS.as_slice(),
+            &["dashboard__list_service_accounts"],
             &["ops-1__confirm", "ops-1__read_things"]
         ]
         .concat()
     );
-    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 2];
+    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 3];
     assert_eq!(listed["annotations"]["readOnlyHint"], true);
     assert!(listed["description"]
         .as_str()
@@ -441,6 +443,7 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             TICKET_TOOLS.as_slice(),
             &["dashboard__list_plugins"],
             PREPARED_TOOLS.as_slice(),
+            &["dashboard__list_service_accounts"],
             &["ops-1__read_things"]
         ]
         .concat()
@@ -486,7 +489,8 @@ async fn a_deployment_admins_delegation_lists_cores_tools_first_when_it_covers_t
         [
             TICKET_TOOLS.as_slice(),
             &["dashboard__list_plugins"],
-            PREPARED_TOOLS.as_slice()
+            PREPARED_TOOLS.as_slice(),
+            &["dashboard__list_service_accounts"]
         ]
         .concat(),
         "the Instruments tools are the deployment admin's alone; a writer lists the plugins"
@@ -1260,6 +1264,7 @@ fn area_app(held: AccessRecords) -> (Arc<App>, Heard) {
         bounds: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
+        service_accounts: Arc::default(),
     });
     (app, heard)
 }

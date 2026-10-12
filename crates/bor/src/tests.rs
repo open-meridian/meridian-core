@@ -591,6 +591,7 @@ async fn a_person_acting_through_a_client_is_recorded_with_the_delegation_and_th
         acting_through_client: "meridian on ada-laptop".into(),
         prepared_call_id: String::new(),
         account_scope: None,
+        ..Default::default()
     };
     let (_, payload) = bus
         .call_stamped(
@@ -613,6 +614,60 @@ async fn a_person_acting_through_a_client_is_recorded_with_the_delegation_and_th
             client_name: "meridian on ada-laptop".into(),
             prepared_call_id: String::new(),
         }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_account_answers_for_a_justified_act_its_actor_its_own_arm() {
+    // Contract v21 (the plan's Q12, W9.1, W9.8): a service account whose
+    // call the dashboard admitted answers for an opening balance, the reason
+    // still required, its actor the service-account arm -- its subject and
+    // its owner when it acted, from the envelope's stamp -- never a person.
+    let (bus, _) = wired();
+    let stamp = Stamp {
+        acting_for_subject: "SA-01JAD000000000000000000001".into(),
+        acting_for_kind: meridian_pb::v1::SubjectKind::ServiceAccount as i32,
+        owner_subject: PERSON.into(),
+        ..Default::default()
+    };
+    let mut reasonless = opening();
+    reasonless.reason.clear();
+    let refused = bus
+        .call_stamped(
+            RECORD_OPENING_BALANCE,
+            "meridian.v1.RecordOpeningBalanceRequest",
+            reasonless.encode_to_vec(),
+            None,
+            None,
+            &stamp,
+        )
+        .await
+        .unwrap_err();
+    let meridian_bus::BusError::HandlerFailed { detail, .. } = refused else {
+        panic!("refused by the book: {refused:?}");
+    };
+    assert_eq!(code(&detail), Some(RefusalReason::ReasonRequired));
+    let (_, payload) = bus
+        .call_stamped(
+            RECORD_OPENING_BALANCE,
+            "meridian.v1.RecordOpeningBalanceRequest",
+            opening().encode_to_vec(),
+            None,
+            None,
+            &stamp,
+        )
+        .await
+        .unwrap();
+    let reply = BookEntryReply::decode(&payload[..]).unwrap();
+    let actor = reply.entry.unwrap().actor.unwrap();
+    assert_eq!(
+        actor.kind,
+        Some(actor::Kind::ServiceAccount(
+            meridian_domain::v1::ServiceAccountActor {
+                subject: "SA-01JAD000000000000000000001".into(),
+                owner_subject: PERSON.into(),
+            }
+        ))
     );
 }
 

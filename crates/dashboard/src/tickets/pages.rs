@@ -1266,10 +1266,17 @@ async fn inbox_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         Err(response) => return *response,
     };
     let reader = reader_of(&session, &access);
+    // A service account's owner's notices (W6.24, W6.34; contract v21).
+    let owned = app
+        .service_accounts
+        .notices(&session.subject)
+        .await
+        .unwrap_or_default();
     if wants_json(&headers) {
         return match super::read_inbox(&app, &reader, "").await {
             Ok(notices) => Json(json!({
                 "notices": notices.iter().map(|(n, t)| super::notice_json(n, Some(t), true)).collect::<Vec<_>>(),
+                "service_account_notices": owned.iter().map(crate::service_accounts::notice_json).collect::<Vec<_>>(),
             }))
             .into_response(),
             Err(why) => json_refused(&why),
@@ -1324,8 +1331,9 @@ async fn inbox_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     let body = format!(
         "<div class=\"inbox\"><div class=\"page-head\"><div><h1>Inbox</h1>\
          <p>What changed on the tickets you filed, own, noted or may work, for 90 days. A notice \
-         names a ticket and never quotes it.</p></div><div class=\"actions\">{mark_all}</div></div>{tabs}{list}</div>",
+         names a ticket and never quotes it.</p></div><div class=\"actions\">{mark_all}</div></div>{tabs}{owned}{list}</div>",
         tabs = crate::prepared::pages::inbox_tabs("notices", waiting),
+        owned = crate::service_accounts::notices_rows(&app, &owned),
         list = if notices.is_empty() {
             "<div class=\"panel empty-state\"><strong>Nothing yet</strong><p>When a ticket you may \
              act on changes, it is listed here.</p></div>"

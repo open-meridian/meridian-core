@@ -156,6 +156,9 @@ pub trait PreparedStore: Send + Sync {
     fn pending(&self) -> Result<Vec<Kept>, String>;
     /// Those prepared through one delegation, newest first, at most `limit`.
     fn by_delegation(&self, delegation: &str, limit: usize) -> Result<Vec<Kept>, String>;
+    /// Those one preparer prepared -- a service account's, for its owner's
+    /// page (contract v21) -- newest first, at most `limit`.
+    fn by_preparer(&self, subject: &str, limit: usize) -> Result<Vec<Kept>, String>;
     /// Moved from one of `from` to `to` (settled when `to` is not pending),
     /// its step and notices with it, only if it stands in `from`: false, and
     /// nothing written, when it had moved already -- the first who settles it
@@ -254,6 +257,19 @@ impl PreparedStore for InMemory {
             .calls
             .values()
             .filter(|kept| kept.through_delegation == delegation)
+            .cloned()
+            .collect();
+        found.sort_by_key(|kept| std::cmp::Reverse(kept.prepared_at_ns));
+        found.truncate(limit);
+        Ok(found)
+    }
+
+    fn by_preparer(&self, subject: &str, limit: usize) -> Result<Vec<Kept>, String> {
+        let mut found: Vec<Kept> = self
+            .lock()
+            .calls
+            .values()
+            .filter(|kept| kept.preparer_subject == subject)
             .cloned()
             .collect();
         found.sort_by_key(|kept| std::cmp::Reverse(kept.prepared_at_ns));
@@ -635,6 +651,24 @@ impl PreparedStore for InPostgres {
                       WHERE through_delegation = $1 ORDER BY prepared_at_ns DESC LIMIT $2"
                 ),
                 &[&delegation, &limit],
+            )
+            .map_err(said)?
+            .iter()
+            .map(kept_of)
+            .collect())
+    }
+
+    fn by_preparer(&self, subject: &str, limit: usize) -> Result<Vec<Kept>, String> {
+        let limit = limit as i64;
+        Ok(self
+            .database
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {KEPT_COLUMNS} FROM dashboard_prepared_call
+                      WHERE preparer_subject = $1 ORDER BY prepared_at_ns DESC LIMIT $2"
+                ),
+                &[&subject, &limit],
             )
             .map_err(said)?
             .iter()

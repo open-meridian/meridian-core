@@ -607,3 +607,116 @@ fn tickets_are_kept_folded_by_key_noted_and_changed_as_the_memory_store_does_it(
     assert_eq!(count(&url, "dashboard_notice"), 0);
     assert_eq!(count(&url, "dashboard_ticket"), 2);
 }
+
+#[test]
+fn service_accounts_are_kept_each_change_its_own_record_as_the_memory_store_does_it() {
+    use meridian_dashboard::service_accounts::store::{
+        Change, InPostgres, Notice, RunsAs, ServiceAccount, ServiceAccountStore as _, Setting,
+        State,
+    };
+    let (database, url) = migrated("service_accounts");
+    let store = InPostgres::on(database);
+    let id = "SA-01JAD000000000000000000001";
+    let mut account = ServiceAccount {
+        service_account_id: id.into(),
+        name: "The sweep".into(),
+        purpose: "Closes breaks whose difference has gone".into(),
+        owner_subject: "local|cat".into(),
+        setting: Setting::PrepareOnly,
+        state: State::Active,
+        created_at_ns: T0,
+        ..Default::default()
+    };
+    let change = |from: &str, to: &str, at: i64| Change {
+        service_account_id: id.into(),
+        scope: String::new(),
+        from: from.into(),
+        to: to.into(),
+        by: "local|harness".into(),
+        at_ns: at,
+        note: String::new(),
+    };
+    store
+        .put(
+            &account,
+            &[change("", "created: name \"The sweep\"", T0)],
+            &[],
+        )
+        .unwrap();
+    account.setting = Setting::Act;
+    store
+        .put(
+            &account,
+            &[change("setting: prepare_only", "setting: act", T0 + 1)],
+            &[],
+        )
+        .unwrap();
+    store.used(id, T0 + 2, None).unwrap();
+    store
+        .used(id, T0 + 3, Some("ops-1__close_books: may not"))
+        .unwrap();
+    let kept = store.account(id).unwrap().expect("kept");
+    assert_eq!(kept.setting, Setting::Act);
+    assert_eq!(kept.last_used_ns, Some(T0 + 3));
+    assert_eq!(kept.last_refusal, "ops-1__close_books: may not");
+    assert_eq!(store.accounts().unwrap().len(), 1);
+
+    // A role's choice, set and cleared, each its own record.
+    let chosen = RunsAs {
+        instance: "ops-1".into(),
+        role: "operations".into(),
+        service_account_id: id.into(),
+        level: "write".into(),
+    };
+    let scoped = |from: &str, to: &str| Change {
+        scope: "ops-1:operations".into(),
+        ..change(from, to, T0 + 4)
+    };
+    store
+        .set_runs_as(
+            "ops-1",
+            "operations",
+            Some(&chosen),
+            &scoped("", "SA-x at write"),
+        )
+        .unwrap();
+    assert_eq!(store.runs_as().unwrap(), std::slice::from_ref(&chosen));
+    store
+        .set_runs_as("ops-1", "operations", None, &scoped("SA-x at write", ""))
+        .unwrap();
+    assert!(store.runs_as().unwrap().is_empty());
+
+    // Disabled, its owner told, beside the tickets' notices.
+    account.state = State::Disabled;
+    let told = Notice {
+        notice_id: "N-SA-01".into(),
+        subject: "local|cat".into(),
+        service_account_id: id.into(),
+        kind: "disabled".into(),
+        prepared_call_id: String::new(),
+        by_subject: "local|harness".into(),
+        by_name: "Harness".into(),
+        changed_ns: T0 + 5,
+    };
+    store
+        .put(
+            &account,
+            &[change("state: active", "state: disabled", T0 + 5)],
+            std::slice::from_ref(&told),
+        )
+        .unwrap();
+    store
+        .notify(&[Notice {
+            notice_id: "N-SA-02".into(),
+            kind: "lapsed".into(),
+            prepared_call_id: "PC-01JAD3R5N8M00000000000001".into(),
+            ..told.clone()
+        }])
+        .unwrap();
+    let notices = store.notices("local|cat", 10).unwrap();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1], told);
+    assert_eq!(notices[0].prepared_call_id, "PC-01JAD3R5N8M00000000000001");
+    assert_eq!(store.changes(id).unwrap().len(), 5);
+    assert_eq!(count(&url, "dashboard_service_account_change"), 5);
+}

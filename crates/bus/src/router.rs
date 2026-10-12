@@ -49,6 +49,16 @@ pub struct Stamp {
     /// a person.
     pub prepared_call_id: String,
 
+    /// The kind of user `acting_for_subject` names (W4.9, contract v21): the
+    /// claims' `subject_kind`, `SUBJECT_KIND_SERVICE_ACCOUNT` for a service
+    /// account, unspecified (0) for a person and for nobody.
+    pub acting_for_kind: i32,
+
+    /// The person answerable for the service account a command was sent
+    /// for, beside `acting_for_kind` (W4.9, W9.8, contract v21): the claims'
+    /// `owner_subject`. Empty for a person, and for nobody.
+    pub owner_subject: String,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -366,6 +376,8 @@ impl Bus {
             acting_through_delegation: stamp.acting_through_delegation.clone(),
             acting_through_client: stamp.acting_through_client.clone(),
             prepared_call_id: stamp.prepared_call_id.clone(),
+            acting_for_kind: stamp.acting_for_kind,
+            owner_subject: stamp.owner_subject.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

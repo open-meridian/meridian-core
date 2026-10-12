@@ -3174,6 +3174,7 @@ async fn set_through(
         acting_through_delegation: "DLG-7".into(),
         acting_through_client: "Claude".into(),
         account_scope: None,
+        ..meridian_bus::Stamp::default()
     };
     let (_, bytes) = h
         .bus

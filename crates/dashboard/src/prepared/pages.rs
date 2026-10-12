@@ -383,7 +383,14 @@ async fn prepared_page(
         },
         by = escape(&prepared_by(&kept)),
         reason = escape(&reason_shown(&kept)),
-        facts = arguments_facts(&kept),
+        facts = if super::contents_withheld(&app, &records, &kept, &session.subject) {
+            format!(
+                "<p class=\"hint\" data-withheld>{}</p>",
+                escape(super::WITHHELD_CONTENTS)
+            )
+        } else {
+            arguments_facts(&kept)
+        },
         checked = escape(&kept.checked),
         actions = actions,
     );

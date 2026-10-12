@@ -17,6 +17,15 @@
 //! acting for a person at any level, and never as the plugin itself
 //! ([`FOR_A_PERSON_AT_ANY_LEVEL`], the one place they are named).
 //!
+//! **A service account** (contract v21; W4.9, W4.15). Claims whose
+//! `subject_kind` says the subject is a service account -- minted by the
+//! dashboard only for a call it admitted through the act's door -- are
+//! admitted exactly as a person's command under Open, and stamped with the
+//! account's subject, its kind and its owner ([`stamp_of`]), so every store
+//! records a service account, never a person. It administers nothing: every
+//! `config` command and query is refused it, whatever it holds, but the two
+//! named exceptions, filing a ticket and reading back what was filed.
+//!
 //! **A session's level decides what is sent for the person** (W4.9, W6.9).
 //! Under `write` (Open), a command on an account in the write set; under
 //! `admin` (Manage), the accounts read and the link, and nothing else, since
@@ -61,7 +70,9 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1 as domain;
 use meridian_domain::v1::{ExternalAccountsEvent, LinkExternalAccountRequest};
 use meridian_pb::plugin::v1 as plugin;
-use meridian_pb::v1::{AccessLevel, CallerAssertion, CallerClaims, Refusal, RefusalReason};
+use meridian_pb::v1::{
+    AccessLevel, CallerAssertion, CallerClaims, Refusal, RefusalReason, SubjectKind,
+};
 use prost::Message;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Response, Status};
@@ -84,6 +95,55 @@ pub(crate) const FILED_TICKETS: &str = "platform.config.query.filed-tickets";
 pub(crate) const FOR_A_PERSON_AT_ANY_LEVEL: [&str; 2] = [FILE_TICKET, FILED_TICKETS];
 /// Where a plugin says which external accounts its connection reaches (W2.8).
 const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
+
+/// Whether claims are a service account's (W4.9, contract v21): set only by
+/// the dashboard, for a call it admitted through the act's door (W4.15).
+pub(crate) fn is_service_account(claims: &CallerClaims) -> bool {
+    claims.subject_kind == SubjectKind::ServiceAccount as i32
+}
+
+/// What the sidecar stamps on what it sends with `claims` (W4.9): the
+/// subject; for a person, the delegation and its client beside them where
+/// the assertion names one; for a service account, its kind and its owner
+/// (contract v21), and never a delegation; and, where `with_prepared`, the
+/// prepared change it was made from (contract v20). Default claims are the
+/// plugin acting as itself: nobody stamped.
+pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
+    if claims.subject.is_empty() {
+        return Stamp::default();
+    }
+    let service_account = is_service_account(claims);
+    let delegation = if service_account {
+        String::new()
+    } else {
+        claims.delegation_id.clone()
+    };
+    Stamp {
+        acting_for_subject: claims.subject.clone(),
+        acting_through_client: if delegation.is_empty() {
+            String::new()
+        } else {
+            claims.client_name.clone()
+        },
+        acting_through_delegation: delegation,
+        prepared_call_id: if with_prepared {
+            claims.prepared_call_id.clone()
+        } else {
+            String::new()
+        },
+        acting_for_kind: if service_account {
+            SubjectKind::ServiceAccount as i32
+        } else {
+            SubjectKind::Unspecified as i32
+        },
+        owner_subject: if service_account {
+            claims.owner_subject.clone()
+        } else {
+            String::new()
+        },
+        account_scope: None,
+    }
+}
 
 // The tonic surface already returns `Result<_, Status>` everywhere; boxing the
 // error here alone would buy nothing.
@@ -257,7 +317,7 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
-        let (subject, delegation, client) = if topic.starts_with(CONFIGURATION) {
+        let mut stamp = if topic.starts_with(CONFIGURATION) {
             let (claims, roles) = self.vouched_for_configuration(
                 &topic,
                 payload_type,
@@ -272,9 +332,9 @@ impl Sidecar {
                 roles = roles.join(","),
                 "read for a person"
             );
-            (claims.subject, claims.delegation_id, claims.client_name)
+            stamp_of(&claims, false)
         } else {
-            (String::new(), String::new(), String::new())
+            Stamp::default()
         };
         let scope = self
             .configuration(self.clock.now_ns())
@@ -287,13 +347,7 @@ impl Sidecar {
                 return Err(Status::permission_denied(refusal));
             }
         }
-        let stamp = Stamp {
-            acting_for_subject: subject,
-            acting_through_delegation: delegation,
-            acting_through_client: client,
-            prepared_call_id: String::new(),
-            account_scope: Some(scope),
-        };
+        stamp.account_scope = Some(scope);
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -376,6 +430,8 @@ impl Sidecar {
                     instance = self.instance_id(),
                     topic,
                     by = claims.subject,
+                    service_account = is_service_account(&claims),
+                    owner = claims.owner_subject,
                     at_level = "write",
                     roles = roles.join(","),
                     "sent for a person"
@@ -398,27 +454,10 @@ impl Sidecar {
         message: D,
         claims: &CallerClaims,
     ) -> Result<Response<R>, Status> {
-        let stamp = Stamp {
-            acting_for_subject: claims.subject.clone(),
-            acting_through_delegation: if claims.subject.is_empty() {
-                String::new()
-            } else {
-                claims.delegation_id.clone()
-            },
-            acting_through_client: if claims.subject.is_empty() || claims.delegation_id.is_empty() {
-                String::new()
-            } else {
-                claims.client_name.clone()
-            },
-            // The prepared change the person made this from (W4.9, contract
-            // v20), as the dashboard's assertion named it; never alone.
-            prepared_call_id: if claims.subject.is_empty() {
-                String::new()
-            } else {
-                claims.prepared_call_id.clone()
-            },
-            account_scope: None,
-        };
+        // The prepared change the person made this from (W4.9, contract
+        // v20), as the dashboard's assertion named it; never alone. A service
+        // account's kind and owner beside its subject (contract v21).
+        let stamp = stamp_of(claims, true);
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -550,6 +589,9 @@ impl Sidecar {
         let claims = verifier
             .vouched(assertion, now_ns)
             .map_err(|refusal| Status::unauthenticated(refusal.said()))?;
+        if is_service_account(&claims) {
+            return refuse(never_administering(topic, &claims));
+        }
         if claims.level != AccessLevel::Admin as i32 {
             return refuse(format!(
                 "{topic} is the deployment's configuration: a plugin sends it only acting for \
@@ -767,6 +809,17 @@ fn who(claims: &CallerClaims) -> &str {
     } else {
         &claims.display_name
     }
+}
+
+/// Why a service account's claims are refused a `config` topic (W4.9,
+/// W6.32; contract v21): it administers nothing, whatever it holds.
+pub(crate) fn never_administering(topic: &str, claims: &CallerClaims) -> String {
+    format!(
+        "{topic} is the deployment's configuration, and {} is a service account, which \
+         administers nothing: whatever it holds, it is refused every config command and query \
+         but filing a ticket and reading back what was filed",
+        claims.subject
+    )
 }
 
 /// The act a topic carries, as the matrix names its operation: the request's

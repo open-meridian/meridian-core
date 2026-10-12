@@ -181,6 +181,12 @@ pub fn actor_named(actor: Option<&meridian_domain::v1::Actor>) -> String {
     use meridian_domain::v1::actor::Kind;
     match actor.and_then(|actor| actor.kind.as_ref()) {
         Some(Kind::Person(person)) => person.subject.clone(),
+        Some(Kind::ServiceAccount(account)) => {
+            format!(
+                "service account {} owned by {}",
+                account.subject, account.owner_subject
+            )
+        }
         Some(Kind::System(system)) if !system.instance_id.is_empty() => {
             format!("instance {}", system.instance_id)
         }

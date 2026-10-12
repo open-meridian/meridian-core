@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 9] = [
+const TABS: [(&str, &str); 10] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -38,6 +38,7 @@ const TABS: [(&str, &str); 9] = [
     ("accounts", "Accounts"),
     ("holds", "Holds"),
     ("agents", "Agents"),
+    ("service-accounts", "Service accounts"),
     ("connected-clients", "Connected clients"),
 ];
 
@@ -146,7 +147,7 @@ fn options(chosen: &str, items: &[(String, String)]) -> String {
 /// a search box narrowing it in the browser with a count of what is shown,
 /// headings that sort it, and what it says when a search matches none. The
 /// rows come sorted from here, so without script it is in that order, whole.
-pub(super) fn listing(
+pub(crate) fn listing(
     id: &str,
     class: &str,
     noun: &str,
@@ -198,6 +199,7 @@ pub fn render(
     people: &[Person],
     books: &super::books::Books,
     agents: (String, String),
+    service_accounts: (String, String),
     token: &str,
     notice: &str,
 ) -> String {
@@ -1014,6 +1016,21 @@ pub fn render(
          admin sets its acts within the ceiling set here.",
         "",
         format!("{agents_body}{agents_dialog}"),
+    ));
+
+    // ── Service accounts ────────────────────────────────────────────────────
+    // W6.32 (contract v21): users of the deployment that are not people, each
+    // with an owner, a purpose and a setting; granted as anyone is.
+    let (service_accounts_body, service_accounts_dialog) = service_accounts;
+    sections.push(section(
+        "service-accounts",
+        "Service accounts",
+        "Users of this deployment that are not people, which a plugin's autonomous work runs \
+         as: each with an owner who answers for it, a purpose, and a setting, prepare only or \
+         act. It never signs in and holds no password; grant it by its ID in a user group's \
+         logins, as anyone is. It administers nothing.",
+        &add_button("service-account", "a service account"),
+        format!("{service_accounts_body}{service_accounts_dialog}"),
     ));
 
     // ── Connected clients ───────────────────────────────────────────────────

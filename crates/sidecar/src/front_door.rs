@@ -321,6 +321,16 @@ async fn through(
     let claims = front_door.verifier.verify(text, now_ns)?;
     let verified = header.expect("verified above");
 
+    // A service account opens no page (W4.9, contract v21): the dashboard
+    // mints its claims only for an act it admitted, naming the act's tool.
+    if crate::typed::is_service_account(&claims) && claims.tool_name.is_empty() {
+        return Err(Refusal::NotThisTool(format!(
+            "{} is a service account, which opens no page: its claims reach only the act the \
+             dashboard admitted",
+            claims.subject
+        )));
+    }
+
     // A call through the deployment's MCP surface names its tool, and is
     // admitted only at that tool's route (W4.9, contract v12): the SDK serves
     // it without a browser's form token, so it must reach nothing else.

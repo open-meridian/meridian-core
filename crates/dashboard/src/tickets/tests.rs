@@ -166,6 +166,7 @@ fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
         bounds: Arc::default(),
         tickets,
         prepared: Arc::default(),
+        service_accounts: Arc::default(),
     });
     plugin::serve(Arc::clone(&app));
     app

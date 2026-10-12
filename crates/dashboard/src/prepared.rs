@@ -238,6 +238,7 @@ pub fn person_caller(subject: &str, display_name: &str, directory_groups: &[Stri
         delegation_id: String::new(),
         client_name: String::new(),
         covers: crate::delegation::Covers::everything(),
+        owner_subject: String::new(),
     }
 }
 
@@ -515,6 +516,21 @@ impl Prepared {
         kept: &Kept,
         eyes: bool,
     ) -> Vec<String> {
+        // One a service account prepared goes to everyone who may make it
+        // at once, there being no person whose own it is, and its owner is
+        // always shown it (contract v21, the plan's Q7).
+        if let Some(owner) = app.service_accounts.owner_of(&kept.preparer_subject) {
+            let mut shown: Vec<String> = records
+                .people
+                .iter()
+                .map(|person| person.subject.clone())
+                .filter(|subject| Self::may_make_act(app, records, act, kept, subject))
+                .collect();
+            if !shown.contains(&owner) {
+                shown.push(owner);
+            }
+            return shown;
+        }
         let through = !kept.through_delegation.is_empty();
         if through && kept.state != PreparedCallState::Shared as i32 {
             return vec![kept.preparer_subject.clone()];
@@ -570,6 +586,22 @@ impl Prepared {
             return Err(format!(
                 "{} needs a second pair of eyes: it is made by someone other than whoever prepared \
                  it, and other than the person behind the agent that did",
+                kept.tool_name
+            ));
+        }
+        // A service account's owner counts as the person behind it (contract
+        // v21, the plan's Q6): under the gate they never make what it
+        // prepared; with it off they may, as anyone who may make the act.
+        if eyes
+            && app
+                .service_accounts
+                .owner_of(&kept.preparer_subject)
+                .as_deref()
+                == Some(subject)
+        {
+            return Err(format!(
+                "{} needs a second pair of eyes: it is made by someone other than the service \
+                 account that prepared it, and other than its owner",
                 kept.tool_name
             ));
         }
@@ -677,6 +709,7 @@ impl Prepared {
             delegation_id: String::new(),
             client_name: String::new(),
             covers: crate::delegation::Covers::default(),
+            owner_subject: String::new(),
         };
         let mut lapsed = 0;
         for kept in pending {
@@ -733,6 +766,31 @@ impl Prepared {
         lapsed
     }
 }
+
+/// Whether a prepared change's contents are withheld from `subject`: it is
+/// a service account's, `subject` is its owner, and the owner may not read
+/// every account it names (contract v21, the plan's Q18): owning an
+/// automation never opens accounts the owner may not read.
+pub fn contents_withheld(app: &App, records: &AccessRecords, kept: &Kept, subject: &str) -> bool {
+    if app
+        .service_accounts
+        .owner_of(&kept.preparer_subject)
+        .as_deref()
+        != Some(subject)
+    {
+        return false;
+    }
+    let reads = access_of(records, subject)
+        .plugin(&kept.instance)
+        .union()
+        .accounts
+        .read;
+    !kept.accounts.iter().all(|account| reads.contains(account))
+}
+
+/// What a person outside the accounts it names reads in place of its
+/// contents.
+pub const WITHHELD_CONTENTS: &str = "[withheld: it names accounts outside your own read access]";
 
 /// The plugin instance one of core's plugin-area acts names, read from its
 /// arguments; None for an act naming none.
@@ -1009,7 +1067,6 @@ pub async fn prepare(
     arguments: Value,
     reason: &str,
 ) -> Result<Kept, Refusal> {
-    let now = app.clock.now_ns();
     if reason.chars().count() > MOST_REASON {
         return Err(refusal(
             "invalid_argument",
@@ -1040,6 +1097,24 @@ pub async fn prepare(
         }
     }
     let checked = check(app, caller, &act, &arguments).await?;
+    keep(app, caller, tool_name, &act, arguments, reason, checked).await
+}
+
+/// A checked change kept for `caller` -- a person, a person through a
+/// delegation, or from contract v21 a service account (W4.15) -- its first
+/// step and its notices to everyone it is shown to; nothing in the
+/// deployment changes.
+pub async fn keep(
+    app: &App,
+    caller: &Caller,
+    tool_name: &str,
+    act: &Act,
+    arguments: Value,
+    reason: &str,
+    checked: String,
+) -> Result<Kept, Refusal> {
+    let now = app.clock.now_ns();
+    let act = act.clone();
     let accounts = match &act {
         Act::Plugin { declared, .. } => values_at(&arguments, &declared.accounts),
         Act::Core(_) => Vec::new(),
@@ -1476,7 +1551,12 @@ pub fn serve(app: Arc<App>) {
             use prost::Message;
             let meta = envelope.meta.clone().unwrap_or_default();
             let instance = meta.publisher_instance_id;
-            if !crate::plugins::is_instance(&instance) || meta.acting_for_subject.is_empty() {
+            // Never a service account's (contract v21): a prepared change's
+            // read is the deployment's configuration, which it does not reach.
+            if !crate::plugins::is_instance(&instance)
+                || meta.acting_for_subject.is_empty()
+                || meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
+            {
                 return Err(
                     "permission_denied: a prepared change is read only for a person a plugin acts for"
                         .into(),

@@ -94,6 +94,14 @@ pub fn set(app: &App, envelope: &Envelope) -> Result<SetOwnSettingsReply, String
             "permission_denied: a person's own settings are never set by a plugin as itself".into(),
         );
     }
+    // A service account administers nothing and has no settings of its own
+    // (contract v21): refused, as the sidecar refused it first.
+    if meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
+        return Err(
+            "permission_denied: a service account administers nothing, and keeps no settings of              its own"
+                .into(),
+        );
+    }
     let asked = SetOwnSettingsRequest::decode(&envelope.payload[..])
         .map_err(|failed| format!("invalid_argument: the change did not read: {failed}"))?;
     let declared = declared(app, &instance);

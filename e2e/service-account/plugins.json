@@ -1,0 +1,4 @@
+[
+  {"instance": "custody", "image": "meridian-python-interop", "roles": ["custody"]},
+  {"instance": "operations", "image": "meridian-python-interop", "roles": ["operations"]}
+]

@@ -132,6 +132,7 @@ async fn admin(app: &App, headers: &HeaderMap) -> Result<Admin, Box<Response>> {
         acting_through_client: client_name.clone(),
         prepared_call_id: String::new(),
         account_scope: None,
+        ..meridian_bus::Stamp::default()
     };
     Ok(Admin {
         person: caller.person,

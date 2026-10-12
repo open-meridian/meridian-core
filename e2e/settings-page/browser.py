@@ -41,6 +41,10 @@ needed?" So, in headless Chromium:
 - a secret's field (2026-10-10): who set it and when, or "Not set", in the
   field itself; no badge and no box; a Remove beside an optional secret
   alone, which asks first, declined sending nothing and confirmed removing it.
+- the Service accounts tab (contract v21): one line an account behind the
+  kit's pager, its dialog within the viewport, one created from it prepare
+  only by default; and the Access tab's Runs as, one line a role, nobody
+  until chosen, its dialog within the viewport -- each at both sizes.
 
 PASS=fit checks the fit alone (the development deployment's run, whose
 Developer group and banner the ordinary run has not). Prints one line per
@@ -574,6 +578,80 @@ def the_accounts_tab_holds_the_book(browser, prefix):
         ctx.close()
 
 
+def the_service_accounts_tab_and_runs_as(browser, prefix):
+    """Contract v21 (W6.32, W6.33): the deployment's Service accounts tab,
+    one line an account behind the kit's pager -- its name, owner, setting,
+    state, the roles it runs for, last used and last refusal -- its dialog
+    within the viewport, one created from it, prepare only by default; and a
+    plugin's Access tab's Runs as, one line a role, its dialog within the
+    viewport -- each page and open dialog fitting one screen at both sizes."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#service-accounts")
+        settled(page)
+        check(page.locator("#service-accounts").is_visible(), f"at {size} the Service accounts tab opens")
+        if size == "desktop" and PASS != "fit":
+            page.click("#service-accounts button[data-dialog-open=service-account][aria-label]")
+            page.wait_for_timeout(300)
+            chosen = page.evaluate("() => document.querySelector('dialog#service-account [name=setting]').value")
+            check(chosen == "prepare_only", f"a new service account is prepare only by default: {chosen}")
+            page.fill("dialog#service-account [name=name]", "The nightly sweep")
+            page.fill("dialog#service-account [name=purpose]", "Closes breaks whose difference has gone")
+            page.select_option("dialog#service-account [name=owner_subject]", index=1)
+            page.fill("dialog#service-account [name=note]", "For the reconciliation sweep")
+            page.click("dialog#service-account button[type=submit]")
+            settled(page)
+            row = page.inner_text("#service-accounts-table tr[data-name='The nightly sweep']")
+            check("Prepare only" in row and "Active" in row, f"created from the dialog, one line: {row!r}")
+        heads = page.eval_on_selector_all("#service-accounts-table thead th", "hs => hs.map(h => h.textContent)")
+        check(heads[:7] == ["Name", "Owner", "Setting", "State", "Runs for", "Last used", "Last refusal"],
+              f"at {size} each account's row says its name, owner, setting, state, the roles it runs for, "
+              f"last used and last refusal: {heads}")
+        tall = page.evaluate("""() => [...document.querySelectorAll('#service-accounts-table tbody tr')]
+          .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).map((r) => r.dataset.name)""")
+        check(not tall, f"at {size} each service account is one line: {tall}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"the Service accounts tab at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-service-accounts-{size}.png"))
+        page.click("#service-accounts button[data-dialog-open=service-account][aria-label]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the service account's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        spilled = page.evaluate(INSIDE)
+        check(not spilled, f"at {size} nothing in the service account's dialog reaches past it"
+              f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-service-account-new-{size}.png"))
+        page.click("dialog#service-account [data-dialog-close]")
+        page.wait_for_timeout(200)
+
+        page.goto(f"{BASE}/admin/plugins/{TWO_ROLES}?tab=access#part-runs-as")
+        settled(page)
+        roles = page.eval_on_selector_all("#runs-as-table tbody tr", "rows => rows.map(r => r.dataset.name)")
+        check(len(roles) >= 1, f"at {size} Runs as has one line a role: {roles}")
+        nobody = page.inner_text("#runs-as-table tbody tr td[data-runs-as='']") if roles else ""
+        check(nobody.startswith("nobody"), f"at {size} a role runs as nobody until its admin chooses: {nobody!r}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"the Access tab's Runs as at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-runs-as-{size}.png"))
+        edit = page.locator("#runs-as-table button[data-dialog-open]").first
+        if edit.count():
+            edit.click()
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the Runs as dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the Runs as dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-runs-as-edit-{size}.png"))
+        check(not errors, f"the service accounts' pages at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def a_secret_says_where_it_stands(browser, prefix):
     """The product owner, 2026-10-10: a secret's field says in its
     placeholder who set it and when, or that it is not set; no badge and no
@@ -758,6 +836,7 @@ with sync_playwright() as playwright:
     the_raw_records_and_the_holds(browser, prefix)
     the_data_sources_page(browser, prefix)
     the_accounts_tab_holds_the_book(browser, prefix)
+    the_service_accounts_tab_and_runs_as(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),

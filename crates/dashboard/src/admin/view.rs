@@ -520,6 +520,9 @@ pub struct View<'a> {
     pub agents: String,
     /// Its Accounts tab (W6.30, contract v20).
     pub accounts: String,
+    /// What each of its roles runs as, below what agents may do (W6.33,
+    /// contract v21).
+    pub runs_as: String,
 }
 
 fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
@@ -573,26 +576,12 @@ pub fn render(view: &View) -> String {
         ),
         // Who holds the plugin by hand and what agents may do with its acts
         // (contract v20, Q9), each a part of its own so each fits the screen.
-        (ACCESS, _) => super::parts_shown(
-            "Access",
-            &[
-                (
-                    "access",
-                    "Who has access",
-                    format!(
-                        "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
-                        access(view.records, &line.instance, view.may_grant)
-                    ),
-                ),
-                (
-                    "agents",
-                    "What agents may do",
-                    format!(
-                        "<section class=\"panel padded\" id=\"agents-acts\">{}</section>",
-                        view.agents
-                    ),
-                ),
-            ],
+        // Its dialogs -- what agents may do with an act, what a role runs as
+        // -- open with the admin portal's own script (contract v21).
+        (ACCESS, _) => format!(
+            "{}<script>(function () {{{}</script>",
+            access_parts(view, line),
+            super::overview::SCRIPT_END
         ),
         (ACCOUNTS, _) => view.accounts.clone(),
         _ => format!(
@@ -618,5 +607,40 @@ pub fn render(view: &View) -> String {
          {nav}<div class=\"tab-body\" data-current=\"{current}\">{body}</div></div>",
         nav = nav(&line.instance, view.tabs, view.current),
         current = escape(&view.current.key),
+    )
+}
+
+/// The Access tab's parts: who holds the plugin, what agents may do with its
+/// acts (contract v20) and what each role runs as (contract v21), each a part
+/// of its own so each fits the screen.
+fn access_parts(view: &View, line: &Line) -> String {
+    super::parts_shown(
+        "Access",
+        &[
+            (
+                "access",
+                "Who has access",
+                format!(
+                    "<section class=\"panel padded\" id=\"access\"><h2>Who has access</h2>{}</section>",
+                    access(view.records, &line.instance, view.may_grant)
+                ),
+            ),
+            (
+                "agents",
+                "What agents may do",
+                format!(
+                    "<section class=\"panel padded\" id=\"agents-acts\">{}</section>",
+                    view.agents
+                ),
+            ),
+            (
+                "runs-as",
+                "Runs as",
+                format!(
+                    "<section class=\"panel padded\" id=\"runs-as\">{}</section>",
+                    view.runs_as
+                ),
+            ),
+        ],
     )
 }

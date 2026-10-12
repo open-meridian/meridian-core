@@ -341,6 +341,16 @@ fn run() -> Result<(), String> {
             )),
             None => Arc::new(meridian_dashboard::prepared::store::InMemory::default()),
         };
+    // Service accounts and each role's "runs as" beside them (contract
+    // v21); in memory without one.
+    let service_account_store: Arc<
+        dyn meridian_dashboard::service_accounts::store::ServiceAccountStore,
+    > = match &database {
+        Some(database) => Arc::new(meridian_dashboard::service_accounts::store::InPostgres::on(
+            database.clone(),
+        )),
+        None => Arc::new(meridian_dashboard::service_accounts::store::InMemory::default()),
+    };
     let accounts = match (&accounts_url, &database) {
         (Some(_), Some(database)) => {
             let store = InPostgres::on(database.clone());
@@ -394,6 +404,11 @@ fn run() -> Result<(), String> {
         let prepared = Arc::new(meridian_dashboard::prepared::Prepared::keeping(
             prepared_store.clone(),
         ));
+        let service_accounts = Arc::new(
+            meridian_dashboard::service_accounts::ServiceAccounts::keeping(
+                service_account_store.clone(),
+            ),
+        );
         let clock = clock();
 
         // Once before listening, so the first request finds records when
@@ -514,6 +529,7 @@ fn run() -> Result<(), String> {
             bounds: Arc::default(),
             tickets,
             prepared,
+            service_accounts,
         });
         // A plugin's filing and its read-back, answered on the bus for the
         // instance its sidecar names (W4.12): the first topics the
@@ -522,6 +538,14 @@ fn run() -> Result<(), String> {
         // The prepared change a page was opened from, and a person's own
         // settings (W4.14, W6.31, contract v20).
         meridian_dashboard::prepared::serve(Arc::clone(&app));
+        // A plugin's act called as its role's service account (W4.15,
+        // contract v21): made, prepared or refused naming the field.
+        meridian_dashboard::service_accounts::admission::serve(Arc::clone(&app));
+        // The service accounts read once, so whom their prepared changes are
+        // shown to is known from the start.
+        if let Err(failed) = app.service_accounts.accounts().await {
+            tracing::warn!(%failed, "the service accounts could not be read at the start");
+        }
         // The lapse sweep (W6.28): every minute, what is past the lapse
         // period, prepared through a delegation that ended, or naming an act
         // set to may not, lapses, each its own record.
@@ -531,6 +555,9 @@ fn run() -> Result<(), String> {
             loop {
                 every.tick().await;
                 lapsing.prepared.sweep(&lapsing, now_ns()).await;
+                // And what a service account no longer active left pending
+                // (contract v21).
+                meridian_dashboard::service_accounts::sweep(&lapsing, now_ns()).await;
             }
         });
         let app = router(app);
