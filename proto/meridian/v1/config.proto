@@ -599,7 +599,6 @@ message PluginConfiguration {
   // for an `ems`, the connectivity plugins linked to it, who may route
   // through each, and its venue account map. The sidecar hands them to the
   // plugin beside its scope (AccountScopeDelivery).
-  // TODO(name): these three fields' names are not in the approved text.
   ConnectivityLink connectivity_link = 9;
   repeated ConnectivityLink connectivity_links = 10;
   VenueAccountMap venue_account_map = 11;
@@ -715,10 +714,9 @@ message ConnectivityLinkChange {
   // The delegation and its client, where one was used (W4.9).
   string acting_through_delegation = 4;
   string client_name = 5;
-  // TODO(name): W11.21's "from" and "to" -- the link before and after --
-  // are not named as fields (`from` is a keyword in the SDKs' languages).
-  ConnectivityLink before = 6;
-  ConnectivityLink after = 7;
+  // The link before the change, and after it (W11.21's "from" and "to").
+  ConnectivityLink from_link = 6;
+  ConnectivityLink to_link = 7;
   string note = 8;
   // The prepared change it was made from, where one was (W6.27).
   string prepared_call_id = 9;
@@ -745,9 +743,10 @@ message VenueAccountMapChange {
   string ems_instance_id = 1;
   string changed_by = 2;
   int64 changed_at_ns = 3;
-  // TODO(name): the mapping before and after are not named as fields.
-  VenueAccountMapping before = 4;
-  VenueAccountMapping after = 5;
+  // The mapping before the change, and after it; unset where there was
+  // none, or is none.
+  VenueAccountMapping from_mapping = 4;
+  VenueAccountMapping to_mapping = 5;
 }
 
 // A venue's offering per venue account code (W11.20), converted at the edge
@@ -779,10 +778,45 @@ message VenueStrategy {
   StrategyKind kind = 1;
   // The broker's name for it.
   string name = 2;
-  // TODO(name): its parameters -- each one's name, type, allowed values or
-  // range, whether required, and default -- are not named, as a field or a
-  // message.
   int64 stated_at_ns = 3;
+  // Its parameters, as FIXatdl's Parameter elements describe them.
+  repeated StrategyParameter parameters = 4;
+}
+
+// One parameter of a broker's strategy, on FIXatdl's Parameter: its name,
+// type, whether required (use="required"), its range (minValue, maxValue),
+// its allowed values (EnumPair) and its default (initValue). FIXatdl's
+// fixTag and the strategy's wireValue stay at the edge: an `ems` never
+// meets a FIX tag (W11.20).
+message StrategyParameter {
+  string name = 1;
+  StrategyParameterType type = 2;
+  bool required = 3;
+  // In the type's text form; empty where unbounded.
+  string min_value = 4;
+  string max_value = 5;
+  // Empty where any value of the type is allowed.
+  repeated string allowed_values = 6;
+  string default_value = 7;
+}
+
+// FIXatdl's parameter types (Int_t, Float_t, Qty_t, Price_t, PriceOffset_t,
+// Amt_t, Percentage_t, Boolean_t, Char_t, String_t, UTCTimestamp_t,
+// LocalMktDate_t), in the contract's spelling.
+enum StrategyParameterType {
+  STRATEGY_PARAMETER_TYPE_UNSPECIFIED = 0;
+  STRATEGY_PARAMETER_TYPE_INT = 1;
+  STRATEGY_PARAMETER_TYPE_FLOAT = 2;
+  STRATEGY_PARAMETER_TYPE_QTY = 3;
+  STRATEGY_PARAMETER_TYPE_PRICE = 4;
+  STRATEGY_PARAMETER_TYPE_PRICE_OFFSET = 5;
+  STRATEGY_PARAMETER_TYPE_AMOUNT = 6;
+  STRATEGY_PARAMETER_TYPE_PERCENTAGE = 7;
+  STRATEGY_PARAMETER_TYPE_BOOLEAN = 8;
+  STRATEGY_PARAMETER_TYPE_CHAR = 9;
+  STRATEGY_PARAMETER_TYPE_STRING = 10;
+  STRATEGY_PARAMETER_TYPE_UTC_TIMESTAMP = 11;
+  STRATEGY_PARAMETER_TYPE_LOCAL_MARKET_DATE = 12;
 }
 
 // The venue's eligibility for one instrument.
@@ -790,8 +824,18 @@ message VenueEligibility {
   string instrument_id = 1;
   bool fractionable = 2;
   bool shortable = 3;
-  // TODO(name): borrow status and an options level are not named.
   int64 stated_at_ns = 4;
+  BorrowStatus borrow_status = 5;
+  // The options level the venue states for the account; 0 where none.
+  uint32 options_level = 6;
+}
+
+// A venue's borrow status for an instrument (W11.18's easy- and
+// hard-to-borrow).
+enum BorrowStatus {
+  BORROW_STATUS_UNSPECIFIED = 0;
+  BORROW_STATUS_EASY_TO_BORROW = 1;
+  BORROW_STATUS_HARD_TO_BORROW = 2;
 }
 
 // W11.20. Published by a connectivity plugin, per venue account code its

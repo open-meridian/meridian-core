@@ -1442,7 +1442,6 @@ message CalendarSource {
 
 // The first and last dates a calendar vouches for (requirement 4): outside
 // them a date's status is not known, never a business day by default.
-// TODO(name): the approved text names the field `coverage`, not its message.
 message CalendarCoverage {
   // ISO 8601, inclusive.
   string from_date = 1;
@@ -1450,8 +1449,6 @@ message CalendarCoverage {
 }
 
 // A securities settlement system, a calendar's subject by name and country.
-// TODO(name): the approved text names the field `settlement_system`, not its
-// message.
 message SettlementSystem {
   string name = 1;
   // ISO 3166-1 alpha-2.
@@ -1470,7 +1467,6 @@ message CalendarRecord {
   // ID; the venues that follow it by their `VEN-` IDs; or a settlement
   // system.
   string instrument_id = 4;
-  // TODO(name): the plural of the contract's `venue_id`, derived.
   repeated string venue_ids = 5;
   SettlementSystem settlement_system = 6;
 
@@ -1565,7 +1561,6 @@ message Tenor {
 }
 
 // A day's cut: after it, an execution's trade date is the next day.
-// TODO(name): the approved text names the field `cut`, not its message.
 message DayCut {
   // HH:MM, local.
   string local_time = 1;
@@ -1574,8 +1569,6 @@ message DayCut {
 }
 
 // A spot-date rule's tenor-date rule, carried on the same record.
-// TODO(name): "tenor-date rule" is approved as a term and `tenor_rule` as
-// the field, not this message's name.
 message TenorDateRule {
   BusinessDayConvention convention = 1;
   bool end_of_month = 2;
@@ -1614,8 +1607,6 @@ message SpotDateRule {
 }
 
 // One rule version, as the platform keeps and publishes it.
-// TODO(name): the pull's `rules` and W1.23's listing need one message for a
-// rule version of either kind; the approved text names none.
 message DateRuleVersion {
   // Its kind, subject and version, as a DateRuleRef names them.
   DateRuleKind kind = 1;
@@ -1667,9 +1658,10 @@ message AmendDateRuleReply {
 message ListCalendarRecordsRequest {
   // Unspecified lists every kind.
   CalendarKind kind = 1;
-  // TODO(name): W1.23's filter by subject is not named.
   int32 page_size = 2;
   string cursor = 3;
+  // A rule's subject, as DateRuleRef names it; empty for every subject.
+  string subject = 4;
 }
 
 message ListCalendarRecordsReply {
@@ -1705,8 +1697,6 @@ message CalendarAppliedEvent {
 
 // What a read named that the store does not hold (W3.18): one of a
 // calendar, a pair or a market.
-// TODO(name): the approved text names the field `subject` (in the fixture,
-// with `pair`), not its message.
 message CalendarSubject {
   string calendar_id = 1;
   // Two cash instruments' `INS-` IDs.
@@ -1761,16 +1751,14 @@ enum DateOutcome {
 }
 
 // W3.20: an instrument's settlement date by its market's rule.
-// TODO(name): the approved text names the arm `settlement`, not its message.
-message SettlementDateQuestion {
+message SettlementDateInputs {
   string instrument_id = 1;
   string trade_date = 2;
 }
 
 // W3.20: a pair's spot date, from a trade date or from an execution's moment
 // through the pair's cut.
-// TODO(name): the approved text names the arm `spot`, not its message.
-message SpotDateQuestion {
+message SpotDateInputs {
   repeated string pair = 1;
   string trade_date = 2;
   // In place of trade_date: the moment, its trade date taken through the
@@ -1779,8 +1767,7 @@ message SpotDateQuestion {
 }
 
 // W3.20: a tenor date from a trade date.
-// TODO(name): the approved text names the arm `tenor`, not its message.
-message TenorDateQuestion {
+message TenorDateInputs {
   repeated string pair = 1;
   Tenor tenor = 2;
   string trade_date = 3;
@@ -1789,13 +1776,12 @@ message TenorDateQuestion {
 // W3.20: one way to work out a date, in core. The same inputs and versions
 // always give the same date; the wall clock is never read.
 message ComputeDateRequest {
-  oneof question {
-    SettlementDateQuestion settlement = 1;
-    SpotDateQuestion spot = 2;
-    TenorDateQuestion tenor = 3;
-    // TODO(name): W3.20's two other questions -- a date rolled by a
-    // BusinessDayConvention on a set of calendars, and whether a date is a
-    // business day on a set of calendars -- are not named.
+  oneof inputs {
+    SettlementDateInputs settlement = 1;
+    SpotDateInputs spot = 2;
+    TenorDateInputs tenor = 3;
+    RollInputs roll = 5;
+    BusinessDayInputs business_day = 6;
   }
   // The records as of this recorded time; zero means the latest held.
   int64 as_of_ns = 4;
@@ -1807,6 +1793,23 @@ message ComputeDateReply {
   DateOutcome outcome = 2;
   // The rule and each calendar, with their versions, it was computed on.
   DateBasis basis = 3;
+  // On a business-day question, computed: whether the date is one on every
+  // calendar named.
+  bool business_day = 4;
+}
+
+// W3.20: a date rolled by a convention on a set of calendars.
+message RollInputs {
+  string date = 1;
+  BusinessDayConvention convention = 2;
+  // By their `CAL-` IDs; a day is good only if good in every one.
+  repeated string calendars = 3;
+}
+
+// W3.20: whether a date is a business day on a set of calendars.
+message BusinessDayInputs {
+  string date = 1;
+  repeated string calendars = 2;
 }
 
 // W3.21: the calendars the deployment holds, for a deployment admin; the
@@ -1818,13 +1821,11 @@ message ListCalendarsRequest {
 
 message ListCalendarsReply {
   repeated HeldCalendar calendars = 1;
-  // TODO(name): W3.21 lists the rules held too; their line is not named.
   string next_cursor = 2;
+  repeated HeldDateRule rules = 3;
 }
 
 // One calendar the deployment holds, one line.
-// TODO(name): the approved text names the field `calendars` and its
-// fields, not this message.
 message HeldCalendar {
   string calendar_id = 1;
   string name = 2;
@@ -1833,4 +1834,12 @@ message HeldCalendar {
   // ISO 8601: its coverage's last date.
   string coverage_to_date = 5;
   int64 refreshed_at_ns = 6;
+}
+
+// One date rule the deployment holds, one line.
+message HeldDateRule {
+  DateRuleKind kind = 1;
+  string subject = 2;
+  int64 version = 3;
+  int64 refreshed_at_ns = 4;
 }
