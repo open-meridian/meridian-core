@@ -1933,6 +1933,8 @@ message UnplacedFact {
   }
   // The entry that placed it, once a later record claimed it.
   JournalRef placed_by = 12;
+  // Its latest entry: the one that kept it, or the one that placed it.
+  JournalRef last_change = 13;
 }
 
 // A trading instruction (W11.15): recorded with its setter's level, a
@@ -1947,6 +1949,8 @@ message TradingInstruction {
   repeated string covers = 4;
   string reason = 5;
   EntryMeta entry = 6;
+  // Its latest entry, which a catch-up reads it by (W11.16).
+  JournalRef last_change = 7;
 }
 
 // What an instruction names: a deployment admin's an account, All accounts,
@@ -2359,15 +2363,26 @@ message LocateUpdatedEvent {
 message ListOrdersRequest {
   // Empty: every account in the reader's scope.
   string account_id = 1;
-  Watermark after_watermark = 2;
+  // Only records whose last change is above it, as every record catch-up
+  // reads (W4.3); unset, every record in scope as of now.
+  Watermark since = 2;
   int32 page_size = 3;
   string cursor = 4;
 }
 
+// Each kind of record the order path delivers, in its own list, so a
+// catch-up after a gap or a loss reads the records its row carries: an
+// order's (OrderUpdated), a placement's (PlacementUpdated), an execution's
+// (ExecutionRecorded), an unplaced fact's (UnplacedFactRecorded).
 message ListOrdersReply {
   repeated Order orders = 1;
-  Watermark watermark = 2;
+  Watermark as_of = 2;
   string next_cursor = 3;
+  repeated Placement placements = 4;
+  repeated Execution executions = 5;
+  // Those naming an account in the reader's scope; one naming none is read
+  // by no plugin (W11.13).
+  repeated UnplacedFact unplaced_facts = 6;
 }
 
 // One order's journal from its first entry; the history never changes.
@@ -2386,23 +2401,32 @@ message OrderHistoryReply {
 }
 
 // Those in force, never a history; read on start, whatever the scope.
-message ListTradingInstructionsRequest {}
+// With `since`, each instruction changed above it, an instruction set back
+// to active included, as an unscoped record row's catch-up reads (W4.3).
+message ListTradingInstructionsRequest {
+  Watermark since = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
 
 message ListTradingInstructionsReply {
   repeated TradingInstruction instructions = 1;
   // The control partition's sequence they were read at.
   uint64 control_sequence = 2;
+  Watermark as_of = 3;
+  string next_cursor = 4;
 }
 
 message ListLocatesRequest {
   string account_id = 1;
-  Watermark after_watermark = 2;
+  // Only locates whose last change is above it (W4.3).
+  Watermark since = 2;
   int32 page_size = 3;
   string cursor = 4;
 }
 
 message ListLocatesReply {
   repeated Locate locates = 1;
-  Watermark watermark = 2;
+  Watermark as_of = 2;
   string next_cursor = 3;
 }
