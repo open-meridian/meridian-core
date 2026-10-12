@@ -596,3 +596,195 @@ async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_
         .unwrap();
     assert!(!allowed(&c), "withdrawn, or not among its users");
 }
+
+// ── The order path's rules the sidecar holds (contract v22) ─────────────────
+
+const REQUEST_ORDER_CHANGE: &str = "platform.book.command.request-order-change";
+const LIST_ORDERS: &str = "platform.book.query.list-orders";
+
+fn quantity_change() -> meridian_pb::plugin::v1::RequestOrderChangeParams {
+    meridian_pb::plugin::v1::RequestOrderChangeParams {
+        order_id: "ORD-1".into(),
+        change: Some(meridian_pb::plugin::v1::OrderChange {
+            kind: meridian_domain::v1::OrderChangeKind::Quantity as i32,
+            quantity: Some(Decimal {
+                high: 0,
+                low: 12,
+                scale: 0,
+            }),
+            ..Default::default()
+        }),
+        reason: "more".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn an_ems_changes_no_ordered_quantity_and_the_book_hears_nothing_of_it() {
+    let desk = plugin("desk-1", &["ems"], None).await;
+    let heard = Arc::clone(&desk.heard);
+    let keeping = Arc::clone(&heard);
+    desk.bus.serve(REQUEST_ORDER_CHANGE, move |envelope| {
+        keeping
+            .lock()
+            .unwrap()
+            .push((envelope.meta.clone().unwrap_or_default(), envelope.payload));
+        Ok((
+            "meridian.v1.OrderReply".into(),
+            OrderReply::default().encode_to_vec(),
+        ))
+    });
+    let refused = desk
+        .sidecar
+        .request_order_change(Request::new(quantity_change()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Aborted);
+    let refusal = meridian_pb::v1::Refusal::decode(
+        refused
+            .metadata()
+            .get_bin(crate::typed::REFUSAL_METADATA)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    assert_eq!(
+        refusal.reason,
+        meridian_pb::v1::RefusalReason::OrderState as i32
+    );
+    assert!(heard.lock().unwrap().is_empty());
+
+    // An oms's goes to the book, which reads whether it is an alignment.
+    let oms = plugin("oms-1", &["oms"], None).await;
+    let heard = Arc::clone(&oms.heard);
+    let keeping = Arc::clone(&heard);
+    oms.bus.serve(REQUEST_ORDER_CHANGE, move |envelope| {
+        keeping
+            .lock()
+            .unwrap()
+            .push((envelope.meta.clone().unwrap_or_default(), envelope.payload));
+        Ok((
+            "meridian.v1.OrderReply".into(),
+            OrderReply::default().encode_to_vec(),
+        ))
+    });
+    oms.sidecar
+        .request_order_change(Request::new(quantity_change()))
+        .await
+        .unwrap();
+    assert_eq!(heard.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_book_refusal_with_a_status_reaches_the_plugin_as_that_status_naming_its_fields() {
+    let desk = plugin("pm-1", &["portfolio"], None).await;
+    let scoped = plugin("oms-9", &["oms"], None).await;
+    // The plugins' book stand-ins answer before the ones `plugin` serves.
+    desk.bus.serve(PROPOSE_ORDER, |_| {
+        Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["quantity".into(), "cash_quantity".into()],
+            "an order states exactly one",
+        ))
+    });
+    scoped.bus.serve(RELEASE_ORDER, |_| {
+        Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::PermissionDenied,
+            &[],
+            "outside the write scope",
+        ))
+    });
+    let refused = desk
+        .sidecar
+        .propose_order(Request::new(ProposeOrderParams {
+            account_id: "ACC-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    let refusal = meridian_pb::v1::Refusal::decode(
+        refused
+            .metadata()
+            .get_bin(crate::typed::REFUSAL_METADATA)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    assert_eq!(refusal.fields, vec!["quantity", "cash_quantity"]);
+    assert_eq!(refusal.reason, 0);
+    let denied = scoped
+        .sidecar
+        .release_order(Request::new(ReleaseOrderParams {
+            order_id: "ORD-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn a_connectivity_plugin_reads_only_the_orders_behind_its_own_placements() {
+    let venue = plugin("fix-1", &["connectivity"], None).await;
+    let placement = |id: &str, instance: &str| meridian_domain::v1::Placement {
+        placement_id: id.into(),
+        connectivity_instance_id: instance.into(),
+        ..Default::default()
+    };
+    let reply = meridian_domain::v1::ListOrdersReply {
+        orders: vec![
+            meridian_domain::v1::Order {
+                order_id: "ORD-mine".into(),
+                placements: vec![
+                    placement("PLC-mine", "fix-1"),
+                    placement("PLC-theirs", "fix-2"),
+                ],
+                ..Default::default()
+            },
+            meridian_domain::v1::Order {
+                order_id: "ORD-theirs".into(),
+                placements: vec![placement("PLC-other", "fix-2")],
+                ..Default::default()
+            },
+        ],
+        placements: vec![
+            placement("PLC-mine", "fix-1"),
+            placement("PLC-other", "fix-2"),
+        ],
+        executions: vec![
+            meridian_domain::v1::Execution {
+                execution_id: "EXE-mine".into(),
+                placement_id: "PLC-mine".into(),
+                ..Default::default()
+            },
+            meridian_domain::v1::Execution {
+                execution_id: "EXE-theirs".into(),
+                placement_id: "PLC-other".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    venue.bus.serve(LIST_ORDERS, move |_| {
+        Ok(("meridian.v1.ListOrdersReply".into(), reply.encode_to_vec()))
+    });
+    let read = venue
+        .sidecar
+        .list_orders(Request::new(
+            meridian_pb::plugin::v1::ListOrdersParams::default(),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.orders.len(), 1);
+    assert_eq!(read.orders[0].order_id, "ORD-mine");
+    assert_eq!(read.orders[0].placements.len(), 1);
+    assert_eq!(read.placements.len(), 1);
+    assert_eq!(read.executions.len(), 1);
+    assert_eq!(read.executions[0].execution_id, "EXE-mine");
+}

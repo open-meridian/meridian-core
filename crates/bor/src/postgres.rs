@@ -30,10 +30,12 @@ use meridian_domain::v1::{
 use crate::book::{agreement_key, Book, Changes};
 use crate::journal::{Body, Entry};
 use crate::migrations;
+use crate::order_reads;
 use crate::reads;
 use crate::store::{
-    Acted, AttributesRead, BreaksRead, Decide, FiguresRead, Mark, Page, PositionsRead, Result,
-    Scope, Store, StoreError, FIRST_PARTITION,
+    first_partition_of, Acted, AttributesRead, BreaksRead, Decide, FiguresRead, HistoryRead,
+    InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead, Record,
+    Result, Scope, Store, StoreError,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -229,10 +231,10 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
             "INSERT INTO book_position
                     (account_id, instrument_id, side, partition, sequence, removed,
                      trade_date_quantity, settled_quantity, not_stated_quantity, effective_date,
-                     record)
+                     record, sleeve)
              VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8::text::numeric,
-                     $9::text::numeric, $10, $11)
-             ON CONFLICT (account_id, instrument_id, side) DO UPDATE
+                     $9::text::numeric, $10, $11, $12)
+             ON CONFLICT (account_id, instrument_id, side, sleeve) DO UPDATE
                 SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
                     removed = EXCLUDED.removed,
                     trade_date_quantity = EXCLUDED.trade_date_quantity,
@@ -251,17 +253,30 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
                 &numeric(&record.not_stated_quantity).unwrap_or_else(|| "0".into()),
                 &record.effective_date,
                 &record.encode_to_vec(),
+                &record.sleeve,
             ],
         )
         .map_err(unavailable)?;
         tx.execute(
-            "DELETE FROM book_lot WHERE account_id = $1 AND instrument_id = $2 AND side = $3",
-            &[&account_id, &record.instrument_id, &record.side],
+            "DELETE FROM book_lot
+              WHERE account_id = $1 AND instrument_id = $2 AND side = $3 AND sleeve = $4",
+            &[
+                &account_id,
+                &record.instrument_id,
+                &record.side,
+                &record.sleeve,
+            ],
         )
         .map_err(unavailable)?;
         tx.execute(
-            "DELETE FROM book_pending WHERE account_id = $1 AND instrument_id = $2 AND side = $3",
-            &[&account_id, &record.instrument_id, &record.side],
+            "DELETE FROM book_pending
+              WHERE account_id = $1 AND instrument_id = $2 AND side = $3 AND sleeve = $4",
+            &[
+                &account_id,
+                &record.instrument_id,
+                &record.side,
+                &record.sleeve,
+            ],
         )
         .map_err(unavailable)?;
         for (ordinal, lot) in record.lots.iter().enumerate() {
@@ -270,9 +285,9 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
             tx.execute(
                 "INSERT INTO book_lot
                         (account_id, instrument_id, side, lot_id, ordinal, open_quantity,
-                         original_quantity, cost, cost_currency, acquired_date, source)
+                         original_quantity, cost, cost_currency, acquired_date, source, sleeve)
                  VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7::text::numeric,
-                         $8::text::numeric, $9, $10, $11)",
+                         $8::text::numeric, $9, $10, $11, $12)",
                 &[
                     &account_id,
                     &record.instrument_id,
@@ -285,6 +300,7 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
                     &cost.map(|cost| cost.currency_code.clone()),
                     &terms.acquired_date,
                     &terms.source,
+                    &record.sleeve,
                 ],
             )
             .map_err(unavailable)?;
@@ -292,8 +308,8 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
         for pending in &record.pending {
             tx.execute(
                 "INSERT INTO book_pending
-                        (account_id, instrument_id, side, value_date, quantity, failing)
-                 VALUES ($1, $2, $3, $4, $5::text::numeric, $6)",
+                        (account_id, instrument_id, side, value_date, quantity, failing, sleeve)
+                 VALUES ($1, $2, $3, $4, $5::text::numeric, $6, $7)",
                 &[
                     &account_id,
                     &record.instrument_id,
@@ -301,6 +317,7 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
                     &pending.value_date,
                     &numeric(&pending.quantity).unwrap_or_else(|| "0".into()),
                     &pending.state.as_ref().is_some_and(|state| state.failing),
+                    &record.sleeve,
                 ],
             )
             .map_err(unavailable)?;
@@ -405,6 +422,216 @@ fn project(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Res
         )
         .map_err(unavailable)?;
     }
+    project_orders(tx, account_id, changes)?;
+    Ok(())
+}
+
+/// The order path's records an entry changed (W11.13, contract v22).
+fn project_orders(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes) -> Result<()> {
+    for (record, _) in &changes.orders {
+        let change = record.last_change.clone().unwrap_or_default();
+        let status = record.status.clone().unwrap_or_default();
+        let ordered = status
+            .quantities
+            .as_ref()
+            .and_then(|quantities| numeric(&quantities.ordered));
+        let expires_at = changes
+            .order_expiries
+            .get(&record.order_id)
+            .copied()
+            .flatten();
+        tx.execute(
+            "INSERT INTO book_order
+                    (account_id, order_id, partition, sequence, state, instrument_id, side,
+                     sleeve, ordered, parent_order_id, expires_at_ns, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::numeric, $10, $11, $12)
+             ON CONFLICT (account_id, order_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    state = EXCLUDED.state, ordered = EXCLUDED.ordered,
+                    expires_at_ns = EXCLUDED.expires_at_ns, record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.order_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &status.state,
+                &record.instrument_id,
+                &record.side,
+                &record.sleeve,
+                &ordered,
+                &record
+                    .link
+                    .as_ref()
+                    .map(|link| link.parent_order_id.clone())
+                    .unwrap_or_default(),
+                &expires_at,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for (record, _) in &changes.placements {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_placement
+                    (account_id, placement_id, order_id, connectivity_instance_id, partition,
+                     sequence, state, quantity, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::numeric, $9)
+             ON CONFLICT (account_id, placement_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    state = EXCLUDED.state, quantity = EXCLUDED.quantity,
+                    record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.placement_id,
+                &record.order_id,
+                &record.connectivity_instance_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record
+                    .status
+                    .as_ref()
+                    .map(|status| status.state)
+                    .unwrap_or_default(),
+                &numeric(&record.quantity),
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for record in &changes.executions {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_execution
+                    (account_id, execution_id, order_id, placement_id, partition, sequence,
+                     quantity, price, trade_date, supersedes, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8::text::numeric, $9, $10, $11)
+             ON CONFLICT (account_id, execution_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.execution_id,
+                &record.order_id,
+                &record.placement_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &numeric(&record.quantity),
+                &record
+                    .price
+                    .as_ref()
+                    .and_then(|price| numeric(&price.amount)),
+                &record.trade_date,
+                &record.supersedes,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for record in &changes.unplaced {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_unplaced
+                    (account_id, unplaced_id, partition, sequence, fact_kind, reason,
+                     instance_id, placed, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (account_id, unplaced_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    placed = EXCLUDED.placed, record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.unplaced_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record.fact_kind,
+                &record.reason,
+                &record
+                    .raw_record
+                    .as_ref()
+                    .map(|raw| raw.instance_id.clone())
+                    .unwrap_or_default(),
+                &record.placed_by.is_some(),
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for record in &changes.locates {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_locate
+                    (account_id, locate_record_id, partition, sequence, locate_id, record)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (account_id, locate_record_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    locate_id = EXCLUDED.locate_id, record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.locate_record_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record.locate_id,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for record in &changes.instructions {
+        let change = record.last_change.clone().unwrap_or_default();
+        let target = record.target.clone().unwrap_or_default();
+        let level = meridian_domain::v1::SetterLevel::try_from(record.setter_level)
+            .unwrap_or(meridian_domain::v1::SetterLevel::Unspecified);
+        tx.execute(
+            "INSERT INTO book_instruction
+                    (instruction_key, account_id, partition, sequence, value, setter_level, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (instruction_key) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    value = EXCLUDED.value, record = EXCLUDED.record",
+            &[
+                &crate::order_decide::instruction_key(&target, level),
+                &account_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record.value,
+                &record.setter_level,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for (change_request_id, order_id, placement_id) in &changes.change_requests {
+        tx.execute(
+            "INSERT INTO book_change_request (change_request_id, account_id, order_id, placement_id)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (change_request_id) DO NOTHING",
+            &[change_request_id, &account_id, order_id, placement_id],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+/// Each order an entry changed, with the entry: an order's history.
+fn project_order_entries(
+    tx: &mut Transaction<'_>,
+    account_id: &str,
+    entry_id: &str,
+    first_sequence: u64,
+    changes: &Changes,
+) -> Result<()> {
+    for (record, _) in &changes.orders {
+        tx.execute(
+            "INSERT INTO book_order_entry (account_id, order_id, entry_id, first_sequence)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (order_id, entry_id) DO NOTHING",
+            &[
+                &account_id,
+                &record.order_id,
+                &entry_id,
+                &(first_sequence as i64),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
     Ok(())
 }
 
@@ -421,6 +648,43 @@ fn all_changes(book: &Book) -> Result<Changes> {
     changes.breaks = book.breaks.values().cloned().collect();
     changes.figures = book.figures.values().cloned().collect();
     changes.attributes = book.attributes.clone();
+    let ledger = &book.ledger;
+    for (id, held) in &ledger.orders {
+        changes
+            .orders
+            .push((ledger.order_record(id, true)?, Vec::new()));
+        changes.order_expiries.insert(
+            id.clone(),
+            crate::orders::expires_at(held)
+                .filter(|_| held.ending.is_none() && held.ended.is_none()),
+        );
+    }
+    for id in ledger.placements.keys() {
+        changes
+            .placements
+            .push((ledger.placement_record(id)?, Vec::new()));
+    }
+    changes.executions = ledger
+        .executions
+        .values()
+        .map(|held| held.execution.clone())
+        .collect();
+    changes.unplaced = ledger.unplaced.values().cloned().collect();
+    for id in ledger.locates.keys() {
+        changes.locates.push(ledger.locate_record(id)?);
+    }
+    changes.instructions = ledger.instructions.values().cloned().collect();
+    changes.change_requests = ledger
+        .changes
+        .values()
+        .map(|request| {
+            (
+                request.change_request_id.clone(),
+                request.order_id.clone(),
+                request.placement_id.clone(),
+            )
+        })
+        .collect();
     Ok(changes)
 }
 
@@ -477,7 +741,7 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?
             .map(|row| row.get(0))
-            .unwrap_or_else(|| FIRST_PARTITION.to_string());
+            .unwrap_or_else(|| first_partition_of(account_id).to_string());
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)",
             &[&partition_lock(&partition)],
@@ -564,6 +828,13 @@ impl Store for PostgresStore {
         )
         .map_err(unavailable)?;
         project(&mut tx, account_id, &decided.changes)?;
+        project_order_entries(
+            &mut tx,
+            account_id,
+            &entry.entry_id,
+            entry.first_sequence,
+            &decided.changes,
+        )?;
         tx.commit().map_err(unavailable)?;
         Ok(Acted::Committed(Box::new(decided)))
     }
@@ -576,7 +847,8 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT account_id FROM book_account ORDER BY account_id COLLATE \"C\"",
+                "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
+                  ORDER BY account_id COLLATE \"C\"",
                 &[],
             )
             .map_err(unavailable)?
@@ -627,7 +899,7 @@ impl Store for PostgresStore {
             return reads::positions_as_of(self, read);
         }
         let after = if read.cursor.is_empty() {
-            (String::new(), String::new(), -1)
+            (String::new(), String::new(), -1, String::new())
         } else {
             reads::from_position_cursor(&read.cursor)?
         };
@@ -645,10 +917,12 @@ impl Store for PostgresStore {
                           WHERE ($1::text[] IS NULL OR account_id = ANY($1))
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
-                            AND (account_id COLLATE \"C\", instrument_id COLLATE \"C\", side)
-                                > ($5 COLLATE \"C\", $6 COLLATE \"C\", $7)
-                          ORDER BY account_id COLLATE \"C\", instrument_id COLLATE \"C\", side
-                          LIMIT $8"
+                            AND (account_id COLLATE \"C\", instrument_id COLLATE \"C\", side,
+                                 sleeve COLLATE \"C\")
+                                > ($5 COLLATE \"C\", $6 COLLATE \"C\", $7, $8 COLLATE \"C\")
+                          ORDER BY account_id COLLATE \"C\", instrument_id COLLATE \"C\", side,
+                                   sleeve COLLATE \"C\"
+                          LIMIT $9"
                     ),
                     &[
                         &scope_param(&read.scope),
@@ -658,6 +932,7 @@ impl Store for PostgresStore {
                         &after.0,
                         &after.1,
                         &after.2,
+                        &after.3,
                         &(read.limit as i64 + 1),
                     ],
                 )
@@ -853,7 +1128,10 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         tx.batch_execute(
             "DELETE FROM book_position; DELETE FROM book_lot; DELETE FROM book_pending;
-             DELETE FROM book_break; DELETE FROM book_figures; DELETE FROM book_attributes;",
+             DELETE FROM book_break; DELETE FROM book_figures; DELETE FROM book_attributes;
+             DELETE FROM book_order; DELETE FROM book_placement; DELETE FROM book_execution;
+             DELETE FROM book_unplaced; DELETE FROM book_locate; DELETE FROM book_instruction;
+             DELETE FROM book_change_request; DELETE FROM book_order_entry;",
         )
         .map_err(unavailable)?;
         let accounts: Vec<(String, String)> = tx
@@ -868,6 +1146,20 @@ impl Store for PostgresStore {
             replayed += entries.len();
             let book = Book::replay(&account, &partition, &entries)?;
             project(&mut tx, &account, &all_changes(&book)?)?;
+            // Each order's history, entry by entry, as the journal holds it.
+            for (order_id, entry_ids) in &book.ledger.order_entries {
+                for entry in entries
+                    .iter()
+                    .filter(|entry| entry_ids.contains(&entry.entry_id))
+                {
+                    tx.execute(
+                        "INSERT INTO book_order_entry (account_id, order_id, entry_id, first_sequence)
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (order_id, entry_id) DO NOTHING",
+                        &[&account, order_id, &entry.entry_id, &(entry.first_sequence as i64)],
+                    )
+                    .map_err(unavailable)?;
+                }
+            }
         }
         // The heads stand where the journal ends: a head behind its journal
         // would number a change twice.
@@ -891,6 +1183,215 @@ impl Store for PostgresStore {
         }
         tx.commit().map_err(unavailable)?;
         Ok(replayed)
+    }
+
+    fn owner(&self, record: Record, id: &str) -> Result<Option<String>> {
+        let query = match record {
+            Record::Order => "SELECT account_id FROM book_order WHERE order_id = $1",
+            Record::Placement => "SELECT account_id FROM book_placement WHERE placement_id = $1",
+            Record::ChangeRequest => {
+                "SELECT account_id FROM book_change_request WHERE change_request_id = $1"
+            }
+            Record::Locate => "SELECT account_id FROM book_locate WHERE locate_record_id = $1",
+        };
+        Ok(self
+            .conn()?
+            .query_opt(query, &[&id])
+            .map_err(unavailable)?
+            .map(|row| row.get(0)))
+    }
+
+    fn orders(&self, read: &OrdersRead) -> Result<OrdersPage> {
+        read.scope.admit(&read.account_id)?;
+        let after = if read.cursor.is_empty() {
+            (0usize, String::new(), String::new())
+        } else {
+            order_reads::from_stream_cursor(&read.cursor)?
+        };
+        let (partitions, sequences) = mark_params(&read.since.clone().unwrap_or_default());
+        let filter = if read.since.is_some() {
+            ABOVE
+        } else {
+            UNUSED_MARK
+        };
+        let tables = [
+            ("book_order", "order_id"),
+            ("book_placement", "placement_id"),
+            ("book_execution", "execution_id"),
+            ("book_unplaced", "unplaced_id"),
+        ];
+        let scope = scope_param(&read.scope);
+        self.reading(|tx| {
+            let mut items = Vec::new();
+            for (kind, (table, id)) in tables.iter().enumerate() {
+                if kind < after.0 {
+                    continue;
+                }
+                let (from_account, from_id) = if kind == after.0 && !read.cursor.is_empty() {
+                    (after.1.clone(), after.2.clone())
+                } else {
+                    (String::new(), String::new())
+                };
+                let rows = tx
+                    .query(
+                        &format!(
+                            "SELECT account_id, {id}, record FROM {table}
+                              WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                                AND ($2 = '' OR account_id = $2)
+                                AND {filter}
+                                AND (account_id COLLATE \"C\", {id} COLLATE \"C\")
+                                    > ($5 COLLATE \"C\", $6 COLLATE \"C\")
+                              ORDER BY account_id COLLATE \"C\", {id} COLLATE \"C\"
+                              LIMIT $7"
+                        ),
+                        &[
+                            &scope,
+                            &read.account_id,
+                            &partitions,
+                            &sequences,
+                            &from_account,
+                            &from_id,
+                            &(read.limit as i64 + 1),
+                        ],
+                    )
+                    .map_err(unavailable)?;
+                for row in rows {
+                    let account: String = row.get(0);
+                    let record_id: String = row.get(1);
+                    let bytes: Vec<u8> = row.get(2);
+                    let item = match kind {
+                        0 => order_reads::Item::Order(Box::new(
+                            meridian_domain::v1::Order::decode(bytes.as_slice())
+                                .map_err(unreadable)?,
+                        )),
+                        1 => order_reads::Item::Placement(
+                            meridian_domain::v1::Placement::decode(bytes.as_slice())
+                                .map_err(unreadable)?,
+                        ),
+                        2 => order_reads::Item::Execution(
+                            meridian_domain::v1::Execution::decode(bytes.as_slice())
+                                .map_err(unreadable)?,
+                        ),
+                        _ => order_reads::Item::Unplaced(
+                            meridian_domain::v1::UnplacedFact::decode(bytes.as_slice())
+                                .map_err(unreadable)?,
+                        ),
+                    };
+                    items.push(((kind, account, record_id), item));
+                }
+                if items.len() > read.limit {
+                    break;
+                }
+            }
+            let mut unpaged = read.clone();
+            unpaged.cursor = String::new();
+            order_reads::orders_page(items, &unpaged, heads_of(tx)?)
+        })
+    }
+
+    fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>> {
+        read.scope.admit(&read.account_id)?;
+        let scope = scope_param(&read.scope);
+        let entries = self.reading(|tx| {
+            tx.query(
+                "SELECT e.meta FROM book_order_entry o JOIN book_entry e USING (entry_id)
+                  WHERE o.order_id = $1
+                    AND ($2::text[] IS NULL OR o.account_id = ANY($2))
+                    AND ($3 = '' OR o.account_id = $3)
+                  ORDER BY e.first_sequence",
+                &[&read.order_id, &scope, &read.account_id],
+            )
+            .map_err(unavailable)
+        })?;
+        order_reads::history_page(decoded(entries, 0)?, read)
+    }
+
+    fn locates(&self, read: &LocatesRead) -> Result<Page<meridian_domain::v1::Locate>> {
+        read.scope.admit(&read.account_id)?;
+        let (partitions, sequences) = mark_params(&read.since.clone().unwrap_or_default());
+        let filter = if read.since.is_some() {
+            ABOVE
+        } else {
+            UNUSED_MARK
+        };
+        let scope = scope_param(&read.scope);
+        self.reading(|tx| {
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT account_id, locate_record_id, record FROM book_locate
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                            AND ($2 = '' OR account_id = $2)
+                            AND account_id NOT LIKE '~%'
+                            AND {filter}"
+                    ),
+                    &[&scope, &read.account_id, &partitions, &sequences],
+                )
+                .map_err(unavailable)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let account: String = row.get(0);
+                let id: String = row.get(1);
+                let bytes: Vec<u8> = row.get(2);
+                records.push((
+                    format!("{account}\u{1f}{id}"),
+                    meridian_domain::v1::Locate::decode(bytes.as_slice()).map_err(unreadable)?,
+                ));
+            }
+            order_reads::keyed_page(records, &read.cursor, read.limit, heads_of(tx)?)
+        })
+    }
+
+    fn instructions(
+        &self,
+        read: &InstructionsRead,
+    ) -> Result<Page<meridian_domain::v1::TradingInstruction>> {
+        let (partitions, sequences) = mark_params(&read.since.clone().unwrap_or_default());
+        let filter = if read.since.is_some() {
+            ABOVE.replace("$3", "$1").replace("$4", "$2")
+        } else {
+            "$1::text[] IS NOT NULL AND $2::bigint[] IS NOT NULL".to_string()
+        };
+        self.reading(|tx| {
+            let rows = tx
+                .query(
+                    &format!("SELECT instruction_key, record FROM book_instruction WHERE {filter}"),
+                    &[&partitions, &sequences],
+                )
+                .map_err(unavailable)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let key: String = row.get(0);
+                let bytes: Vec<u8> = row.get(1);
+                records.push((
+                    key,
+                    meridian_domain::v1::TradingInstruction::decode(bytes.as_slice())
+                        .map_err(unreadable)?,
+                ));
+            }
+            order_reads::keyed_page(records, &read.cursor, read.limit, heads_of(tx)?)
+        })
+    }
+
+    fn expiring(&self, now_ns: i64) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id, order_id FROM book_order
+                  WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 AND state = ANY($2)
+                  ORDER BY expires_at_ns, order_id",
+                &[
+                    &now_ns,
+                    &vec![
+                        meridian_domain::v1::OrderState::Released as i32,
+                        meridian_domain::v1::OrderState::Working as i32,
+                    ],
+                ],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {

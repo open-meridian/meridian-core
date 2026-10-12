@@ -83,6 +83,12 @@ pub struct Context {
     pub reference_unavailable: bool,
     /// The control partition's sequence in force (decisions/024's note).
     pub control_sequence: u64,
+    /// The write scope stamped on a command naming its record by ID alone
+    /// (contract v22, W4.9): the accounts it may write, marked as applying;
+    /// `None` where none was stamped.
+    pub account_scope: Option<BTreeSet<String>>,
+    /// The sidecar's verdict on a placement's connectivity plugin (W11.8).
+    pub connectivity_allowed: bool,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
@@ -96,7 +102,7 @@ pub struct RecordSays {
 }
 
 impl Context {
-    fn actor(&self) -> Actor {
+    pub(crate) fn actor(&self) -> Actor {
         Actor {
             kind: Some(if self.acting_for.is_empty() {
                 actor::Kind::System(SystemActor {
@@ -129,7 +135,7 @@ impl Context {
     /// Refused to be tried again when the instrument store did not answer:
     /// a command the book cannot check is never admitted unchecked (contract
     /// v10; the completion spec's Q7).
-    fn references_answered(&self) -> Result<()> {
+    pub(crate) fn references_answered(&self) -> Result<()> {
         if self.reference_unavailable {
             return Err(StoreError::refused(
                 RefusalReason::ReferenceUnavailable,
@@ -143,7 +149,7 @@ impl Context {
 
     /// Each instrument field the book requires that `instrument`'s record
     /// lacks, by its path under `field` (W9.1, contract v10).
-    fn instrument_missing(&self, field: &str, instrument: &str) -> Vec<String> {
+    pub(crate) fn instrument_missing(&self, field: &str, instrument: &str) -> Vec<String> {
         let says = self.records.get(instrument).copied().unwrap_or_default();
         let mut missing = Vec::new();
         if !says.asset_class {
@@ -155,7 +161,7 @@ impl Context {
         missing
     }
 
-    fn cause(&self) -> ChangeCause {
+    pub(crate) fn cause(&self) -> ChangeCause {
         ChangeCause {
             instance_id: self.instance_id.clone(),
             acting_for_subject: self.acting_for.clone(),
@@ -165,17 +171,17 @@ impl Context {
         }
     }
 
-    fn mint(&self, prefix: &str) -> String {
+    pub(crate) fn mint(&self, prefix: &str) -> String {
         ids::mint(prefix, self.received_at_ns)
     }
 
-    fn today(&self) -> String {
+    pub(crate) fn today(&self) -> String {
         dates::date_of(self.received_at_ns)
     }
 
     /// A justified act: a user -- a person, or from contract v21 a service
     /// account -- and a reason.
-    fn justified(&self, reason: &str, what: &str) -> Result<()> {
+    pub(crate) fn justified(&self, reason: &str, what: &str) -> Result<()> {
         if self.acting_for.is_empty() {
             return Err(StoreError::refused(
                 RefusalReason::ActorRequired,
@@ -201,29 +207,37 @@ pub struct Made {
     pub entry: Entry,
     pub book: Book,
     pub changes: Changes,
+    /// A refusal the book records (contract v22: a placement at a
+    /// connectivity plugin the caller may not route through, W11.8): the
+    /// entry commits and the command is answered with this.
+    pub refusal: Option<String>,
 }
 
 /// The parts of an entry an act chooses.
-struct Draft {
-    entry_id: String,
-    kind: &'static str,
-    effective_date: String,
-    reason: String,
-    break_ids: Vec<String>,
-    idempotency_key: String,
-    actor: Actor,
-    body: Body,
+pub(crate) struct Draft {
+    pub(crate) entry_id: String,
+    pub(crate) kind: &'static str,
+    pub(crate) effective_date: String,
+    pub(crate) reason: String,
+    pub(crate) break_ids: Vec<String>,
+    pub(crate) idempotency_key: String,
+    pub(crate) actor: Actor,
+    pub(crate) body: Body,
 }
 
 /// Number and replay a draft onto a copy of the account, and check what must
 /// hold after it.
-fn made(book: &Book, head: u64, ctx: &Context, draft: Draft) -> Result<Made> {
+pub(crate) fn made(book: &Book, head: u64, ctx: &Context, draft: Draft) -> Result<Made> {
     let named: BTreeSet<&str> = draft
         .body
         .lines
         .iter()
         .map(|line| line.instrument_id.as_str())
         .chain(draft.body.breaks.iter().filter_map(break_instrument))
+        .chain(draft.body.acts.iter().filter_map(|act| match act {
+            crate::orders::Act::Opened { order, .. } => Some(order.instrument_id.as_str()),
+            _ => None,
+        }))
         .collect();
     let meta = EntryMeta {
         entry_id: draft.entry_id,
@@ -266,6 +280,7 @@ fn made(book: &Book, head: u64, ctx: &Context, draft: Draft) -> Result<Made> {
         entry,
         book: after,
         changes,
+        refusal: None,
     })
 }
 
@@ -314,6 +329,25 @@ fn opening_required(book: &Book) -> Result<(String, String)> {
             ),
         )
     })
+}
+
+/// The account's attributes as they stand, or a new account's: from
+/// contract v22 a new account waits for compliance (W9.13, W11.6; step 5's
+/// Q5), recorded so in its first entry (decisions/031).
+pub fn attributes_of(book: &Book) -> AccountAttributes {
+    book.attributes
+        .clone()
+        .unwrap_or_else(|| AccountAttributes {
+            account_id: book.account_id.clone(),
+            waits_for_compliance: true,
+            ..Default::default()
+        })
+}
+
+/// Whether an entry setting `attributes` states waits_for_compliance: an
+/// account's first attributes do, as an explicit set does.
+pub fn first_attributes(book: &Book) -> bool {
+    book.attributes.is_none()
 }
 
 // ── W9.1: the opening balance ───────────────────────────────────────────────
@@ -378,7 +412,7 @@ pub fn opening_balance(
             return Err(StoreError::Invalid(format!("{field} names no instrument")));
         }
         let held = side(&format!("{field}.side"), position.side)?;
-        if !seen.insert((position.instrument_id.clone(), position.side)) {
+        if !seen.insert((position.instrument_id.clone(), position.side, String::new())) {
             return Err(StoreError::Invalid(format!(
                 "{field} names {} {} twice",
                 side_named(position.side),
@@ -397,13 +431,7 @@ pub fn opening_balance(
         journal: None,
         reason: request.reason.clone(),
     };
-    let mut attributes = book
-        .attributes
-        .clone()
-        .unwrap_or_else(|| AccountAttributes {
-            account_id: book.account_id.clone(),
-            ..Default::default()
-        });
+    let mut attributes = attributes_of(book);
     attributes.opening_balance = Some(opening.clone());
     let draft = Draft {
         entry_id,
@@ -414,6 +442,7 @@ pub fn opening_balance(
         idempotency_key: request.idempotency_key.clone(),
         actor: ctx.actor(),
         body: Body {
+            states_waits: first_attributes(book),
             lines,
             sources: request.sources.clone(),
             opening: Some(opening),
@@ -827,6 +856,49 @@ fn check_cause(field: &str, cause: &meridian_domain::v1::BreakCause) -> Result<(
     if let Some(break_cause::Item::PendingSettlement(pending)) = &cause.item {
         side(&format!("{field}.pending_settlement.side"), pending.side)?;
     }
+    // A value date that is not a business day (W9.4, contract v22; the
+    // calendars spec's requirement 14): its own category, linked to the date
+    // read's check -- the date, the calendars with their versions, and why
+    // the day is closed -- and the check beside no other category.
+    let names_check = matches!(cause.item, Some(break_cause::Item::DateCheck(_)));
+    let not_business_day = cause.category == BreakCauseCategory::ValueDateNotBusinessDay as i32;
+    if not_business_day && !names_check {
+        return Err(StoreError::Invalid(format!(
+            "{field} says a value date is not a business day and names no date_check; the \
+             cause links the date read's check"
+        )));
+    }
+    if let Some(break_cause::Item::DateCheck(check)) = &cause.item {
+        if !not_business_day {
+            return Err(StoreError::Invalid(format!(
+                "{field}.date_check is the cause of a value date that is not a business day; \
+                 its category is BREAK_CAUSE_CATEGORY_VALUE_DATE_NOT_BUSINESS_DAY"
+            )));
+        }
+        date(&format!("{field}.date_check.date"), &check.date)?;
+        if check.calendars.is_empty() {
+            return Err(StoreError::Invalid(format!(
+                "{field}.date_check names no calendar; a date is checked on its calendars, \
+                 each with its version"
+            )));
+        }
+        for (index, calendar) in check.calendars.iter().enumerate() {
+            if calendar.calendar_id.is_empty() || calendar.version <= 0 {
+                return Err(StoreError::Invalid(format!(
+                    "{field}.date_check.calendars[{index}] names a calendar by its ID and \
+                     version"
+                )));
+            }
+        }
+        if check.reason == meridian_domain::v1::DateCheckReason::Unspecified as i32
+            || meridian_domain::v1::DateCheckReason::try_from(check.reason).is_err()
+        {
+            return Err(StoreError::Invalid(format!(
+                "{field}.date_check.reason says why the day is closed: a weekend, a holiday or \
+                 outside coverage"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -992,7 +1064,7 @@ pub fn encumbrances(
     let mut seen = BTreeSet::new();
     let mut recorded = Vec::new();
     for (index, named) in request.positions.iter().enumerate() {
-        let key: Key = (named.instrument_id.clone(), named.side);
+        let key: Key = (named.instrument_id.clone(), named.side, String::new());
         if !seen.insert(key.clone()) {
             return Err(StoreError::Invalid(format!(
                 "positions[{index}] names {} again; a position's encumbrances are one set",
@@ -1399,7 +1471,7 @@ fn adjustment_body(
             }
             made.lot_id = ctx.mint(ids::LOT);
         } else if !line.lot_id.is_empty() {
-            let key = (line.instrument_id.clone(), line.side);
+            let key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
             let holds = book
                 .positions
                 .get(&key)
@@ -1496,6 +1568,15 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             reversed.kind
         )));
     }
+    // A fill's or a charge's entry is the order path's: it is corrected by
+    // a superseding execution, so positions and fills never disagree (W11).
+    if !reversed.body.acts.is_empty() {
+        return Err(StoreError::Invalid(format!(
+            "entry {entry_id} is the order path's {}; it is corrected by a superseding \
+             execution, never reversed",
+            reversed.kind
+        )));
+    }
     let opening = book
         .opening
         .as_ref()
@@ -1573,13 +1654,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
         ..Default::default()
     };
     if opening {
-        let mut attributes = book
-            .attributes
-            .clone()
-            .unwrap_or_else(|| AccountAttributes {
-                account_id: book.account_id.clone(),
-                ..Default::default()
-            });
+        let mut attributes = attributes_of(book);
         attributes.opening_balance = None;
         body.attributes = Some(attributes);
     }
@@ -1595,13 +1670,12 @@ pub fn set_attribute(
     request: &SetAccountAttributeRequest,
 ) -> Result<Made> {
     ctx.justified(&request.reason, "setting an account's attribute")?;
-    let mut attributes = book
-        .attributes
-        .clone()
-        .unwrap_or_else(|| AccountAttributes {
-            account_id: book.account_id.clone(),
-            ..Default::default()
-        });
+    let states_waits = first_attributes(book)
+        || matches!(
+            request.attribute,
+            Some(set_account_attribute_request::Attribute::WaitsForCompliance(_))
+        );
+    let mut attributes = attributes_of(book);
     match request.attribute.clone() {
         Some(set_account_attribute_request::Attribute::BaseCurrencyCode(code)) => {
             if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
@@ -1643,6 +1717,7 @@ pub fn set_attribute(
             actor: ctx.actor(),
             body: Body {
                 attributes: Some(attributes),
+                states_waits,
                 ..Default::default()
             },
         },
@@ -1673,11 +1748,15 @@ pub fn follow_replacement(
     let mut lines = Vec::new();
     let mut tombstones = Vec::new();
     let mut encumbrances = Vec::new();
-    for ((instrument_id, side), position) in &book.positions {
+    for ((instrument_id, side, sleeve), position) in &book.positions {
         if instrument_id != placeholder || position.removed {
             continue;
         }
-        tombstones.push((instrument_id.clone(), *side));
+        // A tombstone marks the account's unsleeved position; a sleeve's is
+        // left flat under the placeholder (contract v22).
+        if sleeve.is_empty() {
+            tombstones.push((instrument_id.clone(), *side));
+        }
         // Its encumbrances, as recorded, follow it onto the instrument.
         if !position.encumbrances.is_empty() {
             encumbrances.push((instrument.to_string(), *side, position.encumbrances.clone()));
@@ -1722,6 +1801,7 @@ pub fn follow_replacement(
                 value_date: bucket.1.clone(),
                 quantity: numbers::wire(quantity),
                 pending_state: bucket.2.clone(),
+                sleeve: sleeve.clone(),
                 ..Default::default()
             }
         };

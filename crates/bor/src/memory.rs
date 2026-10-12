@@ -9,10 +9,12 @@ use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break
 
 use crate::book::Book;
 use crate::journal::Entry;
+use crate::order_reads;
 use crate::reads::{self, above, position_key};
 use crate::store::{
-    Acted, AttributesRead, BreaksRead, Decide, FiguresRead, Mark, Page, PositionsRead, Result,
-    Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
+    first_partition_of, is_account, Acted, AttributesRead, BreaksRead, Decide, FiguresRead,
+    HistoryRead, InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead,
+    Record, Result, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
 #[derive(Default)]
@@ -85,7 +87,7 @@ impl Store for MemoryStore {
             .books
             .get(account_id)
             .cloned()
-            .unwrap_or_else(|| Book::new(account_id, FIRST_PARTITION));
+            .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id)));
         let head = state.heads.get(&book.partition).copied().unwrap_or(0);
         let decided = decide(&book, head)?;
         let entry = decided.entry.clone();
@@ -130,7 +132,13 @@ impl Store for MemoryStore {
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
-        Ok(self.state().journals.keys().cloned().collect())
+        Ok(self
+            .state()
+            .journals
+            .keys()
+            .filter(|key| is_account(key))
+            .cloned()
+            .collect())
     }
 
     fn heads(&self) -> Result<Mark> {
@@ -145,7 +153,7 @@ impl Store for MemoryStore {
             .filter(|(_, book)| {
                 book.positions
                     .iter()
-                    .any(|((held, _), position)| held == instrument_id && !position.removed)
+                    .any(|((held, _, _), position)| held == instrument_id && !position.removed)
                     || book
                         .breaks
                         .values()
@@ -159,7 +167,7 @@ impl Store for MemoryStore {
         let state = self.state();
         let mut found = std::collections::BTreeSet::new();
         for book in state.books.values() {
-            for ((instrument, _), position) in &book.positions {
+            for ((instrument, _, _), position) in &book.positions {
                 if !position.removed {
                     found.insert(instrument.clone());
                 }
@@ -325,7 +333,7 @@ impl Store for MemoryStore {
             let partition = entries
                 .first()
                 .map(|entry| entry.partition.clone())
-                .unwrap_or_else(|| FIRST_PARTITION.to_string());
+                .unwrap_or_else(|| first_partition_of(account).to_string());
             books.insert(account.clone(), Book::replay(account, &partition, entries)?);
             replayed += entries.len();
         }
@@ -343,6 +351,94 @@ impl Store for MemoryStore {
             .entry(resolution.code.clone())
             .or_insert_with(|| resolution.clone());
         Ok(())
+    }
+
+    fn owner(&self, record: Record, id: &str) -> Result<Option<String>> {
+        let state = self.state();
+        Ok(state
+            .books
+            .iter()
+            .find(|(_, book)| match record {
+                Record::Order => book.ledger.orders.contains_key(id),
+                Record::Placement => book.ledger.placements.contains_key(id),
+                Record::ChangeRequest => book.ledger.changes.contains_key(id),
+                Record::Locate => book.ledger.locates.contains_key(id),
+            })
+            .map(|(account, _)| account.clone()))
+    }
+
+    fn orders(&self, read: &OrdersRead) -> Result<OrdersPage> {
+        read.scope.admit(&read.account_id)?;
+        let state = self.state();
+        let mut items = Vec::new();
+        for (key, book) in &state.books {
+            if order_reads::book_answers(&read.scope, &read.account_id, key) {
+                items.extend(order_reads::items_of(key, book, &read.since)?);
+            }
+        }
+        order_reads::orders_page(items, read, state.heads.clone())
+    }
+
+    fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>> {
+        read.scope.admit(&read.account_id)?;
+        let state = self.state();
+        let Some((key, book)) = state.books.iter().find(|(key, book)| {
+            book.ledger.orders.contains_key(&read.order_id)
+                && order_reads::book_answers(&read.scope, &read.account_id, key)
+        }) else {
+            return order_reads::history_page(Vec::new(), read);
+        };
+        let ids = book
+            .ledger
+            .order_entries
+            .get(&read.order_id)
+            .cloned()
+            .unwrap_or_default();
+        let entries = state
+            .journals
+            .get(key)
+            .map(|journal| {
+                journal
+                    .iter()
+                    .filter(|entry| ids.contains(&entry.entry_id))
+                    .map(|entry| entry.meta.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        order_reads::history_page(entries, read)
+    }
+
+    fn locates(&self, read: &LocatesRead) -> Result<Page<meridian_domain::v1::Locate>> {
+        read.scope.admit(&read.account_id)?;
+        let state = self.state();
+        let mut records = Vec::new();
+        for (key, book) in &state.books {
+            for locate in order_reads::locates_of(key, book, read)? {
+                records.push((format!("{key}\u{1f}{}", locate.locate_record_id), locate));
+            }
+        }
+        order_reads::keyed_page(records, &read.cursor, read.limit, state.heads.clone())
+    }
+
+    fn instructions(
+        &self,
+        read: &InstructionsRead,
+    ) -> Result<Page<meridian_domain::v1::TradingInstruction>> {
+        let state = self.state();
+        let mut records = Vec::new();
+        for book in state.books.values() {
+            records.extend(order_reads::instructions_of(book, read));
+        }
+        order_reads::keyed_page(records, &read.cursor, read.limit, state.heads.clone())
+    }
+
+    fn expiring(&self, now_ns: i64) -> Result<Vec<(String, String)>> {
+        let state = self.state();
+        let mut out = Vec::new();
+        for (key, book) in &state.books {
+            out.extend(order_reads::expiring_of(key, book, now_ns)?);
+        }
+        Ok(out)
     }
 
     fn currency_codes(&self) -> Result<Vec<String>> {

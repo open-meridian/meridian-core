@@ -14,6 +14,17 @@
 --   break|<account>|<subject>|<category>|<state>|<first seen>|<last seen>|<recorded by>|<confirmed cause>|<resolved by>
 --   figures|<account>|<external account>/<segment>|<business date>
 --   entry|<account>|<kind>|<effective date>|<actor>
+--   order|<account>|<instrument>|<sleeve>|<side>|<ordered>|<state>|<parent's instrument, for a child>
+--   placement|<account>|<instrument>|<connectivity instance>|<quantity>|<state>
+--   execution|<account>|<instrument>|<sleeve>|<quantity>|<price>|<trade date>|<superseding or empty>
+--   unplaced|<account, empty for none>|<fact kind>|<reason>|<instance>|<placed>
+--   instruction|<partition>|<value>|<setter level>
+--
+-- From contract v22 (W11) the order path's records print too: a sleeve is
+-- empty for the account's unsleeved part; <side>, <state>, <reason>,
+-- <value> and <setter level> are the enum's number; a child order names its
+-- parent's instrument, `top` where it has none. Nothing prints for a
+-- deployment holding no orders, so the lines before v22 are unchanged.
 --
 -- <account> is the account's name. <instrument> is its INS- ID, or for a
 -- record the deployment minted its identifiers in force, sorted, as
@@ -123,6 +134,59 @@ lines AS (
            || '|' || e.actor
       FROM book_entry e
       LEFT JOIN named n USING (account_id)
+    UNION ALL
+    SELECT 8, coalesce(n.name, o.account_id), coalesce(i.instrument, o.instrument_id),
+           'order|' || coalesce(n.name, o.account_id)
+           || '|' || coalesce(i.instrument, o.instrument_id)
+           || '|' || o.sleeve
+           || '|' || o.side::text
+           || '|' || coalesce(o.ordered::text, '')
+           || '|' || o.state::text
+           || '|' || CASE WHEN o.parent_order_id = '' THEN 'top'
+                          ELSE coalesce(pi.instrument, po.instrument_id, '') END
+      FROM book_order o
+      LEFT JOIN named n USING (account_id)
+      LEFT JOIN shown i USING (instrument_id)
+      LEFT JOIN book_order po ON po.order_id = o.parent_order_id
+      LEFT JOIN shown pi ON pi.instrument_id = po.instrument_id
+    UNION ALL
+    SELECT 9, coalesce(n.name, p.account_id), coalesce(i.instrument, o.instrument_id),
+           'placement|' || coalesce(n.name, p.account_id)
+           || '|' || coalesce(i.instrument, o.instrument_id, '')
+           || '|' || p.connectivity_instance_id
+           || '|' || coalesce(p.quantity::text, '')
+           || '|' || p.state::text
+      FROM book_placement p
+      LEFT JOIN book_order o USING (order_id)
+      LEFT JOIN named n ON n.account_id = p.account_id
+      LEFT JOIN shown i ON i.instrument_id = o.instrument_id
+    UNION ALL
+    SELECT 10, coalesce(n.name, x.account_id), coalesce(i.instrument, o.instrument_id),
+           'execution|' || coalesce(n.name, x.account_id)
+           || '|' || coalesce(i.instrument, o.instrument_id, '')
+           || '|' || coalesce(o.sleeve, '')
+           || '|' || coalesce(x.quantity::text, '')
+           || '|' || coalesce(x.price::text, '')
+           || '|' || x.trade_date
+           || '|' || CASE WHEN x.supersedes = '' THEN '' ELSE 'superseding' END
+      FROM book_execution x
+      LEFT JOIN book_order o USING (order_id)
+      LEFT JOIN named n ON n.account_id = x.account_id
+      LEFT JOIN shown i ON i.instrument_id = o.instrument_id
+    UNION ALL
+    SELECT 11, CASE WHEN u.account_id LIKE '~%' THEN '' ELSE coalesce(n.name, u.account_id) END,
+           u.fact_kind,
+           'unplaced|' || CASE WHEN u.account_id LIKE '~%' THEN '' ELSE coalesce(n.name, u.account_id) END
+           || '|' || u.fact_kind
+           || '|' || u.reason::text
+           || '|' || u.instance_id
+           || '|' || u.placed::text
+      FROM book_unplaced u
+      LEFT JOIN named n USING (account_id)
+    UNION ALL
+    SELECT 12, '', t.partition,
+           'instruction|' || t.partition || '|' || t.value::text || '|' || t.setter_level::text
+      FROM book_instruction t
 )
 SELECT line FROM lines
  ORDER BY part, account COLLATE "C", at COLLATE "C", line COLLATE "C";

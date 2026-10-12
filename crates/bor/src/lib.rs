@@ -51,13 +51,21 @@ pub mod ids;
 pub mod journal;
 pub mod migrations;
 pub mod numbers;
+pub mod order_decide;
+pub mod order_reads;
+pub mod order_service;
+pub mod orders;
 pub mod postgres;
 pub mod reads;
 pub mod service;
 pub mod store;
+#[rustfmt::skip]
+pub mod transitions;
 
 mod memory;
 
+#[cfg(test)]
+mod order_tests;
 #[cfg(test)]
 mod tests;
 

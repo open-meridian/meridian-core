@@ -449,3 +449,378 @@ fn a_codes_resolution_is_kept_once_in_the_book() {
         assert!(meridian_domain::money::is_iso4217(&code), "{code}");
     }
 }
+
+// ── The order path (W11, contract v22) ──────────────────────────────────────
+
+/// A command as a sidecar sends it on the order path: for a person, with
+/// the write scope of a command naming its record by ID alone and a
+/// placement's link verdict.
+async fn send_order<M: Message>(
+    bus: &Bus,
+    topic: &str,
+    message: &M,
+    person: Option<&str>,
+    scope: Option<Vec<String>>,
+) -> Result<Vec<u8>, String> {
+    let payload_type = format!(
+        "meridian.v1.{}",
+        std::any::type_name::<M>().rsplit("::").next().unwrap()
+    );
+    let stamp = Stamp {
+        acting_for_subject: person.unwrap_or_default().to_string(),
+        account_scope: scope,
+        connectivity_allowed: true,
+        ..Default::default()
+    };
+    bus.call_stamped(
+        topic,
+        &payload_type,
+        message.encode_to_vec(),
+        None,
+        None,
+        &stamp,
+    )
+    .await
+    .map(|(_, payload)| payload)
+    .map_err(|failed| failed.to_string())
+}
+
+fn usd(text: &str) -> Option<Money> {
+    Some(Money {
+        amount: d(text),
+        currency_code: "USD".into(),
+        instrument_id: String::new(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its_records() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let account = unique("ACC");
+    let scope = Some(vec![account.clone()]);
+    send_order(
+        &bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        &SetAccountAttributeRequest {
+            account_id: account.clone(),
+            attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+            reason: "no compliance plugin in this test".into(),
+        },
+        Some(PERSON),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut proposal = ProposeOrderRequest {
+        account_id: account.clone(),
+        instrument_id: "INS-AAPL".into(),
+        sleeve: "core".into(),
+        side: Side::Buy as i32,
+        quantity: d("10"),
+        order_type: OrderType::Limit as i32,
+        limit_price: usd("227.50"),
+        time_in_force: TimeInForce::Day as i32,
+        idempotency_key: unique("propose"),
+        ..Default::default()
+    };
+    let order = OrderReply::decode(
+        &send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+            .await
+            .unwrap()[..],
+    )
+    .unwrap()
+    .order
+    .unwrap();
+    // The same proposal under its key again is answered as the first.
+    let again = OrderReply::decode(
+        &send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+            .await
+            .unwrap()[..],
+    )
+    .unwrap()
+    .order
+    .unwrap();
+    assert_eq!(again.order_id, order.order_id);
+    proposal.quantity = d("11");
+    let conflict = send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+        .await
+        .unwrap_err();
+    assert!(conflict.contains("[refusal-reason 10]"), "{conflict}");
+
+    assert_eq!(
+        blocking(|| store
+            .owner(meridian_bor::store::Record::Order, &order.order_id)
+            .unwrap()),
+        Some(account.clone())
+    );
+    // Outside the write scope: denied, nothing changed.
+    let denied = send_order(
+        &bus,
+        RELEASE_ORDER,
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        Some(PERSON),
+        Some(vec!["ACC-elsewhere".into()]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        denied.contains("[refusal-status permission-denied]"),
+        "{denied}"
+    );
+    send_order(
+        &bus,
+        RELEASE_ORDER,
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        Some(PERSON),
+        scope.clone(),
+    )
+    .await
+    .unwrap();
+    let placement = PlacementReply::decode(
+        &send_order(
+            &bus,
+            CREATE_PLACEMENT,
+            &CreatePlacementRequest {
+                order_id: order.order_id.clone(),
+                connectivity_instance_id: "operations-test-1".into(),
+                quantity: d("10"),
+                ..Default::default()
+            },
+            Some(PERSON),
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .placement
+    .unwrap();
+    let filled = FactReply::decode(
+        &send_order(
+            &bus,
+            REPORT_EXECUTION,
+            &ReportExecutionRequest {
+                placement_id: placement.placement_id.clone(),
+                account_id: account.clone(),
+                venue_execution_id: unique("fill"),
+                kind: ExecutionKind::VenueReported as i32,
+                quantity: d("10"),
+                price: usd("227.41"),
+                trade_date: "2026-10-13".into(),
+                settlement_date: "2026-10-14".into(),
+                ..Default::default()
+            },
+            None,
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap();
+    assert_eq!(
+        filled.order.unwrap().status.unwrap().state,
+        OrderState::Filled as i32
+    );
+
+    let orders = |store: &PostgresStore| {
+        store
+            .orders(&meridian_bor::store::OrdersRead {
+                scope: Scope::Within([account.clone()].into_iter().collect()),
+                account_id: account.clone(),
+                since: None,
+                limit: 100,
+                cursor: String::new(),
+            })
+            .unwrap()
+    };
+    let before = blocking(|| orders(&store));
+    assert_eq!(before.orders.len(), 1);
+    assert_eq!(before.placements.len(), 1);
+    assert_eq!(before.executions.len(), 1);
+    assert_eq!(before.orders[0].executions.len(), 1);
+    // Paged one record at a time, the stream reads the same records.
+    let mut cursor = String::new();
+    let mut paged = 0;
+    loop {
+        let page = blocking(|| {
+            store
+                .orders(&meridian_bor::store::OrdersRead {
+                    scope: Scope::Within([account.clone()].into_iter().collect()),
+                    account_id: String::new(),
+                    since: None,
+                    limit: 1,
+                    cursor: cursor.clone(),
+                })
+                .unwrap()
+        });
+        paged += page.orders.len() + page.placements.len() + page.executions.len();
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(paged, 3);
+    let history = blocking(|| {
+        store
+            .order_history(&meridian_bor::store::HistoryRead {
+                scope: Scope::Everything,
+                account_id: account.clone(),
+                order_id: order.order_id.clone(),
+                limit: 100,
+                cursor: String::new(),
+            })
+            .unwrap()
+    });
+    let kinds: Vec<String> = history
+        .records
+        .iter()
+        .map(|entry| entry.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "order-proposed",
+            "order-released",
+            "placement-created",
+            "execution-recorded"
+        ]
+    );
+    // The position is the sleeve's, with its lot.
+    let positions = blocking(|| {
+        store
+            .positions(&PositionsRead {
+                scope: Scope::Within([account.clone()].into_iter().collect()),
+                account_id: account.clone(),
+                since: None,
+                business_date: String::new(),
+                at: None,
+                limit: 100,
+                cursor: String::new(),
+            })
+            .unwrap()
+            .records
+    });
+    let aapl = positions
+        .iter()
+        .find(|position| position.instrument_id == "INS-AAPL")
+        .unwrap();
+    assert_eq!(
+        (aapl.sleeve.as_str(), read(&aapl.trade_date_quantity)),
+        ("core", "10".into())
+    );
+    blocking(|| store.rebuild().unwrap());
+    let after = blocking(|| orders(&store));
+    assert_eq!(before.orders, after.orders);
+    assert_eq!(before.placements, after.placements);
+    assert_eq!(before.executions, after.executions);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn instructions_stand_in_their_partitions_and_a_day_order_comes_due() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    let account = unique("ACC");
+    let target = unique("plugin");
+    let set = SetTradingInstructionRequest {
+        target: Some(TradingInstructionTarget {
+            instance_id: target.clone(),
+            ..Default::default()
+        }),
+        value: TradingInstructionValue::Pause as i32,
+        reason: "pause the plugin".into(),
+    };
+    let reply = TradingInstructionReply::decode(
+        &send_order(&bus, SET_TRADING_INSTRUCTION, &set, Some(PERSON), None)
+            .await
+            .unwrap()[..],
+    )
+    .unwrap();
+    assert_eq!(reply.journal.unwrap().partition, "control");
+    let listed = blocking(|| {
+        store
+            .instructions(&meridian_bor::store::InstructionsRead {
+                since: None,
+                limit: 500,
+                cursor: String::new(),
+            })
+            .unwrap()
+    });
+    assert!(listed.records.iter().any(|held| held
+        .target
+        .as_ref()
+        .is_some_and(|named| named.instance_id == target)));
+    // Read since the control partition's head: nothing new.
+    let since = listed.as_of.clone();
+    let none = blocking(|| {
+        store
+            .instructions(&meridian_bor::store::InstructionsRead {
+                since: Some(since.clone()),
+                limit: 500,
+                cursor: String::new(),
+            })
+            .unwrap()
+    });
+    assert!(none.records.is_empty());
+
+    send_order(
+        &bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        &SetAccountAttributeRequest {
+            account_id: account.clone(),
+            attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+            reason: "no compliance plugin".into(),
+        },
+        Some(PERSON),
+        None,
+    )
+    .await
+    .unwrap();
+    let order = OrderReply::decode(
+        &send_order(
+            &bus,
+            PROPOSE_ORDER,
+            &ProposeOrderRequest {
+                account_id: account.clone(),
+                instrument_id: "INS-AAPL".into(),
+                side: Side::Buy as i32,
+                quantity: d("1"),
+                time_in_force: TimeInForce::Day as i32,
+                ..Default::default()
+            },
+            Some(PERSON),
+            None,
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .order
+    .unwrap();
+    send_order(
+        &bus,
+        RELEASE_ORDER,
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        Some(PERSON),
+        None,
+    )
+    .await
+    .unwrap();
+    let due = |at: i64| blocking(|| store.expiring(at).unwrap());
+    let now = meridian_clock::Clock::now_ns(&meridian_clock::SystemClock);
+    assert!(!due(now).iter().any(|(_, id)| *id == order.order_id));
+    let later = now + 2 * 86_400 * 1_000_000_000;
+    assert!(due(later)
+        .iter()
+        .any(|(held, id)| *id == order.order_id && *held == account));
+}

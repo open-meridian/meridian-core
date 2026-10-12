@@ -14,7 +14,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
 	@echo "  make codegen        regenerate the domain bindings from proto/"
-	@echo "  make check-codegen  fail if crates/domain/src/v1.rs is stale against proto/"
+	@echo "  make check-codegen  fail if crates/domain/src/v1.rs or the book's transition table is stale"
 	@echo "  make build          compile the workspace"
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
@@ -102,39 +102,47 @@ contract-diff:
 	@$(PY) tools/check_contract_diff.py --repo-root .
 
 DOMAIN_RS := crates/domain/src/v1.rs
+# The book's transition table, generated from meridian-schema's
+# boundaries/transitions.json (decisions/035): every language's copy is
+# generated, and this is core's.
+TRANSITIONS_RS := crates/bor/src/transitions.rs
 SCRATCH   := .codegen-scratch
 # The meridian-schema revision the workspace links, whose protos a domain
 # proto may import (bus.proto takes MessageMeta from there).
 SCHEMA_REV   := $(shell sed -n 's/^meridian-pb = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml)
 SCHEMA_PROTO := --build-context schema-proto=https://github.com/open-meridian/meridian-schema.git\#$(SCHEMA_REV):proto
+SCHEMA_BOUNDARIES := --build-context schema-boundaries=https://github.com/open-meridian/meridian-schema.git\#$(SCHEMA_REV):boundaries
 
 # Regenerate in place. The only sanctioned way to change $(DOMAIN_RS).
 codegen:
 	@rm -rf $(SCRATCH)
-	@$(DOCKER) build $(SCHEMA_PROTO) -f Dockerfile.codegen --target export \
+	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) .
-	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && rm -rf $(SCRATCH)
-	@echo "codegen: wrote $(DOMAIN_RS)"
+	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) && rm -rf $(SCRATCH)
+	@echo "codegen: wrote $(DOMAIN_RS) and $(TRANSITIONS_RS)"
 
 # Generate into a scratch directory and compare. A vendored file that does not
 # match a fresh generation is a stale checkout or a hand-edit, and both are the
 # same bug: the runtime building against types proto/ does not describe.
 check-codegen:
 	@rm -rf $(SCRATCH)
-	@$(DOCKER) build $(SCHEMA_PROTO) -f Dockerfile.codegen --target export \
+	@$(PY) tools/generate_transitions.py --self-test >/dev/null
+	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
 		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
-	@if diff -q $(DOMAIN_RS) $(SCRATCH)/v1.rs >/dev/null 2>&1; then \
-		rm -rf $(SCRATCH); \
-		echo "check-codegen OK: $(DOMAIN_RS) matches a fresh generation"; \
-	else \
-		echo "check-codegen FAILED: $(DOMAIN_RS) is stale or hand-edited" >&2; \
-		diff $(DOMAIN_RS) $(SCRATCH)/v1.rs | head -40 >&2; \
-		rm -rf $(SCRATCH); \
-		echo >&2; \
-		echo "Run 'make codegen' and commit the result. Never edit $(DOMAIN_RS) by hand." >&2; \
-		exit 1; \
-	fi
+	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs"; do \
+		set -- $$pair; \
+		if ! diff -q $$1 $(SCRATCH)/$$2 >/dev/null 2>&1; then \
+			echo "check-codegen FAILED: $$1 is stale or hand-edited" >&2; \
+			diff $$1 $(SCRATCH)/$$2 | head -40 >&2; \
+			rm -rf $(SCRATCH); \
+			echo >&2; \
+			echo "Run 'make codegen' and commit the result. Never edit $$1 by hand." >&2; \
+			exit 1; \
+		fi; \
+	done
+	@rm -rf $(SCRATCH)
+	@echo "check-codegen OK: $(DOMAIN_RS) and $(TRANSITIONS_RS) match a fresh generation from the protos and the schema's transition table"
 
 # Published vulnerabilities in anything the workspace links, from RustSec,
 # read fresh each run. Every exception is in deny.toml with its reason.

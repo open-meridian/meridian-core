@@ -92,6 +92,98 @@ pub fn refusal_fields(detail: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A component's refusal that carries no reason code but a status of its own
+/// (contract v22): a command a component reads as malformed, naming each
+/// field (`INVALID_ARGUMENT`), or one whose record's account is outside the
+/// write scope the sidecar stamped (`PERMISSION_DENIED`, W4.9; the
+/// order-path plan's protos, point 8). The sidecar sends the status beside
+/// a refusal with no code and the fields named, as it sends its own.
+/// Carried at the front of the words, as a reason code is:
+/// `[refusal-status invalid-argument fields=quantity;cash_quantity] words`.
+const REFUSAL_STATUS_PREFIX: &str = "[refusal-status ";
+
+/// The status a [`refusal_with_status`] asks the sidecar to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalStatus {
+    InvalidArgument,
+    PermissionDenied,
+}
+
+impl RefusalStatus {
+    fn word(self) -> &'static str {
+        match self {
+            RefusalStatus::InvalidArgument => "invalid-argument",
+            RefusalStatus::PermissionDenied => "permission-denied",
+        }
+    }
+}
+
+/// A handler's refusal with a status and no reason code, naming each field
+/// the command got wrong, where it names any.
+pub fn refusal_with_status(
+    status: RefusalStatus,
+    fields: &[String],
+    words: impl std::fmt::Display,
+) -> String {
+    if fields.is_empty() {
+        return format!("{REFUSAL_STATUS_PREFIX}{}] {words}", status.word());
+    }
+    format!(
+        "{REFUSAL_STATUS_PREFIX}{} {REFUSAL_FIELDS}{}] {words}",
+        status.word(),
+        fields.join(";")
+    )
+}
+
+/// The status, the fields and the words, where the detail carries a status.
+pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, &str)> {
+    let rest = detail.strip_prefix(REFUSAL_STATUS_PREFIX)?;
+    let (head, words) = rest.split_once("] ")?;
+    let (word, fields) = match head.split_once(' ') {
+        Some((word, named)) => (
+            word,
+            named
+                .strip_prefix(REFUSAL_FIELDS)?
+                .split(';')
+                .filter(|field| !field.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        None => (head, Vec::new()),
+    };
+    let status = match word {
+        "invalid-argument" => RefusalStatus::InvalidArgument,
+        "permission-denied" => RefusalStatus::PermissionDenied,
+        _ => return None,
+    };
+    Some((status, fields, words))
+}
+
+#[cfg(test)]
+mod refusal_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_status_and_its_fields_read_back_and_are_never_a_reason_code() {
+        let said = refusal_with_status(
+            RefusalStatus::InvalidArgument,
+            &["quantity".into(), "cash_quantity".into()],
+            "an order states exactly one",
+        );
+        let (status, fields, words) = read_refusal_status(&said).unwrap();
+        assert_eq!(status, RefusalStatus::InvalidArgument);
+        assert_eq!(fields, vec!["quantity", "cash_quantity"]);
+        assert_eq!(words, "an order states exactly one");
+        assert!(read_refusal(&said).is_none());
+        let denied = refusal_with_status(RefusalStatus::PermissionDenied, &[], "outside");
+        assert_eq!(
+            read_refusal_status(&denied).map(|(status, fields, _)| (status, fields.len())),
+            Some((RefusalStatus::PermissionDenied, 0))
+        );
+        assert!(read_refusal_status("[refusal-reason 21] words").is_none());
+    }
+}
+
 /// One message delivered to a subscriber.
 #[derive(Debug, Clone)]
 pub struct Delivery {

@@ -37,6 +37,14 @@ pub fn mint(prefix: &str, now_ns: i64) -> String {
 pub const ENTRY: &str = "ENT";
 pub const LOT: &str = "LOT";
 pub const BREAK: &str = "BRK";
+// The order path's (W11, contract v22), each never reused (decisions/035).
+pub const ORDER: &str = "ORD";
+pub const PLACEMENT: &str = "PLC";
+pub const EXECUTION: &str = "EXE";
+pub const CHARGE: &str = "CHG";
+pub const UNPLACED: &str = "UNP";
+pub const LOCATE: &str = "LOC";
+pub const CHANGE_REQUEST: &str = "CRQ";
 
 #[cfg(test)]
 mod tests {

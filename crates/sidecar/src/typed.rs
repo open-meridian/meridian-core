@@ -156,6 +156,12 @@ const VENUE_FACTS: [(&str, &str); 3] = [
 /// A placement (CreatePlacement, W11.8, contract v22), whose connectivity
 /// plugin the sidecar holds to the claims' connectivity_instance_ids.
 const CREATE_PLACEMENT: &str = "meridian.v1.CreatePlacementRequest";
+/// An order's change (W11.3, contract v22): a quantity change is never an
+/// `ems`'s.
+const REQUEST_ORDER_CHANGE: &str = "meridian.v1.RequestOrderChangeRequest";
+/// The orders read (W11.17, contract v22): a connectivity plugin's answers
+/// only the orders behind placements naming its instance.
+const LIST_ORDERS: &str = "meridian.v1.ListOrdersRequest";
 
 /// The role whose venue facts take their account from the venue account map
 /// (contract v22, W11.22).
@@ -489,6 +495,16 @@ impl Sidecar {
             )
             .await
             .map_err(refused)?;
+        // A connectivity plugin reads the orders behind the placements naming
+        // its instance, and the records of those alone (W11.17, as a
+        // placement is heard at the instance it names, matrix/directed.tsv).
+        // A plugin reading the row by another role reads it by its scope.
+        if payload_type == LIST_ORDERS {
+            let granting = self.roles_granting(&topic);
+            if !granting.is_empty() && granting.iter().all(|role| role == CONNECTIVITY) {
+                return mirrored(directed_orders(&payload, self.instance_id())?);
+            }
+        }
         mirrored(payload)
     }
 
@@ -590,6 +606,37 @@ impl Sidecar {
                 .cloned()
                 .collect::<Vec<String>>()
         });
+        // An ordered quantity is changed by `portfolio`, or by the `oms` as a
+        // trader's alignment, and never by an `ems` (W11.3; step 5's Q20): a
+        // plugin whose roles granting the change are neither is refused for
+        // the order's state, before the book hears of it. Which of the two
+        // others it is, the book reads from the order's own proposer.
+        if payload_type == REQUEST_ORDER_CHANGE {
+            let quantity =
+                domain::RequestOrderChangeRequest::decode(message.encode_to_vec().as_slice())
+                    .ok()
+                    .and_then(|request| request.change)
+                    .is_some_and(|change| change.kind == domain::OrderChangeKind::Quantity as i32);
+            let granting = self.roles_granting(&topic);
+            if quantity
+                && !granting
+                    .iter()
+                    .any(|role| role == "portfolio" || role == "oms")
+            {
+                let refusal = format!(
+                    "an ordered quantity is changed by portfolio, or by the oms as an \
+                     alignment, and {} changes it as {}, which changes no quantity",
+                    self.instance_id(),
+                    granting.join(" and ")
+                );
+                self.note_refusal(&refusal);
+                return Err(refused_for(
+                    Code::Aborted,
+                    refusal,
+                    RefusalReason::OrderState,
+                ));
+            }
+        }
         // A placement (contract v22, W11.8): whether the connectivity plugin
         // it names is one the claims say the caller may route through from
         // this plugin -- linked, available, its users naming them -- an ems's
@@ -1143,6 +1190,52 @@ fn session_named(level: i32) -> &'static str {
     }
 }
 
+/// A ListOrdersReply narrowed to one connectivity plugin's placements: the
+/// orders behind them, their placements, executions and charges, and the
+/// unplaced facts whose raw record it holds.
+#[allow(clippy::result_large_err)]
+fn directed_orders(payload: &[u8], instance: &str) -> Result<Vec<u8>, Status> {
+    let mut reply = domain::ListOrdersReply::decode(payload)
+        .map_err(|failed| Status::internal(format!("the orders did not read: {failed}")))?;
+    let mine = |placement: &domain::Placement| placement.connectivity_instance_id == instance;
+    let placed: std::collections::BTreeSet<String> = reply
+        .placements
+        .iter()
+        .filter(|placement| mine(placement))
+        .map(|placement| placement.placement_id.clone())
+        .chain(
+            reply
+                .orders
+                .iter()
+                .flat_map(|order| order.placements.iter())
+                .filter(|placement| mine(placement))
+                .map(|placement| placement.placement_id.clone()),
+        )
+        .collect();
+    reply
+        .orders
+        .retain(|order| order.placements.iter().any(&mine));
+    for order in reply.orders.iter_mut() {
+        order.placements.retain(&mine);
+        order
+            .executions
+            .retain(|execution| placed.contains(&execution.placement_id));
+        order
+            .charges
+            .retain(|charge| placed.contains(&charge.placement_id));
+    }
+    reply.placements.retain(&mine);
+    reply
+        .executions
+        .retain(|execution| placed.contains(&execution.placement_id));
+    reply.unplaced_facts.retain(|fact| {
+        fact.raw_record
+            .as_ref()
+            .is_some_and(|raw| raw.instance_id == instance)
+    });
+    Ok(reply.encode_to_vec())
+}
+
 /// A domain reply, read as the plugin-facing mirror it is on the wire.
 #[allow(clippy::result_large_err)]
 fn mirrored<R: Message + Default>(payload: Vec<u8>) -> Result<Response<R>, Status> {
@@ -1190,6 +1283,24 @@ pub(crate) fn refused(failed: BusError) -> Status {
         // A component's refusal of its own (W9's book, contract v8), its
         // reason code carried beside the status and its words alone in it.
         // The fields it names as left out, where it names any, ride with it.
+        // A component's refusal with a status and no code (contract v22): a
+        // command it reads as malformed, naming each field, or a record whose
+        // account is outside the write scope stamped on it (W4.9).
+        BusError::HandlerFailed { detail, .. }
+            if meridian_bus::read_refusal_status(&detail).is_some() =>
+        {
+            let (status, fields, words) =
+                meridian_bus::read_refusal_status(&detail).expect("matched above");
+            refused_naming(
+                match status {
+                    meridian_bus::RefusalStatus::InvalidArgument => Code::InvalidArgument,
+                    meridian_bus::RefusalStatus::PermissionDenied => Code::PermissionDenied,
+                },
+                words.to_string(),
+                RefusalReason::Unspecified,
+                fields,
+            )
+        }
         BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
             .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
         {

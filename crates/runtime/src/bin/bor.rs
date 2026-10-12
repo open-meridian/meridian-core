@@ -126,6 +126,34 @@ fn run() -> Result<(), String> {
             meridian_bor::service::SWEEP_EVERY,
         ));
 
+        // The order path (W11, contract v22): orders whose time in force
+        // ended by the deployment's clock expired, as the book's own act;
+        // and, once at the upgrade, every account held recorded as waiting
+        // for compliance (W9.13, decisions/031).
+        let backfilling = bus.clone();
+        let held = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || {
+            meridian_bor::order_service::backfill_waits(&backfilling, held.as_ref())
+        })
+        .await
+        {
+            Ok(Ok(recorded)) if recorded > 0 => tracing::info!(
+                recorded,
+                "every account the book held is recorded as waiting for compliance"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(why)) => tracing::warn!(
+                why,
+                "the accounts held could not be recorded as waiting for compliance"
+            ),
+            Err(failed) => tracing::warn!(%failed, "the waiting backfill failed"),
+        }
+        tokio::spawn(meridian_bor::order_service::expire_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            meridian_bor::order_service::EXPIRE_EVERY,
+        ));
+
         // W5.20, said on the bus for the instrument store to carry outward.
         let reporting = bus.clone();
         let schema = meridian_bor::migrations::latest();

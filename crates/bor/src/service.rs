@@ -100,10 +100,16 @@ pub fn scope_of(envelope: &Envelope) -> Scope {
 }
 
 /// What a command knows beside its body, from its envelope.
-fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
+pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
     let meta = envelope.meta.clone().unwrap_or_default();
     let now = clock.now_ns();
     Context {
+        // The write scope a command naming its record by ID alone carries
+        // (contract v22, W4.9), and a placement's link verdict (W11.8).
+        account_scope: meta
+            .account_scope_applies
+            .then(|| meta.account_scope.iter().cloned().collect()),
+        connectivity_allowed: meta.connectivity_allowed,
         message_id: meta.message_id,
         instance_id: meta.publisher_instance_id,
         acting_for: meta.acting_for_subject,
@@ -131,7 +137,7 @@ fn expect(arrived: &str, wanted: &str) -> Result<(), String> {
     Err(format!("expected {wanted}, got {arrived}"))
 }
 
-fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, String> {
+pub(crate) fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, String> {
     expect(&envelope.payload_type, wanted)?;
     M::decode(&envelope.payload[..]).map_err(|failed| format!("undecodable {wanted}: {failed}"))
 }
@@ -140,10 +146,10 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
 /// reference version (Q31), and what its record says the book requires (W9.1,
 /// contract v10); or that it did not answer in time.
 #[derive(Default)]
-struct References {
-    versions: std::collections::BTreeMap<String, i64>,
-    records: std::collections::BTreeMap<String, RecordSays>,
-    unavailable: bool,
+pub(crate) struct References {
+    pub(crate) versions: std::collections::BTreeMap<String, i64>,
+    pub(crate) records: std::collections::BTreeMap<String, RecordSays>,
+    pub(crate) unavailable: bool,
 }
 
 /// What a record says that the book requires: an asset class and a currency
@@ -162,7 +168,7 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
 /// does not hold is absent, and lacks everything; a store that does not
 /// answer in time is `unavailable`, and the command is refused to be tried
 /// again.
-fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
+pub(crate) fn references(bus: &Bus, instruments: &[String], now_ns: i64) -> References {
     let mut found = References::default();
     if instruments.is_empty() {
         return found;
@@ -234,7 +240,16 @@ fn entry_reply(made: &Made) -> BookEntryReply {
     reply
 }
 
-fn decided(made: Made, reply: Vec<u8>) -> Decided {
+/// What a reply kept with an entry is prefixed by where the entry records a
+/// refusal (contract v22, W11.8): the command, and any duplicate of it, is
+/// answered with the refusal after the entry commits.
+pub(crate) const REFUSED: &[u8] = b"\0refused\0";
+
+pub(crate) fn decided(made: Made, reply: Vec<u8>) -> Decided {
+    let reply = match &made.refusal {
+        Some(refusal) => [REFUSED, refusal.as_bytes()].concat(),
+        None => reply,
+    };
     Decided {
         entry: made.entry,
         book: made.book,
@@ -254,6 +269,9 @@ pub fn announce(bus: &Bus, decided: &Decided, correlation: Option<&str>, causati
             tracing::warn!(topic, %failed, "a change of the book was committed and not published");
         }
     };
+    // The order path's records first (W11.13): W9's PositionChanged follows
+    // for each position a fill moved.
+    crate::order_service::announce(&say, decided);
     for (record, previous) in &decided.changes.positions {
         say(POSITION_CHANGED, "meridian.v1.PositionChangedEvent", {
             let mut event = PositionChangedEvent {
@@ -311,7 +329,7 @@ pub fn announce(bus: &Bus, decided: &Decided, correlation: Option<&str>, causati
 }
 
 /// A command's decision and its encoded answer.
-type Deciding<'a> =
+pub(crate) type Deciding<'a> =
     dyn Fn(&crate::book::Book, u64, &Context) -> Result<(Made, Vec<u8>), StoreError> + 'a;
 
 /// One command: decided under the account's lock, committed, announced, and
@@ -330,18 +348,53 @@ fn command(
     if account_id.is_empty() {
         return Err("the command names no account".into());
     }
-    let acted = store
-        .act(
-            account_id,
-            &ctx.message_id,
-            idempotency_key,
-            &envelope.payload,
-            &mut |book, head| {
-                let (made, reply) = decide(book, head, &ctx)?;
-                Ok(decided(made, reply))
-            },
-        )
-        .map_err(|failed| failed.on_the_bus())?;
+    command_store(
+        bus,
+        store,
+        envelope,
+        ctx,
+        account_id,
+        idempotency_key,
+        reply_type,
+        decide,
+    )
+    .map_err(|failed| failed.on_the_bus())
+}
+
+/// [`command`], its refusal kept typed: what the order path reads a fact
+/// to keep unplaced from (W11.13). Every entry records the control
+/// partition's sequence in force (decisions/024's note).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn command_store(
+    bus: &Bus,
+    store: &dyn Store,
+    envelope: &Envelope,
+    mut ctx: Context,
+    account_id: &str,
+    idempotency_key: &str,
+    reply_type: &str,
+    decide: &Deciding<'_>,
+) -> Result<(String, Vec<u8>), StoreError> {
+    ctx.control_sequence = store
+        .heads()?
+        .get(crate::store::CONTROL_PARTITION)
+        .copied()
+        .unwrap_or(0);
+    let acted = store.act(
+        account_id,
+        &ctx.message_id,
+        idempotency_key,
+        &envelope.payload,
+        &mut |book, head| {
+            let (made, reply) = decide(book, head, &ctx)?;
+            Ok(decided(made, reply))
+        },
+    );
+    let acted = match acted {
+        // A venue's fact already applied: answered as it stands.
+        Err(StoreError::Repeated(reply)) => return Ok((reply_type.to_string(), reply)),
+        other => other?,
+    };
     let reply = match acted {
         Acted::Duplicate(reply) => reply,
         Acted::Committed(decided) => {
@@ -355,6 +408,11 @@ fn command(
             decided.reply
         }
     };
+    if let Some(refusal) = reply.strip_prefix(REFUSED) {
+        return Err(StoreError::Recorded(
+            String::from_utf8_lossy(refusal).into_owned(),
+        ));
+    }
     Ok((reply_type.to_string(), reply))
 }
 
@@ -687,6 +745,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             reply.encode_to_vec()
         }))
     });
+
+    crate::order_service::serve(bus.clone(), store.clone(), clock.clone());
 
     let reading = store;
     bus.serve(LIST_ACCOUNT_ATTRIBUTES, move |envelope| {

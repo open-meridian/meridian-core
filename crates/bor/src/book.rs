@@ -22,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    AccountAttributes, AccountFigures, BookPosition, Break, Encumbrance, FreeBasis, HoldingSide,
-    JournalRef, Lot, MarginAgreementRef, MovementLine, OpeningSource, PendingSettlement,
-    PendingState, SettlementBucket,
+    AccountAttributes, AccountFigures, BookPosition, Break, Encumbrance, Execution, FreeBasis,
+    HoldingSide, JournalRef, Locate, Lot, MarginAgreementRef, MovementLine, OpeningSource, Order,
+    PendingSettlement, PendingState, Placement, SettlementBucket, TradingInstruction, UnplacedFact,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -40,10 +40,21 @@ pub enum Chain {
     Break = 1,
     Figures = 2,
     Attributes = 3,
+    // The order path's rows (W11.13, contract v22), each chained of its own.
+    Order = 4,
+    Placement = 5,
+    Execution = 6,
+    Unplaced = 7,
+    Locate = 8,
+    Instruction = 9,
 }
 
-/// A position's key within its account: instrument and side.
-pub type Key = (String, i32);
+/// How many rows an account's changes are chained per.
+const CHAINS: usize = 10;
+
+/// A position's key within its account: instrument, side and, from contract
+/// v22, sleeve (W9's invariants; empty for the account's unsleeved part).
+pub type Key = (String, i32, String);
 
 /// A lot as the book holds it: the record, and the entry that opened it,
 /// within which further lines add to its original quantity.
@@ -60,6 +71,9 @@ pub struct LotState {
 pub struct PositionState {
     pub instrument_id: String,
     pub side: i32,
+    /// Its sleeve within the account (contract v22): empty for the unsleeved
+    /// part, as every position before v22 is.
+    pub sleeve: String,
     pub settled: Exact,
     /// Pending by value date, "" for "date not stated" at an opening balance.
     pub pending: BTreeMap<String, (Exact, Option<PendingState>)>,
@@ -77,10 +91,11 @@ pub struct PositionState {
 }
 
 impl PositionState {
-    fn new(instrument_id: &str, side: i32) -> Self {
+    fn new(instrument_id: &str, side: i32, sleeve: &str) -> Self {
         PositionState {
             instrument_id: instrument_id.to_string(),
             side,
+            sleeve: sleeve.to_string(),
             settled: Exact::ZERO,
             pending: BTreeMap::new(),
             not_stated: Exact::ZERO,
@@ -151,10 +166,8 @@ impl PositionState {
             account_id: account_id.to_string(),
             instrument_id: self.instrument_id.clone(),
             side: self.side,
-            // Contract v22: a position keyed by its sleeve is the order
-            // path's build (phase 2b); until then every position is the
-            // account's own, no sleeve.
-            sleeve: String::new(),
+            // Keyed by its sleeve (contract v22; W9's invariants).
+            sleeve: self.sleeve.clone(),
             trade_date_quantity: numbers::wire(self.trade_date()?),
             // Unknown, never zero, while any of the quantity is not stated.
             settled_quantity: self.not_stated.is_zero().then(|| self.settled.to_wire()),
@@ -248,9 +261,33 @@ pub struct Changes {
     pub breaks: Vec<Break>,
     pub figures: Vec<AccountFigures>,
     pub attributes: Option<AccountAttributes>,
+    /// The order path's records the entry changed, whole, with what changed
+    /// on an order or a placement (W11.13).
+    pub orders: Vec<(Order, Vec<String>)>,
+    pub placements: Vec<(Placement, Vec<String>)>,
+    pub executions: Vec<Execution>,
+    pub unplaced: Vec<UnplacedFact>,
+    pub locates: Vec<Locate>,
+    pub instructions: Vec<TradingInstruction>,
+    /// When each order changed may expire by the deployment's clock, None
+    /// where it cannot or is ending already (W11.13).
+    pub order_expiries: BTreeMap<String, Option<i64>>,
+    /// The change requests the entry opened, each with its order and
+    /// placement, and the entry itself, for the store's indexes.
+    pub change_requests: Vec<(String, String, String)>,
     /// The entry's place: its first change's.
     pub first: JournalRef,
     pub last_sequence: u64,
+}
+
+/// The reference each order-path record takes in an entry.
+struct ActRefs {
+    orders: Vec<(String, JournalRef)>,
+    placements: Vec<(String, JournalRef)>,
+    executions: Vec<(String, JournalRef)>,
+    unplaced: Vec<(String, JournalRef)>,
+    locates: Vec<(String, JournalRef)>,
+    instructions: Vec<(String, JournalRef)>,
 }
 
 /// One account's book.
@@ -267,7 +304,13 @@ pub struct Book {
     /// Opening balances reversed, in order.
     pub reversed_openings: Vec<String>,
     pub entries: Vec<EntryIndex>,
-    chains: [u64; 4],
+    chains: [u64; CHAINS],
+    /// The order path's records (W11, contract v22).
+    pub ledger: crate::orders::Ledger,
+    /// Whether an entry has stated whether releases wait for compliance
+    /// (contract v22): false for an account the book held before, until the
+    /// upgrade's backfill records it (decisions/031).
+    pub waits_stated: bool,
 }
 
 /// How an agreement is keyed: the statement's external account and segment
@@ -295,7 +338,9 @@ impl Book {
             opening: None,
             reversed_openings: Vec::new(),
             entries: Vec::new(),
-            chains: [0; 4],
+            chains: [0; CHAINS],
+            ledger: crate::orders::Ledger::default(),
+            waits_stated: false,
         }
     }
 
@@ -350,18 +395,24 @@ impl Book {
         let mut keys: BTreeSet<Key> = body
             .lines
             .iter()
-            .map(|line| (line.instrument_id.clone(), line.side))
+            .map(|line| (line.instrument_id.clone(), line.side, line.sleeve.clone()))
             .collect();
         for adjustment in &body.basis_adjustments {
             if let Some(key) = self.lot_owner(&adjustment.lot_id) {
                 keys.insert(key.clone());
             }
         }
-        keys.extend(body.tombstones.iter().cloned());
+        // A merged record's tombstones and a statement's encumbrances are
+        // the account's, unsleeved (W9.9, W9.15).
+        keys.extend(
+            body.tombstones
+                .iter()
+                .map(|(instrument, side)| (instrument.clone(), *side, String::new())),
+        );
         keys.extend(
             body.encumbrances
                 .iter()
-                .map(|(instrument, side, _)| (instrument.clone(), *side)),
+                .map(|(instrument, side, _)| (instrument.clone(), *side, String::new())),
         );
         keys
     }
@@ -423,6 +474,39 @@ impl Book {
             .attributes
             .as_ref()
             .map(|_| take(self, Chain::Attributes));
+        // The order path's records (W11.13), each row chained of its own, in
+        // the order their acts name them.
+        let touched = self.ledger.touched(&body.acts);
+        let order_refs: Vec<(String, JournalRef)> = touched
+            .orders
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Order)))
+            .collect();
+        let placement_refs: Vec<(String, JournalRef)> = touched
+            .placements
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Placement)))
+            .collect();
+        let execution_refs: Vec<(String, JournalRef)> = touched
+            .executions
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Execution)))
+            .collect();
+        let unplaced_refs: Vec<(String, JournalRef)> = touched
+            .unplaced
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Unplaced)))
+            .collect();
+        let locate_refs: Vec<(String, JournalRef)> = touched
+            .locates
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Locate)))
+            .collect();
+        let instruction_refs: Vec<(String, JournalRef)> = touched
+            .instructions
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Instruction)))
+            .collect();
         let Some(first) = first else {
             return Err(StoreError::Invalid(
                 "an entry that changes no record changes nothing; nothing was journalled".into(),
@@ -445,10 +529,10 @@ impl Book {
         let lines_touch: BTreeSet<Key> = body
             .lines
             .iter()
-            .map(|line| (line.instrument_id.clone(), line.side))
+            .map(|line| (line.instrument_id.clone(), line.side, line.sleeve.clone()))
             .collect();
         for line in &body.lines {
-            let key = (line.instrument_id.clone(), line.side);
+            let key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
             let reference = refs[&key].clone();
             let quantity = numbers::required(
                 &format!("the line on {}'s quantity", line.instrument_id),
@@ -458,10 +542,9 @@ impl Book {
                 (Some(_), false) => self.carried_lot(&key, &line.lot_id),
                 _ => None,
             };
-            let position = self
-                .positions
-                .entry(key.clone())
-                .or_insert_with(|| PositionState::new(&line.instrument_id, line.side));
+            let position = self.positions.entry(key.clone()).or_insert_with(|| {
+                PositionState::new(&line.instrument_id, line.side, &line.sleeve)
+            });
             position.removed = false;
             position.add_to_bucket(line, quantity)?;
             apply_lot(
@@ -538,7 +621,7 @@ impl Book {
         // Encumbrances, the whole set per position named, each naming the
         // change that set it: an attribute; nothing moves.
         for (instrument, side, held) in &body.encumbrances {
-            let key = (instrument.clone(), *side);
+            let key = (instrument.clone(), *side, String::new());
             let reference = refs[&key].clone();
             if let Some(position) = self.positions.get_mut(&key) {
                 position.encumbrances = held
@@ -570,8 +653,8 @@ impl Book {
             let position = self
                 .positions
                 .entry(key.clone())
-                .or_insert_with(|| PositionState::new(&key.0, key.1));
-            if body.tombstones.contains(key) {
+                .or_insert_with(|| PositionState::new(&key.0, key.1, &key.2));
+            if key.2.is_empty() && body.tombstones.contains(&(key.0.clone(), key.1)) {
                 position.removed = true;
             }
             position.effective_date = entry.meta.effective_date.clone();
@@ -619,6 +702,22 @@ impl Book {
             changes.attributes = Some(record);
         }
 
+        self.apply_acts(
+            entry,
+            &mut changes,
+            ActRefs {
+                orders: order_refs,
+                placements: placement_refs,
+                executions: execution_refs,
+                unplaced: unplaced_refs,
+                locates: locate_refs,
+                instructions: instruction_refs,
+            },
+        )?;
+        if body.states_waits {
+            self.waits_stated = true;
+        }
+
         if let Some(opening) = &body.opening {
             self.opening = Some((opening.entry_id.clone(), opening.as_of_date.clone()));
         }
@@ -647,6 +746,132 @@ impl Book {
         Ok(changes)
     }
 
+    /// The order path's acts applied to the ledger, each record they change
+    /// given its reference and set whole in `changes` as it stands after
+    /// them (W11.13).
+    fn apply_acts(&mut self, entry: &Entry, changes: &mut Changes, refs: ActRefs) -> Result<()> {
+        if entry.body.acts.is_empty() {
+            return Ok(());
+        }
+        let before_orders: BTreeMap<String, Order> = refs
+            .orders
+            .iter()
+            .filter(|(id, _)| self.ledger.orders.contains_key(id))
+            .map(|(id, _)| Ok((id.clone(), self.ledger.order_record(id, true)?)))
+            .collect::<Result<_>>()?;
+        let before_placements: BTreeMap<String, Placement> = refs
+            .placements
+            .iter()
+            .filter(|(id, _)| self.ledger.placements.contains_key(id))
+            .map(|(id, _)| Ok((id.clone(), self.ledger.placement_record(id)?)))
+            .collect::<Result<_>>()?;
+        // An order's terms take the sequence of its own change in the entry
+        // that sets them: the version a check names (W11.4).
+        let versions: BTreeMap<String, u64> = refs
+            .orders
+            .iter()
+            .map(|(id, reference)| (id.clone(), reference.sequence))
+            .collect();
+        for act in &entry.body.acts {
+            self.ledger.apply(act, &entry.entry_id, &versions);
+            match act {
+                // Whose own order it is, and when it opened: the instance
+                // that sent it, as its sidecar stamped it.
+                crate::orders::Act::Opened { order, .. } => {
+                    if let Some(held) = self.ledger.orders.get_mut(&order.order_id) {
+                        held.opened_by = entry.cause.instance_id.clone();
+                        held.opened_at_ns = entry.meta.received_at_ns;
+                    }
+                }
+                crate::orders::Act::ChangeOpened { request } => {
+                    changes.change_requests.push((
+                        request.change_request_id.clone(),
+                        request.order_id.clone(),
+                        request.placement_id.clone(),
+                    ));
+                    if let Some(held) = self.ledger.changes.get_mut(&request.change_request_id) {
+                        if held.entry.is_none() {
+                            held.entry = Some(entry.meta.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Every record's reference first, so an order whole carries its
+        // placements and executions as they stand after the entry.
+        for (id, reference) in &refs.orders {
+            if let Some(held) = self.ledger.orders.get_mut(id) {
+                held.last_change = Some(reference.clone());
+                self.ledger
+                    .order_entries
+                    .entry(id.clone())
+                    .or_default()
+                    .push(entry.entry_id.clone());
+            }
+        }
+        for (id, reference) in &refs.placements {
+            if let Some(held) = self.ledger.placements.get_mut(id) {
+                held.last_change = Some(reference.clone());
+            }
+        }
+        for (id, reference) in &refs.executions {
+            if let Some(held) = self.ledger.executions.get_mut(id) {
+                held.execution.last_change = Some(reference.clone());
+            }
+        }
+        for (id, _) in &refs.orders {
+            let Some(held) = self.ledger.orders.get(id) else {
+                continue;
+            };
+            let expiry = crate::orders::expires_at(held)
+                .filter(|_| held.ending.is_none() && held.ended.is_none());
+            changes.order_expiries.insert(id.clone(), expiry);
+            let after = self.ledger.order_record(id, true)?;
+            let changed = crate::orders::order_changed(before_orders.get(id), &after);
+            changes.orders.push((after, changed));
+        }
+        for (id, _) in &refs.placements {
+            if !self.ledger.placements.contains_key(id) {
+                continue;
+            }
+            let after = self.ledger.placement_record(id)?;
+            let changed = crate::orders::placement_changed(before_placements.get(id), &after);
+            changes.placements.push((after, changed));
+        }
+        for (id, _) in &refs.executions {
+            if let Some(held) = self.ledger.executions.get(id) {
+                changes.executions.push(held.execution.clone());
+            }
+        }
+        for (id, reference) in &refs.unplaced {
+            if let Some(held) = self.ledger.unplaced.get_mut(id) {
+                let placed = entry.body.acts.iter().any(|act| {
+                    matches!(act, crate::orders::Act::Placed { unplaced_id } if unplaced_id == id)
+                });
+                if placed {
+                    held.placed_by = Some(reference.clone());
+                }
+                held.last_change = Some(reference.clone());
+                changes.unplaced.push(held.clone());
+            }
+        }
+        for (id, reference) in &refs.locates {
+            if let Some(held) = self.ledger.locates.get_mut(id) {
+                held.locate.last_change = Some(reference.clone());
+                changes.locates.push(self.ledger.locate_record(id)?);
+            }
+        }
+        for (key, reference) in &refs.instructions {
+            if let Some(held) = self.ledger.instructions.get_mut(key) {
+                held.last_change = Some(reference.clone());
+                held.entry = Some(entry.meta.clone());
+                changes.instructions.push(held.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// A lot of this account held under another position, whose record a
     /// line moving it carries over: a merged record's lots keep their
     /// identifiers, costs and dates (W9.9).
@@ -666,7 +891,7 @@ impl Book {
             .lines
             .iter()
             .filter(|line| !line.lot_id.is_empty() || line.opens_lot.is_some())
-            .map(|line| (line.instrument_id.clone(), line.side))
+            .map(|line| (line.instrument_id.clone(), line.side, line.sleeve.clone()))
             .collect();
         for key in self.touched(body) {
             let Some(position) = self.positions.get(&key) else {
@@ -684,7 +909,11 @@ impl Book {
                     !value.negated().is_negative()
                 }
             };
-            if !on_its_side(trade) {
+            // A fill's cash may go below what the account holds: a fact is
+            // never refused for it (W11's invariants).
+            let cash_of_a_trade =
+                body.trade && position.lots.is_empty() && !lot_lines.contains(&key);
+            if !on_its_side(trade) && !cash_of_a_trade {
                 return Err(StoreError::Invalid(format!(
                     "the entry leaves {} on the {} side at {trade}; a position's quantity is \
                      signed to match its side",
@@ -770,7 +999,7 @@ fn apply_lot(
                     opened_by: Some(reference.clone()),
                     relieved_by: Vec::new(),
                     adjusted_by: Vec::new(),
-                    sleeve: String::new(),
+                    sleeve: line.sleeve.clone(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,

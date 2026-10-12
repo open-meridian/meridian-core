@@ -40,11 +40,14 @@ pub fn parts(cursor: &str, count: usize) -> Result<Vec<String>> {
     Ok(out)
 }
 
-pub fn position_key(record: &BookPosition) -> (String, String, i32) {
+/// A position's key: account, instrument, side and, from contract v22, its
+/// sleeve.
+pub fn position_key(record: &BookPosition) -> (String, String, i32, String) {
     (
         record.account_id.clone(),
         record.instrument_id.clone(),
         record.side,
+        record.sleeve.clone(),
     )
 }
 
@@ -53,15 +56,23 @@ pub fn position_cursor(record: &BookPosition) -> String {
         &record.account_id,
         &record.instrument_id,
         &record.side.to_string(),
+        &record.sleeve,
     ])
 }
 
-pub fn from_position_cursor(cursor: &str) -> Result<(String, String, i32)> {
-    let held = parts(cursor, 3)?;
+/// A cursor read back: four parts from contract v22, three from before
+/// (the sleeve then empty).
+pub fn from_position_cursor(cursor: &str) -> Result<(String, String, i32, String)> {
+    let held = parts(cursor, 4).or_else(|_| {
+        parts(cursor, 3).map(|mut held| {
+            held.push(String::new());
+            held
+        })
+    })?;
     let side = held[2]
         .parse()
         .map_err(|_| StoreError::UnreadableCursor(cursor.to_string()))?;
-    Ok((held[0].clone(), held[1].clone(), side))
+    Ok((held[0].clone(), held[1].clone(), side, held[3].clone()))
 }
 
 pub fn break_cursor(record: &Break) -> String {

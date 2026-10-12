@@ -78,6 +78,16 @@ pub struct Body {
     /// Each named position's encumbrances, the whole set, as recorded from a
     /// statement (W9.15): an attribute, never a movement.
     pub encumbrances: Vec<(String, i32, Vec<Encumbrance>)>,
+    /// What it did on the order path (W11, contract v22): orders opened and
+    /// changed, placements, executions, charges, unplaced facts, locates and
+    /// trading instructions, from which the fold derives every status.
+    pub acts: Vec<crate::orders::Act>,
+    /// Its lines are a fill's or a charge's (W11.13): a cash line may take
+    /// the account's cash below zero, which a fact is never refused for.
+    pub trade: bool,
+    /// It states whether releases wait for compliance (contract v22): a new
+    /// account's first entry, the attribute set, or the upgrade's backfill.
+    pub states_waits: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -112,6 +122,12 @@ struct Kept {
     event_reference: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     encumbrances: Vec<(String, i32, Vec<String>)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    acts: Vec<crate::orders::Act>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    trade: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    states_waits: bool,
 }
 
 fn encoded<M: Message>(message: &M) -> String {
@@ -158,6 +174,9 @@ impl Body {
                     )
                 })
                 .collect(),
+            acts: self.acts.clone(),
+            trade: self.trade,
+            states_waits: self.states_waits,
         };
         serde_json::to_vec(&kept).expect("an entry's body is plain data")
     }
@@ -186,6 +205,9 @@ impl Body {
                 .iter()
                 .map(|(instrument, side, held)| Ok((instrument.clone(), *side, all(held)?)))
                 .collect::<Result<_>>()?,
+            acts: kept.acts,
+            trade: kept.trade,
+            states_waits: kept.states_waits,
         })
     }
 

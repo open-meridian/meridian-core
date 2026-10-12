@@ -48,5 +48,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-codegen-target,target=/src/codegen/target \
     cd codegen && cargo run --release --locked
 
+# The book's transition table (decisions/035), generated from
+# meridian-schema's boundaries/transitions.json at the pinned revision, a
+# build context the Makefile names as it names the protos'.
+FROM python:3.12-alpine AS transitions
+COPY tools/generate_transitions.py /tools/generate_transitions.py
+COPY --from=schema-boundaries transitions.json /schema-boundaries/transitions.json
+RUN mkdir -p /out \
+ && python3 /tools/generate_transitions.py --self-test \
+ && python3 /tools/generate_transitions.py /schema-boundaries/transitions.json /out/transitions.rs
+
 FROM scratch AS export
 COPY --from=rust-gen /out/v1.rs /v1.rs
+COPY --from=transitions /out/transitions.rs /transitions.rs

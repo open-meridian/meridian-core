@@ -58,6 +58,34 @@ pub enum StoreError {
 
     #[error("{0} is not a cursor this store wrote; start again from the first page")]
     UnreadableCursor(String),
+
+    /// A command the book reads as malformed, naming each field it got
+    /// wrong (contract v22: INVALID_ARGUMENT, no reason code): an order
+    /// naming both a quantity and a cash quantity, or neither; a child on
+    /// another side; a fill with no settlement date.
+    #[error("{words}")]
+    Malformed { fields: Vec<String>, words: String },
+
+    /// A command naming its record by ID alone whose account is outside the
+    /// write scope the sidecar stamped on it (contract v22, W4.9): refused
+    /// PERMISSION_DENIED with no reason code, nothing changed.
+    #[error("{0}")]
+    Denied(String),
+
+    /// A venue's fact already applied, recognised by its venue identifiers
+    /// (requirement 14): answered as it stands, nothing applied.
+    #[error("the fact was applied already")]
+    Repeated(Vec<u8>),
+
+    /// A venue's fact the account's book cannot place -- its placement not
+    /// the sender's, or its account outside the sender's scope -- to be kept
+    /// as an unplaced fact naming no account (W11.13).
+    #[error("{words}")]
+    Unplace { reason: i32, words: String },
+
+    /// A refusal the book recorded (W11.8), as it is said on the bus.
+    #[error("{0}")]
+    Recorded(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -107,6 +135,17 @@ impl StoreError {
                 words,
                 fields,
             } => meridian_bus::refusal_naming(*reason as i32, fields, words),
+            StoreError::Malformed { fields, words } => meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                fields,
+                words,
+            ),
+            StoreError::Denied(words) => meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::PermissionDenied,
+                &[],
+                words,
+            ),
+            StoreError::Recorded(said) => said.clone(),
             other => other.to_string(),
         }
     }
@@ -117,8 +156,42 @@ impl StoreError {
 pub const FIRST_PARTITION: &str = "P0";
 
 /// The control partition, which holds no account; its sequence in force is
-/// stamped on every entry. Nothing writes it in v8.
+/// stamped on every entry. From contract v22 it holds the trading
+/// instructions that are not a deployment admin's on one account (W11.15).
 pub const CONTROL_PARTITION: &str = "control";
+
+/// The control partition's book, as the store keys it: no account's, never
+/// listed among the accounts, and read by no plugin's scope.
+pub const CONTROL_ACCOUNT: &str = "~control";
+
+/// Where a venue's fact naming no account the book can place it in is kept
+/// (W11.13): an unplaced fact with an empty account, delivered to no plugin
+/// and counted on its connectivity plugin's admin view. Never listed among
+/// the accounts, and read by no plugin's scope.
+pub const NO_ACCOUNT: &str = "~unplaced";
+
+/// Whether a key the store holds a book under is an account's.
+pub fn is_account(key: &str) -> bool {
+    !key.starts_with('~')
+}
+
+/// The partition a book key starts in.
+pub fn first_partition_of(key: &str) -> &'static str {
+    if key == CONTROL_ACCOUNT {
+        CONTROL_PARTITION
+    } else {
+        FIRST_PARTITION
+    }
+}
+
+/// A record a command may name by its ID alone (contract v22, W4.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Record {
+    Order,
+    Placement,
+    ChangeRequest,
+    Locate,
+}
 
 /// Whose accounts a read answers for (W4.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +311,57 @@ pub struct AttributesRead {
     pub cursor: String,
 }
 
+/// W11.17: the orders and the records the order path delivers, as of now
+/// or changed since a watermark.
+#[derive(Debug, Clone)]
+pub struct OrdersRead {
+    pub scope: Scope,
+    pub account_id: String,
+    pub since: Option<Mark>,
+    pub limit: usize,
+    pub cursor: String,
+}
+
+/// A page of them: each kind in its own list, paged as one stream in the
+/// order orders, placements, executions, unplaced facts.
+#[derive(Debug, Clone, Default)]
+pub struct OrdersPage {
+    pub orders: Vec<meridian_domain::v1::Order>,
+    pub placements: Vec<meridian_domain::v1::Placement>,
+    pub executions: Vec<meridian_domain::v1::Execution>,
+    pub unplaced: Vec<meridian_domain::v1::UnplacedFact>,
+    pub next_cursor: String,
+    pub as_of: Mark,
+}
+
+/// W11.17: one order's journal from its first entry.
+#[derive(Debug, Clone)]
+pub struct HistoryRead {
+    pub scope: Scope,
+    pub account_id: String,
+    pub order_id: String,
+    pub limit: usize,
+    pub cursor: String,
+}
+
+/// W11.18: the locates.
+#[derive(Debug, Clone)]
+pub struct LocatesRead {
+    pub scope: Scope,
+    pub account_id: String,
+    pub since: Option<Mark>,
+    pub limit: usize,
+    pub cursor: String,
+}
+
+/// W11.16: the trading instructions in force, whatever the reader's scope.
+#[derive(Debug, Clone)]
+pub struct InstructionsRead {
+    pub since: Option<Mark>,
+    pub limit: usize,
+    pub cursor: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Page<T> {
     pub records: Vec<T>,
@@ -323,4 +447,22 @@ pub trait Store: Send + Sync {
 
     /// Every ISO 4217 code an amount or a base currency the book holds is in.
     fn currency_codes(&self) -> Result<Vec<String>>;
+
+    // ── The order path (W11, contract v22) ──
+
+    /// The account a record named by its ID alone is in, where the book
+    /// holds it.
+    fn owner(&self, record: Record, id: &str) -> Result<Option<String>>;
+
+    fn orders(&self, read: &OrdersRead) -> Result<OrdersPage>;
+    fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>>;
+    fn locates(&self, read: &LocatesRead) -> Result<Page<meridian_domain::v1::Locate>>;
+    fn instructions(
+        &self,
+        read: &InstructionsRead,
+    ) -> Result<Page<meridian_domain::v1::TradingInstruction>>;
+
+    /// Each live order whose own time in force ended at or before `now_ns`
+    /// and is not yet ending, with its account (W11.13).
+    fn expiring(&self, now_ns: i64) -> Result<Vec<(String, String)>>;
 }

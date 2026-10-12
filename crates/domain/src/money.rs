@@ -255,6 +255,43 @@ monies! {
     RecordHoldingRequest { market_value, cost_basis, lots, margin_requirement, average_cost }
     RecordHoldingsStatementRequest { buying_power, margin_requirement, maintenance_excess, figures }
     RecordActivityRequest { activity }
+    // The order path (W11, contract v22).
+    ReceiptQuote { bid, ask }
+    StrategyInstruction { price_limit }
+    Fee { amount }
+    Charge { fee }
+    OrderChange { limit_price }
+    PlacementChange { limit_price }
+    Placement { limit_price, strategy }
+    Execution { price, fees }
+    Order { cash_quantity, limit_price, stop_price, quote_at_receipt, change_requests, placements,
+        executions, charges }
+    ProposeOrderRequest { cash_quantity, limit_price, stop_price, quote_at_receipt }
+    RecordOrderRequest { limit_price }
+    RequestOrderChangeRequest { change }
+    CreatePlacementRequest { limit_price, strategy }
+    RequestPlacementChangeRequest { change }
+    ReportPlacementRequest { limit_price }
+    ReportExecutionRequest { price, fees }
+    ReportChargeRequest { fee }
+    OrderReply { order }
+    PlacementReply { placement }
+    FactReply { placement, execution, order, charge }
+    OrderUpdatedEvent { order }
+    PlacementUpdatedEvent { placement }
+    ExecutionRecordedEvent { execution }
+    ListOrdersReply { orders, placements, executions }
+}
+
+impl Monies for crate::v1::ChangeRequest {
+    fn monies(&mut self, visit: &mut dyn FnMut(&mut Money)) {
+        use crate::v1::change_request::Change;
+        match self.change.as_mut() {
+            Some(Change::OrderChange(change)) => change.monies(visit),
+            Some(Change::PlacementChange(change)) => change.monies(visit),
+            None => {}
+        }
+    }
 }
 
 impl Monies for crate::v1::BasisAdjustment {
