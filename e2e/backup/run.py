@@ -16,12 +16,15 @@ E2E_CLUSTER_TARGET=e2e-cluster-backup` makes one and removes it. No platform:
 the conductor waits for an enrolment nobody gives, and nothing here needs it.
 
 What the wizard's Job writes (the database, its roles, the URLs) is written
-here directly, as first run writes it; the rows the backup carries are put in
-with SQL, every one in the shape its store keeps. The secret is sealed here
-with the deployment's own settings key, in the conductor's format
-(meridian_config::sealing: a version byte, a 24-byte nonce, XChaCha20-
-Poly1305 with the instance and the setting's name as associated data), and
-opened after the restore with the key the restore put back. No value of a
+here directly, as first run writes it, and what it does then is done as it
+does it: the conductor and the dashboard restarted, which read the URL and the
+administrator only when they start, and its rights given up. The rows the
+backup carries are put in with SQL, every one in the shape its store keeps.
+The secret is sealed here with the deployment's own settings key, in the
+conductor's format (meridian_config::sealing: a version byte, a 24-byte
+nonce, XChaCha20-Poly1305 with the instance and the setting's name as
+associated data), and opened after the restore with the key the restore put
+back. No value of a
 secret, a key or a password is ever printed: each is compared by its hash.
 """
 
@@ -80,16 +83,22 @@ def out(*args):
     return kubectl(*args).stdout.decode().strip()
 
 
-def wait_for(what, ready, seconds=420):
+def happens(ready, seconds):
+    """Whether `ready` answers within `seconds`, asked every two."""
     started = time.time()
     while time.time() - started < seconds:
         try:
             if ready():
-                return
+                return True
         except Exception:
             pass
         time.sleep(2)
-    raise SystemExit(f"{what} never happened, in {seconds}s")
+    return False
+
+
+def wait_for(what, ready, seconds=420):
+    if not happens(ready, seconds):
+        raise SystemExit(f"{what} never happened, in {seconds}s")
 
 
 def secret(name):
@@ -226,10 +235,10 @@ def held():
             "from config_user_group g left join config_permission p using (user_group_id) "
             "group by g.user_group_id, g.name, g.logins order by g.name collate \"C\""
         ),
-        "accounts": psql("select account_id || '|' || name from config_account order by 1 collate \"C\""),
+        "accounts": psql("select account_id || '|' || name from config_account order by account_id collate \"C\""),
         "settings": psql(
             "select plugin_instance_id || '|' || name || '|' || coalesce(value, '<sealed>') "
-            "from config_plugin_setting order by 1 collate \"C\""
+            "from config_plugin_setting order by plugin_instance_id collate \"C\", name collate \"C\""
         ),
         "secret opens to its value": value is not None
         and hashlib.sha256(value.encode()).hexdigest() == hashlib.sha256(SECRET_VALUE.encode()).hexdigest(),
@@ -256,6 +265,75 @@ def node_backups():
     node = run("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}").stdout.decode()
     done = run("docker", "exec", node, "sh", "-c", f"ls -1 {BACKUP_PATH} 2>/dev/null || true")
     return sorted(line for line in done.stdout.decode().split() if line.endswith(".meridian-backup"))
+
+
+def first_run_job():
+    """The first-run Job's manifest, as the chart made it."""
+    jobs = json.loads(out("get", "jobs", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+    return next(j for j in jobs
+                if j["spec"]["template"]["metadata"]["labels"].get("meridian.dev/component") == "first-run")
+
+
+def first_run_env(job):
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: e.get("value", "") for e in container.get("env", [])}
+
+
+def first_run_finishes():
+    """The rest of what the Job's apply does once the Secrets are written
+    (meridian_first_run::FirstRun::apply): the Deployments the chart names
+    restarted, since the conductor and the dashboard read the database's URL
+    and the administrator only when they start; its exit; and its own
+    RoleBinding gone. The apply itself is reached only through the wizard,
+    over the bus and sealed to a key the Job holds in memory, which
+    e2e-cluster drives; here its pod is stopped, as it stops once applied.
+
+    The binding is deleted after the Job is done, never before: a pod stopped
+    while running may be counted failed and made again, and the new one finds
+    the URL and gives up the rights itself (stand_down), which it can do only
+    while it holds them. Counted done instead, it leaves them, and they are
+    deleted here."""
+    job = first_run_job()
+    env = first_run_env(job)
+    restarted = [name.strip() for name in env["MERIDIAN_FIRST_RUN_RESTART"].split(",") if name.strip()]
+    for name in restarted:
+        kubectl("rollout", "restart", f"deployment/{name}")
+    kubectl("delete", "pod", "-l", f"job-name={job['metadata']['name']}", "--wait")
+    wait_for("the first-run Job to finish", lambda: json.loads(out(
+        "get", "job", job["metadata"]["name"], "-o", "json"))["status"].get("succeeded"), seconds=120)
+    kubectl("delete", "rolebinding", env["MERIDIAN_FIRST_RUN_BINDING"], "--ignore-not-found")
+    for name in restarted:
+        kubectl("rollout", "status", f"deployment/{name}", "--timeout=600s")
+
+
+def first_run_finished():
+    """The Job done and its rights gone: what a finished first run leaves."""
+    try:
+        job = first_run_job()
+    except StopIteration:
+        return False
+    status = json.loads(out("get", "job", job["metadata"]["name"], "-o", "json"))["status"]
+    binding = first_run_env(job)["MERIDIAN_FIRST_RUN_BINDING"]
+    return bool(status.get("succeeded")) and kubectl("get", "rolebinding", binding, check=False).returncode != 0
+
+
+def started_with_the_database():
+    """Whether the conductor and the dashboard each started with the
+    database's URL: read in the running container, never printed. Without it
+    the conductor keeps its configuration in memory."""
+    for component, variable in (("conductor", "MERIDIAN_CONFIG_DATABASE_URL"),
+                                ("dashboard", "MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL")):
+        pods = json.loads(out(
+            "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component={component}",
+            "--field-selector=status.phase=Running", "-o", "json"))["items"]
+        serving = [p["metadata"]["name"] for p in pods if not p["metadata"].get("deletionTimestamp")]
+        if not serving:
+            return False
+        for pod in serving:
+            done = kubectl("exec", pod, "--", "sh", "-c", f'test -n "${variable}"', check=False)
+            if done.returncode != 0:
+                return False
+    return True
 
 
 def all_ready():
@@ -335,8 +413,11 @@ def main():
     }
     kubectl("replace", "-f", "-", input=json.dumps(addresses).encode())
     del serving, migrating, passwords
+    first_run_finishes()
     wait_for("every component ready", all_ready, seconds=600)
     s.check(True, "every component is ready")
+    s.check(started_with_the_database(), "the conductor and the dashboard started with the database's URL")
+    s.check(first_run_finished(), "first run finished, and holds no rights")
     wait_for("the administrator's permission, which the conductor writes", lambda: ADMIN in psql(
         "select array_to_string(logins, ',') from config_user_group"), seconds=300)
     s.check(True, "the conductor wrote the administrator's permission")
@@ -370,7 +451,10 @@ def main():
     )
     before = held()
     key_before = deployment_key()
-    s.check("Traders|local|bob|" in before["people"] and f"|{ADMIN}|deployment-admin" in before["people"],
+    # The administrator holds what first run grants (meridian_config's
+    # install_named_administrator): deployment admin and every plugin's admin.
+    s.check("Traders|local|bob|" in before["people"]
+            and f"|{ADMIN}|all-plugins-admin,deployment-admin" in before["people"],
             "two people: the administrator with their access, and a trader")
     s.check(before["secret opens to its value"], "the secret setting opens with the settings key")
     s.check("position|Fund A|INS-E2E|" in before["book"] and "lot|Fund A|INS-E2E|" in before["book"],
@@ -429,13 +513,21 @@ def main():
 
     print("H: what it holds now is what it held", flush=True)
     wait_for("every component ready", all_ready, seconds=300)
+    # What the components read only when they start, as after first run: a
+    # conductor still on the store it keeps in memory until it has a database
+    # would answer for nobody, whatever the database holds.
+    s.check(started_with_the_database(), "the conductor and the dashboard started with the database's URL")
+    s.check(first_run_finished(), "first run finished, and holds no rights")
     after = held()
     for what in before:
         s.check(after[what] == before[what], f"the same {what}")
     s.check(deployment_key() == key_before, "the same deployment key, now from a Secret")
-    migrate = out("get", "jobs", "-o", "jsonpath={range .items[*]}{.metadata.name} {.status.succeeded}{\"\\n\"}{end}")
-    s.check(any(line.startswith(f"{FULL}-migrate-") and line.endswith(" 1") for line in migrate.splitlines()),
-            "the migration ran, once the database's URL was given")
+    # Waited for: the Job starts with the URL, and the components do not wait
+    # for it here, since the restored schema is already the one they verify.
+    def migrated():
+        jobs = out("get", "jobs", "-o", "jsonpath={range .items[*]}{.metadata.name} {.status.succeeded}{\"\\n\"}{end}")
+        return any(line.startswith(f"{FULL}-migrate-") and line.endswith(" 1") for line in jobs.splitlines())
+    s.check(happens(migrated, 300), "the migration ran, once the database's URL was given")
 
     print("I: and the restored deployment backs up again", flush=True)
     for name in files:
