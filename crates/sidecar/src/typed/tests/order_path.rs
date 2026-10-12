@@ -467,3 +467,33 @@ fn a_placement_reaches_a_connectivity_plugin_only_at_the_instance_it_names() {
         "fix-2"
     ));
 }
+
+#[tokio::test]
+async fn a_plugin_holding_custody_and_connectivity_takes_the_map_never_its_links() {
+    // Q42: custody does not send a venue's order, so only the map stamps it,
+    // whatever account the plugin names and whether or not it names a code.
+    let map = VenueAccountMap {
+        ems_instance_id: "ems-1".into(),
+        mappings: vec![VenueAccountMapping {
+            connectivity_instance_id: "snap-1".into(),
+            venue_account_code: "SNAP-A".into(),
+            account_id: "ACC-1".into(),
+        }],
+    };
+    let p = plugin("snap-1", &["custody", "connectivity"], Some(map)).await;
+    for (code, expected) in [("SNAP-A", "ACC-1"), ("", "")] {
+        p.sidecar
+            .record_order(Request::new(RecordOrderParams {
+                venue_account_code: code.into(),
+                account_id: "ACC-3".into(),
+                quantity: one(),
+                venue_order_id: "V-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let (_, body) = p.heard.lock().unwrap().last().cloned().unwrap();
+        let sent = meridian_domain::v1::RecordOrderRequest::decode(&body[..]).unwrap();
+        assert_eq!(sent.account_id, expected, "code {code:?}");
+    }
+}

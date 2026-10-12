@@ -136,6 +136,23 @@ pub(crate) const BY_ID_ALONE: [&str; 11] = [
     "meridian.v1.RecordLocateUseRequest",
 ];
 
+/// The venue facts stamped from the venue account map (matrix/stamped.tsv's
+/// `venue-account-map`, contract v22), each with the topic it is sent on.
+const VENUE_FACTS: [(&str, &str); 3] = [
+    (
+        "meridian.v1.RecordOrderRequest",
+        "platform.book.command.record-order",
+    ),
+    (
+        "meridian.v1.ReportExecutionRequest",
+        "platform.book.command.report-execution",
+    ),
+    (
+        "meridian.v1.RecordLocateRequest",
+        "platform.book.command.record-locate",
+    ),
+];
+
 /// The role whose venue facts take their account from the venue account map
 /// (contract v22, W11.22).
 const CONNECTIVITY: &str = "connectivity";
@@ -214,16 +231,25 @@ impl Sidecar {
     /// nobody has, so the book keeps the fact unplaced (W11.13). Sent by a
     /// plugin holding another role that sends the row, and not
     /// `connectivity`, the account it named, as it named it. A plugin
-    /// holding both is read as its connectivity role wherever it names a
-    /// code.
+    /// holding `connectivity` and another role that sends the row is read
+    /// as its connectivity role wherever it names a code. A role that does
+    /// not send the row gives no shortcut: a plugin holding `custody` and
+    /// `connectivity` takes the map, never its custody links (Q42).
     pub(crate) async fn venue_mapped_account(
         &self,
         payload_type: &str,
         venue_account_code: &str,
         named: &str,
     ) -> Result<String, Status> {
-        let connectivity = self.identity.roles.iter().any(|role| role == CONNECTIVITY);
-        let other = self.identity.roles.iter().any(|role| role != CONNECTIVITY);
+        let sending: Vec<String> = match VENUE_FACTS
+            .iter()
+            .find(|(fact, _)| *fact == payload_type)
+        {
+            Some((_, topic)) => self.roles_granting(topic),
+            None => self.identity.roles.clone(),
+        };
+        let connectivity = sending.iter().any(|role| role == CONNECTIVITY);
+        let other = sending.iter().any(|role| role != CONNECTIVITY);
         if !connectivity || (other && venue_account_code.is_empty()) {
             return Ok(named.to_string());
         }
