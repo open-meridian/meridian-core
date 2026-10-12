@@ -493,6 +493,14 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
                 dataset.day_end_minute
             ));
         }
+        // The settlement calendar its business dates follow (contract v22,
+        // W10.1): empty names none, as before.
+        if !dataset.calendar_id.is_empty() && !dataset.calendar_id.starts_with("CAL-") {
+            return Some(format!(
+                "{at}.calendar_id {:?} is not a platform calendar's ID (CAL-...)",
+                dataset.calendar_id
+            ));
+        }
         if !dataset.venue_id.is_empty() && !dataset.venue_id.starts_with("VEN-") {
             return Some(format!(
                 "{at}.venue_id {:?} is not a venue master ID (VEN-...)",
@@ -598,6 +606,13 @@ mod tests {
                     ..daily()
                 },
                 "venue_id",
+            ),
+            (
+                DatasetDeclaration {
+                    calendar_id: "NYSE".into(),
+                    ..daily()
+                },
+                "calendar_id",
             ),
         ] {
             let said = refused(wrong, &["data"]).expect(words);
