@@ -676,8 +676,11 @@ message EntitlementsChangedEvent {
 // the venue account codes they trade under, so it sets the venue's account
 // field and the sidecar stamps a venue fact's account
 // (`venue-account-map`); a connectivity plugin links no account of its own.
-// The conductor keeps each, every change its own record (decisions/031), and
-// delivers them beside each plugin's scope (W4.11). ConnectivityLink and
+// The conductor keeps each, every change its own record (decisions/031:
+// ConnectivityLinkChange and VenueAccountMapChange, kept by the conductor and
+// named in the dictionary with `kept_by: conductor`, which no proto carries,
+// as the dashboard keeps ServiceAccountChange), and delivers them beside
+// each plugin's scope (W4.11). ConnectivityLink and
 // VenueAccountMap ride that delivery, so they are plugin-facing, declared in
 // meridian-schema's sidecar.proto and imported from there.
 
@@ -704,24 +707,6 @@ message LinkConnectivityRequest {
   string note = 4;
 }
 
-// One change to a connectivity plugin's link, its own record: who, when,
-// the instance, from, to, a note (W11.21).
-message ConnectivityLinkChange {
-  string connectivity_instance_id = 1;
-  // The deployment-local subject the dashboard stamped, and when.
-  string changed_by = 2;
-  int64 changed_at_ns = 3;
-  // The delegation and its client, where one was used (W4.9).
-  string acting_through_delegation = 4;
-  string client_name = 5;
-  // The link before the change, and after it (W11.21's "from" and "to").
-  ConnectivityLink from_link = 6;
-  ConnectivityLink to_link = 7;
-  string note = 8;
-  // The prepared change it was made from, where one was (W6.27).
-  string prepared_call_id = 9;
-}
-
 // W11.22. Sent by the `ems` acting for the admin viewing its page (W4.9):
 // maps an account to the venue account code it trades under at one of the
 // `ems`'s connectivity plugins, or removes the mapping (an empty
@@ -736,17 +721,6 @@ message MapVenueAccountRequest {
   string account_id = 3;
   // Stamped by the sidecar: the sending instance.
   string ems_instance_id = 4;
-}
-
-// One change to an `ems`'s map, its own record (W11.22).
-message VenueAccountMapChange {
-  string ems_instance_id = 1;
-  string changed_by = 2;
-  int64 changed_at_ns = 3;
-  // The mapping before the change, and after it; unset where there was
-  // none, or is none.
-  VenueAccountMapping from_mapping = 4;
-  VenueAccountMapping to_mapping = 5;
 }
 
 // A venue's offering per venue account code (W11.20), converted at the edge
