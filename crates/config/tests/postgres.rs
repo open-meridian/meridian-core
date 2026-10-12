@@ -2077,7 +2077,9 @@ fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
         ems_instance_id: "ems-1".into(),
         ..available.clone()
     };
-    store.set_connectivity_link(&linked, &by("linked"), 12).unwrap();
+    store
+        .set_connectivity_link(&linked, &by("linked"), 12)
+        .unwrap();
     let changes = store.connectivity_link_changes("fix-1").unwrap();
     assert_eq!(changes.len(), 2);
     assert!(changes[0].from_link.is_none());

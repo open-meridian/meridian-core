@@ -241,9 +241,7 @@ impl Sidecar {
         venue_account_code: &str,
         named: &str,
     ) -> Result<String, Status> {
-        let sending: Vec<String> = match VENUE_FACTS
-            .iter()
-            .find(|(fact, _)| *fact == payload_type)
+        let sending: Vec<String> = match VENUE_FACTS.iter().find(|(fact, _)| *fact == payload_type)
         {
             Some((_, topic)) => self.roles_granting(topic),
             None => self.identity.roles.clone(),
