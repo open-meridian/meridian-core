@@ -1263,6 +1263,25 @@ async fn trading_instructions_are_journalled_in_their_partitions_and_read_with_t
     .await
     .unwrap_err();
     assert_eq!(status_of(&refused).unwrap().1, vec!["setter_level"]);
+    // A user group's persons are not resolved in v22: refused, naming it.
+    let group = set(
+        TradingInstructionTarget {
+            user_group_id: "UG-desk-2".into(),
+            ..Default::default()
+        },
+        TradingInstructionValue::Pause,
+        "pause the desk",
+    );
+    let refused = send_from(
+        &w.bus,
+        SET_TRADING_INSTRUCTION,
+        "meridian.v1.SetTradingInstructionRequest",
+        &group,
+        &admin,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["target.user_group_id"]);
     // A plugin admin names their plugin; All accounts is not theirs.
     let mut overreach = set(
         TradingInstructionTarget {

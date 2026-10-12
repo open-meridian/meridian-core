@@ -2702,6 +2702,17 @@ pub fn set_trading_instruction(
         .clone()
         .ok_or_else(|| malformed(&["target"], "an instruction names its target"))?;
     check_target(&target)?;
+    // A user group is not resolved to its persons in v22 (covers carried
+    // empty; v27 resolves groups), so an instruction on one is refused
+    // naming the field rather than standing unapplied (the product owner,
+    // 2026-10-12).
+    if !target.user_group_id.is_empty() {
+        return Err(malformed(
+            &["target.user_group_id"],
+            "an instruction on a user group is not taken in v22: its persons are not resolved \
+             until v27; set it on each person, service account, plugin or account instead",
+        ));
+    }
     if request.value == TradingInstructionValue::Unspecified as i32
         || TradingInstructionValue::try_from(request.value).is_err()
     {
