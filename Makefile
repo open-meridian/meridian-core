@@ -468,6 +468,11 @@ E2E_K3D_SYSTEM ?= coredns local-path-provisioner metrics-server traefik
 # that arrive through the Ingress; e2e-cluster-backup needs none, and on a
 # laptop whose own cluster holds 80 it is run with another.
 E2E_K3D_HTTP ?= 80
+# The namespace the run installs into, whose pods and events go to
+# .e2e-cluster.log when it fails: the backup run's own for that run. CI run
+# 38188494317's backup failure logged no pod at all, read from meridian-e2e,
+# which that run never makes.
+E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(E2E_CLUSTER_NAMESPACE))
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -519,14 +524,14 @@ e2e-cluster-k3d:
 	  if [ $$held -ne 0 ]; then \
 	    echo "e2e-cluster-k3d: what the cluster said, in .e2e-cluster.log" >&2; \
 	    { KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl get pods -A -o wide; \
-	      KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get events --sort-by=.lastTimestamp; \
-	      for pod in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get pods -o name); do \
-	        for c in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) get $$pod \
+	      KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) get events --sort-by=.lastTimestamp; \
+	      for pod in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) get pods -o name); do \
+	        for c in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) get $$pod \
 	            -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}'); do \
 	          echo "== $$pod, $$c"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod -c $$c --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --tail=80; \
 	          echo "== $$pod, $$c before, if it restarted"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_CLUSTER_NAMESPACE) logs $$pod -c $$c --previous --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --previous --tail=80; \
 	        done; \
 	      done; } > .e2e-cluster.log 2>&1; \
 	  fi; \
