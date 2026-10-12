@@ -19,6 +19,13 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
+# Smaller build caches on the VM's one disk, which the gates and the dev
+# deployment share: no incremental state, which a fresh build never reuses
+# across stages, and line tables alone for debug builds and tests, so a
+# stack trace stays readable at about half the artifacts' size.
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    CARGO_PROFILE_TEST_DEBUG=line-tables-only
 WORKDIR /w
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/

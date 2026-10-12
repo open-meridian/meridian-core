@@ -25,6 +25,8 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# No incremental state in the build cache, on the VM's one shared disk.
+ENV CARGO_INCREMENTAL=0
 WORKDIR /w
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
