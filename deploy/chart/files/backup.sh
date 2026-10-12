@@ -127,6 +127,19 @@ if [ "$included" = true ]; then
 		# As the migrating role, which owns the tables.
 		target=$(cat "/in/secrets/$MERIDIAN_BACKUP_DATABASE_SECRET/migrate-url" 2>/dev/null || cat "$url_file")
 	fi
+	# Waited for, every two seconds for at most two minutes, before the dump's
+	# one connection. A pod's first connections can be refused while the
+	# cluster's network policy has not yet admitted its address: on k3s every
+	# scheduled backup failed so ("Connection refused", within a second of
+	# starting), while a pod a second older reached the same database. And a
+	# database restarting under an upgrade answers again within the wait.
+	waited=0
+	until pg_isready -q -t 5 -d "$target"; do
+		[ "$waited" -lt 120 ] || fail "the database $database did not answer within 120s"
+		[ "$waited" -gt 0 ] || say "waiting for the database $database to answer"
+		sleep 2
+		waited=$((waited + 2))
+	done
 	export MERIDIAN_DUMP="$work/database/database.dump" MERIDIAN_TARGET="$target"
 	# The dump and the counts in one snapshot, exported by the transaction the
 	# counts are read in, so what restore checks is what the dump holds.
