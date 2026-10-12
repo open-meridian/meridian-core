@@ -427,36 +427,6 @@ def serve(served):
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
-class Delivered:
-    def __init__(self, message):
-        self.message = message
-
-
-ROWS = {"placement_updated": "PlacementUpdated",
-        "trading_instruction_changed": "TradingInstructionChanged"}
-
-
-async def hear(plugin, handlers):
-    """Each delivery of the rows `handlers` names, handed on in order; the
-    stream opened again when it breaks."""
-    while True:
-        try:
-            call = plugin._operations().Receive(
-                ops.ReceiveRequest(rows=[ROWS[item] for item in handlers]))
-            async for delivery in call:
-                which = delivery.WhichOneof("item")
-                if which in handlers:
-                    try:
-                        await handlers[which](Delivered(getattr(delivery, which)))
-                    except Exception as failed:  # said, and the stream goes on
-                        log(handler_failed=f"{type(failed).__name__}: {failed}")
-                elif which == "lost":
-                    log(lost=str(delivery.lost))
-        except grpc.aio.AioRpcError as broken:
-            log(stream_broken=broken.details())
-        await asyncio.sleep(1)
-
-
 async def main():
     title, kind, levels = {
         "pm": ("Portfolio stand-in", Pm, ["write", "admin"]),
@@ -468,15 +438,15 @@ async def main():
     plugin = await meridian.connect(
         interface=Interface(PORT, title, pages=[Page("/", title, levels=levels, roles=roles)]))
     served = kind(plugin)
-    # Heard by the sidecar's own stream, row by row (W4.3): the SDK's
-    # receive() seeds the trading instructions' unscoped row through a read
-    # it cannot make yet (the gate-only SDK; SDK 0.26.0's), so the stand-ins
-    # read the stream themselves.
+    # Heard through the SDK's receive (W4.3): seeded by one read at start,
+    # nothing handed on for it, then each change in order.
     if KIND == "venue":
-        asyncio.ensure_future(hear(plugin, {"placement_updated": served.on_placement,
-                                            "trading_instruction_changed": served.on_instruction}))
+        asyncio.ensure_future(plugin.receive(placement_updated=served.on_placement,
+                                             trading_instruction_changed=served.on_instruction,
+                                             seed=False))
     elif KIND == "desk":
-        asyncio.ensure_future(hear(plugin, {"trading_instruction_changed": served.on_instruction}))
+        asyncio.ensure_future(plugin.receive(trading_instruction_changed=served.on_instruction,
+                                             seed=False))
     log(registered=plugin.identity.instance_id, kind=KIND)
     threading.Thread(target=serve, args=(served,), daemon=True).start()
     while True:
