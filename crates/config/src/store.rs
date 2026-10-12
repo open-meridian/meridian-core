@@ -14,12 +14,16 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::v1::DatasetEntitlement;
+use meridian_domain::v1::VenueCatalogue;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     KnownPluginRoles, LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginCatalogue,
     PluginLaunch, PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
-use meridian_pb::v1::{Catalogue, DatasetLicence, MoveOutcome, SettingDeclaration, StoredSpan};
+use meridian_pb::v1::{
+    Catalogue, ConnectivityLink, DatasetLicence, MoveOutcome, SettingDeclaration, StoredSpan,
+    VenueAccountMapping,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -424,6 +428,54 @@ pub struct Snapshot {
     /// the accounts granted now, with who last changed them. An instance
     /// never granted any has none.
     pub linkable: BTreeMap<String, LinkableAccounts>,
+    /// Each connectivity plugin's link as its latest record says it (W11.21,
+    /// contract v22), by instance: available or not, its `ems`, its users. An
+    /// instance never recorded is withdrawn and unlinked.
+    pub connectivity: BTreeMap<String, ConnectivityLink>,
+    /// Each venue account mapping standing (W11.22, contract v22), with the
+    /// `ems` that made it, by connectivity plugin and code.
+    pub venue_mappings: Vec<HeldMapping>,
+}
+
+/// One venue account mapping as the conductor keeps it (W11.22): the `ems`
+/// that made it, and the code's account at one connectivity plugin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldMapping {
+    pub ems_instance_id: String,
+    pub mapping: VenueAccountMapping,
+}
+
+/// One change to a connectivity plugin's link, its own record
+/// (ConnectivityLinkChange, W11.21, decisions/031; `kept_by: conductor`, no
+/// proto): the link before -- none for the upgrade's own record -- and
+/// after, who, through which delegation and client, when and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectivityLinkChange {
+    pub connectivity_instance_id: String,
+    pub from_link: Option<ConnectivityLink>,
+    pub to_link: ConnectivityLink,
+    pub by: String,
+    pub delegation: String,
+    pub client: String,
+    pub at_ns: i64,
+    pub note: String,
+}
+
+/// One change to an `ems`'s venue account map, its own record
+/// (VenueAccountMapChange, W11.22, decisions/031; `kept_by: conductor`, no
+/// proto): the `ems` that sent it, the mapping before (none where the code
+/// had none) and after (none where it was removed), who it acted for and
+/// when.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VenueAccountMapChange {
+    pub ems_instance_id: String,
+    pub from_mapping: Option<VenueAccountMapping>,
+    pub to_mapping: Option<VenueAccountMapping>,
+    pub by: String,
+    pub delegation: String,
+    pub client: String,
+    pub at_ns: i64,
+    pub note: String,
 }
 
 /// One grant or withdrawal of an instance's linkable accounts, its own
@@ -861,4 +913,44 @@ pub trait Store: Send + Sync {
         &self,
         plugin_instance_id: &str,
     ) -> Result<Vec<LinkableAccountsChange>>;
+
+    /// A connectivity plugin's link as the change makes it, in place of the
+    /// last, the change its own record (W11.21, contract v22): nothing
+    /// recorded when nothing changes. Returns the link as it now stands.
+    fn set_connectivity_link(
+        &self,
+        link: &ConnectivityLink,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<ConnectivityLink>;
+
+    /// Every change of one connectivity plugin's link, the upgrade's
+    /// included, in the order recorded.
+    fn connectivity_link_changes(&self, instance_id: &str) -> Result<Vec<ConnectivityLinkChange>>;
+
+    /// A venue account mapping made, replaced or removed (`to` none), the
+    /// change its own record (W11.22, contract v22): nothing recorded when
+    /// nothing changes. `from` is the mapping the caller read as standing.
+    fn map_venue_account(
+        &self,
+        ems_instance_id: &str,
+        from: Option<&VenueAccountMapping>,
+        to: Option<&VenueAccountMapping>,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()>;
+
+    /// Every change one `ems` made to its venue account map, in order.
+    fn venue_account_map_changes(
+        &self,
+        ems_instance_id: &str,
+    ) -> Result<Vec<VenueAccountMapChange>>;
+
+    /// A venue's catalogue as a connectivity plugin published it, latest per
+    /// plugin and code, a change its own record (W11.20, contract v22);
+    /// true when it differs from what was kept.
+    fn keep_venue_catalogue(&self, catalogue: &VenueCatalogue, at_ns: i64) -> Result<bool>;
+
+    /// The latest catalogue a plugin published for a code, if any.
+    fn venue_catalogue(&self, instance_id: &str, code: &str) -> Result<Option<VenueCatalogue>>;
 }

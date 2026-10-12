@@ -31,6 +31,7 @@ use crate::store::{
     SettingsAuthor, Snapshot, Store, StoreError, StoredSetting, Withdrawal,
     REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
+use crate::store::{ConnectivityLinkChange, HeldMapping, VenueAccountMapChange};
 use crate::DEPLOYMENT_ADMIN;
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -519,6 +520,41 @@ impl Store for PostgresStore {
                 })
                 .account_ids
                 .push(row.get(1));
+        }
+
+        // Each connectivity plugin's link and each venue account mapping
+        // standing (W11.21, W11.22, contract v22).
+        for row in tx
+            .query(
+                "SELECT connectivity_instance_id, link FROM config_connectivity_link
+                  ORDER BY connectivity_instance_id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let bytes: Vec<u8> = row.get(1);
+            snapshot.connectivity.insert(
+                row.get(0),
+                meridian_pb::v1::ConnectivityLink::decode(&bytes[..]).map_err(unavailable)?,
+            );
+        }
+        for row in tx
+            .query(
+                "SELECT ems_instance_id, connectivity_instance_id, venue_account_code, account_id
+                   FROM config_venue_account_mapping
+                  ORDER BY connectivity_instance_id, venue_account_code",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            snapshot.venue_mappings.push(HeldMapping {
+                ems_instance_id: row.get(0),
+                mapping: meridian_pb::v1::VenueAccountMapping {
+                    connectivity_instance_id: row.get(1),
+                    venue_account_code: row.get(2),
+                    account_id: row.get(3),
+                },
+            });
         }
 
         tx.commit().map_err(unavailable)?;
@@ -1605,6 +1641,292 @@ impl Store for PostgresStore {
                 note: row.get(6),
             })
             .collect())
+    }
+
+    fn set_connectivity_link(
+        &self,
+        link: &meridian_pb::v1::ConnectivityLink,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<meridian_pb::v1::ConnectivityLink> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let instance = &link.connectivity_instance_id;
+        // One instance's link in turn, so two changes never interleave.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('config_connectivity_link:' || $1))",
+            &[instance],
+        )
+        .map_err(unavailable)?;
+        let from: Option<Vec<u8>> = tx
+            .query_opt(
+                "SELECT link FROM config_connectivity_link WHERE connectivity_instance_id = $1",
+                &[instance],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        let standing = match &from {
+            Some(bytes) => {
+                meridian_pb::v1::ConnectivityLink::decode(&bytes[..]).map_err(unavailable)?
+            }
+            None => meridian_pb::v1::ConnectivityLink {
+                connectivity_instance_id: instance.clone(),
+                ..Default::default()
+            },
+        };
+        if standing == *link {
+            tx.commit().map_err(unavailable)?;
+            return Ok(standing);
+        }
+        let to = link.encode_to_vec();
+        tx.execute(
+            "INSERT INTO config_connectivity_link (connectivity_instance_id, link)
+             VALUES ($1, $2)
+             ON CONFLICT (connectivity_instance_id) DO UPDATE SET link = excluded.link",
+            &[instance, &to],
+        )
+        .map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO config_connectivity_link_change
+                    (connectivity_instance_id, from_link, to_link, changed_by,
+                     through_delegation, client_name, changed_at_ns, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                instance,
+                &from,
+                &to,
+                &author.by,
+                &author.delegation,
+                &author.client,
+                &at_ns,
+                &author.note,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(link.clone())
+    }
+
+    fn connectivity_link_changes(&self, instance_id: &str) -> Result<Vec<ConnectivityLinkChange>> {
+        self.conn()?
+            .query(
+                "SELECT from_link, to_link, changed_by, through_delegation, client_name,
+                        changed_at_ns, note
+                   FROM config_connectivity_link_change WHERE connectivity_instance_id = $1
+                  ORDER BY change_id",
+                &[&instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let from: Option<Vec<u8>> = row.get(0);
+                let to: Vec<u8> = row.get(1);
+                Ok(ConnectivityLinkChange {
+                    connectivity_instance_id: instance_id.to_string(),
+                    from_link: from
+                        .map(|bytes| meridian_pb::v1::ConnectivityLink::decode(&bytes[..]))
+                        .transpose()
+                        .map_err(unavailable)?,
+                    to_link: meridian_pb::v1::ConnectivityLink::decode(&to[..])
+                        .map_err(unavailable)?,
+                    by: row.get(2),
+                    delegation: row.get(3),
+                    client: row.get(4),
+                    at_ns: row.get(5),
+                    note: row.get(6),
+                })
+            })
+            .collect()
+    }
+
+    fn map_venue_account(
+        &self,
+        ems_instance_id: &str,
+        from: Option<&meridian_pb::v1::VenueAccountMapping>,
+        to: Option<&meridian_pb::v1::VenueAccountMapping>,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        let Some((instance, code)) = to.or(from).map(|held| {
+            (
+                held.connectivity_instance_id.clone(),
+                held.venue_account_code.clone(),
+            )
+        }) else {
+            return Ok(());
+        };
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('config_venue_account_mapping:' || $1))",
+            &[&instance],
+        )
+        .map_err(unavailable)?;
+        let standing = tx
+            .query_opt(
+                "SELECT ems_instance_id, account_id FROM config_venue_account_mapping
+                  WHERE connectivity_instance_id = $1 AND venue_account_code = $2",
+                &[&instance, &code],
+            )
+            .map_err(unavailable)?
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)));
+        let unchanged = match (&standing, to) {
+            (None, None) => true,
+            (Some((ems, account)), Some(mapping)) => {
+                ems == ems_instance_id && account == &mapping.account_id
+            }
+            _ => false,
+        };
+        if unchanged {
+            tx.commit().map_err(unavailable)?;
+            return Ok(());
+        }
+        match to {
+            Some(mapping) => tx.execute(
+                "INSERT INTO config_venue_account_mapping
+                        (connectivity_instance_id, venue_account_code, ems_instance_id, account_id)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (connectivity_instance_id, venue_account_code)
+                 DO UPDATE SET ems_instance_id = excluded.ems_instance_id,
+                               account_id = excluded.account_id",
+                &[&instance, &code, &ems_instance_id, &mapping.account_id],
+            ),
+            None => tx.execute(
+                "DELETE FROM config_venue_account_mapping
+                  WHERE connectivity_instance_id = $1 AND venue_account_code = $2",
+                &[&instance, &code],
+            ),
+        }
+        .map_err(unavailable)?;
+        let from_account = standing.map(|(_, account)| account).unwrap_or_default();
+        let to_account = to
+            .map(|mapping| mapping.account_id.clone())
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO config_venue_account_map_change
+                    (ems_instance_id, connectivity_instance_id, venue_account_code,
+                     from_account_id, to_account_id, changed_by, through_delegation,
+                     client_name, changed_at_ns, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &ems_instance_id,
+                &instance,
+                &code,
+                &from_account,
+                &to_account,
+                &author.by,
+                &author.delegation,
+                &author.client,
+                &at_ns,
+                &author.note,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn venue_account_map_changes(
+        &self,
+        ems_instance_id: &str,
+    ) -> Result<Vec<VenueAccountMapChange>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT connectivity_instance_id, venue_account_code, from_account_id,
+                        to_account_id, changed_by, through_delegation, client_name,
+                        changed_at_ns, note
+                   FROM config_venue_account_map_change WHERE ems_instance_id = $1
+                  ORDER BY change_id",
+                &[&ems_instance_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let mapping = |account: String| {
+                    (!account.is_empty()).then(|| meridian_pb::v1::VenueAccountMapping {
+                        connectivity_instance_id: row.get(0),
+                        venue_account_code: row.get(1),
+                        account_id: account,
+                    })
+                };
+                VenueAccountMapChange {
+                    ems_instance_id: ems_instance_id.to_string(),
+                    from_mapping: mapping(row.get(2)),
+                    to_mapping: mapping(row.get(3)),
+                    by: row.get(4),
+                    delegation: row.get(5),
+                    client: row.get(6),
+                    at_ns: row.get(7),
+                    note: row.get(8),
+                }
+            })
+            .collect())
+    }
+
+    fn keep_venue_catalogue(
+        &self,
+        catalogue: &meridian_domain::v1::VenueCatalogue,
+        at_ns: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('config_venue_catalogue:' || $1))",
+            &[&catalogue.connectivity_instance_id],
+        )
+        .map_err(unavailable)?;
+        let bytes = catalogue.encode_to_vec();
+        let latest: Option<Vec<u8>> = tx
+            .query_opt(
+                "SELECT catalogue FROM config_venue_catalogue
+                  WHERE connectivity_instance_id = $1 AND venue_account_code = $2
+                  ORDER BY catalogue_id DESC LIMIT 1",
+                &[
+                    &catalogue.connectivity_instance_id,
+                    &catalogue.venue_account_code,
+                ],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        if latest.as_deref() == Some(bytes.as_slice()) {
+            tx.commit().map_err(unavailable)?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO config_venue_catalogue
+                    (connectivity_instance_id, venue_account_code, catalogue, heard_at_ns)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &catalogue.connectivity_instance_id,
+                &catalogue.venue_account_code,
+                &bytes,
+                &at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
+
+    fn venue_catalogue(
+        &self,
+        instance_id: &str,
+        code: &str,
+    ) -> Result<Option<meridian_domain::v1::VenueCatalogue>> {
+        self.conn()?
+            .query_opt(
+                "SELECT catalogue FROM config_venue_catalogue
+                  WHERE connectivity_instance_id = $1 AND venue_account_code = $2
+                  ORDER BY catalogue_id DESC LIMIT 1",
+                &[&instance_id, &code],
+            )
+            .map_err(unavailable)?
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::VenueCatalogue::decode(&bytes[..]).map_err(unavailable)
+            })
+            .transpose()
     }
 }
 

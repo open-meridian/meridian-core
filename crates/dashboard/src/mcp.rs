@@ -1234,6 +1234,8 @@ pub async fn plugin_call_as(
                     .await,
                 second_pair_of_eyes: crate::prepared::eyes_for_claims(app, instance, caller).await,
                 owner_subject: &caller.owner_subject,
+                // A person's call through /mcp names no algorithm.
+                algorithm_id: "",
             },
             opened,
             declared,

@@ -880,7 +880,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let message: domain::RecordLocateUseRequest = self.as_domain(params)?;
-        if let Some(held0) = message.use.as_ref() {
+        if let Some(held0) = message.r#use.as_ref() {
             self.known("use.kind", held0.kind, domain::LocateUseKind::try_from(held0.kind).is_ok())?;
             self.exact("use.quantity", held0.quantity.as_ref())?;
         }
@@ -904,7 +904,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             for (i1, held1) in held0.strategies.iter().enumerate() {
                 self.known(&format!("catalogue.strategies[{i1}].kind"), held1.kind, domain::StrategyKind::try_from(held1.kind).is_ok())?;
                 for (i2, held2) in held1.parameters.iter().enumerate() {
-                    self.known(&format!("catalogue.strategies[{i1}].parameters[{i2}].type"), held2.type, domain::StrategyParameterType::try_from(held2.type).is_ok())?;
+                    self.known(&format!("catalogue.strategies[{i1}].parameters[{i2}].type"), held2.r#type, domain::StrategyParameterType::try_from(held2.r#type).is_ok())?;
                 }
             }
             for (i1, held1) in held0.eligibility.iter().enumerate() {

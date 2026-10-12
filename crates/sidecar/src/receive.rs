@@ -16,6 +16,12 @@
 //! out-of-scope message before it filters, within the trust boundary; the
 //! plugin never does.
 //!
+//! **At the instance it names** (contract v22; matrix/directed.tsv, step 5's
+//! Q14): a message a role hears only at one instance -- a placement, at the
+//! connectivity plugin it names -- is delivered to a plugin holding that role
+//! only when the field holds its own instance. A plugin that also hears the
+//! row by another of its roles hears it by that role's scope alone.
+//!
 //! **Bounded, at most once, never silent.** At most 1024 deliveries wait for
 //! the plugin; one past that is dropped, and so may the bus drop one for the
 //! subscription. Either way a `Lost` takes its place in the stream's order,
@@ -67,9 +73,12 @@ pub(crate) struct Row {
 }
 
 /// A row's message, read: the account it names, `None` when its row is
-/// declared unscoped; its journal reference and cause; and the item.
+/// declared unscoped; the instance each role named in matrix/directed.tsv
+/// hears it at (contract v22); its journal reference and cause; and the
+/// item.
 pub(crate) struct Read {
     pub account: Option<String>,
+    pub directed: Vec<(&'static str, String)>,
     pub journal: Option<plugin::JournalRef>,
     pub cause: Option<plugin::ChangeCause>,
     pub item: plugin::delivery::Item,
@@ -255,6 +264,10 @@ impl Sidecar {
         };
         self.entitled.watch(&self.bus);
 
+        let hearer = Hearer {
+            instance: self.instance_id().to_string(),
+            roles: Arc::new(self.identity.roles.clone()),
+        };
         let waiting = Arc::new(Waiting::default());
         let (open, closed) = watch::channel(());
         for row in chosen {
@@ -267,7 +280,7 @@ impl Sidecar {
                     Arc::clone(&self.bus),
                     Arc::clone(&waiting),
                     self.configuration.clone(),
-                    self.instance_id().to_string(),
+                    hearer.clone(),
                     lake.clone(),
                     closed.clone(),
                 ));
@@ -279,7 +292,7 @@ impl Sidecar {
                 subscription,
                 Arc::clone(&waiting),
                 self.configuration.clone(),
-                self.instance_id().to_string(),
+                hearer.clone(),
                 lake.clone(),
                 closed.clone(),
                 None,
@@ -309,6 +322,14 @@ impl Sidecar {
     }
 }
 
+/// Who hears: this plugin's instance and the roles it was launched with,
+/// what a directed row is held to (contract v22).
+#[derive(Clone)]
+struct Hearer {
+    instance: String,
+    roles: Arc<Vec<String>>,
+}
+
 /// What a receive decides the lake's rows by: the plugin's entitlements
 /// and the subjects it named.
 #[derive(Clone)]
@@ -325,7 +346,7 @@ async fn per_dataset(
     bus: Arc<meridian_bus::Bus>,
     waiting: Arc<Waiting>,
     configuration: Configuration,
-    instance: String,
+    hearer: Hearer,
     lake: Lake,
     mut closed: watch::Receiver<()>,
 ) {
@@ -341,16 +362,16 @@ async fn per_dataset(
                     bus.subscribe(&topic),
                     Arc::clone(&waiting),
                     configuration.clone(),
-                    instance.clone(),
+                    hearer.clone(),
                     lake.clone(),
                     closed.clone(),
                     Some(stopped),
                 ));
-                let (bus, waiting, configuration, instance, lake, closed) = (
+                let (bus, waiting, configuration, hearer, lake, closed) = (
                     Arc::clone(&bus),
                     Arc::clone(&waiting),
                     configuration.clone(),
-                    instance.clone(),
+                    hearer.clone(),
                     lake.clone(),
                     closed.clone(),
                 );
@@ -363,7 +384,7 @@ async fn per_dataset(
                         again,
                         waiting,
                         configuration,
-                        instance,
+                        hearer,
                         lake,
                         closed,
                         None,
@@ -388,7 +409,7 @@ async fn forward(
     mut subscription: meridian_bus::Subscription,
     waiting: Arc<Waiting>,
     configuration: Configuration,
-    instance: String,
+    hearer: Hearer,
     lake: Lake,
     mut closed: watch::Receiver<()>,
     mut replaced: Option<watch::Receiver<()>>,
@@ -423,9 +444,43 @@ async fn forward(
             waiting.lose(None, None);
         }
         if let Some(heard) = heard {
-            deliver(row, heard, &waiting, &configuration, &instance, &lake).await;
+            deliver(
+                row,
+                heard,
+                &waiting,
+                &configuration,
+                &hearer.instance,
+                &hearer.roles,
+                &lake,
+            )
+            .await;
         }
     }
+}
+
+/// Whether a message reaches this plugin by the roles it holds that hear
+/// `topic` (contract v22, matrix/directed.tsv): a role `directed` names hears
+/// it only where the field it names holds this instance; any other role
+/// hearing the row hears it by its scope alone. Nothing directed is heard as
+/// every row before v22 was.
+pub(crate) fn directed_here(
+    directed: &[(&'static str, String)],
+    topic: &str,
+    roles: &[String],
+    instance: &str,
+) -> bool {
+    if directed.is_empty() {
+        return true;
+    }
+    crate::grants::Contract::embedded()
+        .roles_hearing(roles, topic)
+        .iter()
+        .any(|role| {
+            directed
+                .iter()
+                .find(|(named, _)| named == role)
+                .is_none_or(|(_, at)| at == instance)
+        })
 }
 
 /// One message heard: read, held to the read scope, and queued.
@@ -435,6 +490,7 @@ async fn deliver(
     waiting: &Waiting,
     configuration: &Configuration,
     instance: &str,
+    roles: &[String],
     lake: &Lake,
 ) {
     let mut envelope = heard.envelope;
@@ -478,6 +534,24 @@ async fn deliver(
             return;
         }
     };
+    // Directed (contract v22): filtered, which is not a loss.
+    if !directed_here(&read.directed, row.topic, roles, instance) {
+        return;
+    }
+    // The venue's catalogue waits under its publisher and venue account
+    // code (W11.20, conflated): a later catalogue for the same plugin and
+    // code replaces one not yet delivered.
+    if let plugin::delivery::Item::ReportVenueCatalogue(event) = &read.item {
+        key = Some(format!(
+            "venue-catalogue\u{1f}{}\u{1f}{}",
+            event.publisher_instance_id,
+            event
+                .catalogue
+                .as_ref()
+                .map(|catalogue| catalogue.venue_account_code.as_str())
+                .unwrap_or_default()
+        ));
+    }
     if let Some(account) = &read.account {
         match configuration.current(configuration.now_ns()).await {
             Ok(held) if held.read_account_ids.contains(account) => {}

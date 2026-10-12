@@ -63,6 +63,10 @@ pub struct Context {
     /// A service account's owner when it acted, as the sidecar stamped it
     /// beside it (W4.9, W9.8, contract v21); empty for a person.
     pub owner_subject: String,
+    /// The algorithm the service account's call named, as the sidecar
+    /// stamped it beside its owner after checking it against the plugin's
+    /// declared algorithms (W4.9, contract v22); empty otherwise.
+    pub algorithm_id: String,
     pub correlation_id: String,
     pub event_time_ns: i64,
     pub received_at_ns: i64,
@@ -105,6 +109,7 @@ impl Context {
                 actor::Kind::ServiceAccount(ServiceAccountActor {
                     subject: self.acting_for.clone(),
                     owner_subject: self.owner_subject.clone(),
+                    algorithm_id: self.algorithm_id.clone(),
                 })
             } else {
                 actor::Kind::Person(PersonActor {
@@ -1615,6 +1620,12 @@ pub fn set_attribute(
                 ));
             }
             attributes.lot_relief_default = method;
+        }
+        // Contract v22 (W9.13, W11.6). The order path's release reads it;
+        // its default for a new account and its backfill at the upgrade are
+        // the order path's build (phase 2b).
+        Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
+            attributes.waits_for_compliance = waits;
         }
         None => return Err(StoreError::Invalid("the request sets no attribute".into())),
     }

@@ -41,14 +41,14 @@ use meridian_domain::v1::{
     RecordHoldingsStatementRequest,
 };
 use meridian_pb::bounds::{
-    Length, AS_REPORTED_CODE_LENGTH, AS_REPORTED_SCHEME_LENGTH, AS_REPORTED_TEXT_LENGTH,
-    BACKFILL_CONTRACT_VERSION_LENGTH, BACKFILL_FIELD_LENGTH,
-    HEARTBEAT_REQUEST_NOT_CARRIED_SEEN_COUNT, NOT_CARRIED_NAME_LENGTH, NOT_CARRIED_ROLE_LENGTH,
-    NOT_CARRIED_SCHEME_LENGTH, NOT_CARRIED_SEEN_NAME_LENGTH, NOT_CARRIED_SEEN_SCHEME_LENGTH,
-    PLUGIN_DECLARATION_NOT_CARRIED_COUNT, PLUGIN_DECLARATION_SECRET_SETTINGS_COUNT,
-    PROVENANCE_FIELD_LENGTH, PROVENANCE_PERSON_LENGTH, PROVENANCE_RULE_LENGTH,
-    PROVENANCE_SOURCE_LENGTH, RAW_RECORD_KIND_LABEL_LENGTH, RAW_RECORD_KIND_NAME_LENGTH,
-    RAW_RECORD_KIND_WINDOW_DAYS_RANGE, RAW_RECORD_REF_KEY_LENGTH,
+    Length, ALGORITHM_DECLARATION_DESCRIPTION_LENGTH, AS_REPORTED_CODE_LENGTH,
+    AS_REPORTED_SCHEME_LENGTH, AS_REPORTED_TEXT_LENGTH, BACKFILL_CONTRACT_VERSION_LENGTH,
+    BACKFILL_FIELD_LENGTH, HEARTBEAT_REQUEST_NOT_CARRIED_SEEN_COUNT, NOT_CARRIED_NAME_LENGTH,
+    NOT_CARRIED_ROLE_LENGTH, NOT_CARRIED_SCHEME_LENGTH, NOT_CARRIED_SEEN_NAME_LENGTH,
+    NOT_CARRIED_SEEN_SCHEME_LENGTH, PLUGIN_DECLARATION_NOT_CARRIED_COUNT,
+    PLUGIN_DECLARATION_SECRET_SETTINGS_COUNT, PROVENANCE_FIELD_LENGTH, PROVENANCE_PERSON_LENGTH,
+    PROVENANCE_RULE_LENGTH, PROVENANCE_SOURCE_LENGTH, RAW_RECORD_KIND_LABEL_LENGTH,
+    RAW_RECORD_KIND_NAME_LENGTH, RAW_RECORD_KIND_WINDOW_DAYS_RANGE, RAW_RECORD_REF_KEY_LENGTH,
     RECORD_HOLDINGS_STATEMENT_REQUEST_PROVENANCE_COUNT, RECORD_HOLDING_REQUEST_PENDING_COUNT,
     RECORD_HOLDING_REQUEST_PROVENANCE_COUNT, STORAGE_DECLARATION_RECORD_KINDS_COUNT,
     STORAGE_DECLARATION_RETENTION_DAYS_RANGE, STORED_SPAN_RECORD_KIND_LENGTH,
@@ -249,6 +249,24 @@ pub(crate) fn provenance(
             PROVENANCE_PERSON_LENGTH,
         )?;
         length(&format!("{at}.rule"), &held.rule, PROVENANCE_RULE_LENGTH)?;
+        // A value core computed carries its basis, and only such a value
+        // does (contract v22; W3.20, the calendars spec's Q10).
+        let computed = held.kind == ProvenanceKind::Computed as i32;
+        match (&held.date_basis, computed) {
+            (None, true) => {
+                return Err(refuse(format!(
+                    "{at}.date_basis is unset; a value core computed names the rule and \
+                     calendars the date read worked it out on"
+                )))
+            }
+            (Some(_), false) => {
+                return Err(refuse(format!(
+                    "{at}.date_basis is set on a value core did not compute; it is carried only \
+                     with PROVENANCE_KIND_COMPUTED"
+                )))
+            }
+            _ => {}
+        }
         own_record(
             &format!("{at}.raw_record"),
             held.raw_record.as_mut(),
@@ -326,6 +344,34 @@ pub fn declaration_refused(
             return Some(format!(
                 "{at}.reason is unspecified; say why it is not carried"
             ));
+        }
+    }
+    // The algorithm identifiers its autonomous work may name (contract v22,
+    // W4.1): each named, once, with what it is.
+    for (i, algorithm) in declaration.algorithms.iter().enumerate() {
+        let at = format!("declaration.algorithms[{i}]");
+        if algorithm.algorithm_id.trim().is_empty() {
+            return Some(format!(
+                "{at}.algorithm_id is empty; an algorithm is named by an identifier stable \
+                 across versions"
+            ));
+        }
+        if declaration.algorithms[..i]
+            .iter()
+            .any(|earlier| earlier.algorithm_id == algorithm.algorithm_id)
+        {
+            return Some(format!(
+                "{at}.algorithm_id is {:?}, which an earlier algorithm names; each is declared \
+                 once",
+                algorithm.algorithm_id
+            ));
+        }
+        if let Err(refused) = length(
+            &format!("{at}.description"),
+            &algorithm.description,
+            ALGORITHM_DECLARATION_DESCRIPTION_LENGTH,
+        ) {
+            return Some(refused.message().to_string());
         }
     }
     if let Some(storage) = &declaration.storage {
@@ -632,6 +678,7 @@ mod tests {
         }];
         let custody = vec!["custody".to_string()];
         let mut declaration = PluginDeclaration {
+            algorithms: Default::default(),
             secret_settings: vec!["consumer_key".into()],
             not_carried: vec![NotCarried {
                 role: "custody".into(),
@@ -802,5 +849,57 @@ mod tests {
             ..span("activity", 1)
         };
         assert!(stored_refused(&[backwards], Some(&declaration)).is_some());
+    }
+
+    #[test]
+    fn a_declaration_names_each_algorithm_once_with_what_it_is() {
+        // Contract v22 (W4.1): an identifier, once, and a description.
+        let algorithm = |id: &str, description: &str| meridian_pb::v1::AlgorithmDeclaration {
+            algorithm_id: id.into(),
+            description: description.into(),
+        };
+        let mut declaration = PluginDeclaration {
+            algorithms: vec![algorithm("drift", "Rebalances past a band")],
+            ..Default::default()
+        };
+        assert_eq!(declaration_refused(&declaration, &[], &[]), None);
+        declaration.algorithms.push(algorithm("drift", "Again"));
+        assert!(declaration_refused(&declaration, &[], &[])
+            .is_some_and(|why| why.starts_with("declaration.algorithms[1].algorithm_id")));
+        declaration.algorithms[1] = algorithm(" ", "Unnamed");
+        assert!(declaration_refused(&declaration, &[], &[])
+            .is_some_and(|why| why.starts_with("declaration.algorithms[1].algorithm_id")));
+        declaration.algorithms[1] = algorithm("twap", "");
+        assert!(declaration_refused(&declaration, &[], &[])
+            .is_some_and(|why| why.starts_with("declaration.algorithms[1].description")));
+    }
+
+    #[test]
+    fn a_computed_value_carries_its_basis_and_no_other_does() {
+        // Contract v22 (W3.20, the calendars spec's Q10).
+        let basis = meridian_pb::v1::DateBasis {
+            rule: None,
+            calendars: vec![meridian_pb::v1::CalendarRef {
+                calendar_id: "CAL-USD".into(),
+                version: 3,
+            }],
+        };
+        let mut held = vec![Provenance {
+            field: "settlement_date".into(),
+            kind: ProvenanceKind::Computed as i32,
+            ..Default::default()
+        }];
+        let refused = provenance(&mut held, 32, "i").unwrap_err();
+        assert!(refused
+            .message()
+            .starts_with("provenance[0].date_basis is unset"));
+        held[0].date_basis = Some(basis.clone());
+        assert!(provenance(&mut held, 32, "i").is_ok());
+        held[0].kind = ProvenanceKind::Derived as i32;
+        held[0].rule = "T+1".into();
+        let refused = provenance(&mut held, 32, "i").unwrap_err();
+        assert!(refused
+            .message()
+            .starts_with("provenance[0].date_basis is set"));
     }
 }

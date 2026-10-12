@@ -1173,6 +1173,7 @@ impl Opening {
             // (contract v21, W4.15).
             subject_kind: meridian_pb::v1::SubjectKind::Unspecified as i32,
             owner_subject: String::new(),
+            algorithm_id: String::new(),
         }
     }
 }
@@ -1225,6 +1226,11 @@ pub(crate) struct ToolCaller<'a> {
     /// carry no delegation, no client and no deployment admin's
     /// capabilities. Empty for a person.
     pub owner_subject: &'a str,
+    /// For a service account (W4.9, W4.15, contract v22), the algorithm its
+    /// call named, kept in the claims so every command the act sends carries
+    /// it; the sidecar checks it against the version's declared algorithms.
+    /// Empty for a person, and where the call named none.
+    pub algorithm_id: &'a str,
 }
 
 impl Plugins {
@@ -1270,6 +1276,7 @@ impl Plugins {
         if !caller.owner_subject.is_empty() {
             claims.subject_kind = meridian_pb::v1::SubjectKind::ServiceAccount as i32;
             claims.owner_subject = caller.owner_subject.to_string();
+            claims.algorithm_id = caller.algorithm_id.to_string();
             claims.deployment_admin = false;
             claims.delegation_id.clear();
             claims.client_name.clear();

@@ -59,10 +59,20 @@ pub struct Stamp {
     /// `owner_subject`. Empty for a person, and for nobody.
     pub owner_subject: String,
 
+    /// The algorithm the service account's call named, beside
+    /// `owner_subject` (W4.9, contract v22): the claims' `algorithm_id`, after
+    /// the sidecar checked it against the algorithms the plugin's version
+    /// declares. Empty for a person, for nobody, and where the call named
+    /// none.
+    pub algorithm_id: String,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
-    /// a core component reading as itself.
+    /// a core component reading as itself. From contract v22 also a command
+    /// naming a record by its ID alone: the accounts the sending instance may
+    /// write, narrowed to the person's write access where it acts for one
+    /// (W4.9), which the store holding the record checks its account against.
     pub account_scope: Option<Vec<String>>,
 }
 
@@ -378,6 +388,7 @@ impl Bus {
             prepared_call_id: stamp.prepared_call_id.clone(),
             acting_for_kind: stamp.acting_for_kind,
             owner_subject: stamp.owner_subject.clone(),
+            algorithm_id: stamp.algorithm_id.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

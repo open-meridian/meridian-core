@@ -1014,6 +1014,7 @@ mod tests {
         assert!(reply.admitted, "{}", reply.refusal_reason);
         let call =
             |tool: &str, role: &str, arguments: &str, reason: &str| CallAsServiceAccountRequest {
+                algorithm_id: Default::default(),
                 role: role.into(),
                 tool_name: tool.into(),
                 arguments_json: arguments.into(),
@@ -1096,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v22"] {
+        for declared in ["v1", "v23"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -1105,7 +1106,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v21"));
+            assert!(reply.refusal_reason.contains("v2 through v22"));
             assert!(sc.registration().is_none());
         }
     }

@@ -357,6 +357,7 @@ async fn running(h: &Harness, setting: Setting, grant: AccessLevel) -> String {
 
 fn call(tool: &str, arguments: &str, reason: &str) -> CallAsServiceAccountRequest {
     CallAsServiceAccountRequest {
+        algorithm_id: Default::default(),
         role: ROLE.into(),
         tool_name: tool.into(),
         arguments_json: arguments.into(),

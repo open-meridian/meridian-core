@@ -162,6 +162,12 @@ pub(crate) fn scope(configuration: &PluginConfiguration) -> AccountScopeDelivery
         read_account_ids: configuration.read_account_ids.clone(),
         write_account_ids: configuration.write_account_ids.clone(),
         links,
+        // Contract v22 (W4.11, W11.21, W11.22): a connectivity plugin's link
+        // to its one `ems`; an `ems`'s connectivity plugins and its venue
+        // account map, as the conductor holds them for this instance.
+        connectivity_link: configuration.connectivity_link.clone(),
+        connectivity_links: configuration.connectivity_links.clone(),
+        venue_account_map: configuration.venue_account_map.clone(),
     }
 }
 

@@ -178,7 +178,45 @@ impl Sidecar {
         if let Some(found) = text::refused(&asked.reason) {
             return refuse("reason", found.to_string());
         }
+        // The algorithm the work runs (contract v22, W4.9, W4.15): one the
+        // version declares, or none.
+        if let Err(words) = self.declared_algorithm(&asked.algorithm_id) {
+            return refuse("algorithm_id", words);
+        }
         Ok(())
+    }
+
+    /// Whether `algorithm_id` is one this plugin's version declares
+    /// (PluginDeclaration.algorithms, contract v22), or empty, naming none:
+    /// what a call as a service account may name, checked again on every
+    /// command the call's claims carry it on. The words of the refusal
+    /// otherwise.
+    pub(crate) fn declared_algorithm(&self, algorithm_id: &str) -> Result<(), String> {
+        if algorithm_id.is_empty() {
+            return Ok(());
+        }
+        let declared: Vec<String> = self
+            .registration()
+            .and_then(|held| held.declaration)
+            .map(|declaration| {
+                declaration
+                    .algorithms
+                    .into_iter()
+                    .map(|algorithm| algorithm.algorithm_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if declared.iter().any(|held| held == algorithm_id) {
+            return Ok(());
+        }
+        Err(if declared.is_empty() {
+            format!("{algorithm_id:?} is not an algorithm this version declares; it declares none")
+        } else {
+            format!(
+                "{algorithm_id:?} is not an algorithm this version declares; it declares {}",
+                declared.join(", ")
+            )
+        })
     }
 
     /// `SidecarService.CallAsServiceAccount` (SidecarCallAsServiceAccount,

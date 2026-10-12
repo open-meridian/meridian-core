@@ -268,18 +268,42 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         .cloned()
         .collect();
     let (hold_days, hold_write_once) = crate::archive::hold_over(snapshot, plugin_instance_id);
+    // A connectivity plugin's link and the accounts its `ems` mapped on it,
+    // which its connectivity role reaches beside whatever its other roles do;
+    // an `ems`'s connectivity plugins and its map (W4.11, W11.21, W11.22,
+    // contract v22). An account mapped and since closed is read, not written.
+    let connectivity = crate::connectivity::told(snapshot, plugin_instance_id);
+    let mut read = scope.read;
+    let mut write = scope.write;
+    for account in &connectivity.mapped_accounts {
+        let Some(record) = snapshot
+            .records
+            .accounts
+            .iter()
+            .find(|held| &held.account_id == account)
+        else {
+            continue;
+        };
+        read.insert(account.clone());
+        if record.state != AccountState::Closed as i32 {
+            write.insert(account.clone());
+        }
+    }
     PluginConfiguration {
         plugin_instance_id: plugin_instance_id.to_string(),
         settings: Vec::new(),
         links,
-        read_account_ids: scope.read.into_iter().collect(),
-        write_account_ids: scope.write.into_iter().collect(),
+        read_account_ids: read.into_iter().collect(),
+        write_account_ids: write.into_iter().collect(),
         linked_accounts,
         // The hold over the instance (W6.25, contract v16): the longest of
         // its edge roles' and the one for every role. Its sidecar refuses a
         // deletion inside it (W4.13); the plugin is never told it.
         hold_days,
         hold_write_once,
+        connectivity_link: connectivity.connectivity_link,
+        connectivity_links: connectivity.connectivity_links,
+        venue_account_map: connectivity.venue_account_map,
     }
 }
 
@@ -1587,6 +1611,127 @@ pub fn serve_with(
         },
     );
 
+    // W11.21: a connectivity plugin made available or withdrawn, for a
+    // deployment admin at the page; linked to an `ems`, or unlinked, and
+    // made available to its users, for the `ems`'s admin at the page. Each
+    // change its own record; each plugin whose configuration it changes is
+    // told (contract v22).
+    answer(
+        &context,
+        crate::connectivity::SET_CONNECTIVITY_AVAILABLE,
+        (
+            "meridian.v1.SetConnectivityAvailableRequest",
+            "meridian.v1.ConnectivityLink",
+        ),
+        |cx, request: meridian_domain::v1::SetConnectivityAvailableRequest, envelope| {
+            let before = cx.snapshot()?;
+            let author = Author {
+                note: request.note.clone(),
+                ..author(envelope)
+            };
+            let link = crate::connectivity::availability(&before, &request, &author)?;
+            let link = cx
+                .store
+                .set_connectivity_link(&link, &author, cx.clock.now_ns())
+                .map_err(|f| f.to_string())?;
+            tracing::info!(
+                connectivity = link.connectivity_instance_id,
+                available = link.available,
+                by = author.by,
+                "connectivity availability set"
+            );
+            cx.announce(&before)?;
+            Ok(link)
+        },
+    );
+
+    answer(
+        &context,
+        crate::connectivity::LINK_CONNECTIVITY,
+        (
+            "meridian.v1.LinkConnectivityRequest",
+            "meridian.v1.ConnectivityLink",
+        ),
+        |cx, request: meridian_domain::v1::LinkConnectivityRequest, envelope| {
+            let before = cx.snapshot()?;
+            let author = Author {
+                note: request.note.clone(),
+                ..author(envelope)
+            };
+            let link = crate::connectivity::linked(&before, &request, &author)?;
+            let link = cx
+                .store
+                .set_connectivity_link(&link, &author, cx.clock.now_ns())
+                .map_err(|f| f.to_string())?;
+            tracing::info!(
+                connectivity = link.connectivity_instance_id,
+                ems = link.ems_instance_id,
+                users = link.users.len(),
+                by = author.by,
+                "connectivity link set"
+            );
+            cx.announce(&before)?;
+            Ok(link)
+        },
+    );
+
+    // W11.22: an `ems`'s venue account mapping, sent by the `ems` for its
+    // admin and stamped with its instance by its sidecar; answered by the
+    // `ems`'s map as it now stands.
+    answer(
+        &context,
+        crate::connectivity::MAP_VENUE_ACCOUNT,
+        (
+            "meridian.v1.MapVenueAccountRequest",
+            "meridian.v1.VenueAccountMap",
+        ),
+        |cx, request: meridian_domain::v1::MapVenueAccountRequest, envelope| {
+            let ems = publisher(envelope);
+            let before = cx.snapshot()?;
+            let author = author(envelope);
+            let (from, to) = crate::connectivity::mapped(&before, &request, &ems, &author)?;
+            cx.store
+                .map_venue_account(&ems, from.as_ref(), to.as_ref(), &author, cx.clock.now_ns())
+                .map_err(|f| f.to_string())?;
+            tracing::info!(
+                ems,
+                connectivity = request.connectivity_instance_id,
+                code = request.venue_account_code,
+                account = request.account_id,
+                by = author.by,
+                "venue account mapping set"
+            );
+            cx.announce(&before)?;
+            Ok(crate::connectivity::told(&cx.snapshot()?, &ems)
+                .venue_account_map
+                .unwrap_or_else(|| meridian_pb::v1::VenueAccountMap {
+                    ems_instance_id: ems.clone(),
+                    mappings: Vec::new(),
+                }))
+        },
+    );
+
+    // W11.20: the latest catalogue for a plugin and code, read by an `ems`
+    // or an `oms` as itself.
+    answer(
+        &context,
+        crate::connectivity::READ_VENUE_CATALOGUE,
+        (
+            "meridian.v1.ReadVenueCatalogueRequest",
+            "meridian.v1.ReadVenueCatalogueReply",
+        ),
+        |cx, request: meridian_domain::v1::ReadVenueCatalogueRequest, _| {
+            let held = cx
+                .store
+                .venue_catalogue(
+                    request.connectivity_instance_id.trim(),
+                    request.venue_account_code.trim(),
+                )
+                .map_err(|f| f.to_string())?;
+            crate::connectivity::read_answer(held, &request)
+        },
+    );
+
     answer(
         &context,
         PLUGIN_ACCESS,
@@ -1663,6 +1808,39 @@ pub fn serve_with(
                 Err(failed) => {
                     tracing::warn!(instance, "an account report did not decode: {failed}")
                 }
+            }
+        }
+    });
+
+    // W11.20: each venue catalogue a connectivity plugin publishes, kept
+    // latest per plugin and code, a change its own record.
+    let mut catalogues = bus.subscribe(crate::connectivity::VENUE_CATALOGUE);
+    let cataloguing = Arc::clone(&context);
+    tokio::spawn(async move {
+        while let Some(delivery) = catalogues.recv().await {
+            let event = match meridian_domain::v1::VenueCatalogueEvent::decode(
+                &delivery.envelope.payload[..],
+            ) {
+                Ok(event) => event,
+                Err(failed) => {
+                    tracing::warn!("a venue catalogue did not decode: {failed}");
+                    continue;
+                }
+            };
+            let Some(catalogue) =
+                crate::connectivity::catalogue_heard(&delivery.envelope, event.catalogue)
+            else {
+                tracing::warn!("a venue catalogue named no code, or no publisher; not kept");
+                continue;
+            };
+            let store = Arc::clone(&cataloguing.store);
+            let now = cataloguing.clock.now_ns();
+            match tokio::task::spawn_blocking(move || store.keep_venue_catalogue(&catalogue, now))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(failed)) => tracing::warn!("a venue catalogue was not kept: {failed}"),
+                Err(failed) => tracing::warn!("a venue catalogue was not kept: {failed}"),
             }
         }
     });

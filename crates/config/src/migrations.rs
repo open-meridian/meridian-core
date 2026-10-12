@@ -129,7 +129,63 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0017_an_agents_prepared_change.sql"),
         then: Some(contract_v20),
     },
+    Migration {
+        version: 18,
+        name: "a_connectivity_plugin_reaches_its_ems",
+        sql: include_str!("../migrations/0018_a_connectivity_plugin_reaches_its_ems.sql"),
+        then: Some(contract_v22),
+    },
 ];
+
+/// Migration 18 (contract v22; W11.21, decisions/031): each instance holding
+/// `connectivity` the store knows -- reported, or launched -- recorded as
+/// withdrawn and unlinked at the upgrade, for no person, its record naming
+/// no link before. An instance recorded already is left as it is, so it
+/// runs once.
+fn contract_v22(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    use prost::Message;
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    let instances = tx
+        .query(
+            "SELECT plugin_instance_id FROM config_known_plugin
+              WHERE 'connectivity' = ANY(roles) OR 'ccm' = ANY(roles)
+             UNION
+             SELECT instance_id FROM config_plugin_launch
+              WHERE 'connectivity' = ANY(roles) OR 'ccm' = ANY(roles)
+             EXCEPT
+             SELECT connectivity_instance_id FROM config_connectivity_link_change
+             ORDER BY 1",
+            &[],
+        )
+        .map_err(unavailable)?;
+    for row in instances {
+        let instance: String = row.get(0);
+        let link = meridian_pb::v1::ConnectivityLink {
+            connectivity_instance_id: instance.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        tx.execute(
+            "INSERT INTO config_connectivity_link (connectivity_instance_id, link)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &[&instance, &link],
+        )
+        .map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO config_connectivity_link_change
+                    (connectivity_instance_id, to_link, changed_at_ns, note)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &instance,
+                &link,
+                &at_ns,
+                &crate::connectivity::AT_THE_UPGRADE,
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
 
 /// The note on each grant the upgrade made (W6.30, decisions/031).
 pub const GRANTED_AT_THE_UPGRADE: &str = "granted at the upgrade to contract v20, for no person:      the accounts this instance's links named then, so no link standing before v20 is refused";

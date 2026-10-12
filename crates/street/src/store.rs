@@ -383,6 +383,9 @@ pub struct Provenance {
     pub source: String,
     pub person: String,
     pub rule: String,
+    /// On a value core computed (contract v22, PROVENANCE_KIND_COMPUTED):
+    /// the wire's DateBasis as the plugin sent it, encoded; empty otherwise.
+    pub date_basis: Vec<u8>,
 }
 
 /// A quantity not yet settled, and its value date (contract v11).

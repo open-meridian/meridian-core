@@ -611,6 +611,9 @@ pub fn account_groups_named(records: &AccessRecords, access: &Access) -> BTreeSe
         .collect()
 }
 
+/// The role that holds no permission-derived scope (contract v22, W4.11).
+pub const CONNECTIVITY: &str = "connectivity";
+
 /// A plugin's account scope: every account anybody may read through it, and
 /// every account anybody may write through it, on any of its roles; and
 /// every account one of its external accounts is linked to. `admin` adds
@@ -632,10 +635,15 @@ pub fn plugin_scope(
         }
     }
     // One scope per plugin, whatever its roles: the union over them (W4.11,
-    // decisions/033 point 5).
+    // decisions/033 point 5). A connectivity role takes none of it (contract
+    // v22, W4.11; ruled 2026-10-10): it reaches accounts only through its one
+    // `ems`, whose mappings on it the conductor adds.
     let mut scope = all
         .remove(plugin_instance_id)
-        .map(|held| held.union().accounts)
+        .map(|mut held| {
+            held.roles.remove(CONNECTIVITY);
+            held.union().accounts
+        })
         .unwrap_or_default();
     for link in links
         .iter()

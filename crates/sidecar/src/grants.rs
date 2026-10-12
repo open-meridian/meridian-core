@@ -222,6 +222,17 @@ impl Contract {
             .cloned()
             .collect()
     }
+
+    /// Which of a plugin's `roles` hear `topic` among their generated grants:
+    /// what a directed row is held to (contract v22, matrix/directed.tsv),
+    /// each role that hears it by its own rule.
+    pub fn roles_hearing(&self, roles: &[String], topic: &str) -> Vec<String> {
+        roles
+            .iter()
+            .filter(|role| self.named(&[role.as_str()]).may_subscribe(topic))
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

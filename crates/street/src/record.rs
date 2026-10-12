@@ -442,6 +442,17 @@ pub(crate) fn provenance_from_wire(provenance: &[PbProvenance]) -> Result<Vec<Pr
                 }
                 Ok(_) => {}
             }
+            // A value core computed carries its basis, and no other value
+            // does (contract v22; W3.20). The sidecar refused a plugin's
+            // already.
+            let computed = held.kind == ProvenanceKind::Computed as i32;
+            if computed != held.date_basis.is_some() {
+                return Err(StoreError::Edge(format!(
+                    "provenance[{at}].date_basis is {}; it is carried with \
+                     PROVENANCE_KIND_COMPUTED and with no other kind",
+                    if computed { "unset" } else { "set" }
+                )));
+            }
             Ok(Provenance {
                 field: held.field.clone(),
                 kind: held.kind,
@@ -449,6 +460,11 @@ pub(crate) fn provenance_from_wire(provenance: &[PbProvenance]) -> Result<Vec<Pr
                 source: held.source.clone(),
                 person: held.person.clone(),
                 rule: held.rule.clone(),
+                date_basis: held
+                    .date_basis
+                    .as_ref()
+                    .map(prost::Message::encode_to_vec)
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -464,6 +480,12 @@ pub(crate) fn provenance_to_wire(provenance: &[Provenance]) -> Vec<PbProvenance>
             source: held.source.clone(),
             person: held.person.clone(),
             rule: held.rule.clone(),
+            date_basis: if held.date_basis.is_empty() {
+                None
+            } else {
+                <meridian_pb::v1::DateBasis as prost::Message>::decode(held.date_basis.as_slice())
+                    .ok()
+            },
         })
         .collect()
 }

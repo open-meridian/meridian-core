@@ -177,8 +177,9 @@ impl Store for PostgresStore {
             for (ordinal, held) in statement.provenance.iter().enumerate() {
                 tx.execute(
                     "INSERT INTO statement_provenance (statement_id, ordinal, field, kind,
-                                                       raw_instance, raw_key, source, person, rule)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                                       raw_instance, raw_key, source, person, rule,
+                                                       date_basis)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                     &[
                         &statement.statement_id,
                         &(ordinal as i32),
@@ -189,6 +190,7 @@ impl Store for PostgresStore {
                         &held.source,
                         &held.person,
                         &held.rule,
+                        &held.date_basis,
                     ],
                 )
                 .map_err(unavailable)?;
@@ -2244,8 +2246,9 @@ fn insert_edge(
     for (ordinal, held) in provenance.iter().enumerate() {
         tx.execute(
             "INSERT INTO holding_provenance (holding_id, ordinal, field, kind, raw_instance,
-                                             raw_key, source, person, rule, amended_in)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                                             raw_key, source, person, rule, amended_in,
+                                             date_basis)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &holding_id,
                 &(ordinal as i32),
@@ -2257,6 +2260,7 @@ fn insert_edge(
                 &held.person,
                 &held.rule,
                 &amended_in,
+                &held.date_basis,
             ],
         )
         .map_err(unavailable)?;
@@ -2319,7 +2323,7 @@ fn edges_of(
     for row in client
         .query(
             "SELECT holding_id, field, kind, raw_instance, raw_key, source, person, rule,
-                    amended_in
+                    amended_in, date_basis
                FROM holding_provenance WHERE holding_id = ANY($1)
               ORDER BY holding_id, amended_in, ordinal",
             &[&holding_ids],
@@ -2337,6 +2341,7 @@ fn edges_of(
                 source: row.get(5),
                 person: row.get(6),
                 rule: row.get(7),
+                date_basis: row.get(9),
             });
     }
     let mut pending: HashMap<(String, bool), Vec<Pending>> = HashMap::new();
@@ -2379,7 +2384,7 @@ fn statement_provenance_of(
 ) -> Result<Vec<Provenance>> {
     client
         .query(
-            "SELECT field, kind, raw_instance, raw_key, source, person, rule
+            "SELECT field, kind, raw_instance, raw_key, source, person, rule, date_basis
                FROM statement_provenance WHERE statement_id = $1 ORDER BY ordinal",
             &[&statement_id],
         )
@@ -2393,6 +2398,7 @@ fn statement_provenance_of(
                 source: row.get(4),
                 person: row.get(5),
                 rule: row.get(6),
+                date_basis: row.get(7),
             })
         })
         .collect()

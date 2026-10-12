@@ -151,6 +151,10 @@ impl PositionState {
             account_id: account_id.to_string(),
             instrument_id: self.instrument_id.clone(),
             side: self.side,
+            // Contract v22: a position keyed by its sleeve is the order
+            // path's build (phase 2b); until then every position is the
+            // account's own, no sleeve.
+            sleeve: String::new(),
             trade_date_quantity: numbers::wire(self.trade_date()?),
             // Unknown, never zero, while any of the quantity is not stated.
             settled_quantity: self.not_stated.is_zero().then(|| self.settled.to_wire()),
@@ -766,6 +770,7 @@ fn apply_lot(
                     opened_by: Some(reference.clone()),
                     relieved_by: Vec::new(),
                     adjusted_by: Vec::new(),
+                    sleeve: String::new(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,

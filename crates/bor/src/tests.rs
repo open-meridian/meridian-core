@@ -664,6 +664,7 @@ async fn a_service_account_answers_for_a_justified_act_its_actor_its_own_arm() {
         actor.kind,
         Some(actor::Kind::ServiceAccount(
             meridian_domain::v1::ServiceAccountActor {
+                algorithm_id: Default::default(),
                 subject: "SA-01JAD000000000000000000001".into(),
                 owner_subject: PERSON.into(),
             }

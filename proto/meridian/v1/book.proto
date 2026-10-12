@@ -2411,7 +2411,9 @@ message ListTradingInstructionsRequest {
 
 message ListTradingInstructionsReply {
   repeated TradingInstruction instructions = 1;
-  // The control partition's sequence they were read at.
+  // The control partition's sequence they were read at. Kept (the product
+  // owner, 2026-10-12) with an invariant: it equals the control partition's
+  // head in the reply's `as_of`, so a reader may take either.
   uint64 control_sequence = 2;
   Watermark as_of = 3;
   string next_cursor = 4;

@@ -10,14 +10,15 @@ use meridian_domain::v1::{
     SettingLastChange, SignInRecord, UserGroup,
 };
 
-use meridian_pb::v1::{SettingDeclaration, StoredSpan};
+use meridian_domain::v1::VenueCatalogue;
+use meridian_pb::v1::{ConnectivityLink, SettingDeclaration, StoredSpan, VenueAccountMapping};
 
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redaction_note, redeclared,
-    AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin, LastChange, LaunchAct,
-    LaunchNote, LinkableAccountsChange, RecordedMove, Result, SettingChange, SettingChangeRecord,
-    SettingsAuthor, Snapshot, Store, StoredSetting, Withdrawal, REDACTED_BY_REDECLARATION,
-    REDACTED_BY_SEALING,
+    AccessChangeRecord, Author, ChangeKind, ConnectivityLinkChange, Ending, Held, HeldMapping,
+    KnownPlugin, LastChange, LaunchAct, LaunchNote, LinkableAccountsChange, RecordedMove, Result,
+    SettingChange, SettingChangeRecord, SettingsAuthor, Snapshot, Store, StoredSetting,
+    VenueAccountMapChange, Withdrawal, REDACTED_BY_REDECLARATION, REDACTED_BY_SEALING,
 };
 use crate::DEPLOYMENT_ADMIN;
 
@@ -41,6 +42,11 @@ pub struct MemoryStore {
     entitlements: Mutex<Vec<meridian_domain::v1::DatasetEntitlement>>,
     /// Each linkable-accounts change, in order (contract v20).
     linkable_changes: Mutex<Vec<LinkableAccountsChange>>,
+    /// Each link and map change, in order, and each venue catalogue as kept,
+    /// latest per plugin and code with every change (contract v22).
+    link_changes: Mutex<Vec<ConnectivityLinkChange>>,
+    map_changes: Mutex<Vec<VenueAccountMapChange>>,
+    catalogues: Mutex<Vec<(i64, VenueCatalogue)>>,
 }
 
 impl MemoryStore {
@@ -67,6 +73,9 @@ impl MemoryStore {
             licences: Mutex::new(Vec::new()),
             entitlements: Mutex::new(Vec::new()),
             linkable_changes: Mutex::new(Vec::new()),
+            link_changes: Mutex::new(Vec::new()),
+            map_changes: Mutex::new(Vec::new()),
+            catalogues: Mutex::new(Vec::new()),
         }
     }
 
@@ -840,5 +849,148 @@ impl Store for MemoryStore {
             .filter(|change| change.plugin_instance_id == plugin_instance_id)
             .cloned()
             .collect())
+    }
+
+    fn set_connectivity_link(
+        &self,
+        link: &ConnectivityLink,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<ConnectivityLink> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let instance = &link.connectivity_instance_id;
+        let from = state.connectivity.get(instance).cloned();
+        let standing = from.clone().unwrap_or_else(|| ConnectivityLink {
+            connectivity_instance_id: instance.clone(),
+            ..Default::default()
+        });
+        if standing == *link {
+            return Ok(standing);
+        }
+        state.connectivity.insert(instance.clone(), link.clone());
+        self.link_changes
+            .lock()
+            .expect("store lock poisoned")
+            .push(ConnectivityLinkChange {
+                connectivity_instance_id: instance.clone(),
+                from_link: from,
+                to_link: link.clone(),
+                by: author.by.clone(),
+                delegation: author.delegation.clone(),
+                client: author.client.clone(),
+                at_ns,
+                note: author.note.clone(),
+            });
+        Ok(link.clone())
+    }
+
+    fn connectivity_link_changes(&self, instance_id: &str) -> Result<Vec<ConnectivityLinkChange>> {
+        Ok(self
+            .link_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.connectivity_instance_id == instance_id)
+            .cloned()
+            .collect())
+    }
+
+    fn map_venue_account(
+        &self,
+        ems_instance_id: &str,
+        from: Option<&VenueAccountMapping>,
+        to: Option<&VenueAccountMapping>,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        let Some(key) = to.or(from).map(|held| {
+            (
+                held.connectivity_instance_id.clone(),
+                held.venue_account_code.clone(),
+            )
+        }) else {
+            return Ok(());
+        };
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let at = state.venue_mappings.iter().position(|held| {
+            held.mapping.connectivity_instance_id == key.0
+                && held.mapping.venue_account_code == key.1
+        });
+        let standing = at.map(|at| state.venue_mappings[at].clone());
+        let unchanged = match (&standing, to) {
+            (None, None) => true,
+            (Some(held), Some(mapping)) => {
+                held.ems_instance_id == ems_instance_id && held.mapping == *mapping
+            }
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        if let Some(at) = at {
+            state.venue_mappings.remove(at);
+        }
+        if let Some(mapping) = to {
+            state.venue_mappings.push(HeldMapping {
+                ems_instance_id: ems_instance_id.to_string(),
+                mapping: mapping.clone(),
+            });
+        }
+        self.map_changes
+            .lock()
+            .expect("store lock poisoned")
+            .push(VenueAccountMapChange {
+                ems_instance_id: ems_instance_id.to_string(),
+                from_mapping: standing.map(|held| held.mapping),
+                to_mapping: to.cloned(),
+                by: author.by.clone(),
+                delegation: author.delegation.clone(),
+                client: author.client.clone(),
+                at_ns,
+                note: author.note.clone(),
+            });
+        Ok(())
+    }
+
+    fn venue_account_map_changes(
+        &self,
+        ems_instance_id: &str,
+    ) -> Result<Vec<VenueAccountMapChange>> {
+        Ok(self
+            .map_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.ems_instance_id == ems_instance_id)
+            .cloned()
+            .collect())
+    }
+
+    fn keep_venue_catalogue(&self, catalogue: &VenueCatalogue, at_ns: i64) -> Result<bool> {
+        let latest = self.venue_catalogue(
+            &catalogue.connectivity_instance_id,
+            &catalogue.venue_account_code,
+        )?;
+        if latest.as_ref() == Some(catalogue) {
+            return Ok(false);
+        }
+        self.catalogues
+            .lock()
+            .expect("store lock poisoned")
+            .push((at_ns, catalogue.clone()));
+        Ok(true)
+    }
+
+    fn venue_catalogue(&self, instance_id: &str, code: &str) -> Result<Option<VenueCatalogue>> {
+        Ok(self
+            .catalogues
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .find(|(_, held)| {
+                held.connectivity_instance_id == instance_id && held.venue_account_code == code
+            })
+            .map(|(_, held)| held.clone()))
     }
 }

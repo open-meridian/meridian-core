@@ -9,8 +9,9 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    Catalogue, DatasetDeclaration, DatasetLicence, NotCarried, NotCarriedReason, NotCarriedSeen,
-    ObservationMode, PluginDeclaration, RawRecordKind, StorageDeclaration,
+    AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, NotCarried,
+    NotCarriedReason, NotCarriedSeen, ObservationMode, PluginDeclaration, RawRecordKind,
+    StorageDeclaration,
 };
 
 use crate::html::escape;
@@ -28,6 +29,18 @@ pub struct Declared {
     /// declaring none, as the SDK uploads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogue: Option<DeclaredCatalogue>,
+    /// The algorithm identifiers its autonomous work may name (W4.1, W4.9,
+    /// contract v22): absent from a version declaring none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub algorithms: Vec<DeclaredAlgorithm>,
+}
+
+/// One algorithm identifier as an upload carries it (contract v22).
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredAlgorithm {
+    pub algorithm_id: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -61,6 +74,10 @@ pub struct DeclaredDataset {
     pub day_end_minute: u32,
     #[serde(default)]
     pub venue_id: String,
+    /// The settlement calendar its business dates follow (W10.1, contract
+    /// v22): empty names none.
+    #[serde(default)]
+    pub calendar_id: String,
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -185,6 +202,14 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
             None => None,
             Some(catalogue) => Some(catalogue_from_json(catalogue)?),
         },
+        algorithms: declared
+            .algorithms
+            .iter()
+            .map(|algorithm| AlgorithmDeclaration {
+                algorithm_id: algorithm.algorithm_id.clone(),
+                description: algorithm.description.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -221,6 +246,7 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             day_time_zone: dataset.day_time_zone.clone(),
             day_end_minute: dataset.day_end_minute,
             venue_id: dataset.venue_id.clone(),
+            calendar_id: dataset.calendar_id.clone(),
         });
     }
     Ok(Catalogue { datasets })
@@ -247,6 +273,7 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
         "venue_id": dataset.venue_id,
+        "calendar_id": dataset.calendar_id,
     })
 }
 
@@ -272,6 +299,10 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
         "catalogue": declaration.catalogue.as_ref().map(|catalogue| serde_json::json!({
             "datasets": catalogue.datasets.iter().map(dataset_json).collect::<Vec<_>>(),
         })),
+        "algorithms": declaration.algorithms.iter().map(|algorithm| serde_json::json!({
+            "algorithm_id": algorithm.algorithm_id,
+            "description": algorithm.description,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -343,9 +374,28 @@ pub fn summary(declaration: Option<&PluginDeclaration>, seen: &[NotCarriedSeen])
              <th>Why</th><th>Seen</th></tr></thead><tbody>{rows}</tbody></table>"
         )
     };
+    // The algorithms its autonomous work may name (contract v22), each by
+    // its identifier with what it is; plain text, escaped.
+    let algorithms = if declaration.algorithms.is_empty() {
+        "none".to_string()
+    } else {
+        declaration
+            .algorithms
+            .iter()
+            .map(|algorithm| {
+                format!(
+                    "{} ({})",
+                    escape(&algorithm.algorithm_id),
+                    escape(&algorithm.description)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     format!(
         "<section class=\"admin-section\"><div class=\"section-head\"><div><h2>What it declares</h2>\
-         <p class=\"hint\">Its secret settings: {secrets}. Its storage: {storage}. What it receives \
+         <p class=\"hint\">Its secret settings: {secrets}. Its storage: {storage}. The algorithms \
+         its autonomous work may name: {algorithms}. What it receives \
          and does not carry, by name only, with how often it saw each since it started; the \
          counts stay in this deployment.</p></div></div>{table}</section>"
     )
@@ -428,6 +478,10 @@ mod tests {
                 ..Default::default()
             }),
             catalogue: None,
+            algorithms: vec![AlgorithmDeclaration {
+                algorithm_id: "rebalance-drift".into(),
+                description: "Rebalances <a> sleeve past its drift band".into(),
+            }],
         };
         let seen = [NotCarriedSeen {
             scheme: "snaptrade:position".into(),
@@ -439,6 +493,8 @@ mod tests {
             page.contains("consumer_key") && page.contains("open_pnl") && page.contains(">42<")
         );
         assert!(page.contains("kept 30 days"));
+        // An algorithm by its identifier and description, escaped.
+        assert!(page.contains("rebalance-drift (Rebalances &lt;a&gt; sleeve past its drift band)"));
         assert_eq!(summary(None, &seen), "");
     }
 }

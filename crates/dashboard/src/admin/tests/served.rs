@@ -486,6 +486,7 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
             ),
         ],
         declaration: Some(PluginDeclaration {
+            algorithms: Default::default(),
             secret_settings: vec!["client_id".into(), "consumer_key".into()],
             not_carried: vec![NotCarried {
                 role: "custody".into(),

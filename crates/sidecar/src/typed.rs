@@ -57,7 +57,20 @@
 //! `invalid_argument` for a number the wire does not carry,
 //! `failed_precondition` for an external account nobody has linked,
 //! `unavailable` when nothing serves the topic, `deadline_exceeded` when it
-//! did not answer in time, `aborted` when it answered with a refusal.
+//! did not answer in time, `aborted` when it answered with a refusal --
+//! `failed_precondition` when that refusal is an account not granted the
+//! instance (REFUSAL_REASON_ACCOUNT_NOT_LINKABLE, W6.30), `already_exists`
+//! for a venue account code an `ems`'s map holds already (contract v22).
+//!
+//! **From contract v22**: a command naming its record by ID alone -- an
+//! order's release, check, approval, claim, placement, change, report or
+//! acknowledgement, a locate's use ([`BY_ID_ALONE`]) -- is admitted on the
+//! role's grant and stamped with the instance's write scope, narrowed to the
+//! person's, marked as applying, for the book to hold the record's account
+//! to (W4.9). A service account's claims carry the algorithm its call named,
+//! checked against the version's declared algorithms on every command and
+//! stamped (`algorithm_id`). The venue's catalogue is read as the plugin
+//! itself ([`AS_ITSELF`]).
 //!
 //! Where one status covers refusals a plugin must tell apart, the refusal
 //! carries a reason code beside it, from the typed-operations refusal
@@ -93,6 +106,39 @@ pub(crate) const FILED_TICKETS: &str = "platform.config.query.filed-tickets";
 /// `config` command and query stays an admin's, and none is ever sent for
 /// the plugin as itself.
 pub(crate) const FOR_A_PERSON_AT_ANY_LEVEL: [&str; 2] = [FILE_TICKET, FILED_TICKETS];
+/// The venue's catalogue (ReadVenueCatalogue, W11.20, contract v22): a
+/// `config` read an `ems` or an `oms` makes as itself, on start and after a
+/// loss, like its own configuration -- a venue's offering, no account's data
+/// and nothing of the deployment's configuration a person administers (the
+/// main session's settlement, 2026-10-12). Sent for nobody, whatever
+/// assertion the call carries.
+pub(crate) const AS_ITSELF: [&str; 1] = ["platform.config.query.venue-catalogue"];
+/// An `ems`'s venue account mapping (MapVenueAccount, W11.22, contract v22).
+const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
+/// The commands that name a record by its ID alone -- an order, a placement,
+/// a change request or a locate -- and no account (contract v22; W4.9, W11;
+/// the order-path plan's protos, point 8, ruled 2026-10-12): admitted on the
+/// role's grant and stamped with the sending instance's write scope, narrowed
+/// to the person's write access where it acts for one, which the book checks
+/// the record's account against. The generated operations hand these no
+/// account; a test holds this list to them.
+pub(crate) const BY_ID_ALONE: [&str; 11] = [
+    "meridian.v1.RequestOrderChangeRequest",
+    "meridian.v1.RecordCheckRequest",
+    "meridian.v1.DecideApprovalRequest",
+    "meridian.v1.ReleaseOrderRequest",
+    "meridian.v1.SetWorkingConditionRequest",
+    "meridian.v1.CreatePlacementRequest",
+    "meridian.v1.RequestPlacementChangeRequest",
+    "meridian.v1.ReportPlacementRequest",
+    "meridian.v1.ReportChargeRequest",
+    "meridian.v1.AcknowledgeFlagRequest",
+    "meridian.v1.RecordLocateUseRequest",
+];
+
+/// The role whose venue facts take their account from the venue account map
+/// (contract v22, W11.22).
+const CONNECTIVITY: &str = "connectivity";
 /// Where a plugin says which external accounts its connection reaches (W2.8).
 const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
 
@@ -141,6 +187,14 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         } else {
             String::new()
         },
+        // The algorithm the call named (contract v22), on a service
+        // account's alone; checked against the version's declared
+        // algorithms before anything is sent ([`Sidecar::declared_algorithm`]).
+        algorithm_id: if service_account {
+            claims.algorithm_id.clone()
+        } else {
+            String::new()
+        },
         account_scope: None,
     }
 }
@@ -151,6 +205,49 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
 impl Sidecar {
     pub(crate) fn instance_id(&self) -> &str {
         &self.identity.instance_id
+    }
+
+    /// A venue fact's account, stamped from the venue account map (contract
+    /// v22; W11.22, matrix/stamped.tsv's `venue-account-map`): sent by a
+    /// connectivity plugin, the account its `ems` mapped the fact's venue
+    /// account code to on this instance, and empty -- never refused -- where
+    /// nobody has, so the book keeps the fact unplaced (W11.13). Sent by a
+    /// plugin holding another role that sends the row, and not
+    /// `connectivity`, the account it named, as it named it. A plugin
+    /// holding both is read as its connectivity role wherever it names a
+    /// code.
+    pub(crate) async fn venue_mapped_account(
+        &self,
+        payload_type: &str,
+        venue_account_code: &str,
+        named: &str,
+    ) -> Result<String, Status> {
+        let connectivity = self.identity.roles.iter().any(|role| role == CONNECTIVITY);
+        let other = self.identity.roles.iter().any(|role| role != CONNECTIVITY);
+        if !connectivity || (other && venue_account_code.is_empty()) {
+            return Ok(named.to_string());
+        }
+        let configuration = self.configuration(self.clock.now_ns()).await?;
+        let mapped = configuration
+            .venue_account_map
+            .iter()
+            .flat_map(|map| map.mappings.iter())
+            .find(|mapping| {
+                mapping.connectivity_instance_id == self.instance_id()
+                    && mapping.venue_account_code == venue_account_code
+                    && !venue_account_code.is_empty()
+            })
+            .map(|mapping| mapping.account_id.clone())
+            .unwrap_or_default();
+        if mapped.is_empty() {
+            tracing::info!(
+                instance = self.instance_id(),
+                payload_type,
+                venue_account_code,
+                "a venue's fact names a code no ems mapped on this plugin; sent with no account"
+            );
+        }
+        Ok(mapped)
     }
 
     /// A plugin's params, read as the domain message they are on the wire.
@@ -317,7 +414,9 @@ impl Sidecar {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
-        let mut stamp = if topic.starts_with(CONFIGURATION) {
+        let mut stamp = if AS_ITSELF.contains(&topic.as_str()) {
+            Stamp::default()
+        } else if topic.starts_with(CONFIGURATION) {
             let (claims, roles) = self.vouched_for_configuration(
                 &topic,
                 payload_type,
@@ -400,6 +499,9 @@ impl Sidecar {
                     &claims,
                 )?;
             }
+            if topic == MAP_VENUE_ACCOUNT {
+                self.code_mapped_once(&message.encode_to_vec(), now).await?;
+            }
             tracing::info!(
                 instance = self.instance_id(),
                 topic,
@@ -410,9 +512,16 @@ impl Sidecar {
             );
             return self.ask_for(&topic, payload_type, message, &claims).await;
         }
+        // Read where it decides: an account named, or a record named by its
+        // ID alone, whose write scope travels with it (contract v22).
+        let by_id_alone = account.is_none() && BY_ID_ALONE.contains(&payload_type);
+        let write_scope = if account.is_some() || by_id_alone {
+            self.configuration(now).await?.write_account_ids
+        } else {
+            Vec::new()
+        };
         if let Some(account) = &account {
-            let configuration = self.configuration(now).await?;
-            if !configuration.write_account_ids.contains(account) {
+            if !write_scope.contains(account) {
                 let refusal = format!(
                     "account {account} is outside this plugin's write scope: nobody may write \
                      it through this plugin"
@@ -421,11 +530,13 @@ impl Sidecar {
                 return Err(Status::permission_denied(refusal));
             }
         }
+        let mut writes = None;
         let claims = match acting_for {
             None => CallerClaims::default(),
             Some(assertion) => {
                 let (claims, roles) =
                     self.vouched_writer(&topic, payload_type, &assertion, account.as_deref(), now)?;
+                writes = Some(person_writes(&claims, &roles));
                 tracing::info!(
                     instance = self.instance_id(),
                     topic,
@@ -439,7 +550,18 @@ impl Sidecar {
                 claims
             }
         };
-        self.ask_for(&topic, payload_type, message, &claims).await
+        // A command naming its record by ID alone carries the write scope it
+        // is held to (contract v22, W4.9): the instance's, narrowed to what
+        // the person may write through it where it acts for one.
+        let scope = by_id_alone.then(|| {
+            write_scope
+                .iter()
+                .filter(|held| writes.as_ref().is_none_or(|writes| writes.contains(*held)))
+                .cloned()
+                .collect::<Vec<String>>()
+        });
+        self.ask_scoped(&topic, payload_type, message, &claims, scope)
+            .await
     }
 
     /// Asked, with the person stamped on the envelope -- and the delegation
@@ -454,10 +576,26 @@ impl Sidecar {
         message: D,
         claims: &CallerClaims,
     ) -> Result<Response<R>, Status> {
+        self.ask_scoped(topic, payload_type, message, claims, None)
+            .await
+    }
+
+    /// [`Self::ask_for`], with the write scope a command naming its record
+    /// by ID alone is held to, marked as applying (contract v22).
+    async fn ask_scoped<D: Message, R: Message + Default>(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        message: D,
+        claims: &CallerClaims,
+        scope: Option<Vec<String>>,
+    ) -> Result<Response<R>, Status> {
         // The prepared change the person made this from (W4.9, contract
         // v20), as the dashboard's assertion named it; never alone. A service
-        // account's kind and owner beside its subject (contract v21).
-        let stamp = stamp_of(claims, true);
+        // account's kind and owner beside its subject (contract v21), and the
+        // algorithm its call named (contract v22).
+        let mut stamp = stamp_of(claims, true);
+        stamp.account_scope = scope;
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -651,6 +789,45 @@ impl Sidecar {
         Err(Status::permission_denied(refusal))
     }
 
+    /// A venue account code is mapped once per connectivity plugin (W11.22,
+    /// contract v22): one this `ems`'s map holds at that plugin for another
+    /// account is refused here, `already_exists` naming the code, before the
+    /// conductor hears of it; the conductor refuses it too, for a map this
+    /// sidecar has not been told yet.
+    async fn code_mapped_once(&self, mapping: &[u8], now_ns: i64) -> Result<(), Status> {
+        let asked = domain::MapVenueAccountRequest::decode(mapping)
+            .map_err(|failed| Status::internal(format!("the mapping did not read: {failed}")))?;
+        if asked.account_id.is_empty() {
+            return Ok(());
+        }
+        let configuration = self.configuration(now_ns).await?;
+        let held = configuration
+            .venue_account_map
+            .iter()
+            .flat_map(|map| map.mappings.iter())
+            .find(|held| {
+                held.connectivity_instance_id == asked.connectivity_instance_id
+                    && held.venue_account_code == asked.venue_account_code
+            });
+        match held {
+            Some(held) if held.account_id != asked.account_id => {
+                let refusal = format!(
+                    "venue_account_code: {} is mapped on {} to {} already; remove that mapping \
+                     first, and nothing was changed",
+                    asked.venue_account_code, asked.connectivity_instance_id, held.account_id
+                );
+                self.note_refusal(&refusal);
+                Err(refused_naming(
+                    Code::AlreadyExists,
+                    refusal,
+                    RefusalReason::Unspecified,
+                    vec!["venue_account_code".into()],
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// A link names an external account this plugin said its connection
     /// reaches (W2.8), or -- to remove it -- one it already links. Any other
     /// is refused before the conductor hears of it.
@@ -717,6 +894,21 @@ impl Sidecar {
             self.note_refusal(&refusal);
             Err(Status::permission_denied(refusal))
         };
+        // The algorithm a service account's call named (contract v22, W4.9):
+        // one this version declares, checked on every command the claims
+        // carry it on, so none can name another; then stamped.
+        if is_service_account(&claims) {
+            if let Err(words) = self.declared_algorithm(&claims.algorithm_id) {
+                let refusal = format!("algorithm_id: {words}");
+                self.note_refusal(&refusal);
+                return Err(refused_naming(
+                    Code::InvalidArgument,
+                    refusal,
+                    RefusalReason::Unspecified,
+                    vec!["algorithm_id".into()],
+                ));
+            }
+        }
         // A command only in a session opened by Open: one under Manage
         // reaches no account's data, and one under View acts on nothing
         // (W6.9).
@@ -799,6 +991,23 @@ impl Sidecar {
             held_on(&claims, &granting)
         ))
     }
+}
+
+/// What a person may write through the plugin, as the claims vouch: on the
+/// roles the command was admitted under, their write accounts there; from
+/// claims carrying no per-role entry, their write set.
+fn person_writes(claims: &CallerClaims, admitted: &[String]) -> Vec<String> {
+    if claims.roles.is_empty() {
+        return claims.write_account_ids.clone();
+    }
+    claims
+        .roles
+        .iter()
+        .filter(|held| admitted.contains(&held.role) && held.level == AccessLevel::Write as i32)
+        .flat_map(|held| held.write_positions.iter())
+        .filter_map(|at| claims.read_account_ids.get(*at as usize))
+        .cloned()
+        .collect()
 }
 
 /// Who the claims name, for a refusal: their name where the dashboard gave
@@ -944,10 +1153,13 @@ pub(crate) fn refused(failed: BusError) -> Status {
             // to be tried again, so the status a caller retries (contract
             // v10). Every other refusal of a component's is `aborted`.
             Some((reason, words)) => refused_naming(
-                if reason == RefusalReason::ReferenceUnavailable {
-                    Code::Unavailable
-                } else {
-                    Code::Aborted
+                match reason {
+                    RefusalReason::ReferenceUnavailable => Code::Unavailable,
+                    // An account not granted the instance, for a link or an
+                    // `ems`'s mapping: the admin asks a deployment admin to
+                    // grant it (W6.4, W6.30, W11.22).
+                    RefusalReason::AccountNotLinkable => Code::FailedPrecondition,
+                    _ => Code::Aborted,
                 },
                 words.to_string(),
                 reason,
@@ -962,5 +1174,7 @@ pub(crate) fn refused(failed: BusError) -> Status {
     }
 }
 
+#[cfg(test)]
+mod order_path;
 #[cfg(test)]
 mod tests;

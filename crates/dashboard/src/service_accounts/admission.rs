@@ -161,6 +161,7 @@ async fn call_route(
     role: &str,
     tool: &ToolDeclaration,
     arguments: Value,
+    algorithm_id: &str,
 ) -> Value {
     let Some(plugins) = app.plugins.as_deref() else {
         return crate::mcp::refused(
@@ -193,6 +194,7 @@ async fn call_route(
                 own_settings: Vec::new(),
                 second_pair_of_eyes: Vec::new(),
                 owner_subject: &account.owner_subject,
+                algorithm_id,
             },
             opened,
             tool,
@@ -490,7 +492,16 @@ async fn decide(
     }
 
     if makes {
-        let answered = call_route(app, &account, instance, role, &declared, arguments).await;
+        let answered = call_route(
+            app,
+            &account,
+            instance,
+            role,
+            &declared,
+            arguments,
+            &asked.algorithm_id,
+        )
+        .await;
         return Ok(CallAsServiceAccountReply {
             outcome: "made".into(),
             prepared_call_id: String::new(),
@@ -502,7 +513,16 @@ async fn decide(
     let Some(check) = check else {
         return Err(Refusal::at(PRECONDITION, "tool_name", "no check tool"));
     };
-    let checked = call_route(app, &account, instance, role, &check, arguments.clone()).await;
+    let checked = call_route(
+        app,
+        &account,
+        instance,
+        role,
+        &check,
+        arguments.clone(),
+        &asked.algorithm_id,
+    )
+    .await;
     let passed = matches!(
         checked.get("outcome").and_then(Value::as_str),
         Some("made") | Some("unchanged")
