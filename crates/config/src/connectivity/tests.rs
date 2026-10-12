@@ -447,7 +447,7 @@ async fn the_venue_catalogue_is_kept_latest_per_plugin_and_code_and_read_as_itse
     let mut answered = None;
     for _ in 0..100 {
         let reply: ReadVenueCatalogueReply = ask(
-            &reader,
+            reader,
             READ_VENUE_CATALOGUE,
             "meridian.v1.ReadVenueCatalogueRequest",
             read("ACCT-7"),
@@ -465,11 +465,11 @@ async fn the_venue_catalogue_is_kept_latest_per_plugin_and_code_and_read_as_itse
     assert_eq!(answered.connectivity_instance_id, "fix-1");
     // Two different catalogues, two records; the repeat changed nothing.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(h.store.keep_venue_catalogue(&answered, NOW).unwrap() == false);
+    assert!(!h.store.keep_venue_catalogue(&answered, NOW).unwrap());
 
     // A code not published is answered empty, never refused.
     let empty: ReadVenueCatalogueReply = ask(
-        &reader,
+        reader,
         READ_VENUE_CATALOGUE,
         "meridian.v1.ReadVenueCatalogueRequest",
         read("ACCT-9"),

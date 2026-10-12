@@ -523,6 +523,10 @@ pub struct View<'a> {
     /// What each of its roles runs as, below what agents may do (W6.33,
     /// contract v21).
     pub runs_as: String,
+    /// A connectivity plugin's ems, or an ems's connectivity plugins and its
+    /// venue account map (W11.21, W11.22, contract v22); empty for any
+    /// other.
+    pub connectivity: String,
 }
 
 fn nav(instance: &str, tabs: &[Tab], current: &Tab) -> String {
@@ -579,8 +583,9 @@ pub fn render(view: &View) -> String {
         // Its dialogs -- what agents may do with an act, what a role runs as
         // -- open with the admin portal's own script (contract v21).
         (ACCESS, _) => format!(
-            "{}<script>(function () {{{}</script>",
+            "{}<script>(function () {{{}{}</script>",
             access_parts(view, line),
+            super::picker::SCRIPT,
             super::overview::SCRIPT_END
         ),
         (ACCOUNTS, _) => view.accounts.clone(),
@@ -640,6 +645,18 @@ fn access_parts(view: &View, line: &Line) -> String {
                     "<section class=\"panel padded\" id=\"runs-as\">{}</section>",
                     view.runs_as
                 ),
+            ),
+            (
+                "connectivity",
+                "Its ems",
+                if view.connectivity.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<section class=\"panel padded\" id=\"connectivity\">{}</section>",
+                        view.connectivity
+                    )
+                },
             ),
         ],
     )

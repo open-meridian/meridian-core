@@ -48,7 +48,7 @@ pub const RULES: [&str; 12] = [
 /// (its `TOOL_NAMES`), by name: either surface's tool named in a text reads
 /// as an instruction to whoever holds it (requirement 61). A plugin's tool,
 /// `{instance}__{name}`, is matched by its shape.
-pub const TOOL_NAMES: [&str; 33] = [
+pub const TOOL_NAMES: [&str; 35] = [
     // The deployment's, core's own.
     "file_ticket",
     "list_tickets",
@@ -64,6 +64,8 @@ pub const TOOL_NAMES: [&str; 33] = [
     "accept_offered_values",
     "merge_instruments",
     "ask_platform_for_instrument",
+    "list_calendars",
+    "read_calendar",
     "resolve_ticket",
     "close_ticket",
     // The platform's.

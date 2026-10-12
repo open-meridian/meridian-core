@@ -65,6 +65,14 @@ pub fn routes() -> Router<Arc<App>> {
             post(set_plugin_agents_may),
         )
         .route("/admin/plugins/{instance}/accounts", post(set_linkable))
+        .route(
+            "/admin/plugins/{instance}/connectivity/available",
+            post(connectivity::available),
+        )
+        .route(
+            "/admin/plugins/{instance}/connectivity/link",
+            post(connectivity::link),
+        )
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -437,6 +445,8 @@ pub(crate) fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod books;
+pub mod calendars;
+pub mod connectivity;
 pub mod data_sources;
 pub mod holds;
 pub mod instruments;
@@ -664,6 +674,29 @@ async fn plugin_view(
         Some(record) => choices(&app, &instance, record, &records).await,
         None => settings::Choices::default(),
     };
+    // A connectivity plugin's ems, or an ems's plugins and map (W11.21,
+    // W11.22, contract v22).
+    let connectivity_part = {
+        let names: Vec<(String, String)> = app
+            .service_accounts
+            .accounts()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|account| (account.service_account_id, account.name))
+            .collect();
+        let administers_ems = |ems: &str| access.plugin(ems).administers("ems");
+        connectivity::part(
+            &records,
+            &instance,
+            &connectivity::Viewer {
+                deployment_admin: access.deployment_admin,
+                administers_ems: &administers_ems,
+            },
+            &names,
+            &token_input(&session),
+        )
+    };
     let body = view::render(&view::View {
         line,
         choices: &choices,
@@ -696,6 +729,7 @@ async fn plugin_view(
             access.deployment_admin,
             &token_input(&session),
         ),
+        connectivity: connectivity_part,
         runs_as: {
             let held = access.plugin(&instance);
             // The held view of the accounts, read afresh for the choices.
@@ -1851,7 +1885,7 @@ fn every(pairs: &[(String, String)], name: &str) -> Vec<String> {
 
 /// A form's fields where each name is sent once; a repeated one keeps its
 /// last, as `Form<Fields>` would.
-fn once(pairs: &[(String, String)]) -> Fields {
+pub(crate) fn once(pairs: &[(String, String)]) -> Fields {
     pairs.iter().cloned().collect()
 }
 
@@ -2243,7 +2277,21 @@ async fn instruments_page(
         Err(response) => return *response,
     };
     let listed = instruments::list(&app.bus, "").await;
-    let body = instruments::list_page(&listed, &token_input(&session), field(&query, "done"));
+    // The Calendars tab (W3.21, contract v22): what is held, and the year of
+    // the calendar chosen, this year by default.
+    let held = calendars::held(&app.bus).await;
+    let chosen = field(&query, "calendar");
+    let year = field(&query, "year")
+        .parse::<u16>()
+        .unwrap_or_else(|_| meridian_domain::date::Date::of_utc_instant(app.clock.now_ns()).year());
+    let read = if chosen.is_empty() {
+        None
+    } else {
+        Some(calendars::year(&app.bus, chosen, year).await)
+    };
+    let tab = calendars::tab(&held, read.as_ref().map(|read| (chosen, year, read)));
+    let body =
+        instruments::list_page_with(&listed, &token_input(&session), field(&query, "done"), &tab);
     Html(page_with(
         "Instruments",
         &body,

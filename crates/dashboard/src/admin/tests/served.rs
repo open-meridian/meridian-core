@@ -296,6 +296,9 @@ fn per_role(records: &mut AccessRecords) {
         known(INSTANCE, &["custody"]),
         known(TWO_ROLES, &["custody", "operations"]),
         known("reference-1", &[]),
+        // Contract v22 (W11.21): a connectivity plugin and its ems.
+        known("fix-1", &["connectivity"]),
+        known("ems-1", &["ems"]),
     ];
     for n in 0..20 {
         records.known_plugins.push(known(
@@ -335,6 +338,13 @@ fn per_role(records: &mut AccessRecords) {
         plugin_instance_id: TWO_ROLES.into(),
         ..Default::default()
     });
+    // And the connectivity plugin's and its ems's (contract v22).
+    for instance in ["fix-1", "ems-1"] {
+        records.plugin_settings.push(PluginSettingsRecord {
+            plugin_instance_id: instance.into(),
+            ..Default::default()
+        });
+    }
     records.account_groups.push(AccountGroup {
         account_group_id: "AG-DESK".into(),
         name: "The desk's accounts".into(),
@@ -433,6 +443,32 @@ fn records() -> AccessRecords {
     let mut records = settings_records();
     per_role(&mut records);
     records.accounts = accounts();
+    // Contract v22 (W11.21, W11.22): fix-1 available and linked to ems-1,
+    // which mapped every account on it.
+    records.connectivity_links = vec![meridian_pb::v1::ConnectivityLink {
+        connectivity_instance_id: "fix-1".into(),
+        available: true,
+        ems_instance_id: "ems-1".into(),
+        users: vec![meridian_pb::v1::ConnectivityUser {
+            user: Some(meridian_pb::v1::connectivity_user::User::Subject(
+                ADMIN.into(),
+            )),
+        }],
+    }];
+    records.venue_account_maps = vec![meridian_pb::v1::VenueAccountMap {
+        ems_instance_id: "ems-1".into(),
+        mappings: records
+            .accounts
+            .iter()
+            .take(40)
+            .enumerate()
+            .map(|(n, account)| meridian_pb::v1::VenueAccountMapping {
+                connectivity_instance_id: "fix-1".into(),
+                venue_account_code: format!("ACCT-{:04}", n + 1),
+                account_id: account.account_id.clone(),
+            })
+            .collect(),
+    }];
     // The holds a deployment admin set (contract v16, W6.25).
     records.holds = vec![
         meridian_domain::v1::Hold {
@@ -909,6 +945,134 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
     reply
 }
 
+/// A connectivity plugin's link in the stand-in conductor's records, made
+/// withdrawn and unlinked where none was kept.
+fn connectivity_link<'a>(
+    records: &'a mut AccessRecords,
+    instance: &str,
+) -> &'a mut meridian_pb::v1::ConnectivityLink {
+    if !records
+        .connectivity_links
+        .iter()
+        .any(|link| link.connectivity_instance_id == instance)
+    {
+        records
+            .connectivity_links
+            .push(meridian_pb::v1::ConnectivityLink {
+                connectivity_instance_id: instance.into(),
+                ..Default::default()
+            });
+    }
+    records
+        .connectivity_links
+        .iter_mut()
+        .find(|link| link.connectivity_instance_id == instance)
+        .unwrap()
+}
+
+/// The calendars the stand-in instrument store holds: three seed calendars
+/// and the US equities rule, and thirty more currencies so the tab pages.
+fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
+    use meridian_domain::v1::{CalendarKind, HeldCalendar, HeldDateRule};
+    let mut calendars = vec![
+        HeldCalendar {
+            calendar_id: "CAL-01JAE000000000000000USD1".into(),
+            name: "US dollar".into(),
+            kind: CalendarKind::Currency as i32,
+            version: 3,
+            coverage_to_date: "2027-12-31".into(),
+            refreshed_at_ns: 1_791_417_600_000_000_000,
+        },
+        HeldCalendar {
+            calendar_id: "CAL-01JAE000000000000000XNYS".into(),
+            name: "US equity venues".into(),
+            kind: CalendarKind::Trading as i32,
+            version: 7,
+            coverage_to_date: "2027-12-31".into(),
+            refreshed_at_ns: 1_791_417_600_000_000_000,
+        },
+        HeldCalendar {
+            calendar_id: "CAL-01JAE0000000000000000USSS".into(),
+            name: "US securities settlement".into(),
+            kind: CalendarKind::SecuritiesSettlement as i32,
+            version: 4,
+            coverage_to_date: "2028-12-31".into(),
+            refreshed_at_ns: 1_791_417_600_000_000_000,
+        },
+    ];
+    for n in 0..30 {
+        calendars.push(HeldCalendar {
+            calendar_id: format!("CAL-01JAE00000000000000CUR{n:02}"),
+            name: format!("Currency {n:02} settlement days, as its central bank publishes them"),
+            kind: CalendarKind::Currency as i32,
+            version: 1,
+            coverage_to_date: "2027-12-31".into(),
+            refreshed_at_ns: 1_791_417_600_000_000_000,
+        });
+    }
+    meridian_domain::v1::ListCalendarsReply {
+        calendars,
+        next_cursor: String::new(),
+        rules: vec![HeldDateRule {
+            kind: meridian_pb::v1::DateRuleKind::Settlement as i32,
+            subject: "US/equity".into(),
+            version: 2,
+            refreshed_at_ns: 1_791_417_600_000_000_000,
+        }],
+    }
+}
+
+/// A calendar's year as the stand-in store answers it: the Federal
+/// Reserve's holidays in 2026.
+fn calendar_year(
+    asked: &meridian_domain::v1::ReadCalendarRequest,
+) -> meridian_domain::v1::ReadCalendarReply {
+    use meridian_domain::v1::{
+        CalendarCoverage, CalendarDay, CalendarDayKind, CalendarSource, CalendarWeekend, Weekday,
+    };
+    let days = [
+        ("2026-01-01", "New Year's Day"),
+        ("2026-01-19", "Birthday of Martin Luther King, Jr."),
+        ("2026-02-16", "Washington's Birthday"),
+        ("2026-05-25", "Memorial Day"),
+        ("2026-06-19", "Juneteenth National Independence Day"),
+        ("2026-09-07", "Labor Day"),
+        ("2026-10-12", "Columbus Day"),
+        ("2026-11-11", "Veterans Day"),
+        ("2026-11-26", "Thanksgiving Day"),
+        ("2026-12-25", "Christmas Day"),
+    ]
+    .into_iter()
+    .filter(|(date, _)| *date >= asked.from_date.as_str() && *date <= asked.to_date.as_str())
+    .map(|(date, name)| CalendarDay {
+        date: date.into(),
+        kind: CalendarDayKind::Closed as i32,
+        name: name.into(),
+        source: "fed-holidays".into(),
+    })
+    .collect();
+    meridian_domain::v1::ReadCalendarReply {
+        found: true,
+        calendar_id: asked.calendar_id.clone(),
+        version: 3,
+        days,
+        weekends: vec![CalendarWeekend {
+            weekdays: vec![Weekday::Saturday as i32, Weekday::Sunday as i32],
+            valid_from_date: "2016-01-01".into(),
+        }],
+        coverage: Some(CalendarCoverage {
+            from_date: "2026-01-01".into(),
+            to_date: "2027-12-31".into(),
+        }),
+        sources: vec![CalendarSource {
+            source_id: "fed-holidays".into(),
+            name: "Federal Reserve holidays".into(),
+            address: "https://www.federalreserve.gov/aboutthefed/k8.htm".into(),
+            read_at_ns: 1_760_140_800_000_000_000,
+        }],
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "serves until stopped: make e2e-settings-page runs it for the browser"]
 async fn serve_a_plugins_settings_pages_for_a_browser() {
@@ -1084,6 +1248,49 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             ))
         },
     );
+    {
+        // The stand-in conductor's links (W11.21, contract v22): kept as
+        // asked.
+        let held = Arc::clone(&held);
+        bus.serve(
+            crate::admin::connectivity::SET_CONNECTIVITY_AVAILABLE,
+            move |envelope| {
+                let asked = meridian_domain::v1::SetConnectivityAvailableRequest::decode(
+                    &envelope.payload[..],
+                )
+                .map_err(|e| e.to_string())?;
+                let mut records = held.lock().unwrap();
+                let link = connectivity_link(&mut records, &asked.connectivity_instance_id);
+                link.available = asked.available;
+                Ok(("".into(), link.encode_to_vec()))
+            },
+        );
+    }
+    {
+        let held = Arc::clone(&held);
+        bus.serve(
+            crate::admin::connectivity::LINK_CONNECTIVITY,
+            move |envelope| {
+                let asked =
+                    meridian_domain::v1::LinkConnectivityRequest::decode(&envelope.payload[..])
+                        .map_err(|e| e.to_string())?;
+                let mut records = held.lock().unwrap();
+                let link = connectivity_link(&mut records, &asked.connectivity_instance_id);
+                link.ems_instance_id = asked.ems_instance_id;
+                link.users = asked.users;
+                Ok(("".into(), link.encode_to_vec()))
+            },
+        );
+    }
+    // The instrument store's calendars (W3.19, W3.21, contract v22).
+    bus.serve(crate::admin::calendars::LIST_CALENDARS, |_| {
+        Ok(("".into(), held_calendars().encode_to_vec()))
+    });
+    bus.serve(crate::admin::calendars::READ_CALENDAR, |envelope| {
+        let asked = meridian_domain::v1::ReadCalendarRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        Ok(("".into(), calendar_year(&asked).encode_to_vec()))
+    });
     bus.serve(crate::admin::instruments::READ_INSTRUMENT_HISTORY, |_| {
         Ok((
             "".into(),

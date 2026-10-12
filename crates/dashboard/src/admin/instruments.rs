@@ -721,6 +721,17 @@ pub fn list_page(
     token: &str,
     notice: &str,
 ) -> String {
+    list_page_with(listed, token, notice, "")
+}
+
+/// The Instruments page with its Calendars tab (W3.21, contract v22), drawn
+/// by [`super::calendars::tab`].
+pub fn list_page_with(
+    listed: &Result<ListInstrumentsToCompleteReply, String>,
+    token: &str,
+    notice: &str,
+    calendars: &str,
+) -> String {
     let notice = if notice.is_empty() {
         String::new()
     } else {
@@ -928,18 +939,23 @@ pub fn list_page(
          the book cannot use is refused until it is complete.</p></div></div>{notice}\
          <nav class=\"tabs\"><a href=\"#to-complete\" data-tab=\"to-complete\">To complete</a>\
          <a href=\"#conflicts\" data-tab=\"conflicts\">Conflicts ({conflicts_n})</a>\
-         <a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a></nav>\
+         <a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
          <section class=\"admin-section\" id=\"to-complete\"><div class=\"section-head\"><div>\
          <h2>Records to complete</h2>{counts}</div></div>{table}</section>\
          <section class=\"admin-section\" id=\"conflicts\"><div class=\"section-head\"><div>\
          <h2>Conflicts</h2><p class=\"hint\">Identifiers that meet two records. Merge them if \
          they are one security; the positions held under the one merged move onto the one that \
-         stays.</p></div></div>{conflicts}</section>{licensed}</div>\
+         stays.</p></div></div>{conflicts}</section>{licensed}{calendars}</div>\
          <script>{}{}{}</script>",
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
         super::data_sources::PAGER_SCRIPT,
         conflicts_n = listed.conflicts.len(),
+        calendars_tab = if calendars.is_empty() {
+            ""
+        } else {
+            "<a href=\"#calendars\" data-tab=\"calendars\">Calendars</a>"
+        },
     )
 }
 

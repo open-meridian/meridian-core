@@ -652,6 +652,98 @@ def the_service_accounts_tab_and_runs_as(browser, prefix):
         ctx.close()
 
 
+def the_connectivity_part_and_the_calendars_tab(browser, prefix):
+    """Contract v22 (W11.21, W11.22, W3.21): a connectivity plugin's Access
+    tab says whether it is available, the ems it is linked to and who may
+    route, one line, its dialogs within the viewport, withdrawn and made
+    available again from its dialog; an ems's says its connectivity plugins
+    and its venue account map, one line a mapping behind the kit's pager,
+    read-only; the Instruments page's Calendars tab lists the calendars held
+    one line each and shows a calendar's year -- each fitting one screen at
+    both sizes."""
+    for size, width, height in SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(f"{BASE}/admin/plugins/fix-1?tab=access#part-connectivity")
+        settled(page)
+        shown = page.locator("table.connectivity").is_visible()
+        check(shown, f"at {size} a connectivity plugin's Access tab shows its ems")
+        if shown:
+            row = page.inner_text("table.connectivity tbody tr")
+            check("ems-1" in row, f"at {size} it says the ems it is linked to: {row!r}")
+        problems = page.evaluate(FIT)
+        check(not problems, f"a connectivity plugin's ems at {size} fits one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-connectivity-{size}.png"))
+        for dialog in ("connectivity-link", "connectivity-available"):
+            opener = page.locator(f"button[data-dialog-open={dialog}]")
+            if not opener.count():
+                check(False, f"at {size} the {dialog} dialog is offered to the deployment's admin")
+                continue
+            opener.click()
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the {dialog} dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the {dialog} dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-{dialog}-{size}.png"))
+            if dialog == "connectivity-available" and size == "desktop" and PASS != "fit":
+                page.fill("dialog#connectivity-available [name=note]", "The venue is paused for the day")
+                page.click("dialog#connectivity-available button[type=submit]")
+                settled(page)
+                page.goto(f"{BASE}/admin/plugins/fix-1?tab=access#part-connectivity")
+                settled(page)
+                withdrawn = page.get_attribute("table.connectivity td[data-available]", "data-available")
+                check(withdrawn == "false", f"withdrawn from its dialog: {withdrawn!r}")
+                page.click("button[data-dialog-open=connectivity-available]")
+                page.wait_for_timeout(300)
+                page.click("dialog#connectivity-available button[type=submit]")
+                settled(page)
+                page.goto(f"{BASE}/admin/plugins/fix-1?tab=access#part-connectivity")
+                settled(page)
+                back = page.get_attribute("table.connectivity td[data-available]", "data-available")
+                check(back == "true", f"made available again from its dialog: {back!r}")
+            else:
+                page.click(f"dialog#{dialog} [data-dialog-close]")
+                page.wait_for_timeout(200)
+
+        page.goto(f"{BASE}/admin/plugins/ems-1?tab=access#part-connectivity")
+        settled(page)
+        mapped = page.get_attribute("[data-mapped]", "data-mapped")
+        check((mapped or "0").isdigit() and int(mapped or "0") >= 6,
+              f"at {size} an ems's venue account map lists its mappings: {mapped!r}")
+        check(page.locator("#connectivity form").count() == 0,
+              f"at {size} an ems's map is read-only here, set on its own page")
+        tall = page.evaluate("""() => [...document.querySelectorAll('[data-mapped] tbody tr')]
+          .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).length""")
+        check(not tall, f"at {size} each mapping is one line: {tall} taller")
+        problems = page.evaluate(FIT)
+        check(not problems, f"an ems's connectivity plugins and map at {size} fit one screen"
+              f"{': ' + '; '.join(problems) if problems else ''}")
+        page.screenshot(path=os.path.join(OUT, f"{prefix}-venue-account-map-{size}.png"))
+
+        for name, url, marker in [
+            ("calendars", f"{BASE}/admin/instruments#calendars", "[data-calendars]"),
+            ("calendar-year", f"{BASE}/admin/instruments?calendar=CAL-01JAE000000000000000USD1&year=2026#calendars", "[data-days]"),
+        ]:
+            page.goto(url)
+            settled(page)
+            check(page.locator(marker).count() == 1, f"at {size} the {name} view draws {marker}")
+            tall = page.evaluate(f"""() => [...document.querySelectorAll('{marker} tbody tr')]
+              .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).length""")
+            check(not tall, f"at {size} each line of {name} is one line: {tall} taller")
+            check(page.locator("#calendars form").count() == 0, f"at {size} the {name} view sets nothing")
+            problems = page.evaluate(FIT)
+            check(not problems, f"the {name} view at {size} fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-{name}-{size}.png"))
+        check(not errors, f"the v22 pages at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def a_secret_says_where_it_stands(browser, prefix):
     """The product owner, 2026-10-10: a secret's field says in its
     placeholder who set it and when, or that it is not set; no badge and no
@@ -837,6 +929,7 @@ with sync_playwright() as playwright:
     the_data_sources_page(browser, prefix)
     the_accounts_tab_holds_the_book(browser, prefix)
     the_service_accounts_tab_and_runs_as(browser, prefix)
+    the_connectivity_part_and_the_calendars_tab(browser, prefix)
     for name, url in [
         ("area-settings", AREA + "settings"),
         ("area-plan-code-links", AREA + PLAN),

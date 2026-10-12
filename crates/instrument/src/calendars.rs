@@ -729,7 +729,7 @@ fn tenor_from(
     }
     let both = Set::of(held, &ids)?;
     let calendars = Set::of(held, &rule.spot_calendars)?;
-    let tenor_rule = rule.tenor_rule.clone().unwrap_or_default();
+    let tenor_rule = rule.tenor_rule.unwrap_or_default();
     let convention = BusinessDayConvention::try_from(tenor_rule.convention)
         .unwrap_or(BusinessDayConvention::ModifiedFollowing);
     let date = match unit {

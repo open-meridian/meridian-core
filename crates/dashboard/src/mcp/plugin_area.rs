@@ -1822,10 +1822,14 @@ impl Context<'_> {
                 ).map(meridian_access::level_name)),
             }));
         }
+        // A connectivity plugin's link, an ems's plugins and its venue
+        // account map (W11.21, W11.22, contract v22).
+        let connectivity = crate::admin::connectivity::access_json(records, &instance);
         let data = json!({
             "plugin_instance_id": instance,
             "acts": acts,
             "runs_as": runs_as,
+            "connectivity": connectivity,
             "roles": self.access.known_roles.get(&instance).cloned().unwrap_or_default(),
             "access_groups": groups,
             "permissions": permissions.iter().map(|p| json!({
@@ -1903,6 +1907,16 @@ pub const PARITY: &[(&str, &str)] = &[
     (
         "/admin/plugins/{instance}/accounts",
         "read_linkable_accounts; exception: a grant is set at the page only (W6.30)",
+    ),
+    // A connectivity plugin's ems (W11.21, contract v22): who may route is
+    // access, set at the page only, and read through read_plugin_access.
+    (
+        "/admin/plugins/{instance}/connectivity/available",
+        "read_plugin_access; exception: a connectivity plugin made available is access, set at the page only (W11.21)",
+    ),
+    (
+        "/admin/plugins/{instance}/connectivity/link",
+        "read_plugin_access; exception: the link to an ems and who may route through it are access, set at the page only (W11.21)",
     ),
     (
         "/terminal/plugins",

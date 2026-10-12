@@ -103,7 +103,53 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: one_schema,
     },
+    // The Calendars tab's reads (W3.21, contract v22; the calendars spec's
+    // Q18): read-only, at the deployment admin's level; nothing sets a
+    // calendar in a deployment.
+    Spec {
+        name: "list_calendars",
+        title: "List the calendars held",
+        description: "the settlement calendars the deployment holds, one line each at its latest version (its name, kind, version, coverage's last date and when it was last refreshed), and the date rules held (kind, subject, version); paged by cursor. Read-only: a calendar is the platform's, pulled as a date read needs it.",
+        reads: true,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: calendars_schema,
+    },
+    Spec {
+        name: "read_calendar",
+        title: "Read a calendar",
+        description: "one calendar's days over a range, from_date to to_date inclusive (a year at a time, as the tab shows it), as of a recorded time or its latest version: its weekends, each closed weekday and weekend business day with its name and source, its coverage and its sources with the time each was read. A calendar not held is answered found false and asked of the platform.",
+        reads: true,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: calendar_schema,
+    },
 ];
+
+fn calendars_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "cursor": {"type": "string", "description": "next_cursor from the page before"},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 200},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn calendar_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "calendar_id": {"type": "string"},
+            "from_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "to_date": {"type": "string", "description": "YYYY-MM-DD, on or after from_date"},
+            "as_of_ns": {"type": "integer", "description": "a recorded time; 0 or absent for the latest"},
+        },
+        "required": ["calendar_id", "from_date", "to_date"],
+        "additionalProperties": false,
+    })
+}
 
 // ── Schemas ─────────────────────────────────────────────────────────────
 
@@ -922,6 +968,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "accept_offered_values" => accept(app, caller, &arguments).await,
         "merge_instruments" => merge(app, caller, &arguments).await,
         "ask_platform_for_instrument" => ask_platform(app, caller, &arguments).await,
+        "list_calendars" => list_calendars(app, caller, &arguments).await,
+        "read_calendar" => read_calendar(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -1094,6 +1142,130 @@ async fn history(app: &App, caller: &Caller, arguments: &Value) -> Value {
             "data": {
                 "versions": reply.versions.iter().map(version_json).collect::<Vec<_>>(),
                 "next_cursor": reply.next_cursor,
+            },
+        }),
+    }
+}
+
+/// W3.21: the calendars and rules held, a page at a time.
+async fn list_calendars(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["cursor", "page_size"], "", &mut problems);
+    let cursor = text(top, "cursor", "", false, &mut problems);
+    let page_size = integer(top, "page_size", "", false, &mut problems);
+    if !(0..=200).contains(&page_size) {
+        problems.add("page_size", "from 1 to 200");
+    }
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::ListCalendarsReply, _> = ask(
+        app,
+        caller,
+        crate::admin::calendars::LIST_CALENDARS,
+        "meridian.v1.ListCalendarsRequest",
+        meridian_domain::v1::ListCalendarsRequest {
+            page_size: page_size as i32,
+            cursor,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({
+            "outcome": "unchanged",
+            "data": {
+                "calendars": reply.calendars.iter().map(|calendar| json!({
+                    "calendar_id": calendar.calendar_id,
+                    "name": calendar.name,
+                    "kind": meridian_domain::v1::CalendarKind::try_from(calendar.kind)
+                        .map(|kind| kind.as_str_name()).unwrap_or_default(),
+                    "version": calendar.version,
+                    "coverage_to_date": calendar.coverage_to_date,
+                    "refreshed_at_ns": calendar.refreshed_at_ns,
+                })).collect::<Vec<_>>(),
+                "rules": reply.rules.iter().map(|rule| json!({
+                    "kind": meridian_pb::v1::DateRuleKind::try_from(rule.kind)
+                        .map(|kind| kind.as_str_name()).unwrap_or_default(),
+                    "subject": rule.subject,
+                    "version": rule.version,
+                    "refreshed_at_ns": rule.refreshed_at_ns,
+                })).collect::<Vec<_>>(),
+                "next_cursor": reply.next_cursor,
+            },
+        }),
+    }
+}
+
+/// W3.19: one calendar's days over a range.
+async fn read_calendar(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["calendar_id", "from_date", "to_date", "as_of_ns"],
+        "",
+        &mut problems,
+    );
+    let calendar_id = text(top, "calendar_id", "", true, &mut problems);
+    let from_date = text(top, "from_date", "", true, &mut problems);
+    let to_date = text(top, "to_date", "", true, &mut problems);
+    let as_of_ns = integer(top, "as_of_ns", "", false, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::ReadCalendarReply, _> = ask(
+        app,
+        caller,
+        crate::admin::calendars::READ_CALENDAR,
+        "meridian.v1.ReadCalendarRequest",
+        meridian_domain::v1::ReadCalendarRequest {
+            calendar_id,
+            from_date,
+            to_date,
+            as_of_ns,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({
+            "outcome": "unchanged",
+            "data": {
+                "found": reply.found,
+                "calendar_id": reply.calendar_id,
+                "version": reply.version,
+                "weekends": reply.weekends.iter().map(|weekend| json!({
+                    "weekdays": weekend.weekdays.iter().map(|day| {
+                        meridian_domain::v1::Weekday::try_from(*day)
+                            .map(|day| day.as_str_name()).unwrap_or_default()
+                    }).collect::<Vec<_>>(),
+                    "valid_from_date": weekend.valid_from_date,
+                })).collect::<Vec<_>>(),
+                "days": reply.days.iter().map(|day| json!({
+                    "date": day.date,
+                    "kind": meridian_domain::v1::CalendarDayKind::try_from(day.kind)
+                        .map(|kind| kind.as_str_name()).unwrap_or_default(),
+                    "name": day.name,
+                    "source": day.source,
+                })).collect::<Vec<_>>(),
+                "coverage": reply.coverage.as_ref().map(|coverage| json!({
+                    "from_date": coverage.from_date,
+                    "to_date": coverage.to_date,
+                })),
+                "sources": reply.sources.iter().map(|source| json!({
+                    "source_id": source.source_id,
+                    "name": source.name,
+                    "address": source.address,
+                    "read_at_ns": source.read_at_ns,
+                })).collect::<Vec<_>>(),
             },
         }),
     }
