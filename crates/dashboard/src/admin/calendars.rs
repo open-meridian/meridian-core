@@ -200,11 +200,16 @@ pub fn tab(
             n = listed.rules.len()
         )
     };
-    let year = shown
-        .map(|(id, year, read)| shown_year(id, year, read))
-        .unwrap_or_default();
+    // A calendar's year in place of the lists, so the tab fits one screen;
+    // Close returns to them.
+    if let Some((id, year, read)) = shown {
+        return format!(
+            "<section class=\"admin-section\" id=\"calendars\">{head}{}</section>",
+            shown_year(id, year, read)
+        );
+    }
     format!(
-        "<section class=\"admin-section\" id=\"calendars\">{head}{year}{calendars}\
+        "<section class=\"admin-section\" id=\"calendars\">{head}{calendars}\
          <h3>Date rules</h3>{rules}</section>"
     )
 }
@@ -357,11 +362,14 @@ mod tests {
             }],
         });
         let page = tab(&listed, Some(("CAL-USSS", 2026, &read)));
-        assert!(page.contains("US &lt;securities&gt; settlement"));
-        assert!(page.contains("Securities settlement"));
-        assert!(page.contains("data-calendars=\"1\""));
-        assert!(page.contains("US/equity"));
         assert!(page.contains("Columbus Day") && page.contains("Federal Reserve holidays"));
+        // The year in place of the lists, which a Close returns to.
+        assert!(!page.contains("data-calendars="));
+        let lists = tab(&listed, None);
+        assert!(lists.contains("US &lt;securities&gt; settlement"));
+        assert!(lists.contains("Securities settlement"));
+        assert!(lists.contains("data-calendars=\"1\""));
+        assert!(lists.contains("US/equity"));
         assert!(page.contains("Saturday and Sunday from 2016-01-01"));
         assert!(page.contains("year=2025") && page.contains("year=2027"));
         // Nothing in the tab sets a calendar.

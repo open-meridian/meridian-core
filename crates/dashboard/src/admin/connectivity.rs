@@ -361,10 +361,8 @@ fn ems_part(records: &AccessRecords, instance: &str) -> String {
         )
     };
     format!(
-        "<h2>Its connectivity plugins</h2><p class=\"hint\">The connectivity plugins linked to \
-         this ems, and the venue account code each account trades under at each, which this \
-         ems's admin maps on its own page among the accounts a deployment admin granted it.</p>\
-         {plugins}<h3>Venue account map</h3>{map}"
+        "<h2>Its connectivity plugins</h2><p class=\"hint\">The map is set on this ems's own \
+         page.</p>{plugins}<h3>Venue account map</h3>{map}"
     )
 }
 
