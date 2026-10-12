@@ -6,7 +6,10 @@
 // deployment mints its own instrument IDs, and a person completes its records).
 // From contract v18 also the venue master: the platform's own record of each
 // venue, which deployments pull and never mint (W1.16 to W1.19, W3.14, W3.15).
-// Every message here traces to a matrix row; see matrix/matrix.tsv.
+// From contract v22 the settlement calendars and date rules, the platform's
+// records too, and the date read that works out every date one way (W1.20 to
+// W1.23, W3.16 to W3.21). Every message here traces to a matrix row; see
+// matrix/matrix.tsv.
 //
 // The scope boundary is load-bearing: this is identity, mapping and structure.
 // Prices, yields, ratings, volumes and sector data are client-licensed and live
@@ -1351,4 +1354,483 @@ message AskPlatformForInstrumentReply {
   InstrumentRecord instrument = 3;
 
   string detail = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The settlement calendars and date rules, contract v22
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// spec/settlement-calendars-are-core-reference-data (accepted 2026-10-11, its
+// names approved; the names it left to the text approved 2026-10-12), under
+// sdk-contract/an-order-reaches-a-venue-contract. A calendar is a platform
+// record under its own `CAL-` ID, never changed and never reused
+// (decisions/036); the rules are platform records named by kind, subject and
+// version, with no ID of their own (the spec's Q11). The platform's curation
+// keeps them (W1.20 to W1.23); the conductor pulls what a deployment needs
+// (W3.16); the instrument store keeps every version and answers the calendar
+// read and the date read, in the kernel's own code (W3.17 to W3.21). Nothing
+// in a deployment mints or edits one, and nothing here claims anything
+// regulatory: a computed date is what a named rule gives on named calendars.
+//
+// DateBasis, DateRuleKind and the two references a basis holds are
+// plugin-facing, since a plugin's Provenance carries a basis: declared in
+// meridian-schema's sidecar.proto and imported from there.
+
+// A calendar's kind.
+enum CalendarKind {
+  CALENDAR_KIND_UNSPECIFIED = 0;
+  // A currency's settlement days; its subject the currency's cash
+  // instrument.
+  CALENDAR_KIND_CURRENCY = 1;
+  // A venue's trading days; its subject the venues that follow it.
+  CALENDAR_KIND_TRADING = 2;
+  // A securities settlement system's days; its subject the system by name
+  // and country.
+  CALENDAR_KIND_SECURITIES_SETTLEMENT = 3;
+}
+
+// What a listed day is.
+enum CalendarDayKind {
+  CALENDAR_DAY_KIND_UNSPECIFIED = 0;
+  // A weekday that is not a business day: a holiday, an ad hoc closure.
+  CALENDAR_DAY_KIND_CLOSED = 1;
+  // A weekend day that is nevertheless a business day.
+  CALENDAR_DAY_KIND_OPEN = 2;
+}
+
+enum Weekday {
+  WEEKDAY_UNSPECIFIED = 0;
+  WEEKDAY_MONDAY = 1;
+  WEEKDAY_TUESDAY = 2;
+  WEEKDAY_WEDNESDAY = 3;
+  WEEKDAY_THURSDAY = 4;
+  WEEKDAY_FRIDAY = 5;
+  WEEKDAY_SATURDAY = 6;
+  WEEKDAY_SUNDAY = 7;
+}
+
+// A calendar's weekend, dated, so a change of weekend takes effect on its
+// day.
+message CalendarWeekend {
+  // A set: each weekday once.
+  repeated Weekday weekdays = 1;
+  // ISO 8601.
+  string valid_from_date = 2;
+}
+
+// One listed day, naming the source it came from: never listed without one.
+message CalendarDay {
+  // ISO 8601, a plain date.
+  string date = 1;
+  CalendarDayKind kind = 2;
+  // The holiday's name as the source gives it.
+  string name = 3;
+  // A source_id among the version's sources.
+  string source = 4;
+}
+
+// A source a calendar or a rule version cites, with the moment the platform
+// read it (requirement 3).
+message CalendarSource {
+  // Unique within the version, which its days name.
+  string source_id = 1;
+  string name = 2;
+  // Where it is read: a public primary source's address.
+  string address = 3;
+  int64 read_at_ns = 4;
+}
+
+// The first and last dates a calendar vouches for (requirement 4): outside
+// them a date's status is not known, never a business day by default.
+// TODO(name): the approved text names the field `coverage`, not its message.
+message CalendarCoverage {
+  // ISO 8601, inclusive.
+  string from_date = 1;
+  string to_date = 2;
+}
+
+// A securities settlement system, a calendar's subject by name and country.
+// TODO(name): the approved text names the field `settlement_system`, not its
+// message.
+message SettlementSystem {
+  string name = 1;
+  // ISO 3166-1 alpha-2.
+  string country_code = 2;
+}
+
+// A calendar version (W1.20, W1.21): sent whole, as a venue's amend is; a
+// ten-year calendar is a few hundred dates.
+message CalendarRecord {
+  // "CAL-...", minted by the platform; never reused (decisions/036).
+  string calendar_id = 1;
+  string name = 2;
+  CalendarKind kind = 3;
+
+  // Its subject, by its kind: a currency's cash instrument by its `INS-`
+  // ID; the venues that follow it by their `VEN-` IDs; or a settlement
+  // system.
+  string instrument_id = 4;
+  // TODO(name): the plural of the contract's `venue_id`, derived.
+  repeated string venue_ids = 5;
+  SettlementSystem settlement_system = 6;
+
+  // Optional dated identifiers others use: an ISO 4217 code, an FpML
+  // business centre under the scheme `fpml_business_center`.
+  repeated Identifier identifiers = 7;
+
+  repeated CalendarWeekend weekends = 8;
+  // Each closed weekday and each weekend business day.
+  repeated CalendarDay days = 9;
+  CalendarCoverage coverage = 10;
+  repeated CalendarSource sources = 11;
+
+  // Monotonic, assigned by the platform, starting at 1.
+  int64 version = 12;
+  // When its change came into force: an ad hoc closure's, its
+  // announcement.
+  int64 valid_time_ns = 13;
+  // When the platform recorded it; never back-dated, never accepted from a
+  // caller.
+  int64 record_time_ns = 14;
+  // Its change note; a backfilled version says so and from what.
+  string note = 15;
+  // Active, or decommissioned: the master's lifecycle, as a venue's.
+  InstrumentLifecycleState lifecycle_state = 16;
+}
+
+// W1.20. Answered by the calendar's record at version 1.
+message DefineCalendarRequest {
+  string name = 1;
+  CalendarKind kind = 2;
+  string instrument_id = 3;
+  repeated string venue_ids = 4;
+  SettlementSystem settlement_system = 5;
+  repeated Identifier identifiers = 6;
+  repeated CalendarWeekend weekends = 7;
+  repeated CalendarDay days = 8;
+  CalendarCoverage coverage = 9;
+  repeated CalendarSource sources = 10;
+  // Zero means now.
+  int64 valid_time_ns = 11;
+  // Required from an agent, whose draft a person on the staff approves.
+  string note = 12;
+}
+
+// W1.21. The next version, whole, or a decommission; refused against a
+// version that is not the latest.
+message AmendCalendarRequest {
+  string calendar_id = 1;
+  int64 against_version = 2;
+  string name = 3;
+  string instrument_id = 4;
+  repeated string venue_ids = 5;
+  SettlementSystem settlement_system = 6;
+  repeated Identifier identifiers = 7;
+  repeated CalendarWeekend weekends = 8;
+  repeated CalendarDay days = 9;
+  CalendarCoverage coverage = 10;
+  repeated CalendarSource sources = 11;
+  int64 valid_time_ns = 12;
+  string note = 13;
+  // Decommissioned as of valid_time_ns; unspecified leaves it as it was.
+  InstrumentLifecycleState lifecycle_state = 14;
+}
+
+// How a date rolls on its calendars.
+enum BusinessDayConvention {
+  BUSINESS_DAY_CONVENTION_UNSPECIFIED = 0;
+  BUSINESS_DAY_CONVENTION_FOLLOWING = 1;
+  BUSINESS_DAY_CONVENTION_MODIFIED_FOLLOWING = 2;
+  BUSINESS_DAY_CONVENTION_PRECEDING = 3;
+  BUSINESS_DAY_CONVENTION_NONE = 4;
+}
+
+enum TenorUnit {
+  TENOR_UNIT_UNSPECIFIED = 0;
+  TENOR_UNIT_DAY = 1;
+  TENOR_UNIT_WEEK = 2;
+  TENOR_UNIT_MONTH = 3;
+  TENOR_UNIT_YEAR = 4;
+  // The short dates, counted in single business days from the trade date,
+  // the next day and spot.
+  TENOR_UNIT_OVERNIGHT = 5;
+  TENOR_UNIT_TOM_NEXT = 6;
+  TENOR_UNIT_SPOT_NEXT = 7;
+}
+
+message Tenor {
+  // Of the unit; 1 for the short dates.
+  int32 count = 1;
+  TenorUnit unit = 2;
+}
+
+// A day's cut: after it, an execution's trade date is the next day.
+// TODO(name): the approved text names the field `cut`, not its message.
+message DayCut {
+  // HH:MM, local.
+  string local_time = 1;
+  // An IANA time zone; required.
+  string time_zone = 2;
+}
+
+// A spot-date rule's tenor-date rule, carried on the same record.
+// TODO(name): "tenor-date rule" is approved as a term and `tenor_rule` as
+// the field, not this message's name.
+message TenorDateRule {
+  BusinessDayConvention convention = 1;
+  bool end_of_month = 2;
+}
+
+// A settlement-date rule for a country and an asset class, a venue's
+// override where a venue differs (requirement 6): T+2 then T+1 are two dated
+// versions of one rule.
+message SettlementDateRule {
+  // ISO 3166-1 alpha-2.
+  string country_code = 1;
+  AssetClass asset_class = 2;
+  // Empty for the market's rule.
+  string venue_id = 3;
+  // In business days.
+  int32 lag_days = 4;
+  // The calendars a day must be good in to count, by their `CAL-` IDs.
+  repeated string counting_calendars = 5;
+  // ISO 8601: the date this version takes effect.
+  string effective_from_date = 6;
+}
+
+// A spot-date rule for a currency pair, named by its two cash instruments in
+// either order (requirement 6).
+message SpotDateRule {
+  // Two `INS-` IDs, each a cash instrument.
+  repeated string pair = 1;
+  int32 lag_days = 2;
+  // The calendars an intermediate day must be good in to count.
+  repeated string counting_calendars = 3;
+  // The calendars the spot date itself must be good in.
+  repeated string spot_calendars = 4;
+  DayCut cut = 5;
+  TenorDateRule tenor_rule = 6;
+  string effective_from_date = 7;
+}
+
+// One rule version, as the platform keeps and publishes it.
+// TODO(name): the pull's `rules` and W1.23's listing need one message for a
+// rule version of either kind; the approved text names none.
+message DateRuleVersion {
+  // Its kind, subject and version, as a DateRuleRef names them.
+  DateRuleKind kind = 1;
+  string subject = 2;
+  int64 version = 3;
+  oneof parameters {
+    SettlementDateRule settlement = 4;
+    SpotDateRule spot = 5;
+  }
+  repeated CalendarSource sources = 6;
+  string note = 7;
+  // When the platform recorded it; never back-dated.
+  int64 record_time_ns = 8;
+}
+
+// W1.22. Answered by the rule's kind, subject and version.
+message DefineDateRuleRequest {
+  oneof rule_parameters {
+    SettlementDateRule settlement = 1;
+    SpotDateRule spot = 2;
+  }
+  repeated CalendarSource sources = 3;
+  string note = 4;
+}
+
+message DefineDateRuleReply {
+  DateRuleRef rule = 1;
+}
+
+// W1.22. The rule's next version, dated; a date before it is still answered
+// by the version before.
+message AmendDateRuleRequest {
+  // Its kind and subject; the version is the platform's.
+  DateRuleRef rule = 1;
+  oneof rule_parameters {
+    SettlementDateRule settlement = 2;
+    SpotDateRule spot = 3;
+  }
+  repeated CalendarSource sources = 4;
+  string note = 5;
+}
+
+message AmendDateRuleReply {
+  DateRuleRef rule = 1;
+}
+
+// W1.23: the platform's calendars and rules, filtered by kind, paged; a
+// deployment never lists them, it pulls what it needs.
+message ListCalendarRecordsRequest {
+  // Unspecified lists every kind.
+  CalendarKind kind = 1;
+  // TODO(name): W1.23's filter by subject is not named.
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message ListCalendarRecordsReply {
+  repeated CalendarRecord calendars = 1;
+  repeated DateRuleVersion rules = 2;
+  string next_cursor = 3;
+}
+
+// W1.23: one calendar, at its latest version or at a version.
+message GetCalendarRecordRequest {
+  string calendar_id = 1;
+  // Zero means the latest.
+  int64 version = 2;
+}
+
+// W3.16: the platform's answer to a pull, handed to the instrument store on
+// the bus as it came (`platform.reference.event.calendar-pulled`). Only a
+// calendar's subject leaves the deployment, never a holding.
+message PullCalendarReply {
+  repeated CalendarRecord calendars = 1;
+  repeated DateRuleVersion rules = 2;
+}
+
+// W3.17: a version kept, which the dashboard hears; the book moves no date
+// for it.
+message CalendarAppliedEvent {
+  // A calendar's version; or a rule's, in `rule`.
+  string calendar_id = 1;
+  int64 version = 2;
+  DateRuleRef rule = 3;
+  int64 applied_at_ns = 4;
+}
+
+// What a read named that the store does not hold (W3.18): one of a
+// calendar, a pair or a market.
+// TODO(name): the approved text names the field `subject` (in the fixture,
+// with `pair`), not its message.
+message CalendarSubject {
+  string calendar_id = 1;
+  // Two cash instruments' `INS-` IDs.
+  repeated string pair = 2;
+  // A market: its country, ISO 3166-1 alpha-2, and asset class.
+  string country_code = 3;
+  AssetClass asset_class = 4;
+}
+
+// W3.18: by its subject only; the conductor pulls it, and the read answers
+// "calendar not held" or "rule not held" meanwhile.
+message MissingCalendarDetectedEvent {
+  CalendarSubject subject = 1;
+  // Where the miss is a rule's.
+  DateRuleKind kind = 2;
+  int64 observed_at_ns = 3;
+}
+
+// W3.19: a calendar's days over a range, as of a recorded time or its latest
+// version. A reference read, answered whatever the asker's scope.
+message ReadCalendarRequest {
+  string calendar_id = 1;
+  // ISO 8601, inclusive; a range ending before it starts is refused naming
+  // `to_date`.
+  string from_date = 2;
+  string to_date = 3;
+  // Zero means the latest version held.
+  int64 as_of_ns = 4;
+}
+
+message ReadCalendarReply {
+  // False: the calendar is not held, reported missing (W3.18).
+  bool found = 1;
+  string calendar_id = 2;
+  int64 version = 3;
+  // The days listed in the range, each with its source.
+  repeated CalendarDay days = 4;
+  repeated CalendarWeekend weekends = 5;
+  CalendarCoverage coverage = 6;
+  repeated CalendarSource sources = 7;
+}
+
+// Why a date was or was not computed (requirement 9).
+enum DateOutcome {
+  DATE_OUTCOME_UNSPECIFIED = 0;
+  DATE_OUTCOME_COMPUTED = 1;
+  // Transient: reported missing, the conductor pulls it, the asker retries.
+  DATE_OUTCOME_CALENDAR_NOT_HELD = 2;
+  // Never a business day by default.
+  DATE_OUTCOME_OUTSIDE_COVERAGE = 3;
+  DATE_OUTCOME_RULE_NOT_HELD = 4;
+}
+
+// W3.20: an instrument's settlement date by its market's rule.
+// TODO(name): the approved text names the arm `settlement`, not its message.
+message SettlementDateQuestion {
+  string instrument_id = 1;
+  string trade_date = 2;
+}
+
+// W3.20: a pair's spot date, from a trade date or from an execution's moment
+// through the pair's cut.
+// TODO(name): the approved text names the arm `spot`, not its message.
+message SpotDateQuestion {
+  repeated string pair = 1;
+  string trade_date = 2;
+  // In place of trade_date: the moment, its trade date taken through the
+  // cut.
+  int64 at_ns = 3;
+}
+
+// W3.20: a tenor date from a trade date.
+// TODO(name): the approved text names the arm `tenor`, not its message.
+message TenorDateQuestion {
+  repeated string pair = 1;
+  Tenor tenor = 2;
+  string trade_date = 3;
+}
+
+// W3.20: one way to work out a date, in core. The same inputs and versions
+// always give the same date; the wall clock is never read.
+message ComputeDateRequest {
+  oneof question {
+    SettlementDateQuestion settlement = 1;
+    SpotDateQuestion spot = 2;
+    TenorDateQuestion tenor = 3;
+    // TODO(name): W3.20's two other questions -- a date rolled by a
+    // BusinessDayConvention on a set of calendars, and whether a date is a
+    // business day on a set of calendars -- are not named.
+  }
+  // The records as of this recorded time; zero means the latest held.
+  int64 as_of_ns = 4;
+}
+
+message ComputeDateReply {
+  // ISO 8601; empty unless computed.
+  string date = 1;
+  DateOutcome outcome = 2;
+  // The rule and each calendar, with their versions, it was computed on.
+  DateBasis basis = 3;
+}
+
+// W3.21: the calendars the deployment holds, for a deployment admin; the
+// Instruments page's Calendars tab and dashboard__list_calendars.
+message ListCalendarsRequest {
+  int32 page_size = 1;
+  string cursor = 2;
+}
+
+message ListCalendarsReply {
+  repeated HeldCalendar calendars = 1;
+  // TODO(name): W3.21 lists the rules held too; their line is not named.
+  string next_cursor = 2;
+}
+
+// One calendar the deployment holds, one line.
+// TODO(name): the approved text names the field `calendars` and its
+// fields, not this message.
+message HeldCalendar {
+  string calendar_id = 1;
+  string name = 2;
+  CalendarKind kind = 3;
+  int64 version = 4;
+  // ISO 8601: its coverage's last date.
+  string coverage_to_date = 5;
+  int64 refreshed_at_ns = 6;
 }

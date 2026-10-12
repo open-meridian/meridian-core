@@ -6,8 +6,11 @@
 // missing what downstream needs, naming each field
 // (sdk-contract/the-book-refuses-what-downstream-cannot-use); from v10 it
 // requires each instrument's asset class and currency, and names the
-// delegation a person acted through. Every message here traces to a matrix
-// row; see matrix/matrix.tsv.
+// delegation a person acted through. From v22 it holds the order path's
+// slice A too (W11; sdk-contract/an-order-reaches-a-venue-contract): orders,
+// placements, executions, charges, unplaced facts, locates and the trading
+// instructions, below the account's attributes. Every message here traces to
+// a matrix row; see matrix/matrix.tsv.
 //
 // W2's governing idea, carried through: there are two beliefs about what is
 // held, ours and the custodian's. holdings.proto carries the custodian's into
@@ -48,8 +51,11 @@ message Actor {
     // dashboard admitted (W4.15, W9.8; contract v21), from the envelope the
     // sidecar stamped. Never a person, nor the plugin's own finding.
     ServiceAccountActor service_account = 3;
+    // The venue, through the connectivity plugin reporting what it did
+    // (W11.2, W11.9 to W11.12; step 5's Q24; contract v22): a fact, never a
+    // person's act, and never refused for the state it arrives in.
+    VenueActor venue = 4;
   }
-  // The venue arrives as an arm of its own with its slice (step 5's Q24).
 }
 
 message PersonActor {
@@ -80,6 +86,27 @@ message ServiceAccountActor {
   // acted, as the sidecar stamped it; a later change of owner leaves it as
   // it was.
   string owner_subject = 2;
+
+  // The algorithm the command named, one of the identifiers the plugin's
+  // version declares (PluginDeclaration.algorithms, W4.1, W4.9; v21's Q16,
+  // the order-path plan's refresh, Q24; contract v22): stable across
+  // versions, so `reporting` reads it for the decision-maker and executor a
+  // regime asks for. Empty where the command named none, and before v22.
+  string algorithm_id = 3;
+}
+
+// The venue an act is a fact of (W11, contract v22).
+// TODO(name): `VenueActor` follows PersonActor, SystemActor and
+// ServiceAccountActor; the approved text names the arm `venue` but not its
+// message.
+message VenueActor {
+  // The connectivity plugin instance that reported it, as its sidecar
+  // stamped it.
+  string instance_id = 1;
+
+  // The venue, the venue master's ID, where the plugin names it; empty
+  // where it does not.
+  string venue_id = 2;
 }
 
 // What a journal entry records beside its JournalRef and ChangeCause.
@@ -88,7 +115,9 @@ message EntryMeta {
   string entry_id = 1;
   // An open list a reader takes as data (Q19): in v8 opening-balance,
   // placeholder-moved (instrument-merged from v10), figures-recorded, break-recorded, break-handled,
-  // break-resolved, break-closed, adjustment, reversal, attribute-set.
+  // break-resolved, break-closed, adjustment, reversal, attribute-set; from
+  // v22 order-proposed, order-recorded, order-released, execution-recorded
+  // among the order path's (W11.13).
   string kind = 2;
   Actor actor = 3;
   // The time on the message that caused it, and when the book received it;
@@ -151,6 +180,12 @@ message MovementLine {
   LotTerms opens_lot = 7;
   // A pending line's fail, where its source reports one.
   PendingState pending_state = 8;
+
+  // The sleeve within the account it moves (W9's invariants, the order-path
+  // plan's refresh, Q33; step 5's requirement 59; contract v22): a cash
+  // line's too. Empty for the account's unsleeved part, and on every line
+  // before v22.
+  string sleeve = 9;
 }
 
 message LotTerms {
@@ -175,6 +210,8 @@ enum LotSource {
   // Opened by an adjustment resolving a break (Q28). Step 5 adds the
   // book's own trade, slice D a transfer in.
   LOT_SOURCE_ADJUSTMENT = 2;
+  // TODO(name): from v22 a reported fill opens a lot (W11.13), and the
+  // approved text names no LotSource value for it.
 }
 
 message PendingState {
@@ -239,6 +276,11 @@ message BookPosition {
   // encumbrances. Unset while that quantity is unknown (some not stated).
   optional Decimal free_quantity = 15;
   FreeBasis free_basis = 16;
+  // The sleeve within the account (W9's invariants; the order-path plan's
+  // refresh, Q33; contract v22): a position is keyed by account,
+  // instrument, side and sleeve. Empty for the account's unsleeved part, as
+  // every position before v22 is.
+  string sleeve = 17;
 }
 
 // The basis a position's free quantity is computed on.
@@ -311,6 +353,8 @@ message Lot {
   JournalRef opened_by = 5;
   repeated JournalRef relieved_by = 6;
   repeated JournalRef adjusted_by = 7;
+  // Its position's sleeve (contract v22); empty for the unsleeved part.
+  string sleeve = 8;
 }
 
 // ── W9.1: the opening balance ──
@@ -438,6 +482,11 @@ enum BreakCauseCategory {
   // Income the custodian reinvested in units, which the book has not
   // booked: a money market fund's monthly dividend (contract v14).
   BREAK_CAUSE_CATEGORY_INCOME_REINVESTED = 8;
+  // A pending value date that is not a business day on its calendars
+  // (W9.4; spec/settlement-calendars-are-core-reference-data, requirement 14
+  // and Q9; contract v22): the cause names the date read's check
+  // (BreakCause.date_check). The book never moves the date itself.
+  BREAK_CAUSE_CATEGORY_VALUE_DATE_NOT_BUSINESS_DAY = 9;
 }
 
 message PositionKey {
@@ -488,8 +537,27 @@ message BreakCause {
     bool none_found = 6;
     // The custodian's activity that explains it (contract v14).
     ActivityRef activity = 8;
+    // The date read's check of a pending value date (W3.20, W9.4; contract
+    // v22): beside BREAK_CAUSE_CATEGORY_VALUE_DATE_NOT_BUSINESS_DAY.
+    DateCheck date_check = 9;
   }
   string note = 7;
+}
+
+// What the date read found of one date (W3.20, W9.4; the calendars spec's
+// requirement 14; contract v22): the date, the calendars and their versions
+// it was checked on, and why the day is closed.
+// TODO(name): the approved text names the field `date_check`, not its
+// message, nor the enum or fields saying why the day is closed.
+message DateCheck {
+  // ISO 8601.
+  string date = 1;
+
+  // Each calendar it was checked on, with its version.
+  repeated CalendarRef calendars = 2;
+
+  // TODO(name): why the day is closed -- a weekend, a named holiday, or
+  // outside coverage -- and the holiday's name as the source gives it.
 }
 
 // An activity the street recorded (W2.12), named by value: never a key the
@@ -818,6 +886,12 @@ message AccountAttributes {
   // unset while none stands (Q21 of the sample operations plugin, ruled
   // 2026-10-01).
   OpeningBalance opening_balance = 5;
+  // Whether a release waits until every compliance plugin covering the
+  // account has answered on the order's version (W9.13, W11.6; step 5's Q5;
+  // contract v22). True for a new account and for every account the book
+  // held at the upgrade, recorded so (decisions/031); the book always
+  // states it, so false is a deployment admin's act with its reason.
+  bool waits_for_compliance = 6;
 }
 
 message SetAccountAttributeRequest {
@@ -825,6 +899,9 @@ message SetAccountAttributeRequest {
   oneof attribute {
     string base_currency_code = 2;
     LotReliefMethod lot_relief_default = 3;
+    // Contract v22 (W9.13): a deployment admin's, from the dashboard or
+    // dashboard__set_account_attribute (the order-path plan's refresh, Q44).
+    bool waits_for_compliance = 5;
   }
   string reason = 4;
 }
@@ -853,4 +930,1355 @@ message ListAccountAttributesReply {
   repeated AccountAttributes attributes = 1;
   string next_cursor = 2;
   Watermark as_of = 3;
+}
+
+// ── W11: the order lifecycle, slice A (contract v22) ──
+
+// sdk-contract/an-order-reaches-a-venue-contract: step 5's slice A
+// (spec/one-order-lifecycle-in-the-book) with step 6's order half
+// (spec/vendor-differences-have-a-place-in-the-contract), as
+// plans/an-order-reaches-a-venue-through-the-book builds it; every name
+// approved 2026-10-12. The book owns order state: plugins ask (a command)
+// and report (a fact); the book decides, journals and publishes, and an
+// order's status and quantities are a fold over its journal, never stored as
+// facts (decisions/035). A command the table does not allow is refused with
+// its reason; a venue's fact is never refused for the state it arrives in,
+// and one the book cannot place is kept as an unplaced fact. Core records;
+// it does not police (step 5's Q1). The street holds none of it.
+//
+// Every quantity is a Decimal at its instrument's scale and every amount a
+// Money naming its cash instrument (decisions/023 as amended in v18). Every
+// command is answered after its entry commits, in the order's account
+// partition, and applied once on its envelope's identifier or its
+// idempotency key; a venue fact once on its venue identifiers.
+
+// ── The lists (decisions/035): states, conditions and their causes ──
+
+// An order is in exactly one of seven states (W11's invariants).
+enum OrderState {
+  ORDER_STATE_UNSPECIFIED = 0;
+  // Proposed, not released: the gate has not passed it (W11.1, W11.6).
+  ORDER_STATE_PROPOSED = 1;
+  // Ended before release: a check's refuse, or the `oms`'s rejection
+  // (W11.4, W11.5). Terminal.
+  ORDER_STATE_REFUSED = 2;
+  // Released for working, nothing committed or filled yet (W11.6).
+  ORDER_STATE_RELEASED = 3;
+  // Released with quantity committed at a placement or a child order, or
+  // filled in part.
+  ORDER_STATE_WORKING = 4;
+  // Reported filled reached ordered.
+  ORDER_STATE_FILLED = 5;
+  // Ended by a cancel, the firm's or the venue's. Terminal.
+  ORDER_STATE_CANCELLED = 6;
+  // Its time in force ended, by the deployment's clock (W11.13). Terminal.
+  ORDER_STATE_EXPIRED = 7;
+}
+
+// The nine conditions an order holds beside its state, each with its reason
+// and the actor that set it.
+enum OrderCondition {
+  ORDER_CONDITION_UNSPECIFIED = 0;
+  // A change request is outstanding (W11.3; requirement 16).
+  ORDER_CONDITION_CHANGE_REQUESTED = 1;
+  // `compliance` requires approval by its policy (W11.5).
+  ORDER_CONDITION_APPROVAL_REQUIRED = 2;
+  // The account waits for compliance and a compliance plugin covering it
+  // has not answered on this version (W11.6; step 5's Q5).
+  ORDER_CONDITION_AWAITING_CHECK = 3;
+  // Claimed to work it, by an instance for a user (W11.7).
+  ORDER_CONDITION_CLAIMED = 4;
+  ORDER_CONDITION_HELD = 5;
+  // Its working paused: not the trading instruction's pause (Q31).
+  ORDER_CONDITION_PAUSED = 6;
+  // A placement's outcome is not known (W11.10; requirement 20).
+  ORDER_CONDITION_OUTCOME_UNKNOWN = 7;
+  // Its quantities do not tie out -- an overfill, or a restatement past its
+  // intent (Q15, Q16, Q21) -- until an alignment, a booking to an error
+  // account (slice B) or a bust clears it. Never acknowledged.
+  ORDER_CONDITION_DOES_NOT_TIE_OUT = 8;
+  // A fact arrived after the state it would have changed ended (#12):
+  // recorded, flagged, acknowledged by a person (W11.14).
+  ORDER_CONDITION_LATE_FACT = 9;
+}
+
+// A placement is in one of eight states.
+enum PlacementState {
+  PLACEMENT_STATE_UNSPECIFIED = 0;
+  // Created, not yet sent.
+  PLACEMENT_STATE_QUEUED = 1;
+  // Sent, not acknowledged.
+  PLACEMENT_STATE_SENT = 2;
+  // Acknowledged by the venue.
+  PLACEMENT_STATE_WORKING = 3;
+  // Ended for the day by the venue; not terminal for a good-till-cancelled
+  // order, whose quantity stays committed (#20).
+  PLACEMENT_STATE_DONE_FOR_DAY = 4;
+  PLACEMENT_STATE_FILLED = 5;
+  PLACEMENT_STATE_CANCELLED = 6;
+  PLACEMENT_STATE_EXPIRED = 7;
+  // Refused by the venue, or held back by the connectivity plugin's own
+  // pre-trade check, with its RejectionReason.
+  PLACEMENT_STATE_REJECTED = 8;
+}
+
+// The conditions a placement holds beside its state.
+enum PlacementCondition {
+  PLACEMENT_CONDITION_UNSPECIFIED = 0;
+  PLACEMENT_CONDITION_CHANGE_REQUESTED = 1;
+  // With its UnknownReason; its quantity stays committed.
+  PLACEMENT_CONDITION_OUTCOME_UNKNOWN = 2;
+  // Halted by the venue, which may leave its state unchanged.
+  PLACEMENT_CONDITION_SUSPENDED = 3;
+  // Held at the venue until a stop or a condition triggers.
+  PLACEMENT_CONDITION_AWAITING_TRIGGER = 4;
+}
+
+// ── The order's values (step 5's Q26; step 6) ──
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+  // With the locate it names (Order.locate_id, W11.18).
+  SIDE_SELL_SHORT = 3;
+  SIDE_SELL_SHORT_EXEMPT = 4;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_MARKET = 1;
+  ORDER_TYPE_LIMIT = 2;
+  ORDER_TYPE_STOP = 3;
+  ORDER_TYPE_STOP_LIMIT = 4;
+  // An RFQ order: its quotes and outcomes are slice C's, on its placement.
+  ORDER_TYPE_REQUEST_FOR_QUOTE = 5;
+}
+
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_DAY = 1;
+  TIME_IN_FORCE_GOOD_TILL_CANCELLED = 2;
+  TIME_IN_FORCE_GOOD_TILL_DATE = 3;
+  // With a kill time.
+  TIME_IN_FORCE_GOOD_TILL_TIME = 4;
+  TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 5;
+  TIME_IN_FORCE_FILL_OR_KILL = 6;
+  TIME_IN_FORCE_AT_THE_OPEN = 7;
+  TIME_IN_FORCE_AT_THE_CLOSE = 8;
+}
+
+// For a broker's order, set by the `oms`.
+enum Capacity {
+  CAPACITY_UNSPECIFIED = 0;
+  CAPACITY_AGENCY = 1;
+  CAPACITY_PRINCIPAL = 2;
+  CAPACITY_RISKLESS_PRINCIPAL = 3;
+  CAPACITY_MIXED = 4;
+}
+
+// Whether an order was received from a client (Q23).
+enum OrderDirection {
+  // The firm's own order, unmarked.
+  ORDER_DIRECTION_UNSPECIFIED = 0;
+  // A client's order, proposed by the `portfolio` intake standing for the
+  // client's portfolio manager.
+  ORDER_DIRECTION_RECEIVED = 1;
+}
+
+// Where an order the book did not create came from (W11.2).
+enum OrderOrigin {
+  // An order the book created: proposed (W11.1).
+  ORDER_ORIGIN_UNSPECIFIED = 0;
+  // A venue-originated order: a liquidation, auto-deleveraging, one a drop
+  // copy shows; actor the venue.
+  ORDER_ORIGIN_VENUE = 1;
+  // A telephoned or outside order, recorded by the `oms` for a person.
+  ORDER_ORIGIN_TELEPHONED = 2;
+}
+
+// A precision a time was stated in (the order-path plan's refresh, Q38).
+enum TimePrecision {
+  TIME_PRECISION_UNSPECIFIED = 0;
+  TIME_PRECISION_SECOND = 1;
+  TIME_PRECISION_MILLISECOND = 2;
+  TIME_PRECISION_MICROSECOND = 3;
+  TIME_PRECISION_NANOSECOND = 4;
+}
+
+// The one named link in v22 (W11.1; step 5's link 1, Q6; the refresh's
+// Q41). Block, allocation, street order, two-way quote, alternatives and
+// basket join with their slices.
+enum OrderLinkKind {
+  ORDER_LINK_KIND_UNSPECIFIED = 0;
+  // A child order an `ems` (or the `oms`) worked out of its parent.
+  ORDER_LINK_KIND_SPLIT = 1;
+}
+
+// Which quote a quote at time of receipt is (the refresh's Q35, as refined
+// and ruled 2026-10-12).
+// The values carry the approved names, without the enum's `_KIND`.
+enum ReceiptQuoteSourceKind {
+  RECEIPT_QUOTE_SOURCE_UNSPECIFIED = 0;
+  // The consolidated best bid and offer across venues, the quote Rule 605's
+  // statistics reference.
+  RECEIPT_QUOTE_SOURCE_CONSOLIDATED = 1;
+  // One named venue's, its `VEN-` ID beside it.
+  RECEIPT_QUOTE_SOURCE_VENUE = 2;
+}
+
+// A broker's algorithm the placement asks for (step 6's Q11; Q6 as ruled).
+enum StrategyKind {
+  STRATEGY_KIND_UNSPECIFIED = 0;
+  STRATEGY_KIND_VWAP = 1;
+  STRATEGY_KIND_TWAP = 2;
+  STRATEGY_KIND_POV = 3;
+  STRATEGY_KIND_IS = 4;
+}
+
+// The route type a placement's destination is reached by (requirement 56).
+enum RouteType {
+  ROUTE_TYPE_UNSPECIFIED = 0;
+  ROUTE_TYPE_DIRECTED = 1;
+  // TODO(name): the approved text gives ROUTE_TYPE_DIRECTED alone; the
+  // other route types requirement 56 implies are not named.
+}
+
+// ── Executions (step 5, "Executions") ──
+
+enum ExecutionKind {
+  EXECUTION_KIND_UNSPECIFIED = 0;
+  EXECUTION_KIND_VENUE_REPORTED = 1;
+  // Entered by the `ems` or the `oms`, for a person.
+  EXECUTION_KIND_MANUAL = 2;
+  // Joins with its two-account act.
+  EXECUTION_KIND_FROM_INVENTORY = 3;
+  EXECUTION_KIND_DONE_AWAY = 4;
+  // Joins with its link.
+  EXECUTION_KIND_FROM_CHILD_ORDERS = 5;
+  // Joins with its two-account act (Q23).
+  EXECUTION_KIND_INTERNAL_CROSS = 6;
+  // From a status report where the venue sends no fill, its ID derived
+  // deterministically (requirement 33).
+  EXECUTION_KIND_INFERRED = 7;
+}
+
+enum ExecutionSource {
+  EXECUTION_SOURCE_UNSPECIFIED = 0;
+  EXECUTION_SOURCE_PRIMARY = 1;
+  // Deduplicated against the primary on the venue's identifiers.
+  EXECUTION_SOURCE_DROP_COPY = 2;
+}
+
+// A level with a time per step; a venue with no steps reports final at once.
+enum FinalityLevel {
+  FINALITY_LEVEL_UNSPECIFIED = 0;
+  // A hit awaiting the maker's accept (Q13, last look).
+  FINALITY_LEVEL_AWAITING_ACCEPTANCE = 1;
+  FINALITY_LEVEL_MATCHED = 2;
+  // On chain, in a block.
+  FINALITY_LEVEL_INCLUDED = 3;
+  FINALITY_LEVEL_FINAL = 4;
+  // It did not happen after all: a last-look reject, a revert, a re-org.
+  FINALITY_LEVEL_FAILED = 5;
+}
+
+// A fee's kind (requirement 26). Grown by revision.
+enum FeeKind {
+  FEE_KIND_UNSPECIFIED = 0;
+  FEE_KIND_EXCHANGE = 1;
+  // A venue's cancel fee.
+  FEE_KIND_CANCEL = 2;
+  // Gas, on an on-chain venue.
+  FEE_KIND_NETWORK = 3;
+}
+
+// ── Checks, approvals and changes ──
+
+// Ruled 2026-09-30 (requirement 44).
+enum CheckVerdict {
+  CHECK_VERDICT_UNSPECIFIED = 0;
+  CHECK_VERDICT_PASS = 1;
+  CHECK_VERDICT_WARN = 2;
+  // Stands until overridden (W11.5); a release is refused while it does.
+  CHECK_VERDICT_BLOCK = 3;
+  // Ends a proposed order refused; nobody may override it.
+  CHECK_VERDICT_REFUSE = 4;
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  // `compliance` sets approval required, by policy.
+  APPROVAL_DECISION_REQUIRE = 1;
+  // A person approves.
+  APPROVAL_DECISION_APPROVE = 2;
+  // A person overrides a block, with a reason.
+  APPROVAL_DECISION_OVERRIDE = 3;
+  // The `oms` rejects a proposed order it was asked to work (Q23): the
+  // order ends refused.
+  APPROVAL_DECISION_REJECT = 4;
+}
+
+// What an order's change request asks (W11.3; step 5's Q20).
+enum OrderChangeKind {
+  ORDER_CHANGE_KIND_UNSPECIFIED = 0;
+  // Each live placement and child order asked to cancel; cancelled when
+  // none is live.
+  ORDER_CHANGE_KIND_CANCEL = 1;
+  // Its limit, time in force or execution instructions.
+  ORDER_CHANGE_KIND_AMEND = 2;
+  // A released order with nothing committed, back to proposed.
+  ORDER_CHANGE_KIND_RECALL = 3;
+  // A proposal withdrawn by its proposer.
+  ORDER_CHANGE_KIND_WITHDRAW = 4;
+  // An increase or a reduction, `portfolio`'s, its allocation amended in the
+  // same act; or the `oms`'s justified alignment.
+  ORDER_CHANGE_KIND_QUANTITY = 5;
+}
+
+// What a placement's change request asks (W11.9).
+enum PlacementChangeKind {
+  PLACEMENT_CHANGE_KIND_UNSPECIFIED = 0;
+  PLACEMENT_CHANGE_KIND_CANCEL = 1;
+  PLACEMENT_CHANGE_KIND_REPLACE = 2;
+}
+
+// ── What the venue did, in the contract's meanings (W11.10) ──
+
+enum PlacementEvent {
+  PLACEMENT_EVENT_UNSPECIFIED = 0;
+  PLACEMENT_EVENT_SENT = 1;
+  // With the venue's order ID and the routing time.
+  PLACEMENT_EVENT_ACKNOWLEDGED = 2;
+  PLACEMENT_EVENT_REPLACED = 3;
+  PLACEMENT_EVENT_DONE_FOR_DAY = 4;
+  // With its RestatementReason.
+  PLACEMENT_EVENT_RESTATED = 5;
+  PLACEMENT_EVENT_SUSPENDED = 6;
+  PLACEMENT_EVENT_TRIGGERED = 7;
+  PLACEMENT_EVENT_CANCELLED = 8;
+  PLACEMENT_EVENT_EXPIRED = 9;
+  // With its RejectionReason.
+  PLACEMENT_EVENT_REJECTED = 10;
+  // With its UnknownReason; never a rejection.
+  PLACEMENT_EVENT_OUTCOME_UNKNOWN = 11;
+  // An unknown outcome resolved by asking the venue, never by resending.
+  // TODO(name): W11.10 says "resolved"; this value's spelling is derived.
+  PLACEMENT_EVENT_OUTCOME_RESOLVED = 12;
+}
+
+// Why a placement was rejected (step 6, "Refusals and rejections"). A
+// rejection, not a refusal: core refuses nothing a venue cannot do.
+enum RejectionReason {
+  REJECTION_REASON_UNSPECIFIED = 0;
+  // Asked for what the plugin or the venue does not offer for this account.
+  REJECTION_REASON_UNSUPPORTED = 1;
+  // The catch-all, the venue's reason beside it in an AsReported only when
+  // no contract reason maps.
+  REJECTION_REASON_VENUE_REJECTED = 2;
+  // The connectivity plugin's own market-access check (Q18).
+  REJECTION_REASON_HELD_BY_PRE_TRADE_CHECK = 3;
+}
+
+// Why a placement's outcome is unknown (requirement 20).
+enum UnknownReason {
+  UNKNOWN_REASON_UNSPECIFIED = 0;
+  UNKNOWN_REASON_CONNECTION_LOST = 1;
+  UNKNOWN_REASON_REQUEST_UNANSWERED = 2;
+  // The venue's status as reported beside it.
+  UNKNOWN_REASON_VENUE_STATUS_NOT_MAPPED = 3;
+}
+
+// A restatement's reason, after FIX's; one beyond the order's intent sets
+// late fact and does not tie out (Q15).
+enum RestatementReason {
+  RESTATEMENT_REASON_UNSPECIFIED = 0;
+  RESTATEMENT_REASON_CORPORATE_ACTION = 1;
+  RESTATEMENT_REASON_RENEWAL = 2;
+  RESTATEMENT_REASON_REPRICING = 3;
+  RESTATEMENT_REASON_PARTIAL_DECLINE = 4;
+  RESTATEMENT_REASON_CANCEL_ON_HALT = 5;
+  RESTATEMENT_REASON_CANCEL_ON_SYSTEM_FAILURE = 6;
+  // TODO(name): "venue's option"; this value's spelling is derived.
+  RESTATEMENT_REASON_VENUE_OPTION = 7;
+  RESTATEMENT_REASON_OTHER = 8;
+}
+
+// Why a fact was kept unplaced (requirement 13; W11.13).
+enum UnplacedReason {
+  UNPLACED_REASON_UNSPECIFIED = 0;
+  // It names a placement the book does not hold.
+  UNPLACED_REASON_UNKNOWN_PLACEMENT = 1;
+  // TODO(name): W11.2 also keeps unplaced a venue account code mapped to no
+  // account, and an instrument whose record is incomplete; neither value is
+  // named.
+}
+
+// ── The trading instructions (W11.15; step 5's Q31, Q32) ──
+
+// Conventions each plugin honours; the book refuses and cancels nothing for
+// any (Q1, Q18). The most restrictive in force governs.
+enum TradingInstructionValue {
+  TRADING_INSTRUCTION_VALUE_UNSPECIFIED = 0;
+  TRADING_INSTRUCTION_VALUE_ACTIVE = 1;
+  // No new orders.
+  TRADING_INSTRUCTION_VALUE_PAUSE = 2;
+  // No new orders, and working orders cancelled; a connectivity plugin
+  // cancels at its venue at once (W11.9).
+  TRADING_INSTRUCTION_VALUE_STOP = 3;
+}
+
+// The level an instruction was set at, from the claims; an entry is lifted
+// only at the level that set it.
+enum SetterLevel {
+  SETTER_LEVEL_UNSPECIFIED = 0;
+  SETTER_LEVEL_DEPLOYMENT_ADMIN = 1;
+  SETTER_LEVEL_PLUGIN_ADMIN = 2;
+}
+
+// ── Locates (W11.18, W11.19; requirement 50a) ──
+
+enum LocateUseKind {
+  LOCATE_USE_KIND_UNSPECIFIED = 0;
+  // Reserved against the locate for an order (at release, recommended).
+  LOCATE_USE_KIND_RESERVE = 1;
+  // Given back: a cancel, or the day's end.
+  LOCATE_USE_KIND_GIVE_BACK = 2;
+  // Consumed by fills.
+  LOCATE_USE_KIND_CONSUME = 3;
+}
+
+// ── The records ──
+
+// An order (W11.1, W11.2): its identity (account, instrument, side) never
+// changes (Q20); each field set by its owner (step 5, "The order's fields").
+message Order {
+  // `ORD-` and a ULID, minted by the book; never reused (decisions/035).
+  string order_id = 1;
+
+  string account_id = 2;
+  string instrument_id = 3;
+
+  // The sleeve within the account (ruled 2026-10-10); empty for the
+  // account's unsleeved part.
+  string sleeve = 4;
+
+  Side side = 5;
+
+  // On a short: the prime's locate ID on a locate record in the book
+  // (W11.18), which `compliance` checks at release by its own logic.
+  string locate_id = 6;
+
+  // The ordered quantity; or, where the order is for an amount, the cash
+  // quantity beside it.
+  Decimal quantity = 7;
+  Money cash_quantity = 8;
+
+  OrderType order_type = 9;
+  Money limit_price = 10;
+  // TODO(name): a stop or stop-limit order's trigger price is not named.
+
+  // On a pair: the dealt currency, by its cash instrument's ID.
+  string dealt_currency = 11;
+
+  // A slot of optional legs (FX swaps, spreads; step 5's Q26).
+  repeated Leg legs = 12;
+
+  // `portfolio`'s: accounts with amounts or weights. At release it sums to
+  // the ordered quantity, or, unset, the whole is in the order's own account
+  // (principle 1; REFUSAL_REASON_ALLOCATION_UNBALANCED). A child order
+  // carries none: its parent's governs (Q47).
+  AllocationInstruction allocation_instruction = 13;
+
+  // Set by the `oms`, on its proposal or by a change (W11.3).
+  TimeInForce time_in_force = 14;
+  // TODO(name): a good-till-date order's date and a good-till-time order's
+  // kill time are not named.
+  // TODO(name): the execution instructions (not held, do not reduce, do not
+  // increase, reduce only, a self-match prevention instruction; step 6's
+  // requirement 12) -- their field and enum are not named.
+
+  // How a sale relieves lots: the method, or the lots it names; unset, the
+  // account's lot_relief_default (W9.13, W11.13).
+  LotReliefMethod lot_relief_method = 15;
+  repeated string relieve_lot_ids = 16;
+
+  Capacity capacity = 17;
+  OrderDirection direction = 18;
+
+  // The client, as delivered, with its LEI where given.
+  repeated Party parties = 19;
+
+  // Entered by, from the actor; decided by, where it differs (requirement
+  // 29).
+  PersonRoles person_roles = 20;
+
+  // The reporting fields its decision owns (requirements 55, 56; the
+  // refresh's Q36): stored as stated, core reporting nothing.
+  string customer_id = 21;
+  string firm_designated_id = 22;
+  repeated string handling_instructions = 23;
+  int64 received_at_ns = 24;
+  TimePrecision received_precision = 25;
+  ReceiptQuote quote_at_receipt = 26;
+  // The orders a firm's order represents, recorded and not checked (Q37).
+  repeated string represents_order_ids = 27;
+
+  // Slice C's, carried empty until it lands (the refresh's Q34): the axe an
+  // order was made from in the lake, its source and counterparty.
+  string axe_source = 28;
+  string axe_counterparty_id = 29;
+
+  // On a child order: its parent, released, whose instrument and side it
+  // has (Q46).
+  OrderLink link = 30;
+
+  // On an order the book did not create (W11.2); unspecified on one it did.
+  OrderOrigin origin = 31;
+  // The venue's order ID on such an order, an external reference, never a
+  // key.
+  string venue_order_id = 32;
+
+  // A fold over its journal (decisions/035), never stored.
+  OrderStatus status = 33;
+
+  // Each check recorded on it, naming the version it checked (W11.4).
+  repeated Check checks = 34;
+
+  // Its change requests, each tracked to its outcome (requirement 16).
+  repeated ChangeRequest change_requests = 35;
+
+  // On a read (W11.17): its placements, executions and charges.
+  repeated Placement placements = 36;
+  repeated Execution executions = 37;
+  repeated Charge charges = 38;
+
+  JournalRef last_change = 39;
+}
+
+// An order's status: its state, its conditions and its quantities, each
+// derived.
+message OrderStatus {
+  OrderState state = 1;
+  repeated ConditionOnOrder conditions = 2;
+  OrderQuantities quantities = 3;
+}
+
+// One condition an order holds, with its reason and who set it.
+// TODO(name): the approved text names the field `conditions` and the enum,
+// not this message.
+message ConditionOnOrder {
+  OrderCondition condition = 1;
+
+  // In words, for a person; a plugin acts on the condition, never on these.
+  // TODO(name): does not tie out's reasons (overfill, restatement) are not
+  // named as values.
+  string reason = 2;
+
+  // Who set it.
+  Actor actor = 3;
+
+  // On claimed: the instance claiming and the user it claims for (W11.7).
+  Claimant claimant = 4;
+}
+
+// The instance holding a claim, and the user it acts for.
+// TODO(name): the approved text names the field `claimant`, not its message.
+message Claimant {
+  string instance_id = 1;
+  oneof user {
+    PersonActor person = 2;
+    ServiceAccountActor service_account = 3;
+  }
+}
+
+// The quantities, derived; idle may go negative, shown, never refused (Q3).
+// TODO(name): the approved text names the field `quantities` and each
+// quantity, not this message.
+message OrderQuantities {
+  Decimal ordered = 1;
+  // Executions at matched or later, a child order's included.
+  Decimal reported_filled = 2;
+  // Executions at final.
+  Decimal final_filled = 3;
+  Decimal awaiting_acceptance = 4;
+  // Open at live placements and live child orders.
+  Decimal committed = 5;
+  // Ordered less committed and filled.
+  Decimal idle = 6;
+  Decimal leaves = 7;
+}
+
+// The split link on a child order (W11.1; Q41).
+message OrderLink {
+  OrderLinkKind kind = 1;
+  string parent_order_id = 2;
+}
+
+// One leg of an order (step 5's Q26).
+message Leg {
+  string instrument_id = 1;
+  Side side = 2;
+  // TODO(name): `ratio` is the text's word, not given as a field name.
+  Decimal ratio = 3;
+}
+
+// `portfolio`'s allocation instruction (principle 1).
+// TODO(name): the approved text names the field `allocation_instruction`,
+// not its message or its lines.
+message AllocationInstruction {
+  repeated AllocationInstructionLine lines = 1;
+}
+
+// TODO(name): one account's part of an allocation instruction.
+message AllocationInstructionLine {
+  string account_id = 1;
+  // The amount, or, where weighted, unset.
+  Decimal quantity = 2;
+  // TODO(name): a line's weight is not named.
+  Decimal weight = 3;
+  // Slice B's, with the allocation; carried empty until then.
+  string sleeve = 4;
+}
+
+// A party to an order or an execution, as delivered (requirements 30, 55).
+message Party {
+  // TODO(name): its fields are not named -- its identifier, its LEI where
+  // given, its contact as delivered, and maker or taker on an execution.
+}
+
+// The people on an order, a placement or an entered execution (requirement
+// 29). Each a person who has signed in (W6.1) or a service account.
+message PersonRoles {
+  // Stamped from the actor of the proposing or recording command.
+  Actor entered_by = 1;
+  // The placement's, and an entered execution's: that act's actor.
+  Actor executed_by = 2;
+  // Named in the command, where it differs from entered by.
+  Actor decided_by = 3;
+}
+
+// The quote at time of receipt, held as stated (requirement 56; the
+// refresh's Q35).
+message ReceiptQuote {
+  Money bid = 1;
+  Money ask = 2;
+  // TODO(name): the bid's and ask's sizes, and the optional reference to
+  // the lake row it was read from, are not named.
+
+  ReceiptQuoteSourceKind source_kind = 3;
+  // With RECEIPT_QUOTE_SOURCE_VENUE: the venue, its `VEN-` ID.
+  string venue_id = 4;
+
+  int64 quoted_at_ns = 5;
+}
+
+// A strategy for the venue to work (step 6's Q11): the kinds name which of
+// a broker's strategies, described in its catalogue on FIXatdl's model
+// (W11.20), is its VWAP, TWAP, POV or IS. A connectivity plugin whose
+// broker has none rejects it unsupported.
+message StrategyInstruction {
+  StrategyKind kind = 1;
+  int64 start_ns = 2;
+  int64 end_ns = 3;
+  // A participation rate, 0.1 for ten percent.
+  Decimal participation = 4;
+  // TODO(name): the urgency and the limits step 6 lists are not named.
+}
+
+// A verdict on an order version or a placement (W11.4).
+message Check {
+  CheckVerdict verdict = 1;
+  // The order version it checked: the journal sequence of the order's last
+  // change when it checked. Unset on a placement's.
+  uint64 order_version = 2;
+  // On a check of a placement before it is sent.
+  string placement_id = 3;
+  string rule = 4;
+  string note = 5;
+  // The compliance plugin instance that recorded it.
+  string instance_id = 6;
+  Actor recorded_by = 7;
+}
+
+// A change request, tracked to its outcome (requirement 16).
+message ChangeRequest {
+  // `CRQ-` and a ULID, minted by the book.
+  string change_request_id = 1;
+  string order_id = 2;
+  // On a placement's change.
+  string placement_id = 3;
+  oneof change {
+    OrderChange order_change = 4;
+    PlacementChange placement_change = 5;
+  }
+  string reason = 6;
+  EntryMeta entry = 7;
+  // TODO(name): its outcome (applied, carried to placements, ended) is not
+  // named.
+}
+
+// What an order's change asks (W11.3).
+// TODO(name): the approved text names the field `change` and its kinds, not
+// this message; `order_change` and `placement_change` above likewise.
+message OrderChange {
+  OrderChangeKind kind = 1;
+  // The new ordered quantity, on ORDER_CHANGE_KIND_QUANTITY.
+  Decimal quantity = 2;
+  Money limit_price = 3;
+  TimeInForce time_in_force = 4;
+  // Amended in the same act as an increase or a reduction.
+  AllocationInstruction allocation_instruction = 5;
+}
+
+// What a placement's change asks (W11.9).
+// TODO(name): see OrderChange.
+message PlacementChange {
+  PlacementChangeKind kind = 1;
+  Decimal quantity = 2;
+  Money limit_price = 3;
+  TimeInForce time_in_force = 4;
+}
+
+// A placement (W11.8): part of a released order at one connectivity plugin
+// linked to the placing `ems`, which it reaches alone.
+message Placement {
+  // `PLC-` and a ULID, minted by the book. The client order identifier the
+  // venue sees is this, or one the plugin derives from it.
+  string placement_id = 1;
+  string order_id = 2;
+  string account_id = 3;
+
+  // The placing `ems`, as its sidecar stamped it.
+  string ems_instance_id = 4;
+  // The connectivity plugin that sends it, linked to that `ems`.
+  string connectivity_instance_id = 5;
+  // What the `ems` set in the venue's account field, from its map (W11.22).
+  string venue_account_code = 6;
+
+  Decimal quantity = 7;
+  Money limit_price = 8;
+  TimeInForce time_in_force = 9;
+  StrategyInstruction strategy = 10;
+
+  // The reporting fields (requirement 56): the destination, a `VEN-` ID,
+  // and route type by the `ems`; the routing time as the connectivity
+  // plugin sent it, on its acknowledgement.
+  string destination = 11;
+  RouteType route_type = 12;
+  int64 routed_at_ns = 13;
+  TimePrecision routed_precision = 14;
+  repeated string handling_instructions = 15;
+
+  // Slice C's, carried empty until it lands (the refresh's Q34): the RFQ a
+  // placement answers, as FIX's QuoteID (tag 117), and the axe, as FIX's
+  // IOIID (tag 23).
+  string rfq_id = 16;
+  string axe_id = 17;
+
+  // The venue's order ID now; every one it has had stays in its history.
+  // TODO(name): the list of every venue identifier it has had is not named.
+  string venue_order_id = 18;
+
+  PlacementStatus status = 19;
+  // Executed by: the actor of the placing command.
+  PersonRoles person_roles = 20;
+  repeated Check checks = 21;
+
+  // On a rejection: its reason, and the venue's as reported only beside
+  // REJECTION_REASON_VENUE_REJECTED.
+  RejectionReason rejection_reason = 22;
+  AsReported rejection_as_reported = 23;
+
+  JournalRef last_change = 24;
+}
+
+// A placement's status, derived.
+// TODO(name): the approved text names the field `status`, not this message.
+message PlacementStatus {
+  PlacementState state = 1;
+  repeated ConditionOnPlacement conditions = 2;
+}
+
+// TODO(name): one condition a placement holds; see ConditionOnOrder.
+message ConditionOnPlacement {
+  PlacementCondition condition = 1;
+  string reason = 2;
+  Actor actor = 3;
+  // On outcome unknown.
+  UnknownReason unknown_reason = 4;
+  AsReported status_as_reported = 5;
+}
+
+// An execution, never edited (W11.11): a bust or a correction is another,
+// superseding it.
+message Execution {
+  // `EXE-` and a ULID, minted by the book.
+  string execution_id = 1;
+  string order_id = 2;
+  string placement_id = 3;
+  string account_id = 4;
+  string instrument_id = 5;
+  // Its order's sleeve (the refresh's Q33).
+  string sleeve = 6;
+  Side side = 7;
+
+  Decimal quantity = 8;
+  Money price = 9;
+  int64 trade_time_ns = 10;
+  // ISO 8601, as the venue reports it.
+  string trade_date = 11;
+
+  // The venue's, or one the plugin derived deterministically (requirement
+  // 33); an external reference.
+  string venue_execution_id = 12;
+  ExecutionKind kind = 13;
+  ExecutionSource source = 14;
+  ExecutionFinality finality = 15;
+
+  // Each with its kind, a signed amount and its asset; a rebate negative.
+  repeated Fee fees = 16;
+
+  // ISO 8601: the date the venue states, kept as stated; and, where it
+  // states none or the plugin also asked, the date read's answer with its
+  // basis (W3.20; the calendars spec's requirement 13). The pending lines
+  // take the stated date, else the computed one.
+  string settlement_date = 17;
+  string computed_settlement_date = 18;
+  DateBasis settlement_date_basis = 19;
+
+  // The execution it busts or corrects: the last correction, not the
+  // original.
+  string supersedes = 20;
+  // TODO(name): a correction's date it takes effect is not named.
+
+  // The place of execution, a `VEN-` ID.
+  string venue_id = 21;
+  // TODO(name): the counterparty, its contact as delivered, and maker or
+  // taker are not named (Party's fields).
+
+  // The reporting fields (requirements 55, 57, 58), carried where set.
+  string uti = 22;
+  // TODO(name): who generated the UTI is not named.
+  string prior_uti = 23;
+  string upi = 24;
+  // TODO(type): where traded terms differ from the template's; the form is
+  // not given.
+  string derivative_terms = 25;
+  // A prime broker.
+  string given_up_to = 26;
+  string trade_chain_reference = 27;
+  string settlement_counterparty = 28;
+
+  // Executed by, on an entered execution.
+  PersonRoles person_roles = 29;
+  RawRecordRef raw_record = 30;
+  JournalRef last_change = 31;
+}
+
+// An execution's finality: a level, and when it reached it.
+// TODO(name): the approved text names the field `finality` and its levels,
+// not this message.
+message ExecutionFinality {
+  FinalityLevel level = 1;
+  int64 at_ns = 2;
+}
+
+// A fee (requirement 26), in any asset with a cash instrument (v18).
+message Fee {
+  FeeKind kind = 1;
+  // Signed; a rebate negative.
+  Money amount = 2;
+}
+
+// A fee with no fill, on its placement (W11.12): it moves cash, pending to
+// its settlement date, and counts toward no quantity.
+message Charge {
+  // `CHG-` and a ULID, minted by the book.
+  string charge_id = 1;
+  string placement_id = 2;
+  string order_id = 3;
+  string account_id = 4;
+  Fee fee = 5;
+  string trade_date = 6;
+  string settlement_date = 7;
+  RawRecordRef raw_record = 8;
+}
+
+// A well-formed fact naming nothing the book holds, kept with its reason,
+// never dropped (requirement 13); placed by its own entry when a later
+// record claims it.
+message UnplacedFact {
+  // `UNP-` and a ULID, minted by the book.
+  string unplaced_id = 1;
+  // Empty where its venue account code maps to no account: delivered to no
+  // plugin, counted on its connectivity plugin's admin view.
+  string account_id = 2;
+  // The kind of fact, as data: `execution`, `placement`, `charge`, `order`.
+  string fact_kind = 3;
+  UnplacedReason reason = 4;
+  RawRecordRef raw_record = 5;
+  string venue_account_code = 6;
+  // TODO(name): the fact as it arrived, and the entry that placed it, are
+  // not named.
+}
+
+// A trading instruction (W11.15): recorded with its setter's level, a
+// deployment admin's on one account in that account's partition, every
+// other in the control partition.
+message TradingInstruction {
+  TradingInstructionTarget target = 1;
+  TradingInstructionValue value = 2;
+  SetterLevel setter_level = 3;
+  // On a user group's: the persons it covers, by their deployment-local
+  // subjects, resolved by core when set and whenever membership changes.
+  repeated string covers = 4;
+  string reason = 5;
+  EntryMeta entry = 6;
+}
+
+// What an instruction names: a deployment admin's an account, All accounts,
+// a plugin, a person, a service account or a user group; a plugin admin's
+// their plugin, or a person, service account or account within it, naming
+// the plugin beside it.
+// TODO(name): the approved text names the field `target` and `all_accounts`,
+// not this message.
+message TradingInstructionTarget {
+  bool all_accounts = 1;
+  string account_id = 2;
+  // A plugin, by its instance.
+  string instance_id = 3;
+  // A person, by the deployment-local subject.
+  string subject = 4;
+  string service_account_id = 5;
+  string user_group_id = 6;
+}
+
+// A locate the fund requested of its prime, the prime's answer on it
+// (W11.18; requirement 50a). Each change its own entry; the street never
+// holds one.
+message Locate {
+  // `LOC-` and a ULID, minted by the book.
+  string locate_record_id = 1;
+  string account_id = 2;
+  string instrument_id = 3;
+  Decimal quantity_requested = 4;
+  // Unset until the prime answers.
+  LocateAnswer answer = 5;
+  // The prime's locate ID, from its answer, which a short order names.
+  string locate_id = 6;
+  // Derived from its uses.
+  Decimal remaining = 7;
+  repeated LocateUse uses = 8;
+  RawRecordRef raw_record = 9;
+  JournalRef last_change = 10;
+}
+
+// The prime's answer.
+// TODO(name): the approved text names the field `answer`, not its message.
+message LocateAnswer {
+  Decimal quantity_approved = 1;
+  Decimal rate = 2;
+  int64 expires_at_ns = 3;
+  string locate_id = 4;
+}
+
+// One use of a locate, its own entry (W11.19): when a locate is used up is
+// `compliance`'s or the `oms`'s logic (principle 3).
+message LocateUse {
+  LocateUseKind kind = 1;
+  Decimal quantity = 2;
+  string order_id = 3;
+}
+
+// ── W11.1 to W11.12, W11.14, W11.18, W11.19: commands ──
+
+// W11.1. For a person or a service account; by `portfolio`, the `oms`, or an
+// `ems` for a child order.
+message ProposeOrderRequest {
+  string account_id = 1;
+  string instrument_id = 2;
+  string sleeve = 3;
+  Side side = 4;
+  string locate_id = 5;
+  // 0, a pass, is refused naming `quantity` until slice C defines it.
+  Decimal quantity = 6;
+  Money cash_quantity = 7;
+  OrderType order_type = 8;
+  Money limit_price = 9;
+  string dealt_currency = 10;
+  repeated Leg legs = 11;
+  AllocationInstruction allocation_instruction = 12;
+  TimeInForce time_in_force = 13;
+  LotReliefMethod lot_relief_method = 14;
+  repeated string relieve_lot_ids = 15;
+  Capacity capacity = 16;
+  OrderDirection direction = 17;
+  repeated Party parties = 18;
+  // Where who decided differs from who enters it.
+  Actor decided_by = 19;
+  string customer_id = 20;
+  string firm_designated_id = 21;
+  repeated string handling_instructions = 22;
+  int64 received_at_ns = 23;
+  TimePrecision received_precision = 24;
+  ReceiptQuote quote_at_receipt = 25;
+  repeated string represents_order_ids = 26;
+  string axe_source = 27;
+  string axe_counterparty_id = 28;
+  // A child order: in its parent's account, released on creation within it
+  // (Q19 (i)); under a parent not released, REFUSAL_REASON_ORDER_STATE.
+  OrderLink link = 29;
+  string idempotency_key = 30;
+}
+
+// W11.2. A fact: never through the gate. By a connectivity plugin, its
+// account stamped by the sidecar from the `ems`'s map
+// (`venue-account-map`); or by the `oms`, for a person, naming the account.
+message RecordOrderRequest {
+  // Stamped from venue_account_code on a connectivity plugin's; empty,
+  // never refused, where none is mapped, so the fact is kept unplaced.
+  string account_id = 1;
+  string venue_account_code = 2;
+  string instrument_id = 3;
+  string sleeve = 4;
+  Side side = 5;
+  Decimal quantity = 6;
+  OrderType order_type = 7;
+  Money limit_price = 8;
+  TimeInForce time_in_force = 9;
+  string venue_order_id = 10;
+  OrderOrigin origin = 11;
+  RawRecordRef raw_record = 12;
+  string idempotency_key = 13;
+}
+
+// W11.3.
+message RequestOrderChangeRequest {
+  string order_id = 1;
+  OrderChange change = 2;
+  // Required on a justified act: an alignment, an override.
+  string reason = 3;
+  string idempotency_key = 4;
+}
+
+// W11.4. By `compliance`; on an order version, or on a placement before it
+// is sent, answered with the placement.
+message RecordCheckRequest {
+  string order_id = 1;
+  uint64 order_version = 2;
+  string placement_id = 3;
+  CheckVerdict verdict = 4;
+  string rule = 5;
+  string note = 6;
+  string idempotency_key = 7;
+}
+
+// W11.5.
+message DecideApprovalRequest {
+  string order_id = 1;
+  ApprovalDecision decision = 2;
+  // Required on an override.
+  string reason = 3;
+  string idempotency_key = 4;
+}
+
+// W11.6. Through the gate, in its order: allocation, block, approval,
+// compliance.
+message ReleaseOrderRequest {
+  string order_id = 1;
+  string idempotency_key = 2;
+}
+
+// W11.7. Claimed, held or paused, set or cleared.
+message SetWorkingConditionRequest {
+  string order_id = 1;
+  // ORDER_CONDITION_CLAIMED, _HELD or _PAUSED; any other refused.
+  OrderCondition condition = 2;
+  // True sets it, false clears it.
+  bool set = 3;
+  string reason = 4;
+  string idempotency_key = 5;
+}
+
+// W11.8. By the `ems`; or by a connectivity plugin, a direct order's.
+message CreatePlacementRequest {
+  string order_id = 1;
+  // One linked to the placing `ems` and made available to the user the
+  // command acts for, or REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED, recorded.
+  string connectivity_instance_id = 2;
+  string venue_account_code = 3;
+  Decimal quantity = 4;
+  Money limit_price = 5;
+  TimeInForce time_in_force = 6;
+  StrategyInstruction strategy = 7;
+  string destination = 8;
+  RouteType route_type = 9;
+  repeated string handling_instructions = 10;
+  // Offered empty until slice C.
+  string rfq_id = 11;
+  string axe_id = 12;
+  // Stamped by the sidecar: the sending instance.
+  string ems_instance_id = 13;
+  string idempotency_key = 14;
+}
+
+// W11.9. By the `ems` or the `oms`; by a connectivity plugin only to report
+// a cancel it already sent under a stop, a fact naming the instruction's
+// entry as its cause (v21's Q17).
+message RequestPlacementChangeRequest {
+  string placement_id = 1;
+  PlacementChange change = 2;
+  string reason = 3;
+  // The trading instruction's entry, on a cancel reported under a stop:
+  // only its entry_id is read.
+  EntryMeta cause = 4;
+  string idempotency_key = 5;
+}
+
+// W11.10. A fact, each with the raw record it was converted from.
+message ReportPlacementRequest {
+  string placement_id = 1;
+  PlacementEvent event = 2;
+  string venue_order_id = 3;
+  int64 routed_at_ns = 4;
+  TimePrecision routed_precision = 5;
+  RejectionReason rejection_reason = 6;
+  AsReported rejection_as_reported = 7;
+  UnknownReason unknown_reason = 8;
+  AsReported status_as_reported = 9;
+  RestatementReason restatement_reason = 10;
+  // On a replace or a restatement: the quantity and limit now.
+  Decimal quantity = 11;
+  Money limit_price = 12;
+  RawRecordRef raw_record = 13;
+}
+
+// W11.11. A fact by a connectivity plugin; or, for a person, a manual or
+// done-away execution by the `ems` or the `oms`. A fill with no settlement
+// date, stated or computed, is refused INVALID_ARGUMENT naming
+// `settlement_date` (the refresh's Q39).
+message ReportExecutionRequest {
+  string placement_id = 1;
+  // A done-away execution's order.
+  string order_id = 2;
+  // Stamped from venue_account_code on a connectivity plugin's, as
+  // RecordOrderRequest's is.
+  string account_id = 3;
+  string venue_account_code = 4;
+  string venue_execution_id = 5;
+  ExecutionKind kind = 6;
+  ExecutionSource source = 7;
+  Decimal quantity = 8;
+  Money price = 9;
+  int64 trade_time_ns = 10;
+  string trade_date = 11;
+  ExecutionFinality finality = 12;
+  string settlement_date = 13;
+  string computed_settlement_date = 14;
+  DateBasis settlement_date_basis = 15;
+  repeated Fee fees = 16;
+  string supersedes = 17;
+  string venue_id = 18;
+  string uti = 19;
+  string prior_uti = 20;
+  string upi = 21;
+  string derivative_terms = 22;
+  string given_up_to = 23;
+  string trade_chain_reference = 24;
+  string settlement_counterparty = 25;
+  RawRecordRef raw_record = 26;
+  string idempotency_key = 27;
+}
+
+// W11.12.
+message ReportChargeRequest {
+  string placement_id = 1;
+  Fee fee = 2;
+  string trade_date = 3;
+  string settlement_date = 4;
+  RawRecordRef raw_record = 5;
+}
+
+// W11.14. Late fact only; does not tie out is never acknowledged.
+message AcknowledgeFlagRequest {
+  string order_id = 1;
+  OrderCondition condition = 2;
+  string reason = 3;
+  string idempotency_key = 4;
+}
+
+// W11.15. From the dashboard, for a deployment admin or a plugin's admin;
+// the setter's level from the claims.
+message SetTradingInstructionRequest {
+  TradingInstructionTarget target = 1;
+  TradingInstructionValue value = 2;
+  string reason = 3;
+}
+
+// W11.18. By the fund's connectivity plugin; the answer later on the same
+// record as its own entry.
+message RecordLocateRequest {
+  // Stamped from venue_account_code (`venue-account-map`).
+  string account_id = 1;
+  string venue_account_code = 2;
+  string instrument_id = 3;
+  Decimal quantity_requested = 4;
+  LocateAnswer answer = 5;
+  // Names the record an answer arriving later is on; empty for a new one.
+  string locate_record_id = 6;
+  RawRecordRef raw_record = 7;
+  string idempotency_key = 8;
+}
+
+// W11.19. By `compliance` or the `oms`; on an expired locate,
+// REFUSAL_REASON_ORDER_STATE.
+message RecordLocateUseRequest {
+  string locate_record_id = 1;
+  LocateUse use = 2;
+  string idempotency_key = 3;
+}
+
+// ── Their answers, after commit ──
+
+message OrderReply {
+  Order order = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  // On a change request: the one it opened.
+  string change_request_id = 4;
+}
+
+message PlacementReply {
+  Placement placement = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  string change_request_id = 4;
+}
+
+// A fact's answer: each record it changed, or the unplaced fact kept.
+message FactReply {
+  Placement placement = 1;
+  Execution execution = 2;
+  Order order = 3;
+  Charge charge = 4;
+  UnplacedFact unplaced = 5;
+  EntryMeta entry = 6;
+  JournalRef journal = 7;
+}
+
+message TradingInstructionReply {
+  TradingInstruction instruction = 1;
+  JournalRef journal = 2;
+}
+
+message LocateReply {
+  Locate locate = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+}
+
+// ── W11.13, W11.16, W11.18: deliveries, records whole ──
+
+message OrderUpdatedEvent {
+  Order order = 1;
+  // What changed, by field.
+  repeated string changed = 2;
+  EntryMeta entry = 3;
+  JournalRef journal = 4;
+  ChangeCause cause = 5;
+}
+
+// To the `ems`, `oms` and `compliance` within scope, and to the
+// connectivity plugin it names, alone of its role (matrix/directed.tsv).
+message PlacementUpdatedEvent {
+  Placement placement = 1;
+  repeated string changed = 2;
+  EntryMeta entry = 3;
+  JournalRef journal = 4;
+  ChangeCause cause = 5;
+}
+
+// W9's PositionChanged follows for each position it moved.
+message ExecutionRecordedEvent {
+  Execution execution = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+message UnplacedFactRecordedEvent {
+  UnplacedFact unplaced = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+// To every subscriber, without an account scope.
+message TradingInstructionChangedEvent {
+  TradingInstruction instruction = 1;
+  JournalRef journal = 2;
+  ChangeCause cause = 3;
+}
+
+message LocateUpdatedEvent {
+  Locate locate = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+// ── W11.16 to W11.18: reads ──
+
+// The orders in the reader's scope, as of now or changed since a watermark;
+// a connectivity plugin's, those behind placements naming its instance.
+message ListOrdersRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+  Watermark after_watermark = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message ListOrdersReply {
+  repeated Order orders = 1;
+  Watermark watermark = 2;
+  string next_cursor = 3;
+}
+
+// One order's journal from its first entry; the history never changes.
+message OrderHistoryRequest {
+  string account_id = 1;
+  string order_id = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message OrderHistoryReply {
+  // Each with its actor, its times, and the prepared change it was made
+  // from where one was.
+  repeated EntryMeta entries = 1;
+  string next_cursor = 2;
+}
+
+// Those in force, never a history; read on start, whatever the scope.
+message ListTradingInstructionsRequest {}
+
+message ListTradingInstructionsReply {
+  repeated TradingInstruction instructions = 1;
+  // The control partition's sequence they were read at.
+  uint64 control_sequence = 2;
+}
+
+message ListLocatesRequest {
+  string account_id = 1;
+  Watermark after_watermark = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+}
+
+message ListLocatesReply {
+  repeated Locate locates = 1;
+  Watermark watermark = 2;
+  string next_cursor = 3;
 }

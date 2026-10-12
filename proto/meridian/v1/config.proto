@@ -2,7 +2,9 @@
 // store serves from it.
 //
 // Derived from workflows W6 (a person in a deployment) and W4 (plugin
-// lifecycle). Every message here traces to a matrix row; see matrix/matrix.tsv.
+// lifecycle); from contract v22 also W11.20 to W11.22, a connectivity
+// plugin's link to its `ems`, the `ems`'s venue account map and the venue's
+// catalogue. Every message here traces to a matrix row; see matrix/matrix.tsv.
 //
 // The governing idea: access is three dimensions joined by a permission -- a
 // user group (who), an account group (which accounts), an access group (which
@@ -30,6 +32,9 @@ import "meridian/v1/plugins.proto";
 // A dataset's entitlements and its catalogue entry (W10.1, contract v18),
 // which an entitlements change carries.
 import "meridian/v1/lake.proto";
+// The order path's order types, times in force and strategy kinds (W11,
+// contract v22), which a venue's catalogue lists.
+import "meridian/v1/book.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W6.1 — who has signed in
@@ -588,6 +593,16 @@ message PluginConfiguration {
 
   // Whether that hold needs records that cannot be altered.
   bool hold_write_once = 8;
+
+  // Contract v22 (W4.11, W11.21, W11.22): for a connectivity plugin, its
+  // link to its one `ems`, its scope the accounts that `ems` mapped on it;
+  // for an `ems`, the connectivity plugins linked to it, who may route
+  // through each, and its venue account map. The sidecar hands them to the
+  // plugin beside its scope (AccountScopeDelivery).
+  // TODO(name): these three fields' names are not in the approved text.
+  ConnectivityLink connectivity_link = 9;
+  repeated ConnectivityLink connectivity_links = 10;
+  VenueAccountMap venue_account_map = 11;
 }
 
 // Something in a plugin's configuration changed; its sidecar asks again.
@@ -647,4 +662,154 @@ message EntitlementsChangedEvent {
   repeated DatasetLicence licences = 2;
   repeated DatasetEntitlement entitlements = 3;
   int64 changed_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W11.20 to W11.22 — a connectivity plugin's `ems`, and its venue's catalogue,
+// contract v22
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Ruled 2026-10-10 (step 5's Q14 extended; the order-path plan's Q20): the
+// deployment admin makes a connectivity plugin available; the `ems` plugin's
+// admin links an available one to their `ems` and makes it available to the
+// `ems`'s users; each connectivity plugin is linked to exactly one `ems`,
+// and an `ems`, usually a desk, may have many. The `ems` maps its accounts to
+// the venue account codes they trade under, so it sets the venue's account
+// field and the sidecar stamps a venue fact's account
+// (`venue-account-map`); a connectivity plugin links no account of its own.
+// The conductor keeps each, every change its own record (decisions/031), and
+// delivers them beside each plugin's scope (W4.11). ConnectivityLink and
+// VenueAccountMap ride that delivery, so they are plugin-facing, declared in
+// meridian-schema's sidecar.proto and imported from there.
+
+// W11.21. For a deployment admin, at the page only (access): makes an
+// instance holding `connectivity` available, or withdraws it. Answered by
+// its link as recorded. Nothing is available by default.
+message SetConnectivityAvailableRequest {
+  string connectivity_instance_id = 1;
+  bool available = 2;
+  // Why, kept with the change's record.
+  string note = 3;
+}
+
+// W11.21. For the `ems` plugin's admin, at the page only (access): links an
+// available connectivity plugin to their `ems`, or unlinks it (an empty
+// ems_instance_id), and makes it available to the `ems`'s users. Refused
+// REFUSAL_REASON_CONNECTIVITY_LINKED for one already linked to another
+// `ems`. Unlinking leaves the placements already made as they are.
+message LinkConnectivityRequest {
+  string connectivity_instance_id = 1;
+  string ems_instance_id = 2;
+  // The whole set, replacing the last.
+  repeated ConnectivityUser users = 3;
+  string note = 4;
+}
+
+// One change to a connectivity plugin's link, its own record: who, when,
+// the instance, from, to, a note (W11.21).
+message ConnectivityLinkChange {
+  string connectivity_instance_id = 1;
+  // The deployment-local subject the dashboard stamped, and when.
+  string changed_by = 2;
+  int64 changed_at_ns = 3;
+  // The delegation and its client, where one was used (W4.9).
+  string acting_through_delegation = 4;
+  string client_name = 5;
+  // TODO(name): W11.21's "from" and "to" -- the link before and after --
+  // are not named as fields (`from` is a keyword in the SDKs' languages).
+  ConnectivityLink before = 6;
+  ConnectivityLink after = 7;
+  string note = 8;
+  // The prepared change it was made from, where one was (W6.27).
+  string prepared_call_id = 9;
+}
+
+// W11.22. Sent by the `ems` acting for the admin viewing its page (W4.9):
+// maps an account to the venue account code it trades under at one of the
+// `ems`'s connectivity plugins, or removes the mapping (an empty
+// account_id). Answered by the `ems`'s map as recorded; refused
+// REFUSAL_REASON_ACCOUNT_NOT_LINKABLE for an account not granted to the
+// `ems`'s instance (W6.30), REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED for a
+// connectivity plugin not linked to it, ALREADY_EXISTS for a code mapped on
+// that plugin already.
+message MapVenueAccountRequest {
+  string connectivity_instance_id = 1;
+  string venue_account_code = 2;
+  string account_id = 3;
+  // Stamped by the sidecar: the sending instance.
+  string ems_instance_id = 4;
+}
+
+// One change to an `ems`'s map, its own record (W11.22).
+message VenueAccountMapChange {
+  string ems_instance_id = 1;
+  string changed_by = 2;
+  int64 changed_at_ns = 3;
+  // TODO(name): the mapping before and after are not named as fields.
+  VenueAccountMapping before = 4;
+  VenueAccountMapping after = 5;
+}
+
+// A venue's offering per venue account code (W11.20), converted at the edge
+// from the venue's own definitions: not a capability, and nothing declared
+// about the role. What is not listed is rejected unsupported if sent.
+message VenueCatalogue {
+  // The connectivity plugin it came from: the stamped publisher's.
+  string connectivity_instance_id = 1;
+  string venue_account_code = 2;
+  repeated VenueOrderType order_types = 3;
+  repeated VenueStrategy strategies = 4;
+  repeated VenueEligibility eligibility = 5;
+}
+
+// An order type the venue offers, with the times in force it takes.
+message VenueOrderType {
+  OrderType order_type = 1;
+  repeated TimeInForce times_in_force = 2;
+  int64 stated_at_ns = 3;
+}
+
+// A broker's strategy (the order-path plan's refresh, Q31, as refined and
+// ruled 2026-10-12): the strategy and its parameters on the model of FIXatdl,
+// the FIX Trading Community's standard for describing algorithmic strategies,
+// or mapping one to one onto it, so a broker's published definitions are
+// imported at the edge rather than keyed again.
+message VenueStrategy {
+  // Which of the contract's kinds it is the broker's, where it is one.
+  StrategyKind kind = 1;
+  // The broker's name for it.
+  string name = 2;
+  // TODO(name): its parameters -- each one's name, type, allowed values or
+  // range, whether required, and default -- are not named, as a field or a
+  // message.
+  int64 stated_at_ns = 3;
+}
+
+// The venue's eligibility for one instrument.
+message VenueEligibility {
+  string instrument_id = 1;
+  bool fractionable = 2;
+  bool shortable = 3;
+  // TODO(name): borrow status and an options level are not named.
+  int64 stated_at_ns = 4;
+}
+
+// W11.20. Published by a connectivity plugin, per venue account code its
+// `ems` mapped; kept by the conductor, latest per code, each change its own
+// record; heard by the `ems` and the `oms`.
+message VenueCatalogueEvent {
+  VenueCatalogue catalogue = 1;
+  // Stamped by the sidecar, whatever the plugin sent.
+  string publisher_instance_id = 2;
+}
+
+// W11.20. The latest per venue account code; a code the plugin has not
+// published is answered empty, not refused.
+message ReadVenueCatalogueRequest {
+  string connectivity_instance_id = 1;
+  string venue_account_code = 2;
+}
+
+message ReadVenueCatalogueReply {
+  VenueCatalogue catalogue = 1;
 }
