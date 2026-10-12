@@ -335,6 +335,13 @@ fn no_account(
     code: &str,
     raw: Option<meridian_pb::v1::RawRecordRef>,
 ) -> Result<(String, Vec<u8>), String> {
+    // Answered in the row's own reply: a recorded order's an OrderReply and
+    // a locate's a LocateReply, naming the entry that kept it and no record.
+    let reply_type = match &fact {
+        unplaced_fact::Fact::Order(_) => "meridian.v1.OrderReply",
+        unplaced_fact::Fact::Locate(_) => "meridian.v1.LocateReply",
+        _ => "meridian.v1.FactReply",
+    };
     command_store(
         bus,
         store,
@@ -342,14 +349,35 @@ fn no_account(
         ctx,
         NO_ACCOUNT,
         "",
-        "meridian.v1.FactReply",
+        reply_type,
         &|book, head, ctx| {
             let made = orders::unplaced(book, head, ctx, fact.clone(), reason, code, raw.clone())?;
-            let reply = fact_reply(&made);
+            let reply = kept_reply(&made, reply_type);
             Ok((made, reply))
         },
     )
     .map_err(|failed| failed.on_the_bus())
+}
+
+/// An unplaced fact's answer in its row's reply type.
+fn kept_reply(made: &Made, reply_type: &str) -> Vec<u8> {
+    let entry = Some(made.entry.meta.clone());
+    let journal = Some(made.changes.first.clone());
+    match reply_type {
+        "meridian.v1.OrderReply" => OrderReply {
+            entry,
+            journal,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        "meridian.v1.LocateReply" => LocateReply {
+            entry,
+            journal,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        _ => fact_reply(made),
+    }
 }
 
 /// Register every order-path handler the book serves.
@@ -483,7 +511,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     });
                     let reply = match order_id {
                         Some(order_id) => order_reply(&made, &order_id, ""),
-                        None => OrderReply::default().encode_to_vec(),
+                        None => kept_reply(&made, "meridian.v1.OrderReply"),
                     };
                     Ok((made, reply))
                 },

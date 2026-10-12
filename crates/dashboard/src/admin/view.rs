@@ -600,8 +600,11 @@ pub fn render(view: &View) -> String {
         .area
         .as_deref()
         .map(|area| {
+            // And its trading instructions, which its admin sets within it
+            // (W11.15, contract v22).
             format!(
-                "<div class=\"actions\"><a class=\"button\" href=\"{}\" data-area>Its pages</a></div>",
+                "<div class=\"actions\"><a class=\"button\" href=\"{}\" data-area>Its pages</a>\
+                 <a class=\"button\" href=\"/admin/trading-instructions\">Trading instructions</a></div>",
                 escape(area)
             )
         })

@@ -1,0 +1,99 @@
+//! The parity check for the order path's core tools (W6.20, contract v22;
+//! the refresh's Q44): each route the Accounts tab's book part and the
+//! trading instructions' page change names one of the four tools, and each
+//! tool reaches something drawn.
+
+use super::{PARITY, SPECS};
+use crate::mcp::Area;
+
+fn names_tools(by: &str) -> bool {
+    let tools: Vec<&str> = SPECS.iter().map(|spec| spec.name).collect();
+    let named: Vec<&str> = by.split(' ').filter(|w| !w.is_empty()).collect();
+    !named.is_empty() && named.iter().all(|name| tools.contains(name))
+}
+
+/// The paths a source file routes, as `.route("...")` gives each.
+fn routes(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        if let Some(quoted) = rest.trim_start().strip_prefix('"') {
+            if let Some(end) = quoted.find('"') {
+                found.push(quoted[..end].to_string());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_route_of_the_book_and_the_instructions_names_its_tool() {
+    let mut checked = 0;
+    for path in routes(include_str!("../../admin.rs")) {
+        if path != "/admin/accounts/book" && !path.starts_with("/admin/trading-instructions") {
+            continue;
+        }
+        checked += 1;
+        let by = PARITY
+            .iter()
+            .find_map(|(drawn, by)| (*drawn == path).then_some(*by))
+            .unwrap_or_else(|| panic!("{path} is routed and names no tool"));
+        assert!(names_tools(by), "{path}: {by:?}");
+    }
+    assert_eq!(checked, 2, "the routes were not found");
+}
+
+#[test]
+fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents() {
+    for (key, by) in PARITY {
+        assert!(names_tools(by), "{key}: {by:?}");
+    }
+    for spec in SPECS {
+        assert!(
+            PARITY
+                .iter()
+                .any(|(_, by)| by.split(' ').any(|word| word == spec.name)),
+            "{} reaches nothing PARITY names",
+            spec.name
+        );
+        assert!(matches!(spec.area, Area::Accounts | Area::Trading));
+        assert_eq!(spec.reads, spec.name.starts_with("list_"), "{}", spec.name);
+        let name = format!("dashboard__{}", spec.name);
+        assert_eq!(
+            crate::prepared::CORE_PREPARABLE.contains(&name.as_str()),
+            !spec.reads,
+            "{name}"
+        );
+        if !spec.reads {
+            assert_eq!(
+                crate::prepared::levels::default_for(&name),
+                crate::prepared::levels::Level::MayNot,
+                "{name} is at may not for agents until loosened (Q44)"
+            );
+        }
+    }
+    assert_eq!(SPECS.len(), 4, "the four approved tools");
+}
+
+#[test]
+fn a_deployment_admin_reaches_all_four_and_a_plugins_admin_the_instructions_alone() {
+    let admin = meridian_access::Access {
+        deployment_admin: true,
+        ..Default::default()
+    };
+    let plugin_admin = meridian_access::Access {
+        all_plugins_admin: true,
+        ..Default::default()
+    };
+    for spec in SPECS {
+        assert!(spec.area.open_to(&admin), "{}", spec.name);
+        assert_eq!(
+            spec.area.open_to(&plugin_admin),
+            spec.area == Area::Trading,
+            "{}",
+            spec.name
+        );
+        assert!(!spec.area.open_to(&meridian_access::Access::default()));
+    }
+}

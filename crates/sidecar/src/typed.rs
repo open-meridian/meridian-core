@@ -159,6 +159,8 @@ const CREATE_PLACEMENT: &str = "meridian.v1.CreatePlacementRequest";
 /// An order's change (W11.3, contract v22): a quantity change is never an
 /// `ems`'s.
 const REQUEST_ORDER_CHANGE: &str = "meridian.v1.RequestOrderChangeRequest";
+/// The entry kind the book journals an unplaced fact under (W11.13).
+const UNPLACED_KIND: &str = "unplaced-fact-recorded";
 /// The orders read (W11.17, contract v22): a connectivity plugin's answers
 /// only the orders behind placements naming its instance.
 const LIST_ORDERS: &str = "meridian.v1.ListOrdersRequest";
@@ -648,8 +650,47 @@ impl Sidecar {
                 .unwrap_or_default();
             !named.is_empty() && claims.connectivity_instance_ids.contains(&named)
         });
-        self.ask_routed(&topic, payload_type, message, &claims, scope, routed)
-            .await
+        let unmapped = account.is_none();
+        let reply: Response<R> = self
+            .ask_routed(&topic, payload_type, message, &claims, scope, routed)
+            .await?;
+        self.count_unplaced(payload_type, unmapped, &reply.get_ref().encode_to_vec());
+        Ok(reply)
+    }
+
+    /// A venue fact the book kept unplaced naming no account, counted for the
+    /// plugin's admin view (contract v22, W11.13): a report's answer naming an
+    /// unplaced fact with no account, or a recorded order or locate sent
+    /// with no account mapped and kept.
+    fn count_unplaced(&self, payload_type: &str, unmapped: bool, reply: &[u8]) {
+        let kept = match payload_type {
+            "meridian.v1.ReportExecutionRequest"
+            | "meridian.v1.ReportPlacementRequest"
+            | "meridian.v1.ReportChargeRequest" => domain::FactReply::decode(reply)
+                .ok()
+                .and_then(|reply| reply.unplaced)
+                .is_some_and(|fact| fact.account_id.is_empty()),
+            "meridian.v1.RecordOrderRequest" => {
+                unmapped
+                    && domain::OrderReply::decode(reply)
+                        .ok()
+                        .and_then(|reply| reply.entry)
+                        .is_some_and(|entry| entry.kind == UNPLACED_KIND)
+            }
+            "meridian.v1.RecordLocateRequest" => {
+                unmapped
+                    && domain::LocateReply::decode(reply)
+                        .ok()
+                        .and_then(|reply| reply.entry)
+                        .is_some_and(|entry| entry.kind == UNPLACED_KIND)
+            }
+            _ => false,
+        };
+        if kept {
+            self.unplaced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.changed.notify_one();
+        }
     }
 
     /// Asked, with the person stamped on the envelope -- and the delegation

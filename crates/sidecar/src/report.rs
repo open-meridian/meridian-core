@@ -33,6 +33,8 @@ use crate::service::Sidecar;
 pub const PLUGIN_REPORT: &str = "platform.deployment.event.plugin-report";
 pub const UNLINKED_EXTERNAL_ACCOUNTS: &str = "platform.config.event.unlinked-external-accounts";
 const EVERY: Duration = Duration::from_secs(30);
+/// Core's figure on a connectivity plugin's admin view (W11.13).
+pub(crate) const UNPLACED_LABEL: &str = "Unplaced facts";
 
 impl Sidecar {
     /// Count a refused grant and keep its reason.
@@ -61,6 +63,30 @@ impl Sidecar {
             };
         }
         report
+    }
+
+    /// The plugin's figures, and core's count of its venue facts kept
+    /// unplaced for want of a mapped venue account code (contract v22,
+    /// W11.13), drawn beside them on its admin view where there are any.
+    fn with_unplaced(
+        &self,
+        mut figures: Vec<meridian_pb::v1::PluginFigure>,
+    ) -> Vec<meridian_pb::v1::PluginFigure> {
+        let unplaced = self.unplaced.load(std::sync::atomic::Ordering::Relaxed);
+        if unplaced > 0 {
+            figures.push(meridian_pb::v1::PluginFigure {
+                label: UNPLACED_LABEL.into(),
+                value: Some(meridian_pb::v1::plugin_figure::Value::Count(
+                    i64::try_from(unplaced).unwrap_or(i64::MAX),
+                )),
+                state: meridian_pb::v1::FigureState::Warn as i32,
+                why: "facts from the venue naming a venue account code no ems mapped on this \
+                      plugin, kept with no account since the sidecar started"
+                    .into(),
+                ..Default::default()
+            });
+        }
+        figures
     }
 
     /// The external accounts refused for want of a link, if any.
@@ -121,7 +147,7 @@ impl Sidecar {
             // registered or after a refused heartbeat.
             figures: registration
                 .as_ref()
-                .map(|r| r.figures.clone())
+                .map(|r| self.with_unplaced(r.figures.clone()))
                 .unwrap_or_default(),
             // The declaration it registered with, and how often it saw each
             // name it does not carry (W4.5, W4.8, contract v11): names and

@@ -93,9 +93,17 @@ impl Level {
     }
 }
 
+/// The order path's two core acts, at may not for agents until the
+/// deployment admin loosens them (contract v22; the order-path plan's
+/// refresh, Q44).
+pub const MAY_NOT_UNTIL_LOOSENED: [&str; 2] = [
+    "dashboard__set_account_attribute",
+    "dashboard__set_trading_instruction",
+];
+
 /// The level an act stands at with no row of its own.
 pub fn default_for(act: &str) -> Level {
-    if ON_A_PREPARED_CHANGE.contains(&act) {
+    if ON_A_PREPARED_CHANGE.contains(&act) || MAY_NOT_UNTIL_LOOSENED.contains(&act) {
         Level::MayNot
     } else {
         Level::MayMake

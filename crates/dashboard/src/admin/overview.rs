@@ -879,6 +879,7 @@ pub fn render(
                 "note": a.note,
                 "base_currency_code": currency,
                 "lot_relief_default": method.to_string(),
+                "waits_for_compliance": super::books::waits_word(super::books::waits(books, &a.account_id)),
                 "since": if since.is_empty() { "not yet".to_string() } else { since.clone() },
                 "reason": "",
             } });
@@ -916,6 +917,7 @@ pub fn render(
             "<tr data-id=\"{id}\" data-name=\"{name}\"><td><span class=\"name\">{name}</span>{state}{mark}\
              <span class=\"id\">{id}</span>{note}{owner}</td>\
              <td>{custodian}</td><td>{account_type}</td><td>{currency}</td><td>{method}</td>\
+             <td>{waits}</td>\
              <td class=\"actions\">{actions}</td></tr>",
             id = escape(&a.account_id),
             name = escape(&a.name),
@@ -928,6 +930,11 @@ pub fn render(
             },
             currency = escape(&currency),
             method = escape(super::books::method_named(method)),
+            waits = if super::books::waits(books, &a.account_id) {
+                "Waits"
+            } else {
+                "Does not wait"
+            },
             state = if closed {
                 " <span class=\"pill\">closed</span>"
             } else {
@@ -967,7 +974,7 @@ pub fn render(
             "accounts",
             "Search by name, custodian, type, owner or note",
             "<th>Name</th><th>Custodian</th><th>Type</th><th>Base currency</th>\
-             <th>Lot relief</th><th></th>",
+             <th>Lot relief</th><th>Compliance</th><th></th>",
             &rows,
         )
     };
@@ -1116,7 +1123,8 @@ pub fn render(
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1>\
          <a class=\"button\" href=\"/admin/instruments\">Instruments</a>\
-         <a class=\"button\" href=\"/admin/data-sources\">Data sources</a></div>\
+         <a class=\"button\" href=\"/admin/data-sources\">Data sources</a>\
+         <a class=\"button\" href=\"/admin/trading-instructions\">Trading instructions</a></div>\
          {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
          <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}{}</script>",
         sections.concat(),

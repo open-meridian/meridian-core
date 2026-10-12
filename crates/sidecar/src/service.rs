@@ -140,6 +140,11 @@ pub struct Sidecar {
     /// with how many rows were refused for each (W4.8). Forgotten once one
     /// is linked and a row for it recorded.
     pub(crate) unlinked: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Unlinked>>>,
+    /// The venue facts this plugin sent that the book kept unplaced naming
+    /// no account, their venue account code mapped by no `ems` on it
+    /// (contract v22, W11.13): counted on its admin view. Since this process
+    /// started, as the unlinked accounts are.
+    pub(crate) unplaced: Arc<std::sync::atomic::AtomicU64>,
     /// The external accounts the plugin last said its connection reaches
     /// (W2.8): the whole list each time. A link is admitted only for one of
     /// these (W6.4). Empty until the plugin first reports, since nothing
@@ -215,6 +220,7 @@ impl Sidecar {
             configuration,
             refusals: Arc::default(),
             unlinked: Arc::default(),
+            unplaced: Arc::default(),
             reported: Arc::default(),
             live: Arc::default(),
             changed: Arc::default(),

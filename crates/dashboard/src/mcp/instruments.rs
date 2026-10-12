@@ -918,6 +918,24 @@ pub(super) async fn ask<R: Message + Default>(
         )
         .await;
     let (_, bytes) = answered.map_err(|failed| match failed {
+        // A store's refusal with a status and no code (contract v22): a
+        // command it reads as malformed, naming each field, or one outside
+        // the scope it was sent with.
+        meridian_bus::BusError::HandlerFailed { detail, .. }
+            if meridian_bus::read_refusal_status(&detail).is_some() =>
+        {
+            let (status, fields, words) =
+                meridian_bus::read_refusal_status(&detail).expect("matched above");
+            (
+                match status {
+                    meridian_bus::RefusalStatus::InvalidArgument => "invalid_arguments",
+                    meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
+                }
+                .into(),
+                words.to_string(),
+                fields,
+            )
+        }
         meridian_bus::BusError::HandlerFailed { detail, .. } => {
             match meridian_bus::read_refusal(&detail) {
                 Some((reason, words)) => (

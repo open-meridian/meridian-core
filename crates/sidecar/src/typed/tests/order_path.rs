@@ -788,3 +788,50 @@ async fn a_connectivity_plugin_reads_only_the_orders_behind_its_own_placements()
     assert_eq!(read.executions.len(), 1);
     assert_eq!(read.executions[0].execution_id, "EXE-mine");
 }
+
+#[tokio::test]
+async fn a_venue_fact_kept_with_no_account_is_counted_on_the_plugins_admin_view() {
+    let venue = plugin("fix-1", &["connectivity"], None).await;
+    venue
+        .bus
+        .serve("platform.book.command.report-execution", |envelope| {
+            let asked =
+                meridian_domain::v1::ReportExecutionRequest::decode(&envelope.payload[..]).unwrap();
+            assert!(asked.account_id.is_empty(), "no ems mapped the code");
+            Ok((
+                "meridian.v1.FactReply".into(),
+                meridian_domain::v1::FactReply {
+                    unplaced: Some(meridian_domain::v1::UnplacedFact {
+                        unplaced_id: "UNP-1".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+    let figure = |sidecar: &Sidecar| {
+        sidecar
+            .report(now())
+            .figures
+            .into_iter()
+            .find(|figure| figure.label == crate::report::UNPLACED_LABEL)
+    };
+    assert!(figure(&venue.sidecar).is_none());
+    venue
+        .sidecar
+        .report_execution(Request::new(
+            meridian_pb::plugin::v1::ReportExecutionParams {
+                placement_id: "PLC-1".into(),
+                venue_account_code: "NOBODY-MAPPED".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let counted = figure(&venue.sidecar).expect("counted");
+    assert_eq!(
+        counted.value,
+        Some(meridian_pb::v1::plugin_figure::Value::Count(1))
+    );
+}

@@ -56,9 +56,9 @@ pub const MOST_REASON: usize = 4_000;
 pub const KEPT_AFTER_SETTLING_NS: i64 = 90 * 24 * 3_600 * 1_000_000_000;
 const DAY_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
-/// Core's thirteen acts that can be prepared (the plan's Q13), by their
-/// names on the surface.
-pub const CORE_PREPARABLE: [&str; 13] = [
+/// Core's acts that can be prepared (the plan's Q13; from contract v22 the
+/// order path's two, Q44), by their names on the surface.
+pub const CORE_PREPARABLE: [&str; 15] = [
     "dashboard__set_plugin_settings",
     "dashboard__allow_archive",
     "dashboard__withdraw_archive",
@@ -72,6 +72,8 @@ pub const CORE_PREPARABLE: [&str; 13] = [
     "dashboard__accept_offered_values",
     "dashboard__merge_instruments",
     "dashboard__ask_platform_for_instrument",
+    "dashboard__set_account_attribute",
+    "dashboard__set_trading_instruction",
 ];
 
 /// v20's own tools, never prepared and never levelled but for the three on

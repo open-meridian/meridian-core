@@ -111,6 +111,25 @@ pub(super) fn in_book(books: &Books, account_id: &str) -> (String, i32, String) 
     )
 }
 
+/// Whether an account's releases wait for compliance (W9.13, W11.6;
+/// contract v22): as the book holds it, and true for an account it holds no
+/// attributes for, as a new account waits.
+pub(super) fn waits(books: &Books, account_id: &str) -> bool {
+    books.of(account_id).is_none_or(|a| a.waits_for_compliance)
+}
+
+/// The form's word for it, which the select posts.
+pub(super) fn waits_word(waits: bool) -> &'static str {
+    if waits {
+        WAITS
+    } else {
+        DOES_NOT_WAIT
+    }
+}
+
+const WAITS: &str = "wait";
+const DOES_NOT_WAIT: &str = "no-wait";
+
 /// The Accounts tab's Edit, its "In the book" section (W9.13; the product
 /// owner, 2026-10-10: one book per deployment, so its attributes sit with the
 /// account they belong to): a form of its own, posted to the book with a
@@ -136,6 +155,9 @@ pub fn book_form(token: &str) -> String {
          <div class=\"pair\"><label>Base currency <input name=\"base_currency_code\" maxlength=\"3\" \
          pattern=\"[A-Z]{{3}}\" placeholder=\"USD\"></label>\
          <label>Lot relief, when a sale names none <select name=\"lot_relief_default\">{methods}</select></label></div>\
+         <div class=\"pair\"><label>Releases <select name=\"waits_for_compliance\">\
+         <option value=\"{WAITS}\">Wait for compliance</option>\
+         <option value=\"{DOES_NOT_WAIT}\">Do not wait</option></select></label></div>\
          <div class=\"pair save\"><label>Reason <input name=\"reason\" required></label>\
          <button type=\"submit\" class=\"primary\">Save</button></div></div></form>"
     )
@@ -147,6 +169,7 @@ pub fn requests(
     account_id: &str,
     base_currency_code: &str,
     lot_relief_default: &str,
+    waits_for_compliance: &str,
     reason: &str,
     held: Option<&AccountAttributes>,
 ) -> Result<Vec<SetAccountAttributeRequest>, String> {
@@ -168,6 +191,23 @@ pub fn requests(
             method,
         ));
     }
+    // Whether releases wait for compliance (contract v22): a new account's
+    // is true, so only a change from what it holds is asked.
+    let waits_now = held.is_none_or(|a| a.waits_for_compliance);
+    match waits_for_compliance {
+        "" => {}
+        WAITS | DOES_NOT_WAIT => {
+            let wanted = waits_for_compliance == WAITS;
+            if wanted != waits_now {
+                asked.push(set_account_attribute_request::Attribute::WaitsForCompliance(wanted));
+            }
+        }
+        other => {
+            return Err(format!(
+                "{other:?} is neither waiting for compliance nor not"
+            ))
+        }
+    }
     if asked.is_empty() {
         return Err("nothing changed: the book holds these already".into());
     }
@@ -179,6 +219,48 @@ pub fn requests(
             reason: reason.to_string(),
         })
         .collect())
+}
+
+/// One attribute's change as dashboard__set_account_attribute's arguments
+/// (W6.20, contract v22): what a dialog prepares.
+pub fn arguments(request: &SetAccountAttributeRequest) -> serde_json::Value {
+    let mut arguments = serde_json::json!({
+        "account_id": request.account_id,
+        "reason": request.reason,
+    });
+    match &request.attribute {
+        Some(set_account_attribute_request::Attribute::BaseCurrencyCode(code)) => {
+            arguments["base_currency_code"] = code.clone().into();
+        }
+        Some(set_account_attribute_request::Attribute::LotReliefDefault(method)) => {
+            arguments["lot_relief_default"] = method_value(*method).into();
+        }
+        Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
+            arguments["waits_for_compliance"] = (*waits).into();
+        }
+        None => {}
+    }
+    arguments
+}
+
+/// A lot relief method by the tool's word for it.
+pub fn method_value(method: i32) -> &'static str {
+    match LotReliefMethod::try_from(method) {
+        Ok(LotReliefMethod::FirstInFirstOut) => "first_in_first_out",
+        Ok(LotReliefMethod::LastInFirstOut) => "last_in_first_out",
+        Ok(LotReliefMethod::HighestCost) => "highest_cost",
+        Ok(LotReliefMethod::LowestCost) => "lowest_cost",
+        Ok(LotReliefMethod::AverageCost) => "average_cost",
+        _ => "",
+    }
+}
+
+/// The method a tool's word names.
+pub fn method_of(word: &str) -> Option<LotReliefMethod> {
+    METHODS
+        .iter()
+        .map(|(method, _)| *method)
+        .find(|method| method_value(*method as i32) == word)
 }
 
 /// Send one, for the person signed in, who the book records as its actor.
@@ -230,6 +312,7 @@ mod tests {
             "ACC-1",
             "EUR",
             "1",
+            "",
             "the fund reports in euros",
             Some(&held("USD", LotReliefMethod::FirstInFirstOut)),
         )
@@ -241,17 +324,28 @@ mod tests {
                 "EUR".into()
             ))
         );
-        let both = requests("ACC-1", "USD", "2", "why", None).unwrap();
-        assert_eq!(both.len(), 2);
+        let both = requests("ACC-1", "USD", "2", "wait", "why", None).unwrap();
+        assert_eq!(both.len(), 2, "a new account waits already");
+        let off = requests("ACC-1", "", "0", "no-wait", "why", None).unwrap();
+        assert_eq!(
+            off[0].attribute,
+            Some(set_account_attribute_request::Attribute::WaitsForCompliance(false))
+        );
+        assert_eq!(arguments(&off[0])["waits_for_compliance"], false);
         assert!(requests(
             "ACC-1",
             "USD",
             "1",
+            "",
             "why",
             Some(&held("USD", LotReliefMethod::FirstInFirstOut))
         )
         .is_err());
-        assert!(requests("", "USD", "0", "why", None).is_err());
+        assert!(requests("", "USD", "0", "", "why", None).is_err());
+        assert_eq!(
+            method_of("highest_cost"),
+            Some(LotReliefMethod::HighestCost)
+        );
     }
 
     #[test]
@@ -276,6 +370,8 @@ mod tests {
         let form = book_form("");
         assert!(form.contains("action=\"/admin/accounts/book#accounts\""));
         assert!(form.contains("name=\"reason\" required") && form.contains("data-edit-only"));
+        assert!(form.contains("name=\"waits_for_compliance\""));
+        assert!(waits(&books, "ACC-2"), "a new account waits");
         assert!(
             form.contains("<output name=\"since\">"),
             "shown, never posted"

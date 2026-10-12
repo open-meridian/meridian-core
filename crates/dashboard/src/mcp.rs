@@ -58,6 +58,7 @@ use crate::delegation::{Covers, Refusal, Resource, ACCESS_PREFIX};
 use crate::terminal::Unavailable;
 use crate::web::App;
 
+pub mod book;
 pub mod bounds;
 pub mod data_sources;
 pub mod instruments;
@@ -434,6 +435,12 @@ pub enum Area {
     /// reaches anything, answering every row for the deployment admin's
     /// capabilities and an owner's own otherwise.
     ServiceAccounts,
+    /// The accounts' attributes in the book (contract v22, W9.13): the
+    /// deployment admin's capabilities.
+    Accounts,
+    /// The trading instructions (contract v22, W11.15): the deployment
+    /// admin's capabilities, or admin of a plugin, within it.
+    Trading,
 }
 
 impl Area {
@@ -445,6 +452,8 @@ impl Area {
             Area::DataSources => "Data sources",
             Area::Prepared => "Prepared changes",
             Area::ServiceAccounts => "Service accounts",
+            Area::Accounts => "Accounts",
+            Area::Trading => "Trading instructions",
         }
     }
 
@@ -464,6 +473,8 @@ impl Area {
                     || access.all_plugins_admin
                     || access.plugins.values().any(|held| held.holds_any())
             }
+            Area::Accounts => access.deployment_admin,
+            Area::Trading => access.deployment_admin || access.administers_any(),
         }
     }
 }
@@ -555,6 +566,7 @@ impl Tool {
                             Area::Plugins(_) => plugin_area::described(spec),
                             Area::DataSources => data_sources::described(spec),
                             Area::Prepared | Area::ServiceAccounts => spec.description.to_string(),
+                            Area::Accounts | Area::Trading => book::described(spec),
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -745,6 +757,7 @@ pub fn listed_to(
         .chain(data_sources::SPECS)
         .chain(prepared::SPECS)
         .chain(service_accounts::SPECS)
+        .chain(book::SPECS)
     {
         if spec.area.open_to(access) {
             tools.push(Tool {
@@ -855,6 +868,7 @@ pub fn core_spec(name: &str) -> Option<&'static Spec> {
         .chain(data_sources::SPECS)
         .chain(prepared::SPECS)
         .chain(service_accounts::SPECS)
+        .chain(book::SPECS)
         .find(|spec| spec.name == bare)
 }
 
@@ -874,6 +888,7 @@ pub async fn run_core(app: &App, caller: &Caller, spec: &'static Spec, arguments
                 .0
         }
         Area::ServiceAccounts => service_accounts::call(app, caller, spec, arguments).await.0,
+        Area::Accounts | Area::Trading => book::call(app, caller, spec, arguments).await,
     }
 }
 
@@ -1015,6 +1030,16 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
             ),
             Area::Prepared => prepared::call(app, caller, spec, arguments).await,
             Area::ServiceAccounts => service_accounts::call(app, caller, spec, arguments).await,
+            // At the setter's level: the deployment admin's, or a plugin
+            // admin's within their plugin.
+            Area::Accounts => (
+                book::call(app, caller, spec, arguments).await,
+                "deployment admin".to_string(),
+            ),
+            Area::Trading => (
+                book::call(app, caller, spec, arguments).await,
+                String::new(),
+            ),
         },
         Owner::Plugin {
             instance,

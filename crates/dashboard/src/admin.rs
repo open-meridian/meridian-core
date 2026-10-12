@@ -73,6 +73,10 @@ pub fn routes() -> Router<Arc<App>> {
             "/admin/plugins/{instance}/connectivity/link",
             post(connectivity::link),
         )
+        .route(
+            "/admin/trading-instructions",
+            get(trading_page).post(set_trading_instruction),
+        )
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -445,6 +449,7 @@ pub(crate) fn token_input(session: &Session) -> String {
 // ── The overview ────────────────────────────────────────────────────────────
 
 mod books;
+pub(crate) use books::{method_of as books_method_of, method_value as books_method_value};
 pub mod calendars;
 pub mod connectivity;
 pub mod data_sources;
@@ -454,6 +459,7 @@ mod overview;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
+pub mod trading;
 
 /// Everybody this dashboard can name for a user group (people.rs): those the
 /// groups name, those holding a delegation, and the accounts this
@@ -1812,45 +1818,68 @@ async fn define_account(
 }
 
 /// W9.13: an account's attributes in the book, for a deployment admin, each
-/// one that changed its own act with the reason given.
+/// one that changed its own act with the reason given; from contract v22
+/// whether its releases wait for compliance among them, and one change
+/// prepared for someone to make (dashboard__set_account_attribute, W6.20).
 async fn set_book(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Form(fields): Form<Fields>,
 ) -> Response {
-    admin_form!(app, headers, fields, session, {
-        let account_id = field(&fields, "account_id");
-        match books::read(&app.bus).await {
-            books::Books::NotAnswering(why) => {
-                Err(format!("the book of record is not answering: {why}"))
-            }
-            books::Books::Read(held) => {
-                let held = held.iter().find(|a| a.account_id == account_id);
-                match books::requests(
-                    account_id,
-                    field(&fields, "base_currency_code"),
-                    field(&fields, "lot_relief_default"),
-                    field(&fields, "reason"),
-                    held,
-                ) {
-                    Err(sentence) => Err(sentence),
-                    Ok(asked) => {
-                        let mut outcome = Ok(());
-                        for request in asked {
-                            if let Err(refused) =
-                                books::set(&app.bus, &session.subject, request).await
-                            {
-                                outcome = Err(refused);
-                                break;
-                            }
-                        }
-                        outcome
-                    }
-                }
-            }
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let account_id = field(&fields, "account_id");
+    let asked = match books::read(&app.bus).await {
+        books::Books::NotAnswering(why) => {
+            return after(Err(format!("the book of record is not answering: {why}")))
         }
+        books::Books::Read(held) => {
+            let held = held.iter().find(|a| a.account_id == account_id);
+            books::requests(
+                account_id,
+                field(&fields, "base_currency_code"),
+                field(&fields, "lot_relief_default"),
+                field(&fields, "waits_for_compliance"),
+                field(&fields, "reason"),
+                held,
+            )
+        }
+    };
+    let asked = match asked {
+        Ok(asked) => asked,
+        Err(sentence) => return after(Err(sentence)),
+    };
+    let preparing = !field(&fields, crate::prepared::handoff::PREPARE_FIELD).is_empty();
+    if preparing && asked.len() > 1 {
+        return after(Err(
+            "a prepared change sets one attribute: change one at a time to prepare it".into(),
+        ));
+    }
+    let first = asked[0].clone();
+    let posted = prepare_or_gate(&app, &session, &fields, SET_ACCOUNT_ATTRIBUTE_TOOL, || {
+        Ok(books::arguments(&first))
     })
+    .await;
+    if let Some(response) = posted_to(posted, "/admin#accounts") {
+        return response;
+    }
+    let mut outcome = Ok(());
+    for request in asked {
+        if let Err(refused) = books::set(&app.bus, &session.subject, request).await {
+            outcome = Err(refused);
+            break;
+        }
+    }
+    after(outcome)
 }
+
+/// The account attribute's act on the surface (W6.20, contract v22).
+const SET_ACCOUNT_ATTRIBUTE_TOOL: &str = "dashboard__set_account_attribute";
 
 async fn close_account(
     State(app): State<Arc<App>>,
@@ -2903,6 +2932,137 @@ async fn set_linkable(
     .map(|_| ());
     after_to(outcome, &back, &back)
 }
+
+// ── The trading instructions (W11.15, contract v22) ─────────────────────────
+
+/// Who is asking about the trading instructions: a deployment admin, or a
+/// plugin's admin for what names their plugins; or the refusal.
+fn gate_trading(
+    app: &App,
+    headers: &HeaderMap,
+) -> Result<(Session, AccessRecords, Access), Box<Response>> {
+    let (session, records) = gate(app, headers, false)?;
+    let access = person_access(&records, &session.subject, &session.directory_groups);
+    if !(access.deployment_admin || access.administers_any()) {
+        return Err(Box::new(status_page(
+            StatusCode::FORBIDDEN,
+            "Not permitted",
+            "the trading instructions are for deployment admins and plugins' admins",
+        )));
+    }
+    Ok((session, records, access))
+}
+
+fn trading_chrome(session: &Session) -> Chrome<'_> {
+    Chrome {
+        crumbs: format!(
+            "{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_here("Trading instructions", None)
+        ),
+        ..admin_chrome(session)
+    }
+}
+
+/// W11.15, W11.16: the trading instructions in force, and the dialog that
+/// sets one.
+async fn trading_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records, access) = match gate_trading(&app, &headers) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let held = trading::read(&app.bus).await;
+    let body = trading::page(
+        &held,
+        &records,
+        &access,
+        &token_input(&session),
+        field(&query, "done"),
+    );
+    Html(page_with(
+        "Trading instructions",
+        &body,
+        &trading_chrome(&session),
+    ))
+    .into_response()
+}
+
+/// W11.15: an instruction set, at the setter's level the dashboard stamps
+/// from their access; or prepared for someone to make. Nothing stands
+/// between a person and a stop but the act's own second pair of eyes, where
+/// an admin turned it on.
+async fn set_trading_instruction(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _, access) = match gate_trading(&app, &headers) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let asked = trading::target_from(
+        field(&fields, "kind"),
+        field(&fields, "id"),
+        field(&fields, "instance"),
+    )
+    .and_then(|target| {
+        let value = trading::value_of(field(&fields, "value"))
+            .ok_or_else(|| format!("{:?} is not active, pause or stop", field(&fields, "value")))?;
+        trading::request(&access, target, value, field(&fields, "reason"))
+    });
+    let request = match asked {
+        Ok(request) => request,
+        Err(sentence) => return not_done(&sentence, trading::PATH),
+    };
+    let arguments = trading::arguments(&request);
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_TRADING_INSTRUCTION_TOOL,
+        || Ok(arguments),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, trading::PATH) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            trading::SET_TRADING_INSTRUCTION,
+            "meridian.v1.SetTradingInstructionRequest",
+            request.encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failed| match failed {
+            BusError::HandlerFailed { detail, .. } => {
+                match meridian_bus::read_refusal_status(&detail) {
+                    Some((_, _, words)) => words.to_string(),
+                    None => refusal_words(detail),
+                }
+            }
+            other => other.to_string(),
+        });
+    after_to(
+        outcome,
+        &format!("{}?done=Set", trading::PATH),
+        trading::PATH,
+    )
+}
+
+/// The trading instruction's act on the surface (W6.20, contract v22).
+const SET_TRADING_INSTRUCTION_TOOL: &str = "dashboard__set_trading_instruction";
 
 // ── The Data sources page ───────────────────────────────────────────────────
 
