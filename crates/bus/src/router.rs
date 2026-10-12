@@ -66,6 +66,14 @@ pub struct Stamp {
     /// none.
     pub algorithm_id: String,
 
+    /// On a placement (contract v22, W11.8): whether the connectivity plugin
+    /// it names is among those the claims say the person or service account
+    /// may route through from the sending plugin (the claims'
+    /// connectivity_instance_ids), which the book refuses and records
+    /// REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED by when false. False
+    /// everywhere else.
+    pub connectivity_allowed: bool,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -389,6 +397,7 @@ impl Bus {
             acting_for_kind: stamp.acting_for_kind,
             owner_subject: stamp.owner_subject.clone(),
             algorithm_id: stamp.algorithm_id.clone(),
+            connectivity_allowed: stamp.connectivity_allowed,
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

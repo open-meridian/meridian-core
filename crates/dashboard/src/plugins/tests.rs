@@ -2464,6 +2464,7 @@ fn where_no_frame_can_hold_a_session_the_page_opens_in_a_window_of_its_own() {
 #[test]
 fn the_assertion_names_the_delegation_a_person_came_through() {
     let opening = || Opening {
+        connectivity_instance_ids: Default::default(),
         access: meridian_access::Levels::default(),
         roles: vec![],
         deployment_admin: false,

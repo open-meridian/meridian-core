@@ -1211,7 +1211,9 @@ pub async fn plugin_call_as(
         Err(stale) => return refused("unavailable", &stale.to_string(), Vec::new()),
     };
     let access = caller.access(&records);
-    let Some(opened) = crate::plugins::opening(&access, instance, level) else {
+    let Some(opened) = crate::plugins::opening(&access, instance, level)
+        .map(|opened| opened.routed(&records, instance, &caller.subject, &access.user_group_ids))
+    else {
         return refused(
             "not_listed",
             &format!(

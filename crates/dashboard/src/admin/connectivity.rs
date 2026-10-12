@@ -468,6 +468,40 @@ pub async fn link(
     super::after_to(outcome, &format!("{back}#part-connectivity"), &back)
 }
 
+/// The connectivity plugins `subject` -- a person, or a service account by
+/// its SA- ID -- in `user_group_ids` may route through from `instance`
+/// (contract v22; W11.8, W11.21; the product owner, 2026-10-12): for an
+/// ems, each linked to it; for a connectivity plugin's own placement (a
+/// direct order), itself while it is linked to an ems; in either case only
+/// while available, and only where its users name the subject, the
+/// service account or one of the user groups. What the claims carry as
+/// connectivity_instance_ids, which the plugin's sidecar holds a placement
+/// to and stamps connectivity_allowed by.
+pub fn routes(
+    records: &AccessRecords,
+    instance: &str,
+    subject: &str,
+    user_group_ids: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    records
+        .connectivity_links
+        .iter()
+        .filter(|link| link.available && !link.ems_instance_id.is_empty())
+        .filter(|link| {
+            link.ems_instance_id == instance || link.connectivity_instance_id == instance
+        })
+        .filter(|link| {
+            link.users.iter().any(|user| match &user.user {
+                Some(connectivity_user::User::Subject(named)) => named == subject,
+                Some(connectivity_user::User::ServiceAccountId(named)) => named == subject,
+                Some(connectivity_user::User::UserGroupId(named)) => user_group_ids.contains(named),
+                None => false,
+            })
+        })
+        .map(|link| link.connectivity_instance_id.clone())
+        .collect()
+}
+
 /// What `dashboard__read_plugin_access` answers of an instance's link and
 /// map (W11.21, W11.22): its link, for a connectivity plugin; its plugins
 /// and its map, for an `ems`; nothing for any other.
@@ -647,5 +681,46 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(user_of("group:").is_none() && user_of("planet:x").is_none());
+    }
+
+    #[test]
+    fn the_connectivity_plugins_a_caller_may_route_through_are_the_links_that_name_them() {
+        // The product owner, 2026-10-12: option (d).
+        let user = |user: connectivity_user::User| ConnectivityUser { user: Some(user) };
+        let link = |instance: &str, available: bool, users: Vec<ConnectivityUser>| ConnectivityLink {
+            connectivity_instance_id: instance.into(),
+            available,
+            ems_instance_id: "ems-1".into(),
+            users,
+        };
+        let mut records = records();
+        records.connectivity_links = vec![
+            link("fix-1", true, vec![user(connectivity_user::User::Subject("local|ada".into()))]),
+            link(
+                "fix-2",
+                true,
+                vec![user(connectivity_user::User::ServiceAccountId("SA-7".into()))],
+            ),
+            link("fix-3", true, vec![user(connectivity_user::User::UserGroupId("UG-1".into()))]),
+            link("fix-4", false, vec![user(connectivity_user::User::Subject("local|ada".into()))]),
+            ConnectivityLink {
+                ems_instance_id: "ems-2".into(),
+                ..link("fix-5", true, vec![user(connectivity_user::User::Subject("local|ada".into()))])
+            },
+        ];
+        let groups = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect();
+        // A person named, and a member of a user group named; a withdrawn link
+        // and another ems's link refused.
+        assert_eq!(
+            routes(&records, "ems-1", "local|ada", &groups(&["UG-1"])),
+            vec!["fix-1", "fix-3"]
+        );
+        // A service account named.
+        assert_eq!(routes(&records, "ems-1", "SA-7", &groups(&[])), vec!["fix-2"]);
+        // A non-member named nowhere: none.
+        assert!(routes(&records, "ems-1", "local|ben", &groups(&["UG-2"])).is_empty());
+        // A connectivity plugin's own direct order: itself, on the same terms.
+        assert_eq!(routes(&records, "fix-1", "local|ada", &groups(&[])), vec!["fix-1"]);
+        assert!(routes(&records, "fix-4", "local|ada", &groups(&[])).is_empty());
     }
 }

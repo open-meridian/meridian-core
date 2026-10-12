@@ -1116,9 +1116,29 @@ pub(crate) struct Opening {
     /// asks when linking, a new account being theirs to name (W6.4).
     pub deployment_admin: bool,
     pub level: AccessLevel,
+    /// The connectivity plugins the caller may route through from this
+    /// plugin (contract v22, W11.8, W11.21): for an ems, those linked to it
+    /// and available whose users name the caller; for a connectivity plugin,
+    /// itself on the same terms. In the claims as connectivity_instance_ids,
+    /// which the plugin's sidecar holds a placement to.
+    pub connectivity_instance_ids: Vec<String>,
 }
 
 impl Opening {
+    /// The same, with the connectivity plugins `subject`, in `user_group_ids`,
+    /// may route through from `instance` (contract v22).
+    pub(crate) fn routed(
+        mut self,
+        records: &meridian_domain::v1::AccessRecords,
+        instance: &str,
+        subject: &str,
+        user_group_ids: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.connectivity_instance_ids =
+            crate::admin::connectivity::routes(records, instance, subject, user_group_ids);
+        self
+    }
+
     /// The assertion's claims, for this instance alone, at the session's
     /// level, for 60 seconds, once.
     fn claims(self, who: &Who, instance: &str, now: i64) -> CallerClaims {
@@ -1174,6 +1194,7 @@ impl Opening {
             subject_kind: meridian_pb::v1::SubjectKind::Unspecified as i32,
             owner_subject: String::new(),
             algorithm_id: String::new(),
+            connectivity_instance_ids: self.connectivity_instance_ids,
         }
     }
 }
@@ -1195,6 +1216,7 @@ pub(crate) fn opening(
             roles: session.roles,
             deployment_admin: access.deployment_admin,
             level,
+            connectivity_instance_ids: Vec::new(),
         })
 }
 
@@ -1416,6 +1438,12 @@ async fn from_terminal(
             format!("you hold no access on {instance}"),
         )));
     };
+    let opened = opened.routed(
+        &records,
+        instance,
+        &caller.person.subject,
+        &access.user_group_ids,
+    );
     let (came, covers, delegation) = match caller.through {
         crate::web::Through::Delegation {
             id,
@@ -1699,7 +1727,9 @@ async fn serve(app: &App, plugins: &Plugins, instance: &str, request: Request) -
     // access withdrawn a moment ago is withdrawn here, and a level no longer
     // held opens nothing.
     let access = session.access(&records);
-    let Some(opened) = opening(&access, instance, level) else {
+    let Some(opened) = opening(&access, instance, level)
+        .map(|opened| opened.routed(&records, instance, &session.subject, &access.user_group_ids))
+    else {
         return said(
             StatusCode::FORBIDDEN,
             "No access",

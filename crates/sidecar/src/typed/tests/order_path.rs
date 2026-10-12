@@ -34,6 +34,7 @@ const KEY_ID: &str = "dashboard-2026-10-0a1b2c3d";
 const PROPOSE_ORDER: &str = "platform.book.command.propose-order";
 const RECORD_ORDER: &str = "platform.book.command.record-order";
 const RELEASE_ORDER: &str = "platform.book.command.release-order";
+const CREATE_PLACEMENT: &str = "platform.book.command.create-placement";
 
 fn now() -> i64 {
     use meridian_clock::Clock as _;
@@ -60,7 +61,7 @@ async fn plugin(instance: &str, roles: &[&str], map: Option<VenueAccountMap>) ->
         Arc::new(meridian_clock::SystemClock),
     ));
     let heard: Heard = Arc::new(Mutex::new(Vec::new()));
-    for topic in [PROPOSE_ORDER, RECORD_ORDER, RELEASE_ORDER] {
+    for topic in [PROPOSE_ORDER, RECORD_ORDER, RELEASE_ORDER, CREATE_PLACEMENT] {
         let keeping = Arc::clone(&heard);
         bus.serve(topic, move |envelope| {
             keeping
@@ -150,6 +151,22 @@ fn vouched(
     owner: Option<&str>,
     algorithm: &str,
 ) -> CallerAssertion {
+    routed(key, instance, role, level, writes, owner, algorithm, &[])
+}
+
+/// [`vouched`], the claims naming the connectivity plugins the caller may
+/// route through from `instance` (contract v22).
+#[allow(clippy::too_many_arguments)]
+fn routed(
+    key: &SigningKey,
+    instance: &str,
+    role: &str,
+    level: AccessLevel,
+    writes: &[&str],
+    owner: Option<&str>,
+    algorithm: &str,
+    routes: &[&str],
+) -> CallerAssertion {
     let issued = now();
     let reads: Vec<String> = writes.iter().map(|w| w.to_string()).collect();
     let claims = CallerClaims {
@@ -179,6 +196,7 @@ fn vouched(
         },
         owner_subject: owner.unwrap_or_default().into(),
         algorithm_id: algorithm.into(),
+        connectivity_instance_ids: routes.iter().map(|r| r.to_string()).collect(),
         ..CallerClaims::default()
     }
     .encode_to_vec();
@@ -496,4 +514,55 @@ async fn a_plugin_holding_custody_and_connectivity_takes_the_map_never_its_links
         let sent = meridian_domain::v1::RecordOrderRequest::decode(&body[..]).unwrap();
         assert_eq!(sent.account_id, expected, "code {code:?}");
     }
+}
+
+#[tokio::test]
+async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_route_through() {
+    use meridian_pb::plugin::v1::CreatePlacementParams;
+    // An ems's placement: allowed where the claims name the plugin, not
+    // where they do not, and never for the plugin as itself.
+    let p = plugin("ems-1", &["ems"], None).await;
+    let place = |connectivity: &str, acting_for: Option<CallerAssertion>| CreatePlacementParams {
+        order_id: "ORD-1".into(),
+        connectivity_instance_id: connectivity.into(),
+        quantity: one(),
+        acting_for,
+        ..Default::default()
+    };
+    let allowed = |p: &Plugin| p.heard.lock().unwrap().last().cloned().unwrap().0.connectivity_allowed;
+    let ada = |routes: &[&str]| {
+        routed(&p.key, "ems-1", "ems", AccessLevel::Write, &["ACC-1"], None, "", routes)
+    };
+    p.sidecar
+        .create_placement(Request::new(place("fix-1", Some(ada(&["fix-1", "fix-3"])))))
+        .await
+        .unwrap();
+    assert!(allowed(&p));
+    p.sidecar
+        .create_placement(Request::new(place("fix-2", Some(ada(&["fix-1"])))))
+        .await
+        .unwrap();
+    assert!(!allowed(&p), "a plugin the claims do not name");
+    p.sidecar
+        .create_placement(Request::new(place("fix-1", None)))
+        .await
+        .unwrap();
+    assert!(!allowed(&p), "the plugin as itself names nobody who may route");
+
+    // A connectivity plugin's own direct order: allowed where the claims
+    // name its own instance.
+    let c = plugin("fix-1", &["connectivity"], None).await;
+    let own = |routes: &[&str]| {
+        routed(&c.key, "fix-1", "connectivity", AccessLevel::Write, &["ACC-1"], None, "", routes)
+    };
+    c.sidecar
+        .create_placement(Request::new(place("fix-1", Some(own(&["fix-1"])))))
+        .await
+        .unwrap();
+    assert!(allowed(&c));
+    c.sidecar
+        .create_placement(Request::new(place("fix-1", Some(own(&[])))))
+        .await
+        .unwrap();
+    assert!(!allowed(&c), "withdrawn, or not among its users");
 }

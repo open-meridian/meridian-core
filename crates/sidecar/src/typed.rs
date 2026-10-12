@@ -153,6 +153,10 @@ const VENUE_FACTS: [(&str, &str); 3] = [
     ),
 ];
 
+/// A placement (CreatePlacement, W11.8, contract v22), whose connectivity
+/// plugin the sidecar holds to the claims' connectivity_instance_ids.
+const CREATE_PLACEMENT: &str = "meridian.v1.CreatePlacementRequest";
+
 /// The role whose venue facts take their account from the venue account map
 /// (contract v22, W11.22).
 const CONNECTIVITY: &str = "connectivity";
@@ -212,6 +216,8 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         } else {
             String::new()
         },
+        // Decided per placement, where the command is sent (contract v22).
+        connectivity_allowed: false,
         account_scope: None,
     }
 }
@@ -584,7 +590,18 @@ impl Sidecar {
                 .cloned()
                 .collect::<Vec<String>>()
         });
-        self.ask_scoped(&topic, payload_type, message, &claims, scope)
+        // A placement (contract v22, W11.8): whether the connectivity plugin
+        // it names is one the claims say the caller may route through from
+        // this plugin -- linked, available, its users naming them -- an ems's
+        // placement and a connectivity plugin's own direct order alike. The
+        // book refuses and records CONNECTIVITY_NOT_ALLOWED by it.
+        let routed = (payload_type == CREATE_PLACEMENT).then(|| {
+            let named = domain::CreatePlacementRequest::decode(message.encode_to_vec().as_slice())
+                .map(|placement| placement.connectivity_instance_id)
+                .unwrap_or_default();
+            !named.is_empty() && claims.connectivity_instance_ids.contains(&named)
+        });
+        self.ask_routed(&topic, payload_type, message, &claims, scope, routed)
             .await
     }
 
@@ -600,19 +617,21 @@ impl Sidecar {
         message: D,
         claims: &CallerClaims,
     ) -> Result<Response<R>, Status> {
-        self.ask_scoped(topic, payload_type, message, claims, None)
+        self.ask_routed(topic, payload_type, message, claims, None, None)
             .await
     }
 
     /// [`Self::ask_for`], with the write scope a command naming its record
-    /// by ID alone is held to, marked as applying (contract v22).
-    async fn ask_scoped<D: Message, R: Message + Default>(
+    /// by ID alone is held to, marked as applying, and a placement's verdict
+    /// on its connectivity plugin (contract v22).
+    async fn ask_routed<D: Message, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
         message: D,
         claims: &CallerClaims,
         scope: Option<Vec<String>>,
+        routed: Option<bool>,
     ) -> Result<Response<R>, Status> {
         // The prepared change the person made this from (W4.9, contract
         // v20), as the dashboard's assertion named it; never alone. A service
@@ -620,6 +639,7 @@ impl Sidecar {
         // algorithm its call named (contract v22).
         let mut stamp = stamp_of(claims, true);
         stamp.account_scope = scope;
+        stamp.connectivity_allowed = routed.unwrap_or(false);
         let (_, payload) = self
             .bus
             .call_stamped(
