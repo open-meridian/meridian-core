@@ -6,8 +6,8 @@
 //!
 //! **What is checked**, in order, refusing at the first that fails, each
 //! refusal `permission_denied`, `failed_precondition` or `invalid_argument`
-//! naming the field (`role`, `tool_name`, `reason`) with no refusal code of
-//! its own:
+//! naming the field (`role`, `tool_name`, `arguments_json`, `reason`) with
+//! no refusal code of its own:
 //!
 //! 1. the role is one the instance was launched with, and the tool is one of
 //!    its acts on that role by the tools its sidecar reported (W4.8) -- never
@@ -441,7 +441,8 @@ async fn decide(
         return Err(Refusal::at(
             INVALID,
             "arguments_json",
-            "is not a JSON object: the act's typed record of inputs, at least {}",
+            "is not a JSON object: the act's typed record of inputs, an empty object when it \
+             takes none",
         ));
     }
     let act = format!("{instance}__{}", declared.name);

@@ -1082,6 +1082,15 @@ mod tests {
                 refused.message()
             );
         }
+        let refused = sc
+            .call_act_as_service_account(Request::new(call("record_note", "custody", "[1]", "x")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.message(),
+            "arguments_json: is not a JSON object: the act's typed record of inputs, an empty \
+             object when it takes none"
+        );
         assert_eq!(heard.lock().unwrap().len(), 2);
     }
 

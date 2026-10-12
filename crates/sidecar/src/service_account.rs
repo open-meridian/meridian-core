@@ -150,7 +150,9 @@ impl Sidecar {
         if !object {
             return refuse(
                 "arguments_json",
-                "is not a JSON object: the act's typed record of inputs, at least {}".into(),
+                "is not a JSON object: the act's typed record of inputs, an empty object when \
+                 it takes none"
+                    .into(),
             );
         }
         let reason = text::characters(&asked.reason);

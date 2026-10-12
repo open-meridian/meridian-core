@@ -624,6 +624,25 @@ async fn a_role_with_none_chosen_or_a_tool_not_its_act_is_refused_naming_the_fie
     .await
     .unwrap_err();
     assert_eq!(reasonless.fields, vec!["reason".to_string()]);
+    for arguments in ["[1]", "not json"] {
+        let refused = super::admission::admit(
+            &h.app,
+            INSTANCE,
+            call("close_cleared_breaks", arguments, REASON),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (refused.status, refused.fields.clone()),
+            ("invalid_argument", vec!["arguments_json".to_string()]),
+            "{arguments}"
+        );
+        assert_eq!(
+            refused.words,
+            "arguments_json: is not a JSON object: the act's typed record of inputs, an empty \
+             object when it takes none"
+        );
+    }
     assert!(
         h.reached.lock().unwrap().is_empty(),
         "nothing reached the plugin"
