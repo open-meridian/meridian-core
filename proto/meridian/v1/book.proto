@@ -1616,9 +1616,9 @@ message AllocationInstruction {
 message AllocationLine {
   string account_id = 1;
   // The amount, or, where weighted, unset.
-  Decimal quantity = 2;
+  optional Decimal quantity = 2;
   // A weighted line's share, 0 to 1.
-  Decimal weight = 3;
+  optional Decimal weight = 3;
   // Slice B's, with the allocation; carried empty until then.
   string sleeve = 4;
 }
@@ -1649,8 +1649,8 @@ message PersonRoles {
 // The quote at time of receipt, held as stated (requirement 56; the
 // refresh's Q35).
 message ReceiptQuote {
-  Money bid = 1;
-  Money ask = 2;
+  optional Money bid = 1;
+  optional Money ask = 2;
 
   ReceiptQuoteSourceKind source_kind = 3;
   // With RECEIPT_QUOTE_SOURCE_KIND_VENUE: the venue, its `VEN-` ID.
@@ -1659,8 +1659,8 @@ message ReceiptQuote {
   int64 quoted_at_ns = 5;
 
   // The sizes (FIX's BidSize, 134, and OfferSize, 135).
-  Decimal bid_size = 6;
-  Decimal ask_size = 7;
+  optional Decimal bid_size = 6;
+  optional Decimal ask_size = 7;
 
   // The lake row it was read from, optional: its dataset and row key.
   string dataset = 8;
@@ -1676,12 +1676,12 @@ message StrategyInstruction {
   int64 start_ns = 2;
   int64 end_ns = 3;
   // A participation rate, 0.1 for ten percent.
-  Decimal participation = 4;
+  optional Decimal participation = 4;
   Urgency urgency = 5;
   // The limits (step 6's Q11): the most participation, and a price beyond
   // which it does not trade, distinct from the order's limit.
-  Decimal max_participation = 6;
-  Money price_limit = 7;
+  optional Decimal max_participation = 6;
+  optional Money price_limit = 7;
 }
 
 // A verdict on an order version or a placement (W11.4).
@@ -1719,8 +1719,8 @@ message ChangeRequest {
 message OrderChange {
   OrderChangeKind kind = 1;
   // The new ordered quantity, on ORDER_CHANGE_KIND_QUANTITY.
-  Decimal quantity = 2;
-  Money limit_price = 3;
+  optional Decimal quantity = 2;
+  optional Money limit_price = 3;
   TimeInForce time_in_force = 4;
   // Amended in the same act as an increase or a reduction.
   AllocationInstruction allocation_instruction = 5;
@@ -1731,8 +1731,8 @@ message OrderChange {
 // What a placement's change asks (W11.9).
 message PlacementChange {
   PlacementChangeKind kind = 1;
-  Decimal quantity = 2;
-  Money limit_price = 3;
+  optional Decimal quantity = 2;
+  optional Money limit_price = 3;
   TimeInForce time_in_force = 4;
 }
 
@@ -1856,9 +1856,11 @@ message Execution {
   string uti = 22;
   string prior_uti = 23;
   string upi = 24;
-  // TODO(type): where traded terms differ from the template's; the form is
-  // not given.
-  string derivative_terms = 25;
+  // Derivative terms, where traded terms differ from the template's, come
+  // with v28's templates (options and futures); slice A is equities and
+  // spot (2026-10-12).
+  reserved 25;
+  reserved "derivative_terms";
   // A prime broker.
   string given_up_to = 26;
   string trade_chain_reference = 27;
@@ -1984,7 +1986,7 @@ message Locate {
 // The prime's answer.
 message LocateAnswer {
   Decimal quantity_approved = 1;
-  Decimal rate = 2;
+  optional Decimal rate = 2;
   int64 expires_at_ns = 3;
   string locate_id = 4;
 }
@@ -2008,10 +2010,10 @@ message ProposeOrderRequest {
   Side side = 4;
   string locate_id = 5;
   // 0, a pass, is refused naming `quantity` until slice C defines it.
-  Decimal quantity = 6;
-  Money cash_quantity = 7;
+  optional Decimal quantity = 6;
+  optional Money cash_quantity = 7;
   OrderType order_type = 8;
-  Money limit_price = 9;
+  optional Money limit_price = 9;
   string dealt_currency = 10;
   repeated Leg legs = 11;
   AllocationInstruction allocation_instruction = 12;
@@ -2036,7 +2038,7 @@ message ProposeOrderRequest {
   // (Q19 (i)); under a parent not released, REFUSAL_REASON_ORDER_STATE.
   OrderLink link = 29;
   string idempotency_key = 30;
-  Money stop_price = 31;
+  optional Money stop_price = 31;
   string expire_date = 32;
   int64 expire_time_ns = 33;
   repeated ExecutionInstruction execution_instructions = 34;
@@ -2055,7 +2057,7 @@ message RecordOrderRequest {
   Side side = 5;
   Decimal quantity = 6;
   OrderType order_type = 7;
-  Money limit_price = 8;
+  optional Money limit_price = 8;
   TimeInForce time_in_force = 9;
   string venue_order_id = 10;
   OrderOrigin origin = 11;
@@ -2119,7 +2121,7 @@ message CreatePlacementRequest {
   string connectivity_instance_id = 2;
   string venue_account_code = 3;
   Decimal quantity = 4;
-  Money limit_price = 5;
+  optional Money limit_price = 5;
   TimeInForce time_in_force = 6;
   StrategyInstruction strategy = 7;
   string destination = 8;
@@ -2160,8 +2162,8 @@ message ReportPlacementRequest {
   AsReported status_as_reported = 9;
   RestatementReason restatement_reason = 10;
   // On a replace or a restatement: the quantity and limit now.
-  Decimal quantity = 11;
-  Money limit_price = 12;
+  optional Decimal quantity = 11;
+  optional Money limit_price = 12;
   RawRecordRef raw_record = 13;
 }
 
@@ -2194,7 +2196,9 @@ message ReportExecutionRequest {
   string uti = 19;
   string prior_uti = 20;
   string upi = 21;
-  string derivative_terms = 22;
+  // As Execution's: derivative terms come with v28's templates.
+  reserved 22;
+  reserved "derivative_terms";
   string given_up_to = 23;
   string trade_chain_reference = 24;
   string settlement_counterparty = 25;
@@ -2238,7 +2242,7 @@ message RecordLocateRequest {
   string account_id = 1;
   string venue_account_code = 2;
   string instrument_id = 3;
-  Decimal quantity_requested = 4;
+  optional Decimal quantity_requested = 4;
   LocateAnswer answer = 5;
   // Names the record an answer arriving later is on; empty for a new one.
   string locate_record_id = 6;
