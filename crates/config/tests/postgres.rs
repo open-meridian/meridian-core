@@ -2042,3 +2042,84 @@ fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
     let (licences, entitlements) = store.dataset_changes("coinbase-1:daily").unwrap();
     assert_eq!((licences.len(), entitlements.len()), (2, 2));
 }
+
+#[test]
+fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
+    // Contract v22 (W11.20 to W11.22): the conductor's records.
+    use meridian_pb::v1::{ConnectivityLink, VenueAccountMapping};
+    let store = store("connectivity");
+    store
+        .put_account(&AccountRecord {
+            account_id: "ACC-1".into(),
+            name: "Desk one".into(),
+            state: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let by = |note: &str| meridian_config::Author {
+        by: "local|ada".into(),
+        note: note.into(),
+        ..Default::default()
+    };
+    let available = ConnectivityLink {
+        connectivity_instance_id: "fix-1".into(),
+        available: true,
+        ..Default::default()
+    };
+    store
+        .set_connectivity_link(&available, &by("made available"), 10)
+        .unwrap();
+    // Setting what stands records nothing.
+    store
+        .set_connectivity_link(&available, &by("again"), 11)
+        .unwrap();
+    let linked = ConnectivityLink {
+        ems_instance_id: "ems-1".into(),
+        ..available.clone()
+    };
+    store.set_connectivity_link(&linked, &by("linked"), 12).unwrap();
+    let changes = store.connectivity_link_changes("fix-1").unwrap();
+    assert_eq!(changes.len(), 2);
+    assert!(changes[0].from_link.is_none());
+    assert_eq!(changes[1].from_link.as_ref(), Some(&available));
+    assert_eq!(changes[1].to_link, linked);
+    assert_eq!(changes[1].note, "linked");
+    assert_eq!(store.snapshot().unwrap().connectivity["fix-1"], linked);
+
+    let mapping = VenueAccountMapping {
+        connectivity_instance_id: "fix-1".into(),
+        venue_account_code: "ACCT-7".into(),
+        account_id: "ACC-1".into(),
+    };
+    store
+        .map_venue_account("ems-1", None, Some(&mapping), &by(""), 13)
+        .unwrap();
+    store
+        .map_venue_account("ems-1", None, Some(&mapping), &by(""), 14)
+        .unwrap();
+    let held = store.snapshot().unwrap().venue_mappings;
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].ems_instance_id, "ems-1");
+    store
+        .map_venue_account("ems-1", Some(&mapping), None, &by(""), 15)
+        .unwrap();
+    assert!(store.snapshot().unwrap().venue_mappings.is_empty());
+    let changes = store.venue_account_map_changes("ems-1").unwrap();
+    assert_eq!(changes.len(), 2, "the repeat recorded nothing");
+    assert_eq!(changes[0].to_mapping.as_ref(), Some(&mapping));
+    assert_eq!(changes[1].from_mapping.as_ref(), Some(&mapping));
+    assert!(changes[1].to_mapping.is_none());
+
+    let catalogue = meridian_domain::v1::VenueCatalogue {
+        connectivity_instance_id: "fix-1".into(),
+        venue_account_code: "ACCT-7".into(),
+        ..Default::default()
+    };
+    assert!(store.keep_venue_catalogue(&catalogue, 16).unwrap());
+    assert!(!store.keep_venue_catalogue(&catalogue, 17).unwrap());
+    assert_eq!(
+        store.venue_catalogue("fix-1", "ACCT-7").unwrap(),
+        Some(catalogue)
+    );
+    assert_eq!(store.venue_catalogue("fix-1", "ACCT-9").unwrap(), None);
+}
