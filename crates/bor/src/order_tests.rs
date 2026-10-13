@@ -1128,6 +1128,31 @@ async fn a_fact_the_book_cannot_place_is_kept_and_placed_when_a_later_record_cla
         .unplaced
         .iter()
         .all(|fact| !fact.account_id.is_empty()));
+    // A core reader naming the book of no account reads those alone, as a
+    // connectivity plugin's sidecar counts them; a scope naming it is refused.
+    let none = |scope: Scope| OrdersRead {
+        scope,
+        account_id: crate::store::NO_ACCOUNT.into(),
+        since: None,
+        limit: 100,
+        cursor: String::new(),
+    };
+    let alone = w.store.orders(&none(Scope::Everything)).unwrap();
+    assert_eq!(
+        alone
+            .unplaced
+            .iter()
+            .map(|fact| fact.unplaced_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![kept.unplaced_id.as_str()]
+    );
+    assert!(alone.orders.is_empty() && alone.placements.is_empty());
+    assert!(w
+        .store
+        .orders(&none(Scope::Within(
+            [ACC.to_string()].into_iter().collect()
+        )))
+        .is_err());
 }
 
 // ── W11.15, W11.16: trading instructions ────────────────────────────────────

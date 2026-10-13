@@ -835,3 +835,63 @@ async fn a_venue_fact_kept_with_no_account_is_counted_on_the_plugins_admin_view(
         Some(meridian_pb::v1::plugin_figure::Value::Count(1))
     );
 }
+
+#[tokio::test]
+async fn the_unplaced_count_is_read_from_the_book_and_survives_a_restart() {
+    // A sidecar started afresh counts what the book keeps for its plugin:
+    // naming no account, not placed since, its raw record its plugin's --
+    // every page of the book of no account, read as a core reader.
+    let venue = plugin("fix-1", &["connectivity"], None).await;
+    let fact =
+        |id: &str, account: &str, instance: &str, placed: bool| meridian_domain::v1::UnplacedFact {
+            unplaced_id: id.into(),
+            account_id: account.into(),
+            raw_record: Some(meridian_pb::v1::RawRecordRef {
+                instance_id: instance.into(),
+                key: format!("orders/{id}"),
+            }),
+            placed_by: placed.then(meridian_domain::v1::JournalRef::default),
+            ..Default::default()
+        };
+    let pages = [
+        meridian_domain::v1::ListOrdersReply {
+            unplaced_facts: vec![
+                fact("UNP-1", "", "fix-1", false),
+                fact("UNP-2", "", "fix-2", false),
+            ],
+            next_cursor: "after-UNP-2".into(),
+            ..Default::default()
+        },
+        meridian_domain::v1::ListOrdersReply {
+            unplaced_facts: vec![
+                fact("UNP-3", "", "fix-1", false),
+                fact("UNP-4", "", "fix-1", true),
+                fact("UNP-5", "ACC-1", "fix-1", false),
+            ],
+            ..Default::default()
+        },
+    ];
+    venue.bus.serve(LIST_ORDERS, move |envelope| {
+        let asked = meridian_domain::v1::ListOrdersRequest::decode(&envelope.payload[..]).unwrap();
+        assert_eq!(
+            asked.account_id, "~unplaced",
+            "the book of no account alone"
+        );
+        let page = if asked.cursor.is_empty() {
+            &pages[0]
+        } else {
+            &pages[1]
+        };
+        Ok(("meridian.v1.ListOrdersReply".into(), page.encode_to_vec()))
+    });
+    let report = venue.sidecar.report_now(now()).await;
+    let counted = report
+        .figures
+        .into_iter()
+        .find(|figure| figure.label == crate::report::UNPLACED_LABEL)
+        .expect("counted from the book");
+    assert_eq!(
+        counted.value,
+        Some(meridian_pb::v1::plugin_figure::Value::Count(2))
+    );
+}

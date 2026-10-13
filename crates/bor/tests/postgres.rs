@@ -630,6 +630,55 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
         OrderState::Filled as i32
     );
 
+    // A fill whose venue account code no ems mapped: kept naming no account,
+    // read by a core reader naming the book of no account (W11.13).
+    let astray = FactReply::decode(
+        &send_order(
+            &bus,
+            REPORT_EXECUTION,
+            &ReportExecutionRequest {
+                placement_id: placement.placement_id.clone(),
+                venue_execution_id: unique("astray"),
+                venue_account_code: "UNMAPPED-1".into(),
+                raw_record: Some(meridian_pb::v1::RawRecordRef {
+                    instance_id: "fix-1".into(),
+                    key: "orders/astray".into(),
+                }),
+                kind: ExecutionKind::VenueReported as i32,
+                quantity: d("1"),
+                price: usd("227.41"),
+                trade_date: "2026-10-13".into(),
+                settlement_date: "2026-10-14".into(),
+                ..Default::default()
+            },
+            None,
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .unplaced
+    .unwrap();
+    assert!(astray.account_id.is_empty());
+    let unplaced = |store: &PostgresStore| {
+        store
+            .orders(&meridian_bor::store::OrdersRead {
+                scope: Scope::Everything,
+                account_id: meridian_bor::store::NO_ACCOUNT.into(),
+                since: None,
+                limit: 500,
+                cursor: String::new(),
+            })
+            .unwrap()
+    };
+    let none = blocking(|| unplaced(&store));
+    assert!(none.orders.is_empty() && none.executions.is_empty());
+    assert!(none
+        .unplaced
+        .iter()
+        .any(|fact| fact.unplaced_id == astray.unplaced_id));
+
     let orders = |store: &PostgresStore| {
         store
             .orders(&meridian_bor::store::OrdersRead {

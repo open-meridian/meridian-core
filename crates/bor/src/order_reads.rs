@@ -44,13 +44,16 @@ pub fn from_stream_cursor(cursor: &str) -> Result<StreamKey> {
 }
 
 /// Whether a book's records answer a read naming `named`: an account's
-/// within the scope; the facts naming no account only a core reader's, and
-/// only when the read names no account (W11.13).
+/// within the scope; the facts naming no account only a core reader's, when
+/// the read names no account or names their book alone -- as a connectivity
+/// plugin's sidecar counts those its plugin sent (W11.13).
 pub fn book_answers(scope: &Scope, named: &str, key: &str) -> bool {
     if is_account(key) {
         return scope.answers(named, key);
     }
-    key == crate::store::NO_ACCOUNT && named.is_empty() && *scope == Scope::Everything
+    key == crate::store::NO_ACCOUNT
+        && (named.is_empty() || named == crate::store::NO_ACCOUNT)
+        && *scope == Scope::Everything
 }
 
 /// One record of the stream, whole.

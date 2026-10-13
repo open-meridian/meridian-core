@@ -35,6 +35,12 @@ pub const UNLINKED_EXTERNAL_ACCOUNTS: &str = "platform.config.event.unlinked-ext
 const EVERY: Duration = Duration::from_secs(30);
 /// Core's figure on a connectivity plugin's admin view (W11.13).
 pub(crate) const UNPLACED_LABEL: &str = "Unplaced facts";
+/// The book's read of its records, and the book it keeps the facts naming no
+/// account in (meridian_bor::store::NO_ACCOUNT), which a core reader names.
+const LIST_ORDERS: &str = "platform.book.query.list-orders";
+const NO_ACCOUNT: &str = "~unplaced";
+/// The most a page of that read holds (ListOrdersRequest.page_size).
+const PAGE: i32 = 500;
 
 impl Sidecar {
     /// Count a refused grant and keep its reason.
@@ -53,6 +59,24 @@ impl Sidecar {
     /// The report, with the plugin unhealthy while a required setting it
     /// declared has no value.
     pub(crate) async fn report_now(&self, now_ns: i64) -> PluginReport {
+        // A connectivity plugin's unplaced facts, counted from the book, so
+        // the count survives a restart and drops as a later record places
+        // one; kept as it was while the book does not answer.
+        if self
+            .identity
+            .roles
+            .iter()
+            .any(|role| role == "connectivity")
+        {
+            match self.unplaced_in_the_book().await {
+                Ok(count) => self
+                    .unplaced
+                    .store(count, std::sync::atomic::Ordering::Relaxed),
+                Err(failed) => {
+                    tracing::debug!(%failed, "the unplaced facts were not counted from the book")
+                }
+            }
+        }
         let mut report = self.report(now_ns);
         let missing = self.missing_settings().await;
         if report.registered && !missing.is_empty() {
@@ -63,6 +87,51 @@ impl Sidecar {
             };
         }
         report
+    }
+
+    /// The venue facts this plugin sent that the book keeps naming no
+    /// account and nothing has placed since (W11.13): its book of no
+    /// account, read as a core reader, every page.
+    async fn unplaced_in_the_book(&self) -> Result<u64, String> {
+        let mut count = 0u64;
+        let mut cursor = String::new();
+        loop {
+            let (_, payload) = self
+                .bus
+                .call(
+                    LIST_ORDERS,
+                    "meridian.v1.ListOrdersRequest",
+                    meridian_domain::v1::ListOrdersRequest {
+                        account_id: NO_ACCOUNT.into(),
+                        page_size: PAGE,
+                        cursor: cursor.clone(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                    None,
+                    Some(Duration::from_secs(5)),
+                )
+                .await
+                .map_err(|failed| failed.to_string())?;
+            let page = meridian_domain::v1::ListOrdersReply::decode(payload.as_slice())
+                .map_err(|failed| failed.to_string())?;
+            count += page
+                .unplaced_facts
+                .iter()
+                .filter(|fact| {
+                    fact.account_id.is_empty()
+                        && fact.placed_by.is_none()
+                        && fact
+                            .raw_record
+                            .as_ref()
+                            .is_some_and(|raw| raw.instance_id == self.identity.instance_id)
+                })
+                .count() as u64;
+            if page.next_cursor.is_empty() {
+                return Ok(count);
+            }
+            cursor = page.next_cursor;
+        }
     }
 
     /// The plugin's figures, and core's count of its venue facts kept
@@ -81,7 +150,7 @@ impl Sidecar {
                 )),
                 state: meridian_pb::v1::FigureState::Warn as i32,
                 why: "facts from the venue naming a venue account code no ems mapped on this \
-                      plugin, kept with no account since the sidecar started"
+                      plugin, kept with no account and not placed since"
                     .into(),
                 ..Default::default()
             });
