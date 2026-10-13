@@ -39,6 +39,13 @@ jobs:
           repository: ${{ github.repository_owner }}/meridian-python
           path: workspace/meridian-python
 
+      # Before anything builds an image: the runner's preinstalled toolsets
+      # and preloaded images, which core never uses, so the gate's disk
+      # budget meets the headroom it was set for (tools/free-runner-disk.sh).
+      - name: Free the runner's disk
+        working-directory: workspace/meridian-core
+        run: tools/free-runner-disk.sh
+
       # The gate needs a range to police. A default checkout is shallow and
       # detached, with no upstream and no origin/main, and the tool now fails
       # rather than passing on that. See the review finding on meridian-core#5,
@@ -114,6 +121,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: workspace/meridian-core
+
+      # Before anything builds an image: the runner's preinstalled toolsets
+      # and preloaded images, which core never uses, so the gate's disk
+      # budget meets the headroom it was set for (tools/free-runner-disk.sh).
+      - name: Free the runner's disk
+        working-directory: workspace/meridian-core
+        run: tools/free-runner-disk.sh
 
       # Said plainly, because without them the steps below fail with an
       # authentication error that reads like the platform is gone.
