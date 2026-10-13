@@ -34,11 +34,38 @@ COPY crates/ crates/
 # actually runs, rather than a copy of it that drifts in silence.
 COPY deploy/ deploy/
 
+# The gate's one compile of the workspace. Every debug binary and every test
+# binary the gates run is compiled here, once, and the stages and images that
+# need them copy them rather than compile again (the release binaries are the
+# runtime image's own, in Dockerfile). The cargo caches are named, so the gate
+# frees every other build cache between its stages and keeps these
+# (tools/gate.py); Dockerfile's release build uses the same ids, so there is
+# one set of them to keep, not two.
 FROM base AS check
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/w/target \
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
     cargo build --workspace --locked
+
+# Every test binary: each crate's unit tests and every integration test, in
+# one invocation with the whole workspace's features, as `test` always built
+# them. Kept, with a manifest saying whose each is, in /tests -- with the
+# workspace's binaries, linked back where a test that starts one finds it
+# (waiting.rs, by CARGO_BIN_EXE_<name>) -- the only part of the target
+# directory this image holds; tools/run-tests.sh runs them as `cargo test`
+# would. test-store, test-broker and test-directory run this image
+# beside their services (docker-compose.yaml's `tests`), where each used to
+# compile the workspace again from nothing in a container's own layer.
+FROM check AS compile
+COPY tools/run-tests.sh /usr/local/bin/run-tests
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
+    cargo test --workspace --locked --no-run --lib --test '*' \
+      --message-format=json-render-diagnostics >/tmp/compiled.json \
+ && run-tests collect </tmp/compiled.json \
+ && rm /tmp/compiled.json
+RUN run-tests link
 
 # Everything that needs nothing but a toolchain: the unit tests, and the
 # integration tests that stand up their own world in-process.
@@ -53,18 +80,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # prove themselves against (`make demo`). A lightweight in-process substitute is
 # deliberately not offered for any of them, so a store or a platform client that
 # behaves differently in development cannot exist.
-FROM base AS test
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/w/target \
-    cargo test --workspace --locked --lib --test wiring
+FROM compile AS test
+RUN run-tests --workspace --lib --test wiring
 
+# Clippy is an analysis, not a build: it checks every target, tests included,
+# with nothing to copy from the compile above, and keeps what it checks in the
+# same target cache so a second run checks only what changed.
 FROM base AS lint
 RUN rustup component add clippy rustfmt
 RUN cargo fmt --all -- --check
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/w/target \
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
     cargo clippy --workspace --locked --all-targets -- -D warnings
 
 # Published vulnerabilities in anything the workspace links, from the RustSec
@@ -87,22 +114,14 @@ RUN case "${TARGETARCH}" in \
  && mv /tmp/cargo-deny-*/cargo-deny /usr/local/bin/ \
  && rm -rf /tmp/deny.tgz /tmp/cargo-deny-*
 COPY deny.toml ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     cargo deny --locked check advisories
 
 # A plugin's Settings pages served for a real browser (make e2e-settings-page):
-# the dashboard's unit-test binary, whose ignored server
+# the dashboard's unit-test binary from the compile above, whose ignored server
 # (crates/dashboard/src/admin/tests/served.rs) stands up its own world in-process,
 # on the runtime image so it serves the kit that image carries.
-FROM base AS settings-page-build
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/w/target \
-    cargo test --locked -p meridian-dashboard --lib --no-run --message-format=json \
-      | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | head -1 | xargs -I{} cp {} /settings-page \
- && test -x /settings-page
-
 FROM ${RUNTIME_IMAGE} AS settings-page
-COPY --from=settings-page-build /settings-page /usr/local/bin/settings-page
+COPY --from=compile /tests/meridian-dashboard/meridian_dashboard /usr/local/bin/settings-page
 ENTRYPOINT ["settings-page", "--ignored", "--exact", "admin::tests::served::serve_a_plugins_settings_pages_for_a_browser", "--nocapture"]

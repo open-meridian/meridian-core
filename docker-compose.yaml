@@ -458,13 +458,15 @@ services:
 
   # The gates that need services. Not a build stage, because a build stage has
   # no database, and a lightweight substitute for one is exactly what must not
-  # exist.
+  # exist. The image is the gate's one compile (Dockerfile.rust's `compile`):
+  # the test binaries are run as built there, by `run-tests`, and nothing here
+  # compiles the workspace again.
   tests:
     profiles: [tests]
     build:
       context: .
       dockerfile: Dockerfile.rust
-      target: base
+      target: compile
     depends_on:
       postgres:
         condition: service_healthy
@@ -495,7 +497,6 @@ services:
       # has to prove itself to the platform exactly as the runtime does, so it
       # signs with the key that was registered rather than one of its own.
       MERIDIAN_TEST_KEY_PATH: /var/lib/meridian/key.pem
-      CARGO_TARGET_DIR: /tmp/target
     volumes:
       - runtime-keys:/var/lib/meridian:ro
     networks: [meridian]

@@ -47,3 +47,7 @@ deploy/nats/dev.conf
 
 # Written by `make e2e-cluster-backup` while it runs: an identity and a backup.
 meridian-backup-e2e-*/
+
+# Written by `make ci-local` while it runs: the gate's disk samples and stages
+# (tools/gate.py).
+.gate/

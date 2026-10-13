@@ -40,9 +40,11 @@ COPY deploy/topics.tsv deploy/roles.tsv deploy/
 # leaves it, a binary says its crate version marked `-dev`. Declared here, by
 # the step that reads it, so a new version rebuilds nothing before it.
 ARG MERIDIAN_VERSION=
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/w/target \
+# The cargo caches by name, Dockerfile.rust's too (the gate keeps them while
+# it frees the rest between its stages); nothing in them reaches the image.
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
     cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-bor target/release/meridian-lake \
        target/release/meridian-instrument \

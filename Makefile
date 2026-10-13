@@ -5,7 +5,8 @@ RUST_VERSION := 1.90
 COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test \
+.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
+        stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -42,9 +43,82 @@ help:
 	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
 
 # Local green is the completion signal; CI is confirmation.
-ci-local: contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-nats-permissions check-codegen advisories build test test-store test-broker test-directory interop e2e-book e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders e2e-first-run e2e-first-run-brought e2e-first-run-oidc check-image-version chart-check lint
+#
+# In stages, inside a disk budget (tools/gate.py). The gates share one disk
+# with the development deployment, whose kubelet evicted every pod at 14 GB
+# free (2026-09-30), and a single `make ci-local` had stopped fitting on it
+# (2026-10-12); a gate that needs another gigabyte for every feature is not one
+# anybody can keep running. So each stage's targets run in order and then what
+# the stage built for itself is freed before the next: the most the gate holds
+# at once is the compile every stage shares -- the cargo caches, the runtime
+# image -- and the largest single stage, not the sum of them all. Before it
+# starts it refuses under GATE_DISK_START GB free on Docker's own filesystem;
+# while it runs it stops itself under GATE_DISK_STOP; and a stage holding more
+# than its budget, in GB above where the gate started, fails it. The budgets
+# are the peaks of a run from cold caches with up to 2 GB of headroom
+# (2026-10-12: 0.0, 2.2, 7.1, 7.5, 5.3, 5.2, 5.2, 5.1, 5.6 and 5.3 GB, in
+# this order): a stage that outgrows its budget is a finding, and raising it
+# says why in its commit.
+#
+# A CI runner shares its disk with nobody, and starts with none of the images
+# a developer's machine already holds, which a stage then pulls: there the
+# floors only let the gate say the disk is full before it is, and a budget
+# overrun is reported, not failed. The pre-push gate is where it is held.
+#
+# The order is the targets' order before the stages, but e2e-settings-page,
+# which ran on its own between the plugin page and the harness, now runs
+# beside the other targets that use the compile's test binaries, so those are
+# freed once and not built twice.
+GATE := $(PY) tools/gate.py
+#              stage=GB: the most each stage may hold above where the gate started
+GATE_BUDGETS ?= checks=1 runtime=4 compile=9 tests=10 sdk=7 dashboards=7 harness=7 first-run=7 image=7 lint=7
+# The cargo caches kept between runs: a run starts them again once they are
+# this many days old, so what cargo built for a dependency nothing uses any
+# more does not stay on the disk for good.
+GATE_CACHE_DAYS ?= 14
+ifeq ($(GITHUB_ACTIONS),true)
+GATE_DISK_START ?= 4
+GATE_DISK_STOP  ?= 2
+GATE_ENFORCE    ?= no
+else
+GATE_DISK_START ?= 20
+GATE_DISK_STOP  ?= 16
+GATE_ENFORCE    ?= yes
+endif
+
+ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
+	@$(GATE) finish
 	@echo
 	@echo "ci-local: GREEN"
+
+stage-checks:     gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage
+	@$(GATE) end checks
+stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen advisories
+	@$(GATE) end runtime
+stage-compile:    gate-begin-compile build test
+	@$(GATE) end compile
+stage-tests:      gate-begin-tests test-store test-broker test-directory e2e-settings-page
+	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
+stage-sdk:        gate-begin-sdk interop e2e-book
+	@$(GATE) end sdk
+stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
+	@$(GATE) end dashboards
+stage-harness:    gate-begin-harness harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders
+	@$(GATE) end harness --drop meridian-python-interop $(HARNESS_IMAGE)
+stage-first-run:  gate-begin-first-run e2e-first-run e2e-first-run-brought e2e-first-run-oidc
+	@$(GATE) end first-run
+stage-image:      gate-begin-image check-image-version chart-check
+	@$(GATE) end image
+stage-lint:       gate-begin-lint lint
+	@$(GATE) end lint
+
+gate-start:
+	@$(GATE) start --make-pid $$PPID --floor-start $(GATE_DISK_START) --floor-stop $(GATE_DISK_STOP) \
+		--budgets "$(GATE_BUDGETS)" --enforce $(GATE_ENFORCE) --cache-days $(GATE_CACHE_DAYS) \
+		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) meridian-python-interop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
+
+gate-begin-%:
+	@$(GATE) begin $*
 
 ci-local-deep: ci-local
 
@@ -145,22 +219,28 @@ check-codegen:
 	@rm -rf $(SCRATCH)
 	@echo "check-codegen OK: $(DOMAIN_RS) and $(TRANSITIONS_RS) match a fresh generation from the protos and the schema's transition table"
 
+# A build whose result is a verdict, not an image: kept as build cache, which
+# the gate frees, rather than left behind as an untagged image holding its
+# layers -- the test stage's, the size of every test binary -- after the gate
+# has dropped everything else that held them.
+VERDICT := --output type=cacheonly
+
 # Published vulnerabilities in anything the workspace links, from RustSec,
 # read fresh each run. Every exception is in deny.toml with its reason.
 advisories:
-	@$(DOCKER) build -f Dockerfile.rust --target advisories . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target advisories $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "advisories FAILED: a published vulnerability reaches this workspace. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; exit 1; }
 	@echo "advisories OK: no published vulnerability reaches the workspace unexplained"
 
 build:
-	@$(DOCKER) build -f Dockerfile.rust --target check . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target check $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "build FAILED; see it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target check ." >&2; exit 1; }
 	@echo "build OK: workspace compiles"
 
 test:
-	@$(DOCKER) build -f Dockerfile.rust --target test . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target test $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "test FAILED; see the output with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target test --progress=plain ." >&2; exit 1; }
 	@echo "test OK: workspace tests pass"
@@ -170,7 +250,7 @@ test:
 # differently in development is a store nobody has tested.
 test-store: network
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-instrument --test postgres -p meridian-street --test postgres \
+		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 			-p meridian-runtime --test grants --test waiting \
@@ -654,7 +734,7 @@ test-broker: network
 	@$(COMPOSE) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-bus --test nats \
+		run-tests -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
 		     tail -40 .test-broker.log >&2; exit 1; }
@@ -1296,7 +1376,7 @@ test-directory: network
 	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
 		echo "test-directory FAILED: the ldaps:// directory did not come up" >&2; exit 1
 	@$(COMPOSE) run --rm -T --build tests \
-		cargo test --locked -p meridian-dashboard --test directory \
+		run-tests -p meridian-dashboard --test directory \
 		>.test-directory.log 2>&1 \
 		|| { echo "test-directory FAILED. The last 40 lines, and the whole of it in .test-directory.log:" >&2; \
 		     tail -40 .test-directory.log >&2; exit 1; }
@@ -1859,7 +1939,7 @@ chart-check:
 	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
-	@$(DOCKER) build -f Dockerfile.rust --target lint . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "lint FAILED; see it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target lint --progress=plain ." >&2; exit 1; }
 	@echo "lint OK: formatting and clippy clean"
@@ -2111,16 +2191,16 @@ demo: network
 	@echo "     deployment $$(cat .demo/deployment-id)"
 	@echo "3/6  resolving, missing, pulling, applying"
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm --build -T tests cargo test --test end_to_end --locked
+		$(COMPOSE) run --rm --build -T tests run-tests --test end_to_end
 	@echo "4/6  taking the platform away"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" stop site >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm -T tests cargo test --test outage --locked \
+		$(COMPOSE) run --rm -T tests run-tests --test outage \
 		|| { docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1; exit 1; }
 	@echo "5/6  putting it back, and changing nothing else"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm -T tests cargo test --test end_to_end --locked
+		$(COMPOSE) run --rm -T tests run-tests --test end_to_end
 	@echo "6/6  done"
 
 # The network the platform and a deployment's runtime meet on.

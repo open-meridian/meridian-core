@@ -103,7 +103,10 @@ every commit with three of core's stand-in plugins.
     make ci-local
 
 Local green is the completion signal, and `make install-hooks` runs it before
-every push. `docker compose up` runs every component locally with a database
+every push. It runs in stages inside a disk budget, compiling the workspace
+once: it wants 20 GB free on Docker's disk to start and stops itself under 16
+(`GATE_DISK_START`, `GATE_DISK_STOP` and the budgets are in the Makefile).
+`docker compose up` runs every component locally with a database
 and a broker. `make demo` proves the round trip against a platform -- resolve,
 miss, pull, apply, then take the platform away and watch resolution keep
 working -- and needs a checkout of the platform beside this one, which is not
