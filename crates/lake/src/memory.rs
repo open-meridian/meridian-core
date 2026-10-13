@@ -188,6 +188,9 @@ impl Store for MemoryStore {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if crate::store::every_version(query) {
+            return Ok(crate::store::recorded_by(rows, query.as_of_ns));
+        }
         Ok(as_of(rows, query.as_of_ns))
     }
 

@@ -37,13 +37,14 @@ use meridian_domain::v1::PartitionSequence;
 use meridian_domain::v1::{
     BarsRecordedEvent, DatasetRef, DeclineWantReply, DeclineWantRequest, EntitlementsChangedEvent,
     Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest, ListDatasetsReply,
-    ListDatasetsRequest, ListPricesReply, ListPricesRequest, ListQuotesReply, ListQuotesRequest,
-    ListSourcePrioritiesReply, ListSourcePrioritiesRequest, ListTradesReply, ListTradesRequest,
+    ListDatasetsRequest, ListOutcomesReply, ListOutcomesRequest, ListPricesReply,
+    ListPricesRequest, ListQuotesReply, ListQuotesRequest, ListSourcePrioritiesReply,
+    ListSourcePrioritiesRequest, ListTradesReply, ListTradesRequest,
     MissingInstrumentDetectedEvent, MissingVenueDetectedEvent, ObservationsWantedEvent,
-    PluginCatalogue, PluginCatalogueRequest, PluginLaunchState, PriceBasis, PriceKind,
-    PricesRecordedEvent, QuoteCharacteristic, QuotesRecordedEvent, RecordBarsRequest,
-    RecordObservationsReply, RecordPricesRequest, RecordQuotesRequest, RecordTradesRequest,
-    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    OutcomesRecordedEvent, PluginCatalogue, PluginCatalogueRequest, PluginLaunchState, PriceBasis,
+    PriceKind, PricesRecordedEvent, QuoteCharacteristic, QuotesRecordedEvent, RecordBarsRequest,
+    RecordObservationsReply, RecordOutcomesRequest, RecordPricesRequest, RecordQuotesRequest,
+    RecordTradesRequest, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
     ResolveInstrumentRequest, SetSourcePriorityRequest, SourceChoice, SourcePriority,
     SourceTimeKind, SubjectRef, TradeCharacteristic, TradesRecordedEvent, Unanswered,
     UnansweredReason, WantWithdrawnEvent, Watermark,
@@ -62,12 +63,14 @@ pub const RECORD_PRICES: &str = "platform.lake.command.record-prices";
 pub const RECORD_BARS: &str = "platform.lake.command.record-bars";
 pub const RECORD_TRADES: &str = "platform.lake.command.record-trades";
 pub const RECORD_QUOTES: &str = "platform.lake.command.record-quotes";
+pub const RECORD_OUTCOMES: &str = "platform.lake.command.record-outcomes";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
 pub const LIST_BARS: &str = "platform.lake.query.list-bars";
 pub const LIST_TRADES: &str = "platform.lake.query.list-trades";
 pub const LIST_QUOTES: &str = "platform.lake.query.list-quotes";
+pub const LIST_OUTCOMES: &str = "platform.lake.query.list-outcomes";
 pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
@@ -87,6 +90,7 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::Bar => format!("platform.lake.{dataset}.event.bars-recorded"),
         DataType::Trade => format!("platform.lake.{dataset}.event.trades-recorded"),
         DataType::Quote => format!("platform.lake.{dataset}.event.quotes-recorded"),
+        DataType::Outcome => format!("platform.lake.{dataset}.event.outcomes-recorded"),
     }
 }
 
@@ -416,15 +420,16 @@ impl Lake {
                 &meta.business_date,
             )?;
             // Real-time data is keyed by UTC instants, with no business date
-            // (contract v19; ruling 3 of 2026-10-09).
-            if data_type.real_time() && !meta.business_date.is_empty() {
+            // (contract v19; ruling 3 of 2026-10-09); nor is an outcome a
+            // daily value (contract v23, the lake plan's vL1c, item 3).
+            if !data_type.dated() && !meta.business_date.is_empty() {
                 return Err(format!(
-                    "{at}.meta.business_date: a {} names no business date; it is keyed by its \
+                    "{at}.meta.business_date: {} names no business date; it is keyed by its \
                      valid time",
-                    if data_type == DataType::Trade {
-                        "trade"
-                    } else {
-                        "quote"
+                    match data_type {
+                        DataType::Trade => "a trade",
+                        DataType::Quote => "a quote",
+                        _ => "an outcome",
                     }
                 ));
             }
@@ -510,6 +515,7 @@ impl Lake {
             match &row {
                 Observation::Trade(trade) => trade_refused(&at, trade)?,
                 Observation::Quote(quote) => quote_refused(&at, quote)?,
+                Observation::Outcome(outcome) => outcome_refused(&at, outcome)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -551,6 +557,7 @@ impl Lake {
             "prices" => bounds::RECORD_PRICES_REQUEST_PRICES_COUNT,
             "trades" => bounds::RECORD_TRADES_REQUEST_TRADES_COUNT,
             "quotes" => bounds::RECORD_QUOTES_REQUEST_QUOTES_COUNT,
+            "outcomes" => bounds::RECORD_OUTCOMES_REQUEST_OUTCOMES_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -653,6 +660,15 @@ impl Lake {
                 "meridian.v1.QuotesRecordedEvent",
                 QuotesRecordedEvent {
                     quote: Some(quote.clone()),
+                }
+                .encode_to_vec(),
+            ),
+            // Every version, never conflated (contract v23, the lake plan's
+            // vL1c, item 4): the receive keys no outcome.
+            Observation::Outcome(outcome) => (
+                "meridian.v1.OutcomesRecordedEvent",
+                OutcomesRecordedEvent {
+                    outcome: Some(outcome.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -978,6 +994,8 @@ impl Lake {
                     )
                 }
             },
+            // Outcomes (contract v23) are read by ListOutcomes alone.
+            DataType::Outcome => return Err("an outcome is read by ListOutcomes".into()),
             // Quotes (contract v19): the latest in force at a time, or a
             // valid-time range; at most one.
             DataType::Quote => {
@@ -1317,6 +1335,103 @@ impl Lake {
         })
     }
 
+    /// W10.6, contract v23 (the lake plan's vL1c, item 4): outcomes for event
+    /// contracts' instruments, from every dataset holding them the reader may
+    /// read -- an outcome takes no default among sources -- the version in
+    /// force of each row key as of a recorded time, or the versions recorded
+    /// after a watermark, whatever their valid time, which is how a reader
+    /// that lost some catches up. A source is never asked: what a venue has
+    /// not determined is nothing to want.
+    pub(crate) fn list_outcomes(
+        &self,
+        request: ListOutcomesRequest,
+        envelope: &Envelope,
+    ) -> Result<ListOutcomesReply, String> {
+        let reader = reader_of(envelope);
+        if !bounds::LIST_OUTCOMES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 500",
+                request.subjects.len()
+            ));
+        }
+        let when = match request
+            .after_watermark
+            .as_ref()
+            .filter(|watermark| !watermark.partitions.is_empty())
+        {
+            Some(watermark) => {
+                let mut at: BTreeMap<String, u64> = BTreeMap::new();
+                for (i, partition) in watermark.partitions.iter().enumerate() {
+                    if at
+                        .insert(partition.partition.clone(), partition.sequence)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "after_watermark.partitions[{i}] {:?} is named twice",
+                            partition.partition
+                        ));
+                    }
+                }
+                When::After(at)
+            }
+            None => When::Latest { at_ns: 0 },
+        };
+        if request.as_of_ns < 0 {
+            return Err("as_of_ns is never negative".into());
+        }
+        let as_of = if request.as_of_ns == 0 {
+            self.clock.now_ns()
+        } else {
+            request.as_of_ns
+        };
+        let config = self.config();
+        let aliases = self.store.aliases().map_err(|failed| failed.to_string())?;
+        let read = Read {
+            reader: reader.clone(),
+            data_type: DataType::Outcome,
+            subjects: request
+                .subjects
+                .iter()
+                .map(|s| s.entity_id.clone())
+                .collect(),
+            kinds: Vec::new(),
+            interval_ns: 0,
+            sources: SourceChoice {
+                side_by_side: true,
+                ..Default::default()
+            },
+            when,
+            as_of_ns: as_of,
+        };
+        let answered = read::answer(
+            self.store.as_ref(),
+            &read,
+            &Against {
+                config: &config,
+                priorities: &[],
+                declined: &read::Declined::new(),
+                aliases: &aliases,
+                now_ns: self.clock.now_ns(),
+            },
+        )?;
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        let readable: BTreeSet<String> = config
+            .readable(&reader, DataType::Outcome)
+            .into_iter()
+            .collect();
+        Ok(ListOutcomesReply {
+            outcomes: answered
+                .rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Observation::Outcome(outcome) => Some(outcome),
+                    _ => None,
+                })
+                .collect(),
+            watermark: Some(watermark(&heads, &readable)),
+        })
+    }
+
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
         let reader = reader_of(envelope);
         let config = self.config();
@@ -1383,7 +1498,9 @@ impl Lake {
             DataType::Price if kind == PriceKind::Unspecified => {
                 return Err("kind: a price's priority names its kind".into())
             }
-            DataType::Bar | DataType::Trade | DataType::Quote if kind != PriceKind::Unspecified => {
+            DataType::Bar | DataType::Trade | DataType::Quote | DataType::Outcome
+                if kind != PriceKind::Unspecified =>
+            {
                 return Err(format!(
                     "kind: a priority for {} names no kind; only prices have one",
                     data_type.name()
@@ -1592,6 +1709,44 @@ fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), Str
 /// A quote held to W10.4 (contract v19): each side's amount stated, each
 /// quantity more than zero, characteristics each in the list and at most
 /// four. Its two sides in one asset is checked beside its amounts.
+/// An outcome held to W10.4 (contract v23): its determination and stage
+/// said, its settlement value set and never negative, its venue's word kept.
+fn outcome_refused(at: &str, outcome: &meridian_domain::v1::Outcome) -> Result<(), String> {
+    use meridian_domain::v1::{OutcomeDetermination, OutcomeStage};
+    if OutcomeDetermination::try_from(outcome.determination)
+        .unwrap_or(OutcomeDetermination::Unspecified)
+        == OutcomeDetermination::Unspecified
+    {
+        return Err(format!("{at}.determination is unspecified"));
+    }
+    if OutcomeStage::try_from(outcome.stage).unwrap_or(OutcomeStage::Unspecified)
+        == OutcomeStage::Unspecified
+    {
+        return Err(format!("{at}.stage is unspecified"));
+    }
+    let Some(value) = outcome.settlement_value.as_ref() else {
+        return Err(format!(
+            "{at}.settlement_value is required: what one contract settles at, in the payout asset"
+        ));
+    };
+    if let Some(amount) = value.amount.as_ref() {
+        let exact = meridian_domain::exact::Exact::from_wire(amount)
+            .map_err(|out| format!("{at}.settlement_value.amount {out}"))?;
+        if exact.is_negative() {
+            return Err(format!("{at}.settlement_value is never negative"));
+        }
+    }
+    if outcome.settled_at_ns < 0 {
+        return Err(format!("{at}.settled_at_ns is never negative"));
+    }
+    if outcome.determination_as_reported.is_none() {
+        return Err(format!(
+            "{at}.determination_as_reported is required: the venue's own word, as reported"
+        ));
+    }
+    Ok(())
+}
+
 fn quote_refused(at: &str, quote: &meridian_domain::v1::Quote) -> Result<(), String> {
     for (name, side) in [("bid", &quote.bid), ("ask", &quote.ask)] {
         if side.as_ref().is_some_and(|money| money.amount.is_none()) {
@@ -1773,6 +1928,37 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 envelope,
             )
         },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_OUTCOMES,
+        (
+            "meridian.v1.RecordOutcomesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordOutcomesRequest, envelope| {
+            lake.record(
+                "outcomes",
+                request
+                    .outcomes
+                    .into_iter()
+                    .map(Observation::Outcome)
+                    .collect(),
+                "",
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_OUTCOMES,
+        (
+            "meridian.v1.ListOutcomesRequest",
+            "meridian.v1.ListOutcomesReply",
+        ),
+        |lake, request: ListOutcomesRequest, envelope| lake.list_outcomes(request, envelope),
     );
     serve_on(
         &bus,

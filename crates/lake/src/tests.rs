@@ -1416,3 +1416,225 @@ async fn a_standing_want_is_delivered_again_under_its_id_so_a_restarted_data_plu
         .count();
     assert_eq!(asked, 1, "delivered again, not asked again");
 }
+
+// ── Contract v23: the lake's 1c, an event contract's outcome ───────────────
+
+/// The 1a's configuration, with kalshi-1:outcomes beside it: outcomes,
+/// polled; each of outcomes' readers entitled to it but signal-1.
+fn outcomes_configuration() -> EntitlementsChangedEvent {
+    let mut c = configuration(true, &[]);
+    c.datasets.push(DatasetRef {
+        dataset: "kalshi-1:outcomes".into(),
+        instance: "kalshi-1".into(),
+        vendor: "Kalshi".into(),
+        declaration: Some(DatasetDeclaration {
+            key: "outcomes".into(),
+            vendor: "Kalshi".into(),
+            data_types: vec!["meridian.v1.Outcome".into()],
+            modes: vec![ObservationMode::Pull as i32],
+            day_time_zone: "Etc/UTC".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    for reader in ["reporting-1", "portfolio-1", "compliance-1", "operations-1"] {
+        c.entitlements.push(DatasetEntitlement {
+            dataset: "kalshi-1:outcomes".into(),
+            instance: reader.into(),
+            allowed: true,
+            ..Default::default()
+        });
+    }
+    c
+}
+
+fn outcome(
+    valid_from_ns: i64,
+    stage: meridian_domain::v1::OutcomeStage,
+    determination: meridian_domain::v1::OutcomeDetermination,
+    value: &str,
+) -> meridian_domain::v1::Outcome {
+    meridian_domain::v1::Outcome {
+        meta: Some(ObservationMeta {
+            row_key: "KXFED-26OCT-T4.25".into(),
+            subjects: vec![SubjectRef {
+                entity_id: AAPL.into(),
+            }],
+            source: Some(Source {
+                instance: "kalshi-1".into(),
+                dataset: "kalshi-1:outcomes".into(),
+                ..Default::default()
+            }),
+            valid_from_ns,
+            ..Default::default()
+        }),
+        determination: determination as i32,
+        stage: stage as i32,
+        settlement_value: money(value, "USD", ""),
+        settled_at_ns: 0,
+        determination_as_reported: Some(AsReported {
+            scheme: "kalshi:result".into(),
+            code: "yes".into(),
+            text: String::new(),
+        }),
+    }
+}
+
+fn record_outcomes(
+    h: &Harness,
+    rows: Vec<meridian_domain::v1::Outcome>,
+) -> Result<meridian_domain::v1::RecordObservationsReply, String> {
+    tokio::task::block_in_place(|| {
+        h.lake.record(
+            "outcomes",
+            rows.into_iter().map(Observation::Outcome).collect(),
+            "",
+            &envelope("kalshi-1", true, ""),
+        )
+    })
+}
+
+fn read_outcomes(
+    h: &Harness,
+    reader: &str,
+    as_of_ns: i64,
+    after: Option<meridian_domain::v1::Watermark>,
+) -> Result<meridian_domain::v1::ListOutcomesReply, String> {
+    tokio::task::block_in_place(|| {
+        h.lake.list_outcomes(
+            meridian_domain::v1::ListOutcomesRequest {
+                subjects: vec![SubjectRef {
+                    entity_id: AAPL.into(),
+                }],
+                after_watermark: after,
+                as_of_ns,
+            },
+            &envelope(reader, true, ""),
+        )
+    })
+}
+
+fn stages(reply: &meridian_domain::v1::ListOutcomesReply) -> Vec<(i32, u64)> {
+    reply
+        .outcomes
+        .iter()
+        .map(|o| (o.stage, o.meta.as_ref().unwrap().version))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_after() {
+    use meridian_domain::v1::{OutcomeDetermination as D, OutcomeStage as S};
+    let h = harness();
+    h.lake.configured(&outcomes_configuration());
+    let mut heard = h
+        .bus
+        .subscribe("platform.lake.kalshi-1:outcomes.event.outcomes-recorded");
+    // Determined; then disputed and restated as version 2; then final.
+    let first = record_outcomes(&h, vec![outcome(NOW, S::Determined, D::Pays, "1.00")]).unwrap();
+    assert_eq!(first.recorded, 1);
+    let seen = first.watermark.unwrap();
+    let before_dispute = h.clock.now_ns();
+    h.clock.advance(1_000);
+    let disputed =
+        record_outcomes(&h, vec![outcome(NOW + 10, S::Disputed, D::Pays, "1.00")]).unwrap();
+    assert_eq!(
+        disputed.restated, 1,
+        "one row key per contract: a new version"
+    );
+    h.clock.advance(1_000);
+    record_outcomes(&h, vec![outcome(NOW + 20, S::Final, D::PaysPart, "0.50")]).unwrap();
+    // The same again changes nothing.
+    let again =
+        record_outcomes(&h, vec![outcome(NOW + 20, S::Final, D::PaysPart, "0.50")]).unwrap();
+    assert_eq!(again.unchanged, 1);
+    // Every version delivered, in order, never conflated.
+    for (stage, version) in [(S::Determined, 1), (S::Disputed, 2), (S::Final, 3)] {
+        let event = meridian_domain::v1::OutcomesRecordedEvent::decode(
+            &heard.recv().await.unwrap().envelope.payload[..],
+        )
+        .unwrap()
+        .outcome
+        .unwrap();
+        assert_eq!(event.stage, stage as i32);
+        assert_eq!(event.meta.as_ref().unwrap().version, version);
+        assert_eq!(event.settlement_value.as_ref().unwrap().instrument_id, USD);
+    }
+    // The version in force; as of a recorded time before the restatement;
+    // and the versions recorded after the watermark a reader last saw.
+    for reader in ["reporting-1", "portfolio-1", "compliance-1", "operations-1"] {
+        let now = read_outcomes(&h, reader, 0, None).unwrap();
+        assert_eq!(stages(&now), vec![(S::Final as i32, 3)], "{reader}");
+        assert!(now
+            .watermark
+            .unwrap()
+            .partitions
+            .iter()
+            .any(|p| p.partition == "kalshi-1:outcomes"));
+    }
+    let then = read_outcomes(&h, "reporting-1", before_dispute, None).unwrap();
+    assert_eq!(stages(&then), vec![(S::Determined as i32, 1)]);
+    let caught = read_outcomes(&h, "reporting-1", 0, Some(seen)).unwrap();
+    assert_eq!(
+        stages(&caught),
+        vec![(S::Disputed as i32, 2), (S::Final as i32, 3)]
+    );
+    // A reader not entitled reads none.
+    assert!(read_outcomes(&h, "signal-1", 0, None)
+        .unwrap()
+        .outcomes
+        .is_empty());
+    // ListOutcomes is the only read of them.
+    assert!(tokio::task::block_in_place(|| h.lake.read(
+        ReadRequest {
+            data_type: DataType::Outcome,
+            subjects: vec![SubjectRef {
+                entity_id: AAPL.into()
+            }],
+            kinds: vec![],
+            interval_ns: 0,
+            sources: None,
+            at_ns: 0,
+            business_date: String::new(),
+            valid_from_ns: 0,
+            valid_until_ns: 0,
+            as_of_ns: 0,
+            page_size: 0,
+            cursor: String::new(),
+            after: None,
+        },
+        &envelope("reporting-1", true, "")
+    ))
+    .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outcome_is_refused_naming_its_field() {
+    use meridian_domain::v1::{OutcomeDetermination as D, OutcomeStage as S};
+    let h = harness();
+    h.lake.configured(&outcomes_configuration());
+    let good = || outcome(NOW, S::Proposed, D::Pays, "1.00");
+    let mut dated = good();
+    dated.meta.as_mut().unwrap().business_date = "2026-10-08".into();
+    let mut undetermined = good();
+    undetermined.determination = 0;
+    let mut unstaged = good();
+    unstaged.stage = 0;
+    let mut valueless = good();
+    valueless.settlement_value = None;
+    let mut unsaid = good();
+    unsaid.determination_as_reported = None;
+    for (row, field) in [
+        (dated, "outcomes[0].meta.business_date"),
+        (undetermined, "outcomes[0].determination"),
+        (unstaged, "outcomes[0].stage"),
+        (valueless, "outcomes[0].settlement_value"),
+        (unsaid, "outcomes[0].determination_as_reported"),
+    ] {
+        let refused = record_outcomes(&h, vec![row]).unwrap_err();
+        assert!(refused.starts_with(field), "{field}: {refused}");
+    }
+    assert!(record_outcomes(&h, vec![])
+        .unwrap_err()
+        .contains("1 to 500"));
+}

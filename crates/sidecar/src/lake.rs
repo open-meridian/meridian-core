@@ -29,8 +29,9 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
-    ObservationMeta, ObservationsWantedEvent, PricesRecordedEvent, QuotesRecordedEvent,
-    RecordBarsRequest, RecordPricesRequest, TradesRecordedEvent, WantWithdrawnEvent,
+    ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent, PricesRecordedEvent,
+    QuotesRecordedEvent, RecordBarsRequest, RecordPricesRequest, TradesRecordedEvent,
+    WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -184,6 +185,17 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 is_want: false,
             })
         }
+        // Every version of an outcome, never conflated (contract v23).
+        "meridian.v1.OutcomesRecordedEvent" => {
+            let outcome = OutcomesRecordedEvent::decode(payload).ok()?.outcome?;
+            let (dataset, subjects, _) = meta_said(outcome.meta.as_ref());
+            Some(Said {
+                key: None,
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
         "meridian.v1.QuotesRecordedEvent" => {
             let quote = QuotesRecordedEvent::decode(payload).ok()?.quote?;
             let (dataset, subjects, venue) = meta_said(quote.meta.as_ref());
@@ -249,6 +261,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             Ok(mut event) => {
                 if let Some(trade) = event.trade.as_mut() {
                     meridian_domain::lake::strip_trade(trade, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
+        "meridian.v1.OutcomesRecordedEvent" => match OutcomesRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(outcome) = event.outcome.as_mut() {
+                    meridian_domain::lake::strip_outcome(outcome, allowed);
                 }
                 event.encode_to_vec()
             }

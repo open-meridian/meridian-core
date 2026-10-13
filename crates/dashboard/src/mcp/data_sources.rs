@@ -177,7 +177,7 @@ fn priority_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "data_type": {"type": "string", "enum": lake::DATA_TYPES},
+            "data_type": {"type": "string", "enum": lake::PRIORITISED},
             "kind": {"type": "string", "enum": ["close", "last", "nav", "settlement"], "description": "for prices only"},
             "datasets": {"type": "array", "minItems": 1, "maxItems": MOST_DATASETS, "items": {"type": "string"}, "description": "first to last"},
             "against_updated_at_ns": {"type": "integer", "description": "the priority's updated_at_ns as it was read; 0 when none is set"},
@@ -485,10 +485,10 @@ async fn set_priority(app: &App, caller: &Caller, arguments: &Value) -> Value {
         &mut problems,
     );
     let data_type = text(top, "data_type", "", true, &mut problems);
-    if !data_type.is_empty() && !lake::DATA_TYPES.contains(&data_type.as_str()) {
+    if !data_type.is_empty() && !lake::PRIORITISED.contains(&data_type.as_str()) {
         problems.add(
             "data_type",
-            format!("one of {}", lake::DATA_TYPES.join(", ")),
+            format!("one of {}", lake::PRIORITISED.join(", ")),
         );
     }
     let kind_said = text(top, "kind", "", false, &mut problems);

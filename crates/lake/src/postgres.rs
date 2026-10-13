@@ -299,6 +299,9 @@ impl Store for PostgresStore {
                 out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
             }
             tx.commit().map_err(unavailable)?;
+            if crate::store::every_version(query) {
+                return Ok(crate::store::recorded_by(out, query.as_of_ns));
+            }
             return Ok(as_of(out, query.as_of_ns));
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();

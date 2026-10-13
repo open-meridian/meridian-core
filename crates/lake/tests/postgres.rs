@@ -272,3 +272,83 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
     assert_eq!(store.lowest_kept(&dataset).unwrap(), Some(1));
     assert_eq!(store.lowest_kept(&unique("none")).unwrap(), None);
 }
+
+fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation {
+    Observation::Outcome(meridian_domain::v1::Outcome {
+        meta: Some(ObservationMeta {
+            row_key: "KXFED-26OCT".into(),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+            }],
+            source: Some(Source {
+                instance: "kalshi-1".into(),
+                dataset: dataset.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: 100 + stage as i64,
+            ..Default::default()
+        }),
+        determination: 1,
+        stage,
+        settlement_value: Some(Money {
+            amount: Some(meridian_pb::v1::Decimal {
+                high: 0,
+                low: value,
+                scale: 2,
+            }),
+            currency_code: "USD".into(),
+            instrument_id: "LCL-USD".into(),
+        }),
+        settled_at_ns: 0,
+        determination_as_reported: Some(meridian_pb::v1::AsReported {
+            scheme: "kalshi:result".into(),
+            code: "yes".into(),
+            text: String::new(),
+        }),
+    })
+}
+
+/// Contract v23: an outcome's stages are versions of one row key; the
+/// latest read answers the version in force, a catch-up after a watermark
+/// every version recorded since.
+#[test]
+fn an_outcomes_every_version_is_read_after_a_watermark() {
+    let store = store();
+    let dataset = unique("kalshi-1:outcomes");
+    let subject = unique("LCL-KXFED");
+    store
+        .record(&dataset, vec![outcome(&dataset, &subject, 2, 100)], 1_000)
+        .unwrap();
+    store
+        .record(&dataset, vec![outcome(&dataset, &subject, 3, 100)], 2_000)
+        .unwrap();
+    store
+        .record(&dataset, vec![outcome(&dataset, &subject, 4, 50)], 3_000)
+        .unwrap();
+    let query = |when: When, as_of_ns: i64| Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Outcome,
+        kinds: vec![],
+        interval_ns: 0,
+        when,
+        as_of_ns,
+    };
+    let versions = |rows: Vec<Observation>| -> Vec<u64> {
+        rows.iter().map(|row| row.meta().version).collect()
+    };
+    assert_eq!(
+        versions(store.read(&query(When::Latest { at_ns: 0 }, 0)).unwrap()),
+        vec![3]
+    );
+    assert_eq!(
+        versions(
+            store
+                .read(&query(When::Latest { at_ns: 0 }, 2_500))
+                .unwrap()
+        ),
+        vec![2]
+    );
+    let after = When::After([(dataset.clone(), 1)].into_iter().collect());
+    assert_eq!(versions(store.read(&query(after, 0)).unwrap()), vec![2, 3]);
+}

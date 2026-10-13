@@ -230,6 +230,24 @@ pub trait Store: Send + Sync {
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;
 }
 
+/// Whether a query answers every version it finds, not each row key's
+/// latest: an outcome's catch-up after a watermark, since every version is
+/// delivered and none conflated (contract v23, the lake plan's vL1c, item
+/// 4), so a reader that lost some reads each stage it lost.
+pub fn every_version(query: &Query) -> bool {
+    query.data_type == DataType::Outcome && matches!(query.when, When::After(_))
+}
+
+/// Each row recorded at or before a cut-off (0 for none), every version.
+pub fn recorded_by(rows: Vec<Observation>, as_of_ns: i64) -> Vec<Observation> {
+    let mut out: Vec<Observation> = rows
+        .into_iter()
+        .filter(|row| as_of_ns == 0 || row.meta().recorded_at_ns <= as_of_ns)
+        .collect();
+    out.sort_by_key(|row| (row.dataset().to_string(), row.meta().sequence));
+    out
+}
+
 /// Whether a row answers a query's valid time and kind, before versions are
 /// chosen.
 pub fn matches(row: &Observation, query: &Query) -> bool {

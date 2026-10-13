@@ -1,11 +1,12 @@
 //! One row of the lake under its envelope: a price or a bar (the 1a), a trade
-//! or a quote (the 1b, contract v19).
+//! or a quote (the 1b, contract v19), an event contract's outcome (the 1c,
+//! contract v23).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
-use meridian_domain::v1::{Bar, Money, ObservationMeta, Price, Quote, Trade};
+use meridian_domain::v1::{Bar, Money, ObservationMeta, Outcome, Price, Quote, Trade};
 use meridian_pb::v1::Decimal;
 use prost::Message;
 
@@ -17,6 +18,8 @@ pub enum DataType {
     /// Contract v19.
     Trade,
     Quote,
+    /// Contract v23.
+    Outcome,
 }
 
 impl DataType {
@@ -28,6 +31,7 @@ impl DataType {
             lake::BAR => Some(DataType::Bar),
             lake::TRADE => Some(DataType::Trade),
             lake::QUOTE => Some(DataType::Quote),
+            lake::OUTCOME => Some(DataType::Outcome),
             _ => None,
         }
     }
@@ -38,6 +42,7 @@ impl DataType {
             DataType::Bar => lake::BAR,
             DataType::Trade => lake::TRADE,
             DataType::Quote => lake::QUOTE,
+            DataType::Outcome => lake::OUTCOME,
         }
     }
 
@@ -47,6 +52,7 @@ impl DataType {
             DataType::Bar => 2,
             DataType::Trade => 3,
             DataType::Quote => 4,
+            DataType::Outcome => 5,
         }
     }
 
@@ -56,6 +62,7 @@ impl DataType {
             2 => Some(DataType::Bar),
             3 => Some(DataType::Trade),
             4 => Some(DataType::Quote),
+            5 => Some(DataType::Outcome),
             _ => None,
         }
     }
@@ -64,6 +71,13 @@ impl DataType {
     /// date: real-time data (contract v19; ruling 3 of 2026-10-09).
     pub fn real_time(self) -> bool {
         matches!(self, DataType::Trade | DataType::Quote)
+    }
+
+    /// Whether its rows may name a business date: a daily value's, never a
+    /// trade's, a quote's or an outcome's (contract v23, the lake plan's
+    /// vL1c, items 3 and 11).
+    pub fn dated(self) -> bool {
+        matches!(self, DataType::Price | DataType::Bar)
     }
 }
 
@@ -77,6 +91,7 @@ pub enum Observation {
     Bar(Bar),
     Trade(Trade),
     Quote(Quote),
+    Outcome(Outcome),
 }
 
 impl Observation {
@@ -86,6 +101,7 @@ impl Observation {
             Observation::Bar(_) => DataType::Bar,
             Observation::Trade(_) => DataType::Trade,
             Observation::Quote(_) => DataType::Quote,
+            Observation::Outcome(_) => DataType::Outcome,
         }
     }
 
@@ -96,6 +112,7 @@ impl Observation {
             Observation::Bar(bar) => bar.meta.as_ref(),
             Observation::Trade(trade) => trade.meta.as_ref(),
             Observation::Quote(quote) => quote.meta.as_ref(),
+            Observation::Outcome(outcome) => outcome.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -106,6 +123,7 @@ impl Observation {
             Observation::Bar(bar) => bar.meta.get_or_insert_with(Default::default),
             Observation::Trade(trade) => trade.meta.get_or_insert_with(Default::default),
             Observation::Quote(quote) => quote.meta.get_or_insert_with(Default::default),
+            Observation::Outcome(outcome) => outcome.meta.get_or_insert_with(Default::default),
         }
     }
 
@@ -144,6 +162,7 @@ impl Observation {
             ),
             Observation::Trade(trade) => lake::asset_key(trade.price.as_ref()),
             Observation::Quote(quote) => lake::quote_asset(quote),
+            Observation::Outcome(outcome) => lake::asset_key(outcome.settlement_value.as_ref()),
         }
     }
 
@@ -186,6 +205,7 @@ impl Observation {
             Observation::Bar(bar) => bar.encode_to_vec(),
             Observation::Trade(trade) => trade.encode_to_vec(),
             Observation::Quote(quote) => quote.encode_to_vec(),
+            Observation::Outcome(outcome) => outcome.encode_to_vec(),
         }
     }
 
@@ -195,6 +215,7 @@ impl Observation {
             DataType::Bar => Observation::Bar(Bar::decode(bytes)?),
             DataType::Trade => Observation::Trade(Trade::decode(bytes)?),
             DataType::Quote => Observation::Quote(Quote::decode(bytes)?),
+            DataType::Outcome => Observation::Outcome(Outcome::decode(bytes)?),
         })
     }
 
@@ -240,6 +261,11 @@ impl Observation {
                 }
                 out
             }
+            Observation::Outcome(outcome) => outcome
+                .settlement_value
+                .as_mut()
+                .map(|m| vec![("settlement_value", m)])
+                .unwrap_or_default(),
         }
     }
 
@@ -293,6 +319,13 @@ impl Observation {
                     && same_decimal(&a.ask_quantity, &b.ask_quantity)
                     && a.characteristics == b.characteristics
             }
+            (Observation::Outcome(a), Observation::Outcome(b)) => {
+                a.determination == b.determination
+                    && a.stage == b.stage
+                    && same_money(&a.settlement_value, &b.settlement_value)
+                    && a.settled_at_ns == b.settled_at_ns
+                    && a.determination_as_reported == b.determination_as_reported
+            }
             _ => false,
         }
     }
@@ -307,6 +340,7 @@ impl Observation {
             Observation::Bar(bar) => lake::strip_bar(bar, allowed),
             Observation::Trade(trade) => lake::strip_trade(trade, allowed),
             Observation::Quote(quote) => lake::strip_quote(quote, allowed),
+            Observation::Outcome(outcome) => lake::strip_outcome(outcome, allowed),
         }
     }
 }

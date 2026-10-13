@@ -28,8 +28,16 @@ pub const TRADE: &str = "meridian.v1.Trade";
 /// The best bid and offer (contract v19).
 pub const QUOTE: &str = "meridian.v1.Quote";
 
-/// The lake's data types: the 1a's, and the 1b's from contract v19.
-pub const DATA_TYPES: [&str; 4] = [PRICE, BAR, TRADE, QUOTE];
+/// An event contract's outcome at one stage (contract v23, the lake's 1c).
+pub const OUTCOME: &str = "meridian.v1.Outcome";
+
+/// The lake's data types: the 1a's, the 1b's from contract v19, and the
+/// 1c's outcome from contract v23.
+pub const DATA_TYPES: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, OUTCOME];
+
+/// The data types a default read takes a priority among (W10.3): an outcome
+/// is read from every dataset that holds it, with no default (contract v23).
+pub const PRIORITISED: [&str; 4] = [PRICE, BAR, TRADE, QUOTE];
 
 const PRICE_FIELDS: [&str; 4] = [
     "meridian.v1.Price.meta",
@@ -66,6 +74,15 @@ const QUOTE_FIELDS: [&str; 6] = [
     "meridian.v1.Quote.characteristics",
 ];
 
+const OUTCOME_FIELDS: [&str; 6] = [
+    "meridian.v1.Outcome.meta",
+    "meridian.v1.Outcome.determination",
+    "meridian.v1.Outcome.stage",
+    "meridian.v1.Outcome.settlement_value",
+    "meridian.v1.Outcome.settled_at_ns",
+    "meridian.v1.Outcome.determination_as_reported",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -74,6 +91,7 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         BAR => &BAR_FIELDS,
         TRADE => &TRADE_FIELDS,
         QUOTE => &QUOTE_FIELDS,
+        OUTCOME => &OUTCOME_FIELDS,
         _ => &[],
     }
 }
@@ -236,6 +254,40 @@ pub fn strip_quote(
     }
     if gone(QUOTE_FIELDS[5]) {
         quote.characteristics.clear();
+    }
+    removed
+}
+
+/// [`strip_price`], for an outcome (contract v23).
+pub fn strip_outcome(
+    outcome: &mut crate::v1::Outcome,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(OUTCOME_FIELDS[1]) {
+        outcome.determination = 0;
+    }
+    if gone(OUTCOME_FIELDS[2]) {
+        outcome.stage = 0;
+    }
+    if gone(OUTCOME_FIELDS[3]) {
+        outcome.settlement_value = None;
+    }
+    if gone(OUTCOME_FIELDS[4]) {
+        outcome.settled_at_ns = 0;
+    }
+    if gone(OUTCOME_FIELDS[5]) {
+        outcome.determination_as_reported = None;
     }
     removed
 }
